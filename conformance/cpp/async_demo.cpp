@@ -1,63 +1,143 @@
 // Conformance consumer: async-demo sample, C++ target.
 //
-// Drives the std::future-backed async surface of the generated header-only
-// wrapper end to end: `weaveffi::tasks::run_task` settled from the producer's
-// worker thread with a TaskResult struct decoded from a value buffer, the
-// typed InvalidNameError (extending TaskError extending WeaveFFIError)
-// rethrown by future::get for an empty name, the buffered list-of-records
-// round trip through `run_batch`, the direct-scalar `run_n_tasks`, the sync
-// `cancel_task`, and `active_callbacks` settling to zero once every task body
-// has completed. Exits 0 on success; aborts (non-zero) on any failed
-// assertion.
+// Drives the std::future-backed async surface end to end: `run_task`
+// settled from a producer thread with a decoded TaskResult record, the typed
+// InvalidNameError (extending TaskError extending Error) rethrown by
+// future::get, the buffered list-of-records round trip through `run_batch`,
+// the direct-scalar `run_n_tasks`, and cancellation of the cancellable
+// `wait` through an RAII CancelToken: cancelling an in-flight call settles
+// its future with Cancelled (code -5) long before its timeout, a token
+// destroyed mid-flight leaves the call running, and omitting the token runs
+// to completion. Ends by asserting no task body is still active and the
+// producer's leak counters are all zero.
 
-#include <cassert>
+#include <chrono>
 #include <cstdio>
-#include <cstring>
+#include <future>
 #include <string>
+#include <thread>
 #include <vector>
 
-#include "weaveffi.hpp"
+#include "async_demo.hpp"
+#include "check.hpp"
 
-int main() {
-    // Async record return: future::get blocks until the worker-thread
-    // callback delivers the decoded TaskResult.
-    weaveffi::TaskResult result = weaveffi::tasks::run_task("alpha").get();
-    assert(result.id > 0);
-    assert(result.value == "completed: alpha");
-    assert(result.success);
+namespace ad = ::async_demo;
 
-    // Typed async error: the empty name settles the future with the typed
-    // exception, rethrown on get().
+static void run() {
+    ad::check_library();
+
+    ad::TaskResult result = ad::tasks::run_task("alpha").get();
+    CHECK(result.id > 0);
+    CHECK(result.value == "completed: alpha");
+    CHECK(result.success);
+
     bool threw = false;
     try {
-        weaveffi::tasks::run_task("").get();
-    } catch (const weaveffi::InvalidNameError& e) {
-        threw = true;
-        assert(e.code() == 1);
-        assert(dynamic_cast<const weaveffi::TaskError*>(&e) != nullptr);
-        assert(dynamic_cast<const weaveffi::WeaveFFIError*>(&e) != nullptr);
+        ad::tasks::run_task("").get();
+    } catch (const ad::InvalidNameError& e) {
+        threw = e.code() == 1;
+        CHECK(dynamic_cast<const ad::TaskError*>(&e) != nullptr);
+        CHECK(dynamic_cast<const ad::Error*>(&e) != nullptr);
     }
-    assert(threw && "expected InvalidNameError for empty name");
+    CHECK(threw);
 
-    // Buffered list-of-records both ways.
-    std::vector<weaveffi::TaskResult> batch =
-        weaveffi::tasks::run_batch({"a", "b", "c"}).get();
-    assert(batch.size() == 3);
+    std::vector<ad::TaskResult> batch = ad::tasks::run_batch({"a", "b", "c"}).get();
+    CHECK(batch.size() == 3);
     const char* expected[3] = {"completed: a", "completed: b", "completed: c"};
     for (size_t i = 0; i < 3; i++) {
-        assert(batch[i].value == expected[i]);
-        assert(batch[i].success);
+        CHECK(batch[i].value == expected[i]);
+        CHECK(batch[i].success);
+    }
+    CHECK(ad::tasks::run_batch({}).get().empty());
+
+    CHECK(ad::tasks::run_n_tasks(7).get() == 7);
+
+    // Many concurrent calls, each settled exactly once.
+    {
+        std::vector<std::future<int32_t>> pending;
+        for (int32_t i = 0; i < 64; i++) pending.push_back(ad::tasks::run_n_tasks(i));
+        for (int32_t i = 0; i < 64; i++) CHECK(pending[i].get() == i);
     }
 
-    // Direct scalar through the async callback.
-    assert(weaveffi::tasks::run_n_tasks(7).get() == 7);
+    // No token: the call runs to its timeout.
+    CHECK(ad::tasks::wait(20).get() == 20);
 
-    // Sync functions beside the async ones.
-    assert(!weaveffi::tasks::cancel_task(1));
+    // Cancelling an in-flight call settles it with Cancelled right away.
+    {
+        ad::CancelToken token;
+        auto start = std::chrono::steady_clock::now();
+        std::future<int64_t> pending = ad::tasks::wait(30000, token);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        CHECK(pending.wait_for(std::chrono::seconds(0)) == std::future_status::timeout);
+        token.cancel();
+        CHECK(token.is_cancelled());
+        bool cancelled = false;
+        try {
+            pending.get();
+        } catch (const ad::Cancelled& e) {
+            cancelled = e.code() == -5;
+        }
+        CHECK(cancelled);
+        CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(10));
+    }
 
-    // Every spawned task body has completed by the time its callback fires.
-    assert(weaveffi::tasks::active_callbacks() == 0);
+    // A token cancelled before the call starts cancels it too, and one token
+    // can cancel several calls.
+    {
+        ad::CancelToken token;
+        std::future<int64_t> first = ad::tasks::wait(30000, token);
+        std::future<int64_t> second = ad::tasks::wait(30000, token);
+        token.cancel();
+        int cancelled = 0;
+        for (auto* f : {&first, &second}) {
+            try {
+                f->get();
+            } catch (const ad::Cancelled&) {
+                cancelled++;
+            }
+        }
+        CHECK(cancelled == 2);
+        std::future<int64_t> late = ad::tasks::wait(30000, token);
+        bool caught = false;
+        try {
+            late.get();
+        } catch (const ad::Cancelled&) {
+            caught = true;
+        }
+        CHECK(caught);
+    }
 
-    std::printf("cpp async-demo conformance: OK\n");
+    // Destroying the consumer's token mid-flight releases only its own
+    // reference: the call keeps running and completes normally.
+    {
+        std::future<int64_t> pending;
+        {
+            ad::CancelToken token;
+            pending = ad::tasks::wait(50, token);
+        }
+        CHECK(pending.get() == 50);
+    }
+
+    // A moved-from token is empty and cancelling it is a no-op.
+    {
+        ad::CancelToken token;
+        ad::CancelToken moved = std::move(token);
+        token.cancel();
+        CHECK(!moved.is_cancelled());
+        CHECK(ad::tasks::wait(1, moved).get() == 1);
+    }
+
+    // Every spawned task body has finished, including the cancelled ones,
+    // whose futures the runtime dropped.
+    for (int i = 0; i < 200 && ad::tasks::active_callbacks() != 0; i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(ad::tasks::active_callbacks() == 0);
+}
+
+int main() {
+    run();
+    check_no_leaks(async_demo_debug_live, "async-demo");
+    std::printf("cpp/async-demo: OK\n");
     return 0;
 }

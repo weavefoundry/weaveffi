@@ -17,6 +17,15 @@ mod surface {
         Detailed { code: i32, note: String } = 2,
     }
 
+    impl std::fmt::Display for Failure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::NotFound => f.write_str("not found"),
+                Self::Detailed { code, note } => write!(f, "{code}: {note}"),
+            }
+        }
+    }
+
     #[weaveffi::enumeration]
     #[repr(i32)]
     pub enum Mode {
@@ -38,6 +47,7 @@ mod surface {
         fn on_item(&self, item: &Item, widget: Arc<Widget>);
         fn should_continue(&self, n: i32) -> bool;
         fn pick(&self) -> Mode;
+        fn label(&self, text: &str, data: &[u8]) -> Result<i32, weaveffi::ForeignError>;
     }
 
     #[weaveffi::interface]
@@ -86,6 +96,16 @@ mod surface {
             widget,
         );
         observer.should_continue(1)
+    }
+
+    #[weaveffi::export]
+    pub fn borrow(text: &str, data: &[u8], owned: String) -> String {
+        format!("{text}{}{owned}", data.len())
+    }
+
+    #[weaveffi::export]
+    pub async fn shout(text: String) -> String {
+        text.to_uppercase()
     }
 
     #[weaveffi::export]

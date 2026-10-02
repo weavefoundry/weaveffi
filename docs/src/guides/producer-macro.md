@@ -1,153 +1,135 @@
 # The Rust Producer Macro
 
-If your producer is written in Rust, the most ergonomic workflow is to write a
-normal, safe Rust library, annotate it with the `#[weaveffi::module]` family of
-attributes, and let the `weaveffi` crate generate the `#[no_mangle] extern "C"`
-thunks that back the stable C ABI. The same annotated source is what
-`weaveffi generate src/lib.rs` reads to emit the IDL, the C header, and every
-language binding, so the producer you compile and the bindings you ship can't
-drift: they are two views of one parse.
-
-This is the "Rust as the source of truth" model. You never hand-write `unsafe`
-FFI glue, and there is no separate IDL file to keep in sync.
+A Rust producer is an ordinary library crate. You annotate the modules you
+want to export with `#[weaveffi::module]`, tag the items inside, and call
+`weaveffi::export_runtime!()` once. The macro emits the `extern "C"` thunks,
+marshalling every argument through the audited `weaveffi::abi` runtime, so
+the crate contains no `unsafe` glue. The CLI reads the same source
+(`weaveffi generate src/lib.rs`) through the same extractor, so the compiled
+symbols and the generated bindings can't drift.
 
 ## Setup
 
-Add the single `weaveffi` facade crate and build a `cdylib` (plus an `rlib` if
-you also want to unit-test the safe functions in-crate):
-
 ```toml
-[package]
-name = "my-lib"
-version = "0.1.0"
-edition = "2021"
-
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]          # add "staticlib" for iOS, "rlib" for in-crate tests
 
 [dependencies]
-weaveffi = "0.22"
+weaveffi = "0.23"
 ```
 
-## A complete example
+**The prefix is the crate name.** Every C symbol starts with the crate's
+library name (`[lib] name`, else the package name with `-` mapped to `_`),
+which the macro reads from `CARGO_CRATE_NAME` at expansion time. The CLI
+derives the same prefix from `Cargo.toml`, and it isn't configurable: setting
+`[package] c_prefix` or `library` in `weaveffi.toml` for a `.rs` input is an
+error. A crate named `kvstore` with a module `kv` exports
+`kvstore_kv_Store_open`, `kvstore_error_clear`, `kvstore_kv_checksum`, and so
+on, and builds `libkvstore.so`.
+
+**`export_runtime!()` exactly once,** at the crate root. It takes no
+arguments and exports the [runtime surface](../reference/abi.md#runtime-surface)
+under the crate's prefix: `abi_version`, the error helpers, `free_bytes`, the
+cancel-token functions, `debug_live`, and on `wasm32` `alloc` and `dealloc`.
+Each top-level `#[weaveffi::module]` additionally exports its contract
+checksum, `{prefix}_{module}_checksum()`.
+
+## The attributes
+
+| Attribute | On | Effect |
+|-----------|----|--------|
+| `#[weaveffi::module]` | inline `mod name { ... }` | An exported namespace and the driver of the expansion. Nested `#[weaveffi::module]` modules become IDL submodules. |
+| `#[weaveffi::export]` | `fn`, `async fn` | Exports a free function. `Result<T, E>` makes it throwing; `async fn` makes it async. |
+| `#[weaveffi::record]` | struct with named fields | A by-value record, serialized as a value buffer. |
+| `#[weaveffi::enumeration]` | `#[repr(i32)]` enum, or enum with named-field variants | A C-style enum (explicit `= N` on every variant) or a rich enum. |
+| `#[weaveffi::interface]` | struct plus its inherent `impl` | A reference-counted object type; the `impl`'s `pub fn`s become constructors, methods, and statics. |
+| `#[weaveffi::callback_interface]` | `trait Name: Send + Sync` | Methods the consumer implements; accepted as `Arc<dyn Name>`. |
+| `#[weaveffi::error]` | enum with explicit discriminants | The module's error domain. Must implement `Display`. |
+| `#[weaveffi::cancellable]` | exported `async fn` or async method | Takes a `weaveffi::CancelToken` as its last parameter. |
+
+Only tagged items are exported; private helpers, `use` items, and state are
+left alone. Doc comments flow into the IDL and every binding, and
+`#[deprecated(note = "...")]` becomes the IDL's `deprecated:` text.
+
+## Types
+
+| Rust | IDL | Crosses the ABI as |
+|------|-----|--------------------|
+| `i8`..`i64`, `u8`..`u64`, `f32`, `f64`, `bool` | same | one value |
+| `String`, `&str` | `string` | UTF-8 `(ptr, len)` |
+| `Vec<u8>`, `&[u8]` | `bytes` | `(ptr, len)` |
+| `#[weaveffi::record]` struct, rich enum | the type | value buffer |
+| `#[repr(i32)]` enum | the enum | `int32_t` |
+| `Option<T>`, `Vec<T>`, `HashMap<K, V>`, `BTreeMap<K, V>` | `T?`, `[T]`, `{K:V}` | value buffer |
+| `&T`, `Arc<T>`, `Option<Arc<T>>` (interface `T`) | `T`, `T?` | object pointer |
+| `Arc<dyn Trait>` (callback interface) | `Trait` | `ctx` plus vtable (parameters only) |
+| `weaveffi::Iter<T>` | `iter<T>` | iterator handle (returns only) |
+| `weaveffi::CancelToken` | none | the launcher's cancel-token slot |
+
+A reference (`&str`, `&[u8]`, `&Contact`, `&Store`) is a calling convention,
+not an IDL distinction: the thunk lends the lifted argument for the call.
+Objects compose with every buffered shape, so `Vec<Arc<T>>`,
+`Option<Arc<T>>`, an `Arc<T>` record field, and `weaveffi::Iter<Arc<T>>` all
+work. [Extracting an IDL from Rust](extract.md#type-mapping) has the full
+mapping.
+
+## Functions and errors
 
 ```rust
-//! src/lib.rs
-
-/// Arithmetic over 32-bit integers.
 #[weaveffi::module]
 pub mod calculator {
-    /// The calculator's error domain: the codes its throwing functions report.
+    /// The calculator's error domain.
     #[weaveffi::error]
     #[derive(Debug)]
     pub enum CalcError {
-        /// division by zero
+        /// Division by zero.
         DivisionByZero = 1,
     }
 
-    /// Add two integers.
-    #[weaveffi::export]
-    pub fn add(a: i32, b: i32) -> i32 {
-        a + b
+    impl std::fmt::Display for CalcError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("division by zero")
+        }
     }
 
     /// Divide two integers, failing on a zero divisor.
     #[weaveffi::export]
     pub fn div(a: i32, b: i32) -> Result<i32, CalcError> {
-        if b == 0 {
-            return Err(CalcError::DivisionByZero);
-        }
-        Ok(a / b)
+        a.checked_div(b).ok_or(CalcError::DivisionByZero)
     }
 }
-
-// Emit the fixed runtime surface (memory, error, and cancel-token helpers)
-// exactly once per cdylib.
-weaveffi::export_runtime!();
 ```
 
-That is the whole producer. Building it yields a shared library exporting
-`weaveffi_calculator_add` and `weaveffi_calculator_div` with the exact
-signatures the generated C header declares. A `Result<T, E>` return marks the
-function `throws: true` in the IDL: the return type is `T`, and `Err` is
-reported through the trailing `out_err` parameter with the code the
-`#[weaveffi::error]` enum declares, so every binding surfaces it as a typed
-domain error (see [Error Handling](errors.md)). A throwing function needs an
-error domain in scope on its module or an ancestor.
+A `Result<T, E>` return is `throws: true` in the IDL with return type `T`;
+`()` and `Result<(), E>` return nothing. The `#[weaveffi::error]` enum's
+discriminants are the codes (positive and unique), and its runtime message
+is the enum's `Display` output; a variant's doc comment is the documented
+default message that appears in the IDL and in generated docs. Without a
+`Display` impl the macro fails with a trait-bound error naming the enum.
 
-Generate the bindings straight from the same file:
+A variant may carry named fields, which travel as the error's structured
+payload (this needs a primitive repr):
 
-```bash
-weaveffi generate src/lib.rs -o generated --target c,swift,python
+```rust
+#[weaveffi::error]
+#[derive(Debug)]
+#[repr(i32)]
+pub enum QuotaError {
+    /// Quota exceeded.
+    Exceeded { limit: i64, used: i64 } = 3001,
+    /// Quota service unavailable.
+    Unavailable = 3002,
+}
 ```
 
-## The attributes
+A module declares at most one domain; it's in scope for that module and every
+module nested in it, and a `Result` with no domain in scope is a compile
+error. `Result<T, String>` compiles too (it reports the generic code `-1`),
+and any type implementing `weaveffi::ErrorReport` can be an error type. A
+panic in producer code is caught at the boundary and reported as code `-2`.
+See [Errors and Memory](errors-and-memory.md).
 
-| Attribute | Where it goes | Effect |
-|-----------|---------------|--------|
-| `#[weaveffi::module]` | inline `mod foo { ... }` | Marks an exported namespace and drives the codegen. Modules may nest. |
-| `#[weaveffi::export]` | `fn` or `async fn` | Exports a function. A `Result<T, E>` return is `throws: true`; `()` (and `Result<(), E>`) is a `void` return; `async fn` is `async: true`. |
-| `#[weaveffi::record]` | named-field `struct` | A by-value record. Generates a `BufferValue` implementation (encode and decode in the value-buffer format); no per-record C symbols. |
-| `#[weaveffi::interface]` | `struct` with an inherent `impl` block | A reference-counted object type (see [Interfaces](#interfaces)). The `impl` block's `pub fn`s become constructors, methods, and statics; `_clone` and `_destroy` symbols are implicit. |
-| `#[weaveffi::callback_interface]` | `trait Name: Send + Sync` | A set of methods the consumer implements and the producer calls (see [Callback interfaces](#callback-interfaces)). Producers accept one as `Arc<dyn Name>`. |
-| `#[weaveffi::error]` | `enum` with explicit discriminants | Declares the module's error domain. Every variant needs an explicit `= N` discriminant; the doc comment is the code's default message. A variant may carry named fields, which become the code's structured payload (this requires a primitive repr such as `#[repr(i32)]`). |
-| `#[weaveffi::enumeration]` | `#[repr(i32)]` `enum`, or an `enum` with named-field variants | A C-style enum (every variant needs an explicit `= N` discriminant) or a rich enum whose variants carry named fields and cross as a value buffer. |
-| `#[weaveffi::cancellable]` | exported `async fn` | Marks the function as accepting a cancel token; its final parameter must be a `weaveffi::CancelToken`. |
-
-Only items carrying a marker are exported. Private helpers, `use` items, the
-module's in-memory state, and free functions without `#[weaveffi::export]` are
-left untouched, so a module can freely mix its exported surface with its
-implementation. Doc comments (`///`) on items, fields, and variants flow into
-the generated IDL and every binding. `#[deprecated(note = "...")]` on an
-exported function or method marks it `deprecated:` in the IDL.
-
-Call `weaveffi::export_runtime!()` exactly once in the crate (not per module).
-It emits the fixed C ABI runtime symbols (`weaveffi_abi_version`,
-`weaveffi_error_set`, `weaveffi_error_clear`, `weaveffi_error_free`,
-`weaveffi_free_string`, `weaveffi_free_bytes`, the cancel-token helpers, and
-on `wasm32` the `weaveffi_alloc`/`weaveffi_dealloc` pair) that every binding
-links against. See [C ABI Contract](../reference/abi.md#runtime-surface).
-
-## How values cross the boundary
-
-The macro marshals each argument and result through the audited
-[`weaveffi::abi`](https://docs.rs/weaveffi-abi) runtime, so every `unsafe`
-pointer operation lives in one reviewed place rather than in generated glue.
-You write ordinary Rust types; the macro picks the matching ABI shape:
-
-| Rust type | IDL type | C ABI shape |
-|-----------|----------|-------------|
-| `i8`..`i64`, `u8`..`u64`, `f32`, `f64`, `bool` | same | the scalar |
-| `String` (or `&str` as a parameter) | `string` | `const char*` |
-| `Vec<u8>` (or `&[u8]` as a parameter) | `bytes` | `const uint8_t* ptr, size_t len` |
-| a `#[weaveffi::record]` struct | the record | serialized value buffer (`ptr` + `len`) |
-| a `#[repr(i32)]` `#[weaveffi::enumeration]` enum | the enum | `int`-sized discriminant |
-| a data-carrying `#[weaveffi::enumeration]` enum | the rich enum | serialized value buffer |
-| `Option<T>` | `T?` | serialized value buffer (nullable pointer for `Option<Arc<Interface>>`) |
-| `Vec<T>` | `[T]` | serialized value buffer |
-| `HashMap<K, V>`, `BTreeMap<K, V>` | `{K:V}` | serialized value buffer |
-| `Arc<T>` or `&T` where `T` is a `#[weaveffi::interface]` | the interface | `const {tag}*` parameter (borrowed); `{tag}*` return (one strong reference) |
-| `Arc<dyn Trait>` where `Trait` is a `#[weaveffi::callback_interface]` | the callback interface | `void* ctx, const {tag}_vtable* vtable` (parameters only) |
-| `weaveffi::Iter<T>` (returns only) | `iter<T>` | opaque iterator with `_next`/`_destroy` |
-| `weaveffi::CancelToken` (final parameter of a `#[weaveffi::cancellable]` `async fn`) | not in the IDL | the launcher's `weaveffi_cancel_token*` slot |
-
-A reference such as `&str`, `&[u8]`, `&Contact`, or `&Shelf` is a
-producer-side calling convention, not an IDL distinction: the thunk lifts the
-argument and lends it to your function. Interfaces compose with every buffered
-shape, so `Option<Arc<T>>`, `Vec<Arc<T>>`, `{string: Arc<T>}`, a record field
-of type `Arc<T>`, and `weaveffi::Iter<Arc<T>>` all work. See
-[Annotated Rust Extraction](extract.md#type-mapping) for the exhaustive table.
-
-## Records
-
-A `#[weaveffi::record]` struct crosses the boundary by value as a serialized
-[value buffer](../reference/value-buffers.md). The macro generates a
-`weaveffi::abi::BufferValue` implementation (an `encode` into a
-`BufferWriter` and a `decode` from a `BufferReader`, one field at a time in
-declaration order); the surrounding marshalling calls it to decode buffered
-parameters and encode buffered returns. No per-record C symbols are
-generated: consumers pack and unpack the bytes with their own generated
-routines.
+## Records and enums
 
 ```rust
 #[weaveffi::record]
@@ -155,619 +137,240 @@ routines.
 pub struct Contact {
     /// Stable identifier.
     pub id: i64,
-    /// Given name.
-    pub first_name: String,
-    /// Optional email address.
+    pub name: String,
     pub email: Option<String>,
-    /// Kind of contact.
     pub kind: ContactType,
+}
+
+#[weaveffi::enumeration]
+#[repr(i32)]
+#[derive(Clone, Copy, Debug)]
+pub enum ContactType {
+    Personal = 0,
+    Work = 1,
+}
+
+#[weaveffi::enumeration]
+#[derive(Clone, Debug)]
+pub enum Shape {
+    Empty,
+    Circle { radius: f64 },
+    Rect { width: f32, height: f32 },
 }
 ```
 
-A record field may hold an object (`Arc<Shelf>`, `Option<Arc<Shelf>>`,
-`Vec<Arc<Shelf>>`). Inside the buffer the object is a `u64` token carrying
-one strong reference; the macro's generated `encode` clones the `Arc` into the
-token and `decode` adopts it, so a record that carries objects is always
-encoded fresh and decoded exactly once.
+Records and rich enums get a generated `weaveffi::abi::BufferValue`
+implementation; no per-type C symbols exist. Rich-enum variants use named
+fields (tuple variants are rejected), and tags follow declaration order unless
+the variant declares a discriminant.
 
 ## Interfaces
 
-A `#[weaveffi::interface]` struct is a first-class, reference-counted object
-type: the consumer holds a strong reference to a live `Arc<T>` rather than a
-copied value. The `impl` block defines the surface; the struct's own fields
-(its state) never cross the boundary, so they need no annotations.
-
-Because the object is shared across the FFI boundary (several consumer
-wrappers, records, collections, and in-flight async calls may all hold a
-reference), the macro asserts that the type is `Send + Sync`, and the
-receivers are restricted:
-
-- Constructors are `pub fn`s without a receiver that return `Self` or
-  `Arc<Self>` (spelled either way or by the type's own name), optionally
-  inside a `Result`.
-- Methods take `&self` or `self: Arc<Self>`. Use interior mutability
-  (`Mutex`, `RwLock`, atomics) for mutable state; `&mut self` and `self` by
-  value are rejected.
-- Statics are `pub fn`s without a receiver that return anything else.
+An interface is shared across the boundary (by consumer wrappers, records,
+collections, and in-flight async calls), so the type must be `Send + Sync`
+and keeps mutable state behind interior mutability.
 
 ```rust
-#[weaveffi::module]
-pub mod library {
-    use std::sync::{Arc, Mutex, PoisonError};
+#[weaveffi::interface]
+pub struct Shelf {
+    titles: std::sync::Mutex<Vec<String>>,
+}
 
-    /// The library's error domain.
-    #[weaveffi::error]
-    #[derive(Debug)]
-    pub enum LibraryError {
-        /// no such shelf
-        NoSuchShelf = 1,
+impl Shelf {
+    /// Constructor: no receiver, returns `Self` or `Arc<Self>`.
+    pub fn new() -> Self {
+        Self { titles: Default::default() }
     }
 
-    /// A shelf snapshot that carries the shelf itself.
-    #[weaveffi::record]
-    #[derive(Clone)]
-    pub struct ShelfInfo {
-        /// A caller-chosen label.
-        pub label: String,
-        /// The described shelf (one strong reference).
-        pub shelf: Arc<Shelf>,
-        /// A neighbouring shelf, if any.
-        pub neighbour: Option<Arc<Shelf>>,
-    }
+    /// Fallible constructor.
+    pub fn open(name: String) -> Result<Arc<Self>, LibraryError> { /* ... */ }
 
-    /// A shelf of titles. Shared across the FFI boundary, so its state
-    /// lives behind a `Mutex`.
-    #[weaveffi::interface]
-    pub struct Shelf {
-        titles: Mutex<Vec<String>>,
-    }
+    /// Method on `&self`.
+    pub fn count(&self) -> i64 { /* ... */ }
 
-    impl Shelf {
-        /// Create an empty shelf.                       // constructor -> Self
-        pub fn new() -> Self {
-            Self {
-                titles: Mutex::new(Vec::new()),
-            }
-        }
+    /// Method on `self: Arc<Self>`, returning another reference to itself.
+    pub fn share(self: Arc<Self>) -> Arc<Shelf> { self }
 
-        /// Open a named shelf.                          // fallible constructor -> Arc<Self>
-        pub fn open(name: String) -> Result<Arc<Self>, LibraryError> {
-            if name.is_empty() {
-                return Err(LibraryError::NoSuchShelf);
-            }
-            Ok(Arc::new(Self::new()))
-        }
+    /// Iterator return.
+    pub fn titles(&self) -> weaveffi::Iter<String> { /* ... */ }
 
-        /// Add a title.                                 // method on &self
-        pub fn add(&self, title: String) {
-            self.titles
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(title);
-        }
+    /// Async method.
+    pub async fn duplicate(self: Arc<Self>) -> Arc<Shelf> { /* ... */ }
 
-        /// Number of titles.
-        pub fn count(&self) -> i64 {
-            self.titles
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .len() as i64
-        }
-
-        /// A second reference to this same shelf.      // method on self: Arc<Self>
-        pub fn share(self: Arc<Self>) -> Arc<Shelf> {
-            self
-        }
-
-        /// Whichever shelf holds more titles.           // Option<Arc<T>> in and out
-        pub fn larger(self: Arc<Self>, other: Option<Arc<Shelf>>) -> Option<Arc<Shelf>> {
-            match other {
-                Some(o) if o.count() > self.count() => Some(o),
-                Some(_) => Some(self),
-                None => None,
-            }
-        }
-
-        /// Snapshot into a record that carries the shelf.
-        pub fn describe(self: Arc<Self>, label: String) -> ShelfInfo {
-            ShelfInfo {
-                label,
-                shelf: self,
-                neighbour: None,
-            }
-        }
-
-        /// Split into `n` empty shelves.                // Vec<Arc<T>> return
-        pub fn split(&self, n: i32) -> Vec<Arc<Shelf>> {
-            (0..n).map(|_| Arc::new(Shelf::new())).collect()
-        }
-
-        /// Stream every title lazily.                   // iter<T>
-        pub fn titles(&self) -> weaveffi::Iter<String> {
-            let snapshot: Vec<String> = self
-                .titles
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            weaveffi::Iter::new(snapshot)
-        }
-
-        /// Copy the shelf on a producer thread.         // async returning an object
-        pub async fn duplicate(self: Arc<Self>) -> Arc<Shelf> {
-            let copy = Shelf::new();
-            for t in self.titles.lock().unwrap_or_else(PoisonError::into_inner).iter() {
-                copy.add(t.clone());
-            }
-            Arc::new(copy)
-        }
-
-        /// The largest shelf a library will hold.       // static (no receiver)
-        pub fn capacity() -> i64 {
-            10_000
-        }
-    }
-
-    /// Total titles across shelves and an optional snapshot.
-    #[weaveffi::export]
-    pub fn total(shelves: Vec<Arc<Shelf>>, extra: Option<ShelfInfo>) -> i64 {
-        let base: i64 = shelves.iter().map(|s| s.count()).sum();
-        base + extra.map_or(0, |info| info.shelf.count())
-    }
-
-    /// Stream shelves lazily.                           // iter<Shelf>
-    #[weaveffi::export]
-    pub fn stream_shelves(n: i32) -> weaveffi::Iter<Arc<Shelf>> {
-        weaveffi::Iter::new((0..n).map(|_| Arc::new(Shelf::new())))
-    }
+    /// Static: no receiver, returns something other than `Self`.
+    pub fn capacity() -> i64 { 10_000 }
 }
 ```
 
-The macro emits `weaveffi_library_Shelf_clone` and
-`weaveffi_library_Shelf_destroy` alongside the constructors, methods, and
-statics. `_clone` returns a new strong reference to the same object and
-`_destroy` releases one; the `Shelf` is dropped when the last reference goes.
-An object parameter (`&Shelf`, `Arc<Shelf>`, `Option<Arc<Shelf>>`) is
-borrowed for the call: when your function takes `Arc<Shelf>` the thunk bumps
-the count for you, so retaining it past the call is safe. An object return
-transfers one strong reference to the consumer; a `self: Arc<Self>` method
-that returns `self` hands back the same pointer the consumer passed in, now
-with one more reference, which the consumer must eventually release too.
+- Constructors return `Self`, `Arc<Self>`, or the type by name, optionally in
+  a `Result`. They can't be `async`; use an async static that returns
+  `Arc<Self>`.
+- Methods take `&self` or `self: Arc<Self>`. `&mut self` and `self` by value
+  are rejected.
+- An object parameter `&T` is borrowed for the call; `Arc<T>` (or
+  `Option<Arc<T>>`) is a new strong reference the thunk took for you, so you
+  may store it.
+- An object you return transfers one strong reference to the consumer.
 
-Every binding wraps the reference in an idiomatic class (a Swift `final class`
-with `deinit`, a Kotlin `AutoCloseable` backed by a `Cleaner`, a Python class
-with `close()` and `__del__`, C# `IDisposable`, Go `Close()` with a
-finalizer, Dart `NativeFinalizer`, Ruby `FFI::AutoPointer`, C++ RAII) that
-releases its reference exactly once. See `samples/kvstore` and
-`samples/events` for complete producers and
-[Memory Ownership](memory.md#interface-objects) for the full contract.
+The macro also emits `{prefix}_{module}_{Type}_clone` and `_destroy`. Every
+binding wraps the reference in a class that releases it exactly once.
 
 ## Callback interfaces
 
-A `#[weaveffi::callback_interface]` trait is the inverse of an interface: the
-**consumer** implements it and the **producer** calls it. Declare it as a
-`Send + Sync` trait whose methods take `&self`, and accept it in exported
-functions, constructors, statics, or methods as `Arc<dyn Trait>`. The macro
-implements the trait on a foreign wrapper around the consumer's `(ctx, vtable)`
-pair, so your code calls the methods like any other trait object and can clone
-and retain the `Arc` for as long as it likes. When the last `Arc` drops the
-consumer's `free(ctx)` entry runs exactly once.
+A callback interface is the inverse of an interface: the consumer implements
+it and the producer calls it, from any thread, for as long as it holds the
+`Arc`. When the last clone drops, the consumer's release hook runs exactly
+once.
 
 ```rust
-#[weaveffi::module]
-pub mod events {
-    use std::sync::{Arc, Mutex, PoisonError};
+#[weaveffi::callback_interface]
+pub trait Subscriber: Send + Sync {
+    /// A consumer failure comes back as an `Err`.
+    fn route(&self, topic: &str) -> Result<Delivery, weaveffi::ForeignError>;
+    /// A consumer failure aborts the enclosing call.
+    fn on_message(&self, message: &Message) -> i64;
+    /// The consumer adopts the reference it receives.
+    fn on_attached(&self, bus: Arc<EventBus>);
+}
 
-    /// How a subscriber wants to be told about a message.
-    #[weaveffi::enumeration]
-    #[repr(i32)]
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Delivery {
-        /// Deliver the message.
-        Accept = 0,
-        /// Skip this subscriber for this message.
-        Skip = 1,
-    }
-
-    /// A published message as subscribers see it.
-    #[weaveffi::record]
-    #[derive(Clone, Debug, PartialEq)]
-    pub struct Message {
-        /// Monotonic sequence number, starting at 1.
-        pub seq: i64,
-        /// Message text.
-        pub text: String,
-    }
-
-    /// A consumer-implemented subscriber.
-    #[weaveffi::callback_interface]
-    pub trait Subscriber: Send + Sync {
-        /// Decide how the bus should treat `topic` for this subscriber.
-        fn route(&self, topic: String) -> Delivery;
-        /// Receive an accepted message. Returns the running count.
-        fn on_message(&self, message: &Message) -> i64;
-        /// Receive the bus itself; the consumer adopts the reference.
-        fn on_attached(&self, bus: Arc<EventBus>);
-    }
-
-    /// A bus that retains its subscribers.
-    #[weaveffi::interface]
-    pub struct EventBus {
-        subscribers: Mutex<Vec<Arc<dyn Subscriber>>>,
-        seq: Mutex<i64>,
-    }
-
-    impl EventBus {
-        /// Create an empty bus.
-        pub fn new() -> Arc<Self> {
-            Arc::new(Self {
-                subscribers: Mutex::new(Vec::new()),
-                seq: Mutex::new(0),
-            })
-        }
-
-        /// Retain `subscriber` and tell it which bus it joined.
-        pub fn subscribe(self: Arc<Self>, subscriber: Arc<dyn Subscriber>) -> i64 {
-            subscriber.on_attached(Arc::clone(&self));
-            let mut subs = self
-                .subscribers
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            subs.push(subscriber);
-            subs.len() as i64
-        }
-
-        /// Publish `text` under `topic`, returning how many subscribers
-        /// accepted it. A subscriber failure aborts the call.
-        pub fn publish(&self, topic: String, text: String) -> i64 {
-            let message = {
-                let mut seq = self.seq.lock().unwrap_or_else(PoisonError::into_inner);
-                *seq += 1;
-                Message { seq: *seq, text }
-            };
-            // Snapshot so no lock is held while the consumer runs.
-            let subs: Vec<Arc<dyn Subscriber>> = self
-                .subscribers
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            let mut delivered = 0;
-            for sub in &subs {
-                if sub.route(topic.clone()) == Delivery::Accept {
-                    sub.on_message(&message);
-                    delivered += 1;
-                }
-            }
-            delivered
-        }
-    }
-
-    /// Ask `subscriber` how it would route `topic` without a bus.
-    #[weaveffi::export]
-    pub fn route_once(subscriber: Arc<dyn Subscriber>, topic: String) -> Delivery {
-        subscriber.route(topic)
-    }
+#[weaveffi::export]
+pub fn route_once(subscriber: Arc<dyn Subscriber>, topic: &str) -> Delivery {
+    subscriber.route(topic).unwrap_or_else(|e| {
+        weaveffi::abi::raise_foreign_error(e);
+        Delivery::Skip
+    })
 }
 ```
 
-The allowed method shapes are deliberately narrow so that nothing the consumer
-allocates has to cross back into the producer:
+The rules:
 
-- The receiver is `&self`. `&mut self`, `self`, and associated functions
-  without a receiver are rejected.
-- Parameters may be any IDL type except another callback interface or an
-  iterator: scalars, strings, bytes, records, enums, optionals, lists, maps,
-  and objects (`Arc<T>` or `Option<Arc<T>>`). Strings, bytes, and buffered
-  values are borrowed by the consumer for the duration of the call; an object
-  parameter transfers one strong reference to the consumer, which adopts it.
-- The return type is `()`, a scalar, `bool`, or a C-style enum. Strings,
-  bytes, records, and objects can't be returned. Methods can't be `async` and
-  can't return `Result`.
-- A callback interface may only appear as a parameter of a function,
-  constructor, static, or method. It can't be returned, stored in a record,
-  wrapped in `Option`, put in a list, or passed to another callback method.
+- The receiver is `&self`. Methods are synchronous.
+- Parameters may be any IDL type except a callback interface or an iterator.
+  Strings, bytes, and buffered values are lent to the consumer for the call;
+  an object parameter transfers one strong reference to the consumer.
+- The return is `()`, a scalar, `bool`, a C-style enum, or
+  `Result<T, weaveffi::ForeignError>` of one of those. Strings, buffers, and
+  objects can't be returned yet (see the [roadmap](../roadmap.md)).
+- A callback interface may appear only as a parameter, never in a return,
+  record, `Option`, or collection.
 
-The generated C header declares one vtable per trait, with an entry per method
-plus the trailing `free`. This is the `Subscriber` vtable from the example
-above:
+**When the consumer fails.** The binding reports a consumer exception
+through the vtable entry's error slot with code `-4`. A method declared with
+`Result<T, ForeignError>` receives it as `Err(ForeignError { code, message })`
+and nothing unwinds; propagate it with `weaveffi::abi::raise_foreign_error`
+or handle it. A method with a plain return can't hand the error back, so the
+failure aborts the producer call: on an unwinding build it unwinds to the
+enclosing thunk, which reports `-4` with the consumer's message, and on a
+`panic = "abort"` build (notably `wasm32-unknown-unknown`) the method returns
+its type's zero value, your code keeps running, and the thunk reports the
+failure when it returns. Either way the original caller sees the consumer's
+message. A failure on a thread with no WeaveFFI call active (a thread you
+spawned) is written to stderr and dropped, never attached to a later call.
 
-```c
-typedef struct weaveffi_events_Subscriber_vtable {
-    /** Decide how the bus should treat `topic` for this subscriber. */
-    weaveffi_events_Delivery (*route)(void* ctx, const char* topic, weaveffi_error* out_err);
-    /**
-     * Receive an accepted message. Returns the running count.
-     */
-    int64_t (*on_message)(void* ctx, const uint8_t* message_ptr, size_t message_len, weaveffi_error* out_err);
-    /** Receive the bus itself; the consumer adopts the reference. */
-    void (*on_attached)(void* ctx, weaveffi_events_EventBus* bus, weaveffi_error* out_err);
-    void (*free)(void* ctx);
-} weaveffi_events_Subscriber_vtable;
-```
+Prefer the `Result` form. With plain returns, don't hold a `Mutex` guard
+across a callback call: snapshot the state you need, release the lock, then
+call out, as `samples/events` does.
 
-### When the consumer fails
+## Iterators
 
-Every vtable entry carries a trailing `out_err`. A consumer implementation
-that raises (a Python exception, a Swift `throw`, a Go panic, and so on) is
-reported there by the generated binding with `FOREIGN_ERROR_CODE` (`-4`) and
-the foreign error's text. Because callback methods never return `Result`, the
-generated trait implementation can't hand you that error as a value. Instead it
-aborts the producer call by unwinding: `weaveffi::abi::check_foreign_error`
-raises a `ForeignError` payload with `std::panic::resume_unwind`, the unwind
-travels through your frames to the nearest exported thunk, and the thunk's
-`catch_unwind` reports `-4` with the consumer's message to the original caller
-(the same channel a producer panic uses, with a different code).
+Return `weaveffi::Iter<T>` (built with `Iter::new` from any `Send + 'static`
+iterator) when the consumer should pull elements lazily instead of receiving
+a materialized list. It may be wrapped in a `Result`, and `T` may be any IDL
+type, including an object. Iterators are returns of synchronous callables
+only; an `Iter` parameter, a nested `Iter`, or an async function returning one
+is rejected.
 
-Treat every callback method call as potentially panicking, exactly as you'd
-treat a call into an arbitrary closure:
+## Async functions and cancellation
 
-- Don't hold a `std::sync::Mutex` guard across the call unless you recover
-  from poisoning (`unwrap_or_else(PoisonError::into_inner)`, as the example
-  does). Otherwise the next lock attempt after a foreign failure panics too,
-  and that panic *is* reported as a producer bug (`-2`).
-- Prefer the snapshot pattern: clone the list of subscribers (or the state you
-  need) under the lock, release the lock, then call out.
-- Make state changes before the call or make them idempotent, because the
-  code after a failing callback doesn't run.
-- Tolerate a callback method returning its type's zero value (`0`, `false`,
-  an empty string) after a failure. On a `panic = "abort"` build such as
-  `wasm32-unknown-unknown` there's no unwinding, so the runtime records the
-  failure in a thread-local slot instead, your code keeps running on the
-  zero return, and the thunk reports the recorded failure once you return.
-
-`samples/events/src/lib.rs` follows these rules and has a test
-(`foreign_error_aborts_publish`) showing the bus remains usable after a
-subscriber failure.
-
-## Errors
-
-Declare a domain as a `#[weaveffi::error]` enum whose discriminants are the
-ABI codes (positive, unique) and whose doc comments are the default messages.
-Return `Result<T, YourError>` from anything that can fail; the macro generates
-the `ErrorReport` implementation that writes the code, message, and payload
-into `out_err`. A variant may carry named fields, which travel as a structured
-payload and surface as properties on the typed error the consumer catches;
-field-carrying variants with explicit discriminants require a primitive repr:
+An `async fn` (free function, method, or static) lowers to a launcher that
+returns immediately and a completion callback that fires exactly once.
+`#[weaveffi::cancellable]` adds a `weaveffi::CancelToken` parameter:
 
 ```rust
-#[weaveffi::error]
-#[derive(Debug)]
-#[repr(i32)]
-pub enum QuotaError {
-    /// quota exceeded
-    Exceeded { limit: i64, used: i64 } = 3001,
-    /// quota service unavailable
-    Unavailable = 3002,
-}
-```
-
-A module may declare at most one error domain, and it's in scope for the
-module and every nested module. `Result<T, String>` also compiles (it reports
-the generic code `-1`), but only a `#[weaveffi::error]` enum gives consumers
-named codes to match on. See [Error Handling](errors.md).
-
-## Iterators and cancel tokens
-
-Return `weaveffi::Iter<T>` when the consumer should pull elements lazily
-instead of receiving one materialized `[T]` buffer. Build it from any
-`Send + 'static` iterator with `Iter::new`; the macro emits the
-`{IterTag}*` launcher plus `_next` and `_destroy` symbols, and every binding
-surfaces it as the language's native lazy iteration idiom. `T` may be any
-IDL type including an object (`weaveffi::Iter<Arc<Shelf>>`). Iterators are
-returns only; an `Iter<T>` parameter isn't supported.
-
-Mark an exported `async fn` `#[weaveffi::cancellable]` and accept a
-`weaveffi::CancelToken` as its final parameter. The token is part of the async
-calling convention rather than the IDL signature: the launcher gains a
-`weaveffi_cancel_token*` slot and the macro lifts it for you. Poll
-`is_cancelled()` at safe points and return early:
-
-```rust
-/// Sum bytes on a producer thread, stopping early when cancelled.
 #[weaveffi::export]
 #[weaveffi::cancellable]
-pub async fn checksum(data: Vec<u8>, cancel: weaveffi::CancelToken) -> Result<i64, ContactsError> {
-    let mut total = 0i64;
-    for chunk in data.chunks(4096) {
-        if cancel.is_cancelled() {
-            return Err(ContactsError::InvalidName);
-        }
-        total += chunk.iter().map(|b| i64::from(*b)).sum::<i64>();
-    }
-    Ok(total)
+pub async fn wait(timeout_ms: i64, cancel: weaveffi::CancelToken) -> i64 {
+    let _ = cancel; // the runtime drops this future when the token fires
+    Delay::new(timeout_ms as u64).await;
+    timeout_ms
 }
 ```
 
-Async functions and methods run on the spawner installed with
-`weaveffi::set_spawner` (a detached thread per future by default); see
-[Async Functions](async.md).
+When the consumer cancels, the runtime drops your future at its next
+suspension point and completes the call with code `-5`; you don't need to
+poll the token. Poll `cancel.is_cancelled()` only for cooperative cleanup,
+such as work running on another thread. Futures run on the executor
+installed with `weaveffi::set_spawner` (a thread per future by default), and
+a future the executor drops without finishing also completes with `-5`. See
+[Async and Cancellation](async.md).
 
-## Cross-module references
+## Modules and cross-module references
 
-Modules can reference each other's records, enums, interfaces, and callback
-interfaces. Import the type with a normal `use` and pass it by value or by
-reference:
+Each `#[weaveffi::module]` at the top level of the crate is a root; nested
+`#[weaveffi::module]` modules are its submodules, and their symbols carry the
+joined path (`contacts_contacts_groups_count_of_type`). Inside one root tree,
+any module may use any declaration in the tree: records, enums, interfaces,
+callback interfaces, and the error domains of its ancestors.
 
-```rust
-#[weaveffi::module]
-pub mod products {
-    /// A product in the catalog.
-    #[weaveffi::record]
-    #[derive(Clone)]
-    pub struct Product {
-        /// Stable identifier.
-        pub id: i64,
-        /// Unit price.
-        pub price: f64,
-    }
-}
+The macro expands each root on its own and can't see a sibling root's
+declarations. A named type it can't resolve is assumed to be a value buffer,
+and the macro asserts at compile time that the type implements
+`weaveffi::abi::ByValue`. Records and rich enums do, so sharing a record
+between roots works. A C-style enum, an interface, or a callback interface
+from another root does not, and the build fails:
 
-#[weaveffi::module]
-pub mod orders {
-    use super::products::Product;
-
-    /// Takes a `products::Product` across the module boundary.
-    #[weaveffi::export]
-    pub fn add_product(order_id: u64, product: Product) -> bool {
-        let _ = (order_id, product);
-        true
-    }
-}
+```text
+error[E0277]: `Color` is declared in a different `#[weaveffi::module]` tree and isn't a record or rich enum
+   = note: nest the modules under one `#[weaveffi::module]` root (as inner `mod`s) so the macro can see the declaration
 ```
 
-Each module is expanded on its own, so the macro emits a thunk named for its
-own module while the CLI (which sees the whole crate) resolves the reference
-to `products.Product` in the IDL and header. Both spellings are the same
-serialized value buffer at the ABI level, so the producer and the generated
-bindings agree. See `samples/inventory` and the `kv.stats` submodule of
-`samples/kvstore` for complete examples.
+The fix is in the message: put the modules under one root. The `contacts`
+sample shows both shapes: a nested `contacts::groups` that uses the parent's
+interface and enum, and a sibling `directory` root that shares only the
+`Contact` record.
+
+## Leak checks
+
+The `leak-check` cargo feature (on `weaveffi`) counts live objects, foreign
+callbacks, iterators, cancel tokens, and returned allocations.
+`{prefix}_debug_live(kind)` reports them (`0` objects, `1` callbacks,
+`2` iterators, `3` tokens, `4` allocations); without the feature the symbol
+still exists and returns `0`. Every sample enables it, and every conformance
+consumer asserts all five counts are zero at exit.
+
+```toml
+[dependencies]
+weaveffi = { version = "0.23", features = ["leak-check"] }
+```
 
 ## What the macro rejects
 
-When the macro can't express a producer it fails at compile time with a
-spanned diagnostic rather than emitting glue that disagrees with the header.
-Every rejection below is pinned by a `trybuild` test in
-`crates/weaveffi-macros/tests/ui/`; the messages are quoted from those tests'
-`.stderr` files.
+Each rejection is a spanned compile error, pinned by a `trybuild` test in
+`crates/weaveffi-macros/tests/ui/`:
 
-**Raw pointers.** There is no `handle<T>` type in ABI 2; declare the pointee
-as an interface.
+| Source | Why |
+|--------|-----|
+| `*const T`, `*mut T` | Declare the pointee as an interface and pass `&T` or `Arc<T>`. |
+| `Box<T>`, `Rc<T>`, `Box<dyn Trait>` | Objects and callbacks are shared: use `Arc<T>`, `Arc<dyn Trait>`. |
+| `&mut T` parameter | Take `&T` or a value and return the result. |
+| interface method on `self` or `&mut self` | Use `&self` or `self: Arc<Self>` with interior mutability. |
+| interface that isn't `Send + Sync` | The compiler names the offending field. |
+| callback method on `&mut self`, or returning a string, buffer, or object | Callback returns are direct values only. |
+| `Result` with no error domain in scope | Declare a `#[weaveffi::error]` enum in the module or an ancestor. |
+| `#[weaveffi::error]` enum without `Display` | `Display` supplies the runtime message. |
+| C-style enum without `#[repr(i32)]` | The discriminant crosses as `int32_t`. |
+| `Iter<T>` parameter or nested `Iter` | Iterators are outermost returns only. |
+| non-value type from another root | See [cross-module references](#modules-and-cross-module-references). |
 
-```text
-error: weaveffi: raw pointers cannot cross the FFI boundary; declare the pointee as a #[weaveffi::interface] and pass it as `&T` or `Arc<T>`
- --> tests/ui/fail_raw_pointer.rs:6:22
-  |
-6 |     pub fn open() -> *mut Token {
-  |                      ^
-```
-
-**`Box<T>` and `Rc<T>`.** Objects are shared, so only `Arc` is accepted.
-
-```text
-error: weaveffi: `Box` cannot cross the FFI boundary; objects and callback interfaces are shared, so spell them as `Arc<T>` / `Arc<dyn Trait>`
- --> tests/ui/fail_box_param.rs:7:20
-  |
-7 |     pub fn take(w: Box<Widget>) {
-  |                    ^^^
-```
-
-**`&mut` parameters.** Nothing mutates a caller's value in place across the
-boundary.
-
-```text
-error: weaveffi: `&mut` parameters cannot cross the FFI boundary; take the value by `&T` or by value and return the updated result
- --> tests/ui/fail_mut_ref_param.rs:4:23
-  |
-4 |     pub fn fill(text: &mut String) {
-  |                       ^
-```
-
-**Interface methods taking `self` by value or `&mut self`.**
-
-```text
-error: weaveffi: interface methods must take `&self` or `self: Arc<Self>`; use interior mutability (Mutex, RwLock, atomics) for mutable state, because the object is shared across the FFI boundary
- --> tests/ui/fail_interface_self_by_value.rs:7:24
-  |
-7 |         pub fn consume(self) {}
-  |                        ^^^^
-```
-
-**Interfaces that aren't `Send + Sync`.** The assertion is a plain trait
-bound, so the compiler's own diagnostic names the offending field:
-
-```text
-error[E0277]: `Cell<i32>` cannot be shared between threads safely
- --> tests/ui/fail_interface_not_sync.rs:1:1
-  |
-1 | #[weaveffi::module]
-  | ^^^^^^^^^^^^^^^^^^^ `Cell<i32>` cannot be shared between threads safely
-  |
-  = help: within `Counter`, the trait `Sync` is not implemented for `Cell<i32>`
-  = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicI32` instead
-note: required because it appears within the type `Counter`
- --> tests/ui/fail_interface_not_sync.rs:6:16
-  |
-6 |     pub struct Counter {
-  |                ^^^^^^^
-note: required by a bound in `__wv_assert_send_sync`
-```
-
-**Callback methods with the wrong receiver or a non-direct return.**
-
-```text
-error: weaveffi: callback interface methods must take `&self`
- --> tests/ui/fail_callback_mut_self.rs:5:21
-  |
-5 |         fn on_event(&mut self, n: i32);
-  |                     ^
-```
-
-```text
-error: weaveffi: unsupported non-direct return type for `callback return` (not yet implemented by #[weaveffi::module])
- --> tests/ui/fail_callback_string_return.rs:1:1
-  |
-1 | #[weaveffi::module]
-  | ^^^^^^^^^^^^^^^^^^^
-```
-
-**A `Result` with no error domain in scope.**
-
-```text
-error: weaveffi: `risky` returns a Result but no error domain is in scope; declare a #[weaveffi::error] enum in this module (or a parent module)
- --> tests/ui/fail_result_without_error_domain.rs:2:5
-  |
-2 | mod bad {
-  |     ^^^
-```
-
-**A C-style enum without `#[repr(i32)]`.**
-
-```text
-error: enum `Mode` must have #[repr(i32)] to be a #[weaveffi::enumeration]
- --> tests/ui/fail_enum_without_repr.rs:3:5
-  |
-3 |     #[weaveffi::enumeration]
-  |     ^
-```
-
-Two removals from earlier releases have no dedicated diagnostic because the
-spelling simply no longer exists: `weaveffi::Handle` (the untyped `handle`
-type) is gone from the crate, so referring to it is an ordinary unresolved
-type error, and the IDL's borrowed `&str`/`&[u8]` types are gone. Rust `&str`
-and `&[u8]` parameters are still accepted; they are the borrowed spellings of
-`string` and `bytes`. Also rejected, with a spanned message: tuple-style
-rich-enum variants (use named fields), error variants without an explicit
-discriminant, a second `#[weaveffi::error]` in one module, an `Arc<dyn A + B>`
-naming more than one trait, and a callback interface not spelled
-`Arc<dyn Trait>`.
-
-## Feature support
-
-The proc-macro generates cdylib glue for the full IDL feature set. Every
-feature below is understood by the IDL, the validator, and every generator, and
-the macro emits the matching producer glue, so an annotated module compiles
-straight to a `weaveffi_*` cdylib with no hand-written `extern "C"` layer.
-
-| Feature | Macro codegen | Reference sample |
-|---------|---------------|------------------|
-| Modules, nested modules | Supported | `inventory`, `kvstore` |
-| Sync functions, `Result` errors | Supported | `calculator`, `contacts` |
-| Error domains (`#[weaveffi::error]`), structured payloads | Supported | `calculator`, `contacts`, `weaveffi` crate's runtime tests |
-| Reference-counted interfaces (constructors, methods, statics, `_clone`/`_destroy`) | Supported | `contacts`, `kvstore`, `events` |
-| Objects in optionals, lists, maps, record fields, iterators, and async returns | Supported | `kvstore` (`share`, `fork`, `larger`, `describe`, `open_many`, `total_count`), `codec` |
-| Callback interfaces (`Arc<dyn Trait>`) | Supported | `events`, `kvstore` (`EvictionListener`) |
-| Records (value-buffer encode / decode) | Supported | `contacts`, `codec` |
-| C-style enums | Supported | `contacts`, `shapes` |
-| Rich (data-carrying) enums | Supported | `shapes` |
-| Scalars, `string`, `bytes` | Supported | `calculator`, `kvstore` |
-| Optionals, lists, maps (nested composites included) | Supported | `inventory`, `kvstore`, `codec` |
-| Async functions and methods, pluggable spawner | Supported | `async-demo`, `kvstore`, `events` |
-| Cancellable async (`weaveffi::CancelToken`) | Supported | `kvstore` (`compact`) |
-| Iterator returns | Supported | `events`, `kvstore` |
+Also rejected: tuple-style rich-enum variants, error variants without an
+explicit discriminant, two `#[weaveffi::error]` enums in one module, and an
+`Arc<dyn A + B>` naming more than one trait. Whole-API rules (duplicate
+names, [C symbol collisions](../reference/idl.md#validation)) are checked by
+the CLI, not the macro, so run `weaveffi validate` or `weaveffi generate` in
+CI.
 
 ## See also
 
-- [Getting Started](../getting-started.md): the end-to-end IDL-first walkthrough; this guide is the Rust-macro alternative to its step 2.
-- [Annotated Rust Extraction](extract.md): the `weaveffi extract`/`generate <file.rs>` CLI and the full attribute and type reference.
-- [C ABI Contract](../reference/abi.md): the normative description of the symbols the macro emits.
-- [Memory Ownership](memory.md), [Error Handling](errors.md), and [Async Functions](async.md): the contracts the macro upholds for you.
-- [Rust API](../api/rust.md): the public items of the `weaveffi` and `weaveffi-abi` crates.
+- [Samples](../samples.md): `kvstore` uses every feature on this page.
+- [C ABI Contract](../reference/abi.md): what the thunks implement.
+- [Rust API Map](../api/rust.md): the `weaveffi` and `weaveffi-abi` items.

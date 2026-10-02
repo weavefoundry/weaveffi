@@ -1,29 +1,26 @@
 // Conformance consumer: events sample, .NET target.
 //
-// Drives the ABI 2 surface of the generated P/Invoke wrapper (WeaveFFI.cs):
-// the `ISubscriber` callback interface implemented in C# and adapted to the
-// producer's vtable by the generated trampolines (Route steering Publish's
-// accepted count through the `Delivery` enum, OnMessage decoding the buffered
-// `Message` record, OnAttached adopting a reference-counted `EventBus` handed
-// through the callback), the `EventBus` object class (constructor, Task-based
-// PublishLater, once-enumerable Messages iterator, optional LastMessage,
-// IDisposable release with a safe double Dispose and ObjectDisposedException
-// afterward), the free function RouteOnce, and a subscriber that throws,
-// which the trampolines report as the generated WeaveFFIException carrying
-// ForeignErrorCode (-4) without crashing the runtime. The producer cdylib is
-// resolved by absolute path via a DllImportResolver reading WEAVEFFI_LIBRARY.
-//
-// The harness compiles the generated source into this assembly, so the
-// wrapper's `internal` Handle property is reachable and used to prove two
-// wrappers point at the same native object.
+// Drives the generated Events project: the `ISubscriber` callback interface
+// implemented in C# and adapted to the producer's vtable by the generated
+// trampolines (Route, whose producer side returns `Result<_, ForeignError>`,
+// steering Publish through the `Delivery` enum; OnMessage decoding the
+// buffered `Message` record; OnAttached adopting an `EventBus` handed through
+// the callback), the `EventBus` class (constructor, Task-based PublishLater,
+// single-use Messages iterator, optional LastMessage, Dispose), the free
+// function RouteOnce, subscribers that throw (reported to the caller as
+// NativeException with ForeignErrorCode -4 for both the Result-returning
+// and the plain callback methods), callbacks fired from producer threads,
+// and wrapper equality as native identity. Ends by asserting the producer's
+// leak counters are zero.
 
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
-using WeaveFFI;
+using Events;
+using EventsApi = Events.Events;
 
 internal sealed class TestSubscriber : ISubscriber
 {
@@ -106,16 +103,16 @@ internal static class Program
         return new WeakReference(sub);
     }
 
-    static async Task<int> Main()
+    static int Main()
     {
-        var lib = Environment.GetEnvironmentVariable("WEAVEFFI_LIBRARY");
-        NativeLibrary.SetDllImportResolver(typeof(Program).Assembly, (name, asm, search) =>
-        {
-            if (name == "weaveffi" && !string.IsNullOrEmpty(lib))
-                return NativeLibrary.Load(lib);
-            return IntPtr.Zero;
-        });
+        Run().GetAwaiter().GetResult();
+        LeakCheck.AssertNoLeaks("events");
+        Console.WriteLine("dotnet/events: OK");
+        return 0;
+    }
 
+    static async Task Run()
+    {
         var bus = new EventBus();
         Expect(bus.SubscriberCount() == 0, "fresh bus has no subscribers");
         Expect(bus.LastMessage() == null, "fresh bus has no last message");
@@ -130,7 +127,7 @@ internal static class Program
         Expect(a.Attached == 1 && b.Attached == 1, "OnAttached fired once per subscriber");
         Expect(a.AttachedCount == 0, $"a saw 0 subscribers at attach (got {a.AttachedCount})");
         Expect(b.AttachedCount == 1, $"b saw 1 subscriber at attach (got {b.AttachedCount})");
-        Expect(a.KeptBus != null && a.KeptBus.Handle == bus.Handle,
+        Expect(a.KeptBus != null && a.KeptBus.Equals(bus),
             "bus handed to OnAttached is the same native object");
         Expect(bus.SubscriberCount() == 2, "subscriber count == 2");
 
@@ -194,9 +191,9 @@ internal static class Program
 
         // Free function taking the callback interface without a bus.
         var probe = new TestSubscriber("quiet", "");
-        Expect(Events.RouteOnce(probe, "quiet") == Delivery.Skip, "RouteOnce skip");
-        Expect(Events.RouteOnce(probe, "stop") == Delivery.AcceptAndStop, "RouteOnce accept-and-stop");
-        Expect(Events.RouteOnce(probe, "x") == Delivery.Accept, "RouteOnce accept");
+        Expect(EventsApi.RouteOnce(probe, "quiet") == Delivery.Skip, "RouteOnce skip");
+        Expect(EventsApi.RouteOnce(probe, "stop") == Delivery.AcceptAndStop, "RouteOnce accept-and-stop");
+        Expect(EventsApi.RouteOnce(probe, "x") == Delivery.Accept, "RouteOnce accept");
         Expect(probe.Routed.SequenceEqual(new[] { "quiet", "stop", "x" }), "RouteOnce routed topics");
         Expect(probe.Attached == 0, "RouteOnce never attaches");
 
@@ -207,11 +204,11 @@ internal static class Program
         try
         {
             bus.Publish("boom", "x", new string[0]);
-            Expect(false, "expected WeaveFFIException from throwing Route");
+            Expect(false, "expected NativeException from throwing Route");
         }
-        catch (WeaveFFIException e)
+        catch (NativeException e)
         {
-            Expect(e.Code == WeaveFFIException.ForeignErrorCode,
+            Expect(e.Code == NativeException.ForeignErrorCode,
                 $"foreign error code == -4 (got {e.Code})");
             Expect(e.Code == -4, "ForeignErrorCode constant is -4");
             Expect(e.Message.Contains("subscriber rejected topic boom"),
@@ -220,11 +217,11 @@ internal static class Program
         try
         {
             bus.Publish("ok", "explode", new string[0]);
-            Expect(false, "expected WeaveFFIException from throwing OnMessage");
+            Expect(false, "expected NativeException from throwing OnMessage");
         }
-        catch (WeaveFFIException e)
+        catch (NativeException e)
         {
-            Expect(e.Code == WeaveFFIException.ForeignErrorCode,
+            Expect(e.Code == NativeException.ForeignErrorCode,
                 $"OnMessage foreign error code == -4 (got {e.Code})");
             Expect(e.Message.Contains("subscriber exploded"),
                 $"OnMessage foreign error message (got '{e.Message}')");
@@ -232,12 +229,12 @@ internal static class Program
         Expect(bus.Publish("ok", "y", new string[0]) == 3, "bus still delivers after a foreign error");
         try
         {
-            Events.RouteOnce(c, "boom");
-            Expect(false, "expected WeaveFFIException from RouteOnce");
+            EventsApi.RouteOnce(c, "boom");
+            Expect(false, "expected NativeException from RouteOnce");
         }
-        catch (WeaveFFIException e)
+        catch (NativeException e)
         {
-            Expect(e.Code == WeaveFFIException.ForeignErrorCode, "RouteOnce foreign error code");
+            Expect(e.Code == NativeException.ForeignErrorCode, "RouteOnce foreign error code");
         }
 
         // ClearSubscribers drops the producer's references; the consumer's
@@ -278,7 +275,36 @@ internal static class Program
             Expect(scoped.Publish("t", "u", new string[0]) == 0, "scoped bus publishes");
         }
 
-        Console.WriteLine("dotnet/events: OK");
-        return 0;
+        // Callbacks arrive on whichever thread calls in, several at once, and
+        // from the producer's own threads for async publishes.
+        var counter = new CountingSubscriber();
+        using (var busy = new EventBus())
+        {
+            busy.Subscribe(counter);
+            await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => Task.Run(() =>
+            {
+                for (var j = 0; j < 50; j++)
+                {
+                    busy.Publish("t", "m", new string[0]);
+                }
+            })));
+            Expect(counter.Count == 400, $"400 concurrent deliveries (got {counter.Count})");
+            var laters = await Task.WhenAll(Enumerable.Range(0, 16).Select(_ => busy.PublishLater("t", "later")));
+            Expect(laters.All(n => n == 1), "every async publish delivered once");
+            Expect(counter.Count == 416, $"416 deliveries in all (got {counter.Count})");
+        }
     }
+}
+
+internal sealed class CountingSubscriber : ISubscriber
+{
+    private long _count;
+
+    public long Count => Interlocked.Read(ref _count);
+
+    public Delivery Route(string topic) => Delivery.Accept;
+
+    public long OnMessage(Message message) => Interlocked.Increment(ref _count);
+
+    public void OnAttached(EventBus bus) => bus.Dispose();
 }

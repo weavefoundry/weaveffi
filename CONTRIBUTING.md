@@ -2,7 +2,9 @@
 
 ## Development environment
 
-1. Install the [Rust toolchain](https://rustup.rs/) (stable channel).
+1. Install the [Rust toolchain](https://rustup.rs/) (stable channel),
+   [`just`](https://github.com/casey/just), and `cargo-insta`
+   (`cargo install just cargo-insta --locked`).
 2. Clone the repository:
 
 ```bash
@@ -19,17 +21,9 @@ cargo build --workspace
 4. Run all tests:
 
 ```bash
-cargo test --workspace
+just test        # or: cargo insta test --workspace --check
 ```
 
-5. (Optional) Preview the documentation locally:
-
-```bash
-cargo install mdbook
-mdbook serve docs -p 3000 -n 127.0.0.1
-```
-
-Open <http://127.0.0.1:3000>.
 
 ## Claiming an issue
 
@@ -41,97 +35,85 @@ To avoid duplicate work, claim an issue before you start on it:
 
 Unsolicited pull requests for issues that are already assigned or already have an open pull request will be closed as duplicates, even if the work is good.
 
-## Documentation
+## Everyday workflow
 
-WeaveFFI has two layers of documentation, and CI checks both:
-
-- **Prose docs** (this book) live under `docs/src/` and build with
-  [mdBook](https://rust-lang.github.io/mdBook/). New generators must add a
-  `docs/src/generators/<lang>.md` page and link it from
-  `docs/src/SUMMARY.md`.
-- **API docs** are generated from Rust doc comments by `cargo doc`. Every
-  public item in the library crates carries a doc comment; this is enforced
-  by `#![deny(missing_docs)]` plus the Clippy doc lints
-  (`missing_errors_doc`, `missing_panics_doc`, `missing_safety_doc`, and
-  `doc_markdown`). See the
-  [doc comment style guide](docs/src/api/doc-style.md) for the conventions,
-  the standard `# Errors`/`# Panics`/`# Safety` sections, and examples.
-
-Check both locally before pushing:
+The `justfile` wraps the commands CI runs:
 
 ```bash
-# Lint everything; clippy -D warnings also enforces the doc lints.
-just check
-
-# Build the API docs (rustdoc) and the book.
-just doc
+just check                       # cargo fmt --check, clippy -D warnings (with the doc lints), rustdoc -D warnings
+just test                        # cargo insta test --workspace --check: every test, failing on snapshot drift
+just snapshots                   # accept snapshot changes after reviewing them
+just fixtures [targets...]       # compile-check generated fixtures with each language's toolchain
+just conformance                 # end-to-end conformance harness (ONLY=python just conformance)
+just docs                        # build the mdBook
 ```
 
-## Running specific tests
+Run `just check` and `just test` before every push. Changes to a generator
+should also pass that target's fixture check and conformance lanes.
 
-```bash
-cargo test -p weaveffi-core
-cargo test -p weaveffi-ir
-```
+### Snapshot tests
 
-## Adding a new generator
-
-Each target language is implemented as its own crate (`weaveffi-gen-<lang>`)
-that implements the `LanguageBackend` trait from `weaveffi_core::backend`.
-Before starting, read the [architecture overview](docs/src/architecture.md)
-for the crate dependency graph, the Parse → Validate → Configure → Generate →
-Output data flow, and the snapshot-test layout new generators must hook into.
-
-The short version:
-
-1. Create `crates/weaveffi-gen-<lang>/` following the layout of an existing
-   generator (e.g. `weaveffi-gen-c`). Add it to the workspace `members` list
-   in the root `Cargo.toml` and depend on `weaveffi-core` and `weaveffi-ir`.
-2. Implement `weaveffi_core::backend::LanguageBackend`: define the
-   associated `Config` type, then `name`, `prefix` (if the config carries a
-   `c_prefix`), and `files`. For a single-pass layout, override the
-   `render_enum`/`render_struct`/`render_function` hooks and compose
-   `emit_members`; otherwise build the layout directly in `files`. Reuse
-   `BindingModel`, `Ty::family()`, and `Ty::wire()` instead of re-deriving
-   traversal or ABI classification.
-3. Add one line to the `cli_targets!` registry in
-   `crates/weaveffi-cli/src/config.rs`; that wires the `--target` token,
-   the `[generators.<lang>]` table in `weaveffi.toml`, and the orchestrator
-   registration at once.
-4. Add the target to the `snapshot_tests!` invocation in
-   `crates/weaveffi-cli/tests/snapshots.rs` and to the determinism test in
-   `tests/determinism.rs`; every fixture in the corpus then runs against it.
-5. Document the generator under `docs/src/generators/<lang>.md` and link it
-   from `docs/src/SUMMARY.md`.
-
-## Snapshot tests
-
-Snapshot tests are the primary defense against generator regressions. They
-live in `crates/weaveffi-cli/tests/snapshots.rs` and write
-one-file-per-snapshot artifacts under `crates/weaveffi-cli/tests/snapshots/`
-using [`cargo-insta`](https://insta.rs/).
-
-Workflow when output changes intentionally:
+Snapshot tests (`crates/weaveffi-cli/tests/snapshots.rs`) pin the exact
+output of every generator for every fixture in
+`crates/weaveffi-cli/tests/fixtures/`, using
+[`cargo-insta`](https://insta.rs/). When output changes on purpose:
 
 ```bash
 cargo install cargo-insta --locked
-cargo test -p weaveffi-cli --test snapshots
-cargo insta review
+cargo insta test --workspace     # writes .snap.new files for changed output
+cargo insta review               # a accepts, r rejects, s skips
 ```
 
-`cargo insta review` opens an interactive TUI showing the `.snap.new` diff
-for each pending snapshot. Inspect every diff carefully:
+Review every diff. Commit accepted `.snap` files in the same commit as the
+code that produced them, and never commit `.snap.new` files; CI rejects
+pending snapshots.
 
-- Press `a` (or run `cargo insta accept`) to promote `.snap.new` files into
-  their final `.snap` form when the change is correct.
-- Press `r` (or run `cargo insta reject`) to delete the `.snap.new` files
-  when the diff exposes a bug; fix the generator before re-running.
-- Press `s` to skip a snapshot and decide later.
+### Fixture compile checks
 
-After accepting, **commit the resulting `.snap` files in the same commit as
-the code change that produced them** so reviewers can see the generator diff
-alongside the implementation diff. Never commit `.snap.new` files; CI rejects
-them.
+Snapshots prove the text didn't change, not that it compiles.
+`scripts/check-fixtures.sh <target>` generates every fixture and compiles or
+type-checks it with the target language's toolchain (through
+`scripts/fixtures/<target>.sh`). Run it for any target whose output you
+change; CI runs one job per target.
+
+### Conformance
+
+`conformance/run.sh` builds every sample producer with leak counters on,
+generates bindings, and runs real consumers in every language against them.
+Each consumer must exit 0 with every leak counter at zero.
+
+```bash
+ONLY=python bash conformance/run.sh             # one language
+ONLY=c,go-kvstore bash conformance/run.sh       # a language plus one lane
+SKIP=wasm SKIP_GEN=1 bash conformance/run.sh    # skip lanes; reuse generated bindings
+```
+
+`LANE_TIMEOUT` sets the per-lane limit in seconds (default 300). A missing
+toolchain fails its lanes; install it or skip them.
+
+## Documentation
+
+- **Prose docs** live under `docs/src/` and build with
+  [mdBook](https://rust-lang.github.io/mdBook/). Follow `AGENTS.md` for
+  style. `scripts/check-links.sh` (needs `mdbook` and `mdbook-linkcheck2`)
+  fails on broken links, and CI runs it.
+- **API docs** come from Rust doc comments. Every public item in the library
+  crates has one, enforced by `#![deny(missing_docs)]` and the Clippy doc
+  lints (`missing_errors_doc`, `missing_panics_doc`, `missing_safety_doc`,
+  `doc_markdown`). See the
+  [doc comment style guide](docs/src/api/doc-style.md).
+
+Preview the book with `mdbook serve docs -p 3000 -n 127.0.0.1`.
+
+## Adding a new generator
+
+Read the [architecture guide](docs/src/architecture.md) first; its "Adding a
+generator" section is the checklist. In short: add
+`crates/weaveffi-gen/src/targets/<lang>/` implementing `LanguageBackend`,
+register it with one line in the `cli_targets!` registry in
+`crates/weaveffi-cli/src/config.rs`, add it to the snapshot tests, add
+`scripts/fixtures/<lang>.sh` and `conformance/<lang>/`, and document it under
+`docs/src/generators/`.
 
 ## Fuzzing
 
@@ -186,9 +168,9 @@ When libFuzzer finds an input that panics or aborts it writes the bytes to
        crates/weaveffi-fuzz/fuzz/artifacts/<target>/crash-<hash>
    ```
 
-3. Convert the minimized input into a regression test in the affected crate
-   (`weaveffi-ir` for parser crashes, `weaveffi-core` for validator crashes)
-   **before** fixing the bug, so the failure is locked in and cannot regress.
+3. Convert the minimized input into a regression test in `weaveffi-model`
+   (which owns the parsers and the validator) **before** fixing the bug, so
+   the failure is locked in and can't regress.
 
 ## Commit conventions
 
@@ -206,22 +188,22 @@ Use the form:
 
 Subject rules:
 
-- Imperative mood, no trailing period, ≤ 72 characters
-- UTF‑8 allowed; avoid emoji in the subject
+- Imperative mood, no trailing period, 72 characters or fewer
+- UTF-8 allowed; avoid emoji in the subject
 
 Accepted types:
 
-- `build` – build system or external dependencies (e.g., package.json, tooling)
-- `chore` – maintenance (no app behavior change)
-- `ci` – continuous integration configuration (workflows, pipelines)
-- `docs` – documentation only
-- `feat` – user-facing feature or capability
-- `fix` – bug fix
-- `perf` – performance improvements
-- `refactor` – code change that neither fixes a bug nor adds a feature
-- `revert` – revert of a previous commit
-- `style` – formatting/whitespace (no code behavior)
-- `test` – add/adjust tests only
+- `build`: build system or external dependencies (e.g., package.json, tooling)
+- `chore`: maintenance (no app behavior change)
+- `ci`: continuous integration configuration (workflows, pipelines)
+- `docs`: documentation only
+- `feat`: user-facing feature or capability
+- `fix`: bug fix
+- `perf`: performance improvements
+- `refactor`: code change that neither fixes a bug nor adds a feature
+- `revert`: revert of a previous commit
+- `style`: formatting/whitespace (no code behavior)
+- `test`: add/adjust tests only
 
 Examples:
 
@@ -250,17 +232,21 @@ BREAKING CHANGE: JS bindings now return Promises instead of using callbacks; upd
 
 ## Versioning and releases
 
-- All crates are versioned in lockstep. Versions are tracked in each `crates/*/Cargo.toml` and updated automatically by [semantic-release](https://semantic-release.gitbook.io/) via `scripts/update-cargo-versions.sh`.
-- **Automated release pipeline** (on every merge to `main`):
-  1. `semantic-release` scans Conventional Commit messages since the last tag.
-  2. It determines the next SemVer bump: `feat` → **minor**, `fix`/`perf` → **patch**, `BREAKING CHANGE` → **minor** (while version < 1.0; see note below).
-  3. `CHANGELOG.md` is generated, `Cargo.toml` versions are updated, and a tagged release commit (`chore(release): vX.Y.Z`) is pushed.
-  4. All publishable crates are published to [crates.io](https://crates.io) in dependency order.
-  5. A GitHub Release is created with auto-generated release notes.
-- Commit types that trigger a release: `feat` (minor), `fix` and `perf` (patch), `BREAKING CHANGE` (minor while pre-1.0). All other types (`build`, `chore`, `ci`, `docs`, `refactor`, `revert`, `style`, `test`) are recorded in the changelog but do **not** trigger a release on their own.
-- **Pre-1.0 breaking changes**: The `{ "breaking": true, "release": "minor" }` rule in `.releaserc.json` caps breaking changes to a minor bump. When the project is ready for 1.0.0, remove that rule so breaking changes bump major as normal.
-- Tag format: `v`-prefixed (e.g., `v0.1.0`).
-- Manual version bumps are no longer needed; just merge PRs with valid Conventional Commit titles. For ad-hoc runs, use the workflow's **Run workflow** button (`workflow_dispatch`).
+- Every published crate shares one version, set once in the root
+  `Cargo.toml` (`[workspace.package]`).
+- Releases are automated by [release-plz](https://release-plz.dev/)
+  (`release-plz.toml`, `.github/workflows/release.yml`). On every push to
+  `main` it opens or updates a release PR that bumps the version from the
+  Conventional Commits since the last release and updates `CHANGELOG.md`.
+  CI runs on that PR like any other.
+- Merging the release PR publishes every crate to crates.io, tags
+  `v{version}`, and creates the GitHub release, which triggers
+  `.github/workflows/release-binaries.yml` to attach prebuilt `weaveffi`
+  binaries (the archives `cargo binstall weaveffi-cli` resolves).
+- The bump follows release-plz's Conventional Commits rules for `0.x`
+  versions: breaking changes bump the minor version. Only `feat`, `fix`,
+  `perf`, and `revert` commits appear in the changelog.
+- Don't bump versions or edit `CHANGELOG.md` by hand.
 
 ### Branching rules
 
@@ -296,13 +282,21 @@ fix/android-jni-crash
 
 ## CI
 
-- **CI** (`ci.yml`): runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, snapshot verification (`cargo insta test`), sample builds, and JSON Schema drift checks on macOS, Linux, and Windows for every push and PR. A second job runs the full conformance harness (`conformance/run.sh`): it installs all eleven consumer toolchains, builds every sample producer, generates bindings, and compiles and runs the consumer for every language lane, including the `async-demo` lanes.
-- **Quality** (`quality.yml`): `cargo deny` (licenses/bans/advisories), `cargo audit`, `cargo machete` (unused dependencies), rustdoc with warnings denied, and test coverage via `cargo llvm-cov`.
-- **Docs** (`docs.yml`): builds the mdBook and the rustdoc API docs and deploys them.
-- **Bench** (`bench.yml`): smoke-runs the criterion benchmarks on PRs and tracks results on pushes to `main`.
-- **Fuzz** (`fuzz.yml`): short fuzzing runs of the parser and validator harnesses on PRs and on a schedule.
-- **PR Lint** (`pr-lint.yml`): validates the PR title against Conventional Commits format (protects squash merges) and checks individual commit messages via commitlint (protects rebase merges).
-- **Release** (`release.yml`): runs on merge to `main`; computes version, generates changelog, tags, creates GitHub Release, and publishes all workspace crates to crates.io.
+- **CI** (`ci.yml`): formatting, clippy, rustdoc, and a build of
+  `weaveffi-model` without its IDL features; the test suite with snapshot
+  checks on Linux, macOS, and Windows; `weaveffi diff --check` on every
+  sample, the JSON Schema drift check, and a `wasm32` build of every sample;
+  the fixture compile check per target; the conformance harness per language
+  on Linux and macOS; and an Android NDK link of the Kotlin JNI shim.
+- **Quality** (`quality.yml`): `cargo deny`, `cargo audit`, `cargo machete`,
+  coverage with `cargo llvm-cov`, and the docs link check.
+- **Docs** (`docs.yml`): builds and deploys the mdBook and rustdoc.
+- **Bench** (`bench.yml`), **Fuzz** (`fuzz.yml`): benchmark and fuzzing
+  runs.
+- **PR Lint** (`pr-lint.yml`): checks the PR title and commit messages
+  against Conventional Commits.
+- **Release** (`release.yml`) and **Release binaries**
+  (`release-binaries.yml`): see above.
 
 ## Security
 

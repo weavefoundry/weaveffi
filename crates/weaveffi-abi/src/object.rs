@@ -23,6 +23,7 @@ use std::sync::Arc;
 /// The consumer releases the reference with `{tag}_destroy`.
 #[must_use]
 pub fn lower_object<T>(value: impl Into<Arc<T>>) -> *mut T {
+    crate::leak::track(crate::leak::OBJECTS, 1);
     Arc::into_raw(value.into()).cast_mut()
 }
 
@@ -90,15 +91,14 @@ pub unsafe fn object_clone<T>(ptr: *const T) -> *mut T {
     }
     // SAFETY: as documented on the function.
     unsafe { Arc::increment_strong_count(ptr) };
+    crate::leak::track(crate::leak::OBJECTS, 1);
     ptr.cast_mut()
 }
 
 /// The body of every `{tag}_destroy` symbol: release one strong reference.
 /// The object is dropped when the last reference goes. Null is a no-op, and
 /// a panicking `Drop` is swallowed because a destructor has no `out_err`
-/// slot and must never unwind into C. A foreign failure that `Drop` deferred
-/// by calling back into the consumer is discarded for the same reason, so it
-/// can't leak into the next unrelated thunk.
+/// slot and must never unwind into C.
 ///
 /// # Safety
 ///
@@ -108,11 +108,11 @@ pub unsafe fn object_destroy<T>(ptr: *mut T) {
     if ptr.is_null() {
         return;
     }
+    crate::leak::track(crate::leak::OBJECTS, -1);
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: as documented on the function.
         unsafe { Arc::decrement_strong_count(ptr) };
     }));
-    let _ = crate::take_foreign_error();
 }
 
 /// The object token an interface value takes inside a value buffer: the
@@ -120,6 +120,7 @@ pub unsafe fn object_destroy<T>(ptr: *mut T) {
 /// reference; whoever decodes it adopts that reference.
 #[must_use]
 pub fn object_to_token<T>(value: &Arc<T>) -> u64 {
+    crate::leak::track(crate::leak::OBJECTS, 1);
     Arc::into_raw(Arc::clone(value)) as usize as u64
 }
 
@@ -137,6 +138,7 @@ pub unsafe fn object_from_token<T>(token: u64) -> Option<Arc<T>> {
     if ptr.is_null() {
         return None;
     }
+    crate::leak::track(crate::leak::OBJECTS, -1);
     // SAFETY: the caller guarantees the token carries one live strong
     // reference that has not been adopted yet.
     Some(unsafe { Arc::from_raw(ptr) })

@@ -2,319 +2,170 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
 jobs:
-  build-test:
-    name: Build and test (${{ matrix.os }})
+  lint:
+    name: Format, clippy, and rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings -D rustdoc::all -D rustdoc::missing_crate_level_docs
+        run: cargo doc --workspace --no-deps
+      - name: weaveffi-model builds without the IDL formats (as the proc macro uses it)
+        run: cargo check -p weaveffi-model --no-default-features
+
+  test:
+    name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
         with:
-          components: rustfmt, clippy
+          tool: cargo-insta
+      # One pass runs every test and fails on any snapshot drift.
+      - run: cargo insta test --workspace --check
+      - name: Benchmarks compile
+        if: runner.os == 'Linux'
+        run: cargo bench --workspace --no-run
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+  generated-drift:
+    name: Samples, schema, and wasm build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          cache-targets: true
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Build workspace (debug)
-        run: cargo build --workspace --all-targets
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Run unit tests
-        run: cargo test --workspace --all-features --no-fail-fast
-
-      - name: Install cargo-insta
-        run: cargo install --locked cargo-insta
-
-      - name: Verify generator snapshots
-        run: cargo insta test --workspace --check
-
-      - name: Build CLI (release)
-        run: cargo build -p weaveffi-cli --release
-
-      - name: Generate bindings from calculator source
-        shell: bash
-        run: |
-          BIN=target/release/weaveffi
-          [ "${{ runner.os }}" = "Windows" ] && BIN="${BIN}.exe"
-          "$BIN" generate samples/calculator/src/lib.rs -o generated
-
-      - name: Build sample producer cdylibs (debug)
-        run: cargo build -p calculator -p contacts -p kvstore -p events -p codec
-
-      # `weaveffi diff --check` is the CI gate we recommend to users, so it has
-      # to hold for our own samples: a fresh tree diffs clean (exit 0), and a
-      # tree with a stale file is reported (exit 1) instead of silently passing.
-      - name: Verify `weaveffi diff --check` on every sample
-        shell: bash
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p weaveffi-cli
+      # `weaveffi diff --check` is the CI gate we recommend to users, so it
+      # must hold for our own samples: a fresh tree diffs clean, and a tree
+      # with a stale file is reported instead of silently passing.
+      - name: weaveffi diff --check on every sample
         run: |
           set -euo pipefail
-          BIN=target/release/weaveffi
-          [ "${{ runner.os }}" = "Windows" ] && BIN="${BIN}.exe"
-          for sample in calculator contacts events kvstore shapes async-demo codec inventory; do
-            "$BIN" generate "samples/$sample/src/lib.rs" -o "diffcheck/$sample" --force --quiet
+          BIN=target/debug/weaveffi
+          for sample in calculator contacts events kvstore async-demo codec; do
+            "$BIN" generate "samples/$sample/src/lib.rs" -o "diffcheck/$sample" --quiet
             "$BIN" diff "samples/$sample/src/lib.rs" -o "diffcheck/$sample" --check --quiet
           done
-          echo "stale" >> diffcheck/calculator/c/weaveffi.h
+          echo "stale" >> diffcheck/calculator/c/calculator.h
           if "$BIN" diff samples/calculator/src/lib.rs -o diffcheck/calculator --check --quiet; then
-            echo "diff --check did not detect a stale file" >&2
+            echo "diff --check did not detect a modified file" >&2
             exit 1
           fi
-
-      - name: Add wasm target
-        if: runner.os != 'Windows'
-        run: rustup target add wasm32-unknown-unknown
-
-      - name: Build calculator wasm (release)
-        if: runner.os != 'Windows'
-        run: cargo build -p calculator --target wasm32-unknown-unknown --release
-
-      - name: Verify weaveffi.schema.json is up to date
-        if: runner.os == 'Linux'
+      - name: weaveffi.schema.json is up to date
         run: |
-          target/release/weaveffi schema --format json-schema > weaveffi.schema.json.regenerated
+          target/debug/weaveffi schema > weaveffi.schema.json.regenerated
           diff -u weaveffi.schema.json weaveffi.schema.json.regenerated
+      - name: Every sample builds for wasm32
+        run: cargo build --target wasm32-unknown-unknown -p calculator -p contacts -p events -p kvstore -p async-demo -p codec
 
-      - name: Upload CLI artifact
-        uses: actions/upload-artifact@v4
-        if: runner.os != 'Windows'
+  fixtures:
+    # Snapshot tests pin the generated text; this compiles or type-checks it
+    # with each language's own toolchain, for every fixture, so invalid code
+    # in shapes no sample exercises still fails CI.
+    name: Fixture compile check (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: c, os: ubuntu-latest }
+          - { target: cpp, os: ubuntu-latest }
+          - { target: swift, os: macos-latest }
+          - { target: kotlin, os: ubuntu-latest }
+          - { target: node, os: ubuntu-latest }
+          - { target: wasm, os: ubuntu-latest }
+          - { target: python, os: ubuntu-latest }
+          - { target: dotnet, os: ubuntu-latest }
+          - { target: dart, os: ubuntu-latest }
+          - { target: go, os: ubuntu-latest }
+          - { target: ruby, os: ubuntu-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/toolchains
         with:
-          name: weaveffi-cli-${{ runner.os }}
-          path: target/release/weaveffi
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Upload CLI artifact (Windows)
-        uses: actions/upload-artifact@v4
-        if: runner.os == 'Windows'
-        with:
-          name: weaveffi-cli-Windows
-          path: target/release/weaveffi.exe
-          if-no-files-found: error
-          retention-days: 7
+          lang: ${{ matrix.target }}
+      - run: bash scripts/check-fixtures.sh ${{ matrix.target }}
 
   conformance:
-    # Correctness gate: every consumer binds through the *generated* wrappers and
-    # asserts concrete results, so a backend that lowers a type wrong, drifts a
-    # symbol, or skips a feature fails here. Covers contacts, events, kvstore,
-    # shapes, async-demo, and codec across C, C++, Python, Ruby, Dart, Go,
-    # Swift, .NET, Node, Kotlin, and Wasm: the events lanes exercise a callback
-    # interface plus objects and iterators, the kvstore lanes exercise objects
-    # in every position (constructors, methods, async methods, iterator methods,
-    # records and lists carrying objects, clone/destroy), typed error domains,
-    # builders, and an eviction callback interface, and the codec lanes
-    # round-trip every value-buffer wire shape; see conformance/run.sh.
-    name: Conformance harness
-    runs-on: ubuntu-latest
-    # A healthy run takes about five minutes. Without a cap, a consumer that
-    # deadlocks (as the Swift events lane did under Swift 5.10, see below)
-    # holds the job for the six-hour default before it is marked failed.
-    timeout-minutes: 45
+    # Behavioral gate: every consumer binds through the *generated* bindings
+    # and asserts concrete results, including leak counters returning to zero.
+    name: Conformance (${{ matrix.lang }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        lang: [c, cpp, python, ruby, dart, go, swift, dotnet, node, kotlin, wasm]
+        os: [ubuntu-latest, macos-latest]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Add wasm target
-        run: rustup target add wasm32-unknown-unknown
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          cache-targets: true
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/toolchains
         with:
-          node-version: '22'
+          lang: ${{ matrix.lang }}
+      - run: bash conformance/run.sh
+        env:
+          ONLY: ${{ matrix.lang }}
 
-      - name: Set up .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.0.x'
-
-      - name: Set up Dart
-        uses: dart-lang/setup-dart@v1
-
-      # Swift 5.10 on Linux miscompiles the events consumer: the top-level
-      # async code returns to the runtime mid-statement (an iterator
-      # `first(where:)` call) without ever suspending, so `dispatch_main`
-      # parks the process forever. Swift 6.0 and 6.1 run the same source
-      # to completion; the generated package stays on swift-tools 5.7.
-      - name: Set up Swift
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: "6.0"
-
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      # The generated Go bindings surface iter<T> as iter.Seq/iter.Seq2,
-      # which needs Go 1.23; Ubuntu's packaged golang-go is older and can't
-      # fetch the newer toolchain on demand.
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.23'
-
-      - name: Install consumer toolchains
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang g++ python3 ruby-ffi
-          sudo snap install kotlin --classic
-
-      - name: Run conformance harness
-        run: bash conformance/run.sh
-
-  windows-e2e:
-    name: Windows E2E
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: true
-
-      - name: Build CLI (release)
-        run: cargo build -p weaveffi-cli --release
-
-      - name: Build calculator cdylib (debug)
-        run: cargo build -p calculator
-
-      - name: Generate bindings from calculator source
-        run: ./target/release/weaveffi.exe generate samples/calculator/src/lib.rs -o generated
-
-      - name: Verify generated bindings
-        shell: pwsh
-        run: |
-          $expected = @(
-            "generated/c/weaveffi.h",
-            "generated/swift/Package.swift",
-            "generated/node/types.d.ts",
-            "generated/kotlin/build.gradle.kts",
-            "generated/python/calculator/weaveffi.py",
-            "generated/dotnet/WeaveFFI.cs",
-            "generated/wasm/README.md"
-          )
-          $missing = @()
-          foreach ($f in $expected) {
-            if (!(Test-Path $f)) { $missing += $f }
-          }
-          if ($missing.Count -gt 0) {
-            Write-Error "Missing files: $($missing -join ', ')"
-            exit 1
-          }
-          Write-Host "All expected generated files present"
-
-  android-ndk:
-    name: Android NDK JNI
+  android:
+    # The Kotlin target's JNI shim must compile and link against a real
+    # producer built for Android.
+    name: Android (NDK link)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          cache-targets: true
-
-      - name: Install Android NDK
-        id: setup-ndk
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - id: ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26d
-
-      - name: Add aarch64-linux-android Rust target
-        run: rustup target add aarch64-linux-android
-
-      - name: Build CLI (release)
-        run: cargo build -p weaveffi-cli --release
-
-      - name: Generate Kotlin + C bindings for contacts
-        run: |
-          target/release/weaveffi generate samples/contacts/src/lib.rs -o generated --target c
-          target/release/weaveffi generate samples/contacts/src/lib.rs -o generated --target kotlin
-
-      - name: Compile JNI shim with NDK clang
+      - name: Build the kvstore producer for aarch64-linux-android
         env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+        run: cargo build -p kvstore --target aarch64-linux-android --release
+      - name: Generate and link the JNI shim against it
+        env:
+          NDK: ${{ steps.ndk.outputs.ndk-path }}
         run: |
           set -euxo pipefail
-          CLANG="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
-          if [ ! -x "$CLANG" ]; then
-            echo "expected NDK clang at $CLANG" >&2
-            ls "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin" >&2
-            exit 1
-          fi
-          "$CLANG" -shared -fPIC \
-            -I generated/c \
-            -Wl,--unresolved-symbols=ignore-all \
-            -o libweaveffi_jni_test.so \
-            generated/kotlin/src/main/cpp/weaveffi_jni.c
-
-      - name: Assert exported JNI symbols
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: |
-          set -euxo pipefail
-          NM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
-          file libweaveffi_jni_test.so
-          ldd libweaveffi_jni_test.so || true
-          "$NM" -D --defined-only libweaveffi_jni_test.so > nm.out
-          # The Kotlin generator lowers each interface to its own Kotlin
-          # class with `native*` externals, so the JNI exports are namespaced
-          # per type: the ContactBook interface's constructor, methods, and
-          # destroy hook. Records (like Contact) are value types serialized
-          # into buffers, so they have no JNI surface of their own; nativeAdd,
-          # nativeGet, and nativeList cover the buffered record paths.
-          for sym in \
-              Java_com_weaveffi_ContactBook_nativeNew \
-              Java_com_weaveffi_ContactBook_nativeAdd \
-              Java_com_weaveffi_ContactBook_nativeGet \
-              Java_com_weaveffi_ContactBook_nativeList \
-              Java_com_weaveffi_ContactBook_nativeCount \
-              Java_com_weaveffi_ContactBook_nativeDestroy; do
-            if ! grep -q " T $sym\$" nm.out; then
-              echo "missing exported JNI symbol: $sym" >&2
-              cat nm.out >&2
-              exit 1
-            fi
-          done
-          echo "All expected JNI symbols are exported."
+          cargo run -q -p weaveffi-cli -- generate samples/kvstore/src/lib.rs -o generated --target c,kotlin
+          CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+          shim=$(ls generated/kotlin/src/main/cpp/*.c | head -1)
+          "$CLANG" -shared -fPIC -Werror -I generated/kotlin/src/main/cpp -I generated/c "$shim" \
+            -L target/aarch64-linux-android/release -lkvstore -o libkvstore_jni.so
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -d libkvstore_jni.so | grep 'libkvstore.so'

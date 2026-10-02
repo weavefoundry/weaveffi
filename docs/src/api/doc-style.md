@@ -14,7 +14,7 @@ read consistently and the doc lints stay green in CI.
   `# Safety` sections. These are the Rust analog of "what can go wrong," and
   the matching Clippy lints require them.
 - Link other items with intra-doc links: `` [`BindingModel`] `` or
-  `` [`Api`](weaveffi_ir::ir::Api) ``.
+  `` [`Api`](weaveffi_model::ir::Api) ``.
 - Wrap code-like identifiers in backticks. Product and tool names
   (WeaveFFI, SwiftPM, CMake) are allow-listed in `clippy.toml` instead.
 - Comments explain why, not what.
@@ -58,8 +58,8 @@ Google-style docstring.
 /// # Examples
 ///
 /// ```no_run
-/// use weaveffi_core::codegen::generate;
-/// # use weaveffi_ir::ir::Api;
+/// use my_crate::generate;
+/// # use weaveffi_model::ir::Api;
 /// # fn demo(api: Api) -> anyhow::Result<()> {
 /// generate(&api, "./generated", &["c", "swift"])?;
 /// # Ok(())
@@ -124,7 +124,7 @@ flags undocumented `pub` fields and variants, not just the type itself.
 ```rust
 /// Error struct passed across the C ABI boundary.
 #[repr(C)]
-pub struct weaveffi_error {
+pub struct FfiError {
     /// Status code. `0` means success; any non-zero value indicates failure.
     pub code: i32,
     /// Owned, NUL-terminated UTF-8 message, or null when `code` is `0`.
@@ -183,7 +183,7 @@ is the Rust analog of the docs site's autorefs:
 ```rust
 /// Renders from the shared [`BindingModel`], never re-deriving lowering.
 ///
-/// See [`Api`](weaveffi_ir::ir::Api) for the input model and
+/// See [`Api`](weaveffi_model::ir::Api) for the input model and
 /// [`LanguageBackend`](crate::backend::LanguageBackend) for the trait every
 /// generator implements.
 ```

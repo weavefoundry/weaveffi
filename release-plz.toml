@@ -1,0 +1,54 @@
+# Releases: release-plz opens (and keeps updating) a release PR from the
+# Conventional Commits on `main`. CI runs on that PR like any other; merging
+# it publishes every crate at the new shared version, tags `v{version}`, and
+# creates the GitHub release, which triggers the binary build in
+# .github/workflows/release-binaries.yml.
+[workspace]
+# Every published crate shares one version.
+changelog_update = false
+git_tag_enable = false
+git_release_enable = false
+semver_check = false
+dependencies_update = false
+pr_labels = ["release"]
+release_always = false
+
+[changelog]
+commit_parsers = [
+  { message = "^feat", group = "Features" },
+  { message = "^fix", group = "Bug Fixes" },
+  { message = "^perf", group = "Performance" },
+  { message = "^revert", group = "Reverts" },
+  { message = "^(chore|ci|build|docs|style|test|refactor)", skip = true },
+]
+
+[[package]]
+name = "weaveffi-model"
+version_group = "weaveffi"
+
+[[package]]
+name = "weaveffi-abi"
+version_group = "weaveffi"
+
+[[package]]
+name = "weaveffi-macros"
+version_group = "weaveffi"
+
+[[package]]
+name = "weaveffi"
+version_group = "weaveffi"
+
+[[package]]
+name = "weaveffi-gen"
+version_group = "weaveffi"
+
+[[package]]
+name = "weaveffi-cli"
+version_group = "weaveffi"
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+changelog_include = ["weaveffi-model", "weaveffi-abi", "weaveffi-macros", "weaveffi", "weaveffi-gen"]
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+git_release_enable = true
+git_release_name = "v{{ version }}"

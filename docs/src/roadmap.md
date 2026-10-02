@@ -1,165 +1,138 @@
 # Roadmap
 
-WeaveFFI is in active `0.x` development. Schema `0.9.0` and ABI revision 2
-landed the object model the project had been building toward: reference-counted
-interfaces that compose with every other type, callback interfaces the consumer
-implements, and a pluggable async executor. This page lists what comes next.
-Items are marked **planned** (the design is settled and the work is scheduled)
-or **exploring** (we want it, but the design has open questions). Nothing here
-carries a date; the [CHANGELOG][changelog] is the source of truth for what has
-shipped, and [Stability and Versioning](stability.md) explains how releases and
-schema versions work.
+WeaveFFI is in active `0.x` development. Schema 0.10 and ABI revision 3 made
+every name derive from the library's identity, moved strings to `(ptr, len)`
+runs, added contract checksums, and made cancellation work idiomatically on
+every target. This page lists what comes next. Items are **planned** (the
+design is settled) or **exploring** (wanted, with open design questions).
+Nothing carries a date; the
+[changelog](https://github.com/weavefoundry/weaveffi/blob/main/CHANGELOG.md)
+records what shipped.
 
 ## Callback interfaces
 
-### Callback methods returning strings, buffers, and objects (planned)
+### Rich callback returns (planned)
 
-Today a callback-interface method returns nothing, a scalar, `bool`, or a
-C-style enum, because the ABI has no way for a consumer allocation to cross
-back into the producer safely: the producer frees with its own allocator, and
-eleven languages have eleven allocators. The planned fix is an explicit
-allocator contract for callback returns. The consumer will write the result
-into producer-owned storage obtained through the runtime (in the spirit of
-`weaveffi_alloc`, which the Wasm target already uses), or return a consumer
-allocation together with a release function the producer calls once it has
-copied the bytes. Once that contract exists, `string`, `bytes`, records, rich
-enums, optionals, lists, maps, and objects become valid callback returns on
-every target, and `throws` on callback methods (a typed domain error raised by
-the consumer, rather than the catch-all `FOREIGN_ERROR_CODE`) follows
-naturally.
+Callback methods return nothing or a direct value, because a consumer
+allocation can't safely cross back to a producer with a different allocator.
+The plan is an allocator contract for callback returns: the consumer writes
+the result into producer-owned storage obtained through the runtime (as the
+Wasm glue already does with `{prefix}_alloc`), or returns its own allocation
+with a release function the producer calls after copying. With that,
+strings, bytes, records, rich enums, optionals, lists, maps, and objects
+become valid callback returns, and typed `throws` on callback methods follows.
 
 ### Async callback methods (planned)
 
-A callback method that returns a future on the consumer side (`async` in
-Swift, Python, Kotlin, and JavaScript; a `Task` in .NET; a `Future` in Dart)
-needs a completion callback flowing the other way, plus a cancellation story
-when the producer drops the future. The vtable shape is straightforward (an
-extra completion function and context per async method); the hard part is
-making the same producer code work whether the consumer runtime is an event
-loop, a thread pool, or the single-threaded Wasm host. This lands after the
-allocator contract above, because an async result needs to carry the same
-return types a synchronous one does.
+A callback method that returns a future on the consumer side needs a
+completion flowing the other way and a cancellation story when the producer
+drops the future. The vtable shape is simple (a completion function and
+context per async method); the hard part is one producer working the same way
+whether the consumer runtime is an event loop, a thread pool, or the
+single-threaded Wasm host. This follows the allocator contract above.
 
-## Type system
+### Vtable versioning (exploring)
+
+A vtable is a fixed struct, so adding a method to a callback interface is a
+breaking change even when no consumer needs it. A size or version field at
+the head of each vtable would let a newer producer detect an older consumer's
+shorter table and fall back, which matters once 1.0 promises additive
+changes are compatible.
+
+### Callback thread affinity (exploring)
+
+Dart can't run a value-returning callback method synchronously on a thread
+other than its isolate's, so a producer that calls one from a worker thread
+aborts the process today (void methods are forwarded safely). A per-vtable
+thread-affinity hint, or a runtime helper that lets a consumer refuse an
+off-thread call with `-4`, would turn that abort into an error.
+
+## Definitions
+
+### Multi-file IDL (planned)
+
+An IDL API is one document. Large APIs want to split by module, and a
+monorepo wants to reference another package's types. The plan is an
+`imports:` list resolved at parse time, with bare type names still unique
+across the merged API, and `diff`, `validate`, the cache, and checksums
+tracking every imported file.
+
+### Extraction from the compiled library (exploring)
+
+The CLI reads a Rust producer's API by parsing source, so it sees only
+inline `#[weaveffi::module]`s in one file and can't expand macros. The macro
+already lowers each module to the IR at compile time; embedding that IR in
+the built library (a custom section or an exported symbol) would let
+`weaveffi generate` read the exact API from the artifact, removing the
+one-file limit and any chance of the parser and the compiler disagreeing.
 
 ### Generic and trait-object interfaces (exploring)
 
-WeaveFFI deliberately ships a fixed set of generic shapes (`T?`, `[T]`,
-`{K:V}`, `iter<T>`) rather than user-defined generics. Two extensions are under
-discussion. The first is *trait-object interfaces*: an interface declared as a
-set of methods with more than one producer-side implementation, so a Rust
-`Arc<dyn Trait>` can be returned and each consumer sees one class. The second
-is *parameterized interfaces* such as `Cache<K, V>`, monomorphized per
-instantiation in the IDL. The first is likely; the second only if it can be
-done without every generator growing type-erasure machinery.
+WeaveFFI has a fixed set of generic shapes (`T?`, `[T]`, `{K:V}`, `iter<T>`).
+Under discussion are trait-object interfaces (one declared method set with
+several producer implementations behind `Arc<dyn Trait>`) and, less likely,
+parameterized interfaces monomorphized per instantiation.
 
 ### Duration and timestamp primitives (exploring)
 
-Most real APIs carry time. Today producers pass `i64` seconds or milliseconds
-and document the unit. A `duration` primitive (nanoseconds as `i64`, mapped to
-`Duration`, `TimeInterval`, `TimeSpan`, `timedelta`, `kotlin.time.Duration`,
-and so on) and a `timestamp` primitive (a UTC instant) would remove the
-ambiguity. The open question is representation: one width for everything, or a
-`u64` seconds plus `u32` nanoseconds pair as UniFFI uses.
+Producers pass time as `i64` with a documented unit. `duration` and
+`timestamp` primitives mapped to each language's types would remove the
+ambiguity; the open question is the representation.
 
-## IDL
+## Targets and runtime
 
-### Multi-file IDL imports (planned)
+### Kotlin Multiplatform (exploring)
 
-An API is one document today. Large APIs want to split by module and share
-types across files, and a monorepo wants to reference an interface declared by
-another package's IDL. The plan is an `imports:` list that resolves relative
-paths at parse time, with bare type names remaining unique across the merged
-API (as they are today) and `weaveffi diff`, `validate`, and the output cache
-tracking every imported file. Annotated Rust already handles this shape
-naturally (one crate, many `#[weaveffi::module]` blocks), so the IDL path is
-the one catching up.
+The Kotlin target reaches Android and the JVM through JNI. A Multiplatform
+flavor using Kotlin/Native `cinterop` for iOS and desktop is the natural next
+step.
 
-## Generators and runtime
+### Wasm threads (exploring)
+
+On `wasm32-unknown-unknown` futures run inline and callbacks fire only while
+a call is on the stack. A spawner that schedules on the JS event loop, or
+shared-memory builds with Web Workers, would lift both limits and let
+Emscripten mode support async functions and callback interfaces.
 
 ### Per-language support packages (exploring)
 
-Every generated package inlines its own helper code: the value-buffer codec,
-the error hierarchy, the object wrapper base, the callback trampolines. That
-keeps consumers free of any WeaveFFI dependency, which is a design principle we
-intend to keep. It also means a codec fix ships as a regeneration of every
-package. We are exploring extracting the stable runtime portions into optional
-per-language support packages (an npm package, a Swift target, a Python wheel,
-and so on) that generated code can depend on *if the library author opts in*,
-with inlining remaining the default. The conformance harness and the `codec`
-sample exist so that this refactor, if it happens, is mechanical.
+Every package inlines its helpers (codec, error types, object base), which
+keeps consumers free of dependencies but means a codec fix ships as a
+regeneration. Opt-in shared support packages per ecosystem are under
+consideration; inlining would stay the default.
 
-### Wasm threads and spawner (exploring)
+## Testing
 
-On `wasm32-unknown-unknown` the default spawner drives each future inline,
-callback-interface methods fire only while a call into the module is on the
-stack, and a producer that calls back from a spawned thread can't run at all.
-Two paths are being evaluated: a spawner that schedules futures on the JS
-microtask queue through `wasm-bindgen-futures`-style glue, and support for
-`wasm32` builds with shared memory and Web Workers (`atomics` plus
-`bulk-memory`) where a real thread-per-future spawner works. Either would also
-let Emscripten mode regain async functions and callback interfaces, which it
-currently rejects at generation time.
+### Windows conformance lanes (planned)
 
-### Library naming in bare `generate` output (planned)
+The workspace's tests run on Windows, Linux, and macOS, but the conformance
+harness runs only on Linux and macOS. Adding Windows lanes means making
+`conformance/run.sh` and the per-language scripts portable (or adding
+PowerShell equivalents) and installing each toolchain on Windows runners.
 
-`weaveffi package` names the native library after the package identity on
-every target. The bare `weaveffi generate` trees are not yet consistent: Dart
-loads `lib<package>.<ext>`, while Python, Node (`binding.gyp`), Swift
-(`module.modulemap`), and Kotlin (`CMakeLists.txt`) still assume a library
-called `weaveffi`, and the bare Kotlin `CMakeLists.txt` doesn't link the JNI
-shim against the producer at all (the packaged module does). The plan is to
-derive one library base name from the package identity in the binding model
-and have every generator use it, so `WEAVEFFI_LIBRARY` overrides stop being
-necessary in the tutorials.
+### Shared codec vectors (planned)
 
-### Cancel tokens on wasm (planned)
-
-The wasm glue passes a null cancel token for `#[weaveffi::cancellable]`
-functions, so JS can't cancel an in-flight async call the way every native
-target can (`AbortSignal` is the natural shape). This follows the spawner
-work above, since inline completion leaves nothing to cancel today.
-
-### Kotlin Multiplatform and other targets (exploring)
-
-The Kotlin generator targets Android and the desktop JVM through JNI. A Kotlin
-Multiplatform flavor (Kotlin/Native `cinterop` for iOS and desktop) is the
-natural next step. Further targets (Java without Kotlin, PHP, Lua) are
-possible because a generator is a self-contained crate implementing
-`LanguageBackend`, but none is scheduled.
+Each language's `codec` conformance consumer asserts the same round-trip
+values by hand. Moving those values into one data file that every consumer
+reads (or into producer-side golden values) would shrink the consumers and
+keep the eleven lanes from drifting apart.
 
 ## Toward 1.0
 
-1.0 means the surfaces listed in [What semver covers](stability.md#what-semver-covers-post-10)
-stop changing without a major release. We will cut it when all of the following
-hold:
+1.0 means the surfaces in [What 1.0 will cover](stability.md#what-10-will-cover)
+stop changing without a major release. It needs:
 
-- **ABI revision 2 has been stable for several minor releases** with no
-  incompatible change, and the callback-return allocator contract has shipped
-  (so that 1.0 doesn't immediately need revision 3).
-- **Every target passes the full conformance matrix**, including the `codec`
-  round-trip lane, the async lanes, and the callback-interface lanes, on
-  Linux, macOS, and Windows in CI.
-- **Multi-file imports and the deprecation policy are live**, so a post-1.0
-  API can grow and shed surface the way the
-  [deprecation policy](stability.md#post-10-deprecation-policy) describes.
-- **The schema has a migration tool** (`weaveffi migrate`) and
-  `SUPPORTED_VERSIONS` accepts more than one version.
-- **The public Rust API of every published crate has been reviewed** for
-  items that should be `#[doc(hidden)]` or private before they become a
-  contract.
+- ABI revision 3 stable for several releases, with the callback-return
+  allocator contract and vtable versioning settled so 1.0 doesn't need
+  revision 4;
+- every target passing the full conformance matrix on Linux, macOS, and
+  Windows;
+- multi-file IDL and the deprecation policy in place;
+- a schema migration tool and more than one accepted schema version;
+- a review of every published crate's public API.
 
-Until then, expect pre-1.0 churn to be batched (one schema bump per minor
-release) and documented, and pin the CLI version in CI as
-[Stability and Versioning](stability.md) recommends.
+## Contributing
 
-## Contributing to the roadmap
-
-Open a discussion or issue on
-[GitHub](https://github.com/weavefoundry/weaveffi/issues) if one of the
-exploring items matters to you, or if something you need isn't listed. Items
-move from exploring to planned when a design has been written up and reviewed;
-see [CONTRIBUTING.md](https://github.com/weavefoundry/weaveffi/blob/main/CONTRIBUTING.md)
-for how proposals work.
-
-[changelog]: https://github.com/weavefoundry/weaveffi/blob/main/CHANGELOG.md
+Open an issue or discussion on
+[GitHub](https://github.com/weavefoundry/weaveffi/issues) if an item here
+matters to you or something you need is missing.

@@ -1,17 +1,22 @@
 //! End-to-end runtime tests for the `#[weaveffi::module]` expansion.
 //!
 //! Each test defines a module with the macro, then calls the generated
-//! `#[no_mangle] extern "C"` thunks directly (by their Rust path) and checks
-//! that arguments lift, results lower, and errors flow through `out_err` the
-//! way the C ABI promises. This is the executable proof that the generated glue
-//! matches the calling convention every language binding expects.
+//! `extern "C"` thunks directly (by their Rust path) and checks that
+//! arguments lift, results lower, and errors flow through `out_err` the way
+//! the C ABI promises. This is the executable proof that the generated glue
+//! matches the calling convention every language binding expects. This test
+//! crate is named `runtime`, so that's the prefix of every symbol.
 
 #![allow(unsafe_code)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::os::raw::c_char;
+use std::os::raw::c_void;
+use std::sync::mpsc;
 use std::sync::Arc;
-use weaveffi::abi::{self, c_ptr_to_string, free_string, string_to_c_ptr, weaveffi_error};
+use std::time::Duration;
+
+use weaveffi::abi::{self, FfiError};
+
+const WAIT: Duration = Duration::from_secs(5);
 
 #[weaveffi::module]
 pub mod demo {
@@ -21,6 +26,14 @@ pub mod demo {
     pub enum DemoError {
         /// division by zero
         DivisionByZero = 100,
+    }
+
+    impl std::fmt::Display for DemoError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::DivisionByZero => f.write_str("cannot divide by zero"),
+            }
+        }
     }
 
     /// A C-style enum that crosses the ABI as its `i32` discriminant.
@@ -71,10 +84,23 @@ pub mod demo {
         format!("hi {name}")
     }
 
-    /// Borrow a string slice and report its length.
+    /// Borrow a string slice and report its length in characters.
     #[weaveffi::export]
     pub fn str_len(text: &str) -> i32 {
         text.chars().count() as i32
+    }
+
+    /// The address of a borrowed string's first byte, proving the thunk lent
+    /// the caller's bytes instead of copying them.
+    #[weaveffi::export]
+    pub fn str_addr(text: &str) -> u64 {
+        text.as_ptr() as u64
+    }
+
+    /// The address of a borrowed byte slice's first byte.
+    #[weaveffi::export]
+    pub fn bytes_addr(data: &[u8]) -> u64 {
+        data.as_ptr() as u64
     }
 
     /// Return an optional string depending on the flag.
@@ -117,6 +143,12 @@ pub mod demo {
     pub fn point_x(p: Point) -> i32 {
         p.x
     }
+
+    /// Echo a color (C-style enum in and out).
+    #[weaveffi::export]
+    pub fn echo_color(c: Color) -> Color {
+        c
+    }
 }
 
 #[weaveffi::module]
@@ -140,21 +172,20 @@ pub mod warehouse {
 
 #[weaveffi::module]
 pub mod dispatch {
-    // A struct declared in a *sibling* top-level module. The macro expands each
-    // module in isolation, so this exercises cross-module type resolution: the
-    // thunk must accept/return the producer's real `Crate` type as an opaque
-    // pointer without the per-module expansion rejecting it as unknown.
+    // A record declared in a *sibling* top-level module. The macro expands
+    // each tree in isolation, lowers the unresolved name as a value buffer,
+    // and asserts at compile time that `Crate` really is a by-value type.
     use super::warehouse::Crate;
 
-    /// Read a sibling-module record's id (struct parameter by value).
+    /// Read a sibling-module record's id (record parameter by value).
     #[weaveffi::export]
     pub fn crate_id(item: Crate) -> i64 {
         item.id
     }
 
-    /// Return a relabeled copy (sibling-module struct in and out).
+    /// Return a relabeled copy (sibling-module record in and out).
     #[weaveffi::export]
-    pub fn relabel(item: Crate, label: String) -> Crate {
+    pub fn relabel(item: Crate, label: String) -> super::warehouse::Crate {
         Crate { id: item.id, label }
     }
 }
@@ -170,7 +201,7 @@ pub mod deferred {
     #[weaveffi::export]
     pub fn sync_then_fail(fail: bool) -> i32 {
         if fail {
-            weaveffi::abi::defer_foreign_error(weaveffi::abi::ForeignError {
+            weaveffi::abi::defer_foreign_error(weaveffi::ForeignError {
                 code: weaveffi::abi::FOREIGN_ERROR_CODE,
                 message: "consumer said no".to_string(),
             });
@@ -182,7 +213,7 @@ pub mod deferred {
     #[weaveffi::export]
     pub async fn later_then_fail(fail: bool) -> i32 {
         if fail {
-            weaveffi::abi::defer_foreign_error(weaveffi::abi::ForeignError {
+            weaveffi::abi::defer_foreign_error(weaveffi::ForeignError {
                 code: weaveffi::abi::FOREIGN_ERROR_CODE,
                 message: "consumer said no, later".to_string(),
             });
@@ -308,6 +339,9 @@ pub mod bus {
         fn classify(&self, weight: i32) -> Priority;
         /// Inspect a shared object without retaining it.
         fn on_ticker(&self, ticker: Arc<Ticker>, alt: Option<Arc<Ticker>>) -> bool;
+        /// Weigh a message; a consumer failure comes back as an `Err`
+        /// instead of unwinding.
+        fn weigh(&self, weight: i32) -> Result<i64, weaveffi::ForeignError>;
     }
 
     /// A shared object handed to subscribers.
@@ -354,7 +388,7 @@ pub mod bus {
         /// A subscriber failure unwinds through this frame like a panic, so
         /// the subscriber list is snapshotted and the lock released before
         /// any callback runs (the same discipline a panic-safe producer uses).
-        pub fn publish(&self, text: String, weight: i32) -> i64 {
+        pub fn publish(&self, text: &str, weight: i32) -> i64 {
             let env = Envelope {
                 seq: 1,
                 topic: Some("t".to_string()),
@@ -365,13 +399,13 @@ pub mod bus {
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
             subs.iter()
-                .map(|s| s.on_message(text.clone(), weight, &env))
+                .map(|s| s.on_message(text.to_string(), weight, &env))
                 .sum()
         }
 
         /// Publish asynchronously.
         pub async fn publish_later(&self, text: String, weight: i32) -> i64 {
-            self.publish(text, weight)
+            self.publish(&text, weight)
         }
 
         /// Drop every subscriber (the consumer's `free` must run).
@@ -396,6 +430,16 @@ pub mod bus {
         subscriber.on_ticker(ticker.clone(), None)
             && subscriber.on_ticker(ticker.clone(), Some(ticker))
     }
+
+    /// Weigh through the subscriber and describe the outcome, handling a
+    /// consumer failure as an ordinary value.
+    #[weaveffi::export]
+    pub fn weigh_or_explain(subscriber: Arc<dyn Subscriber>, weight: i32) -> String {
+        match subscriber.weigh(weight) {
+            Ok(v) => format!("ok {v}"),
+            Err(e) => format!("err {}: {}", e.code, e.message),
+        }
+    }
 }
 
 #[weaveffi::module]
@@ -406,6 +450,12 @@ pub mod tasks {
     pub enum TaskError {
         /// arithmetic overflow
         Overflow = 1,
+    }
+
+    impl std::fmt::Display for TaskError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("arithmetic overflow")
+        }
     }
 
     /// The by-value result an async task completes with.
@@ -427,15 +477,35 @@ pub mod tasks {
         }
     }
 
+    /// Echo a string asynchronously (a `(result_ptr, result_len)` result).
+    #[weaveffi::export]
+    pub async fn shout(text: &str) -> String {
+        text.to_uppercase()
+    }
+
     /// Add two integers asynchronously, failing on overflow.
     #[weaveffi::export]
     pub async fn checked_add(a: i32, b: i32) -> Result<i32, TaskError> {
         a.checked_add(b).ok_or(TaskError::Overflow)
     }
+
+    /// Never finish on its own: only cancellation completes this call.
+    #[weaveffi::export]
+    #[weaveffi::cancellable]
+    pub async fn wait_forever(cancel: weaveffi::CancelToken) -> i32 {
+        let _keep = cancel;
+        std::future::pending::<()>().await;
+        0
+    }
 }
 
-fn ok_err() -> weaveffi_error {
-    weaveffi_error::default()
+fn ok_err() -> FfiError {
+    FfiError::default()
+}
+
+/// The message in `err`, or `""`.
+fn message(err: &FfiError) -> String {
+    unsafe { err.message_str() }.unwrap_or_default().to_string()
 }
 
 /// Decode a buffered return `(ptr, out_len)` into an owned value and release
@@ -447,65 +517,134 @@ fn decode_ret<T: abi::BufferValue>(ptr: *const u8, len: usize) -> T {
     );
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
     let value = abi::decode_value(bytes).expect("well-formed value buffer");
-    abi::free_bytes(ptr as *mut u8, len);
+    unsafe { abi::free_bytes(ptr.cast_mut(), len) };
     value
+}
+
+/// Copy a returned `(ptr, len)` string and release it.
+fn take_string(ptr: *const u8, len: usize) -> String {
+    let s = unsafe { abi::lift_string(ptr, len) }.expect("valid UTF-8");
+    unsafe { abi::free_bytes(ptr.cast_mut(), len) };
+    s
+}
+
+/// Copy a consumer-owned async error and release it.
+fn take_async_err(err: *mut FfiError) -> (i32, String) {
+    if err.is_null() {
+        return (0, String::new());
+    }
+    let out = unsafe { ((*err).code, message(&*err)) };
+    unsafe { abi::error_free(err) };
+    out
 }
 
 #[test]
 fn scalar_call_sets_ok() {
     let mut err = ok_err();
-    let r = demo::weaveffi_demo_add(2, 40, &mut err);
+    let r = unsafe { demo::runtime_demo_add(2, 40, &mut err) };
     assert_eq!(r, 42);
     assert_eq!(err.code, 0);
     assert!(err.message.is_null());
 }
 
 #[test]
-fn fallible_ok_and_err_paths() {
+fn fallible_ok_and_err_paths_use_display_for_the_message() {
     let mut err = ok_err();
-    assert_eq!(demo::weaveffi_demo_checked_div(10, 2, &mut err), 5);
+    assert_eq!(
+        unsafe { demo::runtime_demo_checked_div(10, 2, &mut err) },
+        5
+    );
     assert_eq!(err.code, 0);
 
-    let r = demo::weaveffi_demo_checked_div(1, 0, &mut err);
+    let r = unsafe { demo::runtime_demo_checked_div(1, 0, &mut err) };
     assert_eq!(r, 0, "error path returns the zero sentinel");
     assert_eq!(
         err.code, 100,
         "domain code from the #[weaveffi::error] enum"
     );
-    assert_eq!(c_ptr_to_string(err.message).unwrap(), "division by zero");
-    abi::error_clear(&mut err);
+    assert_eq!(message(&err), "cannot divide by zero", "the Display output");
+
+    // The next successful call resets the slot.
+    assert_eq!(unsafe { demo::runtime_demo_add(1, 1, &mut err) }, 2);
+    assert_eq!(err.code, 0);
+    assert!(err.message.is_null());
 }
 
 #[test]
 fn owned_string_roundtrip() {
     let mut err = ok_err();
-    let input = string_to_c_ptr("alice");
-    let out = demo::weaveffi_demo_greet(input, &mut err);
+    let input = "alice";
+    let mut out_len = 0usize;
+    let out =
+        unsafe { demo::runtime_demo_greet(input.as_ptr(), input.len(), &mut out_len, &mut err) };
     assert_eq!(err.code, 0);
-    assert_eq!(c_ptr_to_string(out).unwrap(), "hi alice");
-    free_string(out);
-    free_string(input);
+    assert_eq!(take_string(out, out_len), "hi alice");
 }
 
 #[test]
-fn borrowed_str_param() {
+fn interior_nul_in_a_returned_string_round_trips() {
     let mut err = ok_err();
-    let input = string_to_c_ptr("héllo");
-    assert_eq!(demo::weaveffi_demo_str_len(input, &mut err), 5);
-    free_string(input);
+    let input = "a\0b";
+    let mut out_len = 0usize;
+    let out =
+        unsafe { demo::runtime_demo_greet(input.as_ptr(), input.len(), &mut out_len, &mut err) };
+    assert_eq!(out_len, 6);
+    assert_eq!(take_string(out, out_len), "hi a\0b");
+}
+
+#[test]
+fn borrowed_str_param_is_not_copied() {
+    let mut err = ok_err();
+    // A slice of a larger buffer: not NUL-terminated, and borrowed in place.
+    let backing = "héllo world";
+    let text = &backing[..6];
+    assert_eq!(
+        unsafe { demo::runtime_demo_str_len(text.as_ptr(), text.len(), &mut err) },
+        5
+    );
+    let addr = unsafe { demo::runtime_demo_str_addr(text.as_ptr(), text.len(), &mut err) };
+    assert_eq!(
+        addr,
+        text.as_ptr() as u64,
+        "the thunk lent the caller's bytes"
+    );
+
+    let data = [1u8, 2, 3];
+    let addr = unsafe { demo::runtime_demo_bytes_addr(data.as_ptr(), data.len(), &mut err) };
+    assert_eq!(addr, data.as_ptr() as u64);
+
+    // An empty string may be passed as (NULL, 0).
+    assert_eq!(
+        unsafe { demo::runtime_demo_str_len(std::ptr::null(), 0, &mut err) },
+        0
+    );
+    assert_eq!(err.code, 0);
+}
+
+#[test]
+fn invalid_string_params_are_marshalling_errors() {
+    let mut err = ok_err();
+    let bad = [0xFFu8, 0xFE];
+    let r = unsafe { demo::runtime_demo_str_len(bad.as_ptr(), bad.len(), &mut err) };
+    assert_eq!(r, 0);
+    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
+
+    let r = unsafe { demo::runtime_demo_str_len(std::ptr::null(), 3, &mut err) };
+    assert_eq!(r, 0);
+    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
 }
 
 #[test]
 fn optional_string_return_is_buffered() {
     let mut err = ok_err();
     let mut out_len: usize = 0;
-    let some = demo::weaveffi_demo_maybe_name(true, &mut out_len, &mut err);
+    let some = unsafe { demo::runtime_demo_maybe_name(true, &mut out_len, &mut err) };
     assert_eq!(
         decode_ret::<Option<String>>(some, out_len),
         Some("present".to_string())
     );
 
-    let none = demo::weaveffi_demo_maybe_name(false, &mut out_len, &mut err);
+    let none = unsafe { demo::runtime_demo_maybe_name(false, &mut out_len, &mut err) };
     assert_eq!(decode_ret::<Option<String>>(none, out_len), None);
 }
 
@@ -513,7 +652,7 @@ fn optional_string_return_is_buffered() {
 fn scalar_list_param_is_buffered() {
     let mut err = ok_err();
     let xs = abi::encode_value(&vec![3i32, 4, 5]);
-    let total = demo::weaveffi_demo_sum(xs.as_ptr(), xs.len(), &mut err);
+    let total = unsafe { demo::runtime_demo_sum(xs.as_ptr(), xs.len(), &mut err) };
     assert_eq!(total, 12);
 }
 
@@ -521,21 +660,21 @@ fn scalar_list_param_is_buffered() {
 fn string_list_param_is_buffered() {
     let mut err = ok_err();
     let parts = abi::encode_value(&vec!["a".to_string(), "b".to_string(), "c".to_string()]);
-    let out = demo::weaveffi_demo_join(parts.as_ptr(), parts.len(), &mut err);
-    assert_eq!(c_ptr_to_string(out).unwrap(), "a,b,c");
-    free_string(out);
+    let mut out_len = 0usize;
+    let out =
+        unsafe { demo::runtime_demo_join(parts.as_ptr(), parts.len(), &mut out_len, &mut err) };
+    assert_eq!(take_string(out, out_len), "a,b,c");
 }
 
 #[test]
 fn malformed_buffer_param_reports_error() {
     let mut err = ok_err();
-    // A truncated encoding (length prefix with no elements) must be rejected
-    // through `out_err`, never decoded partially.
+    // A truncated encoding (count with no elements) must be rejected through
+    // `out_err`, never decoded partially.
     let bad = [9u8, 0, 0, 0];
-    let total = demo::weaveffi_demo_sum(bad.as_ptr(), bad.len(), &mut err);
+    let total = unsafe { demo::runtime_demo_sum(bad.as_ptr(), bad.len(), &mut err) };
     assert_eq!(total, 0, "error path returns the zero sentinel");
-    assert_ne!(err.code, 0);
-    abi::error_clear(&mut err);
+    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
 }
 
 #[test]
@@ -543,9 +682,18 @@ fn byte_buffer_param() {
     let mut err = ok_err();
     let data = [1u8, 2, 3, 4, 5];
     assert_eq!(
-        demo::weaveffi_demo_byte_count(data.as_ptr(), data.len(), &mut err),
+        unsafe { demo::runtime_demo_byte_count(data.as_ptr(), data.len(), &mut err) },
         5
     );
+}
+
+#[test]
+fn c_style_enum_in_and_out() {
+    let mut err = ok_err();
+    assert_eq!(unsafe { demo::runtime_demo_echo_color(2, &mut err) }, 2);
+    assert_eq!(err.code, 0);
+    assert_eq!(unsafe { demo::runtime_demo_echo_color(9, &mut err) }, 0);
+    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
 }
 
 #[test]
@@ -560,6 +708,7 @@ fn record_buffer_round_trip() {
         color: demo::Color::Blue,
     };
     let bytes = abi::encode_value(&original);
+    assert_eq!(bytes.len(), abi::BufferValue::encoded_len(&original));
     let back: demo::Point = abi::decode_value(&bytes).expect("round-trip");
     assert_eq!(back.x, 7);
     assert_eq!(back.label, "corner");
@@ -577,7 +726,7 @@ fn record_param_is_buffered() {
         color: demo::Color::Red,
     };
     let bytes = abi::encode_value(&p);
-    let x = demo::weaveffi_demo_point_x(bytes.as_ptr(), bytes.len(), &mut err);
+    let x = unsafe { demo::runtime_demo_point_x(bytes.as_ptr(), bytes.len(), &mut err) };
     assert_eq!(err.code, 0);
     assert_eq!(x, 41);
 }
@@ -586,7 +735,7 @@ fn record_param_is_buffered() {
 fn struct_return_is_buffered() {
     let mut err = ok_err();
     let mut out_len: usize = 0;
-    let ptr = demo::weaveffi_demo_make_point(99, &mut out_len, &mut err);
+    let ptr = unsafe { demo::runtime_demo_make_point(99, &mut out_len, &mut err) };
     assert_eq!(err.code, 0);
     let p: demo::Point = decode_ret(ptr, out_len);
     assert_eq!(p.x, 99);
@@ -596,37 +745,59 @@ fn struct_return_is_buffered() {
 }
 
 #[test]
-fn cross_module_struct_param_and_return() {
+fn sibling_module_record_param_and_return() {
     let mut err = ok_err();
-    let label = string_to_c_ptr("widget");
+    let label = "widget";
     let mut out_len: usize = 0;
-    let ptr = warehouse::weaveffi_warehouse_make_crate(7, label, &mut out_len, &mut err);
+    let ptr = unsafe {
+        warehouse::runtime_warehouse_make_crate(
+            7,
+            label.as_ptr(),
+            label.len(),
+            &mut out_len,
+            &mut err,
+        )
+    };
     assert_eq!(err.code, 0);
-    free_string(label);
     let c: warehouse::Crate = decode_ret(ptr, out_len);
     assert_eq!(c.id, 7);
     assert_eq!(c.label, "widget");
 
     // `dispatch::crate_id` accepts `warehouse::Crate` as a value buffer.
     let bytes = abi::encode_value(&c);
-    let id = dispatch::weaveffi_dispatch_crate_id(bytes.as_ptr(), bytes.len(), &mut err);
+    let id = unsafe { dispatch::runtime_dispatch_crate_id(bytes.as_ptr(), bytes.len(), &mut err) };
     assert_eq!(id, 7);
     assert_eq!(err.code, 0);
 
-    // `dispatch::relabel` returns a fresh `warehouse::Crate` buffer decoded
-    // with the same impl (same Rust type, same wire format).
-    let new_label = string_to_c_ptr("gadget");
-    let ptr2 = dispatch::weaveffi_dispatch_relabel(
-        bytes.as_ptr(),
-        bytes.len(),
-        new_label,
-        &mut out_len,
-        &mut err,
-    );
-    free_string(new_label);
+    let new_label = "gadget";
+    let ptr2 = unsafe {
+        dispatch::runtime_dispatch_relabel(
+            bytes.as_ptr(),
+            bytes.len(),
+            new_label.as_ptr(),
+            new_label.len(),
+            &mut out_len,
+            &mut err,
+        )
+    };
     let c2: warehouse::Crate = decode_ret(ptr2, out_len);
     assert_eq!(c2.id, 7);
     assert_eq!(c2.label, "gadget");
+}
+
+#[test]
+fn every_top_level_module_exports_a_checksum() {
+    let sums = [
+        demo::runtime_demo_checksum(),
+        warehouse::runtime_warehouse_checksum(),
+        dispatch::runtime_dispatch_checksum(),
+        outer::runtime_outer_checksum(),
+    ];
+    for (i, a) in sums.iter().enumerate() {
+        for b in &sums[i + 1..] {
+            assert_ne!(a, b, "different modules hash differently");
+        }
+    }
 }
 
 #[test]
@@ -639,44 +810,35 @@ fn map_param_and_return_are_buffered() {
     let bytes = abi::encode_value(&scores);
 
     let mut out_len: usize = 0;
-    let ptr =
-        maps::weaveffi_maps_double_scores(bytes.as_ptr(), bytes.len(), &mut out_len, &mut err);
+    let ptr = unsafe {
+        maps::runtime_maps_double_scores(bytes.as_ptr(), bytes.len(), &mut out_len, &mut err)
+    };
     assert_eq!(err.code, 0);
     let doubled: BTreeMap<String, i32> = decode_ret(ptr, out_len);
     assert_eq!(doubled.get("a"), Some(&4));
     assert_eq!(doubled.get("b"), Some(&2));
-}
 
-#[test]
-fn map_param_scalar_return() {
-    use std::collections::BTreeMap;
-    let mut err = ok_err();
-    let mut scores = BTreeMap::new();
-    scores.insert("a".to_string(), 10i32);
-    scores.insert("b".to_string(), 32i32);
-    let bytes = abi::encode_value(&scores);
-    let total = maps::weaveffi_maps_total(bytes.as_ptr(), bytes.len(), &mut err);
-    assert_eq!(err.code, 0);
-    assert_eq!(total, 42);
+    let total = unsafe { maps::runtime_maps_total(bytes.as_ptr(), bytes.len(), &mut err) };
+    assert_eq!(total, 3);
 }
 
 #[test]
 fn widget_optional_field_round_trips() {
-    let with_note = build::Widget {
-        name: "bolt".to_string(),
-        qty: 7,
-        note: Some("aisle 4".to_string()),
-    };
-    let back: build::Widget = abi::decode_value(&abi::encode_value(&with_note)).unwrap();
-    assert_eq!(back, with_note);
-
-    let without_note = build::Widget {
-        name: "nut".to_string(),
-        qty: 1,
-        note: None,
-    };
-    let back: build::Widget = abi::decode_value(&abi::encode_value(&without_note)).unwrap();
-    assert_eq!(back, without_note);
+    for w in [
+        build::Widget {
+            name: "bolt".to_string(),
+            qty: 7,
+            note: Some("aisle 4".to_string()),
+        },
+        build::Widget {
+            name: "nut".to_string(),
+            qty: 1,
+            note: None,
+        },
+    ] {
+        let back: build::Widget = abi::decode_value(&abi::encode_value(&w)).unwrap();
+        assert_eq!(back, w);
+    }
 }
 
 #[test]
@@ -707,48 +869,87 @@ fn rich_enum_encodes_tag_then_fields() {
 fn rich_enum_param_is_buffered() {
     let mut err = ok_err();
     let circle = abi::encode_value(&geom::Shape::Circle { radius: 2.5 });
-    let d = geom::weaveffi_geom_describe(circle.as_ptr(), circle.len(), &mut err);
+    let mut out_len = 0usize;
+    let d = unsafe {
+        geom::runtime_geom_describe(circle.as_ptr(), circle.len(), &mut out_len, &mut err)
+    };
     assert_eq!(err.code, 0);
-    assert_eq!(c_ptr_to_string(d).unwrap(), "circle(2.5)");
-    free_string(d);
+    assert_eq!(take_string(d, out_len), "circle(2.5)");
 }
 
 #[test]
 fn iterator_string_elements() {
     let mut err = ok_err();
-    let iter = stream::weaveffi_stream_greetings(3, &mut err);
+    let iter = unsafe { stream::runtime_stream_greetings(3, &mut err) };
     assert_eq!(err.code, 0);
     assert!(!iter.is_null());
 
     let mut got = Vec::new();
     loop {
-        let mut item: *const c_char = std::ptr::null();
-        let has = stream::weaveffi_stream_GreetingsIterator_next(iter, &mut item, &mut err);
+        let mut item: *const u8 = std::ptr::null();
+        let mut len = 0usize;
+        let has = unsafe {
+            stream::runtime_stream_GreetingsIterator_next(iter, &mut item, &mut len, &mut err)
+        };
         assert_eq!(err.code, 0);
         if has == 0 {
             break;
         }
-        got.push(c_ptr_to_string(item).unwrap());
-        free_string(item);
+        got.push(take_string(item, len));
     }
-    stream::weaveffi_stream_GreetingsIterator_destroy(iter);
+    unsafe { stream::runtime_stream_GreetingsIterator_destroy(iter) };
     assert_eq!(got, vec!["hi 0", "hi 1", "hi 2"]);
 }
 
 #[test]
 fn iterator_scalar_elements() {
     let mut err = ok_err();
-    let iter = stream::weaveffi_stream_squares(4, &mut err);
+    let iter = unsafe { stream::runtime_stream_squares(4, &mut err) };
     let mut got = Vec::new();
     loop {
         let mut item: i32 = 0;
-        if stream::weaveffi_stream_SquaresIterator_next(iter, &mut item, &mut err) == 0 {
+        if unsafe { stream::runtime_stream_SquaresIterator_next(iter, &mut item, &mut err) } == 0 {
             break;
         }
         got.push(item);
     }
-    stream::weaveffi_stream_SquaresIterator_destroy(iter);
+    unsafe { stream::runtime_stream_SquaresIterator_destroy(iter) };
     assert_eq!(got, vec![0, 1, 4, 9]);
+}
+
+#[test]
+fn concurrent_iterator_next_yields_each_element_once() {
+    const N: i32 = 2000;
+    let mut err = ok_err();
+    let iter = unsafe { stream::runtime_stream_squares(N, &mut err) };
+    let addr = iter as usize;
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(move || {
+                let iter = addr as *mut abi::IterHandle<i32>;
+                let mut err = FfiError::default();
+                let mut got = Vec::new();
+                loop {
+                    let mut item = 0i32;
+                    let has = unsafe {
+                        stream::runtime_stream_SquaresIterator_next(iter, &mut item, &mut err)
+                    };
+                    assert_eq!(err.code, 0);
+                    if has == 0 {
+                        break got;
+                    }
+                    got.push(item);
+                }
+            })
+        })
+        .collect();
+    let mut all: Vec<i32> = threads
+        .into_iter()
+        .flat_map(|t| t.join().unwrap())
+        .collect();
+    all.sort_unstable();
+    assert_eq!(all, (0..N).map(|i| i * i).collect::<Vec<_>>());
+    unsafe { stream::runtime_stream_SquaresIterator_destroy(iter) };
 }
 
 /// A consumer-side `Subscriber` implementation: the context is a heap-allocated
@@ -756,7 +957,6 @@ fn iterator_scalar_elements() {
 /// binding would do it.
 mod consumer_subscriber {
     use super::*;
-    use std::os::raw::c_void;
     use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
     pub struct SubState {
@@ -768,73 +968,74 @@ mod consumer_subscriber {
 
     unsafe extern "C" fn on_message(
         ctx: *mut c_void,
-        text: *const c_char,
+        text_ptr: *const u8,
+        text_len: usize,
         weight: i32,
         envelope_ptr: *const u8,
         envelope_len: usize,
-        out_err: *mut weaveffi_error,
+        out_err: *mut FfiError,
     ) -> i64 {
-        let state = &*(ctx as *const SubState);
-        let text = c_ptr_to_string(text).unwrap();
+        let state = unsafe { &*(ctx as *const SubState) };
+        let text = unsafe { abi::lift_str(text_ptr, text_len) }.unwrap();
         let env: bus::Envelope =
-            abi::decode_value(std::slice::from_raw_parts(envelope_ptr, envelope_len)).unwrap();
+            abi::decode_value(unsafe { std::slice::from_raw_parts(envelope_ptr, envelope_len) })
+                .unwrap();
         *state.last_topic.lock().unwrap() = env.topic.clone();
         if weight == state.fail_at {
-            abi::error_set(
-                out_err,
-                abi::FOREIGN_ERROR_CODE,
-                &format!("subscriber rejected {text}"),
-            );
+            let msg = std::ffi::CString::new(format!("subscriber rejected {text}")).unwrap();
+            // Consumers report through the exported `{prefix}_error_set`.
+            unsafe { super::runtime_error_set(out_err, abi::FOREIGN_ERROR_CODE, msg.as_ptr()) };
             return 0;
         }
-        abi::error_set_ok(out_err);
         state.total.fetch_add(weight as i64, Ordering::Relaxed) + weight as i64
     }
 
-    unsafe extern "C" fn classify(
-        _ctx: *mut c_void,
-        weight: i32,
-        out_err: *mut weaveffi_error,
-    ) -> i32 {
-        abi::error_set_ok(out_err);
-        if weight > 5 {
-            1
-        } else {
-            0
-        }
+    unsafe extern "C" fn classify(_ctx: *mut c_void, weight: i32, _err: *mut FfiError) -> i32 {
+        i32::from(weight > 5)
     }
 
     unsafe extern "C" fn on_ticker(
         _ctx: *mut c_void,
         ticker: *mut bus::Ticker,
         alt: *mut bus::Ticker,
-        out_err: *mut weaveffi_error,
+        _err: *mut FfiError,
     ) -> bool {
-        abi::error_set_ok(out_err);
         // Object arguments transfer one strong reference: the consumer adopts
         // each non-null pointer and owes exactly one `_destroy`.
-        let mut err = weaveffi_error::default();
-        let v = bus::weaveffi_bus_Ticker_value(ticker, &mut err);
-        bus::weaveffi_bus_Ticker_destroy(ticker);
-        let alt_ok = if alt.is_null() {
-            true
-        } else {
-            let same = bus::weaveffi_bus_Ticker_value(alt, &mut err) == v;
-            bus::weaveffi_bus_Ticker_destroy(alt);
-            same
-        };
-        v == 42 && alt_ok
+        let mut err = FfiError::default();
+        unsafe {
+            let v = bus::runtime_bus_Ticker_value(ticker, &mut err);
+            bus::runtime_bus_Ticker_destroy(ticker);
+            let alt_ok = if alt.is_null() {
+                true
+            } else {
+                let same = bus::runtime_bus_Ticker_value(alt, &mut err) == v;
+                bus::runtime_bus_Ticker_destroy(alt);
+                same
+            };
+            v == 42 && alt_ok
+        }
+    }
+
+    unsafe extern "C" fn weigh(ctx: *mut c_void, weight: i32, out_err: *mut FfiError) -> i64 {
+        let state = unsafe { &*(ctx as *const SubState) };
+        if weight == state.fail_at {
+            unsafe { abi::error_set(out_err, abi::FOREIGN_ERROR_CODE, "too heavy") };
+            return 0;
+        }
+        i64::from(weight) * 10
     }
 
     unsafe extern "C" fn free(ctx: *mut c_void) {
-        let state = Box::from_raw(ctx as *mut SubState);
+        let state = unsafe { Box::from_raw(ctx as *mut SubState) };
         state.freed.fetch_add(1, Ordering::SeqCst);
     }
 
-    pub static VTABLE: bus::weaveffi_bus_Subscriber_vtable = bus::weaveffi_bus_Subscriber_vtable {
+    pub static VTABLE: bus::runtime_bus_Subscriber_vtable = bus::runtime_bus_Subscriber_vtable {
         on_message,
         classify,
         on_ticker,
+        weigh,
         free,
     };
 
@@ -848,267 +1049,327 @@ mod consumer_subscriber {
     }
 }
 
+weaveffi::export_runtime!();
+
 #[test]
 fn callback_interface_sync_paths() {
     use consumer_subscriber::{new_ctx, VTABLE};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let freed = Arc::new(AtomicUsize::new(0));
-    use std::sync::atomic::Ordering;
-
     let mut err = ok_err();
 
     // Direct-family return through a non-retained callback: `free` runs as soon
     // as the thunk drops its `Arc<dyn Subscriber>`.
     let ctx = new_ctx(-1, &freed);
     assert_eq!(
-        bus::weaveffi_bus_classify_once(ctx, &VTABLE, 9, &mut err),
+        unsafe { bus::runtime_bus_classify_once(ctx, &VTABLE, 9, &mut err) },
         1
     );
     assert_eq!(err.code, 0);
     assert_eq!(freed.load(Ordering::SeqCst), 1);
 
-    // Objects flow producer -> consumer as borrowed pointers the consumer may
-    // clone; a `&Arc<dyn Trait>` spelling lends the lifted callback.
+    // Objects flow producer -> consumer as owned references; a
+    // `&Arc<dyn Trait>` spelling lends the lifted callback.
     let ctx = new_ctx(-1, &freed);
-    assert!(bus::weaveffi_bus_tick(ctx, &VTABLE, 42, &mut err));
+    assert!(unsafe { bus::runtime_bus_tick(ctx, &VTABLE, 42, &mut err) });
     assert_eq!(err.code, 0);
     assert_eq!(freed.load(Ordering::SeqCst), 2);
 
     // A null vtable is a marshalling error, not a crash.
-    let r = bus::weaveffi_bus_classify_once(std::ptr::null_mut(), std::ptr::null(), 1, &mut err);
+    let r = unsafe {
+        bus::runtime_bus_classify_once(std::ptr::null_mut(), std::ptr::null(), 1, &mut err)
+    };
     assert_eq!(r, 0);
     assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
-    abi::error_clear(&mut err);
+}
+
+#[test]
+fn callback_result_methods_return_failures_as_values() {
+    use consumer_subscriber::{new_ctx, VTABLE};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let freed = Arc::new(AtomicUsize::new(0));
+    let mut err = ok_err();
+    let mut len = 0usize;
+
+    let ptr = unsafe {
+        bus::runtime_bus_weigh_or_explain(new_ctx(3, &freed), &VTABLE, 2, &mut len, &mut err)
+    };
+    assert_eq!(err.code, 0);
+    assert_eq!(take_string(ptr, len), "ok 20");
+
+    // The consumer fails, the producer sees an `Err`, and the call itself
+    // succeeds: nothing unwound.
+    let ptr = unsafe {
+        bus::runtime_bus_weigh_or_explain(new_ctx(3, &freed), &VTABLE, 3, &mut len, &mut err)
+    };
+    assert_eq!(err.code, 0);
+    assert_eq!(take_string(ptr, len), "err -4: too heavy");
+    assert_eq!(freed.load(Ordering::SeqCst), 2);
 }
 
 #[test]
 fn callback_interface_retained_and_foreign_error() {
     use consumer_subscriber::{new_ctx, VTABLE};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let freed = Arc::new(AtomicUsize::new(0));
-    use std::sync::atomic::Ordering;
-
     let mut err = ok_err();
 
-    let b = bus::weaveffi_bus_Bus_new(&mut err);
+    let b = unsafe { bus::runtime_bus_Bus_new(&mut err) };
     assert!(!b.is_null());
-    bus::weaveffi_bus_Bus_subscribe(b, new_ctx(7, &freed), &VTABLE, &mut err);
-    bus::weaveffi_bus_Bus_subscribe(b, new_ctx(-1, &freed), &VTABLE, &mut err);
+    unsafe {
+        bus::runtime_bus_Bus_subscribe(b, new_ctx(7, &freed), &VTABLE, &mut err);
+        bus::runtime_bus_Bus_subscribe(b, new_ctx(-1, &freed), &VTABLE, &mut err);
+    }
     assert_eq!(err.code, 0);
     assert_eq!(freed.load(Ordering::SeqCst), 0, "retained by the bus");
 
-    let text = string_to_c_ptr("hi");
-    assert_eq!(bus::weaveffi_bus_Bus_publish(b, text, 3, &mut err), 6);
+    let text = "hi";
+    let publish = |weight: i32, err: &mut FfiError| unsafe {
+        bus::runtime_bus_Bus_publish(b, text.as_ptr(), text.len(), weight, err)
+    };
+    assert_eq!(publish(3, &mut err), 6);
     assert_eq!(err.code, 0);
-    assert_eq!(bus::weaveffi_bus_Bus_publish(b, text, 5, &mut err), 16);
+    assert_eq!(publish(5, &mut err), 16);
 
     // The first subscriber fails on weight 7: the producer call is aborted and
     // the consumer's own message comes back with FOREIGN_ERROR_CODE.
-    let r = bus::weaveffi_bus_Bus_publish(b, text, 7, &mut err);
-    assert_eq!(r, 0);
+    assert_eq!(publish(7, &mut err), 0);
     assert_eq!(err.code, abi::FOREIGN_ERROR_CODE);
-    assert_eq!(
-        c_ptr_to_string(err.message).unwrap(),
-        "subscriber rejected hi"
-    );
-    abi::error_clear(&mut err);
+    assert_eq!(message(&err), "subscriber rejected hi");
 
     // The bus is still usable afterwards.
-    assert_eq!(bus::weaveffi_bus_Bus_publish(b, text, 1, &mut err), 18);
+    assert_eq!(publish(1, &mut err), 18);
     assert_eq!(err.code, 0);
 
-    bus::weaveffi_bus_Bus_clear(b, &mut err);
+    unsafe { bus::runtime_bus_Bus_clear(b, &mut err) };
     assert_eq!(freed.load(Ordering::SeqCst), 2, "free runs once each");
-    free_string(text);
-    bus::weaveffi_bus_Bus_destroy(b);
+    unsafe { bus::runtime_bus_Bus_destroy(b) };
+}
+
+type Completion<T> = mpsc::Sender<(i32, String, T)>;
+
+/// Box a sender as an async `context`; reclaim it with [`drop_ctx`].
+fn new_ctx<T>(tx: Completion<T>) -> *mut c_void {
+    Box::into_raw(Box::new(tx)).cast()
+}
+
+fn drop_ctx<T>(ctx: *mut c_void) {
+    drop(unsafe { Box::from_raw(ctx.cast::<Completion<T>>()) });
+}
+
+fn send<T>(ctx: *mut c_void, err: *mut FfiError, value: T) {
+    let tx = unsafe { &*ctx.cast::<Completion<T>>() };
+    let (code, msg) = take_async_err(err);
+    tx.send((code, msg, value)).unwrap();
+}
+
+extern "C" fn on_i64(ctx: *mut c_void, err: *mut FfiError, result: i64) {
+    send(ctx, err, result);
+}
+
+extern "C" fn on_i32(ctx: *mut c_void, err: *mut FfiError, result: i32) {
+    send(ctx, err, result);
+}
+
+extern "C" fn on_string(ctx: *mut c_void, err: *mut FfiError, ptr: *const u8, len: usize) {
+    let value = if ptr.is_null() {
+        String::new()
+    } else {
+        take_string(ptr, len)
+    };
+    send(ctx, err, value);
 }
 
 #[test]
 fn callback_interface_from_async_method() {
-    use consumer_subscriber::{new_ctx, VTABLE};
-    use std::os::raw::c_void;
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    type Msg = (i32, String, i64);
-    extern "C" fn cb(ctx: *mut c_void, err: *mut weaveffi_error, result: i64) {
-        let tx = unsafe { &*(ctx as *const mpsc::Sender<Msg>) };
-        let (code, msg) = if err.is_null() {
-            (0, String::new())
-        } else {
-            let e = unsafe { &*err };
-            let out = (e.code, c_ptr_to_string(e.message).unwrap_or_default());
-            abi::error_free(err);
-            out
-        };
-        tx.send((code, msg, result)).unwrap();
-    }
+    use consumer_subscriber::{new_ctx as sub_ctx, VTABLE};
 
     let mut err = ok_err();
-    let b = bus::weaveffi_bus_Bus_new(&mut err);
+    let b = unsafe { bus::runtime_bus_Bus_new(&mut err) };
     let freed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    bus::weaveffi_bus_Bus_subscribe(b, new_ctx(4, &freed), &VTABLE, &mut err);
+    unsafe { bus::runtime_bus_Bus_subscribe(b, sub_ctx(4, &freed), &VTABLE, &mut err) };
 
-    let (tx, rx) = mpsc::channel::<Msg>();
-    let tx_ptr = Box::into_raw(Box::new(tx));
-    let text = string_to_c_ptr("async");
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<i64>(tx);
+    let text = "async";
 
-    bus::weaveffi_bus_Bus_publish_later_async(b, text, 2, cb, tx_ptr as *mut c_void);
-    let (code, _, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(code, 0);
-    assert_eq!(result, 2);
+    unsafe { bus::runtime_bus_Bus_publish_later(b, text.as_ptr(), text.len(), 2, on_i64, ctx) };
+    assert_eq!(rx.recv_timeout(WAIT).unwrap(), (0, String::new(), 2));
 
     // A foreign failure inside the future is delivered through the callback.
-    bus::weaveffi_bus_Bus_publish_later_async(b, text, 4, cb, tx_ptr as *mut c_void);
-    let (code, msg, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    unsafe { bus::runtime_bus_Bus_publish_later(b, text.as_ptr(), text.len(), 4, on_i64, ctx) };
+    let (code, msg, result) = rx.recv_timeout(WAIT).unwrap();
     assert_eq!(code, abi::FOREIGN_ERROR_CODE);
     assert_eq!(msg, "subscriber rejected async");
     assert_eq!(result, 0);
 
     // The receiver was retained across the spawn: releasing the consumer's
     // reference while a call is in flight is safe.
-    bus::weaveffi_bus_Bus_publish_later_async(b, text, 1, cb, tx_ptr as *mut c_void);
-    bus::weaveffi_bus_Bus_destroy(b);
-    let (code, _, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(code, 0);
-    assert_eq!(result, 3);
-
-    free_string(text);
-    unsafe { drop(Box::from_raw(tx_ptr)) };
+    unsafe {
+        bus::runtime_bus_Bus_publish_later(b, text.as_ptr(), text.len(), 1, on_i64, ctx);
+        bus::runtime_bus_Bus_destroy(b);
+    }
+    assert_eq!(rx.recv_timeout(WAIT).unwrap(), (0, String::new(), 3));
+    drop_ctx::<i64>(ctx);
 }
 
 #[test]
 fn async_struct_result_completes_via_callback() {
-    use std::os::raw::c_void;
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    type Msg = (bool, i64, String);
+    type Msg = (i32, String, Option<(i64, String)>);
     // The buffered result is owned by the consumer: decode it, then release
     // the producer allocation with `free_bytes`.
-    extern "C" fn cb(
-        ctx: *mut c_void,
-        err: *mut weaveffi_error,
-        result_ptr: *const u8,
-        result_len: usize,
-    ) {
-        let tx = unsafe { &*(ctx as *const mpsc::Sender<Msg>) };
-        let had_err = !err.is_null() && unsafe { (*err).code } != 0;
-        if had_err {
-            abi::error_free(err);
-        }
-        let payload = if result_ptr.is_null() {
-            (had_err, 0, String::new())
-        } else {
-            let bytes = unsafe { std::slice::from_raw_parts(result_ptr, result_len) };
-            let r: tasks::TaskResult = abi::decode_value(bytes).expect("well-formed result");
-            abi::free_bytes(result_ptr as *mut u8, result_len);
-            (had_err, r.id, r.value)
-        };
-        tx.send(payload).unwrap();
+    extern "C" fn cb(ctx: *mut c_void, err: *mut FfiError, ptr: *const u8, len: usize) {
+        let tx = unsafe { &*ctx.cast::<mpsc::Sender<Msg>>() };
+        let (code, msg) = take_async_err(err);
+        let value = (!ptr.is_null()).then(|| {
+            let r: tasks::TaskResult = decode_ret(ptr, len);
+            (r.id, r.value)
+        });
+        tx.send((code, msg, value)).unwrap();
     }
 
     let (tx, rx) = mpsc::channel::<Msg>();
-    let tx_ptr = Box::into_raw(Box::new(tx));
-    let name = string_to_c_ptr("alpha");
-    tasks::weaveffi_tasks_run_task_async(name, cb, tx_ptr as *mut c_void);
-    let (had_err, id, value) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    free_string(name);
-    unsafe { drop(Box::from_raw(tx_ptr)) };
+    let ctx: *mut c_void = Box::into_raw(Box::new(tx)).cast();
+    let name = "alpha";
+    unsafe { tasks::runtime_tasks_run_task(name.as_ptr(), name.len(), cb, ctx) };
+    let (code, _, value) = rx.recv_timeout(WAIT).unwrap();
+    drop(unsafe { Box::from_raw(ctx.cast::<mpsc::Sender<Msg>>()) });
+    assert_eq!(code, 0);
+    assert_eq!(value, Some((7, "done: alpha".to_string())));
+}
 
-    assert!(!had_err);
-    assert_eq!(id, 7);
-    assert_eq!(value, "done: alpha");
+#[test]
+fn async_string_result_is_ptr_and_len() {
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<String>(tx);
+    let text = "quiet\0please";
+    unsafe { tasks::runtime_tasks_shout(text.as_ptr(), text.len(), on_string, ctx) };
+    assert_eq!(
+        rx.recv_timeout(WAIT).unwrap(),
+        (0, String::new(), "QUIET\0PLEASE".into())
+    );
+    drop_ctx::<String>(ctx);
 }
 
 #[test]
 fn async_result_ok_and_err_paths() {
-    use std::os::raw::c_void;
-    use std::sync::mpsc;
-    use std::time::Duration;
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<i32>(tx);
 
-    type Msg = (bool, i32);
-    extern "C" fn cb(ctx: *mut c_void, err: *mut weaveffi_error, result: i32) {
-        let tx = unsafe { &*(ctx as *const mpsc::Sender<Msg>) };
-        let had_err = !err.is_null() && unsafe { (*err).code } != 0;
-        if had_err {
-            // The reported error is heap-boxed and owned by the consumer.
-            abi::error_free(err);
-        }
-        tx.send((had_err, result)).unwrap();
+    unsafe { tasks::runtime_tasks_checked_add(2, 3, on_i32, ctx) };
+    assert_eq!(rx.recv_timeout(WAIT).unwrap(), (0, String::new(), 5));
+
+    unsafe { tasks::runtime_tasks_checked_add(i32::MAX, 1, on_i32, ctx) };
+    let (code, msg, result) = rx.recv_timeout(WAIT).unwrap();
+    assert_eq!((code, msg.as_str(), result), (1, "arithmetic overflow", 0));
+
+    drop_ctx::<i32>(ctx);
+}
+
+#[test]
+fn cancelling_completes_with_the_cancelled_code_exactly_once() {
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<i32>(tx);
+    let token = runtime_cancel_token_create();
+    unsafe { tasks::runtime_tasks_wait_forever(token, on_i32, ctx) };
+    assert!(
+        rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "not complete until cancelled"
+    );
+    unsafe {
+        runtime_cancel_token_cancel(token);
+        assert!(runtime_cancel_token_is_cancelled(token));
+        runtime_cancel_token_destroy(token);
     }
+    let (code, msg, result) = rx.recv_timeout(WAIT).unwrap();
+    assert_eq!(
+        (code, msg.as_str(), result),
+        (abi::CANCELLED_ERROR_CODE, "cancelled", 0)
+    );
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    drop_ctx::<i32>(ctx);
+}
 
-    let (tx, rx) = mpsc::channel::<Msg>();
-    let tx_ptr = Box::into_raw(Box::new(tx));
-
-    tasks::weaveffi_tasks_checked_add_async(2, 3, cb, tx_ptr as *mut c_void);
-    let (had_err, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(!had_err);
-    assert_eq!(result, 5);
-
-    tasks::weaveffi_tasks_checked_add_async(i32::MAX, 1, cb, tx_ptr as *mut c_void);
-    let (had_err, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(had_err);
-    assert_eq!(result, 0);
-
-    unsafe { drop(Box::from_raw(tx_ptr)) };
+#[test]
+fn cancel_then_destroy_races_the_launch_safely() {
+    const RUNS: usize = 200;
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<i32>(tx);
+    for i in 0..RUNS {
+        let token = runtime_cancel_token_create();
+        if i % 2 == 0 {
+            // Cancel and destroy from another thread while the launch races.
+            let raw = token as usize;
+            let canceller = std::thread::spawn(move || unsafe {
+                runtime_cancel_token_cancel(raw as *mut abi::FfiCancelToken);
+                runtime_cancel_token_destroy(raw as *mut abi::FfiCancelToken);
+            });
+            unsafe { tasks::runtime_tasks_wait_forever(token, on_i32, ctx) };
+            canceller.join().unwrap();
+        } else {
+            // Cancel and destroy before the spawned future is ever polled.
+            unsafe {
+                tasks::runtime_tasks_wait_forever(token, on_i32, ctx);
+                runtime_cancel_token_cancel(token);
+                runtime_cancel_token_destroy(token);
+            }
+        }
+    }
+    for _ in 0..RUNS {
+        let (code, _, _) = rx.recv_timeout(WAIT).unwrap();
+        assert_eq!(code, abi::CANCELLED_ERROR_CODE);
+    }
+    assert!(
+        rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "each call completed exactly once"
+    );
+    drop_ctx::<i32>(ctx);
 }
 
 #[test]
 fn deferred_foreign_error_replaces_a_sync_result() {
     let mut err = ok_err();
     assert_eq!(
-        deferred::weaveffi_deferred_sync_then_fail(false, &mut err),
+        unsafe { deferred::runtime_deferred_sync_then_fail(false, &mut err) },
         77
     );
     assert_eq!(err.code, 0);
 
-    let r = deferred::weaveffi_deferred_sync_then_fail(true, &mut err);
+    let r = unsafe { deferred::runtime_deferred_sync_then_fail(true, &mut err) };
     assert_eq!(r, 0, "the producer's value is discarded for the sentinel");
     assert_eq!(err.code, abi::FOREIGN_ERROR_CODE);
-    assert_eq!(c_ptr_to_string(err.message).unwrap(), "consumer said no");
-    abi::error_clear(&mut err);
+    assert_eq!(message(&err), "consumer said no");
 
-    assert!(
-        abi::take_foreign_error().is_none(),
-        "the thunk drained the recorded failure"
-    );
     assert_eq!(
-        deferred::weaveffi_deferred_sync_then_fail(false, &mut err),
+        unsafe { deferred::runtime_deferred_sync_then_fail(false, &mut err) },
         77
     );
     assert_eq!(err.code, 0, "a later call on the same thread is unaffected");
 }
 
 #[test]
+fn deferring_outside_any_call_is_dropped() {
+    // No thunk is running on this thread, so the failure goes to stderr
+    // instead of leaking into the next call.
+    abi::defer_foreign_error(weaveffi::ForeignError {
+        code: abi::FOREIGN_ERROR_CODE,
+        message: "stray".into(),
+    });
+    let mut err = ok_err();
+    assert_eq!(unsafe { demo::runtime_demo_add(1, 2, &mut err) }, 3);
+    assert_eq!(err.code, 0);
+}
+
+#[test]
 fn deferred_foreign_error_fires_the_async_callback_once() {
-    use std::os::raw::c_void;
-    use std::sync::mpsc;
-    use std::time::Duration;
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<i32>(tx);
 
-    type Msg = (i32, String, i32);
-    extern "C" fn cb(ctx: *mut c_void, err: *mut weaveffi_error, result: i32) {
-        let tx = unsafe { &*(ctx as *const mpsc::Sender<Msg>) };
-        let (code, message) = if err.is_null() {
-            (0, String::new())
-        } else {
-            let e = unsafe { &*err };
-            let out = (e.code, c_ptr_to_string(e.message).unwrap_or_default());
-            abi::error_free(err);
-            out
-        };
-        tx.send((code, message, result)).unwrap();
-    }
+    unsafe { deferred::runtime_deferred_later_then_fail(false, on_i32, ctx) };
+    assert_eq!(rx.recv_timeout(WAIT).unwrap(), (0, String::new(), 88));
 
-    let (tx, rx) = mpsc::channel::<Msg>();
-    let tx_ptr = Box::into_raw(Box::new(tx));
-
-    deferred::weaveffi_deferred_later_then_fail_async(false, cb, tx_ptr as *mut c_void);
-    let (code, _, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!((code, result), (0, 88));
-
-    deferred::weaveffi_deferred_later_then_fail_async(true, cb, tx_ptr as *mut c_void);
-    let (code, message, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    unsafe { deferred::runtime_deferred_later_then_fail(true, on_i32, ctx) };
+    let (code, message, result) = rx.recv_timeout(WAIT).unwrap();
     assert_eq!(code, abi::FOREIGN_ERROR_CODE);
     assert_eq!(message, "consumer said no, later");
     assert_eq!(result, 0);
@@ -1116,13 +1377,12 @@ fn deferred_foreign_error_fires_the_async_callback_once() {
         rx.recv_timeout(Duration::from_millis(200)).is_err(),
         "the completion callback fires exactly once"
     );
-
-    unsafe { drop(Box::from_raw(tx_ptr)) };
+    drop_ctx::<i32>(ctx);
 }
 
-/// Exercises nested-module codegen: the inner module's symbols must carry the
-/// joined `outer_inner` path, and a nested function may reference an interface
-/// declared in its parent module via `super::` (the `kvstore` `stats` pattern).
+/// Exercises nested-module codegen: the inner module's symbols carry the
+/// joined `outer_inner` path, and a nested function may reference an
+/// interface declared in its parent module via `super::`.
 #[weaveffi::module]
 pub mod outer {
     use std::sync::Arc;
@@ -1141,13 +1401,24 @@ pub mod outer {
         }
     }
 
+    /// A C-style enum declared in the parent module.
+    #[weaveffi::enumeration]
+    #[repr(i32)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Level {
+        /// Low.
+        Low = 1,
+        /// High.
+        High = 2,
+    }
+
     /// Return the same session (an `Arc<Self>`-typed parameter and return).
     #[weaveffi::export]
     pub fn share(session: Arc<Session>) -> Arc<Session> {
         session
     }
 
-    /// The nested sub-module: its symbols use the `outer_inner` prefix.
+    /// The nested sub-module: its symbols use the `outer_inner` path.
     #[weaveffi::module]
     pub mod inner {
         use std::sync::Arc;
@@ -1185,103 +1456,119 @@ pub mod outer {
         pub fn session_of(report: Report) -> Option<Arc<super::Session>> {
             report.session
         }
+
+        /// Raise a parent-module C-style enum (by value in and out).
+        #[weaveffi::export]
+        pub fn raise(level: super::Level) -> super::Level {
+            let _ = level;
+            super::Level::High
+        }
     }
 }
 
 #[test]
 fn nested_module_symbols_and_parent_type_reference() {
     let mut err = ok_err();
-    let session = outer::weaveffi_outer_Session_open(7, &mut err);
+    let session = unsafe { outer::runtime_outer_Session_open(7, &mut err) };
     assert_eq!(err.code, 0);
     assert!(!session.is_null());
 
-    // The nested function is reachable at `outer::inner::*` and its symbol
-    // carries the joined module path; its record return is a value buffer.
     let mut out_len: usize = 0;
-    let ptr = outer::inner::weaveffi_outer_inner_summarize(
-        session,
-        std::ptr::null(),
-        &mut out_len,
-        &mut err,
-    );
+    let ptr = unsafe {
+        outer::inner::runtime_outer_inner_summarize(
+            session,
+            std::ptr::null(),
+            &mut out_len,
+            &mut err,
+        )
+    };
     assert_eq!(err.code, 0);
     let report: outer::inner::Report = decode_ret(ptr, out_len);
     assert_eq!(report.score, 70);
     assert!(report.session.is_none());
 
-    let ptr =
-        outer::inner::weaveffi_outer_inner_summarize(session, session, &mut out_len, &mut err);
+    let ptr = unsafe {
+        outer::inner::runtime_outer_inner_summarize(session, session, &mut out_len, &mut err)
+    };
     let report: outer::inner::Report = decode_ret(ptr, out_len);
     assert_eq!(report.score, 77);
 
-    outer::weaveffi_outer_Session_destroy(session);
+    assert_eq!(
+        unsafe { outer::inner::runtime_outer_inner_raise(1, &mut err) },
+        2
+    );
+    unsafe { outer::runtime_outer_Session_destroy(session) };
 }
 
 #[test]
 fn object_reference_counting() {
     let mut err = ok_err();
-    let s = outer::weaveffi_outer_Session_open(3, &mut err);
+    unsafe {
+        let s = outer::runtime_outer_Session_open(3, &mut err);
 
-    // `share` retains through `Arc<Session>` in and hands back a new strong
-    // reference out; the pointer identity is the same allocation.
-    let again = outer::weaveffi_outer_share(s, &mut err);
-    assert_eq!(err.code, 0);
-    assert_eq!(again, s, "the same object, one more reference");
-    let third = outer::weaveffi_outer_Session_clone(s);
-    assert_eq!(third, s);
+        // `share` retains through `Arc<Session>` in and hands back a new
+        // strong reference; the pointer identity is the same allocation.
+        let again = outer::runtime_outer_share(s, &mut err);
+        assert_eq!(err.code, 0);
+        assert_eq!(again, s, "the same object, one more reference");
+        let third = outer::runtime_outer_Session_clone(s);
+        assert_eq!(third, s);
 
-    outer::weaveffi_outer_Session_destroy(s);
-    outer::weaveffi_outer_Session_destroy(again);
-    // Still alive through `third`.
-    let mut out_len: usize = 0;
-    let ptr = outer::inner::weaveffi_outer_inner_summarize(
-        third,
-        std::ptr::null(),
-        &mut out_len,
-        &mut err,
-    );
-    assert_eq!(err.code, 0);
-    let report: outer::inner::Report = decode_ret(ptr, out_len);
-    assert_eq!(report.score, 30);
-    outer::weaveffi_outer_Session_destroy(third);
-    outer::weaveffi_outer_Session_destroy(std::ptr::null_mut());
-    assert!(outer::weaveffi_outer_Session_clone(std::ptr::null()).is_null());
+        outer::runtime_outer_Session_destroy(s);
+        outer::runtime_outer_Session_destroy(again);
+        // Still alive through `third`.
+        let mut out_len: usize = 0;
+        let ptr = outer::inner::runtime_outer_inner_summarize(
+            third,
+            std::ptr::null(),
+            &mut out_len,
+            &mut err,
+        );
+        assert_eq!(err.code, 0);
+        let report: outer::inner::Report = decode_ret(ptr, out_len);
+        assert_eq!(report.score, 30);
+        outer::runtime_outer_Session_destroy(third);
+        outer::runtime_outer_Session_destroy(std::ptr::null_mut());
+        assert!(outer::runtime_outer_Session_clone(std::ptr::null()).is_null());
+    }
 }
 
 #[test]
 fn objects_inside_value_buffers_carry_a_reference() {
     let mut err = ok_err();
-    let s = outer::weaveffi_outer_Session_open(5, &mut err);
+    unsafe {
+        let s = outer::runtime_outer_Session_open(5, &mut err);
 
-    // `attach` retains the session inside the returned record: the buffer's
-    // object token is one strong reference the consumer adopts on decode.
-    let mut out_len: usize = 0;
-    let ptr = outer::inner::weaveffi_outer_inner_attach(s, &mut out_len, &mut err);
-    assert_eq!(err.code, 0);
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, out_len) }.to_vec();
-    abi::free_bytes(ptr as *mut u8, out_len);
-    // The consumer owns `s` and the token in `bytes`: two references.
-    outer::weaveffi_outer_Session_destroy(s);
+        // `attach` retains the session inside the returned record: the
+        // buffer's object token is one strong reference the consumer adopts.
+        let mut out_len: usize = 0;
+        let ptr = outer::inner::runtime_outer_inner_attach(s, &mut out_len, &mut err);
+        assert_eq!(err.code, 0);
+        let bytes = std::slice::from_raw_parts(ptr, out_len).to_vec();
+        abi::free_bytes(ptr.cast_mut(), out_len);
+        outer::runtime_outer_Session_destroy(s);
 
-    // Sending the buffer back transfers the token's reference to the producer,
-    // which returns it as the optional object result.
-    let back = outer::inner::weaveffi_outer_inner_session_of(bytes.as_ptr(), bytes.len(), &mut err);
-    assert_eq!(err.code, 0);
-    assert_eq!(back, s, "same allocation, still alive");
-    outer::weaveffi_outer_Session_destroy(back);
+        // Sending the buffer back transfers the token's reference to the
+        // producer, which returns it as the optional object result.
+        let back =
+            outer::inner::runtime_outer_inner_session_of(bytes.as_ptr(), bytes.len(), &mut err);
+        assert_eq!(err.code, 0);
+        assert_eq!(back, s, "same allocation, still alive");
+        outer::runtime_outer_Session_destroy(back);
 
-    // A record with no object decodes to a null optional object return.
-    let none = abi::encode_value(&outer::inner::Report {
-        score: 0,
-        session: None,
-    });
-    let back = outer::inner::weaveffi_outer_inner_session_of(none.as_ptr(), none.len(), &mut err);
-    assert!(back.is_null());
-    assert_eq!(err.code, 0);
+        let none = abi::encode_value(&outer::inner::Report {
+            score: 0,
+            session: None,
+        });
+        let back =
+            outer::inner::runtime_outer_inner_session_of(none.as_ptr(), none.len(), &mut err);
+        assert!(back.is_null());
+        assert_eq!(err.code, 0);
+    }
 }
 
-/// A producer module whose fallible function surfaces an IDL error domain's
-/// named codes through [`weaveffi::ErrorReport`].
+/// A producer module whose fallible function reports through a hand-written
+/// [`weaveffi::ErrorReport`] type rather than the domain enum itself.
 #[weaveffi::module]
 pub mod vault {
     use weaveffi::ErrorReport;
@@ -1296,10 +1583,18 @@ pub mod vault {
         Sealed = 2002,
     }
 
-    /// The producer's internal failure type. It carries payloads (which the
-    /// declared domain cannot), so it maps itself onto the domain's codes with
-    /// a hand-written `ErrorReport` and dynamic messages. It deliberately does
-    /// not implement `Display`, which would collide with the blanket impl.
+    impl std::fmt::Display for VaultError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(match self {
+                Self::NotFound => "entry not found",
+                Self::Sealed => "vault sealed",
+            })
+        }
+    }
+
+    /// The producer's internal failure type: it carries data the declared
+    /// domain doesn't, so it maps itself onto the domain's codes with a
+    /// hand-written `ErrorReport` and dynamic messages.
     pub enum VaultFailure {
         /// No entry exists for the key.
         NotFound,
@@ -1336,31 +1631,24 @@ pub mod vault {
 #[test]
 fn fallible_with_domain_error_codes() {
     let mut err = ok_err();
-    assert_eq!(vault::weaveffi_vault_fetch(21, &mut err), 42);
+    assert_eq!(unsafe { vault::runtime_vault_fetch(21, &mut err) }, 42);
     assert_eq!(err.code, 0);
 
-    // `Err` carries the producer-chosen code and message verbatim.
-    let r = vault::weaveffi_vault_fetch(0, &mut err);
+    let r = unsafe { vault::runtime_vault_fetch(0, &mut err) };
     assert_eq!(r, 0, "error path returns the zero sentinel");
     assert_eq!(err.code, 2001);
-    assert_eq!(c_ptr_to_string(err.message).unwrap(), "entry not found");
-    abi::error_clear(&mut err);
+    assert_eq!(message(&err), "entry not found");
 
-    let r = vault::weaveffi_vault_fetch(-1, &mut err);
+    let r = unsafe { vault::runtime_vault_fetch(-1, &mut err) };
     assert_eq!(r, 0);
     assert_eq!(err.code, 2002);
-    assert_eq!(
-        c_ptr_to_string(err.message).unwrap(),
-        "vault sealed: negative key"
-    );
-    abi::error_clear(&mut err);
+    assert_eq!(message(&err), "vault sealed: negative key");
 }
 
 /// A producer module that exports a `#[deprecated]` function. The generated
-/// thunk must still *call* the deprecated function, so it has to carry an
-/// `#[allow(deprecated)]` of its own; otherwise the workspace's `-D warnings`
-/// policy would reject the expansion. This module compiling at all is the
-/// proof.
+/// thunk must still *call* the deprecated function, so it carries an
+/// `#[allow(deprecated)]` of its own; this module compiling under the
+/// workspace's `-D warnings` policy is the proof.
 #[weaveffi::module]
 pub mod legacy {
     /// The modern entry point.
@@ -1390,6 +1678,12 @@ pub mod counters {
     pub enum CounterError {
         /// start value out of range
         OutOfRange = 1,
+    }
+
+    impl std::fmt::Display for CounterError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("step must be positive")
+        }
     }
 
     /// A monotonic counter, exported as an interface.
@@ -1474,7 +1768,7 @@ pub mod counters {
             self.value()
         }
 
-        /// Return a fresh counter asynchronously (async object result).
+        /// Return the same counter asynchronously (async object result).
         pub async fn snapshot_later(self: Arc<Self>) -> Arc<Counter> {
             self
         }
@@ -1506,232 +1800,218 @@ pub mod counters {
 #[test]
 fn interface_constructor_methods_destroy() {
     let mut err = ok_err();
+    unsafe {
+        let c = counters::runtime_counters_Counter_new(10, &mut err);
+        assert_eq!(err.code, 0);
+        assert!(!c.is_null());
 
-    let c = counters::weaveffi_counters_Counter_new(10, &mut err);
-    assert_eq!(err.code, 0);
-    assert!(!c.is_null());
+        assert_eq!(
+            counters::runtime_counters_Counter_increment(c, &mut err),
+            11
+        );
+        assert_eq!(
+            counters::runtime_counters_Counter_increment(c, &mut err),
+            12
+        );
+        assert_eq!(counters::runtime_counters_Counter_value(c, &mut err), 12);
+        assert_eq!(err.code, 0);
 
-    assert_eq!(
-        counters::weaveffi_counters_Counter_increment(c, &mut err),
-        11
-    );
-    assert_eq!(
-        counters::weaveffi_counters_Counter_increment(c, &mut err),
-        12
-    );
-    assert_eq!(counters::weaveffi_counters_Counter_value(c, &mut err), 12);
-    assert_eq!(err.code, 0);
+        let prefix = "n=";
+        let mut len = 0usize;
+        let label = counters::runtime_counters_Counter_label(
+            c,
+            prefix.as_ptr(),
+            prefix.len(),
+            &mut len,
+            &mut err,
+        );
+        assert_eq!(take_string(label, len), "n=12");
 
-    let prefix = string_to_c_ptr("n=");
-    let label = counters::weaveffi_counters_Counter_label(c, prefix, &mut err);
-    assert_eq!(c_ptr_to_string(label).unwrap(), "n=12");
-    free_string(label);
-    free_string(prefix);
-
-    counters::weaveffi_counters_Counter_destroy(c);
+        counters::runtime_counters_Counter_destroy(c);
+    }
 }
 
 #[test]
 fn interface_fallible_constructor() {
     let mut err = ok_err();
+    unsafe {
+        let ok = counters::runtime_counters_Counter_with_step(0, 5, &mut err);
+        assert_eq!(err.code, 0);
+        assert!(!ok.is_null());
+        assert_eq!(
+            counters::runtime_counters_Counter_increment(ok, &mut err),
+            5
+        );
+        counters::runtime_counters_Counter_destroy(ok);
 
-    let ok = counters::weaveffi_counters_Counter_with_step(0, 5, &mut err);
-    assert_eq!(err.code, 0);
-    assert!(!ok.is_null());
-    assert_eq!(
-        counters::weaveffi_counters_Counter_increment(ok, &mut err),
-        5
-    );
-    counters::weaveffi_counters_Counter_destroy(ok);
-
-    let bad = counters::weaveffi_counters_Counter_with_step(0, 0, &mut err);
-    assert!(bad.is_null());
-    assert_eq!(err.code, 1, "domain code from the #[weaveffi::error] enum");
-    assert_eq!(
-        c_ptr_to_string(err.message).unwrap(),
-        "start value out of range"
-    );
-    abi::error_clear(&mut err);
+        let bad = counters::runtime_counters_Counter_with_step(0, 0, &mut err);
+        assert!(bad.is_null());
+        assert_eq!(err.code, 1, "domain code from the #[weaveffi::error] enum");
+        assert_eq!(message(&err), "step must be positive");
+    }
 }
 
 #[test]
 fn interface_returning_method_and_static() {
     let mut err = ok_err();
-    assert_eq!(
-        counters::weaveffi_counters_Counter_default_start(&mut err),
-        0
-    );
+    unsafe {
+        assert_eq!(
+            counters::runtime_counters_Counter_default_start(&mut err),
+            0
+        );
 
-    let c = counters::weaveffi_counters_Counter_new(3, &mut err);
-    let snap = counters::weaveffi_counters_Counter_snapshot(c, &mut err);
-    assert!(!snap.is_null());
-    counters::weaveffi_counters_Counter_increment(c, &mut err);
-    assert_eq!(counters::weaveffi_counters_Counter_value(c, &mut err), 4);
-    assert_eq!(
-        counters::weaveffi_counters_Counter_value(snap, &mut err),
-        3,
-        "the snapshot is an independent object"
-    );
-    counters::weaveffi_counters_Counter_destroy(snap);
-    counters::weaveffi_counters_Counter_destroy(c);
+        let c = counters::runtime_counters_Counter_new(3, &mut err);
+        let snap = counters::runtime_counters_Counter_snapshot(c, &mut err);
+        assert!(!snap.is_null());
+        counters::runtime_counters_Counter_increment(c, &mut err);
+        assert_eq!(counters::runtime_counters_Counter_value(c, &mut err), 4);
+        assert_eq!(
+            counters::runtime_counters_Counter_value(snap, &mut err),
+            3,
+            "the snapshot is an independent object"
+        );
+        counters::runtime_counters_Counter_destroy(snap);
+        counters::runtime_counters_Counter_destroy(c);
+    }
 }
 
 #[test]
 fn interface_as_free_function_parameter() {
     let mut err = ok_err();
-    let c = counters::weaveffi_counters_Counter_new(21, &mut err);
-    assert_eq!(counters::weaveffi_counters_read_twice(c, &mut err), 42);
-    counters::weaveffi_counters_Counter_destroy(c);
+    unsafe {
+        let c = counters::runtime_counters_Counter_new(21, &mut err);
+        assert_eq!(counters::runtime_counters_read_twice(c, &mut err), 42);
+        counters::runtime_counters_Counter_destroy(c);
+    }
 }
 
 #[test]
 fn arc_self_receiver_and_optional_objects() {
     let mut err = ok_err();
-    let c = counters::weaveffi_counters_Counter_new(10, &mut err);
-    let shared = counters::weaveffi_counters_Counter_share(c, &mut err);
-    assert_eq!(err.code, 0);
-    assert_eq!(shared, c, "`self: Arc<Self>` returns the same object");
-    counters::weaveffi_counters_Counter_destroy(shared);
+    unsafe {
+        let c = counters::runtime_counters_Counter_new(10, &mut err);
+        let shared = counters::runtime_counters_Counter_share(c, &mut err);
+        assert_eq!(err.code, 0);
+        assert_eq!(shared, c, "`self: Arc<Self>` returns the same object");
+        counters::runtime_counters_Counter_destroy(shared);
 
-    let other = counters::weaveffi_counters_Counter_new(20, &mut err);
-    let bigger = counters::weaveffi_counters_Counter_larger(c, other, 0, &mut err);
-    assert_eq!(err.code, 0);
-    assert_eq!(
-        counters::weaveffi_counters_Counter_value(bigger, &mut err),
-        20
-    );
-    counters::weaveffi_counters_Counter_destroy(bigger);
+        let other = counters::runtime_counters_Counter_new(20, &mut err);
+        let bigger = counters::runtime_counters_Counter_larger(c, other, 0, &mut err);
+        assert_eq!(err.code, 0);
+        assert_eq!(
+            counters::runtime_counters_Counter_value(bigger, &mut err),
+            20
+        );
+        counters::runtime_counters_Counter_destroy(bigger);
 
-    let mine = counters::weaveffi_counters_Counter_larger(c, std::ptr::null(), 0, &mut err);
-    assert_eq!(
-        counters::weaveffi_counters_Counter_value(mine, &mut err),
-        10
-    );
-    counters::weaveffi_counters_Counter_destroy(mine);
+        let mine = counters::runtime_counters_Counter_larger(c, std::ptr::null(), 0, &mut err);
+        assert_eq!(counters::runtime_counters_Counter_value(mine, &mut err), 10);
+        counters::runtime_counters_Counter_destroy(mine);
 
-    let none = counters::weaveffi_counters_Counter_larger(c, other, 100, &mut err);
-    assert!(none.is_null());
-    assert_eq!(err.code, 0, "a null optional object return is not an error");
+        let none = counters::runtime_counters_Counter_larger(c, other, 100, &mut err);
+        assert!(none.is_null());
+        assert_eq!(err.code, 0, "a null optional object return is not an error");
 
-    counters::weaveffi_counters_Counter_destroy(other);
-    counters::weaveffi_counters_Counter_destroy(c);
+        counters::runtime_counters_Counter_destroy(other);
+        counters::runtime_counters_Counter_destroy(c);
+    }
 }
 
 #[test]
 fn iterator_of_objects() {
     let mut err = ok_err();
-    let c = counters::weaveffi_counters_Counter_new(5, &mut err);
-    let iter = counters::weaveffi_counters_Counter_fan_out(c, 3, &mut err);
-    assert_eq!(err.code, 0);
     let mut values = Vec::new();
-    loop {
-        let mut item: *mut counters::Counter = std::ptr::null_mut();
-        if counters::weaveffi_counters_Counter_FanOutIterator_next(iter, &mut item, &mut err) == 0 {
-            break;
+    unsafe {
+        let c = counters::runtime_counters_Counter_new(5, &mut err);
+        let iter = counters::runtime_counters_Counter_fan_out(c, 3, &mut err);
+        assert_eq!(err.code, 0);
+        loop {
+            let mut item: *mut counters::Counter = std::ptr::null_mut();
+            if counters::runtime_counters_Counter_FanOutIterator_next(iter, &mut item, &mut err)
+                == 0
+            {
+                break;
+            }
+            values.push(counters::runtime_counters_Counter_value(item, &mut err));
+            counters::runtime_counters_Counter_destroy(item);
         }
-        values.push(counters::weaveffi_counters_Counter_value(item, &mut err));
-        counters::weaveffi_counters_Counter_destroy(item);
+        counters::runtime_counters_Counter_FanOutIterator_destroy(iter);
+        counters::runtime_counters_Counter_destroy(c);
     }
-    counters::weaveffi_counters_Counter_FanOutIterator_destroy(iter);
-    counters::weaveffi_counters_Counter_destroy(c);
     assert_eq!(values, vec![5, 6, 7]);
 }
 
 #[test]
 fn async_methods_retain_the_receiver() {
-    use std::os::raw::c_void;
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    extern "C" fn on_value(ctx: *mut c_void, err: *mut weaveffi_error, result: i64) {
-        let tx = unsafe { &*(ctx as *const mpsc::Sender<i64>) };
-        assert!(err.is_null());
-        tx.send(result).unwrap();
-    }
-    extern "C" fn on_obj(
-        ctx: *mut c_void,
-        err: *mut weaveffi_error,
-        result: *mut counters::Counter,
-    ) {
-        let tx = unsafe { &*(ctx as *const mpsc::Sender<i64>) };
-        assert!(err.is_null());
-        let mut e = weaveffi_error::default();
-        let v = counters::weaveffi_counters_Counter_value(result, &mut e);
-        counters::weaveffi_counters_Counter_destroy(result);
-        tx.send(v).unwrap();
+    extern "C" fn on_obj(ctx: *mut c_void, err: *mut FfiError, result: *mut counters::Counter) {
+        let mut e = FfiError::default();
+        let v = unsafe {
+            let v = counters::runtime_counters_Counter_value(result, &mut e);
+            counters::runtime_counters_Counter_destroy(result);
+            v
+        };
+        send(ctx, err, v);
     }
 
     let mut err = ok_err();
-    let (tx, rx) = mpsc::channel::<i64>();
-    let tx_ptr = Box::into_raw(Box::new(tx));
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<i64>(tx);
 
-    let c = counters::weaveffi_counters_Counter_new(8, &mut err);
-    counters::weaveffi_counters_Counter_value_later_async(c, on_value, tx_ptr as *mut c_void);
-    counters::weaveffi_counters_Counter_snapshot_later_async(c, on_obj, tx_ptr as *mut c_void);
-    // Releasing the consumer's reference while calls are in flight is safe:
-    // each launcher retained its own.
-    counters::weaveffi_counters_Counter_destroy(c);
+    unsafe {
+        let c = counters::runtime_counters_Counter_new(8, &mut err);
+        counters::runtime_counters_Counter_value_later(c, on_i64, ctx);
+        counters::runtime_counters_Counter_snapshot_later(c, on_obj, ctx);
+        // Releasing the consumer's reference while calls are in flight is
+        // safe: each launcher retained its own.
+        counters::runtime_counters_Counter_destroy(c);
+    }
     let mut got = vec![
-        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        rx.recv_timeout(WAIT).unwrap().2,
+        rx.recv_timeout(WAIT).unwrap().2,
     ];
     got.sort_unstable();
     assert_eq!(got, vec![8, 8]);
 
     // A null receiver still completes (with a marshalling error).
-    extern "C" fn on_null(ctx: *mut c_void, err: *mut weaveffi_error, result: i64) {
-        let tx = unsafe { &*(ctx as *const mpsc::Sender<i64>) };
-        assert!(!err.is_null());
-        assert_eq!(unsafe { (*err).code }, abi::MARSHAL_ERROR_CODE);
-        abi::error_free(err);
-        tx.send(result).unwrap();
-    }
-    counters::weaveffi_counters_Counter_value_later_async(
-        std::ptr::null(),
-        on_null,
-        tx_ptr as *mut c_void,
-    );
-    assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
-    unsafe { drop(Box::from_raw(tx_ptr)) };
+    unsafe { counters::runtime_counters_Counter_value_later(std::ptr::null(), on_i64, ctx) };
+    let (code, _, result) = rx.recv_timeout(WAIT).unwrap();
+    assert_eq!((code, result), (abi::MARSHAL_ERROR_CODE, 0));
+    drop_ctx::<i64>(ctx);
 }
 
 #[test]
 fn interface_null_self_reports_error() {
     let mut err = ok_err();
-    let r = counters::weaveffi_counters_Counter_value(std::ptr::null(), &mut err);
+    let r = unsafe { counters::runtime_counters_Counter_value(std::ptr::null(), &mut err) };
     assert_eq!(r, 0);
-    assert_ne!(err.code, 0);
-    abi::error_clear(&mut err);
+    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
 }
 
 #[test]
 fn producer_panic_reports_panic_code() {
     let mut err = ok_err();
-    let c = counters::weaveffi_counters_Counter_new(0, &mut err);
+    unsafe {
+        let c = counters::runtime_counters_Counter_new(0, &mut err);
 
-    counters::weaveffi_counters_Counter_explode(c, &mut err);
-    assert_eq!(err.code, abi::PANIC_ERROR_CODE);
-    assert!(c_ptr_to_string(err.message)
-        .unwrap()
-        .contains("counter exploded"));
-    abi::error_clear(&mut err);
+        counters::runtime_counters_Counter_explode(c, &mut err);
+        assert_eq!(err.code, abi::PANIC_ERROR_CODE);
+        assert!(message(&err).contains("counter exploded"));
 
-    // The object is still usable and the error slot resets on the next call.
-    assert_eq!(counters::weaveffi_counters_Counter_value(c, &mut err), 0);
-    assert_eq!(err.code, 0);
-    counters::weaveffi_counters_Counter_destroy(c);
+        // The object is still usable and the error slot resets on the next call.
+        assert_eq!(counters::runtime_counters_Counter_value(c, &mut err), 0);
+        assert_eq!(err.code, 0);
+        counters::runtime_counters_Counter_destroy(c);
+    }
 }
 
 #[test]
 fn deprecated_export_thunk_compiles_and_runs() {
     let mut err = ok_err();
-    assert_eq!(legacy::weaveffi_legacy_add_one(41, &mut err), 42);
+    assert_eq!(unsafe { legacy::runtime_legacy_add_one(41, &mut err) }, 42);
     assert_eq!(err.code, 0);
 
-    // Calling the deprecated thunk would warn at this site, but the generated
-    // thunk's own `#[allow(deprecated)]` keeps the macro expansion clean.
     #[allow(deprecated)]
-    let bumped = legacy::weaveffi_legacy_bump(41, &mut err);
+    let bumped = unsafe { legacy::runtime_legacy_bump(41, &mut err) };
     assert_eq!(bumped, 42);
     assert_eq!(err.code, 0);
 }
@@ -1757,6 +2037,15 @@ pub mod quota {
         Unavailable = 3002,
     }
 
+    impl std::fmt::Display for QuotaError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Exceeded { limit, used } => write!(f, "used {used} of {limit}"),
+                Self::Unavailable => f.write_str("quota service unavailable"),
+            }
+        }
+    }
+
     /// Consume `amount` units against a limit of 100.
     #[weaveffi::export]
     pub fn consume(amount: i64) -> Result<i64, QuotaError> {
@@ -1776,28 +2065,27 @@ fn error_payload_fields_cross_the_abi() {
     let mut err = ok_err();
 
     // Success leaves the payload slots empty.
-    assert_eq!(quota::weaveffi_quota_consume(30, &mut err), 70);
+    assert_eq!(unsafe { quota::runtime_quota_consume(30, &mut err) }, 70);
     assert_eq!(err.code, 0);
     assert!(err.payload_ptr.is_null());
 
     // A payload-carrying variant serializes its fields in declaration order.
-    let r = quota::weaveffi_quota_consume(250, &mut err);
+    let r = unsafe { quota::runtime_quota_consume(250, &mut err) };
     assert_eq!(r, 0, "error path returns the zero sentinel");
     assert_eq!(err.code, 3001);
-    assert_eq!(c_ptr_to_string(err.message).unwrap(), "quota exceeded");
+    assert_eq!(message(&err), "used 250 of 100");
     assert!(!err.payload_ptr.is_null());
     let payload = unsafe { std::slice::from_raw_parts(err.payload_ptr, err.payload_len) };
     let mut reader = abi::BufferReader::new(payload);
     assert_eq!(reader.read_i64().unwrap(), 100, "limit field");
     assert_eq!(reader.read_i64().unwrap(), 250, "used field");
     reader.expect_end().unwrap();
-    abi::error_clear(&mut err);
+    unsafe { runtime_error_clear(&mut err) };
     assert!(err.payload_ptr.is_null(), "clear releases the payload");
 
     // A unit variant reports code and message with no payload.
-    let r = quota::weaveffi_quota_consume(-1, &mut err);
+    let r = unsafe { quota::runtime_quota_consume(-1, &mut err) };
     assert_eq!(r, 0);
     assert_eq!(err.code, 3002);
     assert!(err.payload_ptr.is_null());
-    abi::error_clear(&mut err);
 }

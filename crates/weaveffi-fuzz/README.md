@@ -10,11 +10,11 @@ locally and in CI.
 
 | Target | What it exercises |
 | --- | --- |
-| `fuzz_parse_yaml` | `weaveffi_ir::parse::parse_api_str(..., "yaml")` |
-| `fuzz_parse_json` | `weaveffi_ir::parse::parse_api_str(..., "json")` |
-| `fuzz_parse_toml` | `weaveffi_ir::parse::parse_api_str(..., "toml")` |
-| `fuzz_parse_type_ref` | `weaveffi_ir::ir::parse_type_ref` |
-| `fuzz_validate` | parses YAML, then runs `weaveffi_core::validate::validate_api` on success |
+| `fuzz_parse_yaml` | `weaveffi_model::parse::parse_api_str(..., "yaml")` |
+| `fuzz_parse_json` | `weaveffi_model::parse::parse_api_str(..., "json")` |
+| `fuzz_parse_toml` | `weaveffi_model::parse::parse_api_str(..., "toml")` |
+| `fuzz_parse_type_ref` | `weaveffi_model::ir::parse_type_ref` |
+| `fuzz_validate` | parses YAML, then runs `weaveffi_model::validate::validate_api` on success |
 
 Seed inputs for each target live in `fuzz/seeds/<target>/` and are committed
 to git. `fuzz/corpus/`, `fuzz/artifacts/`, and `fuzz/coverage/` are generated
@@ -68,8 +68,9 @@ cargo +nightly fuzz tmin \
     crates/weaveffi-fuzz/fuzz/artifacts/fuzz_parse_yaml/crash-<hash>
 ```
 
-Then turn the minimized reproducer into a regression test in the relevant
-crate (`weaveffi-ir` or `weaveffi-core`) before fixing the bug.
+Then turn the minimized reproducer into a regression test in
+`weaveffi-model` (the parsers and the validator both live there) before
+fixing the bug.
 
 ## Why is this gated behind a feature?
 

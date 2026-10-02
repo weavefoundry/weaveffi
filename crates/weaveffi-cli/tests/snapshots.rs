@@ -20,24 +20,24 @@
 //! conformance harness's job.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use camino::Utf8Path;
-use weaveffi_core::codegen::{ConfiguredBackend, Target};
-use weaveffi_core::resolved::ResolvedApi;
-use weaveffi_core::validate::validate_api;
-use weaveffi_gen_c::{CConfig, CGenerator};
-use weaveffi_gen_cpp::{CppConfig, CppGenerator};
-use weaveffi_gen_dart::{DartConfig, DartGenerator};
-use weaveffi_gen_dotnet::{DotnetConfig, DotnetGenerator};
-use weaveffi_gen_go::{GoConfig, GoGenerator};
-use weaveffi_gen_kotlin::{KotlinConfig, KotlinGenerator};
-use weaveffi_gen_node::{NodeConfig, NodeGenerator};
-use weaveffi_gen_python::{PythonConfig, PythonGenerator};
-use weaveffi_gen_ruby::{RubyConfig, RubyGenerator};
-use weaveffi_gen_swift::{SwiftConfig, SwiftGenerator};
-use weaveffi_gen_wasm::{WasmConfig, WasmGenerator};
-use weaveffi_ir::parse::parse_api_str;
+use weaveffi_gen::codegen::{ConfiguredBackend, Target};
+use weaveffi_gen::targets::c::{CConfig, CGenerator};
+use weaveffi_gen::targets::cpp::{CppConfig, CppGenerator};
+use weaveffi_gen::targets::dart::{DartConfig, DartGenerator};
+use weaveffi_gen::targets::dotnet::{DotnetConfig, DotnetGenerator};
+use weaveffi_gen::targets::go::{GoConfig, GoGenerator};
+use weaveffi_gen::targets::kotlin::{KotlinConfig, KotlinGenerator};
+use weaveffi_gen::targets::node::{NodeConfig, NodeGenerator};
+use weaveffi_gen::targets::python::{PythonConfig, PythonGenerator};
+use weaveffi_gen::targets::ruby::{RubyConfig, RubyGenerator};
+use weaveffi_gen::targets::swift::{SwiftConfig, SwiftGenerator};
+use weaveffi_gen::targets::wasm::{WasmConfig, WasmGenerator};
+use weaveffi_model::parse::parse_api_str;
+use weaveffi_model::resolved::ResolvedApi;
+use weaveffi_model::validate::validate_api;
 
 const FIXTURES: [&str; 5] = [
     "kitchen_sink",
@@ -55,27 +55,9 @@ fn load_api(stem: &str) -> ResolvedApi {
         .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
     let api = parse_api_str(&contents, "yaml")
         .unwrap_or_else(|e| panic!("parse fixture {}: {e}", path.display()));
-    validate_api(api, None).unwrap_or_else(|e| panic!("validate fixture {}: {e}", path.display()))
-}
-
-fn collect_files_sorted(root: &Path) -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.is_file() {
-                out.push(path);
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(root, &mut out);
-    out.sort();
-    out
+    validate_api(api, None)
+        .unwrap_or_else(|e| panic!("validate fixture {}: {e}", path.display()))
+        .with_identity(weaveffi_model::pkg::Identity::named(stem))
 }
 
 fn sanitize(rel: &Path) -> String {
@@ -115,19 +97,17 @@ fn assert_prelude_present(contents: &str, file: &Path) {
 }
 
 fn run_snapshots(target: &dyn Target) {
+    let out_dir = Utf8Path::new("out");
     for stem in FIXTURES {
         let api = load_api(stem);
-        let tmp = tempfile::tempdir().expect("create tempdir");
-        let out_dir = Utf8Path::from_path(tmp.path()).expect("utf8 tempdir");
-        target.generate(&api, out_dir).expect("generator failed");
-
-        let root = out_dir.join(target.name());
-        let files = collect_files_sorted(root.as_std_path());
+        let mut files = target.render(&api, out_dir);
+        files.sort_by(|a, b| a.path.cmp(&b.path));
         assert!(
             !files.is_empty(),
             "generator {} produced no files for fixture {stem}",
             target.name(),
         );
+        let root = out_dir.join(target.name());
 
         insta::with_settings!({
             snapshot_path => "snapshots",
@@ -136,13 +116,12 @@ fn run_snapshots(target: &dyn Target) {
         }, {
             for file in files {
                 let rel = file
-                    .strip_prefix(root.as_std_path())
+                    .path
+                    .strip_prefix(&root)
                     .expect("file under generator root");
-                let name = format!("{}_{stem}__{}", target.name(), sanitize(rel));
-                let contents = fs::read_to_string(&file)
-                    .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
-                insta::assert_snapshot!(name, redact_version(&contents));
-                assert_prelude_present(&contents, &file);
+                let name = format!("{}_{stem}__{}", target.name(), sanitize(rel.as_std_path()));
+                insta::assert_snapshot!(name, redact_version(&file.contents));
+                assert_prelude_present(&file.contents, file.path.as_std_path());
             }
         });
     }

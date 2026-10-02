@@ -4,16 +4,16 @@
 //!   1. every committed seed is well-formed for its target's parser, and
 //!   2. each fuzz target's underlying call pattern (the body of the
 //!      `fuzz_target!` macro invocation) keeps compiling against the upstream
-//!      APIs in `weaveffi-ir` and `weaveffi-core`.
+//!      APIs in `weaveffi-model`.
 //!
 //! If a parser or validator signature changes, this file is what should
 //! break first, long before a nightly fuzz run.
 
 use std::path::PathBuf;
 
-use weaveffi_core::validate::validate_api;
-use weaveffi_ir::ir::parse_type_ref;
-use weaveffi_ir::parse::parse_api_str;
+use weaveffi_model::ir::parse_type_ref;
+use weaveffi_model::parse::parse_api_str;
+use weaveffi_model::validate::validate_api;
 
 fn seed(target: &str, name: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

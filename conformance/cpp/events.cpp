@@ -1,4 +1,4 @@
-// Conformance consumer: events sample, C++ target (ABI revision 2).
+// Conformance consumer: events sample, C++ target.
 //
 // Drives the generated header-only wrapper over the callback-interface and
 // reference-counted-object surface:
@@ -12,11 +12,15 @@
 //  - the `bus` handed to `on_attached` is an owned wrapper the consumer may
 //    keep and use.
 //  - `Delivery` return values steer `publish`'s accepted count.
-//  - a subscriber that throws surfaces to the caller as `WeaveFFIError`
-//    with code -4 and leaves the bus usable.
+//  - a subscriber that throws surfaces to the caller as `Error` with code
+//    -4 and leaves the bus usable. `route` is a `Result`-returning method on
+//    the producer side, so its failure arrives there as an `Err` value the
+//    bus propagates; `on_message` returns a plain value, so its failure
+//    aborts the producer's call directly. Both reach C++ the same way.
 //  - `messages()` is a lazy single-pass range; `last_message()` is an
 //    optional record; `publish_later` is a std::future settled from a
 //    producer thread.
+// Ends by asserting the producer's leak counters are all zero.
 // Exits non-zero on the first failed check.
 
 #include <cstdio>
@@ -29,9 +33,11 @@
 #include <utility>
 #include <vector>
 
-#include "weaveffi.hpp"
+#include "check.hpp"
+#include "events.hpp"
 
-using namespace weaveffi;
+using namespace events;
+namespace ev = ::events::events;
 
 static void check(bool ok, const char* what) {
     if (!ok) {
@@ -47,7 +53,7 @@ struct SubState {
     std::vector<Message> received;
     int attached = 0;
     int64_t attached_count_seen = -1;
-    const weaveffi_events_EventBus* attached_handle = nullptr;
+    const events_events_EventBus* attached_handle = nullptr;
     std::optional<EventBus> kept_bus;
     int freed = 0;
 };
@@ -68,8 +74,8 @@ public:
 
     ~RecordingSubscriber() override { state_->freed++; }
 
-    Delivery route(const std::string& topic) override {
-        state_->routed.push_back(topic);
+    Delivery route(std::string_view topic) override {
+        state_->routed.emplace_back(topic);
         if (topic == skip_topic_) return Delivery::Skip;
         if (topic == stop_topic_) return Delivery::AcceptAndStop;
         return Delivery::Accept;
@@ -101,8 +107,8 @@ public:
     ThrowingSubscriber(std::string route_bomb, std::string message_bomb)
         : route_bomb_(std::move(route_bomb)), message_bomb_(std::move(message_bomb)) {}
 
-    Delivery route(const std::string& topic) override {
-        if (topic == route_bomb_) throw std::runtime_error("route rejected " + topic);
+    Delivery route(std::string_view topic) override {
+        if (topic == route_bomb_) throw std::runtime_error("route rejected " + std::string(topic));
         return Delivery::Accept;
     }
 
@@ -114,8 +120,8 @@ public:
     void on_attached(EventBus) override {}
 };
 
-int main() {
-    check_abi_version();
+static void run() {
+    check_library();
 
     EventBus bus;
     check(bus.handle() != nullptr, "constructor yields a live handle");
@@ -250,14 +256,14 @@ int main() {
         auto tmp_state = std::make_shared<SubState>();
         auto tmp = std::make_shared<RecordingSubscriber>(tmp_state, "quiet", "stop", false);
         std::weak_ptr<Subscriber> weak = tmp;
-        check(events::route_once(std::move(tmp), "quiet") == Delivery::Skip, "route_once Skip");
+        check(ev::route_once(std::move(tmp), "quiet") == Delivery::Skip, "route_once Skip");
         check(weak.expired() && tmp_state->freed == 1,
               "route_once released the subscriber when the call returned");
         tmp_state = std::make_shared<SubState>();
-        check(events::route_once(std::make_shared<RecordingSubscriber>(tmp_state, "", "stop", false),
+        check(ev::route_once(std::make_shared<RecordingSubscriber>(tmp_state, "", "stop", false),
                                  "stop") == Delivery::AcceptAndStop,
               "route_once AcceptAndStop");
-        check(events::route_once(std::make_shared<RecordingSubscriber>(tmp_state, "", "", false),
+        check(ev::route_once(std::make_shared<RecordingSubscriber>(tmp_state, "", "", false),
                                  "other") == Delivery::Accept,
               "route_once Accept");
         check(tmp_state->attached == 0, "route_once never calls on_attached");
@@ -287,7 +293,7 @@ int main() {
         bool caught = false;
         try {
             bus2.publish("boom", "x", {});
-        } catch (const WeaveFFIError& e) {
+        } catch (const Error& e) {
             caught = true;
             check(e.code() == -4, "route exception maps to FOREIGN_ERROR_CODE (-4)");
             check(std::string(e.what()).find("route rejected boom") != std::string::npos,
@@ -299,7 +305,7 @@ int main() {
         caught = false;
         try {
             bus2.publish("fine", "explode", {});
-        } catch (const WeaveFFIError& e) {
+        } catch (const Error& e) {
             caught = true;
             check(e.code() == -4, "on_message exception maps to -4");
             check(std::string(e.what()).find("on_message exploded") != std::string::npos,
@@ -316,7 +322,7 @@ int main() {
         caught = false;
         try {
             bus2.publish_later("boom", "z").get();
-        } catch (const WeaveFFIError& e) {
+        } catch (const Error& e) {
             caught = true;
             check(e.code() == -4, "async foreign error maps to -4");
         }
@@ -325,8 +331,8 @@ int main() {
         // route_once with a throwing subscriber.
         caught = false;
         try {
-            events::route_once(std::make_shared<ThrowingSubscriber>("boom", ""), "boom");
-        } catch (const WeaveFFIError& e) {
+            ev::route_once(std::make_shared<ThrowingSubscriber>("boom", ""), "boom");
+        } catch (const Error& e) {
             caught = (e.code() == -4);
         }
         check(caught, "route_once surfaces the foreign error");
@@ -350,7 +356,12 @@ int main() {
     check(bus.publish("after", "clear", {}) == 0, "publishing with no subscribers accepts none");
     check(bus.last_message()->seq == 5, "log kept counting");
 
-    // `bus` releases the last reference when main returns.
+    // `bus` releases the last reference when run returns.
+}
+
+int main() {
+    run();
+    check_no_leaks(events_debug_live, "events");
     std::printf("cpp/events: OK\n");
     return 0;
 }

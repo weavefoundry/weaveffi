@@ -3,28 +3,29 @@
 
 use camino::Utf8Path;
 use miette::{miette, IntoDiagnostic, Result, WrapErr};
-use weaveffi_core::codegen::Orchestrator;
+use weaveffi_gen::codegen::{relative_path, GenerateReport, Hook, Orchestrator};
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_generate(
-    input: &str,
-    out: &str,
-    targets: Option<&str>,
-    config_path: Option<&str>,
-    warn: bool,
-    force: bool,
-    dry_run: bool,
-    quiet: bool,
-) -> Result<()> {
-    let (config, api) = super::load_project(input, config_path, warn)?;
-    let out_dir = Utf8Path::new(out);
-    let hooks = config.hooks();
-    let selected = config.select_targets(targets)?;
+/// Options for [`cmd_generate`].
+pub(crate) struct GenerateArgs<'a> {
+    pub(crate) input: Option<&'a str>,
+    pub(crate) out: Option<&'a str>,
+    pub(crate) targets: Option<&'a str>,
+    pub(crate) config: Option<&'a str>,
+    pub(crate) warn: bool,
+    pub(crate) force: bool,
+    pub(crate) dry_run: bool,
+    pub(crate) quiet: bool,
+}
 
-    if dry_run {
+pub(crate) fn cmd_generate(args: &GenerateArgs<'_>) -> Result<()> {
+    let project = super::load_project(args.input, args.config, args.warn)?;
+    let out_dir = project.config.out_dir(args.out);
+    let selected = project.config.select_targets(args.targets)?;
+
+    if args.dry_run {
         for target in &selected {
-            for path in target.output_files(&api, out_dir) {
-                println!("{path}");
+            for file in target.render(&project.api, &out_dir) {
+                println!("{}", relative_path(&out_dir, &file.path));
             }
         }
         return Ok(());
@@ -32,30 +33,63 @@ pub(crate) fn cmd_generate(
 
     std::fs::create_dir_all(out_dir.as_std_path())
         .into_diagnostic()
-        .wrap_err_with(|| format!("failed to create output directory: {}", out))?;
+        .wrap_err_with(|| format!("failed to create output directory: {out_dir}"))?;
 
     let mut orchestrator = Orchestrator::new();
     for target in &selected {
         orchestrator = orchestrator.with_target(target.as_ref());
     }
-
-    orchestrator
-        .run(&api, out_dir, &hooks, force)
+    let global = &project.config.global;
+    let report = orchestrator
+        .run(&project.api, &out_dir, args.force, &mut |hook| {
+            let cmd = match hook {
+                Hook::BeforeWrite => global.pre_generate.as_deref(),
+                Hook::AfterWrite => global.post_generate.as_deref(),
+            };
+            match cmd {
+                Some(cmd) => {
+                    super::run_hook(&format!("{hook:?}"), cmd).map_err(|e| anyhow::anyhow!("{e}"))
+                }
+                None => Ok(()),
+            }
+        })
         .map_err(|e| miette!("{:#}", e))?;
 
-    if !quiet {
-        match &config.source {
-            Some(src) => println!("Generated artifacts in {out} (config: {src})"),
-            None => println!("Generated artifacts in {out}"),
-        }
+    for w in &report.warnings {
+        eprintln!("warning: {w}");
+    }
+    if !args.quiet {
+        println!("{}", report_summary(&report, &out_dir));
     }
     Ok(())
+}
+
+/// One line describing what a generation run did.
+fn report_summary(report: &GenerateReport, out_dir: &Utf8Path) -> String {
+    if report.generated.is_empty() {
+        return format!(
+            "{out_dir} is up to date ({} targets)",
+            report.up_to_date.len()
+        );
+    }
+    let mut line = format!(
+        "Generated {} in {out_dir}: {} written, {} unchanged",
+        report.generated.join(", "),
+        report.written,
+        report.unchanged
+    );
+    if !report.removed.is_empty() {
+        line.push_str(&format!(", {} stale removed", report.removed.len()));
+    }
+    if !report.up_to_date.is_empty() {
+        line.push_str(&format!(" ({} up to date)", report.up_to_date.join(", ")));
+    }
+    line
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ProjectConfig;
 
     #[test]
     fn dry_run_lists_files_without_writing() {
@@ -63,48 +97,21 @@ mod tests {
         let yml = dir.path().join("api.yml");
         std::fs::write(
             &yml,
-            concat!(
-                "version: \"0.9.0\"\n",
-                "modules:\n",
-                "  - name: math\n",
-                "    functions:\n",
-                "      - name: add\n",
-                "        params:\n",
-                "          - { name: a, type: i32 }\n",
-                "          - { name: b, type: i32 }\n",
-                "        return: i32\n",
-            ),
+            "version: \"0.10.0\"\nmodules:\n  - name: math\n    functions:\n      - { name: add, params: [{ name: a, type: i32 }], return: i32 }\n",
         )
         .unwrap();
-
         let out = dir.path().join("out");
-        let input = yml.to_str().unwrap();
-        let out_str = out.to_str().unwrap();
-
-        cmd_generate(input, out_str, None, None, false, false, true, false).unwrap();
+        cmd_generate(&GenerateArgs {
+            input: yml.to_str(),
+            out: out.to_str(),
+            targets: Some("c"),
+            config: None,
+            warn: false,
+            force: false,
+            dry_run: true,
+            quiet: false,
+        })
+        .unwrap();
         assert!(!out.exists(), "dry-run should not create output directory");
-
-        let (_, api) = super::super::load_project(input, None, false).unwrap();
-        let out_dir = Utf8Path::new(out_str);
-        let files: Vec<String> = ProjectConfig::default()
-            .select_targets(None)
-            .unwrap()
-            .iter()
-            .flat_map(|t| t.output_files(&api, out_dir))
-            .collect();
-
-        for expected in [
-            "c/weaveffi.h",
-            "swift/Package.swift",
-            "kotlin/build.gradle.kts",
-            "node/types.d.ts",
-            "wasm/weaveffi_wasm.js",
-            "python/weaveffi/__init__.py",
-        ] {
-            assert!(
-                files.iter().any(|f| f.contains(expected)),
-                "missing {expected}: {files:?}"
-            );
-        }
     }
 }

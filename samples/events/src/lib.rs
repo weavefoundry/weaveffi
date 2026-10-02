@@ -2,7 +2,7 @@
 //! callback interface, a reference-counted object, and an iterator.
 //!
 //! The `#[weaveffi::module]` expansion emits exactly the ABI the WeaveFFI
-//! generators bind to (see the generated `weaveffi.h`): a `Subscriber` vtable
+//! generators bind to (see the generated `events.h`): a `Subscriber` vtable
 //! the consumer implements, an `EventBus` object with `_clone`/`_destroy`
 //! reference counting, and an opaque iterator with an
 //! `int32_t next(iter, out_item, out_err)` contract. The conformance harness
@@ -11,8 +11,13 @@
 //!
 //! The producer writes only safe Rust. The consumer's subscriber arrives as an
 //! `Arc<dyn Subscriber>`; the bus retains it for as long as it likes and the
-//! consumer's `free` entry fires when the last reference drops. A subscriber
-//! that fails aborts the publishing call with `FOREIGN_ERROR_CODE`, so the bus
+//! consumer's `free` entry fires when the last reference drops.
+//!
+//! The two callback styles are both on show. `route` returns
+//! `Result<Delivery, ForeignError>`, so a consumer failure comes back as a
+//! value; the bus chooses to propagate it, aborting the call with
+//! `FOREIGN_ERROR_CODE`. `on_message` and `on_attached` return plain values,
+//! so a consumer failure there aborts the call directly. Either way the bus
 //! snapshots its subscriber list before calling out and never holds a lock
 //! across a callback.
 
@@ -52,8 +57,9 @@ pub mod events {
     /// deliver each message and then calls `on_message` for accepted ones.
     #[weaveffi::callback_interface]
     pub trait Subscriber: Send + Sync {
-        /// Decide how the bus should treat `topic` for this subscriber.
-        fn route(&self, topic: String) -> Delivery;
+        /// Decide how the bus should treat `topic` for this subscriber. A
+        /// consumer failure is returned as an `Err`.
+        fn route(&self, topic: &str) -> Result<Delivery, weaveffi::ForeignError>;
         /// Receive an accepted message. Returns the subscriber's running count
         /// of received messages.
         fn on_message(&self, message: &Message) -> i64;
@@ -112,7 +118,16 @@ pub mod events {
                 .clone();
             let mut delivered = 0;
             for sub in &subs {
-                match sub.route(message.topic.clone()) {
+                let delivery = match sub.route(&message.topic) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        // Propagate the subscriber's failure to our caller,
+                        // exactly as a plain-return method would have.
+                        weaveffi::abi::raise_foreign_error(e);
+                        return delivered;
+                    }
+                };
+                match delivery {
                     Delivery::Skip => {}
                     Delivery::Accept => {
                         sub.on_message(&message);
@@ -172,10 +187,14 @@ pub mod events {
         }
     }
 
-    /// Ask `subscriber` how it would route `topic` without a bus.
+    /// Ask `subscriber` how it would route `topic` without a bus. A
+    /// subscriber failure fails the call.
     #[weaveffi::export]
-    pub fn route_once(subscriber: Arc<dyn Subscriber>, topic: String) -> Delivery {
-        subscriber.route(topic)
+    pub fn route_once(subscriber: Arc<dyn Subscriber>, topic: &str) -> Delivery {
+        subscriber.route(topic).unwrap_or_else(|e| {
+            weaveffi::abi::raise_foreign_error(e);
+            Delivery::Skip
+        })
     }
 }
 
@@ -185,15 +204,10 @@ weaveffi::export_runtime!();
 #[allow(unsafe_code)]
 mod tests {
     use crate::events::*;
-    use std::ffi::CString;
-    use std::os::raw::{c_char, c_void};
+    use std::os::raw::c_void;
     use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
     use std::sync::Arc;
-    use weaveffi::abi::{self, weaveffi_error};
-
-    fn new_err() -> weaveffi_error {
-        weaveffi_error::default()
-    }
+    use weaveffi::abi::{self, FfiError};
 
     /// A consumer-side subscriber, exactly as a generated binding builds one:
     /// a heap-allocated context and a process-wide vtable.
@@ -207,17 +221,16 @@ mod tests {
 
     unsafe extern "C" fn route(
         ctx: *mut c_void,
-        topic: *const c_char,
-        out_err: *mut weaveffi_error,
+        topic_ptr: *const u8,
+        topic_len: usize,
+        out_err: *mut FfiError,
     ) -> i32 {
-        let state = &*(ctx as *const SubState);
-        let topic = abi::c_ptr_to_string(topic).unwrap();
+        let state = unsafe { &*(ctx as *const SubState) };
+        // String arguments are borrowed `(ptr, len)` runs for the call.
+        let topic = unsafe { abi::lift_str(topic_ptr, topic_len) }.unwrap();
         if topic == state.fail_topic {
-            abi::error_set(
-                out_err,
-                abi::FOREIGN_ERROR_CODE,
-                "subscriber rejected topic",
-            );
+            let msg = c"subscriber rejected topic";
+            unsafe { crate::events_error_set(out_err, abi::FOREIGN_ERROR_CODE, msg.as_ptr()) };
             return 0;
         }
         if topic == state.skip_topic {
@@ -233,32 +246,29 @@ mod tests {
         ctx: *mut c_void,
         message_ptr: *const u8,
         message_len: usize,
-        _out_err: *mut weaveffi_error,
+        _out_err: *mut FfiError,
     ) -> i64 {
-        let state = &*(ctx as *const SubState);
+        let state = unsafe { &*(ctx as *const SubState) };
         let message: Message =
-            abi::decode_value(std::slice::from_raw_parts(message_ptr, message_len)).unwrap();
+            abi::decode_value(unsafe { std::slice::from_raw_parts(message_ptr, message_len) })
+                .unwrap();
         assert!(message.seq >= 1);
         state.received.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    unsafe extern "C" fn on_attached(
-        ctx: *mut c_void,
-        bus: *mut EventBus,
-        _out_err: *mut weaveffi_error,
-    ) {
-        let state = &*(ctx as *const SubState);
+    unsafe extern "C" fn on_attached(ctx: *mut c_void, bus: *mut EventBus, _err: *mut FfiError) {
+        let state = unsafe { &*(ctx as *const SubState) };
         state.attached.fetch_add(1, Ordering::SeqCst);
         // The reference is ours: dropping it must not free the live bus.
-        weaveffi_events_EventBus_destroy(bus);
+        unsafe { events_events_EventBus_destroy(bus) };
     }
 
     unsafe extern "C" fn free(ctx: *mut c_void) {
-        let state = Box::from_raw(ctx as *mut SubState);
+        let state = unsafe { Box::from_raw(ctx as *mut SubState) };
         state.freed.fetch_add(1, Ordering::SeqCst);
     }
 
-    static VTABLE: weaveffi_events_Subscriber_vtable = weaveffi_events_Subscriber_vtable {
+    static VTABLE: events_events_Subscriber_vtable = events_events_Subscriber_vtable {
         route,
         on_message,
         on_attached,
@@ -275,37 +285,44 @@ mod tests {
         })) as *mut c_void
     }
 
-    fn publish(bus: *mut EventBus, topic: &str, text: &str, err: &mut weaveffi_error) -> i64 {
-        let topic = CString::new(topic).unwrap();
-        let text = CString::new(text).unwrap();
+    fn new_bus() -> *mut EventBus {
+        let mut err = FfiError::default();
+        let bus = unsafe { events_events_EventBus_new(&mut err) };
+        assert!(!bus.is_null());
+        bus
+    }
+
+    fn subscribe(bus: *mut EventBus, sub: *mut c_void) -> i64 {
+        let mut err = FfiError::default();
+        unsafe { events_events_EventBus_subscribe(bus, sub, &VTABLE, &mut err) }
+    }
+
+    fn publish(bus: *mut EventBus, topic: &str, text: &str, err: &mut FfiError) -> i64 {
         let tags = abi::encode_value(&vec!["a".to_string()]);
-        weaveffi_events_EventBus_publish(
-            bus,
-            topic.as_ptr(),
-            text.as_ptr(),
-            tags.as_ptr(),
-            tags.len(),
-            err,
-        )
+        unsafe {
+            events_events_EventBus_publish(
+                bus,
+                topic.as_ptr(),
+                topic.len(),
+                text.as_ptr(),
+                text.len(),
+                tags.as_ptr(),
+                tags.len(),
+                err,
+            )
+        }
     }
 
     #[test]
     fn subscribe_publish_and_iterate() {
-        let mut err = new_err();
+        let mut err = FfiError::default();
         let freed = Arc::new(AtomicUsize::new(0));
-        let bus = weaveffi_events_EventBus_new(&mut err);
-        assert!(!bus.is_null());
+        let bus = new_bus();
 
         let a = new_sub("quiet", "", &freed);
         let b = new_sub("", "", &freed);
-        assert_eq!(
-            weaveffi_events_EventBus_subscribe(bus, a, &VTABLE, &mut err),
-            1
-        );
-        assert_eq!(
-            weaveffi_events_EventBus_subscribe(bus, b, &VTABLE, &mut err),
-            2
-        );
+        assert_eq!(subscribe(bus, a), 1);
+        assert_eq!(subscribe(bus, b), 2);
         let a_state = unsafe { &*(a as *const SubState) };
         assert_eq!(a_state.attached.load(Ordering::SeqCst), 1);
 
@@ -314,53 +331,56 @@ mod tests {
         assert_eq!(publish(bus, "stop", "last", &mut err), 1);
         assert_eq!(err.code, 0);
 
-        let iter = weaveffi_events_EventBus_messages(bus, &mut err);
+        let iter = unsafe { events_events_EventBus_messages(bus, &mut err) };
         let mut got = Vec::new();
         loop {
-            let mut item: *const c_char = std::ptr::null();
-            if weaveffi_events_EventBus_MessagesIterator_next(iter, &mut item, &mut err) == 0 {
+            let mut item: *const u8 = std::ptr::null();
+            let mut len = 0usize;
+            let has = unsafe {
+                events_events_EventBus_MessagesIterator_next(iter, &mut item, &mut len, &mut err)
+            };
+            if has == 0 {
                 break;
             }
-            got.push(abi::c_ptr_to_string(item).unwrap());
-            abi::free_string(item);
+            got.push(unsafe { abi::lift_string(item, len) }.unwrap());
+            unsafe { crate::events_free_bytes(item.cast_mut(), len) };
         }
-        weaveffi_events_EventBus_MessagesIterator_destroy(iter);
+        unsafe { events_events_EventBus_MessagesIterator_destroy(iter) };
         assert_eq!(got, vec!["hello", "psst", "last"]);
 
         let mut len = 0usize;
-        let ptr = weaveffi_events_EventBus_last_message(bus, &mut len, &mut err);
+        let ptr = unsafe { events_events_EventBus_last_message(bus, &mut len, &mut err) };
         let last: Option<Message> =
             abi::decode_value(unsafe { std::slice::from_raw_parts(ptr, len) }).unwrap();
-        abi::free_bytes(ptr as *mut u8, len);
+        unsafe { crate::events_free_bytes(ptr.cast_mut(), len) };
         assert_eq!(last.unwrap().text, "last");
 
-        weaveffi_events_EventBus_clear_subscribers(bus, &mut err);
+        unsafe { events_events_EventBus_clear_subscribers(bus, &mut err) };
         assert_eq!(
             freed.load(Ordering::SeqCst),
             2,
             "free ran once per subscriber"
         );
-        weaveffi_events_EventBus_destroy(bus);
+        unsafe { events_events_EventBus_destroy(bus) };
     }
 
     #[test]
-    fn foreign_error_aborts_publish() {
-        let mut err = new_err();
+    fn a_failed_route_aborts_publish() {
+        let mut err = FfiError::default();
         let freed = Arc::new(AtomicUsize::new(0));
-        let bus = weaveffi_events_EventBus_new(&mut err);
-        let a = new_sub("", "boom", &freed);
-        weaveffi_events_EventBus_subscribe(bus, a, &VTABLE, &mut err);
+        let bus = new_bus();
+        subscribe(bus, new_sub("", "boom", &freed));
         publish(bus, "boom", "x", &mut err);
         assert_eq!(err.code, abi::FOREIGN_ERROR_CODE);
-        assert!(abi::c_ptr_to_string(err.message)
-            .unwrap()
-            .contains("rejected topic"));
-        abi::error_clear(&mut err);
+        assert_eq!(
+            unsafe { err.message_str() },
+            Some("subscriber rejected topic")
+        );
 
         // The bus is still usable afterward.
         assert_eq!(publish(bus, "ok", "y", &mut err), 1);
         assert_eq!(err.code, 0);
-        weaveffi_events_EventBus_destroy(bus);
+        unsafe { events_events_EventBus_destroy(bus) };
         assert_eq!(
             freed.load(Ordering::SeqCst),
             1,
@@ -370,27 +390,45 @@ mod tests {
 
     #[test]
     fn route_once_does_not_retain() {
-        let mut err = new_err();
+        let mut err = FfiError::default();
         let freed = Arc::new(AtomicUsize::new(0));
-        let a = new_sub("quiet", "", &freed);
-        let topic = CString::new("quiet").unwrap();
-        let d = weaveffi_events_route_once(a, &VTABLE, topic.as_ptr(), &mut err);
+        let topic = "quiet";
+        let d = unsafe {
+            events_events_route_once(
+                new_sub("quiet", "", &freed),
+                &VTABLE,
+                topic.as_ptr(),
+                topic.len(),
+                &mut err,
+            )
+        };
         assert_eq!(d, Delivery::Skip as i32);
         assert_eq!(freed.load(Ordering::SeqCst), 1);
+
+        let d = unsafe {
+            events_events_route_once(
+                new_sub("", "quiet", &freed),
+                &VTABLE,
+                topic.as_ptr(),
+                topic.len(),
+                &mut err,
+            )
+        };
+        assert_eq!(d, 0);
+        assert_eq!(err.code, abi::FOREIGN_ERROR_CODE);
     }
 
     #[test]
     fn reference_counting() {
-        let mut err = new_err();
-        let bus = weaveffi_events_EventBus_new(&mut err);
-        let again = weaveffi_events_EventBus_clone(bus);
-        assert_eq!(bus, again);
-        weaveffi_events_EventBus_destroy(bus);
-        assert_eq!(
-            weaveffi_events_EventBus_subscriber_count(again, &mut err),
-            0
-        );
-        weaveffi_events_EventBus_destroy(again);
-        weaveffi_events_EventBus_destroy(std::ptr::null_mut());
+        let mut err = FfiError::default();
+        let bus = new_bus();
+        unsafe {
+            let again = events_events_EventBus_clone(bus);
+            assert_eq!(bus, again);
+            events_events_EventBus_destroy(bus);
+            assert_eq!(events_events_EventBus_subscriber_count(again, &mut err), 0);
+            events_events_EventBus_destroy(again);
+            events_events_EventBus_destroy(std::ptr::null_mut());
+        }
     }
 }

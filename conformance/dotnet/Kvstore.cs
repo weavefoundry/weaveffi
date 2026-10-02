@@ -1,33 +1,28 @@
 // Conformance consumer: kvstore sample, .NET target.
 //
-// Full-surface drive of the generated P/Invoke wrapper (Kvstore.cs, namespace
-// Kvstore) at ABI 2: the reference-counted Store object class (static Open
+// Full-surface drive of the generated Kvstore project: the Store class (static Open
 // factory throwing the typed KvException IoError=1004 on an empty path,
 // instance methods put/get/delete/list_keys/count/clear, the deprecated
-// legacy_put, the Task-returning Compact, the DefaultCapacity static), the
+// legacy_put, the cancellable Task-returning Compact, the DefaultCapacity static), the
 // optional buffered `Entry?` return decoded into a plain value class, direct
 // value-class construction of Entry, the IEnumerable-backed ListKeys iterator,
 // the cross-module KvStats.GetStats, the `IEvictionListener` callback
 // interface implemented in C# (fired synchronously on delete and on an
 // expired read, detached when it returns false, replaced and cleared, and a
-// throwing listener surfacing to the caller as WeaveFFIException with
+// throwing listener surfacing to the caller as NativeException with
 // ForeignErrorCode -4), the object graph (Share returning a second wrapper to
 // the same native object, Fork, `Store?` both ways through Larger, the
 // StoreInfo record carrying Store objects, OpenMany returning a list of
 // objects, TotalCount taking a list of objects plus an optional record with
 // objects), the typed KvException codes (KeyNotFound=1001, Expired=1002), and
 // IDisposable release (safe double Dispose, ObjectDisposedException after).
-// The producer cdylib is resolved by absolute path via a DllImportResolver
-// reading WEAVEFFI_LIBRARY.
-//
-// The harness compiles the generated source into this assembly, so the
-// wrapper's `internal` Handle property is reachable and used to prove two
-// wrappers point at the same native object.
+// Wrapper equality is native object identity. Ends by asserting the
+// producer's leak counters are zero.
 
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using Kvstore;
 
@@ -71,16 +66,16 @@ internal static class Program
         }
     }
 
-    static async Task<int> Main()
+    static int Main()
     {
-        var lib = Environment.GetEnvironmentVariable("WEAVEFFI_LIBRARY");
-        NativeLibrary.SetDllImportResolver(typeof(Program).Assembly, (name, asm, search) =>
-        {
-            if (name == "weaveffi" && !string.IsNullOrEmpty(lib))
-                return NativeLibrary.Load(lib);
-            return IntPtr.Zero;
-        });
+        Run().GetAwaiter().GetResult();
+        LeakCheck.AssertNoLeaks("kvstore");
+        Console.WriteLine("dotnet/kvstore: OK");
+        return 0;
+    }
 
+    static async Task Run()
+    {
         // Typed constructor error: an empty path reports KvError::IoError
         // through the domain exception.
         try
@@ -139,7 +134,7 @@ internal static class Program
         {
             Expect(e.Code == KvException.KeyNotFound, $"KeyNotFound code == 1001 (got {e.Code})");
             Expect(e.Message == "key not found", $"KeyNotFound message (got '{e.Message}')");
-            Expect(e is WeaveFFIException, "typed exception extends the brand exception");
+            Expect(e is NativeException, "typed exception extends the brand exception");
         }
 
         // Entry is a plain value class: non-empty list and map fields live
@@ -204,15 +199,15 @@ internal static class Program
         try
         {
             store.Delete("doomed");
-            Expect(false, "expected WeaveFFIException from throwing listener");
+            Expect(false, "expected NativeException from throwing listener");
         }
         catch (KvException)
         {
             Expect(false, "foreign error must not wear the domain exception type");
         }
-        catch (WeaveFFIException e)
+        catch (NativeException e)
         {
-            Expect(e.Code == WeaveFFIException.ForeignErrorCode, $"foreign error code == -4 (got {e.Code})");
+            Expect(e.Code == NativeException.ForeignErrorCode, $"foreign error code == -4 (got {e.Code})");
             Expect(e.Message.Contains("listener refused doomed"),
                 $"foreign error carries the exception message (got '{e.Message}')");
         }
@@ -240,7 +235,7 @@ internal static class Program
         // usable.
         var twin = store.Share();
         Expect(!ReferenceEquals(twin, store), "Share returns a distinct wrapper");
-        Expect(twin.Handle == store.Handle, "Share wraps the same native pointer");
+        Expect(twin.Equals(store), "Share wraps the same native pointer");
         Expect(twin.Count() == 2, "twin sees the same entries");
         Expect(twin.Put("via-twin", payload, EntryKind.Persistent, null), "put via twin");
         Expect(store.Count() == 3 && store.Get("via-twin") != null, "store sees the twin's put");
@@ -258,7 +253,7 @@ internal static class Program
 
         // Fork: an independent copy.
         var forked = store.Fork();
-        Expect(forked.Handle != store.Handle, "Fork is a different native object");
+        Expect(!forked.Equals(store), "Fork is a different native object");
         Expect(forked.Count() == 3, "fork copied live entries");
         Expect(forked.Put("only-in-fork", payload, EntryKind.Volatile, null), "put into fork");
         Expect(forked.Count() == 4 && store.Count() == 3, "fork and original diverge");
@@ -267,14 +262,14 @@ internal static class Program
         var empty = Store.Open("/tmp/conformance-kvstore-dotnet-empty");
         Expect(empty.Larger(null) == null, "empty.Larger(null) is null");
         var bigger = empty.Larger(store);
-        Expect(bigger != null && bigger.Handle == store.Handle, "empty.Larger(store) is store");
+        Expect(bigger != null && bigger.Equals(store), "empty.Larger(store) is store");
         Expect(bigger.Count() == 3, "returned larger store is usable");
         bigger.Dispose();
         var own = store.Larger(null);
-        Expect(own != null && own.Handle == store.Handle, "store.Larger(null) is store itself");
+        Expect(own != null && own.Equals(store), "store.Larger(null) is store itself");
         own.Dispose();
         var forkWins = store.Larger(forked);
-        Expect(forkWins != null && forkWins.Handle == forked.Handle, "store.Larger(fork) is the fork");
+        Expect(forkWins != null && forkWins.Equals(forked), "store.Larger(fork) is the fork");
         forkWins.Dispose();
         Expect(store.Count() == 3 && forked.Count() == 4, "both stores alive after Larger releases");
 
@@ -282,11 +277,11 @@ internal static class Program
         var info = store.Describe("primary", null);
         Expect(info.Label == "primary", "describe label");
         Expect(info.Count == 3, $"describe count == 3 (got {info.Count})");
-        Expect(info.Store.Handle == store.Handle, "describe().Store is the same native object");
+        Expect(info.Store.Equals(store), "describe().Store is the same native object");
         Expect(info.Mirror == null, "describe().Mirror absent");
         Expect(info.Store.Count() == 3, "describe().Store is usable");
         var mirrored = store.Describe("mirrored", forked);
-        Expect(mirrored.Mirror != null && mirrored.Mirror.Handle == forked.Handle,
+        Expect(mirrored.Mirror != null && mirrored.Mirror.Equals(forked),
             "describe().Mirror is the fork");
         Expect(mirrored.Mirror.Count() == 4, "describe().Mirror is usable");
 
@@ -294,7 +289,7 @@ internal static class Program
         // optional record as parameters (each encoded token is a fresh clone).
         var many = Store.OpenMany(new[] { "/tmp/many-a", "/tmp/many-b" });
         Expect(many.Length == 2, "open_many returns two stores");
-        Expect(many[0].Handle != many[1].Handle, "open_many stores are distinct");
+        Expect(!many[0].Equals(many[1]), "open_many stores are distinct");
         Expect(many[0].Count() == 0 && many[1].Count() == 0, "open_many stores start empty");
         Expect(many[0].Put("m", payload, EntryKind.Volatile, null), "put into many[0]");
         Expect(Store.TotalCount(many, null) == 1, "total_count over the list");
@@ -323,6 +318,19 @@ internal static class Program
         Expect(reclaimed == 3, $"compact reclaimed 3 bytes (got {reclaimed})");
         Expect(store.Count() == 3, "live entries survive compact");
         Expect((await forked.Compact()) == 0, "nothing to compact in the fork");
+        using (var cts = new CancellationTokenSource())
+        {
+            Expect((await forked.Compact(cts.Token)) == 0, "compact with a live token");
+            cts.Cancel();
+            try
+            {
+                await forked.Compact(cts.Token);
+                Expect(false, "expected a canceled compact");
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
 
         store.Clear();
         Expect(store.Count() == 0, "store empty after clear");
@@ -363,8 +371,5 @@ internal static class Program
         {
             Expect(scoped.Count() == 0, "scoped store opens empty");
         }
-
-        Console.WriteLine("dotnet/kvstore: OK");
-        return 0;
     }
 }

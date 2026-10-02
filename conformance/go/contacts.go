@@ -6,27 +6,27 @@
 // decoded from value buffers, optional strings (pointer email) present and
 // absent, list-of-record returns, the throws split (plain returns for
 // non-throwing methods), and the typed ContactsError domain via errors.As.
+//
+// Cross-module types: the nested contacts.groups module takes and returns
+// the parent's ContactType enum and ContactBook interface and reports the
+// parent's ContactsError; the sibling directory root shares the Contact
+// record and has its own DirectoryError. Its `card` function keeps the
+// module prefix (DirectoryCard) because the Card record owns that name in the
+// flat Go package.
 
 package main
 
 import (
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 
 	wv "__MODPATH__"
 )
 
-func expect(cond bool, msg string) {
-	if !cond {
-		fmt.Fprintln(os.Stderr, "assertion failed:", msg)
-		os.Exit(1)
-	}
-}
-
 func main() {
 	book := wv.NewContactBook()
+	expect(wv.DebugLive(0) >= 1, "the producer counts live objects (leak checks are on)")
 
 	email := "alice@example.com"
 	alice, err := book.Add("Alice", "Smith", &email, wv.ContactTypeWork)
@@ -43,7 +43,7 @@ func main() {
 	expect(errors.As(err, &cerr), "empty name yields a *ContactsError")
 	expect(cerr.Code == wv.ContactsErrorInvalidName,
 		fmt.Sprintf("invalid name code == 1 (got %d)", cerr.Code))
-	expect(cerr.Message == "name must not be empty", "invalid name default message")
+	expect(cerr.Message == "name must not be empty", "invalid name message")
 
 	// Optional string: a missing email round-trips as a nil pointer.
 	bob, err := book.Add("Bob", "Jones", nil, wv.ContactTypePersonal)
@@ -71,6 +71,45 @@ func main() {
 	expect(cerr.Code == wv.ContactsErrorNotFound,
 		fmt.Sprintf("not found code == 2 (got %d)", cerr.Code))
 
-	book.Close()
+	// ── contacts.groups: the parent's enum, interface, and error domain ──
+	_, err = book.Add("Ann", "Lee", nil, wv.ContactTypeWork)
+	expect(err == nil, "add ann")
+	_, err = book.Add("Bo", "Kim", nil, wv.ContactTypeWork)
+	expect(err == nil, "add bo")
+	expect(wv.CountOfType(book, wv.ContactTypeWork) == 2, "count_of_type(Work) == 2")
+	expect(wv.CountOfType(book, wv.ContactTypePersonal) == 1, "count_of_type(Personal) == 1")
+	expect(wv.DominantType(book) == wv.ContactTypeWork, "dominant_type is Work")
+
+	work := wv.SplitByType(book, wv.ContactTypeWork)
+	expect(work != nil && work.Count() == 2, "split_by_type returns a new book with two contacts")
+	expect(book.Count() == 3, "the source book is unchanged")
+	first, err := wv.FirstOfType(work, wv.ContactTypeWork)
+	expect(err == nil && first.FirstName == "Ann", fmt.Sprintf("first_of_type(Work) (got %+v, %v)", first, err))
+	_, err = wv.FirstOfType(work, wv.ContactTypeOther)
+	cerr = nil
+	expect(errors.As(err, &cerr) && cerr.Code == wv.ContactsErrorNotFound,
+		fmt.Sprintf("the nested module reports the parent's NotFound (got %v)", err))
+	expect(work.Close() == nil, "close the split book")
+
+	// ── directory: a sibling root sharing the Contact record ──
+	zoe := wv.Contact{Id: 7, FirstName: "Zoe", LastName: "Quinn", ContactType: wv.ContactTypePersonal}
+	card := wv.DirectoryCard(zoe)
+	expect(card == wv.Card{DisplayName: "Quinn, Zoe", Initials: "ZQ", HasEmail: false},
+		fmt.Sprintf("directory card (got %+v)", card))
+	sorted, err := wv.Sorted(book.List())
+	expect(err == nil && len(sorted) == 3, fmt.Sprintf("sorted (got %v)", err))
+	expect(sorted[0].LastName == "Jones" && sorted[1].LastName == "Kim" && sorted[2].LastName == "Lee",
+		fmt.Sprintf("sorted by last name (got %+v)", sorted))
+	_, err = wv.Sorted(nil)
+	var derr *wv.DirectoryError
+	expect(errors.As(err, &derr) && derr.Code == wv.DirectoryErrorEmpty,
+		fmt.Sprintf("empty list yields *DirectoryError (got %T %v)", err, err))
+	expect(derr.Message == "no contacts to list", "directory error message")
+
+	// Close is idempotent, and a closed wrapper traps on use.
+	expect(book.Close() == nil && book.Close() == nil, "double close")
+	expect(catchPanic(func() { book.Count() }) != nil, "use after Close panics")
+
+	expectNoLeaks(wv.DebugLive)
 	fmt.Println("go/contacts: OK")
 }

@@ -2,145 +2,48 @@ name: Quality
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
 
 jobs:
-  deny:
-    name: cargo-deny
+  supply-chain:
+    name: cargo-deny, cargo-audit, cargo-machete
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
-
-      - name: cargo deny check
-        # `cargo deny check` exits non-zero only when a check produces errors,
-        # so advisory warnings (yanked, unmaintained) are surfaced but do not
-        # block the build.
-        run: cargo deny check
-
-  audit:
-    name: cargo-audit
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-
-      - name: cargo audit
-        # Ignored advisories:
-        #   RUSTSEC-2023-0057 / RUSTSEC-2023-0058 apply to the crates.io
-        #     `inventory` crate; our `samples/inventory` shares the name but
-        #     is an unrelated, unpublished sample cdylib.
-        run: |
-          cargo audit --deny warnings \
-            --ignore RUSTSEC-2023-0057 \
-            --ignore RUSTSEC-2023-0058
-
-  machete:
-    name: cargo-machete
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-machete
-        run: cargo install cargo-machete --locked
-
-      - name: cargo machete
-        run: cargo machete --with-metadata
-
-  doc:
-    name: rustdoc
-    runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: "-D rustdoc::all -D rustdoc::missing_crate_level_docs"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: cargo doc
-        run: cargo doc --workspace --no-deps
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit,cargo-machete
+      - run: cargo deny check
+      - run: cargo audit --deny warnings
+      - run: cargo machete --with-metadata
 
   coverage:
-    name: coverage
+    name: Coverage
     runs-on: ubuntu-latest
-    # Threshold is informational while we establish a baseline.
     continue-on-error: true
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --locked
-
-      - name: Generate lcov coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v4
         with:
           files: lcov.info
           fail_ci_if_error: false
 
   docs-linkcheck:
-    name: docs link check
+    name: Docs link check
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install mdbook + mdbook-linkcheck2
-        # Use the maintained `mdbook-linkcheck2` fork rather than the
-        # original `mdbook-linkcheck` (last release Oct 2022), which fails
-        # to deserialize mdBook 0.5+ render contexts ("missing field
-        # `sections`").
-        run: |
-          cargo install mdbook --locked
-          cargo install mdbook-linkcheck2 --locked
-
-      - name: Validate docs links
-        run: scripts/check-links.sh
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook,mdbook-linkcheck2
+      - run: scripts/check-links.sh

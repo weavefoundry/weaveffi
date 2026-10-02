@@ -1,7 +1,7 @@
 [package]
 name = "weaveffi-fuzz"
-version = "0.23.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 publish = false
 
 [package.metadata]
@@ -12,8 +12,7 @@ fuzzing = ["dep:libfuzzer-sys"]
 
 [dependencies]
 libfuzzer-sys = { version = "0.4", optional = true }
-weaveffi-ir = { path = "../weaveffi-ir" }
-weaveffi-core = { path = "../weaveffi-core" }
+weaveffi-model = { workspace = true, features = ["idl"] }
 
 [lib]
 name = "weaveffi_fuzz"

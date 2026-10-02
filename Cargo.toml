@@ -1,30 +1,16 @@
 [workspace]
 members = [
-    "crates/weaveffi-ir",
+    "crates/weaveffi-model",
     "crates/weaveffi-abi",
-    "crates/weaveffi-bridge",
     "crates/weaveffi-macros",
     "crates/weaveffi",
-    "crates/weaveffi-core",
-    "crates/weaveffi-gen-c",
-    "crates/weaveffi-gen-swift",
-    "crates/weaveffi-gen-kotlin",
-    "crates/weaveffi-gen-node",
-    "crates/weaveffi-gen-wasm",
-    "crates/weaveffi-gen-python",
-    "crates/weaveffi-gen-dotnet",
-    "crates/weaveffi-gen-cpp",
-    "crates/weaveffi-gen-dart",
-    "crates/weaveffi-gen-go",
-    "crates/weaveffi-gen-ruby",
+    "crates/weaveffi-gen",
     "crates/weaveffi-cli",
     "samples/calculator",
     "samples/contacts",
-    "samples/inventory",
     "samples/async-demo",
     "samples/events",
     "samples/kvstore",
-    "samples/shapes",
     "samples/codec",
     "crates/weaveffi-fuzz",
 ]
@@ -35,6 +21,8 @@ default-members = [
 ]
 
 [workspace.package]
+version = "0.23.0"
+rust-version = "1.85"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["WeaveFFI Contributors"]
@@ -42,6 +30,11 @@ repository = "https://github.com/weavefoundry/weaveffi"
 description = "WeaveFFI: Rust core with stable C ABI and multi-language bindings"
 
 [workspace.dependencies]
+weaveffi = { path = "crates/weaveffi", version = "0.23.0" }
+weaveffi-abi = { path = "crates/weaveffi-abi", version = "0.23.0" }
+weaveffi-macros = { path = "crates/weaveffi-macros", version = "0.23.0" }
+weaveffi-model = { path = "crates/weaveffi-model", version = "0.23.0", default-features = false }
+weaveffi-gen = { path = "crates/weaveffi-gen", version = "0.23.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1.0"
@@ -50,10 +43,9 @@ thiserror = "1.0"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
-camino = "1.1"
+camino = { version = "1.1", features = ["serde1"] }
 sha2 = "0.10"
 heck = "0.5"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 syn = { version = "2.0", features = ["full", "parsing", "visit"] }
 quote = "1.0"
 similar = "2.0"
@@ -61,10 +53,8 @@ tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 miette = { version = "7", features = ["fancy"] }
 insta = { version = "1", features = ["yaml", "json"] }
-notify = "6"
 schemars = { version = "0.8", features = ["preserve_order"] }
 rayon = "1.10"
-clap_mangen = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

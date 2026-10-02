@@ -1,26 +1,17 @@
+# `weaveffi generate` (no arguments) from anywhere in this crate uses this.
+[project]
+input = "src/lib.rs"
+out = "bindings"
+
+# The package name, prefix, and library come from Cargo.toml (`kvstore`);
+# this table adds the published metadata.
 [package]
-name = "kvstore"
 version = "1.0.0"
 description = "An embedded key-value store API with TTLs, iteration, and async compaction."
 license = "MIT"
 authors = ["WeaveFoundry <hello@weavefoundry.dev>"]
 homepage = "https://github.com/weavefoundry/weaveffi"
 repository = "https://github.com/weavefoundry/weaveffi"
-
-[generators.ruby]
-module_name = "Kvstore"
-
-[generators.dotnet]
-namespace = "Kvstore"
-
-[generators.swift]
-module_name = "Kvstore"
-
-[generators.cpp]
-namespace = "kvstore"
-
-[generators.dart]
-package_name = "kvstore"
 
 [generators.go]
 module_path = "github.com/example/kvstore"

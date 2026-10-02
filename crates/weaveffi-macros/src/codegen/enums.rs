@@ -7,9 +7,9 @@
 //! `i32` tag followed by the active variant's fields in declaration order,
 //! so its whole generated surface is one `BufferValue` impl.
 
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::TokenStream;
 use quote::quote;
-use weaveffi_core::model::EnumBinding;
+use weaveffi_model::model::EnumBinding;
 
 use super::helpers::{ident, rust_type_ident};
 use super::marshal::{field_read_expr, field_write_stmt_ref};
@@ -20,14 +20,8 @@ use super::marshal::{field_read_expr, field_write_stmt_ref};
 ///
 /// `__weaveffi_to_i32` takes `&self` so a thunk can lower an enum it holds by
 /// value or by reference without requiring `Copy` or `Clone`.
-pub(crate) fn gen_enum(e: &EnumBinding, item: Option<&syn::ItemEnum>) -> syn::Result<TokenStream> {
+pub(crate) fn gen_enum(e: &EnumBinding, item: &syn::ItemEnum) -> syn::Result<TokenStream> {
     if e.is_rich() {
-        let item = item.ok_or_else(|| {
-            syn::Error::new(
-                Span::call_site(),
-                format!("internal error: no source enum for rich enum `{}`", e.name),
-            )
-        })?;
         return gen_rich_enum(e, item);
     }
     let ty = rust_type_ident(&e.name);
@@ -42,9 +36,9 @@ pub(crate) fn gen_enum(e: &EnumBinding, item: Option<&syn::ItemEnum>) -> syn::Re
         quote!(Self::#vident => #value,)
     });
     let first = e.variants.first().map(|v| ident(&v.name)).ok_or_else(|| {
-        syn::Error::new(
-            Span::call_site(),
-            format!("internal error: enum `{}` has no variants", e.name),
+        syn::Error::new_spanned(
+            &item.ident,
+            format!("weaveffi: enum `{}` must have at least one variant", e.name),
         )
     })?;
     Ok(quote! {
@@ -76,6 +70,9 @@ pub(crate) fn gen_enum(e: &EnumBinding, item: Option<&syn::ItemEnum>) -> syn::Re
         }
 
         impl ::weaveffi::abi::BufferValue for #ty {
+            fn encoded_len(&self) -> usize {
+                4
+            }
             fn write_value(&self, __wv_w: &mut ::weaveffi::abi::BufferWriter) {
                 __wv_w.write_i32(self.__weaveffi_to_i32());
             }
@@ -107,6 +104,20 @@ fn gen_rich_enum(e: &EnumBinding, item: &syn::ItemEnum) -> syn::Result<TokenStre
             ));
         }
     }
+
+    let len_arms = e.variants.iter().map(|v| {
+        let vident = ident(&v.name);
+        if v.fields.is_empty() {
+            quote!(Self::#vident => 4,)
+        } else {
+            let bindings: Vec<syn::Ident> = v.fields.iter().map(|f| ident(&f.name)).collect();
+            quote! {
+                Self::#vident { #(#bindings),* } => {
+                    4 #(+ ::weaveffi::abi::BufferValue::encoded_len(#bindings))*
+                }
+            }
+        }
+    });
 
     let write_arms = e.variants.iter().map(|v| {
         let value = v.value;
@@ -150,8 +161,12 @@ fn gen_rich_enum(e: &EnumBinding, item: &syn::ItemEnum) -> syn::Result<TokenStre
     });
 
     Ok(quote! {
-        #[allow(unsafe_code)]
         impl ::weaveffi::abi::BufferValue for #ty {
+            fn encoded_len(&self) -> usize {
+                match self {
+                    #(#len_arms)*
+                }
+            }
             fn write_value(&self, __wv_w: &mut ::weaveffi::abi::BufferWriter) {
                 match self {
                     #(#write_arms)*
@@ -171,5 +186,7 @@ fn gen_rich_enum(e: &EnumBinding, item: &syn::ItemEnum) -> syn::Result<TokenStre
                 })
             }
         }
+
+        impl ::weaveffi::abi::ByValue for #ty {}
     })
 }

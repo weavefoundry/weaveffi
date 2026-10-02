@@ -1,6 +1,6 @@
 //! `weaveffi extract`: read annotated Rust source and emit the IDL.
 //!
-//! This is thin CLI glue around [`weaveffi_bridge`], the single Rust-to-IR
+//! This is thin CLI glue around [`weaveffi_model::rust`], the single Rust-to-IR
 //! bridge that the `#[weaveffi::module]` proc-macro also uses. Because both the
 //! macro (which builds the C ABI scaffolding) and this command read the *same*
 //! extraction, the emitted IDL and the producer's compiled symbols cannot
@@ -15,7 +15,7 @@
 
 use miette::{miette, IntoDiagnostic, WrapErr};
 
-/// Read the annotated Rust file at `input`, extract its [`Api`](weaveffi_ir::ir::Api),
+/// Read the annotated Rust file at `input`, extract its [`Api`](weaveffi_model::ir::Api),
 /// validate, and serialize to the requested `format` (`yaml`, `json`, or `toml`).
 ///
 /// # Errors
@@ -26,50 +26,46 @@ use miette::{miette, IntoDiagnostic, WrapErr};
 pub(crate) fn cmd_extract(
     input: &str,
     output: Option<&str>,
-    format: &str,
-    warn: bool,
+    format: crate::IdlFormat,
+    lenient: bool,
     quiet: bool,
 ) -> miette::Result<()> {
     let source = std::fs::read_to_string(input)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read source file: {input}"))?;
 
-    let api = weaveffi_bridge::api_from_src_stringly(&source)
+    let api = weaveffi_model::rust::api_from_src_stringly(&source)
         .map_err(|e| miette!("failed to extract API from Rust source {input}:\n{e}"))?;
 
     // Serialize the resolved form when the API validates (so cross-module
     // references are emitted qualified and stable across runs); fall back
     // to the raw extracted document under `--warn`.
-    let api = match weaveffi_core::validate::validate_api(api.clone(), None) {
+    let api = match weaveffi_model::validate::validate_api(api.clone(), None) {
         Ok(resolved) => resolved.api().clone(),
         Err(e) => {
-            if warn {
+            if lenient {
                 eprintln!("warning: {e}");
                 api
             } else {
                 return Err(miette!(
                     "{e:?}\n\nThe extracted API does not validate, so it would not \
                      generate. Fix the source (e.g. declare the referenced types), \
-                     or pass `--warn` to emit the IDL anyway."
+                     or pass `--lenient` to emit the IDL anyway."
                 ));
             }
         }
     };
 
     let serialized = match format {
-        "yaml" | "yml" => serde_yaml::to_string(&api)
+        crate::IdlFormat::Yaml => serde_yaml::to_string(&api)
             .into_diagnostic()
             .wrap_err("failed to serialize API as YAML")?,
-        "json" => serde_json::to_string_pretty(&api)
+        crate::IdlFormat::Json => serde_json::to_string_pretty(&api)
             .into_diagnostic()
             .wrap_err("failed to serialize API as JSON")?,
-        "toml" => toml::to_string_pretty(&api)
+        crate::IdlFormat::Toml => toml::to_string_pretty(&api)
             .into_diagnostic()
             .wrap_err("failed to serialize API as TOML")?,
-        other => miette::bail!(
-            "unsupported output format: {} (expected yaml, json, or toml)",
-            other
-        ),
     };
 
     match output {

@@ -1,53 +1,220 @@
 # Getting Started
 
-This guide walks you through installing WeaveFFI, defining an API as a
-language-neutral IDL, generating multi-language bindings from it, implementing
-the native library behind the generated C ABI, and calling it from C.
+This guide builds a small Rust library, generates bindings for it, and calls
+it from Python and from C. A second, shorter path at the end shows how to
+start from an IDL instead and implement the generated C header in C.
 
-WeaveFFI works with any native library that exposes a C ABI, so the producer
-can be written in Rust, C, C++, Zig, or anything else that can speak C. This
-guide implements it in Rust because that's the quickest to set up. If you're
-writing a Rust producer, you can also let the `#[weaveffi::module]` macro
-generate the C ABI and derive the IDL for you, instead of hand-writing YAML
-(see step 2).
+## Install the CLI
 
-## Prerequisites
-
-You need the [Rust toolchain](https://rustup.rs/) (stable channel) to install
-the CLI, and for this guide's Rust producer. Verify with:
-
-```bash
-rustc --version
-cargo --version
-```
-
-The CLI is the only hard requirement. The library you generate bindings for can
-be written in any language that exposes a C ABI.
-
-## 1) Install WeaveFFI
-
-Install the CLI from crates.io:
+You need a stable [Rust toolchain](https://rustup.rs/). Install the
+`weaveffi` CLI from crates.io (or grab a prebuilt binary with
+`cargo binstall weaveffi-cli`):
 
 ```bash
 cargo install weaveffi-cli
+weaveffi --version
 ```
 
-This puts the `weaveffi` binary on your `PATH`.
+## Write the producer
 
-## 2) Define your API as an IDL
+Create a library crate, add the `weaveffi` crate, and build it as a C
+dynamic library:
 
-Describe the API once in a language-neutral IDL. Create `math.yml` with a
-record and a function:
+```bash
+cargo new --lib mathlib
+cd mathlib
+cargo add weaveffi
+```
+
+```toml
+# Cargo.toml
+[lib]
+crate-type = ["cdylib"]
+```
+
+Replace `src/lib.rs` with an annotated module. Everything here is safe Rust;
+the macro writes the `extern "C"` layer.
+
+```rust
+/// Integer arithmetic and greetings.
+#[weaveffi::module]
+pub mod math {
+    /// Errors the math functions report.
+    #[weaveffi::error]
+    #[derive(Debug)]
+    pub enum MathError {
+        /// Division by zero.
+        DivisionByZero = 1,
+    }
+
+    impl std::fmt::Display for MathError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("division by zero")
+        }
+    }
+
+    /// Add two integers.
+    #[weaveffi::export]
+    pub fn add(a: i32, b: i32) -> i32 {
+        a + b
+    }
+
+    /// Divide `a` by `b`, failing when `b` is zero.
+    #[weaveffi::export]
+    pub fn div(a: i32, b: i32) -> Result<i32, MathError> {
+        a.checked_div(b).ok_or(MathError::DivisionByZero)
+    }
+
+    /// Greet someone by name.
+    #[weaveffi::export]
+    pub fn greet(name: &str) -> String {
+        format!("Hello, {name}!")
+    }
+}
+
+// Export the runtime symbols (errors, memory, cancel tokens) once per library.
+weaveffi::export_runtime!();
+```
+
+A few things to notice:
+
+- Every C symbol starts with the crate's library name, so this crate exports
+  `mathlib_math_add`, `mathlib_math_div`, and `mathlib_math_greet`, plus the
+  runtime (`mathlib_error_clear`, `mathlib_free_bytes`, and so on).
+- `Result<i32, MathError>` makes `div` a throwing function. The enum's
+  discriminants are the stable error codes, and its `Display` output is the
+  message consumers see.
+- `weaveffi::export_runtime!()` appears exactly once, at the crate root.
+
+The [producer macro guide](guides/producer-macro.md) covers records, enums,
+objects, callbacks, iterators, and async functions.
+
+## Configure and generate
+
+Run `weaveffi init` in the crate. It writes a `weaveffi.toml` whose
+`[project]` table points at `src/lib.rs`, then lists anything the crate still
+needs (a `cdylib` crate type, the `weaveffi` dependency, the
+`export_runtime!` call):
+
+```bash
+weaveffi init
+```
+
+```toml
+# weaveffi.toml
+[project]
+input = "src/lib.rs"
+out = "bindings"
+targets = ["c", "python"]   # omit to generate all eleven
+```
+
+Build the library and generate the bindings. With a `[project]` table,
+`weaveffi generate` needs no arguments and works from any directory in the
+project:
+
+```bash
+cargo build
+weaveffi generate
+```
+
+The output has one directory per target. The C target writes
+`bindings/c/mathlib.h`; the Python target writes an installable package
+named `mathlib`. Run `weaveffi generate` again after any change: it rewrites
+only the files whose contents changed and removes files a previous run wrote
+that are no longer produced.
+
+## Call it from Python
+
+Install the generated package and point it at the library you built. Every
+generated loader honors a `{PREFIX}_LIBRARY` environment variable, here
+`MATHLIB_LIBRARY`; a packaged release bundles the library instead (see
+[Packaging](guides/packaging.md)).
+
+```bash
+pip install ./bindings/python
+export MATHLIB_LIBRARY="$PWD/target/debug/libmathlib.dylib"   # .so on Linux
+```
+
+```python
+import mathlib
+
+print(mathlib.add(2, 3))          # 5
+print(mathlib.greet("Python"))    # Hello, Python!
+
+try:
+    mathlib.div(1, 0)
+except mathlib.MathError as e:
+    print("caught:", e)           # caught: division by zero
+```
+
+On import the package checks the library's ABI revision and the contract
+checksum of the `math` module, so a library built from different source
+fails to load with an error naming the module. The
+[Python page](generators/python.md) documents the generated surface.
+
+## Call it from C
+
+The header is the contract every other binding is built on. Strings cross as
+UTF-8 `(ptr, len)` runs, the caller owns a zeroed `mathlib_error`, and
+returned strings are released with `mathlib_free_bytes`:
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include "mathlib.h"
+
+int main(void) {
+    if (mathlib_abi_version() != MATHLIB_ABI_VERSION ||
+        mathlib_math_checksum() != MATHLIB_MATH_CHECKSUM) {
+        fprintf(stderr, "mathlib.h does not match the loaded library\n");
+        return 1;
+    }
+
+    mathlib_error err = {0};
+    printf("2 + 3 = %d\n", mathlib_math_add(2, 3, &err));
+
+    mathlib_math_div(1, 0, &err);
+    if (err.code == mathlib_math_MathError_DivisionByZero) {
+        printf("error %d: %s\n", err.code, err.message);
+        mathlib_error_clear(&err);
+    }
+
+    const char* name = "C";
+    size_t len = 0;
+    const uint8_t* text =
+        mathlib_math_greet((const uint8_t*)name, strlen(name), &len, &err);
+    printf("%.*s\n", (int)len, (const char*)text);
+    mathlib_free_bytes((uint8_t*)text, len);
+    return 0;
+}
+```
+
+```bash
+cc -I bindings/c main.c -L target/debug -lmathlib -o main
+DYLD_LIBRARY_PATH=target/debug ./main    # LD_LIBRARY_PATH on Linux
+```
+
+[Errors and Memory](guides/errors-and-memory.md) states every ownership rule
+the generated bindings follow for you.
+
+## Implementing an IDL in C
+
+A producer doesn't have to be Rust. Start from an IDL, generate the C header,
+and implement it in any language that can export C symbols. Outside a Rust
+crate, `weaveffi init` writes a starter IDL and a `weaveffi.toml`:
+
+```bash
+mkdir greeter && cd greeter
+weaveffi init           # writes greeter.yml and weaveffi.toml
+```
+
+Edit `greeter.yml` to declare the API (the [IDL reference](reference/idl.md)
+has the full schema):
 
 ```yaml
-version: "0.9.0"
+version: "0.10.0"
 modules:
-  - name: math
-    structs:
-      - name: Point
-        fields:
-          - { name: x, type: f64 }
-          - { name: y, type: f64 }
+  - name: greeter
     functions:
       - name: add
         params:
@@ -56,271 +223,65 @@ modules:
         return: i32
 ```
 
-The IDL describes only the API. It supports primitives (`i32`, `f64`, `bool`,
-`string`, `bytes`, and the rest of the fixed-width integers and floats),
-optionals (`string?`), lists (`[i32]`), maps (`{string:i64}`), lazy iterators
-(`iter<string>`), records and rich enums, interfaces (reference-counted
-objects with constructors, methods, and statics), callback interfaces
-(methods the consumer implements and the native library calls), async
-functions, and typed error domains (opt in per function with `throws: true`).
-See the [IDL Schema](reference/idl.md) reference for the full specification
-and the [C ABI Contract](reference/abi.md) for how each of them crosses the
-boundary.
-
-Everything about how the API is *published* lives in an optional
-`weaveffi.toml` next to it. Create one so the generated package manifests
-(`package.json`, `pyproject.toml`, `Package.swift`, and so on) carry your name
-and version:
-
-```toml
-[package]
-name = "my-math"
-version = "0.1.0"
-```
-
-The CLI picks up the nearest `weaveffi.toml` at or above the input file
-automatically; pass `--config` to point at a different one. The same file
-holds per-target options under `[generators.<target>]` tables; see
-[Configuration](guides/config.md).
-
-> **Writing a Rust producer?** You can make annotated Rust the single source of
-> truth instead of a separate IDL: annotate a module with `#[weaveffi::module]`
-> and point the generator straight at the source. The macro emits the C ABI and
-> derives the IDL from your code, so you write no `unsafe` glue. See
-> [The Rust Producer Macro](guides/producer-macro.md). The rest of this guide
-> uses the IDL.
-
-## 3) Generate bindings
-
-Run the generator to produce bindings for all targets:
+For an IDL input the identity comes from `[package]` in `weaveffi.toml`
+(`name = "greeter"`), so the prefix and the library are both `greeter`.
+Generate the header and implement it:
 
 ```bash
-weaveffi generate math.yml -o generated
+weaveffi generate --target c     # writes bindings/c/greeter.h
 ```
-
-Pass `--target c,swift,node` to generate a subset. The output tree has one
-directory per target:
-
-```text
-generated/
-├── c/          # C header + convenience stubs
-├── cpp/        # RAII C++ header + CMakeLists.txt
-├── swift/      # SwiftPM package + Swift wrapper
-├── kotlin/     # Kotlin JNI wrapper + Gradle (build.gradle.kts) project
-├── node/       # N-API addon + TypeScript types
-├── wasm/       # JavaScript loader + TypeScript types
-├── python/     # ctypes bindings + .pyi stubs
-├── dotnet/     # C# P/Invoke bindings
-├── dart/       # dart:ffi bindings
-├── go/         # cgo bindings
-└── ruby/       # FFI gem bindings
-```
-
-## 4) Examine the generated output
-
-### C header (`generated/c/weaveffi.h`)
-
-Records generate no C functions: a `Point` crosses the ABI serialized as
-a [value buffer](reference/value-buffers.md), a single
-`(const uint8_t*, size_t)` pair, and the header opens with a comment
-block spelling out that convention. What remains is one prototype per
-module-level function, each taking an `out_err` parameter for error
-reporting:
 
 ```c
-/*
- * Value buffer convention: records, rich enums, lists, maps, and
- * optionals cross the ABI serialized in the WeaveFFI value buffer
- * format ...
- */
+/* greeter.c */
+#include <stdlib.h>
+#include <string.h>
+#include "greeter.h"
 
-// Module: math
-WEAVEFFI_API int32_t weaveffi_math_add(int32_t a, int32_t b, weaveffi_error* out_err);
-```
+uint32_t greeter_abi_version(void) { return GREETER_ABI_VERSION; }
+uint64_t greeter_greeter_checksum(void) { return GREETER_GREETER_CHECKSUM; }
 
-The header also declares the fixed runtime surface every producer exports
-(`weaveffi_abi_version`, the `weaveffi_error` struct and its helpers,
-`weaveffi_free_string`/`weaveffi_free_bytes`, and the cancel-token family);
-see the [C ABI Contract](reference/abi.md). Had `math.yml` declared an
-interface, the header would also carry an opaque typedef plus `_clone` and
-`_destroy` symbols for it, and a callback interface would appear as a vtable
-typedef.
-
-### Swift wrapper (`generated/swift/Sources/MyMath/MyMath.swift`)
-
-Structs become plain Swift structs with typed properties, packed and
-unpacked from value buffers by the wrapper. Module functions are grouped
-under a Swift enum namespace. Because `add` doesn't declare
-`throws: true`, its Swift wrapper is a plain non-throwing function:
-
-```swift
-public struct Point {
-    public var x: Double
-    public var y: Double
-
-    public init(x: Double, y: Double) { ... }
+int32_t greeter_greeter_add(int32_t a, int32_t b, greeter_error* out_err) {
+    (void)out_err;   /* written only on failure */
+    return a + b;
 }
 
-public enum Math {
-    public static func add(a: Int32, b: Int32) -> Int32 { ... }
-}
-```
-
-### TypeScript types (`generated/node/types.d.ts`)
-
-Structs become interfaces with mapped types. Functions use the IR name
-directly (no module prefix):
-
-```typescript
-export interface Point {
-  x: number;
-  y: number;
+void greeter_error_set(greeter_error* err, int32_t code, const char* message) {
+    greeter_error_clear(err);
+    err->code = code;
+    err->message = message ? strdup(message) : NULL;
 }
 
-// module math
-export function add(a: number, b: number): number
-```
-
-## 5) Implement the library behind the C ABI
-
-The generated C header (`generated/c/weaveffi.h`) is the contract your native
-library must satisfy, and it's the same contract every language binding calls
-into. You can implement it in any language that can expose a C ABI; here we use
-Rust and write the one `#[no_mangle] extern "C"` function the header declares
-by hand.
-
-Create a library crate, add the WeaveFFI ABI helpers, and build a `cdylib`:
-
-```bash
-cargo new --lib my-math
-cd my-math
-cargo add weaveffi-abi
-```
-
-In `Cargo.toml`:
-
-```toml
-[lib]
-crate-type = ["cdylib"]
-```
-
-Implementing `add` in `src/lib.rs` looks like this:
-
-```rust
-#![allow(unsafe_code)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
-
-use weaveffi_abi::{self as abi, weaveffi_error};
-
-#[no_mangle]
-pub extern "C" fn weaveffi_math_add(
-    a: i32,
-    b: i32,
-    out_err: *mut weaveffi_error,
-) -> i32 {
-    abi::error_set_ok(out_err);
-    a + b
+void greeter_error_clear(greeter_error* err) {
+    free((void*)err->message);
+    free((void*)err->payload_ptr);
+    memset(err, 0, sizeof *err);
 }
 
-// Emit the fixed WeaveFFI C ABI runtime surface (abi_version, error_set,
-// error_clear, error_free, free_string, free_bytes, cancel_token_*) in one
-// line. Call this exactly once per cdylib.
-abi::export_runtime!();
-```
-
-Key points:
-
-- Every exported function uses `#[no_mangle]` and `extern "C"`.
-- `out_err` must always be cleared on success with `abi::error_set_ok`.
-- On error, call `abi::error_set(out_err, code, message)` and return a
-  zero/null value.
-- The library must export the WeaveFFI runtime symbols: invoke
-  [`weaveffi_abi::export_runtime!()`][export-runtime-doc] to emit all of
-  them in one line instead of writing each `#[no_mangle]` thunk by hand.
-  Among them is `weaveffi_abi_version()`, which reports ABI revision 2 and
-  which the generated Python, Ruby, Dart, Go, .NET, Node.js, and Wasm
-  bindings call at load time to refuse a library built against a different
-  revision.
-- An interface in your IDL adds a `_clone` and `_destroy` pair you implement
-  with `weaveffi_abi::object_clone` and `object_destroy` over an `Arc<T>`;
-  the [C ABI Contract](reference/abi.md#objects-interfaces) spells out the
-  reference-counting rules. The `#[weaveffi::module]` macro writes all of
-  this for you.
-
-[export-runtime-doc]: https://docs.rs/weaveffi-abi/latest/weaveffi_abi/macro.export_runtime.html
-
-> **Tip for Rust producers:** the `#[weaveffi::module]` macro generates these
-> `#[no_mangle] extern "C"` thunks for you from safe Rust, so you never fill in
-> stubs by hand. See [The Rust Producer Macro](guides/producer-macro.md).
-
-Build with:
-
-```bash
-cargo build
-```
-
-This produces a shared library (`libmy_math.dylib` on macOS,
-`libmy_math.so` on Linux, `my_math.dll` on Windows). The exported symbols match
-`generated/c/weaveffi.h` by construction.
-
-## 6) Build and test with C
-
-Write a small C program that calls your library:
-
-**main.c:**
-
-```c
-#include <stdio.h>
-#include "weaveffi.h"
-
-int main(void) {
-    struct weaveffi_error err = {0};
-
-    int32_t sum = weaveffi_math_add(3, 4, &err);
-    if (err.code) {
-        printf("error: %s\n", err.message);
-        weaveffi_error_clear(&err);
-        return 1;
-    }
-    printf("add(3, 4) = %d\n", sum);
-
-    return 0;
+void greeter_error_free(greeter_error* err) {
+    if (err) { greeter_error_clear(err); free(err); }
 }
+
+void greeter_free_bytes(uint8_t* ptr, size_t len) { (void)len; free(ptr); }
+
+/* Also required: the four greeter_cancel_token_* functions and
+   greeter_debug_live (which may return 0). */
 ```
 
-Compile, link, and run:
-
-```bash
-# macOS
-cc -I generated/c main.c -L target/debug -lmy_math -o my_example
-DYLD_LIBRARY_PATH=target/debug ./my_example
-
-# Linux
-cc -I generated/c main.c -L target/debug -lmy_math -o my_example
-LD_LIBRARY_PATH=target/debug ./my_example
-```
-
-Expected output:
-
-```text
-add(3, 4) = 7
-```
+The library must export every runtime symbol the header declares, each
+top-level module's checksum function, and the API itself; the
+[C ABI contract](reference/abi.md#runtime-surface) lists them, and
+[`conformance/c/producer.c`](https://github.com/weavefoundry/weaveffi/blob/main/conformance/c/producer.c)
+is a complete hand-written producer to copy from. Build it as
+`libgreeter.so` (`libgreeter.dylib`, `greeter.dll`), then run
+`weaveffi generate` for the other targets; they load it exactly as they load
+a Rust producer.
 
 ## Next steps
 
-- Read the [IDL Schema](reference/idl.md) reference for all supported types
-  and features, and the [C ABI Contract](reference/abi.md) for how objects,
-  callback interfaces, value buffers, async functions, and iterators cross
-  the boundary.
-- Writing a Rust producer? See
-  [The Rust Producer Macro](guides/producer-macro.md) to generate the C ABI
-  directly from annotated Rust instead of implementing the header by hand.
-- Look at the [samples](samples.md): `kvstore` exercises every IDL feature,
-  and `events` is the smallest example of a reference-counted object plus a
-  callback interface.
-- See the [Calculator tutorial](tutorials/calculator.md) for a full end-to-end
-  walkthrough including Swift and Node.js.
-- Explore the [Generators](generators/README.md) section for target-specific
-  details, and [Configuration](guides/config.md) for `weaveffi.toml`.
-- Add `weaveffi diff --check` to CI so regenerated bindings can't drift from
-  the committed ones; see [Stability and Versioning](stability.md).
+- [Project Configuration](guides/config.md): `[package]` metadata, per-target
+  options, and the generation cache.
+- [Samples](samples.md): six complete producers, from `calculator` to the
+  kitchen-sink `kvstore`.
+- [Generators](generators/README.md): what each language gets.
+- Gate CI on `weaveffi diff --check` so committed bindings can't drift; see
+  [Stability and Versioning](stability.md#ci-workflow).

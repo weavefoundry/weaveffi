@@ -33,6 +33,12 @@ pub mod codec {
         Mismatch = 1,
     }
 
+    impl std::fmt::Display for CodecError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("value does not match the canonical fixture")
+        }
+    }
+
     /// A C-style enum (crosses by value, and as an `i32` inside buffers).
     #[weaveffi::enumeration]
     #[repr(i32)]
@@ -421,68 +427,90 @@ weaveffi::export_runtime!();
 mod tests {
     use crate::codec::*;
     use std::sync::Arc;
-    use weaveffi::abi::{self, weaveffi_error};
+    use weaveffi::abi::{self, FfiError};
 
     fn decode_and_free<T: abi::BufferValue>(ptr: *const u8, len: usize) -> T {
         assert!(!ptr.is_null());
         let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
         let value = abi::decode_value::<T>(bytes).expect("well-formed value buffer");
-        abi::free_bytes(ptr as *mut u8, len);
+        unsafe { abi::free_bytes(ptr.cast_mut(), len) };
         value
     }
 
     #[test]
     fn composite_round_trips_through_the_abi() {
-        let mut err = weaveffi_error::default();
+        let mut err = FfiError::default();
         let mut len = 0usize;
-        let ptr = weaveffi_codec_sample_composite(&mut len, &mut err);
+        let ptr = unsafe { codec_codec_sample_composite(&mut len, &mut err) };
         let sample = decode_and_free::<Composite>(ptr, len);
         assert_eq!(sample.names.len(), 3);
         assert_eq!(sample.by_id.len(), 2);
 
         let bytes = abi::encode_value(&sample);
-        assert!(weaveffi_codec_verify_composite(
-            bytes.as_ptr(),
-            bytes.len(),
-            &mut err
-        ));
+        assert!(unsafe { codec_codec_verify_composite(bytes.as_ptr(), bytes.len(), &mut err) });
         assert_eq!(err.code, 0);
 
         let mut changed = sample.clone();
         changed.sparse[1] = Some(true);
         let bytes = abi::encode_value(&changed);
-        assert!(!weaveffi_codec_verify_composite(
-            bytes.as_ptr(),
-            bytes.len(),
-            &mut err
-        ));
+        assert!(!unsafe { codec_codec_verify_composite(bytes.as_ptr(), bytes.len(), &mut err) });
         assert_eq!(err.code, 1);
-        abi::error_clear(&mut err);
-    }
-
-    #[test]
-    fn scalars_round_trip() {
-        let mut err = weaveffi_error::default();
-        let mut len = 0usize;
-        let ptr = weaveffi_codec_sample_scalars(&mut len, &mut err);
-        let sample = decode_and_free::<Scalars>(ptr, len);
-        assert_eq!(sample.u64_value, u64::MAX);
-        let bytes = abi::encode_value(&sample);
-        let out = weaveffi_codec_roundtrip_scalars(bytes.as_ptr(), bytes.len(), &mut len, &mut err);
-        assert_eq!(decode_and_free::<Scalars>(out, len), sample);
-        assert_eq!(weaveffi_codec_roundtrip_i64(i64::MIN, &mut err), i64::MIN);
-        assert_eq!(weaveffi_codec_roundtrip_u64(u64::MAX, &mut err), u64::MAX);
         assert_eq!(
-            weaveffi_codec_roundtrip_color(Color::Blue as i32, &mut err),
-            Color::Blue as i32
+            unsafe { err.message_str() },
+            Some("value does not match the canonical fixture")
         );
     }
 
     #[test]
-    fn holders_carry_object_references() {
-        let mut err = weaveffi_error::default();
+    fn scalars_round_trip() {
+        let mut err = FfiError::default();
         let mut len = 0usize;
-        let ptr = weaveffi_codec_make_holder(10, true, &mut len, &mut err);
+        let ptr = unsafe { codec_codec_sample_scalars(&mut len, &mut err) };
+        let sample = decode_and_free::<Scalars>(ptr, len);
+        assert_eq!(sample.u64_value, u64::MAX);
+        let bytes = abi::encode_value(&sample);
+        let out = unsafe {
+            codec_codec_roundtrip_scalars(bytes.as_ptr(), bytes.len(), &mut len, &mut err)
+        };
+        assert_eq!(decode_and_free::<Scalars>(out, len), sample);
+        unsafe {
+            assert_eq!(codec_codec_roundtrip_i64(i64::MIN, &mut err), i64::MIN);
+            assert_eq!(codec_codec_roundtrip_u64(u64::MAX, &mut err), u64::MAX);
+            assert_eq!(
+                codec_codec_roundtrip_color(Color::Blue as i32, &mut err),
+                Color::Blue as i32
+            );
+        }
+    }
+
+    #[test]
+    fn strings_and_bytes_round_trip_verbatim() {
+        let mut err = FfiError::default();
+        let mut len = 0usize;
+        let text = "nul\0inside \u{1F980}";
+        let out =
+            unsafe { codec_codec_roundtrip_string(text.as_ptr(), text.len(), &mut len, &mut err) };
+        assert_eq!(unsafe { abi::lift_str(out, len) }, Some(text));
+        unsafe { abi::free_bytes(out.cast_mut(), len) };
+
+        let data = [0u8, 255, 0, 7];
+        let out =
+            unsafe { codec_codec_roundtrip_bytes(data.as_ptr(), data.len(), &mut len, &mut err) };
+        assert_eq!(unsafe { abi::lift_bytes(out, len) }, Some(data.to_vec()));
+        unsafe { abi::free_bytes(out.cast_mut(), len) };
+
+        // The empty string is `(NULL, 0)` in both directions.
+        let out = unsafe { codec_codec_roundtrip_string(std::ptr::null(), 0, &mut len, &mut err) };
+        assert!(out.is_null());
+        assert_eq!(len, 0);
+        assert_eq!(err.code, 0);
+    }
+
+    #[test]
+    fn holders_carry_object_references() {
+        let mut err = FfiError::default();
+        let mut len = 0usize;
+        let ptr = unsafe { codec_codec_make_holder(10, true, &mut len, &mut err) };
         let holder = decode_and_free::<Holder>(ptr, len);
         assert_eq!(holder.primary.value(), 10);
         assert_eq!(holder.spare.as_ref().unwrap().value(), 11);
@@ -492,30 +520,26 @@ mod tests {
         // decode adopts it, so an encoded buffer is consumed exactly once.
         let bytes = abi::encode_value(&holder);
         assert_eq!(
-            weaveffi_codec_sum_holder(bytes.as_ptr(), bytes.len(), &mut err),
+            unsafe { codec_codec_sum_holder(bytes.as_ptr(), bytes.len(), &mut err) },
             10 + 11 + 12 + 13 + 14
         );
         assert_eq!(Arc::strong_count(&holder.primary), 1);
 
         let bytes = abi::encode_value(&holder);
-        let primary = weaveffi_codec_primary_of(bytes.as_ptr(), bytes.len(), &mut err);
+        let primary = unsafe { codec_codec_primary_of(bytes.as_ptr(), bytes.len(), &mut err) };
         assert_eq!(primary as *const Token, Arc::as_ptr(&holder.primary));
         assert_eq!(Arc::strong_count(&holder.primary), 2);
-        weaveffi_codec_Token_destroy(primary);
+        unsafe { codec_codec_Token_destroy(primary) };
         assert_eq!(Arc::strong_count(&holder.primary), 1);
 
         let a = abi::encode_value(&holder);
         let b = abi::encode_value(&holder);
-        assert!(weaveffi_codec_same_primary(
-            a.as_ptr(),
-            a.len(),
-            b.as_ptr(),
-            b.len(),
-            &mut err
-        ));
+        assert!(unsafe {
+            codec_codec_same_primary(a.as_ptr(), a.len(), b.as_ptr(), b.len(), &mut err)
+        });
         assert_eq!(Arc::strong_count(&holder.primary), 1);
 
-        let ptr = weaveffi_codec_make_holder(0, false, &mut len, &mut err);
+        let ptr = unsafe { codec_codec_make_holder(0, false, &mut len, &mut err) };
         let without = decode_and_free::<Holder>(ptr, len);
         assert!(without.spare.is_none());
     }

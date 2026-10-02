@@ -1,0 +1,187 @@
+//! CI gate: no silent stubs, in either the generators or their output.
+//!
+//! The pre-overhaul backends shipped bindings that compiled but lied: builder
+//! `build()` methods that threw "requires FFI backing", `unimplemented!()`
+//! paths for whole call shapes, features skipped without a word. These tests
+//! make that class of regression a build failure:
+//!
+//! 1. Generator and model crate sources must not contain `unimplemented!(` / `todo!(`.
+//!    (`unreachable!` stays allowed: it documents genuinely impossible states.)
+//! 2. The full generated output for the feature-complete sample IDLs must not
+//!    contain stub markers. A target that cannot support a feature must either
+//!    fail generation loudly (the capability gate) or emit an *explicit*
+//!    "not supported by this target" surface, never a fake implementation.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("workspace root")
+}
+
+fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}")) {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            walk_files(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+/// Generator crate sources must not punt with panicking placeholder macros.
+#[test]
+fn generator_sources_ban_unimplemented_and_todo() {
+    let crates_dir = workspace_root().join("crates");
+    let mut scanned = 0usize;
+    let mut violations: Vec<String> = Vec::new();
+
+    for entry in fs::read_dir(&crates_dir).expect("read crates/") {
+        let path = entry.expect("dir entry").path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        // Only the generator and model crates (the code that produces
+        // consumer bindings) are in scope; test helpers and the CLI are free
+        // to use placeholder macros.
+        if !(name == "weaveffi-gen" || name == "weaveffi-model") {
+            continue;
+        }
+        let src = path.join("src");
+        let mut files = Vec::new();
+        walk_files(&src, &mut files);
+        for file in files {
+            if file.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            // The Rust extractor's tests parse annotated sample sources whose
+            // bodies are `todo!()`; that's fixture text, not a stub.
+            if name == "weaveffi-model" && file.ends_with("src/rust.rs") {
+                continue;
+            }
+            let text = fs::read_to_string(&file).expect("read source file");
+            scanned += 1;
+            for banned in ["unimplemented!(", "todo!("] {
+                if text.contains(banned) {
+                    violations.push(format!("{}: contains `{banned}`", file.display()));
+                }
+            }
+        }
+    }
+
+    assert!(
+        scanned > 10,
+        "expected to scan generator sources, got {scanned} files"
+    );
+    assert!(
+        violations.is_empty(),
+        "panicking placeholder macros in generator crates (implement the path, \
+         fail generation via the capability gate, or use unreachable! for \
+         impossible states):\n{}",
+        violations.join("\n")
+    );
+}
+
+/// The Ruby callback-interface mixin's abstract-method default, which is the
+/// one legitimate "not implemented" in generated output (see the exemption in
+/// [`generated_output_has_no_stub_markers`]).
+fn is_abstract_callback_default(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("raise NotImplementedError, \"#{self.class}#")
+        || (t.starts_with('#') && t.contains("NotImplementedError"))
+}
+
+/// Every file generated for the feature-complete samples (structs, builders,
+/// enums, optionals, lists, maps, bytes, objects in every position, callback
+/// interfaces, async, iterators, submodules) must be free of stub markers
+/// across all targets.
+#[test]
+fn generated_output_has_no_stub_markers() {
+    let root = workspace_root();
+    let samples = [
+        root.join("samples/contacts/src/lib.rs"),
+        root.join("samples/events/src/lib.rs"),
+        root.join("samples/kvstore/src/lib.rs"),
+        root.join("samples/codec/src/lib.rs"),
+    ];
+
+    // Case-insensitive marker list. Bare "not supported" is deliberately
+    // absent: an explicit, permanently declared unsupported-feature surface
+    // (e.g. wasm async/listener stubs in Emscripten mode, which throw "is
+    // not supported in Emscripten mode") is the *correct* loud behavior. The
+    // "yet" in "not yet supported" is what distinguishes capability drift: a
+    // target that declares a feature `true` (so the gate lets generation
+    // through) but then emits a runtime-throwing TODO stub for it. That is
+    // exactly the Kotlin `iter<T>` regression the capability gate exists to
+    // prevent, so it must stay a hard build failure.
+    let banned = [
+        "unimplemented",
+        "notimplemented",
+        "not implemented",
+        "not yet supported",
+        "not yet implemented",
+        "requires ffi backing",
+    ];
+
+    let mut violations: Vec<String> = Vec::new();
+    for idl in &samples {
+        assert!(idl.exists(), "missing sample IDL: {}", idl.display());
+        let dir = tempfile::tempdir().expect("temp dir");
+        let out = dir.path().join("out");
+
+        assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .args([
+                "generate",
+                idl.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                "--force",
+            ])
+            .assert()
+            .success();
+
+        let mut files = Vec::new();
+        walk_files(&out, &mut files);
+        assert!(
+            files.len() > 10,
+            "expected many generated files for {}, got {}",
+            idl.display(),
+            files.len()
+        );
+        for file in files {
+            let Ok(text) = fs::read_to_string(&file) else {
+                continue; // non-UTF-8 artifacts have no text stubs to check
+            };
+            // A callback interface is implemented by the *consumer*, and the
+            // idiomatic way to publish its method set in dynamic languages is
+            // an abstract default that raises until overridden (Ruby's
+            // `raise NotImplementedError, "#{self.class}#m is not implemented"`).
+            // That is an API contract the consumer sees, not a generator
+            // stub, so those lines are exempt from the scan.
+            let lower: String = text
+                .lines()
+                .filter(|l| !is_abstract_callback_default(l))
+                .map(str::to_lowercase)
+                .collect::<Vec<_>>()
+                .join("\n");
+            for marker in banned {
+                if lower.contains(marker) {
+                    violations.push(format!(
+                        "{} (from {}): contains \"{marker}\"",
+                        file.display(),
+                        idl.file_name().unwrap().to_string_lossy()
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "stub markers found in generated output:\n{}",
+        violations.join("\n")
+    );
+}

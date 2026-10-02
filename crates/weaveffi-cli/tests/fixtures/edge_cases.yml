@@ -1,4 +1,4 @@
-version: "0.9.0"
+version: "0.10.0"
 # Shapes the mainstream fixtures do not reach: identifiers that are reserved
 # words in one or more target languages, deeply nested composites, optional
 # parameters, interfaces in every legal position (including inside records,

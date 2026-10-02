@@ -2,15 +2,19 @@
 //! json` output, plus advisory warnings under `--warn`.
 
 use miette::{Report, Result};
-use weaveffi_core::validate::{collect_warnings, validate_api, ValidationError, ValidationWarning};
+use weaveffi_model::validate::{
+    collect_warnings, validate_api, ValidationError, ValidationWarning,
+};
 
 pub(crate) fn cmd_validate(
-    input: &str,
+    input: Option<&str>,
+    config: Option<&str>,
     warn: bool,
-    format: Option<&str>,
+    json_mode: bool,
     quiet: bool,
 ) -> Result<()> {
-    let json_mode = format == Some("json");
+    let (_, input) = crate::config::ProjectConfig::locate(config, input)?;
+    let input = input.as_str();
     let (api, contents) = super::load_api(input)?;
 
     match validate_api(api, Some((input, &contents))) {
@@ -20,17 +24,17 @@ pub(crate) fn cmd_validate(
             } else {
                 Vec::new()
             };
-            let n_modules = api.modules.len();
-            let n_functions: usize = api.modules.iter().map(|m| m.functions.len()).sum();
-            let n_structs: usize = api.modules.iter().map(|m| m.structs.len()).sum();
-            let n_enums: usize = api.modules.iter().map(|m| m.enums.len()).sum();
+            let counts = Counts::of(&api.modules);
             if json_mode {
                 let json = serde_json::json!({
                     "ok": true,
-                    "modules": n_modules,
-                    "functions": n_functions,
-                    "structs": n_structs,
-                    "enums": n_enums,
+                    "modules": counts.modules,
+                    "functions": counts.functions,
+                    "interfaces": counts.interfaces,
+                    "callback_interfaces": counts.callback_interfaces,
+                    "records": counts.records,
+                    "enums": counts.enums,
+                    "error_domains": counts.error_domains,
                     "warnings": warnings.iter().map(warning_to_json).collect::<Vec<_>>(),
                 });
                 println!("{json}");
@@ -39,10 +43,7 @@ pub(crate) fn cmd_validate(
                     eprintln!("warning: {w}");
                 }
                 println!("Validation passed");
-                println!(
-                    "  {} modules, {} functions, {} structs, {} enums",
-                    n_modules, n_functions, n_structs, n_enums
-                );
+                println!("  {}", counts.summary());
             }
             Ok(())
         }
@@ -61,6 +62,61 @@ pub(crate) fn cmd_validate(
             }
             Err(Report::new(diags))
         }
+    }
+}
+
+/// Declaration counts across a module tree, for the success summary.
+#[derive(Default)]
+struct Counts {
+    modules: usize,
+    functions: usize,
+    interfaces: usize,
+    callback_interfaces: usize,
+    records: usize,
+    enums: usize,
+    error_domains: usize,
+}
+
+impl Counts {
+    fn of(modules: &[weaveffi_model::ir::Module]) -> Self {
+        let mut c = Self::default();
+        c.add(modules);
+        c
+    }
+
+    fn add(&mut self, modules: &[weaveffi_model::ir::Module]) {
+        for m in modules {
+            self.modules += 1;
+            self.functions += m.functions.len();
+            self.interfaces += m.interfaces.len();
+            self.callback_interfaces += m.callback_interfaces.len();
+            self.records += m.structs.len();
+            self.enums += m.enums.len();
+            self.error_domains += usize::from(m.errors.is_some());
+            self.add(&m.modules);
+        }
+    }
+
+    fn summary(&self) -> String {
+        let parts = [
+            (self.modules, "module", "modules"),
+            (self.functions, "function", "functions"),
+            (self.interfaces, "interface", "interfaces"),
+            (
+                self.callback_interfaces,
+                "callback interface",
+                "callback interfaces",
+            ),
+            (self.records, "record", "records"),
+            (self.enums, "enum", "enums"),
+            (self.error_domains, "error domain", "error domains"),
+        ];
+        parts
+            .iter()
+            .filter(|(n, ..)| *n > 0)
+            .map(|(n, one, many)| format!("{n} {}", if *n == 1 { one } else { many }))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -111,7 +167,8 @@ fn validation_error_code(err: &ValidationError) -> &'static str {
         ValidationError::DuplicateTypeName { .. } => "DuplicateTypeName",
         ValidationError::DuplicateErrorCodeName { .. } => "DuplicateErrorCodeName",
         ValidationError::ThrowsWithoutErrorDomain { .. } => "ThrowsWithoutErrorDomain",
-        ValidationError::AbiSymbolCollision { .. } => "AbiSymbolCollision",
+        ValidationError::SymbolCollision { .. } => "SymbolCollision",
+        ValidationError::CancellableNotAsync { .. } => "CancellableNotAsync",
     }
 }
 
@@ -262,9 +319,18 @@ fn validation_error_to_json(err: &ValidationError) -> serde_json::Value {
             obj.insert("module".into(), Value::String(module.clone()));
             obj.insert("function".into(), Value::String(function.clone()));
         }
-        ValidationError::AbiSymbolCollision { module, symbol } => {
-            obj.insert("module".into(), Value::String(module.clone()));
+        ValidationError::SymbolCollision {
+            symbol,
+            first,
+            second,
+        } => {
             obj.insert("symbol".into(), Value::String(symbol.clone()));
+            obj.insert("first".into(), Value::String(first.clone()));
+            obj.insert("second".into(), Value::String(second.clone()));
+        }
+        ValidationError::CancellableNotAsync { module, function } => {
+            obj.insert("module".into(), Value::String(module.clone()));
+            obj.insert("function".into(), Value::String(function.clone()));
         }
     }
     obj.insert("message".into(), Value::String(err.to_string()));

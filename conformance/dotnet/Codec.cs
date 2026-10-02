@@ -1,7 +1,7 @@
 // Conformance consumer: codec sample, .NET target.
 //
-// Round-trips every value-buffer wire shape through the generated P/Invoke
-// wrapper (Codec.cs, namespace Codec) against the producer's oracle: the
+// Round-trips every value-buffer wire shape through the generated Codec
+// project against the producer's oracle: the
 // canonical Scalars and Composite fixtures are decoded and checked field by
 // field (producer encodes, consumer decodes), handed back through Verify*
 // (consumer encodes, producer decodes) and Roundtrip* (both), then rebuilt
@@ -12,19 +12,18 @@
 // objects in a required field, an optional, and a list: each encoded token is
 // a fresh clone, PrimaryOf returns a wrapper to the same native object as the
 // holder's Primary, and every wrapper is disposed (double Dispose safe,
-// ObjectDisposedException after). The producer cdylib is resolved by absolute
-// path via a DllImportResolver reading WEAVEFFI_LIBRARY.
+// ObjectDisposedException after). Strings with interior NULs cross the
+// function boundary intact, since strings are (pointer, length) pairs.
+// Wrapper equality is native object identity. Ends by asserting the
+// producer's leak counters are zero.
 //
-// The harness compiles the generated source into this assembly, so the
-// wrapper's `internal` Handle property is reachable and used to prove two
-// wrappers point at the same native object. The IDL sets the .NET namespace
-// to `Codec` and the module is also `codec`, so the free-function class is
-// `Codec.Codec`; `using static` imports those statics.
+// The namespace is `Codec` and the module is also `codec`, so the
+// free-function class is `Codec.Codec`; `using static` imports its statics.
 
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
 using Codec;
 using static Codec.Codec;
 
@@ -155,14 +154,15 @@ internal static class Program
 
     static int Main()
     {
-        var lib = Environment.GetEnvironmentVariable("WEAVEFFI_LIBRARY");
-        NativeLibrary.SetDllImportResolver(typeof(Program).Assembly, (name, asm, search) =>
-        {
-            if (name == "weaveffi" && !string.IsNullOrEmpty(lib))
-                return NativeLibrary.Load(lib);
-            return IntPtr.Zero;
-        });
+        Run();
+        LeakCheck.AssertNoLeaks("codec");
+        Console.WriteLine("dotnet/codec: OK");
+        return 0;
+    }
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void Run()
+    {
         // --- Scalars: producer encodes, consumer decodes; then back. ---
         var scalars = SampleScalars();
         CheckScalars(scalars, "sample_scalars");
@@ -183,7 +183,7 @@ internal static class Program
         {
             Expect(e.Code == CodecException.Mismatch, $"Mismatch code == 1 (got {e.Code})");
             Expect(e.Code == 1, "Mismatch constant is 1");
-            Expect(e is WeaveFFIException, "typed exception extends the brand exception");
+            Expect(e is NativeException, "typed exception extends the brand exception");
         }
 
         // Scalars at the extremes, including float edge values whose bit
@@ -330,7 +330,12 @@ internal static class Program
         Expect(map.Count == 3 && map[""] == long.MinValue && map["k"] == 0 && map["ключ"] == long.MaxValue, "map contents");
         Expect(RoundtripString("") == "", "empty string");
         Expect(RoundtripString("héllo wörld ✓ 🎉") == "héllo wörld ✓ 🎉", "unicode string");
+        var nul = RoundtripString("a\0b\0");
+        Expect(nul == "a\0b\0" && nul.Length == 4, "interior NULs survive the function boundary");
+        Expect(RoundtripString("\0") == "\0", "a lone NUL survives");
         Expect(RoundtripBytes(new byte[0]).Length == 0, "empty bytes");
+        ReadOnlySpan<byte> span = stackalloc byte[] { 7, 0, 9 };
+        Expect(RoundtripBytes(span).SequenceEqual(new byte[] { 7, 0, 9 }), "bytes from a span");
         Expect(RoundtripBytes(new byte[] { 0, 127, 128, 255 }).SequenceEqual(new byte[] { 0, 127, 128, 255 }), "bytes");
         Expect(RoundtripI64(long.MinValue) == long.MinValue, "i64::MIN direct");
         Expect(RoundtripI64(long.MaxValue) == long.MaxValue, "i64::MAX direct");
@@ -350,7 +355,7 @@ internal static class Program
         Expect(holder.Primary.Value() == 10, "holder.primary");
         Expect(holder.Spare != null && holder.Spare.Value() == 11, "holder.spare");
         Expect(holder.Many.Select(t => t.Value()).SequenceEqual(new long[] { 12, 13, 14 }), "holder.many");
-        Expect(holder.Many.Select(t => t.Handle).Distinct().Count() == 3, "holder.many are distinct objects");
+        Expect(holder.Many.Select(t => t).Distinct().Count() == 3, "holder.many are distinct objects");
         Expect(SumHolder(holder) == 10 + 11 + 12 + 13 + 14, "sum_holder");
         // Encoding cloned each token, so the holder is still fully usable.
         Expect(SumHolder(holder) == 60, "sum_holder again after re-encoding");
@@ -358,7 +363,7 @@ internal static class Program
 
         var primary = PrimaryOf(holder);
         Expect(!ReferenceEquals(primary, holder.Primary), "primary_of is a new wrapper");
-        Expect(primary.Handle == holder.Primary.Handle, "primary_of wraps the same native object");
+        Expect(primary.Equals(holder.Primary), "primary_of wraps the same native object");
         Expect(primary.Value() == 10, "primary_of value");
         Expect(SamePrimary(holder, holder), "same_primary with itself");
         var other = MakeHolder(10, true);
@@ -378,7 +383,7 @@ internal static class Program
         var own = new Holder(t1, t2, new[] { t3, t1 });
         Expect(SumHolder(own) == 1 + 2 + long.MinValue + 1, "sum_holder over consumer tokens");
         var ownPrimary = PrimaryOf(own);
-        Expect(ownPrimary.Handle == t1.Handle && ownPrimary.Value() == 1, "primary_of consumer token");
+        Expect(ownPrimary.Equals(t1) && ownPrimary.Value() == 1, "primary_of consumer token");
 
         // Reference counting: dropping one wrapper leaves the others valid;
         // double Dispose is a no-op; a disposed wrapper throws.
@@ -414,8 +419,5 @@ internal static class Program
         {
             Expect(scoped.Value() == 99, "scoped token");
         }
-
-        Console.WriteLine("dotnet/codec: OK");
-        return 0;
     }
 }

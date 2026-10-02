@@ -1,60 +1,31 @@
 // Conformance consumer: events sample, Kotlin (JVM via JNI) target.
 //
-// Exercises the ABI 2 callback-interface and object surface: `Subscriber` is
-// a generated Kotlin interface the consumer implements (the JNI vtable
-// trampolines pin the implementing object with a GlobalRef and dispatch
-// through the `SubscriberJni` shims), `EventBus` is a reference-counted
-// `AutoCloseable` wrapper (companion `invoke` for `new`, `close()` releases
-// one strong reference, the `Cleaner` is the backstop), and `Message` is a
-// data class decoded from a value buffer. Asserts that every callback method
-// is invoked with the right arguments (including the bus object handed to
-// `onAttached`, which is usable and independently closeable), that `Delivery`
-// return values steer `publish`'s accepted count, that a Kotlin exception
-// thrown inside a callback surfaces to the caller as `WeaveFFIException` with
-// code -4 without unwinding through the JVM, the `suspend` async `publishLater`
-// driven with `runBlocking`, the iterator-backed `messages()` drained as a
-// `Sequence`, the nullable `lastMessage()`, `routeOnce` without a bus, and the
-// close semantics (double `close()` is safe, use after close throws).
-// Compiled in-module with the generated `WeaveFFI.kt`.
+// Exercises the callback-interface and object surface: `Subscriber` is a
+// generated Kotlin interface the consumer implements (the JNI vtable
+// trampolines pin the implementing object with a global reference and call
+// the `JniBridge` dispatch shims from any producer thread), `EventBus` is a
+// reference-counted `AutoCloseable` wrapper, and `Message` is a data class
+// decoded from a value buffer. Asserts that every callback method is invoked
+// with the right arguments (including the bus object handed to
+// `onAttached`, which is usable and independently closeable), that
+// `Delivery` return values steer `publish`'s accepted count, that a Kotlin
+// exception thrown inside a callback (including `route`, which the producer
+// declares as returning `Result<_, ForeignError>`) surfaces to the caller as
+// `FfiException` code -4, the `suspend` `publishLater`, the
+// `NativeIterator`-backed `messages()`, the nullable `lastMessage()`,
+// `Events.routeOnce` without a bus, close semantics, and, at exit, that
+// every native resource was released.
 @file:JvmName("Main")
 
-import com.weaveffi.Delivery
-import com.weaveffi.EventBus
-import com.weaveffi.EventsEventBusMessagesIterator
-import com.weaveffi.Message
-import com.weaveffi.Subscriber
-import com.weaveffi.WeaveFFI
-import com.weaveffi.WeaveFFIException
+import events.Delivery
+import events.EventBus
+import events.Message
+import events.Subscriber
+import events.Events
+import events.JniBridge
+import events.FfiException
 import java.lang.ref.WeakReference
-import kotlin.system.exitProcess
 import kotlinx.coroutines.runBlocking
-
-fun expect(cond: Boolean, msg: String) {
-    if (!cond) {
-        System.err.println("assertion failed: $msg")
-        exitProcess(1)
-    }
-}
-
-/** Run `block` and return the exception it threw, or null if it completed. */
-inline fun thrownBy(block: () -> Unit): Throwable? =
-    try {
-        block()
-        null
-    } catch (e: Throwable) {
-        e
-    }
-
-/** Spin the collector until `ref` clears or we give up. */
-fun collected(ref: WeakReference<*>): Boolean {
-    for (i in 0 until 200) {
-        if (ref.get() == null) return true
-        System.gc()
-        System.runFinalization()
-        Thread.sleep(5)
-    }
-    return ref.get() == null
-}
 
 /**
  * A subscriber that records every callback. `skipTopic` is routed as Skip,
@@ -105,7 +76,7 @@ class RecordingSubscriber(
 /** Route once through a subscriber nothing else references, returning a weak handle to it. */
 fun routeOnceThrowaway(): WeakReference<RecordingSubscriber> {
     val sub = RecordingSubscriber("throwaway")
-    expect(WeaveFFI.routeOnce(sub, "t") == Delivery.Accept, "routeOnce throwaway")
+    expect(Events.routeOnce(sub, "t") == Delivery.Accept, "routeOnce throwaway")
     return WeakReference(sub)
 }
 
@@ -117,7 +88,7 @@ fun subscribeThrowaway(bus: EventBus): WeakReference<RecordingSubscriber> {
     return WeakReference(sub)
 }
 
-fun main() {
+fun run() {
     val bus = EventBus()
     expect(bus.subscriberCount() == 0L, "fresh bus has no subscribers")
     expect(bus.lastMessage() == null, "fresh bus has no last message")
@@ -180,7 +151,7 @@ fun main() {
     expect(byHand == texts, "manual iteration matches")
     expect(thrownBy { it.next() } is NoSuchElementException, "exhausted iterator throws NoSuchElementException")
     // An abandoned iterator can be closed early, and closed twice.
-    val partial = bus.messages() as EventsEventBusMessagesIterator
+    val partial = bus.messages()
     expect(partial.next() == "nobody home", "partial iterator first element")
     partial.close()
     partial.close()
@@ -191,9 +162,9 @@ fun main() {
     expect(last == Message(5L, "later", "async hello", listOf()), "lastMessage (got $last)")
 
     // routeOnce: a free function taking the callback interface without a bus.
-    expect(WeaveFFI.routeOnce(quiet, "quiet") == Delivery.Skip, "routeOnce quiet -> Skip")
-    expect(WeaveFFI.routeOnce(stopper, "stop") == Delivery.AcceptAndStop, "routeOnce stop -> AcceptAndStop")
-    expect(WeaveFFI.routeOnce(tail, "anything") == Delivery.Accept, "routeOnce -> Accept")
+    expect(Events.routeOnce(quiet, "quiet") == Delivery.Skip, "routeOnce quiet -> Skip")
+    expect(Events.routeOnce(stopper, "stop") == Delivery.AcceptAndStop, "routeOnce stop -> AcceptAndStop")
+    expect(Events.routeOnce(tail, "anything") == Delivery.Accept, "routeOnce -> Accept")
     expect(quiet.routed.last() == "quiet", "routeOnce reached route()")
     // The producer drops its only reference when routeOnce returns, so the
     // GlobalRef pinning a throwaway subscriber is released and it becomes
@@ -203,7 +174,7 @@ fun main() {
     // The bus handed to onAttached is a distinct wrapper over the same
     // object: usable, and closing it leaves the caller's wrapper alive.
     val kept = tail.keptBus!!
-    expect(kept.handle == bus.handle, "onAttached bus is the same native object")
+    expect(kept.handle.address == bus.handle.address, "onAttached bus is the same native object")
     expect(kept.subscriberCount() == 3L, "kept bus reads the live subscriber count")
     kept.close()
     kept.close()
@@ -213,7 +184,7 @@ fun main() {
     stopper.keptBus!!.close()
 
     // Foreign errors: a Kotlin exception thrown from any callback method
-    // surfaces to the caller as WeaveFFIException(-4) carrying the throwable's
+    // surfaces to the caller as FfiException(-4) carrying the throwable's
     // text, and the JVM keeps running. Use a fresh bus for exact counts.
     EventBus().use { bus2 ->
         val ok = RecordingSubscriber("ok")
@@ -223,8 +194,8 @@ fun main() {
         ok.keptBus!!.close()
         rejecter.keptBus!!.close()
         val routeErr = thrownBy { bus2.publish("boom", "x", listOf()) }
-        expect(routeErr is WeaveFFIException, "throwing route() surfaces as WeaveFFIException (got $routeErr)")
-        expect((routeErr as WeaveFFIException).code == -4, "foreign error code -4 (got ${routeErr.code})")
+        expect(routeErr is FfiException, "throwing route() surfaces as FfiException (got $routeErr)")
+        expect((routeErr as FfiException).code == -4, "foreign error code -4 (got ${routeErr.code})")
         expect(
             routeErr.message?.contains("rejected boom") == true,
             "foreign error carries the Kotlin message (got ${routeErr.message})"
@@ -240,20 +211,20 @@ fun main() {
         bus2.subscribe(onMsg)
         onMsg.keptBus!!.close()
         val msgErr = thrownBy { bus2.publish("any", "z", listOf()) }
-        expect(msgErr is WeaveFFIException && msgErr.code == -4, "throwing onMessage() surfaces as -4 (got $msgErr)")
+        expect(msgErr is FfiException && msgErr.code == -4, "throwing onMessage() surfaces as -4 (got $msgErr)")
         expect(msgErr?.message?.contains("failed on message") == true, "onMessage error text (got ${msgErr?.message})")
 
         // Throwing from onAttached aborts subscribe itself and the subscriber
         // isn't retained.
         val refuser = RecordingSubscriber("refuser", failOnAttached = true)
         val attachErr = thrownBy { bus2.subscribe(refuser) }
-        expect(attachErr is WeaveFFIException && attachErr.code == -4, "throwing onAttached() surfaces as -4 (got $attachErr)")
+        expect(attachErr is FfiException && attachErr.code == -4, "throwing onAttached() surfaces as -4 (got $attachErr)")
         expect(bus2.subscriberCount() == 3L, "refused subscriber not retained (got ${bus2.subscriberCount()})")
 
         // routeOnce also propagates the foreign error.
-        val onceErr = thrownBy { WeaveFFI.routeOnce(rejecter, "boom") }
-        expect(onceErr is WeaveFFIException && onceErr.code == -4, "routeOnce propagates -4 (got $onceErr)")
-        expect(WeaveFFI.routeOnce(rejecter, "calm") == Delivery.Accept, "rejecter still works for other topics")
+        val onceErr = thrownBy { Events.routeOnce(rejecter, "boom") }
+        expect(onceErr is FfiException && onceErr.code == -4, "routeOnce propagates -4 (got $onceErr)")
+        expect(Events.routeOnce(rejecter, "calm") == Delivery.Accept, "rejecter still works for other topics")
     }
 
     // clearSubscribers drops every retained subscriber (each free runs), and
@@ -274,4 +245,10 @@ fun main() {
     expect(thrownBy { bus.publish("x", "y", listOf()) } is IllegalStateException, "publish rejects use after close")
 
     println("kotlin/events: OK")
+}
+
+fun main() {
+    run()
+    expectNoLeaks { JniBridge.debug_live(it) }
+    println("kotlin/events: no leaks")
 }

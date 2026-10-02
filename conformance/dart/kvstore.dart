@@ -14,15 +14,14 @@
 // the same native object, `fork()`, `Store?` in and out of `larger`, the
 // `StoreInfo` record carrying a `Store` field plus an optional `Store`,
 // `openMany` returning a list of objects, `totalCount` taking a list of
-// objects and a Dart-built record holding objects), the Future-returning
-// `compact`, and dispose / double dispose / use after dispose on every
-// wrapper. Throws (non-zero exit) on any mismatch.
+// objects and a Dart-built record holding objects), the Future-returning,
+// cancellable `compact`, dispose / double dispose / use after dispose on
+// every wrapper, and the producer's leak counters at exit. Throws (non-zero
+// exit) on any mismatch.
 
-import 'package:__PKG__/__LIB__.dart' as wv;
+import 'package:kvstore/kvstore.dart' as wv;
 
-void expect(bool cond, String msg) {
-  if (!cond) throw StateError('assertion failed: $msg');
-}
+import 'support.dart';
 
 /// Records every eviction; returns false (detaching itself) once it has seen
 /// `keepFor` evictions, and throws when `fail` is set.
@@ -45,7 +44,7 @@ class RecordingListener extends wv.EvictionListener {
   List<String> get keys => evictions.map((e) => e.$1.key).toList();
 }
 
-Future<void> main() async {
+Future<void> run() async {
   // Fallible constructor: an empty path reports the IoError domain code
   // through the typed exception hierarchy.
   try {
@@ -55,7 +54,7 @@ Future<void> main() async {
     expect(e.code == 1004, 'IoError code == 1004 (got ${e.code})');
     expect(e.message == 'I/O failure', 'IoError message (got ${e.message})');
     expect(e is wv.KvException, 'IoException extends KvException');
-    expect(e is wv.WeaveFFIException, 'IoException extends the generic brand');
+    expect(e is wv.NativeException, 'IoException extends the generic brand');
   }
 
   final store = wv.Store.open('/tmp/conformance-kvstore-dart');
@@ -210,10 +209,10 @@ Future<void> main() async {
       'put doomed');
   try {
     store.delete('doomed');
-    throw StateError('expected WeaveFFIException from throwing listener');
-  } on wv.WeaveFFIException catch (e) {
+    throw StateError('expected NativeException from throwing listener');
+  } on wv.NativeException catch (e) {
     expect(e is! wv.KvException, 'foreign error is not a domain error');
-    expect(e.code == wv.WeaveFFIException.foreignCode && e.code == -4,
+    expect(e.code == wv.NativeException.foreignCode && e.code == -4,
         'foreign code -4 (got ${e.code})');
     expect(e.message.contains('hostile refuses eviction of doomed'),
         'foreign message carries the exception text (got ${e.message})');
@@ -224,7 +223,7 @@ Future<void> main() async {
   try {
     store.delete('doomed2');
     throw StateError('expected a second foreign error');
-  } on wv.WeaveFFIException catch (e) {
+  } on wv.NativeException catch (e) {
     expect(e.code == -4, 'listener still attached after failing');
   }
   store.clearEvictionListener();
@@ -384,5 +383,25 @@ Future<void> main() async {
     throw StateError('expected StateError after dispose');
   } on StateError catch (_) {}
 
+  await expectCompactCancellation();
+}
+
+/// `compact` is cancellable: a token cancelled before launch completes the
+/// call with CancelledException, and an unused token changes nothing.
+Future<void> expectCompactCancellation() async {
+  final store = wv.Store.open('/tmp/conformance-kvstore-dart-cancel');
+  final idle = wv.CancelToken();
+  expect(await store.compact(cancelToken: idle) == 0, 'compact with a token');
+  final token = wv.CancelToken()..cancel();
+  final cancelled = await expectThrowsAsync<wv.CancelledException>(
+      () => store.compact(cancelToken: token), 'cancelled compact');
+  expect(cancelled.code == -5 && cancelled is! wv.KvException,
+      'cancellation is not a domain error');
+  store.dispose();
+}
+
+Future<void> main() async {
+  await run();
+  await expectNoLeaks('kvstore');
   print('dart/kvstore: OK');
 }

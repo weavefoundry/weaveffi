@@ -1,119 +1,194 @@
-//! Marshalling helpers that bridge owned Rust values and the C ABI slots.
+//! Marshalling helpers that bridge Rust values and the C ABI's `(ptr, len)`
+//! slots.
 //!
-//! These functions are the audited home of every `unsafe` pointer operation a
-//! WeaveFFI producer performs. The [`weaveffi-macros`](https://docs.rs/weaveffi-macros)
-//! `#[weaveffi::module]` expansion wires the generated `extern "C"` thunks to
-//! these helpers; producers never write the marshalling by hand. Keeping the
-//! conversions in one place (rather than re-deriving them per generated symbol)
-//! is what lets the runtime guarantee memory ownership rules consistently:
+//! These functions are the audited home of the pointer operations a WeaveFFI
+//! producer performs on strings, bytes, and value buffers. The
+//! `#[weaveffi::module]` expansion wires the generated thunks to them:
 //!
-//! * **lift** functions (`c_* -> Rust`) borrow or copy a foreign-supplied slot
-//!   into a Rust value for the duration of a call; they never take ownership
-//!   of caller memory.
-//! * **lower** functions (`Rust -> c_*`) hand an owned, heap-allocated value to
-//!   the foreign caller, who later releases it through the matching
-//!   `weaveffi_free_*` / `*_destroy` entry point.
+//! * **lift** functions read a borrowed `(ptr, len)` parameter. They never
+//!   take ownership of caller memory; the borrowing variants
+//!   ([`lift_str`], [`lift_byte_slice`]) don't even copy.
+//! * **lower** functions hand an owned value to the consumer as a
+//!   producer-allocated `(ptr, len)` run, which the consumer releases with
+//!   `{prefix}_free_bytes` (see [`free_bytes`]).
 //!
-//! Strings cross as NUL-terminated pointers via
-//! [`string_to_c_ptr`](crate::string_to_c_ptr) (freed with
-//! `weaveffi_free_string`); bytes and serialized value buffers cross as a
-//! `(ptr, len)` pair via [`lower_bytes`] (freed with `weaveffi_free_bytes`);
-//! everything composite crosses inside a value buffer (see [`crate::buffer`]),
-//! so there are no per-shape array helpers here.
+//! Strings, bytes, and serialized value buffers all share this one
+//! representation: a string is its UTF-8 bytes, never NUL-terminated, so an
+//! interior NUL round-trips intact. A null pointer is valid only with a
+//! length of `0` and denotes the empty run.
 
-// ── Lifting: C ABI slot -> Rust value ─────────────────────────────────────
-
-/// Copy a foreign byte buffer (`ptr` + `len`) into an owned `Vec<u8>`.
+/// Borrow a `(ptr, len)` parameter as a byte slice for a caller-chosen
+/// lifetime, without copying.
 ///
-/// A null `ptr` (or `len == 0`) yields an empty vector. The returned vector
-/// owns its bytes; the caller's buffer is left untouched.
+/// Returns `None` when `ptr` is null but `len` isn't `0`, which the thunk
+/// reports as a marshalling failure.
 ///
 /// # Safety
 ///
-/// When `ptr` is non-null it must point to at least `len` initialized bytes
-/// that stay valid for the duration of the call.
+/// When `ptr` is non-null it must point to `len` initialized bytes that stay
+/// valid and unmodified for the whole lifetime `'a`. Generated thunks bound
+/// `'a` by the call, matching the contract that parameters are borrowed for
+/// the call's duration.
 #[must_use]
-pub unsafe fn lift_bytes(ptr: *const u8, len: usize) -> Vec<u8> {
-    if ptr.is_null() || len == 0 {
-        return Vec::new();
+pub unsafe fn lift_byte_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    if ptr.is_null() {
+        return (len == 0).then_some(&[][..]);
     }
-    // SAFETY: caller guarantees `ptr` covers `len` initialized bytes.
-    unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+    // SAFETY: the caller guarantees `ptr` covers `len` bytes valid for `'a`.
+    Some(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
-/// Borrow a foreign byte buffer (`ptr` + `len`) as a `&[u8]` slice for the
-/// lifetime `'a` the caller chooses.
+/// Copy a `(ptr, len)` parameter into an owned `Vec<u8>`.
 ///
-/// A null `ptr` (or `len == 0`) yields an empty slice. No copy is made, so this
-/// is the marshalling for a borrowed `&[u8]` parameter.
+/// Returns `None` when `ptr` is null but `len` isn't `0`.
 ///
 /// # Safety
 ///
-/// When `ptr` is non-null it must point to at least `len` initialized bytes
-/// that remain valid and immutable for the entire chosen lifetime `'a`.
+/// Same contract as [`lift_byte_slice`], for the duration of the call.
 #[must_use]
-pub unsafe fn lift_byte_slice<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
-    if ptr.is_null() || len == 0 {
-        return &[];
-    }
-    // SAFETY: caller guarantees `ptr` covers `len` bytes valid for `'a`.
-    unsafe { std::slice::from_raw_parts(ptr, len) }
+pub unsafe fn lift_bytes(ptr: *const u8, len: usize) -> Option<Vec<u8>> {
+    // SAFETY: forwarded from the caller.
+    unsafe { lift_byte_slice(ptr, len) }.map(<[u8]>::to_vec)
 }
 
-// ── Lowering: owned Rust value -> C ABI slot ─────────────────────────────
-
-/// Lower an owned byte buffer into a heap allocation the caller frees with
-/// `weaveffi_free_bytes`, writing the byte count through `out_len`.
+/// Borrow a `(ptr, len)` string parameter as a `&str`, validating UTF-8,
+/// without copying.
 ///
-/// An empty buffer yields a null pointer and a length of `0`. The allocation is
-/// a boxed slice, matching the layout [`free_bytes`](crate::free_bytes)
-/// reconstructs.
+/// Returns `None` when `ptr` is null but `len` isn't `0`, or when the bytes
+/// aren't valid UTF-8.
 ///
 /// # Safety
 ///
-/// `out_len`, when non-null, must point to a writable `usize`.
-pub unsafe fn lower_bytes(data: Vec<u8>, out_len: *mut usize) -> *const u8 {
-    if !out_len.is_null() {
-        // SAFETY: caller guarantees `out_len` is writable when non-null.
-        unsafe { *out_len = data.len() };
-    }
+/// Same contract as [`lift_byte_slice`].
+#[must_use]
+pub unsafe fn lift_str<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
+    // SAFETY: forwarded from the caller.
+    std::str::from_utf8(unsafe { lift_byte_slice(ptr, len) }?).ok()
+}
+
+/// Copy a `(ptr, len)` string parameter into an owned `String`, validating
+/// UTF-8.
+///
+/// Returns `None` when `ptr` is null but `len` isn't `0`, or when the bytes
+/// aren't valid UTF-8.
+///
+/// # Safety
+///
+/// Same contract as [`lift_byte_slice`], for the duration of the call.
+#[must_use]
+pub unsafe fn lift_string(ptr: *const u8, len: usize) -> Option<String> {
+    // SAFETY: forwarded from the caller.
+    unsafe { lift_str(ptr, len) }.map(str::to_owned)
+}
+
+/// Turn an owned byte vector into the producer-allocated `(ptr, len)` run a
+/// return slot or async result carries, to be released with
+/// [`free_bytes`]. An empty vector yields `(null, 0)` and allocates nothing.
+///
+/// When the vector's capacity equals its length (as it does for every
+/// encoding [`encode_value`](crate::encode_value) produces) the conversion
+/// reuses the allocation as is; otherwise it's shrunk to fit first.
+#[must_use]
+pub fn bytes_into_raw(data: Vec<u8>) -> (*const u8, usize) {
     if data.is_empty() {
-        return std::ptr::null();
+        return (std::ptr::null(), 0);
     }
-    let boxed = data.into_boxed_slice();
-    Box::into_raw(boxed) as *const u8
+    let len = data.len();
+    let ptr = Box::into_raw(data.into_boxed_slice())
+        .cast::<u8>()
+        .cast_const();
+    crate::leak::track(crate::leak::ALLOCATIONS, 1);
+    (ptr, len)
+}
+
+/// Lower an owned byte vector into a return value plus the trailing
+/// `size_t* out_len` slot. See [`bytes_into_raw`].
+///
+/// # Safety
+///
+/// `out_len` must be null or point to a writable `usize`.
+pub unsafe fn lower_bytes(data: Vec<u8>, out_len: *mut usize) -> *const u8 {
+    let (ptr, len) = bytes_into_raw(data);
+    if !out_len.is_null() {
+        // SAFETY: the caller guarantees `out_len` is writable when non-null.
+        unsafe { *out_len = len };
+    }
+    ptr
+}
+
+/// Lower an owned string as its UTF-8 bytes, exactly like [`lower_bytes`].
+///
+/// # Safety
+///
+/// Same contract as [`lower_bytes`].
+pub unsafe fn lower_string(s: String, out_len: *mut usize) -> *const u8 {
+    // SAFETY: forwarded from the caller.
+    unsafe { lower_bytes(s.into_bytes(), out_len) }
+}
+
+/// The body of `{prefix}_free_bytes`: release a run returned by this runtime
+/// (a string, bytes, or a value buffer). A null `ptr` is a no-op.
+///
+/// # Safety
+///
+/// `ptr` must be null or a pointer this runtime returned together with
+/// `len`, released exactly once.
+pub unsafe fn free_bytes(ptr: *mut u8, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    crate::leak::track(crate::leak::ALLOCATIONS, -1);
+    // SAFETY: `bytes_into_raw` produced `ptr` from a `Box<[u8]>` of `len`
+    // bytes, and the caller hands it back exactly once.
+    drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)) });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::free_bytes;
 
     #[test]
     fn bytes_roundtrip() {
-        let data = vec![1u8, 2, 3, 4];
         let mut len = 0usize;
-        let ptr = unsafe { lower_bytes(data.clone(), &mut len) } as *mut u8;
+        let ptr = unsafe { lower_bytes(vec![1u8, 2, 3, 4], &mut len) };
         assert_eq!(len, 4);
-        let back = unsafe { lift_bytes(ptr, len) };
-        assert_eq!(back, data);
-        free_bytes(ptr, len);
+        assert_eq!(unsafe { lift_bytes(ptr, len) }, Some(vec![1, 2, 3, 4]));
+        unsafe { free_bytes(ptr.cast_mut(), len) };
     }
 
     #[test]
-    fn empty_bytes_is_null() {
+    fn empty_is_null_and_null_is_empty() {
         let mut len = 99usize;
         let ptr = unsafe { lower_bytes(Vec::new(), &mut len) };
         assert!(ptr.is_null());
         assert_eq!(len, 0);
+        assert_eq!(unsafe { lift_str(std::ptr::null(), 0) }, Some(""));
+        assert_eq!(unsafe { lift_bytes(std::ptr::null(), 0) }, Some(vec![]));
+        unsafe { free_bytes(std::ptr::null_mut(), 0) };
     }
 
     #[test]
-    fn lift_byte_slice_is_borrow() {
-        let data = [9u8, 8, 7];
-        let s = unsafe { lift_byte_slice(data.as_ptr(), data.len()) };
-        assert_eq!(s, &data);
-        let empty = unsafe { lift_byte_slice::<'static>(std::ptr::null(), 0) };
-        assert!(empty.is_empty());
+    fn null_with_a_length_is_rejected() {
+        assert!(unsafe { lift_byte_slice(std::ptr::null(), 3) }.is_none());
+        assert!(unsafe { lift_string(std::ptr::null(), 1) }.is_none());
+    }
+
+    #[test]
+    fn strings_borrow_and_keep_interior_nul() {
+        let text = "a\0b \u{1F980}";
+        let s = unsafe { lift_str(text.as_ptr(), text.len()) }.unwrap();
+        assert!(std::ptr::eq(s.as_ptr(), text.as_ptr()));
+        assert_eq!(s, text);
+
+        let mut len = 0usize;
+        let ptr = unsafe { lower_string(text.to_string(), &mut len) };
+        assert_eq!(unsafe { lift_string(ptr, len) }.as_deref(), Some(text));
+        unsafe { free_bytes(ptr.cast_mut(), len) };
+    }
+
+    #[test]
+    fn invalid_utf8_is_rejected() {
+        let bad = [0xFFu8, 0xFE];
+        assert!(unsafe { lift_str(bad.as_ptr(), bad.len()) }.is_none());
     }
 }

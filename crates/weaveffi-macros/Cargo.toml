@@ -1,7 +1,8 @@
 [package]
 name = "weaveffi-macros"
-version = "0.23.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -13,9 +14,7 @@ categories = ["development-tools::ffi"]
 proc-macro = true
 
 [dependencies]
-weaveffi-ir = { path = "../weaveffi-ir", version = "0.23.0" }
-weaveffi-core = { path = "../weaveffi-core", version = "0.23.0" }
-weaveffi-bridge = { path = "../weaveffi-bridge", version = "0.23.0" }
+weaveffi-model = { workspace = true }
 syn = { workspace = true }
 quote = { workspace = true }
 proc-macro2 = "1.0"

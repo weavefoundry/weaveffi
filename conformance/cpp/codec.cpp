@@ -1,4 +1,4 @@
-// Conformance consumer: codec sample, C++ target (ABI revision 2).
+// Conformance consumer: codec sample, C++ target.
 //
 // Round-trips every value-buffer wire shape through the producer oracle with
 // the generated header-only wrapper:
@@ -8,12 +8,14 @@
 //    unless the bytes decode to exactly the canonical value;
 //  - `roundtrip_*` covers the direct, string, and bytes families plus
 //    consumer-built values with edge cases (empty strings, lists, and maps,
-//    non-ASCII text, i64/u64 extremes, NaN, infinities, negative zero);
+//    non-ASCII text, interior NULs, i64/u64 extremes, NaN, infinities,
+//    negative zero);
 //  - `Shape` exercises every rich-enum variant as a std::variant;
 //  - `Holder` puts `Token` objects inside a record field, an optional, and a
 //    list: decoding adopts one reference per token, encoding clones one per
 //    token, `primary_of` returns the same object as `holder.primary`, and
 //    `same_primary` compares identity through two encodings.
+// Ends by asserting the producer's leak counters are all zero.
 // Exits non-zero on the first failed check.
 
 #include <cmath>
@@ -28,7 +30,8 @@
 #include <variant>
 #include <vector>
 
-#include "weaveffi.hpp"
+#include "check.hpp"
+#include "codec.hpp"
 
 // The root namespace is `codec` and the module namespace is `codec::codec`,
 // so types live at `codec::Scalars` and functions at `codec::codec::f`.
@@ -134,8 +137,8 @@ static void check_canonical_scalars(const Scalars& s, const char* who) {
     check(s.color == Color::Blue, (prefix + "color").c_str());
 }
 
-int main() {
-    codec::check_abi_version();
+static void run() {
+    codec::check_library();
 
     // Scalars: producer encodes, consumer decodes, and back again.
     Scalars sample = oracle::sample_scalars();
@@ -371,6 +374,14 @@ int main() {
         check(oracle::roundtrip_string("h\xC3\xA9llo \xE2\x9C\x93 \xF0\x9F\x8E\x89") ==
                   "h\xC3\xA9llo \xE2\x9C\x93 \xF0\x9F\x8E\x89",
               "roundtrip_string non-ASCII");
+        // Strings cross as pointer and length, so interior NULs survive both
+        // as a direct argument and inside a value buffer.
+        const std::string with_nul("a\0b\0\0c", 6);
+        check(oracle::roundtrip_string(with_nul) == with_nul, "roundtrip_string interior NUL");
+        check(oracle::roundtrip_string(std::string(1, '\0')).size() == 1,
+              "roundtrip_string lone NUL");
+        std::unordered_map<std::string, int64_t> nul_keys{{with_nul, 1}, {std::string("\0", 1), 2}};
+        check(oracle::roundtrip_map(nul_keys) == nul_keys, "roundtrip_map with NUL-bearing keys");
 
         check(oracle::roundtrip_bytes({}).empty(), "roundtrip_bytes empty");
         std::vector<uint8_t> all_bytes;
@@ -470,6 +481,11 @@ int main() {
               "long-lived tokens are still alive after the loop");
     }
 
+}
+
+int main() {
+    run();
+    check_no_leaks(codec_debug_live, "codec");
     std::printf("cpp/codec: OK\n");
     return 0;
 }

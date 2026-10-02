@@ -1,161 +1,245 @@
-// Conformance consumer: async-demo sample, C target.
+// Conformance consumer: async-demo sample, C target (ABI revision 3).
 //
-// Includes the *generated* C header and links the async_demo cdylib,
-// exercising the raw async launcher convention: each `*_async` symbol takes a
-// completion callback plus a context pointer and fires it once from the
-// producer's worker thread, with buffered results (the TaskResult record and
-// the list-of-records batch) borrowed for the duration of the callback and
-// direct scalars passed by value. Also covers the typed error code delivered
-// through the callback's error slot (InvalidName == 1), the plain sync
-// functions beside the async ones, and active_callbacks settling to zero.
-// Completion arrives on the producer's worker thread, so each wait polls an
-// atomic flag. Exits 0 on success; aborts (non-zero) on any failed assertion.
+// Exercises the raw async launcher convention: each async function's symbol
+// takes its inputs, a completion callback, and a context pointer, returns at
+// once, and fires the callback exactly once from a producer thread. Buffered
+// results (the TaskResult record, the list-of-records batch) arrive as
+// consumer-owned (ptr, len) runs released with async_demo_free_bytes; a
+// non-null error is heap-boxed and released with async_demo_error_free.
+// The cancellable `wait` takes a cancel token: cancelling it completes the
+// call with code -5 long before its timeout, whether the token fires before
+// or after launch, and the consumer may destroy its token reference at any
+// time. Also covers many concurrent launches, the plain sync function beside
+// the async ones, and the producer's leak counters settling to zero.
 
-#include <assert.h>
+#include "harness.h"
+
 #include <stdatomic.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
-#include "weaveffi.h"
-#include "wvbuf.h"
+#include "async_demo_buffer.h"
 
-// A decoded TaskResult record: id, value, success.
+#define CANCELLED (-5)
+
+// One in-flight call's completion slot; the callback runs on a producer
+// thread, so the main thread polls `done`.
 typedef struct {
-    int64_t id;
-    char* value;
-    int success;
-} task_result_t;
+    atomic_int done;
+    atomic_int fired;  // completions observed (must end at exactly 1)
+    int32_t code;
+    char message[96];
+    int64_t i64;
+    int32_t i32;
+    uint8_t* buf;  // owned result run
+    size_t buf_len;
+} call;
 
-static void read_task_result(wv_reader* r, task_result_t* t) {
-    t->id = wv_get_i64(r);
-    t->value = wv_get_str(r);
-    t->success = wv_get_bool(r);
+static void call_reset(call* c) {
+    memset(c, 0, sizeof *c);
+    atomic_init(&c->done, 0);
+    atomic_init(&c->fired, 0);
 }
 
-// Poll the completion flag; the callback fires on the producer's worker
-// thread, so the main thread spins until it lands.
-static void wait_done(atomic_int* done) {
-    while (!atomic_load(done)) {
+static void record_err(call* c, async_demo_error* err) {
+    c->code = err ? err->code : 0;
+    if (err && err->message) snprintf(c->message, sizeof c->message, "%s", err->message);
+    async_demo_error_free(err);
+}
+
+static void finish(call* c) {
+    atomic_fetch_add(&c->fired, 1);
+    atomic_store(&c->done, 1);
+}
+
+static void on_buffer(void* context, async_demo_error* err, const uint8_t* result_ptr,
+                      size_t result_len) {
+    call* c = (call*)context;
+    record_err(c, err);
+    // The result run is ours: keep it and release it after decoding.
+    c->buf = (uint8_t*)result_ptr;
+    c->buf_len = result_len;
+    finish(c);
+}
+
+static void on_i64(void* context, async_demo_error* err, int64_t result) {
+    call* c = (call*)context;
+    record_err(c, err);
+    c->i64 = result;
+    finish(c);
+}
+
+static void on_i32(void* context, async_demo_error* err, int32_t result) {
+    call* c = (call*)context;
+    record_err(c, err);
+    c->i32 = result;
+    finish(c);
+}
+
+// Wait for a completion, failing after `limit_ms`. Returns the elapsed time.
+static long await_call(call* c, long limit_ms) {
+    long waited = 0;
+    while (!atomic_load(&c->done)) {
+        assert(waited < limit_ms && "async call did not complete in time");
+        sleep_ms(1);
+        waited++;
+    }
+    assert(atomic_load(&c->fired) == 1);
+    return waited;
+}
+
+static void run_task(void) {
+    call c;
+    call_reset(&c);
+    async_demo_tasks_run_task(STR("alpha"), on_buffer, &c);
+    await_call(&c, 5000);
+    assert(c.code == 0 && c.buf != NULL);
+    async_demo_tasks_TaskResult r;
+    assert(async_demo_tasks_TaskResult_decode(c.buf, c.buf_len, &r));
+    async_demo_free_bytes(c.buf, c.buf_len);
+    assert(r.id > 0);
+    assert(strcmp(r.value.ptr, "completed: alpha") == 0);
+    assert(r.success);
+    async_demo_tasks_TaskResult_free(&r);
+
+    // Typed async error: the empty name reports InvalidName with its message
+    // and no result run.
+    call_reset(&c);
+    async_demo_tasks_run_task(NULL, 0, on_buffer, &c);
+    await_call(&c, 5000);
+    assert(c.code == async_demo_tasks_TaskError_InvalidName);
+    assert(strcmp(c.message, "task name must not be empty") == 0);
+    assert(c.buf == NULL && c.buf_len == 0);
+}
+
+static void run_batch(void) {
+    async_demo_str names[3] = {async_demo_str_of("a"), async_demo_str_of("b"),
+                               async_demo_str_of("c")};
+    async_demo_list_string in;
+    in.items = names;
+    in.len = 3;
+    async_demo_writer w;
+    memset(&w, 0, sizeof w);
+    async_demo_list_string_write(&w, &in);
+    call c;
+    call_reset(&c);
+    async_demo_tasks_run_batch(w.ptr, w.len, on_buffer, &c);
+    // Inputs are lifted before the launcher returns, so the buffer can go now.
+    async_demo_writer_free(&w);
+    await_call(&c, 5000);
+    assert(c.code == 0);
+    async_demo_list_tasks_TaskResult out;
+    assert(async_demo_list_tasks_TaskResult_decode(c.buf, c.buf_len, &out));
+    async_demo_free_bytes(c.buf, c.buf_len);
+    assert(out.len == 3);
+    const char* expected[3] = {"completed: a", "completed: b", "completed: c"};
+    for (size_t i = 0; i < 3; i++) {
+        assert(strcmp(out.items[i].value.ptr, expected[i]) == 0);
+        assert(out.items[i].success);
+    }
+    assert(out.items[0].id < out.items[1].id && out.items[1].id < out.items[2].id);
+    async_demo_list_tasks_TaskResult_free(&out);
+}
+
+static void run_n_tasks(void) {
+    // Many concurrent launches, each with its own context: every completion
+    // fires exactly once with its own value.
+    enum { N = 64 };
+    static call calls[N];
+    for (int i = 0; i < N; i++) {
+        call_reset(&calls[i]);
+        async_demo_tasks_run_n_tasks(i, on_i32, &calls[i]);
+    }
+    for (int i = 0; i < N; i++) {
+        await_call(&calls[i], 5000);
+        assert(calls[i].code == 0 && calls[i].i32 == i);
     }
 }
 
-// --- run_task("alpha"): buffered record result, decoded in the callback. ---
-static atomic_int g_task_done = 0;
-static int32_t g_task_err = -1;
-static task_result_t g_task_result;
+static void wait_and_cancel(void) {
+    call c;
 
-static void on_task_done(void* context, weaveffi_error* err,
-                         const uint8_t* result_ptr, size_t result_len) {
-    (void)context;
-    g_task_err = err ? err->code : 0;
-    if (g_task_err == 0) {
-        wv_reader r;
-        wv_r_init(&r, result_ptr, result_len);
-        read_task_result(&r, &g_task_result);
-        wv_r_expect_end(&r);
+    // No token: wait runs to its (short) timeout.
+    call_reset(&c);
+    async_demo_tasks_wait(5, NULL, on_i64, &c);
+    await_call(&c, 5000);
+    assert(c.code == 0 && c.i64 == 5);
+
+    // A token that is never cancelled changes nothing.
+    async_demo_cancel_token* token = async_demo_cancel_token_create();
+    assert(token != NULL && !async_demo_cancel_token_is_cancelled(token));
+    call_reset(&c);
+    async_demo_tasks_wait(10, token, on_i64, &c);
+    await_call(&c, 5000);
+    assert(c.code == 0 && c.i64 == 10);
+    async_demo_cancel_token_destroy(token);
+
+    // Cancel mid-flight: a one-minute wait completes with -5 almost at once.
+    // The consumer drops its token reference right after cancelling; the
+    // producer holds its own until the call completes.
+    token = async_demo_cancel_token_create();
+    call_reset(&c);
+    async_demo_tasks_wait(60000, token, on_i64, &c);
+    sleep_ms(20);
+    assert(!atomic_load(&c.done) && "the wait is still pending");
+    async_demo_cancel_token_cancel(token);
+    async_demo_cancel_token_cancel(token);  // idempotent
+    assert(async_demo_cancel_token_is_cancelled(token));
+    async_demo_cancel_token_destroy(token);
+    long waited = await_call(&c, 5000);
+    assert(waited < 5000);
+    assert(c.code == CANCELLED);
+    assert(c.message[0] != '\0');
+
+    // Cancelled before launch: completes with -5 without waiting.
+    token = async_demo_cancel_token_create();
+    async_demo_cancel_token_cancel(token);
+    call_reset(&c);
+    async_demo_tasks_wait(60000, token, on_i64, &c);
+    await_call(&c, 5000);
+    assert(c.code == CANCELLED);
+    async_demo_cancel_token_destroy(token);
+
+    // One token cancels several in-flight calls at once.
+    token = async_demo_cancel_token_create();
+    call many[3];
+    for (int i = 0; i < 3; i++) {
+        call_reset(&many[i]);
+        async_demo_tasks_wait(60000, token, on_i64, &many[i]);
     }
-    atomic_store(&g_task_done, 1);
-}
-
-// --- run_task(""): the typed error code lands in the callback's err slot. ---
-static atomic_int g_err_done = 0;
-static int32_t g_err_code = -1;
-
-static void on_task_err(void* context, weaveffi_error* err,
-                        const uint8_t* result_ptr, size_t result_len) {
-    (void)context;
-    (void)result_ptr;
-    (void)result_len;
-    g_err_code = err ? err->code : 0;
-    atomic_store(&g_err_done, 1);
-}
-
-// --- run_batch: buffered list-of-records result. ---
-static atomic_int g_batch_done = 0;
-static int32_t g_batch_err = -1;
-static size_t g_batch_count = 0;
-static task_result_t g_batch[3];
-
-static void on_batch_done(void* context, weaveffi_error* err,
-                          const uint8_t* result_ptr, size_t result_len) {
-    (void)context;
-    g_batch_err = err ? err->code : 0;
-    if (g_batch_err == 0) {
-        wv_reader r;
-        wv_r_init(&r, result_ptr, result_len);
-        g_batch_count = wv_get_u32(&r);
-        for (size_t i = 0; i < g_batch_count && i < 3; i++) {
-            read_task_result(&r, &g_batch[i]);
-        }
-        wv_r_expect_end(&r);
+    async_demo_cancel_token_cancel(token);
+    for (int i = 0; i < 3; i++) {
+        await_call(&many[i], 5000);
+        assert(many[i].code == CANCELLED);
     }
-    atomic_store(&g_batch_done, 1);
-}
+    async_demo_cancel_token_destroy(token);
 
-// --- run_n_tasks: direct scalar result. ---
-static atomic_int g_n_done = 0;
-static int32_t g_n_err = -1;
-static int32_t g_n_result = -1;
-
-static void on_n_done(void* context, weaveffi_error* err, int32_t result) {
-    (void)context;
-    g_n_err = err ? err->code : 0;
-    g_n_result = result;
-    atomic_store(&g_n_done, 1);
+    // Destroying the consumer's reference is not cancellation: the call
+    // keeps its own reference and runs to its timeout.
+    token = async_demo_cancel_token_create();
+    call_reset(&c);
+    async_demo_tasks_wait(100, token, on_i64, &c);
+    async_demo_cancel_token_destroy(token);
+    await_call(&c, 5000);
+    assert(c.code == 0 && c.i64 == 100);
 }
 
 int main(void) {
-    weaveffi_error err = {0};
+    async_demo_error err = {0};
 
-    // Async record return: the callback borrows the encoded TaskResult.
-    weaveffi_tasks_run_task_async("alpha", on_task_done, NULL);
-    wait_done(&g_task_done);
-    assert(g_task_err == 0);
-    assert(g_task_result.id > 0);
-    assert(strcmp(g_task_result.value, "completed: alpha") == 0);
-    assert(g_task_result.success == 1);
-    free(g_task_result.value);
+    assert(ASYNC_DEMO_ABI_VERSION == 3u);
+    assert(async_demo_abi_version() == ASYNC_DEMO_ABI_VERSION);
+    assert(async_demo_tasks_checksum() == ASYNC_DEMO_TASKS_CHECKSUM);
 
-    // Typed async error: the empty name reports InvalidName (code 1).
-    weaveffi_tasks_run_task_async("", on_task_err, NULL);
-    wait_done(&g_err_done);
-    assert(g_err_code == 1);
+    run_task();
+    run_batch();
+    run_n_tasks();
+    wait_and_cancel();
 
-    // Buffered list-of-records both ways: encode ["a", "b", "c"], decode
-    // three results.
-    wv_writer names;
-    wv_w_init(&names);
-    wv_put_u32(&names, 3);
-    wv_put_str(&names, "a");
-    wv_put_str(&names, "b");
-    wv_put_str(&names, "c");
-    weaveffi_tasks_run_batch_async(names.buf, names.len, on_batch_done, NULL);
-    wait_done(&g_batch_done);
-    wv_w_free(&names);
-    assert(g_batch_err == 0);
-    assert(g_batch_count == 3);
-    const char* expected[3] = {"completed: a", "completed: b", "completed: c"};
-    for (size_t i = 0; i < 3; i++) {
-        assert(strcmp(g_batch[i].value, expected[i]) == 0);
-        assert(g_batch[i].success == 1);
-        free(g_batch[i].value);
-    }
-
-    // Direct scalar through the async callback.
-    weaveffi_tasks_run_n_tasks_async(7, on_n_done, NULL);
-    wait_done(&g_n_done);
-    assert(g_n_err == 0);
-    assert(g_n_result == 7);
-
-    // Sync functions beside the async ones.
-    assert(weaveffi_tasks_cancel_task(1, &err) == false);
+    // Every task body, cancelled ones included, has been dropped.
+    for (int i = 0; i < 2000 && async_demo_tasks_active_callbacks(&err) != 0; i++) sleep_ms(1);
+    assert(async_demo_tasks_active_callbacks(&err) == 0);
     assert(err.code == 0);
 
-    // Every spawned task body has completed by the time its callback fires.
-    assert(weaveffi_tasks_active_callbacks(&err) == 0);
-    assert(err.code == 0);
-
-    printf("c async-demo conformance: OK\n");
+    ASSERT_NO_LEAKS(async_demo_debug_live);
+    printf("c/async-demo: OK\n");
     return 0;
 }

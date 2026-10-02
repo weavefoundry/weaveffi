@@ -64,3 +64,6 @@ examples/dotnet/Contacts/obj/
 crates/weaveffi-fuzz/fuzz/artifacts/
 crates/weaveffi-fuzz/fuzz/corpus/
 crates/weaveffi-fuzz/fuzz/coverage/
+
+# Bindings generated inside a sample by `weaveffi generate`
+samples/*/bindings/

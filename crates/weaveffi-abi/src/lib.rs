@@ -1,895 +1,117 @@
-//! C ABI runtime: error struct, memory helpers, reference-counted objects,
-//! callback-interface vtables, the value-buffer codec, and the async spawner.
+//! C ABI runtime: the error struct, memory helpers, reference-counted
+//! objects, cancel tokens, callback-interface vtables, iterators, the
+//! value-buffer codec, and the async executor hook.
 //!
-//! The normative description of the contract this crate implements is
-//! `docs/src/reference/abi.md` in the WeaveFFI repository.
+//! Producers don't use this crate directly. The `#[weaveffi::module]`
+//! expansion and `weaveffi::export_runtime!()` call into it (re-exported as
+//! `weaveffi::abi`), so every `unsafe` pointer operation a producer performs
+//! has one audited home. The normative description of the contract it
+//! implements is `docs/src/reference/abi.md` in the WeaveFFI repository.
 #![deny(missing_docs)]
 #![warn(clippy::missing_errors_doc)]
 #![warn(clippy::missing_panics_doc)]
+#![warn(clippy::missing_safety_doc)]
 #![warn(clippy::doc_markdown)]
-#![allow(non_camel_case_types)]
 #![allow(unsafe_code)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod buffer;
 pub mod callback;
+pub mod cancel;
 pub mod convert;
-mod macros;
+pub mod error;
+pub mod iter;
+pub mod leak;
 pub mod object;
 pub mod spawn;
 
 pub use buffer::{
     decode_value, encode_value, BufferDecodeError, BufferReader, BufferValue, BufferWriter,
+    ByValue, FixedWidth,
 };
 pub use callback::{
-    check_foreign_error, defer_foreign_error, lift_callback, raise_foreign_error,
-    take_foreign_error, CallbackInterface, ForeignCallback, ForeignError, Vtable,
+    defer_foreign_error, foreign_status, lift_callback, raise_foreign_error, take_foreign_error,
+    CallbackInterface, ForeignCallback, ForeignError, ThunkScope, Vtable,
 };
-pub use convert::{lift_byte_slice, lift_bytes, lower_bytes};
+pub use cancel::{
+    cancel_token_cancel, cancel_token_create, cancel_token_destroy, cancel_token_is_cancelled,
+    CancelToken, Cancellable, FfiCancelToken,
+};
+pub use convert::{
+    bytes_into_raw, free_bytes, lift_byte_slice, lift_bytes, lift_str, lift_string, lower_bytes,
+    lower_string,
+};
+pub use error::{
+    boxed_error, error_clear, error_free, error_set, error_set_c, error_store, panic_message,
+    ErrorReport, FfiError, CANCELLED_ERROR_CODE, FOREIGN_ERROR_CODE, GENERIC_ERROR_CODE,
+    MARSHAL_ERROR_CODE, PANIC_ERROR_CODE,
+};
+pub use iter::{iter_destroy, iter_into_raw, iter_next, Iter, IterHandle};
+pub use leak::debug_live;
 pub use object::{
     lower_object, lower_object_opt, object_arc, object_clone, object_destroy, object_from_token,
     object_ref, object_to_token,
 };
-pub use spawn::{set_spawner, spawn, BoxFuture, CatchUnwind, Spawner, SpawnerAlreadySet};
-
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
-use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+pub use spawn::{
+    block_on, run_async, set_spawner, spawn, BoxFuture, CatchUnwind, Spawner, SpawnerAlreadySet,
+};
 
 /// The revision of the WeaveFFI C ABI this runtime implements.
 ///
-/// Every producer cdylib exports it as `weaveffi_abi_version()` (via
-/// [`export_runtime!`]), and every generated consumer embeds the revision it
-/// was generated against. Consumers that can do so cheaply compare the two
-/// at load time and refuse to run against a producer built for a different
-/// revision, turning a silent memory-layout mismatch into a clear error.
+/// Every producer exports it as `{prefix}_abi_version()` (via
+/// `weaveffi::export_runtime!()`), and every generated consumer compares it
+/// with the revision it was generated against when it loads the library,
+/// turning a silent memory-layout mismatch into a clear error.
 ///
-/// The number only changes when the runtime surface (the `weaveffi_error`
-/// layout, the value-buffer encoding, the object or callback-interface
-/// conventions, or the set and signatures of the `weaveffi_*` runtime
-/// symbols) changes incompatibly. It is independent of the crate version and
-/// of the IDL schema version.
+/// The number only changes when the runtime surface (the error layout, the
+/// value-buffer encoding, the object or callback-interface conventions, or
+/// the set and signatures of the runtime symbols) changes incompatibly. It's
+/// independent of the crate version and of the IDL schema version.
 ///
-/// Revision 2 introduced reference-counted objects (`_clone`), object tokens
-/// inside value buffers, callback-interface vtables, `weaveffi_error_set`,
-/// and the foreign error code, and removed handles and the arena.
-pub const ABI_VERSION: u32 = 2;
-
-/// Return [`ABI_VERSION`]; the body behind the exported
-/// `weaveffi_abi_version` thunk.
-#[must_use]
-pub const fn abi_version() -> u32 {
-    ABI_VERSION
-}
-
-/// Error struct passed across the C ABI boundary.
-///
-/// # Safety
-///
-/// - `message` is a NUL-terminated UTF-8 C string allocated by Rust and must be
-///   released by calling `weaveffi_error_clear` or `weaveffi_free_string`.
-/// - `payload_ptr`, when non-null, is a Rust-allocated value buffer of
-///   `payload_len` bytes (the matched error code's fields serialized in the
-///   [`buffer`] format), released by `weaveffi_error_clear`.
-/// - This struct must not be copied while it owns a message or payload
-///   pointer, as that would lead to double-free on clear.
-#[repr(C)]
-#[derive(Debug)]
-pub struct weaveffi_error {
-    /// Status code. `0` means success; any non-zero value indicates failure.
-    pub code: i32,
-    /// Owned, NUL-terminated UTF-8 message describing the failure, or null when
-    /// [`code`](Self::code) is `0`. Freed by `weaveffi_error_clear`.
-    pub message: *const c_char,
-    /// Owned value buffer holding the matched error code's payload fields
-    /// serialized in the [`buffer`] format, or null when the code declares no
-    /// fields. Freed by `weaveffi_error_clear`.
-    pub payload_ptr: *const u8,
-    /// Byte length of [`payload_ptr`](Self::payload_ptr); `0` when null.
-    pub payload_len: usize,
-}
-
-impl Default for weaveffi_error {
-    fn default() -> Self {
-        Self {
-            code: 0,
-            message: ptr::null(),
-            payload_ptr: ptr::null(),
-            payload_len: 0,
-        }
-    }
-}
-
-/// Release any owned message and payload on `err`, leaving both null. Does not
-/// touch the code.
-fn release_error_allocations(err: &mut weaveffi_error) {
-    if !err.message.is_null() {
-        // SAFETY: message was allocated via `CString::into_raw` in this module
-        unsafe { drop(CString::from_raw(err.message as *mut c_char)) };
-        err.message = ptr::null();
-    }
-    if !err.payload_ptr.is_null() {
-        free_bytes(err.payload_ptr as *mut u8, err.payload_len);
-        err.payload_ptr = ptr::null();
-    }
-    err.payload_len = 0;
-}
-
-/// Set the error to OK (code = 0) and free any prior message and payload.
-pub fn error_set_ok(out_err: *mut weaveffi_error) {
-    if out_err.is_null() {
-        return;
-    }
-    // SAFETY: pointer checked for null above
-    let err = unsafe { &mut *out_err };
-    release_error_allocations(err);
-    err.code = 0;
-}
-
-/// Populate an error with the given code and message (copying message),
-/// clearing any prior payload.
-// `CString::new` is infallible here because interior NUL bytes are stripped
-// from `message` immediately below, so there is no reachable panic to document.
-#[allow(clippy::missing_panics_doc)]
-pub fn error_set(out_err: *mut weaveffi_error, code: i32, message: &str) {
-    if out_err.is_null() {
-        return;
-    }
-    // SAFETY: pointer checked for null above
-    let err = unsafe { &mut *out_err };
-    release_error_allocations(err);
-    err.code = code;
-    let owned_message = message.replace('\0', "");
-    let cstr = CString::new(owned_message).expect("CString::new sanitized input");
-    err.message = cstr.into_raw();
-}
-
-/// The body of the exported `weaveffi_error_set` thunk: fill `out_err` from a
-/// borrowed C string the consumer owns.
-///
-/// Callback-interface implementations call this to report a failure without
-/// allocating the message with a foreign allocator (the producer frees
-/// `message` with its own). A null or non-UTF-8 `message` yields an empty
-/// message; the code is always recorded.
-pub fn error_set_c(out_err: *mut weaveffi_error, code: i32, message: *const c_char) {
-    let message = c_ptr_to_string(message).unwrap_or_default();
-    error_set(out_err, code, &message);
-}
-
-/// Populate an error with a code, message, and an owned payload buffer (the
-/// matched error code's fields serialized in the [`buffer`] format).
-///
-/// An empty `payload` leaves the payload slots null, matching a code that
-/// declares no fields.
-pub fn error_set_with_payload(
-    out_err: *mut weaveffi_error,
-    code: i32,
-    message: &str,
-    payload: Vec<u8>,
-) {
-    error_set(out_err, code, message);
-    if out_err.is_null() || payload.is_empty() {
-        return;
-    }
-    // SAFETY: `out_err` checked for null above.
-    let err = unsafe { &mut *out_err };
-    let mut len = 0usize;
-    // SAFETY: `&mut len` is a writable usize.
-    err.payload_ptr = unsafe { convert::lower_bytes(payload, &mut len) };
-    err.payload_len = len;
-}
-
-/// Maps a producer error onto the ABI's `(code, message)` pair.
-///
-/// A fallible `#[weaveffi::export]` function returning `Result<T, E>` reports
-/// `Err(e)` through its trailing `out_err` slot by writing
-/// [`ErrorReport::code`] and [`ErrorReport::message`] into the caller's
-/// [`weaveffi_error`]. `String` and `&str` errors are covered out of the box
-/// with the generic code `-1`, so `Result<T, String>` needs no extra code.
-///
-/// The `#[weaveffi::error]` expansion implements this trait for an IDL error
-/// domain's enum, surfacing the domain's named codes so consumers can react
-/// to each case. Because there's no blanket implementation, your error type
-/// is free to also derive or implement [`Display`](std::fmt::Display) and
-/// [`std::error::Error`] (for example via `thiserror`). To implement the
-/// trait by hand:
-///
-/// ```
-/// use weaveffi_abi::ErrorReport;
-///
-/// enum KvError {
-///     KeyNotFound,
-///     Io(String),
-/// }
-///
-/// impl ErrorReport for KvError {
-///     fn code(&self) -> i32 {
-///         match self {
-///             KvError::KeyNotFound => 1001,
-///             KvError::Io(_) => 1004,
-///         }
-///     }
-///     fn message(&self) -> String {
-///         match self {
-///             KvError::KeyNotFound => "key not found".to_string(),
-///             KvError::Io(detail) => format!("I/O error: {detail}"),
-///         }
-///     }
-/// }
-/// ```
-pub trait ErrorReport {
-    /// The non-zero status code written to [`weaveffi_error::code`]. Defaults to
-    /// [`GENERIC_ERROR_CODE`].
-    fn code(&self) -> i32 {
-        GENERIC_ERROR_CODE
-    }
-
-    /// The human-readable message written to [`weaveffi_error::message`].
-    fn message(&self) -> String;
-
-    /// The serialized payload fields written to
-    /// [`weaveffi_error::payload_ptr`], or an empty vector for a code with no
-    /// fields. The `#[weaveffi::error]` expansion overrides this for variants
-    /// that carry data; the default reports no payload.
-    fn payload(&self) -> Vec<u8> {
-        Vec::new()
-    }
-}
-
-impl ErrorReport for String {
-    fn message(&self) -> String {
-        self.clone()
-    }
-}
-
-impl ErrorReport for &str {
-    fn message(&self) -> String {
-        (*self).to_string()
-    }
-}
-
-impl ErrorReport for Box<dyn std::error::Error> {
-    fn message(&self) -> String {
-        self.to_string()
-    }
-}
-
-impl ErrorReport for Box<dyn std::error::Error + Send + Sync> {
-    fn message(&self) -> String {
-        self.to_string()
-    }
-}
-
-/// Convenience adapter: map a `Result<T, E>` to `Option<T>` by writing into `out_err`.
-///
-/// `Err(e)` is reported through [`ErrorReport`], so the generic `-1` code is
-/// used for [`Display`](std::fmt::Display) errors and the domain code (plus
-/// any payload) for types that implement [`ErrorReport`] directly.
-pub fn result_to_out_err<T, E: ErrorReport>(
-    result: Result<T, E>,
-    out_err: *mut weaveffi_error,
-) -> Option<T> {
-    match result {
-        Ok(value) => {
-            error_set_ok(out_err);
-            Some(value)
-        }
-        Err(e) => {
-            error_set_with_payload(out_err, e.code(), &e.message(), e.payload());
-            None
-        }
-    }
-}
-
-/// The reserved error code for an **untyped producer error**: the default
-/// [`ErrorReport::code`], used by `Result<T, String>` and other error types
-/// that don't map onto a declared domain code.
-pub const GENERIC_ERROR_CODE: i32 = -1;
-
-/// The reserved error code reporting a producer **panic**.
-///
-/// Generated thunks wrap the producer call in `catch_unwind`; a panic is
-/// reported through `out_err` with this code so the consumer can distinguish
-/// "the producer has a bug" from any declared domain error. Validation rejects
-/// error domains that try to claim a reserved code (`0`, which means success,
-/// or any negative value).
-pub const PANIC_ERROR_CODE: i32 = -2;
-
-/// The reserved error code reporting a **marshalling failure**: an argument
-/// that could not be lifted at the boundary (a null or invalid pointer, a
-/// non-UTF-8 string, an out-of-range enum discriminant, or a malformed value
-/// buffer).
-///
-/// Both sides are generated from the same IDL, so a marshalling failure is a
-/// producer/consumer contract violation, not a domain error; wrappers surface
-/// it through the same trap channel as [`PANIC_ERROR_CODE`].
-pub const MARSHAL_ERROR_CODE: i32 = -3;
-
-/// The reserved error code reporting that a **consumer callback-interface
-/// implementation failed**.
-///
-/// A consumer's method implementation that raises reports it through the
-/// vtable entry's `out_err` slot with this code (via `weaveffi_error_set`);
-/// the producer aborts the call it was making and the original caller
-/// observes this code with the consumer's message. See [`callback`].
-pub const FOREIGN_ERROR_CODE: i32 = -4;
-
-/// Best-effort extraction of a panic payload's message (`&str`, `String`,
-/// and [`ForeignError`] payloads; anything else yields a fixed placeholder).
-pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else if let Some(f) = payload.downcast_ref::<ForeignError>() {
-        f.message.clone()
-    } else {
-        "producer panicked".to_string()
-    }
-}
-
-/// Report a caught unwind through `out_err`. A [`ForeignError`] payload (a
-/// consumer callback-interface implementation raised, or returned a value
-/// the producer could not lift) is reported with the payload's own code
-/// (normally [`FOREIGN_ERROR_CODE`]) and message; any other payload is a
-/// producer panic and is reported as [`PANIC_ERROR_CODE`]. Generated thunks
-/// call this from their `catch_unwind` error arm.
-pub fn error_set_panic(out_err: *mut weaveffi_error, payload: &(dyn std::any::Any + Send)) {
-    if let Some(f) = payload.downcast_ref::<ForeignError>() {
-        error_set(out_err, f.code, &f.message);
-        return;
-    }
-    error_set(
-        out_err,
-        PANIC_ERROR_CODE,
-        &format!("producer panicked: {}", panic_message(payload)),
-    );
-}
-
-/// Allocate a new C string from a Rust string, returning an owned pointer.
-/// Caller must later free with `weaveffi_free_string` or `weaveffi_error_clear`.
-// `CString::new` is infallible here because interior NUL bytes are stripped
-// before the call, so there is no reachable panic to document.
-#[allow(clippy::missing_panics_doc)]
-pub fn string_to_c_ptr(s: impl AsRef<str>) -> *const c_char {
-    let s = s.as_ref();
-    let sanitized = if s.as_bytes().contains(&0) {
-        s.replace('\0', "")
-    } else {
-        s.to_owned()
-    };
-    let cstr = CString::new(sanitized).expect("string_to_c_ptr: unexpected NUL after sanitization");
-    cstr.into_raw()
-}
-
-/// Free a C string previously allocated by this runtime.
-pub fn free_string(ptr: *const c_char) {
-    if ptr.is_null() {
-        return;
-    }
-    // SAFETY: pointer must be returned from `CString::into_raw`
-    unsafe { drop(CString::from_raw(ptr as *mut c_char)) };
-}
-
-/// Free a byte buffer previously allocated by Rust and returned to foreign code.
-pub fn free_bytes(ptr: *mut u8, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    // SAFETY: reconstructs the original Box<[u8]> for deallocation
-    unsafe { drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len))) };
-}
+/// Revision 3 prefixed every runtime symbol with the library's own C prefix,
+/// passed strings as `(ptr, len)` UTF-8 runs freed with `{prefix}_free_bytes`
+/// (removing `free_string`), made cancel tokens reference counted, and added
+/// [`CANCELLED_ERROR_CODE`] and the per-module contract checksums.
+pub const ABI_VERSION: u32 = 3;
 
 /// Fixed alignment used for every Wasm linear-memory allocation handed to JS.
 ///
-/// 8 bytes over-aligns scalar/byte buffers but is required for the `{i32 ptr,
-/// i32 len}` and wider return slots that JS reads back through `DataView`.
+/// 8 bytes over-aligns scalar and byte buffers but is required for the
+/// `{i32 ptr, i32 len}` and wider return slots that JS reads back through
+/// `DataView`.
 #[cfg(target_arch = "wasm32")]
 const WASM_ALLOC_ALIGN: usize = 8;
 
-/// Allocate `size` bytes in this module's Wasm linear memory.
+/// The body of `{prefix}_alloc` (`wasm32` only): allocate `size` bytes in this
+/// module's linear memory.
 ///
-/// The Wasm backend has no host-provided allocator, so generated JS glue calls
-/// the `weaveffi_alloc` thunk (emitted by [`export_runtime!`]) to stage input
-/// strings/byte buffers and to reserve struct-return (`sret`) slots. The caller
-/// must release the block with [`wasm_dealloc`] using the *same* `size`.
+/// The Wasm backend has no host-provided allocator, so the generated JS glue
+/// stages input strings and buffers, and reserves return slots, through this.
+/// The caller releases the block with [`wasm_dealloc`] using the same `size`.
 #[cfg(target_arch = "wasm32")]
+#[must_use]
 pub fn wasm_alloc(size: usize) -> *mut u8 {
     let size = size.max(1);
-    let layout = std::alloc::Layout::from_size_align(size, WASM_ALLOC_ALIGN)
-        .expect("weaveffi_alloc: invalid layout");
-    // SAFETY: `size >= 1` and the alignment is a non-zero power of two.
-    unsafe { std::alloc::alloc(layout) }
+    match std::alloc::Layout::from_size_align(size, WASM_ALLOC_ALIGN) {
+        // SAFETY: the layout has a non-zero size.
+        Ok(layout) => unsafe { std::alloc::alloc(layout) },
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 
-/// Release a block previously returned by [`wasm_alloc`].
+/// The body of `{prefix}_dealloc` (`wasm32` only): release a block from
+/// [`wasm_alloc`].
 ///
-/// `size` must match the original allocation request (JS retains it).
+/// # Safety
+///
+/// `ptr` must be null or a block [`wasm_alloc`] returned for this same
+/// `size`, released exactly once.
 #[cfg(target_arch = "wasm32")]
-pub fn wasm_dealloc(ptr: *mut u8, size: usize) {
+pub unsafe fn wasm_dealloc(ptr: *mut u8, size: usize) {
     if ptr.is_null() {
         return;
     }
-    let size = size.max(1);
-    let layout = std::alloc::Layout::from_size_align(size, WASM_ALLOC_ALIGN)
-        .expect("weaveffi_dealloc: invalid layout");
-    // SAFETY: `ptr` came from `wasm_alloc` with this exact layout.
-    unsafe { std::alloc::dealloc(ptr, layout) };
-}
-
-/// Clear an error by freeing any message and zeroing fields.
-pub fn error_clear(err: *mut weaveffi_error) {
-    error_set_ok(err);
-}
-
-/// Free a heap-boxed error delivered through an async completion callback.
-///
-/// Async launchers hand the callback an *owned* `weaveffi_error` allocated on
-/// the heap (unlike the caller-owned `out_err` slot of synchronous calls), so
-/// consumers can defer reading it past the callback's return. Once the
-/// consumer has copied what it needs, it releases the message, the payload,
-/// and the box itself through this function. Passing null is a safe no-op.
-pub fn error_free(err: *mut weaveffi_error) {
-    if err.is_null() {
-        return;
-    }
-    error_clear(err);
-    // SAFETY: async launchers allocate the error with `Box::new`, and the
-    // consumer calls this exactly once with that pointer.
-    unsafe { drop(Box::from_raw(err)) };
-}
-
-/// Opaque cancellation token passed across the C ABI boundary.
-///
-/// Foreign callers obtain a token via `weaveffi_cancel_token_create`, signal
-/// cancellation with `weaveffi_cancel_token_cancel`, and release it with
-/// `weaveffi_cancel_token_destroy`.
-#[repr(C)]
-pub struct weaveffi_cancel_token {
-    cancelled: AtomicBool,
-}
-
-/// Allocate a new cancel token. The caller owns the returned pointer and must
-/// eventually call `weaveffi_cancel_token_destroy`.
-pub fn cancel_token_create() -> *mut weaveffi_cancel_token {
-    Box::into_raw(Box::new(weaveffi_cancel_token {
-        cancelled: AtomicBool::new(false),
-    }))
-}
-
-/// Signal cancellation on the token (thread-safe).
-pub fn cancel_token_cancel(token: *mut weaveffi_cancel_token) {
-    if token.is_null() {
-        return;
-    }
-    // SAFETY: pointer checked for null above
-    let t = unsafe { &*token };
-    t.cancelled.store(true, Ordering::Release);
-}
-
-/// Check whether the token has been cancelled (thread-safe).
-pub fn cancel_token_is_cancelled(token: *const weaveffi_cancel_token) -> bool {
-    if token.is_null() {
-        return false;
-    }
-    // SAFETY: pointer checked for null above
-    let t = unsafe { &*token };
-    t.cancelled.load(Ordering::Acquire)
-}
-
-/// Destroy a cancel token previously created by `cancel_token_create`.
-pub fn cancel_token_destroy(token: *mut weaveffi_cancel_token) {
-    if token.is_null() {
-        return;
-    }
-    // SAFETY: pointer was returned from `Box::into_raw` in `cancel_token_create`
-    unsafe { drop(Box::from_raw(token)) };
-}
-
-/// A safe, `Send` view of a foreign [`weaveffi_cancel_token`] handed to a
-/// cancellable `async fn`.
-///
-/// A producer marks an exported `async fn` `#[weaveffi::cancellable]` and
-/// accepts a `CancelToken` as its final parameter; the `#[weaveffi::module]`
-/// expansion lifts the launcher's `cancel_token` slot into one of these and
-/// moves it onto the worker thread. The function polls [`CancelToken::is_cancelled`]
-/// at safe points and returns early (typically `Err`) when cancellation is observed.
-/// The token carries no parameter in the IDL: it is part of the async calling
-/// convention, not the function's logical signature.
-///
-/// # Safety
-///
-/// The wrapped pointer is owned by the foreign caller, which (per the cancel
-/// token contract) keeps it alive until the completion callback fires, so
-/// reading the atomic flag from the worker thread is sound. The wrapper is
-/// therefore `Send`/`Sync`.
-pub struct CancelToken {
-    raw: *const weaveffi_cancel_token,
-}
-
-// SAFETY: the wrapped token is an atomic flag behind a pointer the foreign
-// caller keeps valid for the whole async operation; reading it from the worker
-// thread the launcher spawns races only on the atomic, which is synchronized.
-unsafe impl Send for CancelToken {}
-// SAFETY: see the `Send` impl; `is_cancelled` is a shared atomic load.
-unsafe impl Sync for CancelToken {}
-
-impl CancelToken {
-    /// Wrap a raw cancel-token pointer. A null pointer is permitted and reads as
-    /// "never cancelled".
-    ///
-    /// This is the entry point the `#[weaveffi::module]` expansion calls; it is
-    /// `#[doc(hidden)]` because producers receive an already-built token.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn from_raw(raw: *const weaveffi_cancel_token) -> Self {
-        Self { raw }
-    }
-
-    /// Whether the foreign caller has requested cancellation.
-    #[must_use]
-    pub fn is_cancelled(&self) -> bool {
-        cancel_token_is_cancelled(self.raw)
-    }
-}
-
-/// An owned, type-erased iterator handed across the C ABI boundary.
-///
-/// A producer function whose IDL return type is `iter<T>` returns a
-/// `weaveffi::Iter<T>`, built from any iterator with [`Iter::new`]. The
-/// `#[weaveffi::module]` expansion boxes it behind an opaque iterator handle,
-/// pulls one element per `_next` call, and drops it in `_destroy`. Pulling
-/// elements lazily (rather than materializing a `Vec`) is what distinguishes an
-/// `iter<T>` return from a `[T]` (list) return.
-pub struct Iter<T> {
-    inner: Box<dyn Iterator<Item = T> + Send>,
-}
-
-impl<T> Iter<T> {
-    /// Wrap any `Send + 'static` iterator as a WeaveFFI iterator handle.
-    ///
-    /// Accepts anything `IntoIterator`, so `Iter::new(vec)`, `Iter::new(0..n)`,
-    /// and `Iter::new(map.into_values())` all work.
-    pub fn new<I>(iter: I) -> Self
-    where
-        I: IntoIterator<Item = T>,
-        I::IntoIter: Send + 'static,
-    {
-        Self {
-            inner: Box::new(iter.into_iter()),
-        }
-    }
-}
-
-impl<T> Iterator for Iter<T> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<T> {
-        self.inner.next()
-    }
-}
-
-/// Drive a future to completion on the current thread, blocking until it
-/// resolves.
-///
-/// This is the minimal, dependency-free executor behind the default
-/// [`Spawner`]: each async launch runs its future on a fresh thread through
-/// this function, then invokes the completion callback with the result. It
-/// parks the thread between polls and wakes on `Waker::wake`, so a future
-/// that yields (for example, one awaiting a channel woken from another thread)
-/// makes progress without busy-spinning. There is no reactor, so a future that
-/// depends on an external runtime's I/O driver (such as Tokio's) needs that
-/// runtime installed with [`set_spawner`] instead.
-///
-/// # Examples
-///
-/// ```
-/// let n = weaveffi_abi::block_on(async { 1 + 2 });
-/// assert_eq!(n, 3);
-/// ```
-pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
-    use std::thread::{self, Thread};
-
-    struct ThreadWaker(Thread);
-    impl Wake for ThreadWaker {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-
-    let mut fut = Box::pin(fut);
-    let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
-    let mut cx = Context::from_waker(&waker);
-    loop {
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(out) => return out,
-            Poll::Pending => thread::park(),
-        }
-    }
-}
-
-/// Convert a NUL-terminated C string pointer to an owned `String`.
-/// Returns `None` if `ptr` is null or not valid UTF-8.
-pub fn c_ptr_to_string(ptr: *const c_char) -> Option<String> {
-    if ptr.is_null() {
-        return None;
-    }
-    // SAFETY: caller guarantees `ptr` points to a NUL-terminated string
-    let c = unsafe { CStr::from_ptr(ptr) };
-    c.to_str().ok().map(|s| s.to_owned())
-}
-
-/// Borrow a NUL-terminated C string as a `&str` without copying.
-/// Returns `None` if `ptr` is null or the bytes aren't valid UTF-8.
-///
-/// This is the zero-copy lift for a producer parameter spelled `&str`: the
-/// generated thunk borrows the caller's buffer for the duration of the call
-/// instead of allocating an owned `String`.
-///
-/// # Safety
-///
-/// `ptr` must be null or point to a NUL-terminated string that stays valid
-/// (and unmodified) for the caller-chosen lifetime `'a`. Generated thunks
-/// bound that lifetime by the call, matching the C contract that string
-/// arguments are borrowed for the call's duration.
-pub unsafe fn c_ptr_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
-    if ptr.is_null() {
-        return None;
-    }
-    // SAFETY: the caller guarantees `ptr` is NUL-terminated and valid for 'a.
-    let c = unsafe { CStr::from_ptr(ptr) };
-    c.to_str().ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn string_roundtrip_and_free() {
-        let ptr = string_to_c_ptr("hello world");
-        assert!(!ptr.is_null());
-        let recovered = c_ptr_to_string(ptr).unwrap();
-        assert_eq!(recovered, "hello world");
-        free_string(ptr);
-    }
-
-    #[test]
-    fn free_string_null_is_safe() {
-        free_string(ptr::null());
-    }
-
-    #[test]
-    fn free_bytes_null_is_safe() {
-        free_bytes(ptr::null_mut(), 0);
-    }
-
-    #[test]
-    fn bytes_alloc_and_free() {
-        let data: Vec<u8> = vec![1, 2, 3, 4, 5];
-        let len = data.len();
-        let boxed = data.into_boxed_slice();
-        let ptr = Box::into_raw(boxed) as *mut u8;
-        free_bytes(ptr, len);
-    }
-
-    #[test]
-    fn error_default_is_ok() {
-        let err = weaveffi_error::default();
-        assert_eq!(err.code, 0);
-        assert!(err.message.is_null());
-    }
-
-    #[test]
-    fn error_set_and_clear() {
-        let mut err = weaveffi_error::default();
-        error_set(&mut err, -1, "something went wrong");
-        assert_eq!(err.code, -1);
-        assert!(!err.message.is_null());
-        let msg = c_ptr_to_string(err.message).unwrap();
-        assert_eq!(msg, "something went wrong");
-        error_clear(&mut err);
-        assert_eq!(err.code, 0);
-        assert!(err.message.is_null());
-    }
-
-    #[test]
-    fn error_clear_null_is_safe() {
-        error_clear(ptr::null_mut());
-    }
-
-    #[test]
-    fn error_set_ok_frees_prior_message() {
-        let mut err = weaveffi_error::default();
-        error_set(&mut err, 1, "first");
-        error_set_ok(&mut err);
-        assert_eq!(err.code, 0);
-        assert!(err.message.is_null());
-    }
-
-    #[test]
-    fn error_set_replaces_prior_message() {
-        let mut err = weaveffi_error::default();
-        error_set(&mut err, 1, "first");
-        error_set(&mut err, 2, "second");
-        assert_eq!(err.code, 2);
-        let msg = c_ptr_to_string(err.message).unwrap();
-        assert_eq!(msg, "second");
-        error_clear(&mut err);
-    }
-
-    #[test]
-    fn result_to_out_err_ok_path() {
-        let mut err = weaveffi_error::default();
-        let val: Result<i32, String> = Ok(42);
-        let opt = result_to_out_err(val, &mut err);
-        assert_eq!(opt, Some(42));
-        assert_eq!(err.code, 0);
-        assert!(err.message.is_null());
-    }
-
-    #[test]
-    fn result_to_out_err_error_path() {
-        let mut err = weaveffi_error::default();
-        let val: Result<i32, String> = Err("bad input".to_string());
-        let opt = result_to_out_err(val, &mut err);
-        assert_eq!(opt, None);
-        assert_eq!(err.code, -1);
-        let msg = c_ptr_to_string(err.message).unwrap();
-        assert_eq!(msg, "bad input");
-        error_clear(&mut err);
-    }
-
-    // A domain error type carrying its own `ErrorReport` impl. It could also
-    // implement `Display` and `std::error::Error` freely; there's no blanket
-    // impl to collide with.
-    enum DomainError {
-        NotFound,
-        Io(String),
-    }
-
-    impl ErrorReport for DomainError {
-        fn code(&self) -> i32 {
-            match self {
-                DomainError::NotFound => 1001,
-                DomainError::Io(_) => 1004,
-            }
-        }
-        fn message(&self) -> String {
-            match self {
-                DomainError::NotFound => "not found".to_string(),
-                DomainError::Io(detail) => format!("io: {detail}"),
-            }
-        }
-    }
-
-    #[test]
-    fn error_set_c_copies_a_borrowed_message() {
-        let mut err = weaveffi_error::default();
-        let msg = CString::new("from the consumer").unwrap();
-        error_set_c(&mut err, FOREIGN_ERROR_CODE, msg.as_ptr());
-        drop(msg);
-        assert_eq!(err.code, FOREIGN_ERROR_CODE);
-        assert_eq!(c_ptr_to_string(err.message).unwrap(), "from the consumer");
-        error_clear(&mut err);
-        error_set_c(&mut err, 3, ptr::null());
-        assert_eq!(err.code, 3);
-        assert_eq!(c_ptr_to_string(err.message).unwrap(), "");
-        error_clear(&mut err);
-    }
-
-    #[test]
-    fn foreign_error_payload_is_reported_as_foreign_code() {
-        let mut err = weaveffi_error::default();
-        let payload: Box<dyn std::any::Any + Send> = Box::new(ForeignError {
-            code: FOREIGN_ERROR_CODE,
-            message: "listener threw".into(),
-        });
-        error_set_panic(&mut err, &*payload);
-        assert_eq!(err.code, FOREIGN_ERROR_CODE);
-        assert_eq!(c_ptr_to_string(err.message).unwrap(), "listener threw");
-        error_clear(&mut err);
-
-        let payload: Box<dyn std::any::Any + Send> = Box::new("bug");
-        error_set_panic(&mut err, &*payload);
-        assert_eq!(err.code, PANIC_ERROR_CODE);
-        assert_eq!(
-            c_ptr_to_string(err.message).unwrap(),
-            "producer panicked: bug"
-        );
-        error_clear(&mut err);
-    }
-
-    #[test]
-    fn error_report_string_uses_generic_code() {
-        let e = "boom".to_string();
-        assert_eq!(ErrorReport::code(&e), GENERIC_ERROR_CODE);
-        assert_eq!(ErrorReport::message(&e), "boom");
-        assert_eq!(ErrorReport::code(&"boom"), -1);
-        assert_eq!(ErrorReport::message(&"boom"), "boom");
-    }
-
-    #[test]
-    fn error_report_coexists_with_display_impls() {
-        // The point of dropping the blanket impl: a domain error can derive
-        // or implement `Display`/`Error` and still carry its own codes.
-        #[derive(Debug)]
-        struct Both;
-        impl std::fmt::Display for Both {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "both")
-            }
-        }
-        impl std::error::Error for Both {}
-        impl ErrorReport for Both {
-            fn code(&self) -> i32 {
-                7
-            }
-            fn message(&self) -> String {
-                "both".to_string()
-            }
-        }
-        assert_eq!(ErrorReport::code(&Both), 7);
-    }
-
-    #[test]
-    fn c_ptr_to_str_borrows_without_copying() {
-        let owned = CString::new("borrowed").unwrap();
-        // SAFETY: `owned` outlives the borrow.
-        let s = unsafe { c_ptr_to_str(owned.as_ptr()) }.unwrap();
-        assert_eq!(s, "borrowed");
-        assert_eq!(unsafe { c_ptr_to_str(ptr::null()) }, None);
-    }
-
-    #[test]
-    fn error_report_domain_error_carries_its_code() {
-        let mut err = weaveffi_error::default();
-        let val: Result<i32, DomainError> = Err(DomainError::NotFound);
-        assert_eq!(result_to_out_err(val, &mut err), None);
-        assert_eq!(err.code, 1001);
-        assert_eq!(c_ptr_to_string(err.message).unwrap(), "not found");
-        error_clear(&mut err);
-
-        let val: Result<i32, DomainError> = Err(DomainError::Io("disk".to_string()));
-        assert_eq!(result_to_out_err(val, &mut err), None);
-        assert_eq!(err.code, 1004);
-        assert_eq!(c_ptr_to_string(err.message).unwrap(), "io: disk");
-        error_clear(&mut err);
-    }
-
-    #[test]
-    fn string_with_interior_nul_is_sanitized() {
-        let ptr = string_to_c_ptr("hel\0lo");
-        let recovered = c_ptr_to_string(ptr).unwrap();
-        assert_eq!(recovered, "hello");
-        free_string(ptr);
-    }
-
-    #[test]
-    fn c_ptr_to_string_null_returns_none() {
-        assert_eq!(c_ptr_to_string(ptr::null()), None);
-    }
-
-    #[test]
-    fn cancel_token_lifecycle() {
-        let token = cancel_token_create();
-        assert!(!token.is_null());
-        assert!(!cancel_token_is_cancelled(token));
-        cancel_token_cancel(token);
-        assert!(cancel_token_is_cancelled(token));
-        cancel_token_destroy(token);
-    }
-
-    #[test]
-    fn cancel_token_null_is_safe() {
-        cancel_token_cancel(ptr::null_mut());
-        assert!(!cancel_token_is_cancelled(ptr::null()));
-        cancel_token_destroy(ptr::null_mut());
+    if let Ok(layout) = std::alloc::Layout::from_size_align(size.max(1), WASM_ALLOC_ALIGN) {
+        // SAFETY: `ptr` came from `wasm_alloc` with this exact layout.
+        unsafe { std::alloc::dealloc(ptr, layout) };
     }
 }
