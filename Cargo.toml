@@ -21,7 +21,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.23.0"
+version = "0.24.0"
 rust-version = "1.85"
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -30,11 +30,11 @@ repository = "https://github.com/weavefoundry/weaveffi"
 description = "WeaveFFI: Rust core with stable C ABI and multi-language bindings"
 
 [workspace.dependencies]
-weaveffi = { path = "crates/weaveffi", version = "0.23.0" }
-weaveffi-abi = { path = "crates/weaveffi-abi", version = "0.23.0" }
-weaveffi-macros = { path = "crates/weaveffi-macros", version = "0.23.0" }
-weaveffi-model = { path = "crates/weaveffi-model", version = "0.23.0", default-features = false }
-weaveffi-gen = { path = "crates/weaveffi-gen", version = "0.23.0" }
+weaveffi = { path = "crates/weaveffi", version = "0.24.0" }
+weaveffi-abi = { path = "crates/weaveffi-abi", version = "0.24.0" }
+weaveffi-macros = { path = "crates/weaveffi-macros", version = "0.24.0" }
+weaveffi-model = { path = "crates/weaveffi-model", version = "0.24.0", default-features = false }
+weaveffi-gen = { path = "crates/weaveffi-gen", version = "0.24.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1.0"
