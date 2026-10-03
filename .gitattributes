@@ -1,0 +1,5 @@
+# Generated code is compared byte for byte (snapshots, include_str! runtime
+# templates), so text files are LF on every platform.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf

@@ -17,9 +17,8 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use miette::{bail, miette, IntoDiagnostic, Result, WrapErr};
 use std::process::{Command, Stdio};
-use weaveffi_core::package::{summarize, write_package, PackageContext};
-use weaveffi_core::pkg;
-use weaveffi_core::platform::{BinarySet, Platform};
+use weaveffi_gen::package::{summarize, write_package, PackageContext};
+use weaveffi_gen::platform::{BinarySet, Os, Platform};
 
 /// How `weaveffi package` should obtain the native libraries it bundles.
 pub(crate) enum BinarySource<'a> {
@@ -29,43 +28,64 @@ pub(crate) enum BinarySource<'a> {
     Build(&'a str),
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_package(
-    input: &str,
-    out: &str,
-    targets: Option<&str>,
-    config_path: Option<&str>,
-    binaries: Option<&str>,
-    build: Option<&str>,
-    platforms: Option<&str>,
-    warn: bool,
-    quiet: bool,
-) -> Result<()> {
+/// Options for [`cmd_package`].
+pub(crate) struct PackageArgs<'a> {
+    pub(crate) input: Option<&'a str>,
+    pub(crate) out: &'a str,
+    pub(crate) targets: Option<&'a str>,
+    pub(crate) config: Option<&'a str>,
+    pub(crate) binaries: Option<&'a str>,
+    pub(crate) build: Option<&'a str>,
+    pub(crate) platforms: Option<&'a str>,
+    pub(crate) warn: bool,
+    pub(crate) quiet: bool,
+}
+
+pub(crate) fn cmd_package(args: &PackageArgs<'_>) -> Result<()> {
+    let PackageArgs {
+        out,
+        targets,
+        binaries,
+        build,
+        platforms,
+        quiet,
+        ..
+    } = *args;
     let source = match (binaries, build) {
         (Some(_), Some(_)) => {
-            bail!("--binaries and --build are mutually exclusive; choose one source for the native libraries")
+            return Err(miette::miette!("--binaries and --build are mutually exclusive; choose one source for the native libraries"))
         }
         (Some(dir), None) => BinarySource::Prebuilt(dir),
         (None, Some(crate_name)) => BinarySource::Build(crate_name),
-        (None, None) => bail!(
+        (None, None) => return Err(miette::miette!(
             "provide native libraries with --binaries <dir> (laid out as <dir>/<platform>/<lib>) \
              or --build <crate> to cross-compile a Rust producer"
-        ),
+        )),
     };
 
-    let (config, api) = super::load_project(input, config_path, warn)?;
-    let in_path = Utf8Path::new(input);
+    let project = super::load_project(args.input, args.config, args.warn)?;
+    let (config, api) = (&project.config, &project.api);
 
-    let selected_platforms = parse_platforms(platforms)?;
-    let input_basename = in_path.file_name();
-    let lib_name = pkg::resolve(&api, None, input_basename).ident_name();
+    let explicit_platforms = platforms.is_some();
+    let input_basename = project.input.file_name();
+    let lib_name = api.identity().library.clone();
 
     let binary_set = match source {
         BinarySource::Prebuilt(dir) => {
-            discover_prebuilt(Utf8Path::new(dir), &lib_name, &selected_platforms, quiet)?
+            // Without --platforms, package every platform the directory has.
+            let selected = match platforms {
+                Some(_) => parse_platforms(platforms)?,
+                None => Platform::ALL.to_vec(),
+            };
+            discover_prebuilt(
+                Utf8Path::new(dir),
+                &lib_name,
+                &selected,
+                quiet || !explicit_platforms,
+            )?
         }
         BinarySource::Build(crate_name) => {
-            cross_build(crate_name, &lib_name, &selected_platforms, quiet)?
+            cross_build(crate_name, &lib_name, &parse_platforms(platforms)?, quiet)?
         }
     };
 
@@ -97,7 +117,7 @@ pub(crate) fn cmd_package(
     let mut packaged = 0usize;
     let mut skipped: Vec<&str> = Vec::new();
     for gen in &selected {
-        match gen.package(&api, &ctx, out_dir) {
+        match gen.package(api, &ctx, out_dir) {
             Some(files) => {
                 write_package(&files).map_err(|e| miette!("{:#}", e))?;
                 let (text, bins) = summarize(&files);
@@ -130,6 +150,10 @@ pub(crate) fn cmd_package(
         );
     }
 
+    if selected.iter().any(|t| t.name() == "swift") {
+        assemble_xcframework(&project, &binary_set, out_dir, quiet)?;
+    }
+
     if !quiet {
         println!("Packaged {packaged} target(s) into {out}");
     }
@@ -138,9 +162,125 @@ pub(crate) fn cmd_package(
 
 /// Parse the comma-separated `--platforms` list into [`Platform`] values,
 /// defaulting to the full v1 matrix when omitted.
+/// The platforms to build with `--build`; without `--platforms`, just the
+/// host (cross builds need targets and linkers most machines don't have, so
+/// they are opt-in).
+/// Fuse the Apple slices into `swift/C{Module}.xcframework` beside the
+/// generated `Package.swift`, which switches to it as a binary target.
+///
+/// Runs only when the set includes an iOS slice (iOS needs the XCFramework;
+/// macOS alone links the bundled dylib through the system-library target).
+/// Each slice is a static library: iOS slices are the crate's `staticlib`
+/// output, and a macOS slice is the `lib{library}.a` next to its dylib (so a
+/// producer that ships to both declares `crate-type = ["cdylib", "staticlib"]`).
+/// Simulator and macOS architectures are fused with `lipo`.
+fn assemble_xcframework(
+    project: &super::Project,
+    binaries: &BinarySet,
+    out_dir: &Utf8Path,
+    quiet: bool,
+) -> Result<()> {
+    if !binaries.platforms().any(|p| p.os() == Os::Ios) {
+        return Ok(());
+    }
+    if !cfg!(target_os = "macos") {
+        eprintln!("warning: skipping the Swift XCFramework: xcodebuild needs macOS");
+        return Ok(());
+    }
+    let identity = project.api.identity();
+    let library = &identity.library;
+    let module = project
+        .config
+        .generators
+        .swift
+        .module_name
+        .clone()
+        .unwrap_or_else(|| identity.pascal_name());
+    let static_lib = |p: Platform| -> Option<Utf8PathBuf> {
+        let nb = binaries.get(p)?;
+        if p.os() == Os::Ios {
+            return Some(nb.source.clone());
+        }
+        let sibling = nb.source.parent()?.join(format!("lib{library}.a"));
+        sibling.exists().then_some(sibling)
+    };
+    let scratch = tempfile::tempdir().into_diagnostic()?;
+    let scratch = Utf8Path::from_path(scratch.path())
+        .ok_or_else(|| miette!("temp directory path is not valid UTF-8"))?
+        .to_path_buf();
+    let headers = scratch.join("Headers");
+    std::fs::create_dir_all(headers.as_std_path()).into_diagnostic()?;
+    let header = format!("{library}.h");
+    let model = weaveffi_model::model::BindingModel::build(&project.api);
+    let input_basename = project.input.file_name().unwrap_or("api");
+    std::fs::write(
+        headers.join(&header).as_std_path(),
+        weaveffi_gen::targets::c::render_c_header_from_model(&model, input_basename, &header),
+    )
+    .into_diagnostic()?;
+    std::fs::write(
+        headers.join("module.modulemap").as_std_path(),
+        format!("module C{module} {{\n  header \"{header}\"\n  export *\n}}\n"),
+    )
+    .into_diagnostic()?;
+
+    let mut args: Vec<String> = vec!["-create-xcframework".into()];
+    for (group, platforms) in [
+        ("ios", &[Platform::IosArm64][..]),
+        (
+            "ios-simulator",
+            &[Platform::IosSimArm64, Platform::IosSimX64][..],
+        ),
+        ("macos", &[Platform::MacosArm64, Platform::MacosX64][..]),
+    ] {
+        let libs: Vec<Utf8PathBuf> = platforms.iter().filter_map(|p| static_lib(*p)).collect();
+        let lib = match libs.as_slice() {
+            [] => continue,
+            [one] => one.clone(),
+            many => {
+                let fat = scratch.join(group).join(format!("lib{library}.a"));
+                std::fs::create_dir_all(scratch.join(group).as_std_path()).into_diagnostic()?;
+                let status = Command::new("lipo")
+                    .arg("-create")
+                    .args(many.iter().map(|p| p.as_str()))
+                    .args(["-output", fat.as_str()])
+                    .status()
+                    .into_diagnostic()
+                    .wrap_err("failed to run lipo")?;
+                if !status.success() {
+                    bail!("lipo failed to fuse the {group} slices");
+                }
+                fat
+            }
+        };
+        args.extend(["-library".into(), lib.to_string()]);
+        args.extend(["-headers".into(), headers.to_string()]);
+    }
+    let output = out_dir.join("swift").join(format!("C{module}.xcframework"));
+    if output.exists() {
+        std::fs::remove_dir_all(output.as_std_path()).into_diagnostic()?;
+    }
+    args.extend(["-output".into(), output.to_string()]);
+    let status = Command::new("xcodebuild")
+        .args(&args)
+        .stdout(Stdio::null())
+        .status()
+        .into_diagnostic()
+        .wrap_err("failed to run xcodebuild")?;
+    if !status.success() {
+        bail!("xcodebuild -create-xcframework failed");
+    }
+    if !quiet {
+        println!("  swift: assembled {output}");
+    }
+    Ok(())
+}
+
 fn parse_platforms(platforms: Option<&str>) -> Result<Vec<Platform>> {
     let Some(list) = platforms else {
-        return Ok(Platform::ALL.to_vec());
+        return Platform::host().map(|p| vec![p]).ok_or_else(|| {
+            miette!("the host is not a packaging platform; pass --platforms explicitly")
+        });
     };
     let mut out = Vec::new();
     for token in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -231,10 +371,10 @@ fn find_library(
             if let Some(hit) = matches.iter().find(|p| p.file_name() == Some(&canonical)) {
                 Ok(Some(hit.clone()))
             } else {
-                bail!(
+                Err(miette::miette!(
                     "multiple .{ext} libraries in {platform_dir}; \
                      name one '{canonical}' to disambiguate"
-                )
+                ))
             }
         }
     }
@@ -249,6 +389,7 @@ fn cross_build(
     quiet: bool,
 ) -> Result<BinarySet> {
     let mut set = BinarySet::new(lib_name);
+    let mut failed = Vec::new();
     for &platform in platforms {
         if !quiet {
             println!(
@@ -257,8 +398,20 @@ fn cross_build(
                 platform.rust_target()
             );
         }
-        let lib = build_one(crate_name, platform)?;
-        set.insert(platform, lib);
+        match build_one(crate_name, platform) {
+            Ok(lib) => set.insert(platform, lib),
+            Err(e) => {
+                eprintln!("error: {e:?}");
+                failed.push(platform.id());
+            }
+        }
+    }
+    if !failed.is_empty() {
+        bail!(
+            "cargo build failed for {}; the other platforms built (fix or drop the failing \
+             ones with --platforms)",
+            failed.join(", ")
+        );
     }
     Ok(set)
 }
@@ -304,11 +457,16 @@ fn build_one(crate_name: &str, platform: Platform) -> Result<Utf8PathBuf> {
         if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
             continue;
         }
+        let want = if platform.os() == Os::Ios {
+            "staticlib"
+        } else {
+            "cdylib"
+        };
         let is_cdylib = msg
             .get("target")
             .and_then(|t| t.get("kind"))
             .and_then(|k| k.as_array())
-            .map(|kinds| kinds.iter().any(|k| k.as_str() == Some("cdylib")))
+            .map(|kinds| kinds.iter().any(|k| k.as_str() == Some(want)))
             .unwrap_or(false);
         if !is_cdylib {
             continue;
@@ -323,10 +481,11 @@ fn build_one(crate_name: &str, platform: Platform) -> Result<Utf8PathBuf> {
     }
 
     match produced.len() {
-        0 => bail!(
+        0 => Err(miette::miette!(
             "cargo built {crate_name} for {triple} but produced no .{ext} cdylib; \
-             ensure the crate declares `crate-type = [\"cdylib\"]`"
-        ),
+             ensure the crate declares `crate-type = [\"cdylib\", \"staticlib\"]` \
+             (iOS slices are static libraries)"
+        )),
         1 => Ok(produced.into_iter().next().unwrap()),
         _ => {
             // Prefer the artifact whose stem matches the crate's normalized lib name.
@@ -346,8 +505,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_platforms_defaults_to_full_matrix() {
-        assert_eq!(parse_platforms(None).unwrap(), Platform::ALL.to_vec());
+    fn parse_platforms_defaults_to_the_host() {
+        if let Some(host) = Platform::host() {
+            assert_eq!(parse_platforms(None).unwrap(), vec![host]);
+        }
     }
 
     #[test]

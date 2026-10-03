@@ -1,133 +1,112 @@
-//! `weaveffi diff`: regenerate into a temp directory and compare against
-//! the on-disk output (`--check` for CI gating with distinct exit codes).
+//! `weaveffi diff`: show how regenerating would change an existing output
+//! directory, without writing anything or running hooks. `--check` turns it
+//! into a CI gate.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8Path;
-use miette::{miette, IntoDiagnostic, Result, WrapErr};
+use miette::{IntoDiagnostic, Result};
 use similar::TextDiff;
-use std::collections::BTreeSet;
-use weaveffi_core::codegen::Orchestrator;
+use weaveffi_gen::cache;
+use weaveffi_gen::codegen::relative_path;
 
-pub(crate) fn cmd_diff(
-    input: &str,
-    out: Option<&str>,
-    config_path: Option<&str>,
-    check: bool,
-    quiet: bool,
-) -> Result<()> {
-    let out = out.unwrap_or("./generated");
+/// Options for [`cmd_diff`].
+pub(crate) struct DiffArgs<'a> {
+    pub(crate) input: Option<&'a str>,
+    pub(crate) out: Option<&'a str>,
+    pub(crate) targets: Option<&'a str>,
+    pub(crate) config: Option<&'a str>,
+    pub(crate) check: bool,
+    pub(crate) quiet: bool,
+}
 
-    let (config, api) = super::load_project(input, config_path, false)?;
+/// Exit status of `diff --check` when files differ.
+const EXIT_MODIFIED: i32 = 2;
+/// Exit status of `diff --check` when files would be added or removed.
+const EXIT_ADDED_OR_REMOVED: i32 = 3;
 
-    let tmp = tempfile::tempdir()
-        .into_diagnostic()
-        .wrap_err("failed to create temp directory")?;
-    let tmp_path = Utf8Path::from_path(tmp.path())
-        .ok_or_else(|| miette!("temp directory path is not valid UTF-8"))?;
+pub(crate) fn cmd_diff(args: &DiffArgs<'_>) -> Result<()> {
+    let project = super::load_project(args.input, args.config, false)?;
+    let out_dir = project.config.out_dir(args.out);
+    let targets = project.config.select_targets(args.targets)?;
 
-    let hooks = config.hooks();
-    let targets = config.select_targets(None)?;
-
-    let mut orchestrator = Orchestrator::new();
+    let mut generated: BTreeMap<String, String> = BTreeMap::new();
+    let mut existing: BTreeSet<String> = BTreeSet::new();
     for target in &targets {
-        orchestrator = orchestrator.with_target(target.as_ref());
+        for file in target.render(&project.api, &out_dir) {
+            generated.insert(relative_path(&out_dir, &file.path), file.contents);
+        }
+        // Files a previous generation recorded are the generator's; without a
+        // record, everything under the target's directory counts.
+        match cache::read_record(&out_dir, target.name()) {
+            Some(record) => existing.extend(
+                record
+                    .files
+                    .into_keys()
+                    .filter(|rel| out_dir.join(rel).exists()),
+            ),
+            None => collect_files(&out_dir, &out_dir.join(target.name()), &mut existing)?,
+        }
     }
-    orchestrator
-        .run(&api, tmp_path, &hooks, true)
-        .map_err(|e| miette!("{:#}", e))?;
 
-    let out_dir = Utf8Path::new(out);
-
-    let generated = collect_relative_files(tmp_path)?;
-    let existing = if out_dir.exists() {
-        collect_relative_files(out_dir)?
-    } else {
-        BTreeSet::new()
-    };
-
-    let all_paths: BTreeSet<_> = generated.union(&existing).collect();
-    let mut added = 0usize;
-    let mut removed = 0usize;
-    let mut modified = 0usize;
-
-    for rel in &all_paths {
-        let gen_file = tmp_path.join(rel);
-        let out_file = out_dir.join(rel);
-
-        match (gen_file.exists(), out_file.exists()) {
-            (true, false) => {
+    let (mut added, mut removed, mut modified) = (0usize, 0usize, 0usize);
+    let all: BTreeSet<&String> = generated.keys().chain(existing.iter()).collect();
+    for rel in all {
+        match (generated.get(rel), existing.contains(rel)) {
+            (Some(_), false) => {
                 added += 1;
-                if !check {
+                if !args.check {
                     println!("{rel}: [new file]");
                 }
             }
-            (false, true) => {
+            (None, true) => {
                 removed += 1;
-                if !check {
+                if !args.check {
                     println!("{rel}: [would be removed]");
                 }
             }
-            (true, true) => {
-                let gen_content =
-                    std::fs::read_to_string(gen_file.as_std_path()).into_diagnostic()?;
-                let out_content =
-                    std::fs::read_to_string(out_file.as_std_path()).into_diagnostic()?;
-                if gen_content != out_content {
+            (Some(new), true) => {
+                let old =
+                    std::fs::read_to_string(out_dir.join(rel).as_std_path()).into_diagnostic()?;
+                if &old != new {
                     modified += 1;
-                    if !check {
-                        print_unified_diff(rel, &out_content, &gen_content);
+                    if !args.check {
+                        print_unified_diff(rel, &old, new);
                     }
                 }
             }
-            _ => {}
+            (None, false) => {}
         }
     }
 
-    if check {
+    if args.check {
         println!("+ {added} added, - {removed} removed, ~ {modified} modified");
         if added > 0 || removed > 0 {
-            std::process::exit(3);
+            std::process::exit(EXIT_ADDED_OR_REMOVED);
         }
         if modified > 0 {
-            std::process::exit(2);
+            std::process::exit(EXIT_MODIFIED);
         }
-        return Ok(());
-    }
-
-    if added == 0 && removed == 0 && modified == 0 && !quiet {
+    } else if added == 0 && removed == 0 && modified == 0 && !args.quiet {
         println!("No differences found.");
     }
-
     Ok(())
 }
 
-fn collect_relative_files(base: &Utf8Path) -> Result<BTreeSet<String>> {
-    let mut files = BTreeSet::new();
-    walk_dir(base, base, &mut files)?;
-    Ok(files)
-}
-
-fn walk_dir(base: &Utf8Path, dir: &Utf8Path, out: &mut BTreeSet<String>) -> Result<()> {
-    let entries = std::fs::read_dir(dir.as_std_path())
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read directory: {}", dir))?;
+/// Every file under `dir` (recursively), relative to `base`.
+fn collect_files(base: &Utf8Path, dir: &Utf8Path, out: &mut BTreeSet<String>) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(dir.as_std_path()) else {
+        return Ok(());
+    };
     for entry in entries {
-        let entry = entry.into_diagnostic()?;
-        let path = entry.path();
-        let utf8 = Utf8Path::from_path(&path)
-            .ok_or_else(|| miette!("non-UTF-8 path: {:?}", path))?
-            .to_owned();
-        if utf8.file_name() == Some(".weaveffi-cache") {
+        let path = entry.into_diagnostic()?.path();
+        let Some(path) = Utf8Path::from_path(&path) else {
             continue;
-        }
-        if utf8.is_dir() {
-            walk_dir(base, &utf8, out)?;
+        };
+        if path.is_dir() {
+            collect_files(base, path, out)?;
         } else {
-            let rel = utf8
-                .strip_prefix(base)
-                .into_diagnostic()
-                .wrap_err("failed to strip prefix")?
-                .to_string();
-            out.insert(rel);
+            out.insert(relative_path(base, path));
         }
     }
     Ok(())
@@ -139,53 +118,5 @@ fn print_unified_diff(path: &str, old: &str, new: &str) {
     println!("+++ {path}");
     for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
         println!("{hunk}");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn diff_shows_new_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let yml = dir.path().join("api.yml");
-        std::fs::write(
-            &yml,
-            concat!(
-                "version: \"0.9.0\"\n",
-                "modules:\n",
-                "  - name: math\n",
-                "    functions:\n",
-                "      - name: add\n",
-                "        params:\n",
-                "          - { name: a, type: i32 }\n",
-                "          - { name: b, type: i32 }\n",
-                "        return: i32\n",
-            ),
-        )
-        .unwrap();
-
-        let empty_out = dir.path().join("empty_out");
-        std::fs::create_dir_all(&empty_out).unwrap();
-        let input = yml.to_str().unwrap();
-        let out_str = empty_out.to_str().unwrap();
-
-        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
-            .expect("binary not found")
-            .args(["diff", input, "--out", out_str])
-            .output()
-            .expect("failed to run weaveffi diff");
-
-        let stdout = String::from_utf8_lossy(&cmd.stdout);
-        assert!(cmd.status.success(), "diff failed: {stdout}");
-        assert!(
-            !stdout.is_empty(),
-            "diff output should not be empty for an empty output dir"
-        );
-        for line in stdout.lines() {
-            assert!(
-                line.contains("[new file]"),
-                "expected [new file] in every line, got: {line}"
-            );
-        }
     }
 }

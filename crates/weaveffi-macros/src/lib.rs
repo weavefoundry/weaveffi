@@ -1,12 +1,13 @@
 //! Procedural macros that turn safe, annotated Rust into the WeaveFFI C ABI.
 //!
-//! A producer annotates an ordinary Rust module with `#[weaveffi::module]` and
-//! tags the items it wants to export. The macro lowers the module to the
-//! WeaveFFI IR (through [`weaveffi_bridge`]), builds the canonical
-//! [`BindingModel`](weaveffi_core::model::BindingModel), and emits the
-//! `#[no_mangle] extern "C"` thunks every generated language binding calls.
-//! All of the `unsafe` marshalling lives in the `weaveffi-abi` runtime, so the
-//! producer writes only safe Rust.
+//! A producer annotates an ordinary Rust module with `#[weaveffi::module]`,
+//! tags the items it wants to export, and calls `weaveffi::export_runtime!()`
+//! once. The module macro lowers the module tree to the WeaveFFI IR (through
+//! [`weaveffi_model::rust`]), builds the canonical
+//! [`BindingModel`](weaveffi_model::model::BindingModel), and emits the
+//! `extern "C"` thunks every generated language binding calls. All of the
+//! `unsafe` marshalling lives in the `weaveffi-abi` runtime, so the producer
+//! writes only safe Rust.
 //!
 //! ```ignore
 //! #[weaveffi::module]
@@ -21,14 +22,17 @@
 //! weaveffi::export_runtime!();
 //! ```
 //!
-//! The same IR the macro lowers is what `weaveffi generate path/to/lib.rs`
-//! reads, so the generated bindings and the producer cannot drift.
+//! Every C symbol starts with the crate's name (`CARGO_CRATE_NAME`), which
+//! is also the prefix `weaveffi generate` derives for a `.rs` input, so the
+//! generated bindings and the producer can't drift: they're two views of one
+//! parse.
 //!
 //! # Attributes
 //!
 //! * [`macro@module`] marks an exported namespace (the driver attribute).
 //! * [`macro@export`] exports a function; [`macro@record`] a by-value struct;
-//!   [`macro@enumeration`] a `#[repr(i32)]` C-style enum.
+//!   [`macro@enumeration`] a `#[repr(i32)]` C-style enum or a rich enum with
+//!   data-carrying variants.
 //! * [`macro@interface`] declares an opaque, reference-counted object type
 //!   whose `impl` block's `pub fn`s become constructors, methods, and statics.
 //! * [`macro@error`] declares the module's error domain from an enum with
@@ -36,6 +40,8 @@
 //!   structured payload.
 //! * [`macro@callback_interface`] declares a trait the consumer implements;
 //!   [`macro@cancellable`] marks an async function as cancellable.
+//! * [`export_runtime!`] emits the runtime symbols (memory, errors, cancel
+//!   tokens, ABI version) once per library.
 //!
 //! The item-level attributes are inert markers that [`macro@module`] reads; on
 //! their own they expand to the item unchanged.
@@ -45,16 +51,34 @@
 use proc_macro::TokenStream;
 
 mod codegen;
+mod runtime;
 
 /// Mark an inline `mod` as an exported WeaveFFI namespace.
 ///
-/// The macro re-emits the module unchanged and appends the generated C ABI
-/// thunks for every tagged item it contains (functions, records, enums). Apply
-/// it to a `mod foo { ... }` whose items carry the item-level markers.
+/// The macro re-emits the module and appends the generated C ABI thunks for
+/// every tagged item it contains, recursing into nested `#[weaveffi::module]`
+/// submodules (whose symbols carry the joined module path). A top-level
+/// module also exports `{prefix}_{module}_checksum()`, the contract checksum
+/// generated bindings verify when they load the library.
 #[proc_macro_attribute]
 pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_mod = syn::parse_macro_input!(item as syn::ItemMod);
     codegen::expand_module(&item_mod)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Emit the runtime symbols every WeaveFFI library exports, prefixed with the
+/// crate's name: `{prefix}_abi_version`, `{prefix}_error_set`,
+/// `{prefix}_error_clear`, `{prefix}_error_free`, `{prefix}_free_bytes`, the
+/// four `{prefix}_cancel_token_*` functions, `{prefix}_debug_live`, and on
+/// `wasm32` `{prefix}_alloc` and `{prefix}_dealloc`.
+///
+/// Invoke it exactly once, at the crate root of the `cdylib`. It takes no
+/// arguments.
+#[proc_macro]
+pub fn export_runtime(input: TokenStream) -> TokenStream {
+    runtime::expand(input.into())
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
@@ -88,22 +112,27 @@ marker_attr! {
     interface
 }
 marker_attr! {
-    /// Declare the module's error domain from a unit-variant enum with
-    /// explicit discriminants. The module macro generates the matching
-    /// `ErrorReport` implementation.
+    /// Declare the module's error domain from an enum with explicit
+    /// discriminants (the stable error codes). The enum must implement
+    /// `std::fmt::Display`, which supplies the runtime message; each
+    /// variant's doc comment is the documented default message.
     error
 }
 marker_attr! {
-    /// Declare a C-style `#[repr(i32)]` enum exported by value.
+    /// Declare an enum exported by value: a `#[repr(i32)]` C-style enum, or a
+    /// rich enum whose variants carry named fields.
     enumeration
 }
 marker_attr! {
-    /// Declare a callback interface: a trait whose `&self` methods the consumer
-    /// implements. Producers accept one as `Arc<dyn Trait>`; declare
-    /// `Send + Sync` as supertraits when it is used from an `async fn`.
+    /// Declare a callback interface: a trait whose `&self` methods the
+    /// consumer implements. Producers accept one as `Arc<dyn Trait>`. A
+    /// method may return `Result<T, weaveffi::ForeignError>` to receive the
+    /// consumer's failure as a value.
     callback_interface
 }
 marker_attr! {
-    /// Mark an async function as accepting a cancellation token.
+    /// Mark an `async fn` as cancellable: it takes a `weaveffi::CancelToken`
+    /// as its final parameter, and cancelling the token completes the call
+    /// with the cancelled code.
     cancellable
 }

@@ -5,41 +5,53 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
+  # Opens or updates the release PR whenever releasable commits land.
+  release-pr:
+    name: Release PR
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'weavefoundry' }}
+    concurrency:
+      group: release-pr
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          # A token other than GITHUB_TOKEN, so CI runs on the release PR
+          # (GitHub doesn't trigger workflows from GITHUB_TOKEN events).
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Publishes when the merged release PR bumped the version (a no-op
+  # otherwise). The release PR passed CI before it could merge, so nothing
+  # unreviewed or red is ever published.
   release:
-    name: Semantic Release
+    name: Publish
     runs-on: ubuntu-latest
     if: ${{ github.repository_owner == 'weavefoundry' }}
     concurrency:
       group: release
       cancel-in-progress: false
-    permissions:
-      contents: write
-      id-token: write
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
         with:
-          node-version: 22
-          cache: npm
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install npm dependencies
-        run: npm ci
-
-      - name: Semantic Release
-        run: npx semantic-release
+          command: release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A token other than GITHUB_TOKEN, so the GitHub release it creates
+          # triggers release-binaries.yml.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

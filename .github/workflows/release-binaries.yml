@@ -1,0 +1,57 @@
+name: Release binaries
+
+# Builds the `weaveffi` CLI for every supported host and attaches the
+# archives to the GitHub release (the same names `cargo binstall weaveffi-cli`
+# resolves through the crate's `[package.metadata.binstall]`).
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach binaries to (for example v0.24.0)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-13 }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build -p weaveffi-cli --release --locked --target ${{ matrix.target }}
+      - name: Package and upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          name="weaveffi-${{ matrix.target }}"
+          mkdir "$name"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/weaveffi.exe" README.md LICENSE-MIT LICENSE-APACHE "$name/"
+            7z a "$name.zip" "$name" > /dev/null
+            gh release upload "$TAG" "$name.zip" --clobber
+          else
+            cp "target/${{ matrix.target }}/release/weaveffi" README.md LICENSE-MIT LICENSE-APACHE "$name/"
+            tar czf "$name.tar.gz" "$name"
+            gh release upload "$TAG" "$name.tar.gz" --clobber
+          fi

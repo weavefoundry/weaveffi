@@ -17,6 +17,14 @@ pub mod calculator {
         DivisionByZero = 1,
     }
 
+    impl std::fmt::Display for CalcError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::DivisionByZero => f.write_str("division by zero"),
+            }
+        }
+    }
+
     /// Add two integers.
     #[weaveffi::export]
     pub fn add(a: i32, b: i32) -> i32 {
@@ -48,33 +56,54 @@ pub mod calculator {
 weaveffi::export_runtime!();
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::calculator::*;
-    use weaveffi::abi::{self, c_ptr_to_string, weaveffi_error};
+    use weaveffi::abi::{self, FfiError};
+
+    fn message(err: &FfiError) -> &str {
+        unsafe { err.message_str() }.unwrap_or_default()
+    }
 
     #[test]
     fn add_and_mul() {
-        let mut err = weaveffi_error::default();
-        assert_eq!(weaveffi_calculator_add(2, 40, &mut err), 42);
+        let mut err = FfiError::default();
+        assert_eq!(unsafe { calculator_calculator_add(2, 40, &mut err) }, 42);
         assert_eq!(err.code, 0);
-        assert_eq!(weaveffi_calculator_mul(6, 7, &mut err), 42);
+        assert_eq!(unsafe { calculator_calculator_mul(6, 7, &mut err) }, 42);
         assert_eq!(err.code, 0);
     }
 
     #[test]
     fn div_ok_path() {
-        let mut err = weaveffi_error::default();
-        assert_eq!(weaveffi_calculator_div(10, 2, &mut err), 5);
+        let mut err = FfiError::default();
+        assert_eq!(unsafe { calculator_calculator_div(10, 2, &mut err) }, 5);
         assert_eq!(err.code, 0);
     }
 
     #[test]
     fn div_by_zero_reports_domain_code() {
-        let mut err = weaveffi_error::default();
-        let r = weaveffi_calculator_div(1, 0, &mut err);
+        let mut err = FfiError::default();
+        let r = unsafe { calculator_calculator_div(1, 0, &mut err) };
         assert_eq!(r, 0, "error path returns the zero sentinel");
         assert_eq!(err.code, 1, "CalcError::DivisionByZero's declared code");
-        assert_eq!(c_ptr_to_string(err.message).unwrap(), "division by zero");
-        abi::error_clear(&mut err);
+        assert_eq!(message(&err), "division by zero");
+    }
+
+    #[test]
+    fn echo_round_trips_utf8_with_interior_nul() {
+        let text = "h\u{e9}llo\0world";
+        let mut err = FfiError::default();
+        let mut len = 0usize;
+        let ptr =
+            unsafe { calculator_calculator_echo(text.as_ptr(), text.len(), &mut len, &mut err) };
+        assert_eq!(err.code, 0);
+        assert_eq!(unsafe { abi::lift_str(ptr, len) }, Some(text));
+        unsafe { abi::free_bytes(ptr.cast_mut(), len) };
+    }
+
+    #[test]
+    fn checksum_is_exported() {
+        assert_ne!(calculator_calculator_checksum(), 0);
     }
 }

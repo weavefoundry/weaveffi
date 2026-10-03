@@ -1,44 +1,31 @@
-// Conformance consumer: contacts sample, Android/Kotlin (JNI) target.
+// Conformance consumer: contacts sample, Kotlin (JVM via JNI) target.
 //
-// Exercises the original struct/enum/optional surface: `ContactBook` is a
-// generated Closeable class (companion `invoke` for the canonical `new`
-// constructor, instance methods, destroy through `close()`), `Contact` is a
-// plain data class decoded from a value buffer (the nullable email rides
-// inside the same buffer), enums cross as `ContactType` values, and
-// `ContactsError` is a typed exception domain (`ContactsException` sealed
-// subclasses extending the generic `WeaveFFIException`, raised through the
-// payload-aware `fromCode` factory). Asserts the typed-error paths
-// (InvalidName from an empty first name, NotFound from a missing id), record
-// materialization with data-class value equality, the buffered nullable email
-// parameter and field, list-of-record returns, boolean returns, and
-// per-object state. Compiled in-module with the generated `WeaveFFI.kt`, so
-// the `internal` constructor surface is reachable.
+// Exercises the struct/enum/optional surface across three modules:
+// `ContactBook` is a generated `AutoCloseable` class (companion `invoke` for
+// the `new` constructor, instance methods, release through `close()`),
+// `Contact` is a data class decoded from a value buffer (the nullable email
+// rides inside it), enums cross as `ContactType` values, and `ContactsError`
+// is a typed exception domain (`ContactsException` sealed subclasses
+// extending `FfiException`). The nested `contacts.groups` module
+// (`Contacts.Groups`) takes the parent's interface and C-style enum, returns
+// a new parent-module object and record, and reports the parent's domain; the
+// sibling top-level `directory` module (`Directory`) takes the `contacts`
+// record by value, alone and in a list, and reports its own domain. At exit
+// it checks that every native resource was released.
 @file:JvmName("Main")
 
-import com.weaveffi.Contact
-import com.weaveffi.ContactBook
-import com.weaveffi.ContactType
-import com.weaveffi.ContactsException
-import com.weaveffi.WeaveFFIException
-import kotlin.system.exitProcess
+import contacts.Card
+import contacts.Contact
+import contacts.ContactBook
+import contacts.ContactType
+import contacts.Contacts
+import contacts.ContactsException
+import contacts.Directory
+import contacts.DirectoryException
+import contacts.FfiException
+import contacts.JniBridge
 
-fun expect(cond: Boolean, msg: String) {
-    if (!cond) {
-        System.err.println("assertion failed: $msg")
-        exitProcess(1)
-    }
-}
-
-/** Run `block` and return the exception it threw, or null if it completed. */
-inline fun thrownBy(block: () -> Unit): Throwable? =
-    try {
-        block()
-        null
-    } catch (e: Throwable) {
-        e
-    }
-
-fun main() {
+fun checkBook() {
     ContactBook().use { book ->
         expect(book.count() == 0, "fresh book empty")
 
@@ -75,16 +62,14 @@ fun main() {
         expect(!book.remove(alice.id), "second remove returns false")
         expect(book.count() == 1, "count == 1 after remove")
 
-        // Typed error from a method: a missing id reports NotFound (2), which
-        // is both the sealed domain type and the generic brand exception.
+        // Typed error from a method: a missing id reports NotFound (2).
         val missingErr = thrownBy { book.get(9999L) }
         expect(
             missingErr is ContactsException.NotFound,
             "get(9999) throws ContactsException.NotFound (got $missingErr)"
         )
-        expect(missingErr is ContactsException, "NotFound is a ContactsException")
-        expect(missingErr is WeaveFFIException, "NotFound is a WeaveFFIException")
-        val missingCode = (missingErr as? WeaveFFIException)?.code
+        expect(missingErr is FfiException, "NotFound is an FfiException")
+        val missingCode = (missingErr as? FfiException)?.code
         expect(missingCode == 2, "NotFound code 2 (got $missingCode)")
 
         // Typed error: an empty first name is rejected with InvalidName (1)
@@ -94,7 +79,7 @@ fun main() {
             invalidErr is ContactsException.InvalidName,
             "add(\"\") throws ContactsException.InvalidName (got $invalidErr)"
         )
-        val invalidCode = (invalidErr as? WeaveFFIException)?.code
+        val invalidCode = (invalidErr as? FfiException)?.code
         expect(invalidCode == 1, "InvalidName code 1 (got $invalidCode)")
         expect(book.count() == 1, "failed add leaves count == 1")
 
@@ -104,6 +89,56 @@ fun main() {
             expect(book.count() == 1, "first book unaffected")
         }
     }
+}
 
+fun checkGroups() {
+    ContactBook().use { book ->
+        book.add("Ann", "Lee", null, ContactType.Work)
+        book.add("Ben", "Ito", "ben@example.com", ContactType.Work)
+        book.add("Cy", "Ng", null, ContactType.Personal)
+
+        // The nested module takes the parent's interface and enum.
+        expect(Contacts.Groups.countOfType(book, ContactType.Work) == 2, "two work contacts")
+        expect(Contacts.Groups.countOfType(book, ContactType.Other) == 0, "no other contacts")
+        expect(Contacts.Groups.dominantType(book) == ContactType.Work, "work dominates")
+
+        // It returns a new object of the parent module's interface type.
+        Contacts.Groups.splitByType(book, ContactType.Work).use { work ->
+            expect(work.count() == 2, "split book holds the work contacts (got ${work.count()})")
+            expect(work.list().all { it.contact_type == ContactType.Work }, "split book is all work")
+            expect(book.count() == 3, "source book unchanged")
+        }
+
+        // And the parent's record and error domain.
+        val first = Contacts.Groups.firstOfType(book, ContactType.Personal)
+        expect(first.first_name == "Cy", "first personal contact (got $first)")
+        val none = thrownBy { Contacts.Groups.firstOfType(book, ContactType.Other) }
+        expect(none is ContactsException.NotFound, "firstOfType(Other) throws NotFound (got $none)")
+    }
+    ContactBook().use { empty ->
+        expect(Contacts.Groups.dominantType(empty) == ContactType.Personal, "empty book defaults to Personal")
+    }
+}
+
+fun checkDirectory() {
+    // A sibling top-level module taking the `contacts` record by value.
+    val ann = Contact(1L, "Ann", "Lee", "ann@example.com", ContactType.Work)
+    val cy = Contact(2L, "Cy", "Ng", null, ContactType.Personal)
+    expect(Directory.card(ann) == Card("Lee, Ann", "AL", true), "card(ann) (got ${Directory.card(ann)})")
+    expect(Directory.card(cy) == Card("Ng, Cy", "CN", false), "card(cy)")
+    val zed = Contact(3L, "Zed", "Abe", null, ContactType.Other)
+    expect(Directory.sorted(listOf(cy, ann, zed)) == listOf(zed, ann, cy), "sorted by last name")
+    val empty = thrownBy { Directory.sorted(listOf()) }
+    expect(empty is DirectoryException.Empty, "sorted(empty) throws DirectoryException.Empty (got $empty)")
+    expect((empty as FfiException).code == 1, "Empty code 1")
+    expect(empty !is ContactsException, "the directory domain is its own")
+}
+
+fun main() {
+    checkBook()
+    checkGroups()
+    checkDirectory()
     println("kotlin/contacts: OK")
+    expectNoLeaks { JniBridge.debug_live(it) }
+    println("kotlin/contacts: no leaks")
 }

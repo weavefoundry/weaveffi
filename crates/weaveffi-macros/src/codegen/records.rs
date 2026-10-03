@@ -9,36 +9,30 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use weaveffi_core::model::StructBinding;
+use weaveffi_model::model::StructBinding;
 
 use super::helpers::{ident, rust_type_ident};
 use super::marshal::{field_read_expr, field_write_stmt};
 
-/// Generate the `BufferValue` implementation for one record.
-pub(crate) fn gen_record(s: &StructBinding) -> syn::Result<TokenStream> {
+/// Generate the `BufferValue` and `ByValue` implementations for one record.
+pub(crate) fn gen_record(s: &StructBinding) -> TokenStream {
     let rust_ty = rust_type_ident(&s.name);
-
-    let writes: Vec<TokenStream> = s
+    let names: Vec<syn::Ident> = s.fields.iter().map(|f| ident(&f.name)).collect();
+    let writes = s
         .fields
         .iter()
-        .map(|f| {
-            let fname = ident(&f.name);
-            field_write_stmt(f, quote!(self.#fname))
-        })
-        .collect();
-    let reads: Vec<TokenStream> = s
-        .fields
-        .iter()
-        .map(|f| {
-            let fname = ident(&f.name);
-            let read = field_read_expr(f);
-            quote!(#fname: #read?)
-        })
-        .collect();
+        .zip(&names)
+        .map(|(f, n)| field_write_stmt(f, quote!(self.#n)));
+    let reads = s.fields.iter().zip(&names).map(|(f, n)| {
+        let read = field_read_expr(f);
+        quote!(#n: #read?)
+    });
 
-    Ok(quote! {
-        #[allow(unsafe_code)]
+    quote! {
         impl ::weaveffi::abi::BufferValue for #rust_ty {
+            fn encoded_len(&self) -> usize {
+                0 #(+ ::weaveffi::abi::BufferValue::encoded_len(&self.#names))*
+            }
             fn write_value(&self, __wv_w: &mut ::weaveffi::abi::BufferWriter) {
                 #(#writes)*
             }
@@ -48,5 +42,7 @@ pub(crate) fn gen_record(s: &StructBinding) -> syn::Result<TokenStream> {
                 ::std::result::Result::Ok(Self { #(#reads),* })
             }
         }
-    })
+
+        impl ::weaveffi::abi::ByValue for #rust_ty {}
+    }
 }

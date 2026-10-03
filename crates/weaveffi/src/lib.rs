@@ -3,13 +3,28 @@
 //! This is the single crate a Rust producer depends on. Annotate an ordinary
 //! module with [`macro@module`], tag the items you want to export, and call
 //! [`export_runtime!`] once. The [`macro@module`] expansion emits the
-//! `#[no_mangle] extern "C"` thunks that the generated language bindings call,
-//! marshalling every argument and result through the audited [`abi`] runtime so
-//! you never write `unsafe` glue by hand.
+//! `extern "C"` thunks that the generated language bindings call, marshalling
+//! every argument and result through the audited [`abi`] runtime so you never
+//! write `unsafe` glue by hand. Every C symbol starts with the crate's name
+//! (`calculator_math_add` below).
 //!
 //! ```ignore
 //! #[weaveffi::module]
-//! pub mod calculator {
+//! pub mod math {
+//!     /// The module's error domain; `Display` supplies the runtime message.
+//!     #[weaveffi::error]
+//!     #[derive(Debug)]
+//!     pub enum MathError {
+//!         /// Division by zero.
+//!         DivisionByZero = 1,
+//!     }
+//!
+//!     impl std::fmt::Display for MathError {
+//!         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+//!             f.write_str("division by zero")
+//!         }
+//!     }
+//!
 //!     /// Add two integers.
 //!     #[weaveffi::export]
 //!     pub fn add(a: i32, b: i32) -> i32 {
@@ -18,15 +33,12 @@
 //!
 //!     /// Divide, reporting division by zero through the ABI's error channel.
 //!     #[weaveffi::export]
-//!     pub fn div(a: i32, b: i32) -> Result<i32, String> {
-//!         if b == 0 {
-//!             return Err("division by zero".to_string());
-//!         }
-//!         Ok(a / b)
+//!     pub fn div(a: i32, b: i32) -> Result<i32, MathError> {
+//!         a.checked_div(b).ok_or(MathError::DivisionByZero)
 //!     }
 //! }
 //!
-//! // Expose the fixed runtime surface (memory/error/cancel helpers) once.
+//! // Export the runtime symbols (memory, errors, cancel tokens) once.
 //! weaveffi::export_runtime!();
 //! ```
 //!
@@ -50,8 +62,16 @@
 //! * [`macro@cancellable`] - mark an `async fn` as accepting a cancel token.
 //! * [`set_spawner`] - install the executor async exports run on (Tokio, for
 //!   example); the default drives each future on its own thread.
-//! * [`abi`] - the C ABI runtime: the error struct, memory helpers, the
-//!   marshalling converters the expansion calls, and [`export_runtime!`].
+//! * [`export_runtime!`] - export the runtime symbols (memory, errors, cancel
+//!   tokens, ABI version) under the crate's prefix, once per library.
+//! * [`abi`] - the C ABI runtime: the error struct, memory helpers, and the
+//!   marshalling converters the expansion calls.
+//!
+//! # Features
+//!
+//! * `leak-check` counts live objects, callbacks, iterators, cancel tokens,
+//!   and returned allocations, reported by `{prefix}_debug_live` so a test
+//!   harness can assert a consumer released everything. Off by default.
 
 #![deny(missing_docs)]
 
@@ -62,27 +82,31 @@
 /// crate; the generated thunks reference these items as `::weaveffi::abi::*`.
 pub use weaveffi_abi as abi;
 
-pub use weaveffi_abi::export_runtime;
-
 /// An owned, lazily-pulled iterator returned by a producer function whose IDL
 /// return type is `iter<T>`. Construct one from any iterator with
 /// [`Iter::new`](weaveffi_abi::Iter::new); the [`macro@module`] expansion turns
 /// it into the opaque iterator handle the generated bindings consume.
 pub use weaveffi_abi::Iter;
 
-/// A `Send` view of a foreign cancellation token, accepted as the final
-/// parameter of a `#[weaveffi::cancellable]` `async fn`. Poll
-/// [`is_cancelled`](weaveffi_abi::CancelToken::is_cancelled) at safe points and
-/// return early when it reports cancellation; the [`macro@module`] expansion
-/// supplies the token from the async launcher's `cancel_token` slot.
+/// The producer's handle on a consumer's cancel token, accepted as the final
+/// parameter of a `#[weaveffi::cancellable]` `async fn`. When the consumer
+/// cancels, the runtime drops the function's future and completes the call
+/// with the cancelled code; poll
+/// [`is_cancelled`](weaveffi_abi::CancelToken::is_cancelled) only for
+/// cooperative cleanup (work on other threads, say).
 pub use weaveffi_abi::CancelToken;
+
+/// A consumer's callback-interface implementation failed. A callback trait
+/// method declared to return `Result<T, ForeignError>` receives the failure
+/// as an `Err` instead of unwinding.
+pub use weaveffi_abi::ForeignError;
 
 /// Maps a producer error onto the ABI's `(code, message)` pair. A fallible
 /// `#[weaveffi::export]` function reports `Err(e)` through its trailing
 /// `out_err` slot using this trait: `String` and `&str` errors get the
 /// generic code `-1` out of the box, while a `#[weaveffi::error]` enum (or a
 /// manual [`ErrorReport`] impl) surfaces the named codes of an IDL error
-/// domain.
+/// domain, with its `Display` output as the message.
 pub use weaveffi_abi::ErrorReport;
 
 /// Install the process-wide executor that exported `async fn`s run on. Call it
@@ -99,5 +123,6 @@ pub use weaveffi_abi::Spawner;
 pub use weaveffi_abi::BoxFuture;
 
 pub use weaveffi_macros::{
-    callback_interface, cancellable, enumeration, error, export, interface, module, record,
+    callback_interface, cancellable, enumeration, error, export, export_runtime, interface, module,
+    record,
 };

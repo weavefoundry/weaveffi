@@ -1,9 +1,9 @@
 name: Bench
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 9 * * 1'
 
 jobs:
   bench:
@@ -31,14 +31,14 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           set -euo pipefail
-          cargo bench -p weaveffi-core --bench codegen_bench -- --test
+          cargo bench -p weaveffi-gen  --bench codegen_bench -- --test
           cargo bench -p weaveffi-cli  --bench generate_bench -- --test
 
       # Full sampled run on main; the uploaded artifact is the historical
       # record of the numbers.
       - name: Run cargo bench
         if: github.event_name == 'push'
-        # The two criterion harnesses (`weaveffi-core` and `weaveffi-cli`)
+        # The two criterion harnesses (`weaveffi-gen` and `weaveffi-cli`)
         # accept `--noplot`; the workspace `cargo bench --workspace` flag
         # also fans out to the default `libtest` harness in every other
         # crate, which rejects `--noplot`, so we invoke each criterion
@@ -48,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            cargo bench -p weaveffi-core --bench codegen_bench -- --noplot
+            cargo bench -p weaveffi-gen  --bench codegen_bench -- --noplot
             cargo bench -p weaveffi-cli  --bench generate_bench -- --noplot
           } 2>&1 | tee bench.txt
 

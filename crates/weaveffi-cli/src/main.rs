@@ -10,131 +10,161 @@ mod extract;
 mod report;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use miette::{bail, IntoDiagnostic, Result, WrapErr};
-use tracing_subscriber::EnvFilter;
-use weaveffi_ir::ir::CURRENT_SCHEMA_VERSION;
+use miette::{IntoDiagnostic, Result, WrapErr};
+use weaveffi_model::ir::CURRENT_SCHEMA_VERSION;
+
+const INPUT_HELP: &str = "Annotated Rust source (.rs) or an IDL document (yaml|yml|json|toml); \
+                          defaults to `[project] input` from the nearest weaveffi.toml";
 
 #[derive(Parser, Debug)]
-#[command(name = "weaveffi", version, about = "WeaveFFI CLI")]
+#[command(
+    name = "weaveffi",
+    version,
+    about = "Generate idiomatic bindings for 11 languages from one API definition over a stable C ABI"
+)]
 struct Cli {
-    #[arg(long, global = true)]
-    quiet: bool,
+    /// Print only errors and warnings
     #[arg(long, short, global = true)]
-    verbose: bool,
+    quiet: bool,
     #[command(subcommand)]
     command: Commands,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum HumanJsonFormat {
+/// Output format for `validate`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ReportFormat {
+    /// Human-readable text.
     Human,
+    /// One JSON object on stdout.
     Json,
 }
 
-impl HumanJsonFormat {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Human => "human",
-            Self::Json => "json",
-        }
-    }
+/// An IDL serialization format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum IdlFormat {
+    /// YAML.
+    Yaml,
+    /// JSON.
+    Json,
+    /// TOML.
+    Toml,
+}
+
+/// A schema export format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SchemaFormat {
+    /// JSON Schema (draft 7) for the IDL document.
+    JsonSchema,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Generate bindings for every (or the selected) language target
-    Generate {
-        /// Input: annotated Rust source (.rs) or an IDL document (yaml|yml|json|toml)
-        input: String,
-        /// Output directory for generated artifacts
-        #[arg(short, long, default_value = "./generated")]
-        out: String,
-        /// Comma-separated list of targets to generate (c, cpp, swift, kotlin, node, wasm, python, dotnet, dart, go, ruby)
-        #[arg(short, long)]
-        target: Option<String>,
-        /// Path to weaveffi.toml (default: the nearest one at or above the input file)
+    /// Create a weaveffi.toml (and a starter IDL outside a Rust crate)
+    Init {
+        /// Project directory
+        #[arg(default_value = ".")]
+        dir: String,
+        /// Package name for a new IDL project (default: the directory name)
         #[arg(long)]
-        config: Option<String>,
-        /// Print non-fatal warnings after validation
-        #[arg(long)]
-        warn: bool,
-        /// Force regeneration, bypassing the incremental cache
+        name: Option<String>,
+        /// Overwrite an existing weaveffi.toml
         #[arg(long)]
         force: bool,
-        /// Parse and validate only; print which files would be generated without writing them
+    },
+    /// Generate bindings for every (or the selected) language target
+    Generate {
+        #[arg(help = INPUT_HELP)]
+        input: Option<String>,
+        /// Output directory (default: `[project] out`, else ./generated)
+        #[arg(short, long)]
+        out: Option<String>,
+        /// Comma-separated targets: c, cpp, swift, kotlin, node, wasm, python, dotnet, dart, go, ruby (default: `[project] targets`, else all)
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Path to weaveffi.toml (default: the nearest one at or above the input)
+        #[arg(long)]
+        config: Option<String>,
+        /// Print advisory lints after validation
+        #[arg(long)]
+        warn: bool,
+        /// Regenerate every target even if its inputs and files are unchanged
+        #[arg(long)]
+        force: bool,
+        /// Validate and list the files that would be written, without writing
         #[arg(long)]
         dry_run: bool,
     },
     /// Validate an API definition without generating anything
     Validate {
-        /// Input: annotated Rust source (.rs) or an IDL document (yaml|yml|json|toml)
-        input: String,
-        /// Also report non-fatal warnings (advisory lints)
+        #[arg(help = INPUT_HELP)]
+        input: Option<String>,
+        /// Path to weaveffi.toml (default: the nearest one at or above the input)
+        #[arg(long)]
+        config: Option<String>,
+        /// Also report advisory lints
         #[arg(long)]
         warn: bool,
-        /// Output format: `json` for machine-readable output, otherwise human-readable
+        /// Output format
+        #[arg(long, value_enum, default_value_t = ReportFormat::Human)]
+        format: ReportFormat,
+    },
+    /// Show how regenerating would change the output directory (writes nothing, runs no hooks)
+    Diff {
+        #[arg(help = INPUT_HELP)]
+        input: Option<String>,
+        /// Output directory to compare against (default: `[project] out`, else ./generated)
+        #[arg(short, long)]
+        out: Option<String>,
+        /// Comma-separated targets to compare (default: `[project] targets`, else all)
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Path to weaveffi.toml (default: the nearest one at or above the input)
         #[arg(long)]
-        format: Option<HumanJsonFormat>,
+        config: Option<String>,
+        /// Print only a summary and exit 2 if files differ, 3 if files would be added or removed
+        #[arg(long)]
+        check: bool,
     },
     /// Assemble publishable packages that bundle prebuilt native libraries
     Package {
-        /// Input: annotated Rust source (.rs) or an IDL document (yaml|yml|json|toml)
-        input: String,
+        #[arg(help = INPUT_HELP)]
+        input: Option<String>,
         /// Output directory for the packaged artifacts
         #[arg(short, long, default_value = "./dist")]
         out: String,
-        /// Comma-separated list of targets to package (e.g. node,python,dotnet)
+        /// Comma-separated targets to package (default: `[project] targets`, else all)
         #[arg(short, long)]
         target: Option<String>,
-        /// Path to weaveffi.toml (default: the nearest one at or above the input file)
+        /// Path to weaveffi.toml (default: the nearest one at or above the input)
         #[arg(long)]
         config: Option<String>,
         /// Directory of prebuilt native libraries laid out as `<dir>/<platform>/<lib>`
-        /// (platform ids: darwin-arm64, darwin-x64, linux-x64, linux-arm64, windows-x64,
-        /// android-arm64, android-x64, wasm32)
         #[arg(long)]
         binaries: Option<String>,
-        /// Cargo package to cross-compile as the native producer (one cdylib per platform)
+        /// Cargo package to build as the native producer, once per platform
         #[arg(long)]
         build: Option<String>,
-        /// Comma-separated platform ids to target (defaults to the full v1 matrix)
+        /// Comma-separated platform ids (default: the host): darwin-arm64, darwin-x64, linux-x64, linux-arm64, windows-x64, android-arm64, android-x64, wasm32
         #[arg(long)]
         platforms: Option<String>,
-        /// Print non-fatal warnings after validation
+        /// Print advisory lints after validation
         #[arg(long)]
         warn: bool,
     },
     /// Extract an IDL document from annotated Rust source
     Extract {
-        /// Path to a Rust source file to extract API definitions from
+        /// Rust source file to extract the API from
         input: String,
-        /// Output file path (defaults to stdout)
+        /// Output file (default: stdout)
         #[arg(short, long)]
         output: Option<String>,
-        /// Output format: yaml (default), json, or toml
-        #[arg(short, long, default_value = "yaml")]
-        format: Option<String>,
-        /// Downgrade validation errors to warnings and emit the IDL anyway.
-        /// Useful for bootstrapping from source that references types it does
-        /// not yet declare (e.g. an interface you will define later).
+        /// Output format
+        #[arg(short, long, value_enum, default_value_t = IdlFormat::Yaml)]
+        format: IdlFormat,
+        /// Emit the IDL even if it does not validate (for example, it
+        /// references types declared elsewhere)
         #[arg(long)]
-        warn: bool,
-    },
-    /// Show how regenerating would change an existing output directory
-    Diff {
-        /// Input: annotated Rust source (.rs) or an IDL document (yaml|yml|json|toml)
-        input: String,
-        /// Output directory to compare against (defaults to ./generated)
-        #[arg(short, long)]
-        out: Option<String>,
-        /// Path to weaveffi.toml (default: the nearest one at or above the input file)
-        #[arg(long)]
-        config: Option<String>,
-        /// Exit non-zero if regeneration would change `out` (2 if files
-        /// differ, 3 if files are missing/extra). Prints only a summary,
-        /// not per-file diffs.
-        #[arg(long)]
-        check: bool,
+        lenient: bool,
     },
     /// Print shell completions
     Completions {
@@ -145,9 +175,9 @@ enum Commands {
     SchemaVersion,
     /// Print the IDL document schema
     Schema {
-        /// Schema export format (currently only json-schema is supported)
-        #[arg(long, default_value = "json-schema")]
-        format: String,
+        /// Schema export format
+        #[arg(long, value_enum, default_value_t = SchemaFormat::JsonSchema)]
+        format: SchemaFormat,
     },
 }
 
@@ -162,21 +192,16 @@ fn main() -> Result<()> {
     }));
 
     let cli = Cli::parse();
-
-    let filter = if cli.verbose {
-        EnvFilter::new("trace")
-    } else if cli.quiet {
-        EnvFilter::new("error")
-    } else {
-        EnvFilter::from_default_env()
-    };
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .without_time()
-        .init();
-
     let quiet = cli.quiet;
     match cli.command {
+        Commands::Init { dir, name, force } => {
+            commands::init::cmd_init(&commands::init::InitArgs {
+                dir: &dir,
+                name: name.as_deref(),
+                force,
+                quiet,
+            })?
+        }
         Commands::Generate {
             input,
             out,
@@ -185,26 +210,42 @@ fn main() -> Result<()> {
             warn,
             force,
             dry_run,
-        } => commands::generate::cmd_generate(
-            &input,
-            &out,
-            target.as_deref(),
-            config.as_deref(),
+        } => commands::generate::cmd_generate(&commands::generate::GenerateArgs {
+            input: input.as_deref(),
+            out: out.as_deref(),
+            targets: target.as_deref(),
+            config: config.as_deref(),
             warn,
             force,
             dry_run,
             quiet,
-        )?,
+        })?,
         Commands::Validate {
             input,
+            config,
             warn,
             format,
         } => commands::validate::cmd_validate(
-            &input,
+            input.as_deref(),
+            config.as_deref(),
             warn,
-            format.map(HumanJsonFormat::as_str),
+            format == ReportFormat::Json,
             quiet,
         )?,
+        Commands::Diff {
+            input,
+            out,
+            target,
+            config,
+            check,
+        } => commands::diff::cmd_diff(&commands::diff::DiffArgs {
+            input: input.as_deref(),
+            out: out.as_deref(),
+            targets: target.as_deref(),
+            config: config.as_deref(),
+            check,
+            quiet,
+        })?,
         Commands::Package {
             input,
             out,
@@ -214,38 +255,26 @@ fn main() -> Result<()> {
             build,
             platforms,
             warn,
-        } => commands::package::cmd_package(
-            &input,
-            &out,
-            target.as_deref(),
-            config.as_deref(),
-            binaries.as_deref(),
-            build.as_deref(),
-            platforms.as_deref(),
+        } => commands::package::cmd_package(&commands::package::PackageArgs {
+            input: input.as_deref(),
+            out: &out,
+            targets: target.as_deref(),
+            config: config.as_deref(),
+            binaries: binaries.as_deref(),
+            build: build.as_deref(),
+            platforms: platforms.as_deref(),
             warn,
             quiet,
-        )?,
+        })?,
         Commands::Extract {
             input,
             output,
             format,
-            warn,
-        } => extract::cmd_extract(
-            &input,
-            output.as_deref(),
-            format.as_deref().unwrap_or("yaml"),
-            warn,
-            quiet,
-        )?,
-        Commands::Diff {
-            input,
-            out,
-            config,
-            check,
-        } => commands::diff::cmd_diff(&input, out.as_deref(), config.as_deref(), check, quiet)?,
+            lenient,
+        } => extract::cmd_extract(&input, output.as_deref(), format, lenient, quiet)?,
         Commands::Completions { shell } => cmd_completions(shell),
         Commands::SchemaVersion => println!("{CURRENT_SCHEMA_VERSION}"),
-        Commands::Schema { format } => cmd_schema(&format)?,
+        Commands::Schema { format } => cmd_schema(format)?,
     }
     Ok(())
 }
@@ -259,21 +288,17 @@ fn cmd_completions(shell: clap_complete::Shell) {
     );
 }
 
-fn cmd_schema(format: &str) -> Result<()> {
+fn cmd_schema(format: SchemaFormat) -> Result<()> {
     match format {
-        "json-schema" => {
-            let schema = schemars::schema_for!(weaveffi_ir::ir::Api);
+        SchemaFormat::JsonSchema => {
+            let schema = schemars::schema_for!(weaveffi_model::ir::Api);
             let json = serde_json::to_string_pretty(&schema)
                 .into_diagnostic()
                 .wrap_err("failed to serialize JSON Schema")?;
             println!("{json}");
-            Ok(())
         }
-        other => bail!(
-            "unsupported schema format: {} (expected 'json-schema')",
-            other
-        ),
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -289,16 +314,6 @@ mod tests {
             error.to_string().contains("possible values: human, json"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn removed_subcommands_are_gone() {
-        for cmd in ["new", "lint", "doctor", "man", "watch", "format"] {
-            assert!(
-                Cli::try_parse_from(["weaveffi", cmd]).is_err(),
-                "`{cmd}` should no longer parse"
-            );
-        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-// Conformance consumer: kvstore sample, C++ target (ABI revision 2).
+// Conformance consumer: kvstore sample, C++ target.
 //
 // Drives the generated header-only wrapper over the object-graph surface:
 //  - `Store` is a copyable RAII interface wrapper (copies `_clone`, moves
@@ -12,11 +12,13 @@
 //  - `EvictionListener` is an abstract class the consumer subclasses; a
 //    returned `false` detaches (and frees) it, replacing or clearing frees
 //    the previous one, and an implementation that throws surfaces to the
-//    caller as `WeaveFFIError` code -4.
+//    caller as `Error` code -4.
 //  - the pre-existing surface still works: value records with optional,
 //    list, map, and bytes fields, the `KvError` hierarchy, the lazy
 //    `list_keys` range, the `kv::stats` nested module, and the
-//    std::future-backed cancellable `compact`.
+//    std::future-backed cancellable `compact`, cancelled through an RAII
+//    `CancelToken` into `Cancelled`.
+// Ends by asserting the producer's leak counters are all zero.
 // Exits non-zero on the first failed check.
 
 #include <cstdio>
@@ -29,7 +31,8 @@
 #include <utility>
 #include <vector>
 
-#include "weaveffi.hpp"
+#include "check.hpp"
+#include "kvstore.hpp"
 
 using namespace kvstore;
 
@@ -70,8 +73,8 @@ public:
     }
 };
 
-int main() {
-    check_abi_version();
+static void run() {
+    check_library();
 
     check(Store::default_capacity() == 1000000, "static default_capacity");
 
@@ -86,7 +89,7 @@ int main() {
         } catch (const IoError& e) {
             caught = (e.code() == 1004);
             check(dynamic_cast<const KvError*>(&e) != nullptr, "IoError is a KvError");
-            check(dynamic_cast<const WeaveFFIError*>(&e) != nullptr, "IoError is a WeaveFFIError");
+            check(dynamic_cast<const Error*>(&e) != nullptr, "IoError is an Error");
         }
         check(caught, "open(\"\") throws IoError 1004");
     }
@@ -343,7 +346,7 @@ int main() {
     }
 
     // A listener that throws surfaces to the caller as a foreign error (-4)
-    // on a `throws` method: the generic WeaveFFIError, not a KvError.
+    // on a `throws` method: the generic Error, not a KvError.
     {
         auto state = std::make_shared<ListenerState>();
         store.set_eviction_listener(std::make_shared<RecordingListener>(state, 1000, "bomb"));
@@ -353,7 +356,7 @@ int main() {
             store.delete_("bomb");
         } catch (const KvError&) {
             check(false, "a foreign error must not be mapped to a domain exception");
-        } catch (const WeaveFFIError& e) {
+        } catch (const Error& e) {
             caught = true;
             check(e.code() == -4, "listener exception maps to FOREIGN_ERROR_CODE (-4)");
             check(std::string(e.what()).find("listener refused bomb") != std::string::npos,
@@ -378,17 +381,18 @@ int main() {
         check(pending.get() == 3, "compact reclaimed the expired bytes");
         check(store.count() == 2, "compact left the live entries");
 
-        weaveffi_cancel_token* token = weaveffi_cancel_token_create();
-        weaveffi_cancel_token_cancel(token);
+        CancelToken token;
+        check(!token.is_cancelled(), "a new token is not cancelled");
+        token.cancel();
+        check(token.is_cancelled(), "cancel() marks the token");
         std::future<int64_t> cancelled = store.compact(token);
         bool caught = false;
         try {
             cancelled.get();
-        } catch (const IoError& e) {
-            caught = (e.code() == 1004);
+        } catch (const Cancelled& e) {
+            caught = (e.code() == -5);
         }
-        check(caught, "a pre-cancelled compact settles the future with IoError");
-        weaveffi_cancel_token_destroy(token);
+        check(caught, "a pre-cancelled compact settles the future with Cancelled");
     }
 
     // Non-throwing method still works, then release everything via RAII.
@@ -403,6 +407,11 @@ int main() {
         check(last.count() == 0, "moved-to store is usable");
     }
 
+}
+
+int main() {
+    run();
+    check_no_leaks(kvstore_debug_live, "kvstore");
     std::printf("cpp/kvstore: OK\n");
     return 0;
 }

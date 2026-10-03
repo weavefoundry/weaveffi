@@ -2,45 +2,46 @@
 //! `cli_targets!` registry, and the per-target [`Targets`] struct it
 //! generates.
 //!
-//! A project's identity and generator options live in one TOML file next to
-//! the IDL:
+//! A project's identity, inputs, and generator options live in one TOML file
+//! at the project root:
 //!
 //! ```toml
+//! [project]
+//! input = "src/lib.rs"          # or an IDL such as "kvstore.yml"
+//! out = "bindings"
+//! targets = ["c", "swift", "python"]
+//!
 //! [package]
 //! name = "kvstore"
 //! version = "1.2.0"
 //! license = "MIT"
 //!
-//! [global]
-//! c_prefix = "kv"
-//!
 //! [generators.swift]
 //! module_name = "KVStore"
-//!
-//! [generators.kotlin]
-//! package = "com.example.kvstore"
 //! ```
 //!
-//! The IDL itself describes only the API surface. `weaveffi generate` finds
-//! the config automatically by walking up from the input file's directory
-//! (like Cargo finds `Cargo.toml`); `--config <path>` names one explicitly.
+//! The API definition describes only the API surface. With a `[project]`
+//! table, `weaveffi generate` (no arguments) works from any directory inside
+//! the project, like `cargo build`. With an explicit input, the CLI finds the
+//! nearest `weaveffi.toml` at or above the input's directory; `--config
+//! <path>` names one explicitly.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::Deserialize;
-use weaveffi_core::codegen::{ConfiguredBackend, OrchestratorHooks, Target};
-use weaveffi_core::pkg::Package;
-use weaveffi_gen_c::{CConfig, CGenerator};
-use weaveffi_gen_cpp::{CppConfig, CppGenerator};
-use weaveffi_gen_dart::{DartConfig, DartGenerator};
-use weaveffi_gen_dotnet::{DotnetConfig, DotnetGenerator};
-use weaveffi_gen_go::{GoConfig, GoGenerator};
-use weaveffi_gen_kotlin::{KotlinConfig, KotlinGenerator};
-use weaveffi_gen_node::{NodeConfig, NodeGenerator};
-use weaveffi_gen_python::{PythonConfig, PythonGenerator};
-use weaveffi_gen_ruby::{RubyConfig, RubyGenerator};
-use weaveffi_gen_swift::{SwiftConfig, SwiftGenerator};
-use weaveffi_gen_wasm::{WasmConfig, WasmGenerator};
+use weaveffi_gen::codegen::{ConfiguredBackend, Target};
+use weaveffi_gen::targets::c::{CConfig, CGenerator};
+use weaveffi_gen::targets::cpp::{CppConfig, CppGenerator};
+use weaveffi_gen::targets::dart::{DartConfig, DartGenerator};
+use weaveffi_gen::targets::dotnet::{DotnetConfig, DotnetGenerator};
+use weaveffi_gen::targets::go::{GoConfig, GoGenerator};
+use weaveffi_gen::targets::kotlin::{KotlinConfig, KotlinGenerator};
+use weaveffi_gen::targets::node::{NodeConfig, NodeGenerator};
+use weaveffi_gen::targets::python::{PythonConfig, PythonGenerator};
+use weaveffi_gen::targets::ruby::{RubyConfig, RubyGenerator};
+use weaveffi_gen::targets::swift::{SwiftConfig, SwiftGenerator};
+use weaveffi_gen::targets::wasm::{WasmConfig, WasmGenerator};
+use weaveffi_model::pkg::Package;
 
 /// The file name `weaveffi generate` looks for when `--config` is absent.
 pub(crate) const CONFIG_FILE_NAME: &str = "weaveffi.toml";
@@ -52,8 +53,8 @@ pub(crate) const CONFIG_FILE_NAME: &str = "weaveffi.toml";
 ///   * the [`Targets`] struct: one typed field per target, deserialized from
 ///     the `[generators.<target>]` tables;
 ///   * `build`: the ordered, object-safe target list;
-///   * `stamp_input_basename` / `fan_strip_module_prefix` / `fan_c_prefix`:
-///     the `finalize` fan-outs.
+///   * `stamp_input_basename` / `fan_strip_module_prefix`: the `finalize`
+///     fan-outs.
 ///
 /// Adding a language is therefore a one-line edit here (plus the generator
 /// crate and its workspace dependency), keeping WeaveFFI's promise that a new
@@ -99,20 +100,6 @@ macro_rules! cli_targets {
             fn fan_strip_module_prefix(&mut self, value: bool) {
                 $( $( cli_targets!(@strip self, $field, value, $strip); )? )*
             }
-
-            /// Fan the resolved global C ABI `prefix` out to every per-target
-            /// config that has not set its own. The C symbol prefix is global
-            /// by nature: every consumer must call the identical exported
-            /// symbols, so a single `[global] c_prefix` reaches all eleven
-            /// languages.
-            fn fan_c_prefix(&mut self, resolved: Option<String>) {
-                let Some(p) = resolved else { return };
-                $(
-                    if self.$field.prefix.is_none() {
-                        self.$field.prefix = Some(p.clone());
-                    }
-                )*
-            }
         }
     };
     (@strip $self:ident, $field:ident, $value:ident, strip) => {
@@ -125,7 +112,7 @@ cli_targets! {
     "cpp"     => cpp:     CppConfig     via CppGenerator,
     "swift"   => swift:   SwiftConfig   via SwiftGenerator,   strip,
     "kotlin"  => kotlin:  KotlinConfig  via KotlinGenerator,  strip,
-    "node"    => node:    NodeConfig    via NodeGenerator,    strip,
+    "node"    => node:    NodeConfig    via NodeGenerator,
     "wasm"    => wasm:    WasmConfig    via WasmGenerator,
     "python"  => python:  PythonConfig  via PythonGenerator,  strip,
     "dotnet"  => dotnet:  DotnetConfig  via DotnetGenerator,  strip,
@@ -145,21 +132,33 @@ pub(crate) struct GlobalConfig {
     /// once. When set, this overrides per-target sections; omit it to
     /// control targets individually.
     pub(crate) strip_module_prefix: Option<bool>,
-    /// Global C ABI symbol prefix (default `"weaveffi"`). Applies to every
-    /// target so generated consumers across all languages call the identical
-    /// exported symbols. A per-target `prefix` overrides this for that target.
-    pub(crate) c_prefix: Option<String>,
     /// Shell command executed once before any generator runs.
     pub(crate) pre_generate: Option<String>,
     /// Shell command executed once after every generator succeeds.
     pub(crate) post_generate: Option<String>,
 }
 
-/// The whole `weaveffi.toml`: package identity, global knobs, and per-target
-/// generator options.
+/// The `[project]` table: what to generate from, where to, and for which
+/// targets, so a configured project needs no command-line arguments. Paths
+/// are relative to the directory containing `weaveffi.toml`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ProjectTable {
+    /// The API definition: annotated Rust source or an IDL document.
+    pub(crate) input: Option<Utf8PathBuf>,
+    /// The output directory for `generate` and `diff` (default `generated`).
+    pub(crate) out: Option<Utf8PathBuf>,
+    /// The targets to generate when `--target` is not given (default: all).
+    pub(crate) targets: Option<Vec<String>>,
+}
+
+/// The whole `weaveffi.toml`: project paths, package identity, global knobs,
+/// and per-target generator options.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct ProjectConfig {
+    /// The `[project]` table.
+    pub(crate) project: ProjectTable,
     /// The `[package]` table: distribution identity shared by every
     /// generated manifest.
     pub(crate) package: Package,
@@ -210,47 +209,83 @@ impl ProjectConfig {
     }
 
     /// Fan `global.strip_module_prefix` out to every per-target config that
-    /// honors it, propagate the C symbol prefix to every target that did not
-    /// set its own, then stamp the IDL `input_basename` on every per-target
+    /// honors it, then stamp the IDL `input_basename` on every per-target
     /// config.
     pub(crate) fn finalize(&mut self, input_basename: Option<String>) {
         if let Some(v) = self.global.strip_module_prefix {
             self.generators.fan_strip_module_prefix(v);
         }
-        // The C ABI prefix is global: every backend must call the exact same
-        // `extern "C"` symbols. Resolve it once (`[global] c_prefix` wins,
-        // then `[generators.c] prefix`) and fan it out to every per-target
-        // config so a custom prefix is honored across all eleven languages.
-        let resolved_prefix = self
-            .global
-            .c_prefix
-            .clone()
-            .or_else(|| self.generators.c.prefix.clone());
-        self.generators.fan_c_prefix(resolved_prefix);
         self.generators.stamp_input_basename(input_basename);
     }
 
-    /// Load, then finalize against the input path in one step.
+    /// Resolve the project for a command: the config (explicit, discovered
+    /// from `input`, or discovered from the current directory) and the input
+    /// file (the argument, else `[project] input`), finalized against the
+    /// input.
     ///
     /// # Errors
     ///
-    /// Propagates errors from [`ProjectConfig::load`].
-    pub(crate) fn for_input(explicit: Option<&str>, input: &Utf8Path) -> Result<Self> {
-        let mut cfg = Self::load(explicit, input)?;
+    /// Returns an error when no input is given and no discovered config
+    /// names one, or when a config file cannot be read or parsed.
+    pub(crate) fn locate(
+        explicit: Option<&str>,
+        input: Option<&str>,
+    ) -> Result<(Self, Utf8PathBuf)> {
+        let (mut cfg, input) = match input {
+            Some(i) => (
+                Self::load(explicit, Utf8Path::new(i))?,
+                Utf8PathBuf::from(i),
+            ),
+            None => {
+                let path = match explicit {
+                    Some(p) => Utf8PathBuf::from(p),
+                    None => current_dir()
+                        .ok()
+                        .and_then(|cwd| discover(&cwd.join(CONFIG_FILE_NAME)))
+                        .ok_or_else(|| {
+                            miette::miette!(
+                                "no input given and no {CONFIG_FILE_NAME} found in this directory \
+                             or any parent; pass an input file or run `weaveffi init`"
+                            )
+                        })?,
+                };
+                let cfg = Self::from_file(&path)?;
+                let Some(rel) = cfg.project.input.clone() else {
+                    miette::bail!(
+                        "no input given and {path} has no `[project] input`; pass an input \
+                         file or set `input` in the [project] table"
+                    );
+                };
+                let input = cfg.relative_to_config(&rel);
+                (cfg, input)
+            }
+        };
         cfg.finalize(input.file_name().map(str::to_string));
-        Ok(cfg)
+        Ok((cfg, input))
     }
 
-    /// The orchestrator hooks configured in `[global]`.
-    pub(crate) fn hooks(&self) -> OrchestratorHooks {
-        OrchestratorHooks {
-            pre_generate: self.global.pre_generate.clone(),
-            post_generate: self.global.post_generate.clone(),
+    /// Resolve `path` against the directory holding the config file (or the
+    /// current directory when there is no file).
+    pub(crate) fn relative_to_config(&self, path: &Utf8Path) -> Utf8PathBuf {
+        match self.source.as_deref().and_then(Utf8Path::parent) {
+            Some(dir) if path.is_relative() && !dir.as_str().is_empty() => dir.join(path),
+            _ => path.to_path_buf(),
+        }
+    }
+
+    /// The output directory: `out` if given on the command line, else
+    /// `[project] out`, else `./generated`.
+    pub(crate) fn out_dir(&self, out: Option<&str>) -> Utf8PathBuf {
+        match (out, &self.project.out) {
+            (Some(o), _) => Utf8PathBuf::from(o),
+            (None, Some(o)) => self.relative_to_config(o),
+            (None, None) => Utf8PathBuf::from("./generated"),
         }
     }
 
     /// Build every registered target, keeping only those named in the
-    /// comma-separated `filter` (all of them when `filter` is `None`).
+    /// comma-separated `filter`, else those listed in `[project] targets`,
+    /// else all of them.
     ///
     /// # Errors
     ///
@@ -258,12 +293,19 @@ impl ProjectConfig {
     /// target, so a typo in `--target` fails instead of silently generating
     /// nothing.
     pub(crate) fn select_targets(&self, filter: Option<&str>) -> Result<Vec<Box<dyn Target>>> {
-        let wanted: Option<Vec<&str>> = filter.map(|t| {
-            t.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect()
-        });
+        let wanted: Option<Vec<&str>> = match filter {
+            Some(t) => Some(
+                t.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            ),
+            None => self
+                .project
+                .targets
+                .as_ref()
+                .map(|ts| ts.iter().map(String::as_str).collect()),
+        };
         if let Some(names) = &wanted {
             let unknown: Vec<&str> = names
                 .iter()
@@ -285,6 +327,12 @@ impl ProjectConfig {
             .filter(|g| wanted.as_ref().is_none_or(|ts| ts.contains(&g.name())))
             .collect())
     }
+}
+
+/// The current directory as a UTF-8 path.
+fn current_dir() -> std::io::Result<Utf8PathBuf> {
+    Utf8PathBuf::from_path_buf(std::env::current_dir()?)
+        .map_err(|_| std::io::Error::other("current directory is not valid UTF-8"))
 }
 
 /// Walk from the input file's directory up to the filesystem root and return
@@ -328,7 +376,6 @@ mod tests {
                 "version = \"1.2.0\"\n",
                 "[global]\n",
                 "strip_module_prefix = true\n",
-                "c_prefix = \"kv\"\n",
                 "[generators.swift]\n",
                 "module_name = \"MyApp\"\n",
                 "[generators.kotlin]\n",
@@ -338,14 +385,12 @@ mod tests {
         let mut cfg = ProjectConfig::from_file(&cfg_path).unwrap();
         assert_eq!(cfg.package.name.as_deref(), Some("kvstore"));
         assert_eq!(cfg.package.version.as_deref(), Some("1.2.0"));
-        assert_eq!(cfg.generators.swift.module_name(), "MyApp");
-        assert_eq!(cfg.generators.kotlin.package(), "com.example.myapp");
+        assert_eq!(cfg.generators.swift.module_name.as_deref(), Some("MyApp"));
+        assert_eq!(cfg.generators.kotlin.package(), Some("com.example.myapp"));
         assert_eq!(cfg.global.strip_module_prefix, Some(true));
         assert_eq!(cfg.source.as_deref(), Some(cfg_path.as_path()));
 
         cfg.finalize(Some("api.yml".into()));
-        assert_eq!(cfg.generators.c.prefix(), "kv");
-        assert_eq!(cfg.generators.python.prefix(), "kv");
         assert!(cfg.generators.python.strip_module_prefix);
         assert_eq!(
             cfg.generators.swift.input_basename.as_deref(),
@@ -375,7 +420,7 @@ mod tests {
             CONFIG_FILE_NAME,
             "[package]\nname = \"found\"\n",
         );
-        let input = write(&nested, "api.yml", "version: \"0.9.0\"\nmodules: []\n");
+        let input = write(&nested, "api.yml", "version: \"0.10.0\"\nmodules: []\n");
 
         let cfg = ProjectConfig::load(None, &input).unwrap();
         assert_eq!(cfg.package.name.as_deref(), Some("found"));
@@ -384,11 +429,9 @@ mod tests {
     #[test]
     fn defaults_when_no_config_exists() {
         let dir = tempfile::tempdir().unwrap();
-        let input = write(dir.path(), "api.yml", "version: \"0.9.0\"\nmodules: []\n");
+        let input = write(dir.path(), "api.yml", "version: \"0.10.0\"\nmodules: []\n");
         let cfg = ProjectConfig::load(None, &input).unwrap();
         assert!(cfg.source.is_none(), "unexpected config: {:?}", cfg.source);
-        assert_eq!(cfg.generators.swift.module_name(), "WeaveFFI");
-        assert_eq!(cfg.generators.kotlin.package(), "com.weaveffi");
         assert_eq!(cfg.global.strip_module_prefix, None);
         assert!(cfg.package.name.is_none());
     }
@@ -417,6 +460,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn project_table_supplies_input_out_and_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = write(
+            dir.path(),
+            CONFIG_FILE_NAME,
+            "[project]\ninput = \"api.yml\"\nout = \"bindings\"\ntargets = [\"c\", \"python\"]\n",
+        );
+        write(dir.path(), "api.yml", "version: \"0.10.0\"\nmodules: []\n");
+        let (cfg, input) = ProjectConfig::locate(Some(cfg_path.as_str()), None).unwrap();
+        let root = cfg_path.parent().unwrap();
+        assert_eq!(input, root.join("api.yml"));
+        assert_eq!(cfg.out_dir(None), root.join("bindings"));
+        assert_eq!(cfg.out_dir(Some("x")), Utf8PathBuf::from("x"));
+        let names: Vec<&str> = cfg
+            .select_targets(None)
+            .unwrap()
+            .iter()
+            .map(|t| t.name())
+            .collect();
+        assert_eq!(names, ["c", "python"]);
+        assert_eq!(cfg.select_targets(Some("go")).unwrap().len(), 1);
+
+        let bare = write(dir.path(), "other.toml", "[package]\nname = \"x\"\n");
+        let err = ProjectConfig::locate(Some(bare.as_str()), None).unwrap_err();
+        assert!(format!("{err}").contains("[project] input"), "{err}");
+    }
+
     /// Every registered target's *declared* [`TargetCapabilities`] must match
     /// the documented feature matrix. This pins the declarations so a backend
     /// cannot silently claim (or drop) a gated feature: the matrix here, the
@@ -430,7 +501,7 @@ mod tests {
     #[test]
     fn declared_capabilities_match_documented_matrix() {
         use std::collections::BTreeMap;
-        use weaveffi_core::capabilities::TargetCapabilities;
+        use weaveffi_gen::capabilities::TargetCapabilities;
 
         // Every target is full. Wasm delivers callbacks/listeners
         // synchronously through function-table trampolines in its standard

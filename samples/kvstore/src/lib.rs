@@ -13,10 +13,8 @@
 //! `Store` is exported as an interface, so each object owns its rich state
 //! (its entries and the monotonic entry-id counter) directly. Methods take
 //! `&self` and guard that state with a `Mutex` because the object is shared
-//! across the FFI boundary; the last `weaveffi_kv_Store_destroy` releases the
+//! across the FFI boundary; the last `kvstore_kv_Store_destroy` releases the
 //! state with it.
-
-#![allow(unsafe_code)]
 
 /// An embedded key-value store API with TTLs, iteration, and async compaction.
 #[weaveffi::module]
@@ -28,8 +26,9 @@ pub mod kv {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// The store's error domain. Each variant's discriminant is the stable
-    /// ABI code a throwing method reports through `out_err`, and its doc
-    /// comment is the default message.
+    /// ABI code a throwing method reports through `out_err`, its `Display`
+    /// output is the runtime message, and its doc comment is the documented
+    /// default message.
     #[weaveffi::error]
     #[derive(Debug)]
     pub enum KvError {
@@ -41,6 +40,17 @@ pub mod kv {
         StoreFull = 1003,
         /// I/O failure
         IoError = 1004,
+    }
+
+    impl std::fmt::Display for KvError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(match self {
+                Self::KeyNotFound => "key not found",
+                Self::Expired => "entry expired",
+                Self::StoreFull => "store has reached capacity",
+                Self::IoError => "I/O failure",
+            })
+        }
     }
 
     /// The largest number of live entries one store will hold before `put`
@@ -365,9 +375,9 @@ pub mod kv {
         }
 
         /// Reclaim space asynchronously; returns the number of bytes
-        /// reclaimed. Honors the caller's cancellation token: a token already
-        /// cancelled when the future runs fails with [`KvError::IoError`]
-        /// instead of compacting.
+        /// reclaimed. Cancelling the call's token completes it with the
+        /// cancelled code (the runtime drops the work); the check here only
+        /// covers a cancellation that lands as compaction starts.
         #[weaveffi::cancellable]
         pub async fn compact(&self, cancel: weaveffi::CancelToken) -> Result<i64, KvError> {
             if cancel.is_cancelled() {
@@ -444,20 +454,30 @@ mod tests {
     use crate::kv::stats::*;
     use crate::kv::*;
     use std::collections::BTreeMap;
-    use std::ffi::{c_void, CString};
-    use std::os::raw::c_char;
+    use std::ffi::c_void;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
-    use weaveffi::abi::{self, weaveffi_error};
+    use weaveffi::abi::{self, FfiError};
 
     /// Decode a buffered return and release the producer-owned bytes.
     fn decode_and_free<T: abi::BufferValue>(ptr: *const u8, len: usize) -> T {
         assert!(!ptr.is_null());
         let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
         let value = abi::decode_value::<T>(bytes).expect("well-formed value buffer");
-        abi::free_bytes(ptr as *mut u8, len);
+        unsafe { abi::free_bytes(ptr.cast_mut(), len) };
         value
+    }
+
+    /// Copy a returned string and release it.
+    fn take_string(ptr: *const u8, len: usize) -> String {
+        let s = unsafe { abi::lift_string(ptr, len) }.expect("UTF-8");
+        unsafe { abi::free_bytes(ptr.cast_mut(), len) };
+        s
+    }
+
+    fn message(err: &FfiError) -> &str {
+        unsafe { err.message_str() }.unwrap_or_default()
     }
 
     // Stores are independent objects, but the tests share process-wide
@@ -470,90 +490,146 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn new_err() -> weaveffi_error {
-        weaveffi_error::default()
-    }
-
     fn open() -> *mut Store {
-        let mut err = new_err();
-        let path = CString::new("/tmp/kvstore-test").unwrap();
-        let s = weaveffi_kv_Store_open(path.as_ptr(), &mut err);
+        let mut err = FfiError::default();
+        let path = "/tmp/kvstore-test";
+        let s = unsafe { kvstore_kv_Store_open(path.as_ptr(), path.len(), &mut err) };
         assert_eq!(err.code, 0);
         assert!(!s.is_null());
         s
     }
 
+    fn destroy(s: *mut Store) {
+        unsafe { kvstore_kv_Store_destroy(s) };
+    }
+
+    fn count(s: *const Store) -> i64 {
+        let mut err = FfiError::default();
+        unsafe { kvstore_kv_Store_count(s, &mut err) }
+    }
+
+    /// `put` through the thunk; the optional TTL is buffered, so it's
+    /// encoded as `Option<i64>` and passed as a borrowed (ptr, len) pair.
+    fn put(
+        s: *mut Store,
+        key: &str,
+        value: &[u8],
+        kind: i32,
+        ttl: Option<i64>,
+        err: &mut FfiError,
+    ) -> bool {
+        let ttl = abi::encode_value(&ttl);
+        unsafe {
+            kvstore_kv_Store_put(
+                s,
+                key.as_ptr(),
+                key.len(),
+                value.as_ptr(),
+                value.len(),
+                kind,
+                ttl.as_ptr(),
+                ttl.len(),
+                err,
+            )
+        }
+    }
+
     fn put_simple(s: *mut Store, k: &str, v: &[u8]) {
-        let mut err = new_err();
-        let key = CString::new(k).unwrap();
-        // The optional TTL is buffered: encode `Option<i64>` and pass the
-        // borrowed (ptr, len) pair.
-        let ttl = abi::encode_value(&None::<i64>);
-        let ok = weaveffi_kv_Store_put(
-            s,
-            key.as_ptr(),
-            v.as_ptr(),
-            v.len(),
-            EntryKind::Persistent as i32,
-            ttl.as_ptr(),
-            ttl.len(),
-            &mut err,
-        );
+        let mut err = FfiError::default();
+        assert!(put(s, k, v, EntryKind::Persistent as i32, None, &mut err));
         assert_eq!(err.code, 0);
-        assert!(ok);
+    }
+
+    fn get(s: *mut Store, key: &str, err: &mut FfiError) -> Option<Entry> {
+        let mut out_len = 0usize;
+        let ptr = unsafe { kvstore_kv_Store_get(s, key.as_ptr(), key.len(), &mut out_len, err) };
+        if ptr.is_null() {
+            assert_ne!(err.code, 0);
+            return None;
+        }
+        decode_and_free::<Option<Entry>>(ptr, out_len)
+    }
+
+    fn delete(s: *mut Store, key: &str, err: &mut FfiError) -> bool {
+        unsafe { kvstore_kv_Store_delete(s, key.as_ptr(), key.len(), err) }
+    }
+
+    fn keys(s: *mut Store, prefix: Option<&str>) -> Vec<String> {
+        let mut err = FfiError::default();
+        let prefix = abi::encode_value(&prefix.map(str::to_string));
+        let iter =
+            unsafe { kvstore_kv_Store_list_keys(s, prefix.as_ptr(), prefix.len(), &mut err) };
+        assert_eq!(err.code, 0);
+        assert!(!iter.is_null());
+        let mut got = Vec::new();
+        loop {
+            let mut item: *const u8 = std::ptr::null();
+            let mut len = 0usize;
+            let has = unsafe {
+                kvstore_kv_Store_ListKeysIterator_next(iter, &mut item, &mut len, &mut err)
+            };
+            assert_eq!(err.code, 0);
+            if has == 0 {
+                assert!(item.is_null());
+                break;
+            }
+            got.push(take_string(item, len));
+        }
+        unsafe { kvstore_kv_Store_ListKeysIterator_destroy(iter) };
+        got
     }
 
     #[test]
     fn open_destroy_lifecycle() {
         let _g = setup();
-        let s = open();
-        weaveffi_kv_Store_destroy(s);
+        destroy(open());
     }
 
     #[test]
     fn open_empty_path_reports_io_error() {
         let _g = setup();
-        let mut err = new_err();
-        // The fallible constructor rejects an empty path with the IoError
-        // domain code and returns null.
-        let path = CString::new("").unwrap();
-        let s = weaveffi_kv_Store_open(path.as_ptr(), &mut err);
+        let mut err = FfiError::default();
+        // The fallible constructor rejects an empty path (here the canonical
+        // `(NULL, 0)` empty string) with the IoError domain code.
+        let s = unsafe { kvstore_kv_Store_open(std::ptr::null(), 0, &mut err) };
         assert!(s.is_null());
         assert_eq!(err.code, 1004, "KvError::IoError's declared code");
-        assert_eq!(abi::c_ptr_to_string(err.message).unwrap(), "I/O failure");
-        abi::error_clear(&mut err);
+        assert_eq!(message(&err), "I/O failure");
     }
 
     #[test]
-    fn open_null_path_errors() {
+    fn open_invalid_path_is_a_marshalling_error() {
         let _g = setup();
-        let mut err = new_err();
-        // A `string` parameter rejects a null pointer with the reserved
-        // marshalling code, before `open` ever runs.
-        let s = weaveffi_kv_Store_open(std::ptr::null(), &mut err);
+        let mut err = FfiError::default();
+        // A null pointer with a length, or bytes that aren't UTF-8, are
+        // rejected with the reserved marshalling code before `open` runs.
+        let s = unsafe { kvstore_kv_Store_open(std::ptr::null(), 4, &mut err) };
         assert!(s.is_null());
         assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
-        abi::error_clear(&mut err);
+        let bad = [0xC0u8, 0x00];
+        let s = unsafe { kvstore_kv_Store_open(bad.as_ptr(), bad.len(), &mut err) };
+        assert!(s.is_null());
+        assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
     }
 
     #[test]
     fn default_capacity_static() {
         let _g = setup();
-        let mut err = new_err();
-        assert_eq!(weaveffi_kv_Store_default_capacity(&mut err), 1_000_000);
+        let mut err = FfiError::default();
+        assert_eq!(
+            unsafe { kvstore_kv_Store_default_capacity(&mut err) },
+            1_000_000
+        );
         assert_eq!(err.code, 0);
     }
 
     #[test]
     fn null_self_method_call_reports_error() {
         let _g = setup();
-        let mut err = new_err();
-        // A method thunk rejects a null object pointer with the reserved
-        // marshalling code before touching the producer.
-        let n = weaveffi_kv_Store_count(std::ptr::null(), &mut err);
+        let mut err = FfiError::default();
+        let n = unsafe { kvstore_kv_Store_count(std::ptr::null(), &mut err) };
         assert_eq!(n, 0);
         assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
-        abi::error_clear(&mut err);
     }
 
     #[test]
@@ -561,86 +637,54 @@ mod tests {
         let _g = setup();
         let s = open();
         put_simple(s, "alpha", b"hello");
-
-        let mut err = new_err();
-        let key = CString::new("alpha").unwrap();
-        let mut out_len: usize = 0;
-        let ptr = weaveffi_kv_Store_get(s, key.as_ptr(), &mut out_len, &mut err);
+        let mut err = FfiError::default();
+        let e = get(s, "alpha", &mut err).expect("entry present");
         assert_eq!(err.code, 0);
-
-        let e = decode_and_free::<Option<Entry>>(ptr, out_len).expect("entry present");
         assert_eq!(e.key, "alpha");
         assert_eq!(e.value, b"hello");
         assert!(e.id > 0);
-
-        weaveffi_kv_Store_destroy(s);
+        destroy(s);
     }
 
     #[test]
     fn put_invalid_kind_errors() {
         let _g = setup();
         let s = open();
-        let mut err = new_err();
-        let key = CString::new("k").unwrap();
+        let mut err = FfiError::default();
         // An out-of-range `EntryKind` discriminant is rejected by the macro's
         // enum lift with the reserved marshalling code.
-        let ttl = abi::encode_value(&None::<i64>);
-        let ok = weaveffi_kv_Store_put(
-            s,
-            key.as_ptr(),
-            std::ptr::null(),
-            0,
-            999,
-            ttl.as_ptr(),
-            ttl.len(),
-            &mut err,
-        );
-        assert!(!ok);
+        assert!(!put(s, "k", b"", 999, None, &mut err));
         assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
-        abi::error_clear(&mut err);
-        weaveffi_kv_Store_destroy(s);
+        destroy(s);
     }
 
     #[test]
     fn get_missing_key_returns_not_found() {
         let _g = setup();
         let s = open();
-        let mut err = new_err();
-        let k = CString::new("nope").unwrap();
-        let mut out_len: usize = 0;
-        let p = weaveffi_kv_Store_get(s, k.as_ptr(), &mut out_len, &mut err);
-        assert!(p.is_null());
+        let mut err = FfiError::default();
+        assert!(get(s, "nope", &mut err).is_none());
         assert_eq!(err.code, 1001, "KvError::KeyNotFound's declared code");
-        assert_eq!(abi::c_ptr_to_string(err.message).unwrap(), "key not found");
-        abi::error_clear(&mut err);
-        weaveffi_kv_Store_destroy(s);
+        assert_eq!(message(&err), "key not found");
+        destroy(s);
     }
 
     #[test]
     fn put_with_ttl_expires() {
         let _g = setup();
         let s = open();
-        let mut err = new_err();
-        let key = CString::new("ttl").unwrap();
-        let ttl = abi::encode_value(&Some(-1i64));
-        let ok = weaveffi_kv_Store_put(
+        let mut err = FfiError::default();
+        assert!(put(
             s,
-            key.as_ptr(),
-            b"x".as_ptr(),
-            1,
+            "ttl",
+            b"x",
             EntryKind::Volatile as i32,
-            ttl.as_ptr(),
-            ttl.len(),
-            &mut err,
-        );
-        assert!(ok);
-
-        let mut out_len: usize = 0;
-        let entry = weaveffi_kv_Store_get(s, key.as_ptr(), &mut out_len, &mut err);
-        assert!(entry.is_null());
+            Some(-1),
+            &mut err
+        ));
+        assert!(get(s, "ttl", &mut err).is_none());
         assert_eq!(err.code, 1002, "KvError::Expired's declared code");
-        abi::error_clear(&mut err);
-        weaveffi_kv_Store_destroy(s);
+        destroy(s);
     }
 
     #[test]
@@ -648,12 +692,11 @@ mod tests {
         let _g = setup();
         let s = open();
         put_simple(s, "k", b"v");
-        let mut err = new_err();
-        let key = CString::new("k").unwrap();
-        assert!(weaveffi_kv_Store_delete(s, key.as_ptr(), &mut err));
+        let mut err = FfiError::default();
+        assert!(delete(s, "k", &mut err));
         assert_eq!(err.code, 0);
-        assert!(!weaveffi_kv_Store_delete(s, key.as_ptr(), &mut err));
-        weaveffi_kv_Store_destroy(s);
+        assert!(!delete(s, "k", &mut err));
+        destroy(s);
     }
 
     #[test]
@@ -663,29 +706,8 @@ mod tests {
         put_simple(s, "alpha", b"1");
         put_simple(s, "beta", b"2");
         put_simple(s, "gamma", b"3");
-
-        let mut err = new_err();
-        let prefix = abi::encode_value(&None::<String>);
-        let iter = weaveffi_kv_Store_list_keys(s, prefix.as_ptr(), prefix.len(), &mut err);
-        assert_eq!(err.code, 0);
-        assert!(!iter.is_null());
-
-        let mut got = Vec::new();
-        loop {
-            let mut item: *const c_char = std::ptr::null();
-            let r = weaveffi_kv_Store_ListKeysIterator_next(iter, &mut item, &mut err);
-            if r == 0 {
-                assert!(item.is_null());
-                break;
-            }
-            assert!(!item.is_null());
-            got.push(abi::c_ptr_to_string(item).unwrap());
-            abi::free_string(item);
-        }
-        weaveffi_kv_Store_ListKeysIterator_destroy(iter);
-        assert_eq!(got, vec!["alpha", "beta", "gamma"]);
-
-        weaveffi_kv_Store_destroy(s);
+        assert_eq!(keys(s, None), vec!["alpha", "beta", "gamma"]);
+        destroy(s);
     }
 
     #[test]
@@ -695,132 +717,104 @@ mod tests {
         put_simple(s, "user.alice", b"1");
         put_simple(s, "user.bob", b"2");
         put_simple(s, "system.x", b"3");
-
-        let mut err = new_err();
-        let prefix = abi::encode_value(&Some("user.".to_string()));
-        let iter = weaveffi_kv_Store_list_keys(s, prefix.as_ptr(), prefix.len(), &mut err);
-        let mut got = Vec::new();
-        loop {
-            let mut item: *const c_char = std::ptr::null();
-            if weaveffi_kv_Store_ListKeysIterator_next(iter, &mut item, &mut err) == 0 {
-                break;
-            }
-            got.push(abi::c_ptr_to_string(item).unwrap());
-            abi::free_string(item);
-        }
-        weaveffi_kv_Store_ListKeysIterator_destroy(iter);
-        assert_eq!(got, vec!["user.alice", "user.bob"]);
-
-        weaveffi_kv_Store_destroy(s);
+        assert_eq!(keys(s, Some("user.")), vec!["user.alice", "user.bob"]);
+        destroy(s);
     }
 
     #[test]
     fn count_and_clear() {
         let _g = setup();
         let s = open();
-        let mut err = new_err();
-        assert_eq!(weaveffi_kv_Store_count(s, &mut err), 0);
+        let mut err = FfiError::default();
+        assert_eq!(count(s), 0);
         put_simple(s, "a", b"1");
         put_simple(s, "b", b"2");
-        assert_eq!(weaveffi_kv_Store_count(s, &mut err), 2);
-        weaveffi_kv_Store_clear(s, &mut err);
+        assert_eq!(count(s), 2);
+        unsafe { kvstore_kv_Store_clear(s, &mut err) };
         assert_eq!(err.code, 0);
-        assert_eq!(weaveffi_kv_Store_count(s, &mut err), 0);
-        weaveffi_kv_Store_destroy(s);
+        assert_eq!(count(s), 0);
+        destroy(s);
     }
 
     #[test]
     fn legacy_put_inserts_volatile() {
         let _g = setup();
         let s = open();
-        let mut err = new_err();
-        let k = CString::new("legacy").unwrap();
+        let mut err = FfiError::default();
+        let (k, v) = ("legacy", b"v");
         // The generated thunk carries its own `#[allow(deprecated)]`, so
         // calling it needs no opt-in here.
-        let ok = weaveffi_kv_Store_legacy_put(s, k.as_ptr(), b"v".as_ptr(), 1, &mut err);
+        let ok = unsafe {
+            kvstore_kv_Store_legacy_put(s, k.as_ptr(), k.len(), v.as_ptr(), v.len(), &mut err)
+        };
         assert!(ok);
-        assert_eq!(weaveffi_kv_Store_count(s, &mut err), 1);
-        weaveffi_kv_Store_destroy(s);
+        assert_eq!(count(s), 1);
+        destroy(s);
+    }
+
+    type Done = mpsc::Sender<(i32, i64)>;
+
+    extern "C" fn on_compacted(context: *mut c_void, err: *mut FfiError, result: i64) {
+        let tx = unsafe { &*(context as *const Done) };
+        let code = if err.is_null() {
+            0
+        } else {
+            let code = unsafe { (*err).code };
+            unsafe { crate::kvstore_error_free(err) };
+            code
+        };
+        tx.send((code, result)).unwrap();
+    }
+
+    fn compact(s: *mut Store, cancelled: bool) -> (i32, i64) {
+        let (tx, rx) = mpsc::channel::<(i32, i64)>();
+        let tx_ptr = Box::into_raw(Box::new(tx));
+        let token = crate::kvstore_cancel_token_create();
+        unsafe {
+            if cancelled {
+                crate::kvstore_cancel_token_cancel(token);
+            }
+            kvstore_kv_Store_compact(s, token, on_compacted, tx_ptr.cast());
+            // The launcher took its own reference, so the consumer may
+            // release the token right away.
+            crate::kvstore_cancel_token_destroy(token);
+        }
+        let out = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(unsafe { Box::from_raw(tx_ptr) });
+        out
     }
 
     #[test]
     fn compact_reclaims_expired_bytes() {
         let _g = setup();
         let s = open();
-        let mut err = new_err();
-        let k = CString::new("dead").unwrap();
-        let expired_ttl = abi::encode_value(&Some(-1i64));
-        weaveffi_kv_Store_put(
+        let mut err = FfiError::default();
+        put(
             s,
-            k.as_ptr(),
-            b"hello".as_ptr(),
-            5,
+            "dead",
+            b"hello",
             EntryKind::Volatile as i32,
-            expired_ttl.as_ptr(),
-            expired_ttl.len(),
+            Some(-1),
             &mut err,
         );
-        let k2 = CString::new("alive").unwrap();
-        let no_ttl = abi::encode_value(&None::<i64>);
-        weaveffi_kv_Store_put(
+        put(
             s,
-            k2.as_ptr(),
-            b"x".as_ptr(),
-            1,
+            "alive",
+            b"x",
             EntryKind::Persistent as i32,
-            no_ttl.as_ptr(),
-            no_ttl.len(),
+            None,
             &mut err,
         );
-
-        let (tx, rx) = mpsc::channel::<(i32, i64)>();
-        let tx_ptr = Box::into_raw(Box::new(tx));
-        extern "C" fn cb(context: *mut c_void, err: *mut weaveffi_error, result: i64) {
-            let tx = unsafe { &*(context as *const mpsc::Sender<(i32, i64)>) };
-            let code = if err.is_null() {
-                0
-            } else {
-                unsafe { (*err).code }
-            };
-            tx.send((code, result)).unwrap();
-        }
-        let token = abi::cancel_token_create();
-        weaveffi_kv_Store_compact_async(s, token, cb, tx_ptr as *mut c_void);
-
-        let (code, reclaimed) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        unsafe { drop(Box::from_raw(tx_ptr)) };
-        assert_eq!(code, 0);
-        assert_eq!(reclaimed, 5);
-        abi::cancel_token_destroy(token);
-        weaveffi_kv_Store_destroy(s);
+        assert_eq!(compact(s, false), (0, 5));
+        destroy(s);
     }
 
     #[test]
     fn compact_honors_cancel_token() {
         let _g = setup();
         let s = open();
-
-        let (tx, rx) = mpsc::channel::<(i32, i64)>();
-        let tx_ptr = Box::into_raw(Box::new(tx));
-        extern "C" fn cb(context: *mut c_void, err: *mut weaveffi_error, result: i64) {
-            let tx = unsafe { &*(context as *const mpsc::Sender<(i32, i64)>) };
-            let code = if err.is_null() {
-                0
-            } else {
-                unsafe { (*err).code }
-            };
-            tx.send((code, result)).unwrap();
-        }
-        let token = abi::cancel_token_create();
-        abi::cancel_token_cancel(token);
-        weaveffi_kv_Store_compact_async(s, token, cb, tx_ptr as *mut c_void);
-
-        let (code, reclaimed) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        unsafe { drop(Box::from_raw(tx_ptr)) };
-        assert_eq!(code, 1004, "a cancelled compact reports KvError::IoError");
-        assert_eq!(reclaimed, 0);
-        abi::cancel_token_destroy(token);
-        weaveffi_kv_Store_destroy(s);
+        assert_eq!(compact(s, true), (abi::CANCELLED_ERROR_CODE, 0));
+        destroy(s);
     }
 
     #[test]
@@ -829,15 +823,15 @@ mod tests {
         let s = open();
         put_simple(s, "a", b"hi");
         put_simple(s, "b", b"bye");
-        let mut err = new_err();
+        let mut err = FfiError::default();
         let mut out_len: usize = 0;
-        let ptr = weaveffi_kv_stats_get_stats(s, &mut out_len, &mut err);
+        let ptr = unsafe { kvstore_kv_stats_get_stats(s, &mut out_len, &mut err) };
         assert_eq!(err.code, 0);
         let stats = decode_and_free::<Stats>(ptr, out_len);
         assert_eq!(stats.total_entries, 2);
         assert_eq!(stats.total_bytes, 5);
         assert_eq!(stats.expired_entries, 0);
-        weaveffi_kv_Store_destroy(s);
+        destroy(s);
     }
 
     #[test]
@@ -917,33 +911,34 @@ mod tests {
         entry_ptr: *const u8,
         entry_len: usize,
         reason: i32,
-        _out_err: *mut weaveffi_error,
+        _out_err: *mut FfiError,
     ) -> bool {
-        let state = &*(ctx as *const ListenerState);
+        let state = unsafe { &*(ctx as *const ListenerState) };
         let entry: Entry =
-            abi::decode_value(std::slice::from_raw_parts(entry_ptr, entry_len)).unwrap();
+            abi::decode_value(unsafe { std::slice::from_raw_parts(entry_ptr, entry_len) }).unwrap();
         let mut seen = state.evictions.lock().unwrap();
         seen.push((entry.key, reason));
         seen.len() < state.keep_after
     }
 
     unsafe extern "C" fn free_listener(ctx: *mut c_void) {
-        let state = Box::from_raw(ctx as *mut ListenerState);
+        let state = unsafe { Box::from_raw(ctx as *mut ListenerState) };
         state.freed.fetch_add(1, Ordering::SeqCst);
     }
 
-    static LISTENER_VTABLE: weaveffi_kv_EvictionListener_vtable =
-        weaveffi_kv_EvictionListener_vtable {
+    static LISTENER_VTABLE: kvstore_kv_EvictionListener_vtable =
+        kvstore_kv_EvictionListener_vtable {
             on_evict,
             free: free_listener,
         };
 
-    fn new_listener(keep_after: usize, freed: &Arc<AtomicUsize>) -> *mut ListenerState {
+    fn new_listener(keep_after: usize, freed: &Arc<AtomicUsize>) -> *mut c_void {
         Box::into_raw(Box::new(ListenerState {
             evictions: Mutex::new(Vec::new()),
             keep_after,
             freed: Arc::clone(freed),
         }))
+        .cast()
     }
 
     #[test]
@@ -951,37 +946,30 @@ mod tests {
         let _g = setup();
         let s = open();
         let freed = Arc::new(AtomicUsize::new(0));
-        let listener = new_listener(2, &freed);
-        let mut err = new_err();
-        weaveffi_kv_Store_set_eviction_listener(
-            s,
-            listener as *mut c_void,
-            &LISTENER_VTABLE,
-            &mut err,
-        );
+        let mut err = FfiError::default();
+        unsafe {
+            kvstore_kv_Store_set_eviction_listener(
+                s,
+                new_listener(2, &freed),
+                &LISTENER_VTABLE,
+                &mut err,
+            )
+        };
         assert_eq!(err.code, 0);
 
         put_simple(s, "evict-me", b"v");
-        let key = CString::new("evict-me").unwrap();
-        assert!(weaveffi_kv_Store_delete(s, key.as_ptr(), &mut err));
+        assert!(delete(s, "evict-me", &mut err));
 
-        let expiring = CString::new("expiring").unwrap();
-        let ttl = abi::encode_value(&Some(-1i64));
-        weaveffi_kv_Store_put(
+        put(
             s,
-            expiring.as_ptr(),
-            b"x".as_ptr(),
-            1,
+            "expiring",
+            b"x",
             EntryKind::Volatile as i32,
-            ttl.as_ptr(),
-            ttl.len(),
+            Some(-1),
             &mut err,
         );
-        let mut out_len = 0usize;
-        let p = weaveffi_kv_Store_get(s, expiring.as_ptr(), &mut out_len, &mut err);
-        assert!(p.is_null());
+        assert!(get(s, "expiring", &mut err).is_none());
         assert_eq!(err.code, 1002);
-        abi::error_clear(&mut err);
 
         // The second eviction returned `false`, so the store detached (and
         // freed) the listener; a third eviction is not observed.
@@ -991,9 +979,8 @@ mod tests {
             "detached listener is freed"
         );
         put_simple(s, "again", b"x");
-        let again = CString::new("again").unwrap();
-        weaveffi_kv_Store_delete(s, again.as_ptr(), &mut err);
-        weaveffi_kv_Store_destroy(s);
+        delete(s, "again", &mut err);
+        destroy(s);
     }
 
     #[test]
@@ -1001,30 +988,30 @@ mod tests {
         let _g = setup();
         let s = open();
         let freed = Arc::new(AtomicUsize::new(0));
-        let mut err = new_err();
-        let first = new_listener(usize::MAX, &freed);
-        weaveffi_kv_Store_set_eviction_listener(
-            s,
-            first as *mut c_void,
-            &LISTENER_VTABLE,
-            &mut err,
-        );
-        assert_eq!(freed.load(Ordering::SeqCst), 0);
-        let second = new_listener(usize::MAX, &freed);
-        weaveffi_kv_Store_set_eviction_listener(
-            s,
-            second as *mut c_void,
-            &LISTENER_VTABLE,
-            &mut err,
-        );
-        assert_eq!(
-            freed.load(Ordering::SeqCst),
-            1,
-            "replaced listener is freed"
-        );
-        weaveffi_kv_Store_clear_eviction_listener(s, &mut err);
+        let mut err = FfiError::default();
+        unsafe {
+            kvstore_kv_Store_set_eviction_listener(
+                s,
+                new_listener(usize::MAX, &freed),
+                &LISTENER_VTABLE,
+                &mut err,
+            );
+            assert_eq!(freed.load(Ordering::SeqCst), 0);
+            kvstore_kv_Store_set_eviction_listener(
+                s,
+                new_listener(usize::MAX, &freed),
+                &LISTENER_VTABLE,
+                &mut err,
+            );
+            assert_eq!(
+                freed.load(Ordering::SeqCst),
+                1,
+                "replaced listener is freed"
+            );
+            kvstore_kv_Store_clear_eviction_listener(s, &mut err);
+        }
         assert_eq!(freed.load(Ordering::SeqCst), 2);
-        weaveffi_kv_Store_destroy(s);
+        destroy(s);
     }
 
     #[test]
@@ -1032,24 +1019,24 @@ mod tests {
         let _g = setup();
         let s = open();
         put_simple(s, "a", b"1");
-        let mut err = new_err();
+        let mut err = FfiError::default();
 
-        let shared = weaveffi_kv_Store_share(s, &mut err);
+        let shared = unsafe { kvstore_kv_Store_share(s, &mut err) };
         assert_eq!(shared, s, "share returns the same object");
-        weaveffi_kv_Store_destroy(s);
-        assert_eq!(weaveffi_kv_Store_count(shared, &mut err), 1, "still alive");
+        destroy(s);
+        assert_eq!(count(shared), 1, "still alive");
 
-        let forked = weaveffi_kv_Store_fork(shared, &mut err);
+        let forked = unsafe { kvstore_kv_Store_fork(shared, &mut err) };
         assert_ne!(forked, shared);
         put_simple(forked, "b", b"2");
-        assert_eq!(weaveffi_kv_Store_count(forked, &mut err), 2);
-        assert_eq!(weaveffi_kv_Store_count(shared, &mut err), 1);
+        assert_eq!(count(forked), 2);
+        assert_eq!(count(shared), 1);
 
-        let cloned = weaveffi_kv_Store_clone(forked);
-        weaveffi_kv_Store_destroy(forked);
-        assert_eq!(weaveffi_kv_Store_count(cloned, &mut err), 2);
-        weaveffi_kv_Store_destroy(cloned);
-        weaveffi_kv_Store_destroy(shared);
+        let cloned = unsafe { kvstore_kv_Store_clone(forked) };
+        destroy(forked);
+        assert_eq!(count(cloned), 2);
+        destroy(cloned);
+        destroy(shared);
     }
 
     #[test]
@@ -1058,18 +1045,18 @@ mod tests {
         let a = open();
         let b = open();
         put_simple(b, "x", b"1");
-        let mut err = new_err();
-
-        assert!(weaveffi_kv_Store_larger(a, std::ptr::null(), &mut err).is_null());
-        let bigger = weaveffi_kv_Store_larger(a, b, &mut err);
-        assert_eq!(bigger, b);
-        weaveffi_kv_Store_destroy(bigger);
-        let own = weaveffi_kv_Store_larger(b, std::ptr::null(), &mut err);
-        assert_eq!(own, b);
-        weaveffi_kv_Store_destroy(own);
-
-        weaveffi_kv_Store_destroy(a);
-        weaveffi_kv_Store_destroy(b);
+        let mut err = FfiError::default();
+        unsafe {
+            assert!(kvstore_kv_Store_larger(a, std::ptr::null(), &mut err).is_null());
+            let bigger = kvstore_kv_Store_larger(a, b, &mut err);
+            assert_eq!(bigger, b);
+            destroy(bigger);
+            let own = kvstore_kv_Store_larger(b, std::ptr::null(), &mut err);
+            assert_eq!(own, b);
+            destroy(own);
+        }
+        destroy(a);
+        destroy(b);
     }
 
     #[test]
@@ -1077,12 +1064,20 @@ mod tests {
         let _g = setup();
         let s = open();
         put_simple(s, "k", b"v");
-        let mut err = new_err();
+        let mut err = FfiError::default();
 
-        let label = CString::new("primary").unwrap();
+        let label = "primary";
         let mut out_len = 0usize;
-        let ptr =
-            weaveffi_kv_Store_describe(s, label.as_ptr(), std::ptr::null(), &mut out_len, &mut err);
+        let ptr = unsafe {
+            kvstore_kv_Store_describe(
+                s,
+                label.as_ptr(),
+                label.len(),
+                std::ptr::null(),
+                &mut out_len,
+                &mut err,
+            )
+        };
         assert_eq!(err.code, 0);
         let info = decode_and_free::<StoreInfo>(ptr, out_len);
         assert_eq!(info.label, "primary");
@@ -1094,36 +1089,43 @@ mod tests {
 
         let paths = abi::encode_value(&vec!["/a".to_string(), "/b".to_string()]);
         let mut many_len = 0usize;
-        let many_ptr =
-            weaveffi_kv_Store_open_many(paths.as_ptr(), paths.len(), &mut many_len, &mut err);
+        let many_ptr = unsafe {
+            kvstore_kv_Store_open_many(paths.as_ptr(), paths.len(), &mut many_len, &mut err)
+        };
         assert_eq!(err.code, 0);
         let many = decode_and_free::<Vec<Arc<Store>>>(many_ptr, many_len);
         assert_eq!(many.len(), 2);
-        put_simple(Arc::as_ptr(&many[0]) as *mut Store, "m", b"1");
+        put_simple(Arc::as_ptr(&many[0]).cast_mut(), "m", b"1");
 
         // Objects written into a parameter buffer carry one reference each.
         let stores = abi::encode_value(&many);
         let extra = abi::encode_value(&Some(info.clone()));
-        let total = weaveffi_kv_Store_total_count(
-            stores.as_ptr(),
-            stores.len(),
-            extra.as_ptr(),
-            extra.len(),
-            &mut err,
-        );
+        let total = unsafe {
+            kvstore_kv_Store_total_count(
+                stores.as_ptr(),
+                stores.len(),
+                extra.as_ptr(),
+                extra.len(),
+                &mut err,
+            )
+        };
         assert_eq!(total, 2);
         drop(info);
         drop(many);
-        weaveffi_kv_Store_destroy(s);
+        destroy(s);
     }
 
     #[test]
-    fn cancel_token_helpers_are_reexported() {
-        let t = crate::weaveffi_cancel_token_create();
+    fn runtime_symbols_carry_the_crate_prefix() {
+        assert_eq!(crate::kvstore_abi_version(), weaveffi::abi::ABI_VERSION);
+        assert_ne!(crate::kv::kvstore_kv_checksum(), 0);
+        let t = crate::kvstore_cancel_token_create();
         assert!(!t.is_null());
-        assert!(!crate::weaveffi_cancel_token_is_cancelled(t));
-        crate::weaveffi_cancel_token_cancel(t);
-        assert!(crate::weaveffi_cancel_token_is_cancelled(t));
-        crate::weaveffi_cancel_token_destroy(t);
+        unsafe {
+            assert!(!crate::kvstore_cancel_token_is_cancelled(t));
+            crate::kvstore_cancel_token_cancel(t);
+            assert!(crate::kvstore_cancel_token_is_cancelled(t));
+            crate::kvstore_cancel_token_destroy(t);
+        }
     }
 }

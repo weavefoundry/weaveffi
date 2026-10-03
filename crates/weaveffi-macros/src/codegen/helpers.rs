@@ -6,10 +6,8 @@ use proc_macro2::{Span, TokenStream};
 use quote::{quote, ToTokens};
 use syn::spanned::Spanned as _;
 use syn::Ident;
-use weaveffi_core::abi::{AbiParam, CType, ConstPos};
-use weaveffi_core::model::{ParamBinding, Ty};
-
-use super::PREFIX;
+use weaveffi_model::abi::{AbiParam, CType, ConstPos};
+use weaveffi_model::model::{ParamBinding, Ty};
 
 /// Make a call-site identifier from a string.
 pub(crate) fn ident(name: &str) -> Ident {
@@ -20,12 +18,13 @@ pub(crate) fn ident(name: &str) -> Ident {
 
 /// Render a [`CType`] as the Rust spelling a producer thunk uses.
 ///
-/// This mirrors [`CType::render_rust`] for every slot except opaque object
-/// pointers: a struct tag resolves to the producer's *real* Rust type (the
-/// `Arc`-allocated object), which is ABI-identical to the header's incomplete
-/// tag. Callers that know the producer's written type prefer
-/// [`slot_type_for`], which keeps a `super::T` path in scope.
-pub(crate) fn ctype_to_rust(ct: &CType) -> TokenStream {
+/// This mirrors [`CType::render_rust`] except for the runtime types (the
+/// error and cancel-token structs, which are `weaveffi::abi` types) and
+/// opaque object pointers: a struct tag resolves to the producer's *real*
+/// Rust type (the `Arc`-allocated object), which is ABI-identical to the
+/// header's incomplete tag. Callers that know the producer's written type
+/// prefer [`slot_type_for`], which keeps a `super::T` path in scope.
+pub(crate) fn ctype_to_rust(ct: &CType, prefix: &str) -> TokenStream {
     match ct {
         CType::Int8 => quote!(i8),
         CType::Int16 => quote!(i16),
@@ -41,8 +40,8 @@ pub(crate) fn ctype_to_rust(ct: &CType) -> TokenStream {
         CType::Size => quote!(usize),
         CType::Char => quote!(::std::os::raw::c_char),
         CType::Void => quote!(::std::ffi::c_void),
-        CType::CancelToken => quote!(::weaveffi::abi::weaveffi_cancel_token),
-        CType::Error => quote!(::weaveffi::abi::weaveffi_error),
+        CType::CancelToken => quote!(::weaveffi::abi::FfiCancelToken),
+        CType::Error => quote!(::weaveffi::abi::FfiError),
         CType::Enum { .. } => quote!(i32),
         CType::StructTag { name, .. } => {
             let ty = ident(name);
@@ -52,11 +51,11 @@ pub(crate) fn ctype_to_rust(ct: &CType) -> TokenStream {
         // interface vtable) render `{prefix}_...`, matching `render_rust` so
         // the slot type lines up with the alias or struct the macro emits.
         CType::Named(_) | CType::VtableTag { .. } => {
-            let ty = ident(&ct.render_rust(PREFIX));
+            let ty = ident(&ct.render_rust(prefix));
             quote!(#ty)
         }
         CType::Ptr { konst, pointee } => {
-            let inner = ctype_to_rust(pointee);
+            let inner = ctype_to_rust(pointee, prefix);
             match konst {
                 ConstPos::None => quote!(*mut #inner),
                 ConstPos::West => quote!(*const #inner),
@@ -66,26 +65,36 @@ pub(crate) fn ctype_to_rust(ct: &CType) -> TokenStream {
 }
 
 /// Render one ABI slot as `name: ty`.
-pub(crate) fn slot_tokens(p: &AbiParam) -> TokenStream {
+pub(crate) fn slot_tokens(p: &AbiParam, prefix: &str) -> TokenStream {
     let n = ident(&p.name);
-    let t = ctype_to_rust(&p.ty);
+    let t = ctype_to_rust(&p.ty, prefix);
     quote!(#n: #t)
 }
 
 /// Render the `-> T` return clause for a lowered symbol (empty for `void`).
-pub(crate) fn ret_arrow(ret: &CType) -> TokenStream {
+pub(crate) fn ret_arrow(ret: &CType, prefix: &str) -> TokenStream {
     if matches!(ret, CType::Void) {
         TokenStream::new()
     } else {
-        let t = ctype_to_rust(ret);
+        let t = ctype_to_rust(ret, prefix);
         quote!(-> #t)
     }
 }
 
-/// The zero/null value a fallible symbol returns on the error path.
-pub(crate) fn sentinel(ret: &CType) -> TokenStream {
-    match ret {
-        CType::Void => quote!(()),
+/// The statement that leaves a thunk early: `return sentinel;`, or a bare
+/// `return;` for a `void` symbol (`sentinel` is `None`).
+pub(crate) fn early_return(sentinel: Option<&TokenStream>) -> TokenStream {
+    match sentinel {
+        Some(s) => quote!(return #s;),
+        None => quote!(return;),
+    }
+}
+
+/// The zero/null value a fallible symbol returns on the error path, or
+/// `None` for a `void` symbol.
+pub(crate) fn sentinel(ret: &CType) -> Option<TokenStream> {
+    Some(match ret {
+        CType::Void => return None,
         CType::Ptr {
             konst: ConstPos::None,
             ..
@@ -94,6 +103,32 @@ pub(crate) fn sentinel(ret: &CType) -> TokenStream {
         CType::Bool => quote!(false),
         CType::Float | CType::Double => quote!(0.0),
         _ => quote!(0),
+    })
+}
+
+/// The statement every thunk runs right after the producer's code returns:
+/// if a consumer callback failure was deferred during the call (a
+/// `panic = "abort"` build), report it through `out_err` and return
+/// `sentinel`, dropping the producer's result unlowered.
+pub(crate) fn deferred_failure_check(sentinel: Option<&TokenStream>) -> TokenStream {
+    let ret = early_return(sentinel);
+    quote! {
+        if let ::std::option::Option::Some(__wv_f) = ::weaveffi::abi::take_foreign_error() {
+            unsafe { ::weaveffi::abi::error_set(out_err, __wv_f.code, &__wv_f.message) };
+            #ret
+        }
+    }
+}
+
+/// The `error_set(out_err, MARSHAL_ERROR_CODE, msg); return sentinel;` tail a
+/// synchronous thunk uses to reject an invalid input.
+pub(crate) fn reject(msg: &str, sentinel: Option<&TokenStream>) -> TokenStream {
+    let ret = early_return(sentinel);
+    quote! {
+        unsafe {
+            ::weaveffi::abi::error_set(out_err, ::weaveffi::abi::MARSHAL_ERROR_CODE, #msg)
+        };
+        #ret
     }
 }
 
@@ -170,10 +205,48 @@ impl<'a> UserSig<'a> {
         })
     }
 
+    /// The parameter's written type as tokens, to anchor a diagnostic on it.
+    pub(crate) fn param_span(&self, name: &str) -> TokenStream {
+        match self.param_type(name) {
+            Some(ty) => ty.to_token_stream(),
+            None => self.sig.ident.to_token_stream(),
+        }
+    }
+
+    /// The written return type as tokens, to anchor a diagnostic on it.
+    pub(crate) fn ret_span(&self) -> TokenStream {
+        match &self.sig.output {
+            syn::ReturnType::Type(_, ty) => ty.to_token_stream(),
+            syn::ReturnType::Default => self.sig.ident.to_token_stream(),
+        }
+    }
+
     /// Whether the parameter is written as a shared reference (`&T`), so the
     /// call lends the lifted value instead of moving it.
     pub(crate) fn param_is_ref(&self, name: &str) -> bool {
         matches!(self.param_type(name), Some(syn::Type::Reference(_)))
+    }
+
+    /// Whether the parameter is written `&{elem}` for a bare `elem` (`&str`)
+    /// or a slice `&[elem]` (`&[u8]`), which the thunk can lend straight from
+    /// the caller's buffer without copying.
+    pub(crate) fn param_is_borrowed(&self, name: &str, elem: &str) -> bool {
+        let Some(syn::Type::Reference(r)) = self.param_type(name) else {
+            return false;
+        };
+        match r.elem.as_ref() {
+            syn::Type::Path(p) => p.path.is_ident(elem),
+            syn::Type::Slice(s) => {
+                matches!(s.elem.as_ref(), syn::Type::Path(p) if p.path.is_ident(elem))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the method returns `Result<T, ForeignError>` (a callback
+    /// method that receives the consumer's failure as a value).
+    pub(crate) fn returns_result(&self) -> bool {
+        weaveffi_model::rust::output_is_result(&self.sig.output)
     }
 
     /// Whether the parameter's type (under any `&` and `Option`) is an
@@ -213,13 +286,8 @@ impl<'a> UserSig<'a> {
     fn ret_syn(&self) -> Option<&'a syn::Type> {
         match &self.sig.output {
             syn::ReturnType::Default => None,
-            syn::ReturnType::Type(_, ty) => Some(weaveffi_bridge::peel_result(ty)),
+            syn::ReturnType::Type(_, ty) => Some(weaveffi_model::rust::peel_result(ty)),
         }
-    }
-
-    /// The producer's return type with `Result` peeled, spelled for a thunk.
-    pub(crate) fn ret_type(&self) -> Option<TokenStream> {
-        self.ret_syn().map(|t| self.spell(t))
     }
 
     /// The producer's spelling of the object type behind an interface return
@@ -236,6 +304,11 @@ impl<'a> UserSig<'a> {
     pub(crate) fn iter_elem_object(&self) -> Option<TokenStream> {
         let elem = peel_wrappers(self.iter_elem()?);
         matches!(elem, syn::Type::Path(_)).then(|| self.spell(elem))
+    }
+
+    /// The element type `X` of an `Iter<X>` return, spelled for a thunk.
+    pub(crate) fn iter_elem_type(&self) -> Option<TokenStream> {
+        self.iter_elem().map(|t| self.spell(t))
     }
 
     /// The element type `X` of an `Iter<X>` return.
@@ -383,6 +456,7 @@ pub(crate) fn slot_type_for(
     p: &AbiParam,
     params: &[ParamBinding],
     user: &UserSig<'_>,
+    prefix: &str,
 ) -> syn::Result<TokenStream> {
     let n = if p.name == "self" {
         ident("__wv_self")
@@ -415,7 +489,7 @@ pub(crate) fn slot_type_for(
             ));
         }
     }
-    let t = ctype_to_rust(&p.ty);
+    let t = ctype_to_rust(&p.ty, prefix);
     Ok(quote!(#n: #t))
 }
 
@@ -424,22 +498,47 @@ pub(crate) fn fn_slots(
     abi_params: &[AbiParam],
     params: &[ParamBinding],
     user: &UserSig<'_>,
+    prefix: &str,
 ) -> syn::Result<Vec<TokenStream>> {
     abi_params
         .iter()
-        .map(|p| slot_type_for(p, params, user))
+        .map(|p| slot_type_for(p, params, user, prefix))
         .collect()
 }
 
 /// Render the `-> T` return clause, spelling an object return with the
 /// producer's own type.
-pub(crate) fn ret_arrow_for(ret: &CType, ret_ty: Option<&Ty>, user: &UserSig<'_>) -> TokenStream {
+pub(crate) fn ret_arrow_for(
+    ret: &CType,
+    ret_ty: Option<&Ty>,
+    user: &UserSig<'_>,
+    prefix: &str,
+) -> TokenStream {
     if ret_ty.is_some_and(|t| t.interface_name().is_some()) {
         if let Some(obj) = user.ret_object() {
             return quote!(-> *mut #obj);
         }
     }
-    ret_arrow(ret)
+    ret_arrow(ret, prefix)
+}
+
+/// The attributes every exported thunk carries. Thunks are `unsafe extern
+/// "C"` (they trust the caller's pointers), hidden from the producer's docs,
+/// and exempt from the lints generated code can't satisfy.
+pub(crate) fn thunk_attrs() -> TokenStream {
+    quote! {
+        #[doc(hidden)]
+        #[unsafe(no_mangle)]
+        #[allow(
+            unsafe_code,
+            unused_unsafe,
+            deprecated,
+            clippy::missing_safety_doc,
+            clippy::needless_return,
+            clippy::let_unit_value,
+            clippy::unit_arg
+        )]
+    }
 }
 
 // ── call targets ─────────────────────────────────────────────────────────
@@ -480,10 +579,15 @@ impl CallTarget {
     /// through `out_err`, and bind `__wv_obj` as a borrow (`&self`) or a
     /// retained reference (`self: Arc<Self>`). Empty for free functions and
     /// statics.
-    pub(crate) fn self_preamble(&self, sentinel: &TokenStream, as_arc: bool) -> TokenStream {
+    pub(crate) fn self_preamble(
+        &self,
+        sentinel: Option<&TokenStream>,
+        as_arc: bool,
+    ) -> TokenStream {
         let CallTarget::Method(ty) = self else {
             return TokenStream::new();
         };
+        let fail = reject("self is null", sentinel);
         let lift = if as_arc {
             quote!(unsafe { ::weaveffi::abi::object_arc::<#ty>(__wv_self) })
         } else {
@@ -492,14 +596,7 @@ impl CallTarget {
         quote! {
             let __wv_obj = match #lift {
                 ::std::option::Option::Some(__wv_o) => __wv_o,
-                ::std::option::Option::None => {
-                    ::weaveffi::abi::error_set(
-                        out_err,
-                        ::weaveffi::abi::MARSHAL_ERROR_CODE,
-                        "self is null",
-                    );
-                    return #sentinel;
-                }
+                ::std::option::Option::None => { #fail }
             };
         }
     }
@@ -508,35 +605,40 @@ impl CallTarget {
 /// Wrap a thunk body in `catch_unwind` so a producer panic is reported through
 /// `out_err` (with the reserved panic code, or the foreign code when the
 /// payload is a consumer callback's failure) instead of unwinding across the C
-/// boundary and aborting the process. On a non-throwing function this is the
-/// only way `out_err` can report failure, which consumers interpret per
-/// [`weaveffi_core::plan::ErrorStrategy::Trap`]. `sentinel` is the value the
-/// thunk returns on the panic path; pass `None` for a void thunk.
+/// boundary. On a non-throwing function this is the only way `out_err` can
+/// report failure, which consumers interpret per
+/// [`weaveffi_model::plan::ErrorStrategy::Trap`]. `sentinel` is the value the
+/// thunk returns on the panic path (`None` for a `void` thunk).
 ///
-/// The success arm also drains `take_foreign_error`: on a `panic = "abort"`
-/// build a consumer callback failure can't unwind, so `check_foreign_error`
-/// records it and the producer runs to completion; the thunk then reports the
-/// recorded failure in place of the result.
+/// The body runs inside a [`ThunkScope`](weaveffi_abi::ThunkScope), so on a
+/// `panic = "abort"` build a consumer failure deferred during the call is
+/// recorded for this thunk (and checked by [`deferred_failure_check`] in the
+/// body) rather than for some later, unrelated call.
 pub(crate) fn wrap_unwind(body: TokenStream, sentinel: Option<&TokenStream>) -> TokenStream {
     let tail = match sentinel {
         Some(s) => quote!(#s),
         None => TokenStream::new(),
     };
     quote! {
-        match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(move || {
-            #body
+        let __wv_scope = ::weaveffi::abi::ThunkScope::enter();
+        let __wv_out = match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(move || {
+            #[allow(unused_unsafe)]
+            unsafe {
+                #body
+            }
         })) {
-            ::std::result::Result::Ok(__wv_v) => match ::weaveffi::abi::take_foreign_error() {
-                ::std::option::Option::None => __wv_v,
-                ::std::option::Option::Some(__wv_foreign) => {
-                    ::weaveffi::abi::error_set(out_err, __wv_foreign.code, &__wv_foreign.message);
-                    #tail
-                }
-            },
+            ::std::result::Result::Ok(__wv_v) => __wv_v,
             ::std::result::Result::Err(__wv_panic) => {
-                ::weaveffi::abi::error_set_panic(out_err, &*__wv_panic);
+                unsafe {
+                    ::weaveffi::abi::error_store(
+                        out_err,
+                        ::weaveffi::abi::FfiError::from_panic(&*__wv_panic),
+                    )
+                };
                 #tail
             }
-        }
+        };
+        ::std::mem::drop(__wv_scope);
+        __wv_out
     }
 }

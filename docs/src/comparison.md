@@ -8,25 +8,27 @@ hand-written glue, the single-language bridges **swift-bridge**, **napi-rs**,
 and **wasm-bindgen**, and the C/C++-first generators **SWIG** and **autocxx**.
 
 > All comparisons reflect the public state of each project at the time of
-> writing (ABI revision 2, schema `0.9.0`). If something here is out of date,
-> please open a PR.
+> writing (WeaveFFI ABI revision 3, schema `0.10.0`). If something here is out
+> of date, please open a PR.
 
 ## The short version
 
 WeaveFFI's distinguishing bet is *one language-neutral IDL, one C ABI, eleven
 generators*. The producer can be Rust (with `#[weaveffi::module]` writing the
 ABI for you) or anything else that can export C symbols, and every generated
-package is standalone: consumers never install WeaveFFI. Since ABI revision 2
-the object model is on par with the Rust-first tools: interface objects are
-reference counted (`Arc<T>`), can be shared between wrappers and nested inside
-records, lists, maps, optionals, iterators, and async results, and callback
-interfaces let the producer call consumer code through a vtable.
+package is standalone: consumers never install WeaveFFI. The object model is
+on par with the Rust-first tools: interface objects are reference counted
+(`Arc<T>`), can be shared between wrappers and nested inside records, lists,
+maps, optionals, iterators, and async results, and callback interfaces let
+the producer call consumer code through a vtable. Every symbol and package is
+named after the library, never after WeaveFFI, so several WeaveFFI-built
+libraries coexist in one process.
 
 The honest flip side is that WeaveFFI is pre-1.0 and its type system is
 deliberately smaller than UniFFI's: no user-defined generics or trait objects
-with generics, callback methods return only scalars (no strings, buffers, or
-objects yet), no async callback methods, and no multi-file IDL imports. The
-[roadmap](roadmap.md) lists what's planned.
+with generics, callback methods return only direct values (no strings,
+buffers, or objects yet), no async callback methods, and no multi-file IDL
+imports. The [roadmap](roadmap.md) lists what's planned.
 
 ## At a glance
 
@@ -39,9 +41,9 @@ objects yet), no async callback methods, and no multi-file IDL imports. The
 | **Type system**                    |              |            |              |                     |                  |             |                  |          |             |
 | Records / enums / optionals / lists / maps | ✓ (value buffers) | ✓ | ✓ (structs, enums, `Option`, slices; no maps) | manual | ✓ (transparent structs and enums, `Option`, `Vec`) | ✓ (serde objects) | ✓ (`serde-wasm-bindgen` or classes) | ✓ | ✓ |
 | Objects with methods               | ✓ reference counted, shareable, nestable | ✓ (`Arc<T>`) | ✓ (opaques, borrowed or owned) | manual | ✓ (opaque types) | ✓ (`#[napi]` classes) | ✓ (classes) | ✓ (classes) | ✓ (C++ classes) |
-| Callback interfaces                | ✓ (vtable; sync, scalar returns) | ✓ (foreign traits; any return, `throws`, async) | partial (Kotlin, C, C++; input-only) | manual fn pointers | partial (closures Rust to Swift) | ✓ (`ThreadsafeFunction`) | ✓ (closures) | partial (directors) | partial |
+| Callback interfaces                | ✓ (vtable; sync, direct returns, failures as `Result`) | ✓ (foreign traits; any return, `throws`, async) | partial (Kotlin, C, C++; input-only) | manual fn pointers | partial (closures Rust to Swift) | ✓ (`ThreadsafeFunction`) | ✓ (closures) | partial (directors) | partial |
 | Typed error domains                | ✓ (per-module codes, opt-in `throws`, payload fields) | ✓ (error enums) | ✓ (`Result`) | manual | ✓ (`Result`) | ✓ (JS `Error`) | ✓ (`Result<JsValue>`) | ✗ | ✗ |
-| Async functions                    | ✓ (callback ABI, pluggable spawner, cancel tokens) | ✓ (poll-based, foreign executors) | ✗ | manual | ✓ (both directions) | ✓ (Tokio) | ✓ (`Promise`) | ✗ | ✗ |
+| Async functions                    | ✓ (callback ABI, pluggable spawner, native cancellation on every target) | ✓ (poll-based, foreign executors) | ✗ | manual | ✓ (both directions) | ✓ (Tokio) | ✓ (`Promise`) | ✗ | ✗ |
 | Iterators                          | ✓ (`iter<T>`, lazy on every target) | ✗ (materialize or use a trait) | partial (`DiplomatWrite`) | manual | ✗ | ✗ | ✓ (JS iterators) | partial | ✗ |
 | Generics / trait objects           | ✗ (fixed set of built-in shapes) | partial (traits, no generics) | partial (traits on some backends) | ✗ | partial | ✗ | ✗ | ✓ (templates via `%template`) | ✓ |
 | Multi-file / multi-crate definitions | ✗ (one document per API) | ✓ (external types across crates) | ✓ (one bridge crate, many modules) | n/a | ✗ | n/a | n/a | ✓ (`%include`) | ✓ |
@@ -49,7 +51,7 @@ objects yet), no async callback methods, and no multi-file IDL imports. The
 | Standalone CLI                     | ✓ (`cargo install weaveffi-cli`) | `uniffi-bindgen` (build.rs or CLI) | `diplomat-tool` | ✓ | `swift-bridge-cli` | `napi` CLI (npm) | `wasm-bindgen-cli` | system package | cargo build |
 | Publishable per-ecosystem packages | ✓ (`weaveffi package` for every target) | partial | partial | n/a | ✓ (SwiftPM) | ✓ (npm) | ✓ (npm via wasm-pack) | ✗ | n/a |
 | Schema-checked IDL with JSON Schema | ✓ | ✗ | n/a | n/a | n/a | n/a | n/a | ✗ | n/a |
-| Load-time ABI version check        | ✓ (`weaveffi_abi_version`) | ✓ (checksums) | ✗ | ✗ | ✗ | ✓ (N-API version) | ✗ | ✗ | n/a |
+| Load-time ABI check                | ✓ (ABI revision plus per-module contract checksums) | ✓ (checksums) | ✗ | ✗ | ✗ | ✓ (N-API version) | ✗ | ✗ | n/a |
 | Generated-output drift check in CI | ✓ (`weaveffi diff --check`) | build-time | build-time | ✓ | build-time | build-time | build-time | ✗ | build-time |
 | Maturity                           | pre-1.0      | shipping in Firefox and Mozilla products since 2020 | shipping in ICU4X | 1.0+, widely deployed | 0.1.x, active | 2.x+, widely deployed | 0.2.x, ubiquitous | 30+ years | pre-1.0 |
 | License                            | MIT OR Apache-2.0 | MPL-2.0 | MIT OR Apache-2.0 | MPL-2.0 | MIT OR Apache-2.0 | MIT | MIT OR Apache-2.0 | GPL-3.0 (generated code exempt) | MIT OR Apache-2.0 |
@@ -101,15 +103,16 @@ is ahead of WeaveFFI today.
   generated header.
 - **WeaveFFI's Wasm target is single-threaded.** The default
   `wasm32-unknown-unknown` build has no threads, so async functions resolve
-  inline and callback-interface methods fire only while a call into the
-  module is on the stack; a producer that calls back from a spawned thread
-  can't run there. wasm-bindgen's `wasm-bindgen-futures` integrates with the
+  inline (which leaves little for an `AbortSignal` to cancel) and
+  callback-interface methods fire only while a call into the module is on the
+  stack; a producer that calls back from a spawned thread can't run there. wasm-bindgen's `wasm-bindgen-futures` integrates with the
   JS event loop natively, and Emscripten-based toolchains can use
   `pthread`s. In WeaveFFI's Emscripten compatibility mode, async functions
   and callback interfaces are not available at all.
-- **No formal stability guarantee yet.** WeaveFFI is pre-1.0; schema `0.9.0`
-  and ABI revision 2 removed constructs without compatibility shims (see the
-  [migration guide](stability.md#migrating-from-schema-080--abi-1-to-090--abi-2)).
+- **No formal stability guarantee yet.** WeaveFFI is pre-1.0; schema
+  `0.10.0` and ABI revision 3 renamed every symbol and changed string
+  passing without compatibility shims (see the
+  [migration guide](stability.md#migrating-to-schema-010-and-abi-3)).
   UniFFI, cbindgen, napi-rs, wasm-bindgen, and SWIG offer stronger
   compatibility commitments today.
 
@@ -144,11 +147,13 @@ WeaveFFI is the right pick when you want:
    Async functions become `async/await` in Swift, `Promise`s in Node and
    Wasm, `suspend fun` in Kotlin, `async def` in Python, `Task<T>` in C#, and
    `Future<T>` in Dart, all from the same `async: true` flag; Rust producers
-   can plug their own executor with `weaveffi::set_spawner`.
+   can plug their own executor with `weaveffi::set_spawner`. Cancelling the
+   awaiting task, coroutine, or promise cancels the native call.
 7. **A CI-first CLI.** `validate`, `diff --check`, `extract`, `schema`, and
    `package` are designed to drop into pipelines, every generator's output is
    byte-for-byte deterministic, and generated consumers refuse to load a
-   producer built for a different ABI revision.
+   producer built for a different ABI revision or from a different API
+   definition (per-module contract checksums).
 
 ## When to choose something else
 

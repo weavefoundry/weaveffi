@@ -45,6 +45,7 @@ jobs:
           cp -r docs/book/html/* site/
           mkdir -p site/api/rust
           cp -r target/doc/* site/api/rust/
+          cp weaveffi.schema.json site/
           touch site/.nojekyll
           printf "weaveffi.com" > site/CNAME
 

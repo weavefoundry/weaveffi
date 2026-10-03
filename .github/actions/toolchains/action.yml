@@ -1,0 +1,59 @@
+name: Language toolchains
+description: Install the consumer toolchain one WeaveFFI target needs (conformance and fixture checks).
+inputs:
+  lang:
+    description: Target language (c, cpp, python, ruby, dart, go, swift, dotnet, node, kotlin, wasm)
+    required: true
+runs:
+  using: composite
+  steps:
+    - if: inputs.lang == 'node' || inputs.lang == 'wasm'
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+    - if: inputs.lang == 'python'
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - if: inputs.lang == 'ruby'
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: '3.3'
+    - if: inputs.lang == 'ruby'
+      shell: bash
+      run: gem install ffi
+    # dart-lang/setup-dart can't run inside a composite action (it registers
+    # a problem matcher relative to the calling action), so fetch the SDK.
+    - if: inputs.lang == 'dart'
+      shell: bash
+      run: |
+        os=linux; [ "$RUNNER_OS" = macOS ] && os=macos
+        arch=x64; case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; esac
+        curl -fsSL -o "$RUNNER_TEMP/dart.zip" \
+          "https://storage.googleapis.com/dart-archive/channels/stable/release/latest/sdk/dartsdk-$os-$arch-release.zip"
+        unzip -q -o "$RUNNER_TEMP/dart.zip" -d "$RUNNER_TEMP"
+        echo "$RUNNER_TEMP/dart-sdk/bin" >> "$GITHUB_PATH"
+    - if: inputs.lang == 'go'
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+    - if: inputs.lang == 'dotnet'
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+    - if: inputs.lang == 'swift' && runner.os == 'Linux'
+      uses: swift-actions/setup-swift@v2
+      with:
+        swift-version: '6.0'
+    - if: inputs.lang == 'kotlin'
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+    - if: inputs.lang == 'kotlin'
+      uses: fwilhe2/setup-kotlin@main
+      with:
+        version: '2.0.21'
+    - if: (inputs.lang == 'c' || inputs.lang == 'cpp') && runner.os == 'Linux'
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang

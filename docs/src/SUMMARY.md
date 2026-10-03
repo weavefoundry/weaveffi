@@ -1,46 +1,51 @@
 # Summary
 
-- [Introduction](intro.md)
+[Introduction](intro.md)
+
 - [Getting Started](getting-started.md)
+
+# Guides
+
+- [The Rust Producer Macro](guides/producer-macro.md)
+- [Errors and Memory](guides/errors-and-memory.md)
+- [Async and Cancellation](guides/async.md)
+- [Project Configuration](guides/config.md)
+- [Packaging](guides/packaging.md)
+- [Extracting an IDL from Rust](guides/extract.md)
+
+# Reference
+
+- [IDL Schema](reference/idl.md)
+- [C ABI Contract](reference/abi.md)
+- [Value Buffers](reference/value-buffers.md)
+- [Naming](reference/naming.md)
+
+# Generators
+
+- [Capability Matrix](generators/README.md)
+- [C](generators/c.md)
+- [C++](generators/cpp.md)
+- [Swift](generators/swift.md)
+- [Kotlin](generators/kotlin.md)
+- [Node.js](generators/node.md)
+- [WebAssembly](generators/wasm.md)
+- [Python](generators/python.md)
+- [.NET](generators/dotnet.md)
+- [Dart](generators/dart.md)
+- [Go](generators/go.md)
+- [Ruby](generators/ruby.md)
+
+# Project
+
 - [Architecture](architecture.md)
+- [Samples](samples.md)
 - [Comparison](comparison.md)
 - [FAQ](faq.md)
 - [Stability and Versioning](stability.md)
-- [Performance](performance.md)
 - [Roadmap](roadmap.md)
-- [Samples](samples.md)
-- [Reference](reference/README.md)
-  - [IDL Schema](reference/idl.md)
-  - [C ABI Contract](reference/abi.md)
-  - [Value Buffer Protocol](reference/value-buffers.md)
-  - [Memory & Error Model](reference/memory-error.md)
-  - [Naming and Package Conventions](reference/naming.md)
-- [Generators](generators/README.md)
-  - [Kotlin](generators/kotlin.md)
-  - [C](generators/c.md)
-  - [Node](generators/node.md)
-  - [Swift](generators/swift.md)
-  - [Wasm](generators/wasm.md)
-  - [Python](generators/python.md)
-  - [.NET](generators/dotnet.md)
-  - [C++](generators/cpp.md)
-  - [Dart](generators/dart.md)
-  - [Go](generators/go.md)
-  - [Ruby](generators/ruby.md)
-- [API](api/README.md)
-  - [Rust API (cargo doc)](api/rust.md)
-  - [Doc Comment Style](api/doc-style.md)
-- [Guides](guides/README.md)
-  - [The Rust Producer Macro](guides/producer-macro.md)
-  - [Memory Ownership](guides/memory.md)
-  - [Error Handling](guides/errors.md)
-  - [Async Functions](guides/async.md)
-  - [Annotated Rust Extraction](guides/extract.md)
-  - [Project Configuration](guides/config.md)
-  - [Packaging and Distribution](guides/packaging.md)
-- [Tutorials](tutorials/README.md)
-  - [Calculator](tutorials/calculator.md)
-  - [Swift iOS](tutorials/swift.md)
-  - [Kotlin](tutorials/kotlin.md)
-  - [Python](tutorials/python.md)
-  - [Node.js](tutorials/node.md)
+
+# API
+
+- [Rust Crates](api/README.md)
+- [Rust API Map](api/rust.md)
+- [Doc Comment Style](api/doc-style.md)

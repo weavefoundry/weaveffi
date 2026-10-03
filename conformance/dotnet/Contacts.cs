@@ -1,20 +1,19 @@
 // Conformance consumer: contacts sample, .NET target.
 //
-// Drives the generated P/Invoke surface (WeaveFFI.cs): the ContactBook
-// interface class (real `new` constructor, instance methods, Dispose lowering
-// to the destroy symbol), enum marshalling, the plain value-class Contact
-// decoded from value buffers (properties, no IDisposable), UTF-8 string
-// params, optional strings (null email) crossing as buffered `string?`
-// parameters, list-of-record returns decoded from one buffer, the bool
-// return, and the typed ContactsException error path (InvalidName=1,
-// NotFound=2). The producer cdylib is resolved by absolute path via a
-// DllImportResolver reading WEAVEFFI_LIBRARY, mirroring the override the
-// Python/Ruby/Dart backends use.
+// Drives the generated Contacts project: the ContactBook interface (real
+// constructor, instance methods, Dispose), the ContactType enum, the plain
+// Contact record decoded from value buffers, optional strings, list returns,
+// and the typed ContactsException (InvalidName=1, NotFound=2). The nested
+// contacts.groups module (ContactsGroups) takes and returns the parent's
+// enum and interface and reports the parent's error domain; the sibling
+// directory root (Directory) shares the Contact record and has its own
+// DirectoryException. Ends by asserting the producer's leak counters are
+// zero.
 
 using System;
 using System.Linq;
-using System.Runtime.InteropServices;
-using WeaveFFI;
+using System.Runtime.CompilerServices;
+using Contacts;
 
 internal static class Program
 {
@@ -27,46 +26,70 @@ internal static class Program
         }
     }
 
-    static int Main()
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void Run()
     {
-        var lib = Environment.GetEnvironmentVariable("WEAVEFFI_LIBRARY");
-        NativeLibrary.SetDllImportResolver(typeof(Program).Assembly, (name, asm, search) =>
-        {
-            if (name == "weaveffi" && !string.IsNullOrEmpty(lib))
-                return NativeLibrary.Load(lib);
-            return IntPtr.Zero;
-        });
-
         using (var book = new ContactBook())
         {
-            // Contact is a plain value class now: no Dispose, just properties.
             var alice = book.Add("Alice", "Smith", "alice@example.com", ContactType.Work);
-            long aliceId = alice.Id;
-            Expect(aliceId > 0, "alice id positive");
-            Expect(alice.FirstName == "Alice", "first name");
-            Expect(alice.LastName == "Smith", "last name");
+            Expect(alice.Id > 0, "alice id positive");
+            Expect(alice.FirstName == "Alice" && alice.LastName == "Smith", "names");
             Expect(alice.Email == "alice@example.com", "email");
             Expect(alice.ContactType == ContactType.Work, "contact type");
 
-            // Optional string: a missing email round-trips as null.
             var bob = book.Add("Bob", "Jones", null, ContactType.Personal);
             Expect(bob.Email == null, "bob email null");
-            Expect(bob.ContactType == ContactType.Personal, "bob contact type");
+            var carol = book.Add("Carol", "Adams", null, ContactType.Work);
 
-            var fetched = book.Get(aliceId);
-            Expect(fetched.FirstName == "Alice", "get returns alice");
+            Expect(book.Get(alice.Id).FirstName == "Alice", "get returns alice");
+            Expect(book.Count() == 3, "count == 3");
+            var names = book.List().Select(p => p.FirstName).OrderBy(s => s).ToArray();
+            Expect(names.SequenceEqual(new[] { "Alice", "Bob", "Carol" }), "list names");
 
-            Expect(book.Count() == 2, "count == 2");
+            // The nested module uses the parent's enum and interface.
+            Expect(ContactsGroups.CountOfType(book, ContactType.Work) == 2, "two work contacts");
+            Expect(ContactsGroups.CountOfType(book, ContactType.Other) == 0, "no other contacts");
+            Expect(ContactsGroups.DominantType(book) == ContactType.Work, "work dominates");
+            using (var work = ContactsGroups.SplitByType(book, ContactType.Work))
+            {
+                Expect(work.Count() == 2, "split copied the work contacts");
+                Expect(!work.Equals(book), "split is a new book");
+                Expect(work.List().All(c => c.ContactType == ContactType.Work), "split holds only work");
+            }
+            Expect(ContactsGroups.FirstOfType(book, ContactType.Personal).FirstName == "Bob",
+                "first personal contact");
+            try
+            {
+                ContactsGroups.FirstOfType(book, ContactType.Other);
+                Expect(false, "expected ContactsException from the nested module");
+            }
+            catch (ContactsException e)
+            {
+                Expect(e.Code == ContactsException.NotFound, "nested module reports the parent's NotFound");
+            }
 
-            var everyone = book.List();
-            Expect(everyone.Length == 2, "list length == 2");
-            var names = everyone.Select(p => p.FirstName).OrderBy(s => s).ToArray();
-            Expect(names[0] == "Alice" && names[1] == "Bob", "list names");
+            // The sibling root shares the Contact record.
+            var card = Directory.Card(alice);
+            Expect(card.DisplayName == "Smith, Alice", $"card display name (got {card.DisplayName})");
+            Expect(card.Initials == "AS" && card.HasEmail, "card initials and email");
+            Expect(!Directory.Card(bob).HasEmail, "bob has no email");
+            var sorted = Directory.Sorted(book.List());
+            Expect(sorted.Select(c => c.LastName).SequenceEqual(new[] { "Adams", "Jones", "Smith" }),
+                "sorted by last name");
+            try
+            {
+                Directory.Sorted(new Contact[0]);
+                Expect(false, "expected DirectoryException");
+            }
+            catch (DirectoryException e)
+            {
+                Expect(e.Code == DirectoryException.Empty, "Empty code == 1");
+            }
 
-            Expect(book.Remove(aliceId) == true, "remove returns true");
-            Expect(book.Count() == 1, "count == 1 after remove");
+            Expect(book.Remove(alice.Id), "remove returns true");
+            Expect(!book.Remove(alice.Id), "second remove returns false");
+            Expect(book.Count() == 2, "count == 2 after remove");
 
-            // Typed errors: the domain exception carries the declared code.
             try
             {
                 book.Add("", "Smith", null, ContactType.Personal);
@@ -75,8 +98,8 @@ internal static class Program
             catch (ContactsException e)
             {
                 Expect(e.Code == ContactsException.InvalidName, "InvalidName code == 1");
+                Expect(e.Message == "name must not be empty", $"InvalidName message (got '{e.Message}')");
             }
-
             try
             {
                 book.Get(9999);
@@ -85,10 +108,35 @@ internal static class Program
             catch (ContactsException e)
             {
                 Expect(e.Code == ContactsException.NotFound, "NotFound code == 2");
-                Expect(e is WeaveFFIException, "typed exception extends the brand exception");
+                Expect(e is NativeException, "typed exception extends NativeException");
             }
+            Expect(carol.Id > 0, "carol kept");
         }
 
+        // A disposed book refuses further calls.
+        var gone = new ContactBook();
+        gone.Dispose();
+        gone.Dispose();
+        try
+        {
+            gone.Count();
+            Expect(false, "expected ObjectDisposedException");
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
+        // Books left to the garbage collector are released by finalizers.
+        for (var i = 0; i < 10; i++)
+        {
+            new ContactBook().Add("Temp", "Book", null, ContactType.Other);
+        }
+    }
+
+    static int Main()
+    {
+        Run();
+        LeakCheck.AssertNoLeaks("contacts");
         Console.WriteLine("dotnet/contacts: OK");
         return 0;
     }

@@ -1,6 +1,6 @@
 // Conformance consumer: events sample, Go target.
 //
-// Exercises the ABI 2 surface end to end: a Go type implementing the
+// Exercises the callback surface end to end: a Go type implementing the
 // generated Subscriber callback interface (crossing as a cgo.Handle plus a
 // static vtable of //export trampolines), the reference-counted EventBus
 // object (including a second wrapper handed back through OnAttached, its
@@ -9,18 +9,21 @@
 // borrowed value buffer inside a callback, the async PublishLater bridge,
 // the lazy iter.Seq behind Messages, the optional LastMessage, the free
 // function RouteOnce, and the foreign-error path: a subscriber that panics
-// surfaces to the caller as a recoverable *WeaveFFIError with code -4 and
-// leaves the bus usable. Finally ClearSubscribers must let the producer's
+// surfaces to the caller as a recoverable *Error with code -4 and
+// leaves the bus usable. Route returns Result<Delivery, ForeignError> on the
+// producer side, so its failure comes back to the bus as a value that the
+// bus propagates; OnMessage returns a plain value, so its failure aborts the
+// call directly. Both look the same from Go. Finally ClearSubscribers must let the producer's
 // `free` entry run, which is observed through a Go finalizer on the
-// implementation once its handle is deleted. Exits 0 on success; aborts
-// (non-zero) on any mismatch.
+// implementation once its handle is deleted, and nothing leaks. Exits 0 on
+// success; aborts (non-zero) on any mismatch.
 
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"os"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -28,13 +31,6 @@ import (
 
 	wv "__MODPATH__"
 )
-
-func expect(cond bool, msg string) {
-	if !cond {
-		fmt.Fprintln(os.Stderr, "assertion failed:", msg)
-		os.Exit(1)
-	}
-}
 
 // subState is the observable side of a subscriber. It's held separately
 // from the implementing value so the implementation itself can become
@@ -89,6 +85,21 @@ func (r *recorder) OnAttached(bus *wv.EventBus) {
 	r.st.bus = bus
 }
 
+// closingSub closes a bus wrapper from inside a callback, while the call
+// that triggered the callback is still using that wrapper.
+type closingSub struct {
+	target *wv.EventBus
+}
+
+func (c *closingSub) Route(string) wv.Delivery {
+	expect(c.target.Close() == nil, "close inside a callback")
+	return wv.DeliveryAccept
+}
+
+func (c *closingSub) OnMessage(wv.Message) int64 { return 1 }
+
+func (c *closingSub) OnAttached(bus *wv.EventBus) { bus.Close() }
+
 // attach subscribes a fresh recorder and returns only its state. The
 // recorder value stays reachable solely through the cgo.Handle the
 // producer holds, so its finalizer fires once the producer calls `free`.
@@ -99,21 +110,14 @@ func attach(bus *wv.EventBus, name, skip string, fails bool, freed *atomic.Int32
 	return st, bus.Subscribe(r)
 }
 
-// catchPanic runs f and returns the recovered panic value (nil if none).
-func catchPanic(f func()) (v any) {
-	defer func() { v = recover() }()
-	f()
-	return nil
-}
-
 // expectForeignError asserts that v is the generated brand error carrying
 // FOREIGN_ERROR_CODE (-4) and the Go panic text.
 func expectForeignError(v any, needle string, what string) {
 	expect(v != nil, what+": expected a panic")
 	err, isErr := v.(error)
 	expect(isErr, fmt.Sprintf("%s: panic value is an error (got %T)", what, v))
-	var ferr *wv.WeaveFFIError
-	expect(errors.As(err, &ferr), fmt.Sprintf("%s: *WeaveFFIError (got %T: %v)", what, v, v))
+	var ferr *wv.Error
+	expect(errors.As(err, &ferr), fmt.Sprintf("%s: *Error (got %T: %v)", what, v, v))
 	expect(ferr.Code == -4, fmt.Sprintf("%s: code -4 (got %d)", what, ferr.Code))
 	expect(strings.Contains(ferr.Message, needle),
 		fmt.Sprintf("%s: message carries the Go panic text (got %q)", what, ferr.Message))
@@ -180,8 +184,8 @@ func main() {
 
 	// Async: the producer publishes from its own thread, and the callback
 	// trampolines run there; the wrapper parks the goroutine until done.
-	delivered = bus.PublishLater("async", "later")
-	expect(delivered == 2, fmt.Sprintf("publish_later accepted by both (got %d)", delivered))
+	delivered, err := bus.PublishLater(context.Background(), "async", "later")
+	expect(err == nil && delivered == 2, fmt.Sprintf("publish_later accepted by both (got %d)", delivered))
 	expect(len(a.received) == 3 && a.received[2].Seq == 4 && a.received[2].Topic == "async",
 		"a received the async message")
 	expect(len(b.received) == 3 && b.received[2].Text == "later", "b received the async message")
@@ -239,6 +243,13 @@ func main() {
 	delivered = bus.Publish("after", "nobody", nil)
 	expect(delivered == 0, "no subscribers accept after clear")
 
+	// Close racing an in-flight call: the subscriber closes the wrapper
+	// Publish is running on; the reference is released once Publish returns.
+	racy := wv.NewEventBus()
+	racy.Subscribe(&closingSub{target: racy})
+	expect(racy.Publish("x", "y", nil) == 1, "publish completes although its wrapper closed mid-call")
+	expect(catchPanic(func() { racy.SubscriberCount() }) != nil, "the closed wrapper traps afterwards")
+
 	// Every wrapper releases its own reference; Close is idempotent.
 	a.bus.Close()
 	a.bus.Close()
@@ -247,5 +258,7 @@ func main() {
 	f.bus.Close()
 	bus.Close()
 	bus.Close()
+
+	expectNoLeaks(wv.DebugLive)
 	fmt.Println("go/events: OK")
 }

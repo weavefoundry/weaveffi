@@ -1,14 +1,17 @@
 # Project Configuration
 
-## Overview
-
-WeaveFFI ships with sensible defaults so `weaveffi generate src/lib.rs` (or
-`weaveffi generate api.yml`) just works. The API definition, whether it's an
-annotated Rust module or an IDL document, describes only the API. Everything
-about how that API is published lives in one optional file next to it:
-`weaveffi.toml`.
+A project's settings live in one `weaveffi.toml` at its root. The API
+definition (annotated Rust or an IDL) describes only the API; this file says
+where it is, what the library is called, and how each target is generated.
+Every table is optional, and every unknown table or key is an error, so a typo
+fails the run instead of being ignored.
 
 ```toml
+[project]
+input = "src/lib.rs"        # or an IDL such as "kvstore.yml"
+out = "bindings"
+targets = ["c", "swift", "kotlin", "python"]
+
 [package]
 name = "kvstore"
 version = "1.2.0"
@@ -18,242 +21,149 @@ authors = ["Example <hello@example.dev>"]
 repository = "https://github.com/example/kvstore"
 
 [global]
-c_prefix = "kv"
-
-[generators.swift]
-module_name = "KVStore"
+post_generate = "swiftformat bindings/swift"
 
 [generators.kotlin]
 package = "com.example.kvstore"
 ```
 
-The file has three tables, all optional:
-
-- `[package]`: the distribution identity stamped into every generated
-  manifest (`package.json`, `pyproject.toml`, `Package.swift`, `.csproj`,
-  `pubspec.yaml`, `go.mod`, `.gemspec`, and so on).
-- `[global]`: knobs that affect several generators or the orchestrator
-  itself.
-- `[generators.<target>]`: one table per language with that generator's own
-  options.
+`weaveffi init` writes a starter file: in a Rust crate it points `input` at
+`src/lib.rs`; elsewhere it also writes a starter IDL.
 
 ## Discovery
 
-`weaveffi generate`, `weaveffi package`, and `weaveffi diff` find the config
-the same way Cargo finds `Cargo.toml`: they walk up from the input file's
-directory and use the first `weaveffi.toml` they meet. Keeping the file beside
-`Cargo.toml` (for a Rust producer) or beside the IDL therefore needs no flag.
+With an explicit input (`weaveffi generate api.yml`), the CLI uses the nearest
+`weaveffi.toml` at or above the input's directory. With no input, it looks for
+`weaveffi.toml` in the current directory and its parents and reads
+`[project] input`, so `weaveffi generate` works from anywhere inside the
+project, like `cargo build`. `--config <path>` names a file explicitly.
+Without any file, every setting takes its default.
 
-```bash
-weaveffi generate src/lib.rs -o generated                 # nearest weaveffi.toml
-weaveffi generate src/lib.rs -o generated --config ci.toml # a specific file
-```
+## `[project]`
 
-Without any config file, every generator runs with its defaults and the
-package name falls back as described under [Package identity](#package-identity).
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `input` | none | The API definition: a `.rs` file or a `.yml`, `.yaml`, `.json`, or `.toml` IDL |
+| `out` | `generated` | Output directory for `generate` and `diff` |
+| `targets` | all eleven | Targets to generate when `--target` isn't given |
 
-Every unknown table and key is rejected, so a typo like `[generator.swift]`,
-`c_prefx`, or `modulename` fails the run with the offending name, and so does
-a table for a target that no longer exists (such as the pre-0.22
-`[generators.android]`; the target is now `kotlin`). The accepted per-target
-keys are listed in the [table below](#generatorstarget).
+Paths are relative to the directory holding `weaveffi.toml`. Command-line
+arguments (`input`, `-o`, `--target`) override the table.
 
 ## `[package]`
 
-| Key           | Type       | Description                                                      |
-|---------------|------------|------------------------------------------------------------------|
-| `name`        | string     | Distribution name; normalized per ecosystem (see below)          |
-| `version`     | string     | Published version (default `0.1.0`)                              |
-| `description` | string     | One-line description for manifests that carry one                |
-| `license`     | string     | SPDX license expression                                          |
-| `authors`     | `[string]` | Author strings, `Name <email>`                                   |
-| `homepage`    | string     | Project home page URL                                            |
-| `repository`  | string     | Source repository URL                                            |
+`[package]` resolves into the library's [identity](../reference/naming.md):
+the package `name` every ecosystem publishes under, the C symbol `prefix`,
+and the native `library` base name. Generators derive every other name from
+these three.
 
-### Package identity
+| Key | Meaning |
+|-----|---------|
+| `name` | Distribution name (may contain `-` or `.`) |
+| `version` | Version stamped into every manifest (default `0.1.0`) |
+| `description`, `license`, `authors`, `homepage`, `repository` | Manifest metadata |
+| `c_prefix` | C symbol prefix; IDL inputs only |
+| `library` | Native library base name (`lib{library}.so`); IDL inputs only |
 
-Every generated manifest resolves its name through one shared policy. For
-an identity value, an explicit per-target key wins; otherwise the generator
-uses `package.name` normalized for its ecosystem (`kvstore` becomes
-`Kvstore` for Swift and .NET, `kvstore` for Python and Ruby, and so on);
-otherwise it falls back to the input file stem, and finally to the
-`weaveffi`/`WeaveFFI` default. The per-target keys that participate are
-`[generators.swift] module_name`, `[generators.node] package_name`,
-`[generators.python] package_name`, `[generators.dart] package_name`,
-`[generators.go] module_path`, `[generators.ruby] gem_name`, and
-`[generators.dotnet] namespace` (which also sets the NuGet package id).
+The rules depend on the input:
 
-For a Rust producer whose input is `src/lib.rs`, the input file stem (`lib`)
-is useless as a name, so the CLI uses the crate directory name instead
-(`my-crate/src/lib.rs` yields `my-crate`) when `[package] name` is unset.
+| | Rust producer (`.rs`) | IDL |
+|-|-----------------------|-----|
+| `name` | `[package] name`, else the crate's Cargo package name | `[package] name`, else the input file stem |
+| `prefix` | the crate's library name (`[lib] name`, else the package name with `-` mapped to `_`) | `c_prefix`, else snake-case `name` |
+| `library` | same as `prefix` (the cdylib Cargo builds) | `library`, else snake-case `name` |
+| metadata | `[package]`, falling back to `Cargo.toml` | `[package]` |
+
+A Rust producer's prefix is what the macro compiled into its symbols, so it
+can't be configured: setting `c_prefix` or `library` for a `.rs` input is an
+error. Renaming the published package with `name` is fine.
 
 ## `[global]`
 
-| Key                   | Type   | Default | Description                                                                                                                                                        |
-|-----------------------|--------|---------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `c_prefix`            | string | unset   | The C ABI symbol prefix (`{prefix}_{module}_{function}`), fanned out to every target that hasn't set its own `prefix`; wins over `[generators.c] prefix`               |
-| `strip_module_prefix` | bool   | unset   | Sets `strip_module_prefix` on every target that supports it, overriding their tables. Stripping is on by default, so `false` restores module-prefixed names everywhere |
-| `pre_generate`        | string | none    | Shell command run once before any generator starts                                                                                                                 |
-| `post_generate`       | string | none    | Shell command run once after every generator finishes                                                                                                              |
+| Key | Meaning |
+|-----|---------|
+| `strip_module_prefix` | Sets `strip_module_prefix` on every target that supports it, overriding their own tables |
+| `pre_generate` | Shell command run once before `generate` writes anything |
+| `post_generate` | Shell command run once after `generate` finishes writing |
 
-The C ABI symbol prefix is global by nature: every consumer must call the
-identical exported symbols. The CLI resolves it once (`[global] c_prefix`,
-then `[generators.c] prefix`) and fans it out to every per-target config
-that leaves `prefix` unset, so a custom prefix is honored across all eleven
-languages, not just C and C++. The generated C header aliases the runtime
-symbols (`{prefix}_free_string`, `{prefix}_error_clear`, ...) back to the
-canonical `weaveffi_*` names the `weaveffi-abi` runtime exports, so a Rust
-producer needs no change.
+Targets that place every module's members in one flat namespace strip the
+module name from free functions by default (`get_stats`, not
+`kv_stats_get_stats`). Set `strip_module_prefix = false` when two modules
+declare the same function name; targets that namespace each module
+separately don't need it. Each language page says which applies.
+
+Hooks run through `sh -c` (`cmd /C` on Windows), only when at least one
+target actually regenerates; an up-to-date run skips them. `weaveffi diff`
+never runs them. Don't put untrusted input in a hook.
 
 ## `[generators.<target>]`
 
-Every table also accepts a `prefix` key naming the C ABI symbol prefix its
-wrappers call; you rarely set it per target because of the fan-out above.
+One table per target (`c`, `cpp`, `swift`, `kotlin`, `node`, `wasm`,
+`python`, `dotnet`, `dart`, `go`, `ruby`) holds that generator's options.
+These keys override names derived from the identity:
 
-| Table                  | Key                   | Type   | Default           | Description                                                                                                                                                                               |
-|------------------------|-----------------------|--------|-------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `[generators.c]`       | `prefix`              | string | `"weaveffi"`      | Prefix prepended to every C ABI symbol                                                                                                                                                    |
-| `[generators.cpp]`     | `namespace`           | string | `"weaveffi"`      | C++ namespace for the wrapper                                                                                                                                                             |
-| `[generators.cpp]`     | `header_name`         | string | `"weaveffi.hpp"`  | Header file name for the C++ output                                                                                                                                                       |
-| `[generators.cpp]`     | `standard`            | string | `"17"`            | C++ standard for the generated `CMakeLists.txt`                                                                                                                                           |
-| `[generators.swift]`   | `module_name`         | string | identity          | Swift module name in `Package.swift` and the `Sources/` directory                                                                                                                          |
-| `[generators.swift]`   | `strip_module_prefix` | bool   | `true`            | Strip the module prefix from emitted Swift symbols                                                                                                                                        |
-| `[generators.kotlin]`  | `package`             | string | `"com.weaveffi"`  | JVM package for the generated Kotlin wrapper and the `namespace` in `build.gradle.kts`                                                                                                     |
-| `[generators.kotlin]`  | `strip_module_prefix` | bool   | `true`            | Strip the module prefix from emitted Kotlin symbols                                                                                                                                       |
-| `[generators.node]`    | `package_name`        | string | identity          | npm package name                                                                                                                                                                          |
-| `[generators.node]`    | `strip_module_prefix` | bool   | `true`            | Strip the module prefix from emitted JS/TS symbols                                                                                                                                        |
-| `[generators.wasm]`    | `module_name`         | string | `"weaveffi_wasm"` | Module name in the Wasm JS loader                                                                                                                                                         |
-| `[generators.wasm]`    | `emscripten`          | bool   | `false`           | Target an Emscripten build: the loader accepts a pre-initialized Emscripten `Module` (or its `MODULARIZE` factory promise) instead of a `.wasm` source. Async functions and callback interfaces are unsupported in this mode |
-| `[generators.wasm]`    | `allow_unsupported`   | bool   | `false`           | In Emscripten mode, generate anyway when the API uses async functions or callback interfaces: the capability failure becomes a warning and those entry points are emitted as explicit throwing stubs. No effect outside Emscripten mode |
-| `[generators.python]`  | `package_name`        | string | identity          | Python package name                                                                                                                                                                       |
-| `[generators.python]`  | `strip_module_prefix` | bool   | `true`            | Strip the module prefix from emitted Python symbols                                                                                                                                       |
-| `[generators.dotnet]`  | `namespace`           | string | identity          | .NET namespace and NuGet package id                                                                                                                                                       |
-| `[generators.dotnet]`  | `strip_module_prefix` | bool   | `true`            | Strip the module prefix from emitted C# symbols                                                                                                                                           |
-| `[generators.dart]`    | `package_name`        | string | identity          | Dart package name in `pubspec.yaml`                                                                                                                                                       |
-| `[generators.dart]`    | `strip_module_prefix` | bool   | `true`            | Strip the module prefix from emitted Dart symbols                                                                                                                                         |
-| `[generators.go]`      | `module_path`         | string | identity          | Go module path in `go.mod`                                                                                                                                                                |
-| `[generators.go]`      | `strip_module_prefix` | bool   | `true`            | Strip the module prefix from emitted Go symbols                                                                                                                                           |
-| `[generators.ruby]`    | `module_name`         | string | `"WeaveFFI"`      | Ruby module that wraps the bindings                                                                                                                                                       |
-| `[generators.ruby]`    | `gem_name`            | string | identity          | Ruby gem name                                                                                                                                                                             |
-| `[generators.ruby]`    | `strip_module_prefix` | bool   | `true`            | Strip the module prefix from emitted Ruby symbols                                                                                                                                         |
+| Table | Key | Default |
+|-------|-----|---------|
+| `[generators.cpp]` | `namespace`, `header_name` | `{prefix}`, `{library}.hpp` |
+| `[generators.swift]` | `module_name` | `PascalCase(name)` |
+| `[generators.kotlin]` | `package` | `{prefix}` |
+| `[generators.node]` | `package_name` | `{name}` |
+| `[generators.wasm]` | `package_name` | `{name}` |
+| `[generators.python]` | `package_name`, `import_name` | `{name}`, `{prefix}` |
+| `[generators.dotnet]` | `namespace` | `PascalCase(name)` |
+| `[generators.dart]` | `package_name` | `{prefix}` |
+| `[generators.go]` | `module_path` | `{name}` |
+| `[generators.ruby]` | `gem_name`, `module_name` | `{name}`, `PascalCase(name)` |
 
-"identity" means the value follows [Package identity](#package-identity).
+Every other option (Kotlin's Android or JVM flavor, Wasm's Emscripten mode,
+and so on) is documented on the target's page under
+[Generators](../generators/README.md). No target has its own C prefix: the
+prefix belongs to the library.
 
-## Recipes
+## Generation and caching
 
-```toml
-# iOS / macOS app with a branded module and symbol prefix
-[global]
-c_prefix = "myapp"
+Rendering is pure: each target renders its files in memory, and the
+orchestrator does every write. After a target generates, the orchestrator
+writes a record to `{out}/.weaveffi-cache/{target}.json` holding a hash of
+every input that affects the output (the API, the identity, the target's
+config, and the CLI version) and the path and hash of every file written. On
+the next run:
 
-[generators.swift]
-module_name = "MyAppFFI"
-```
+- A target is skipped when its input hash matches and every recorded file is
+  still on disk unmodified. Deleting or hand-editing a generated file
+  regenerates it.
+- A regenerated target rewrites only files whose contents changed, so file
+  timestamps (and incremental builds) stay stable.
+- Files the previous run wrote that the current run no longer produces (a
+  renamed type, a removed module) are deleted. Files you added under the
+  output directory (a `node_modules/`, a build directory) are never touched.
 
-```toml
-# Android or desktop-JVM library
-[generators.kotlin]
-package = "com.example.myapp.ffi"
-```
+`--force` ignores the records and regenerates every selected target.
+`--dry-run` validates and prints the files that would be written.
 
-```toml
-# Browser bundle linked into an existing Emscripten build (no async or
-# callback interfaces in the API)
-[generators.wasm]
-module_name = "myapp"
-emscripten = true
-```
+## CI
 
-```toml
-# Scoped npm package, module-prefixed names everywhere
-[global]
-strip_module_prefix = false
-
-[generators.node]
-package_name = "@myorg/myapp-native"
-```
-
-```toml
-# Build the producer before generating so `weaveffi package --build` can
-# find fresh binaries
-[global]
-pre_generate = "cargo build --release"
-```
-
-## Wiring it into CI
-
-`weaveffi diff --check` enforces that the committed bindings still match the
-API definition and config. A typical guard job:
-
-```yaml
-# .github/workflows/ci.yml
-- name: Verify generated bindings are up to date
-  run: weaveffi diff src/lib.rs --out generated --check
-```
-
-Exit codes:
-
-| Code | Meaning                                              |
-|------|------------------------------------------------------|
-| `0`  | The committed output matches the definition exactly. |
-| `2`  | One or more files would change in place.             |
-| `3`  | One or more files would be added or removed.         |
-
-`weaveffi validate --format json` emits structured success or failure, and
-`--warn` adds the advisory lint warnings to the same document:
+`weaveffi diff --check` regenerates in memory and compares with the output
+directory without writing anything or running hooks:
 
 ```bash
-weaveffi --quiet validate src/lib.rs --warn --format json | jq '.ok, .warnings'
+weaveffi diff --check                       # uses [project]
+weaveffi diff src/lib.rs -o bindings --target c,swift --check
 ```
 
-```json
-{ "ok": true, "modules": 2, "functions": 8, "structs": 3, "enums": 1, "warnings": [] }
-```
-
-```json
-{
-  "ok": false,
-  "errors": [
-    {
-      "code": "DuplicateFunctionName",
-      "module": "math",
-      "function": "add",
-      "message": "duplicate function name in module 'math': add",
-      "suggestion": "function names must be unique within a module; rename the duplicate"
-    }
-  ]
-}
-```
-
-Warnings never change `ok` or the exit status; they carry stable `code`,
-`location`, and `message` fields for dashboards to key on.
-
-## Performance and caching
-
-- The orchestrator dispatches every selected generator in parallel using
-  [rayon](https://docs.rs/rayon). The `pre_generate` and `post_generate`
-  hooks run serially around the whole batch.
-- Each generator persists a hash under
-  `{out_dir}/.weaveffi-cache/{target}.hash` covering the resolved API
-  (including `[package]`), the generator's name and config, and the CLI
-  version. Only generators whose hash changed re-run; pass `--force` to
-  invalidate every entry.
+It exits `0` when the directory is up to date, `2` when files would change,
+and `3` when files would be added or removed (stale files count as removed).
+`weaveffi validate --format json` prints one JSON object with `ok`, counts,
+and any errors (each with a `code` matching the
+[error catalog](../reference/idl.md#error-catalog)); `--warn` adds advisory
+warnings, which never change the exit status.
 
 ## Pitfalls
 
-- **The C prefix rewrites every generator**: picking a custom prefix
-  renames every exported business symbol. Rust producers using
-  `#[weaveffi::module]` must be built with the same prefix; every wrapper
-  picks it up from the resolved global value, so if you also set a
-  per-target `prefix`, make sure they agree.
-- **Module-prefix stripping flattens names**: it's on by default, so two
-  modules that each declare an `open` function collide in targets with a
-  flat namespace. Rename one, or set `strip_module_prefix = false`
-  (globally or per target) to restore prefixed names.
-- **Hooks run shell commands as-is**: `pre_generate` and `post_generate`
-  are passed straight to `sh -c`. Quote them carefully and never include
-  untrusted input.
-- **Config lives outside the definition**: two checkouts generating from
-  the same `lib.rs` with different `weaveffi.toml` files produce different
-  manifests. Commit the config next to the definition and let discovery
-  find it rather than passing `--config` from scripts.
+- **Config travels with the definition.** Two checkouts with different
+  `weaveffi.toml` files generate different packages from the same source.
+  Commit the file next to the definition and let discovery find it.
+- **Name overrides don't rename the library.** A target's package or module
+  override changes what consumers import, not which native library it loads;
+  that's always `{library}`, overridable at run time with the
+  `{PREFIX}_LIBRARY` environment variable.

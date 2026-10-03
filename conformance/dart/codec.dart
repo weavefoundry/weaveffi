@@ -17,11 +17,9 @@
 
 import 'dart:typed_data';
 
-import 'package:__PKG__/__LIB__.dart' as wv;
+import 'package:codec/codec.dart' as wv;
 
-void expect(bool cond, String msg) {
-  if (!cond) throw StateError('assertion failed: $msg');
-}
+import 'support.dart';
 
 const int i64Min = -9223372036854775808;
 const int i64Max = 9223372036854775807;
@@ -203,7 +201,7 @@ void checkScalars() {
     expect(e.code == 1, 'Mismatch code == 1 (got ${e.code})');
     expect(e.message == 'value does not match the canonical fixture',
         'Mismatch message (got ${e.message})');
-    expect(e is wv.CodecException && e is wv.WeaveFFIException,
+    expect(e is wv.CodecException && e is wv.NativeException,
         'Mismatch extends the domain and brand exceptions');
   }
 
@@ -460,6 +458,9 @@ void checkDirect() {
   expect(m.length == 3 && m[''] == i64Min && m['k'] == -1 && m['ü'] == i64Max,
       'map values (got $m)');
   expect(wv.roundtripString('') == '', 'empty string');
+  final nul = wv.roundtripString('a\u0000b\u0000');
+  expect(nul.length == 4 && nul.codeUnitAt(1) == 0 && nul.codeUnitAt(3) == 0,
+      'interior and trailing NUL survive a (ptr, len) string');
   expect(wv.roundtripString('héllo wörld ✓ \u{1F600}') ==
           'héllo wörld ✓ \u{1F600}',
       'unicode string');
@@ -587,11 +588,12 @@ void checkHolder() {
   }
 }
 
-void main() {
+Future<void> main() async {
   checkScalars();
   checkComposite();
   checkShapes();
   checkDirect();
   checkHolder();
+  await expectNoLeaks('codec');
   print('dart/codec: OK');
 }

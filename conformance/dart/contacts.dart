@@ -1,78 +1,88 @@
 // Conformance consumer: contacts sample, Dart target.
 //
-// Binds through the generated `package:weaveffi` wrapper and drives the
-// ContactBook interface surface: the unnamed factory constructor, instance
-// methods passing the object pointer (add/get/list/remove/count), enum
-// marshalling, the Contact record decoded from a value buffer into a plain
-// Dart value class, optional strings (null email), list-of-record returns,
-// boolean returns, and the typed ContactsException hierarchy
-// (InvalidNameException = 1, NotFoundException = 2) raised by throwing
-// methods.
+// The ContactBook interface (unnamed factory, instance methods, dispose and
+// use after dispose), the Contact record with an optional string and a
+// C-style enum field, the typed ContactsException domain, the nested
+// `contacts.groups` module taking and returning the parent's ContactType
+// enum and ContactBook interface and reporting the parent's domain, and the
+// sibling `directory` root sharing the Contact record and declaring its own
+// DirectoryException domain.
 
-import 'package:__PKG__/__LIB__.dart' as wv;
+import 'package:contacts/contacts.dart' as ct;
 
-void expect(bool cond, String msg) {
-  if (!cond) throw StateError('assertion failed: $msg');
-}
+import 'support.dart';
 
-void main() {
-  final book = wv.ContactBook();
+void run() {
+  final book = ct.ContactBook();
 
   final alice =
-      book.add('Alice', 'Smith', 'alice@example.com', wv.ContactType.work);
+      book.add('Alice', 'Smith', 'alice@example.com', ct.ContactType.work);
   expect(alice.id > 0, 'alice id positive');
-  expect(alice.firstName == 'Alice', 'firstName');
-  expect(alice.lastName == 'Smith', 'lastName');
+  expect(alice.firstName == 'Alice' && alice.lastName == 'Smith', 'names');
   expect(alice.email == 'alice@example.com', 'email');
-  expect(alice.contactType == wv.ContactType.work, 'contactType');
+  expect(alice.contactType == ct.ContactType.work, 'contactType');
+  expect(book.get(alice.id).firstName == 'Alice', 'get');
 
-  final fetched = book.get(alice.id);
-  expect(fetched.firstName == 'Alice', 'get returns the stored record');
+  final bob = book.add('Bob', 'Jones', null, ct.ContactType.personal);
+  expect(bob.email == null, 'absent email');
+  book.add('Carol', 'Adams', 'carol@example.com', ct.ContactType.work);
+  book.add('Dan', 'Brown', null, ct.ContactType.other);
+  expect(book.count() == 4, 'count');
+  final names = book.list().map((c) => c.firstName).toList()..sort();
+  expect(names.join(',') == 'Alice,Bob,Carol,Dan', 'list (got $names)');
 
-  // Optional string: a missing email round-trips as null.
-  final bob = book.add('Bob', 'Jones', null, wv.ContactType.personal);
-  expect(bob.email == null, 'bob email null');
-  expect(bob.contactType == wv.ContactType.personal, 'bob contactType');
+  final invalid = expectThrows<ct.ContactsException>(
+      () => book.add('', 'Smith', null, ct.ContactType.personal),
+      'empty name');
+  expect(invalid is ct.InvalidNameException && invalid.code == 1,
+      'InvalidName (got $invalid)');
+  final missing =
+      expectThrows<ct.NotFoundException>(() => book.get(9999), 'missing id');
+  expect(missing.code == 2 && missing is ct.NativeException, 'NotFound');
 
-  expect(book.count() == 2, 'count == 2');
-  final everyone = book.list();
-  expect(everyone.length == 2, 'list length == 2');
-  final names = everyone.map((p) => p.firstName).toList()..sort();
-  expect(names.join(',') == 'Alice,Bob', 'list names');
+  // Nested module: the parent's enum and interface cross the module
+  // boundary, and the parent's error domain applies.
+  expect(ct.countOfType(book, ct.ContactType.work) == 2, 'countOfType work');
+  expect(ct.countOfType(book, ct.ContactType.other) == 1, 'countOfType other');
+  expect(ct.dominantType(book) == ct.ContactType.work, 'dominantType');
+  final work = ct.splitByType(book, ct.ContactType.work);
+  expect(work.count() == 2, 'splitByType returns a new book');
+  expect(work.list().every((c) => c.contactType == ct.ContactType.work),
+      'split book holds only work contacts');
+  expect(ct.firstOfType(book, ct.ContactType.personal).firstName == 'Bob',
+      'firstOfType');
+  work.dispose();
+  final empty = ct.ContactBook();
+  expectThrows<ct.NotFoundException>(
+      () => ct.firstOfType(empty, ct.ContactType.work),
+      'nested module raises the parent domain');
+  expect(ct.dominantType(empty) == ct.ContactType.personal, 'empty book');
+  empty.dispose();
 
-  // Typed error: an empty name raises the InvalidNameException class of the
-  // ContactsException domain, carrying its stable code.
-  try {
-    book.add('', 'Smith', null, wv.ContactType.personal);
-    throw StateError('expected InvalidNameException for empty name');
-  } on wv.ContactsException catch (e) {
-    expect(e is wv.InvalidNameException, 'InvalidName subclass (got $e)');
-    expect(e.code == 1, 'InvalidName code == 1 (got ${e.code})');
-  }
+  // Sibling root: the shared record crosses into another module tree.
+  final card = ct.card(alice);
+  expect(card.displayName == 'Smith, Alice', 'card name');
+  expect(card.initials == 'AS' && card.hasEmail, 'card initials and email');
+  expect(!ct.card(bob).hasEmail, 'card without email');
+  final sorted = ct.sorted(book.list());
+  expect(sorted.map((c) => c.lastName).join(',') == 'Adams,Brown,Jones,Smith',
+      'sorted (got ${sorted.map((c) => c.lastName)})');
+  final none = expectThrows<ct.DirectoryException>(
+      () => ct.sorted(<ct.Contact>[]), 'sorted empty');
+  expect(none is ct.EmptyException && none.code == 1, 'EmptyException');
 
-  expect(book.remove(alice.id) == true, 'remove returns true');
-  expect(book.count() == 1, 'count == 1 after remove');
-  expect(book.remove(alice.id) == false, 'second remove returns false');
+  expect(book.remove(alice.id), 'remove');
+  expect(!book.remove(alice.id), 'second remove');
+  expect(book.count() == 3, 'count after remove');
 
-  // Typed error: a missing id raises NotFoundException, which is also
-  // catchable as the domain and the generic brand exception.
-  try {
-    book.get(9999);
-    throw StateError('expected NotFoundException for missing contact');
-  } on wv.NotFoundException catch (e) {
-    expect(e.code == 2, 'NotFound code == 2 (got ${e.code})');
-    expect(e is wv.ContactsException, 'NotFound extends ContactsException');
-    expect(e is wv.WeaveFFIException, 'NotFound extends the generic brand');
-  }
-
-  // Releasing the object twice is safe; using it afterward is a StateError.
   book.dispose();
   book.dispose();
-  try {
-    book.count();
-    throw StateError('expected StateError after dispose');
-  } on StateError catch (e) {
-    expect(e.message.contains('dispose'), 'use after dispose message');
-  }
+  final gone = expectThrows<StateError>(() => book.count(), 'use after dispose');
+  expect(gone.message.contains('dispose'), 'use after dispose message');
+}
+
+Future<void> main() async {
+  run();
+  await expectNoLeaks('contacts');
   print('dart/contacts: OK');
 }

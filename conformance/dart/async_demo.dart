@@ -1,54 +1,77 @@
 // Conformance consumer: async-demo sample, Dart target.
 //
-// Drives the Future-backed async surface end to end: `runTask` settled
-// through a NativeCallable.listener from the producer's worker thread and
-// decoded from a value buffer into the plain TaskResult class, the typed
-// InvalidNameException (extending TaskException extending WeaveFFIException)
-// for an empty name, the buffered list-of-records round trip through
-// `runBatch`, the direct-scalar `runNTasks`, the sync `cancelTask`, and
-// `activeCallbacks` settling to zero once every task body has completed.
-// Throws (non-zero exit) on any mismatch.
+// Futures completed from the producer's worker threads: a record result, the
+// typed InvalidNameException, a buffered list both ways, a direct scalar,
+// many concurrent calls, and cancellation through CancelToken (cancelling a
+// pending call, a token cancelled before launch, one token shared by two
+// calls, and a cancel after completion), each cancelled call failing with
+// CancelledException (code -5) long before its timeout.
 
-import 'package:__PKG__/__LIB__.dart' as wv;
+import 'package:async_demo/async_demo.dart' as tasks;
 
-void expect(bool cond, String msg) {
-  if (!cond) throw StateError('assertion failed: $msg');
+import 'support.dart';
+
+Future<void> run() async {
+  final result = await tasks.runTask('alpha');
+  expect(result.id > 0, 'runTask id');
+  expect(result.value == 'completed: alpha', 'runTask value (${result.value})');
+  expect(result.success, 'runTask success');
+
+  final invalid = await expectThrowsAsync<tasks.InvalidNameException>(
+      () => tasks.runTask(''), 'empty name');
+  expect(invalid.code == 1 && invalid is tasks.TaskException, 'InvalidName');
+
+  final batch = await tasks.runBatch(<String>['a', 'b', 'c']);
+  expect(batch.map((r) => r.value).join('|') ==
+          'completed: a|completed: b|completed: c',
+      'runBatch values');
+  expect((await tasks.runBatch(<String>[])).isEmpty, 'runBatch empty');
+
+  expect(await tasks.runNTasks(7) == 7, 'runNTasks');
+  final many = await Future.wait(
+      <Future<int>>[for (var i = 0; i < 64; i++) tasks.runNTasks(i)]);
+  expect(many.length == 64 && many[63] == 63, 'concurrent runNTasks');
+
+  // A timeout that elapses completes normally, with or without a token.
+  expect(await tasks.wait(20) == 20, 'wait elapses');
+  final idle = tasks.CancelToken();
+  expect(await tasks.wait(10, cancelToken: idle) == 10, 'uncancelled token');
+  idle.cancel();
+  expect(idle.isCancelled, 'cancel after completion is harmless');
+
+  // Cancelling a pending call completes it with CancelledException.
+  final watch = Stopwatch()..start();
+  final token = tasks.CancelToken();
+  final pending = outcome(tasks.wait(60000, cancelToken: token));
+  await Future<void>.delayed(const Duration(milliseconds: 20));
+  token.cancel();
+  final cancelled = await pending;
+  expect(cancelled is tasks.CancelledException, 'cancelled wait (got $cancelled)');
+  final code = (cancelled! as tasks.NativeException).code;
+  expect(code == -5 && code == tasks.NativeException.cancelledCode,
+      'cancelled code (got $code)');
+  expect(watch.elapsed < const Duration(seconds: 5), 'cancel is prompt');
+
+  // A token cancelled before launch, and one token shared by two calls.
+  await expectThrowsAsync<tasks.CancelledException>(
+      () => tasks.wait(60000, cancelToken: token), 'pre-cancelled token');
+  final shared = tasks.CancelToken();
+  final both = Future.wait(<Future<Object?>>[
+    outcome(tasks.wait(60000, cancelToken: shared)),
+    outcome(tasks.wait(60000, cancelToken: shared)),
+  ]);
+  shared.cancel();
+  shared.cancel();
+  final outcomes = await both;
+  expect(outcomes.every((o) => o is tasks.CancelledException),
+      'one token cancels both calls (got $outcomes)');
+  expect(watch.elapsed < const Duration(seconds: 10), 'all cancels prompt');
+
+  await settle(() => tasks.activeCallbacks() == 0, 'task bodies finish');
 }
 
 Future<void> main() async {
-  // Async record return: the Future resolves with a plain TaskResult.
-  final result = await wv.runTask('alpha');
-  expect(result.id > 0, 'runTask assigns an id');
-  expect(result.value == 'completed: alpha', 'runTask value (got ${result.value})');
-  expect(result.success, 'runTask success flag');
-
-  // Typed async error: the empty name settles with InvalidNameException.
-  try {
-    await wv.runTask('');
-    expect(false, 'expected InvalidNameException for empty name');
-  } on wv.InvalidNameException catch (e) {
-    expect(e.code == 1, 'InvalidName carries code 1 (got ${e.code})');
-    expect(e is wv.TaskException, 'subclass of TaskException');
-    expect(e is wv.WeaveFFIException, 'subclass of the brand exception');
-  }
-
-  // Buffered list-of-records both ways.
-  final batch = await wv.runBatch(['a', 'b', 'c']);
-  expect(
-    batch.map((r) => r.value).join('|') ==
-        'completed: a|completed: b|completed: c',
-    'runBatch values',
-  );
-  expect(batch.every((r) => r.success), 'runBatch success flags');
-
-  // Direct scalar through the async callback.
-  expect(await wv.runNTasks(7) == 7, 'runNTasks echoes n');
-
-  // Sync functions beside the async ones.
-  expect(!wv.cancelTask(1), 'cancelTask reports not cancelled');
-
-  // Every spawned task body has completed by the time its callback fires.
-  expect(wv.activeCallbacks() == 0, 'activeCallbacks settles to zero');
-
-  print('dart async-demo conformance: OK');
+  await run();
+  await expectNoLeaks('async_demo');
+  print('dart/async-demo: OK');
 }

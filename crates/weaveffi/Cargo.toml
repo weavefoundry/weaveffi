@@ -1,7 +1,8 @@
 [package]
 name = "weaveffi"
-version = "0.23.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -10,12 +11,20 @@ keywords = ["ffi", "abi", "bindings", "codegen", "proc-macro"]
 categories = ["development-tools::ffi"]
 
 [dependencies]
-weaveffi-abi = { path = "../weaveffi-abi", version = "0.23.0" }
-weaveffi-macros = { path = "../weaveffi-macros", version = "0.23.0" }
+weaveffi-abi = { workspace = true }
+weaveffi-macros = { workspace = true }
+
+[features]
+# Count live objects, callbacks, iterators, cancel tokens, and returned
+# allocations for `{prefix}_debug_live`. Every sample enables it.
+leak-check = ["weaveffi-abi/leak-check"]
 
 [dev-dependencies]
-# Only for the ABI-revision lockstep test; the facade never links core at runtime.
-weaveffi-core = { path = "../weaveffi-core", version = "0.23.0" }
+# Only for the ABI-revision lockstep test; the facade never links the
+# generators at runtime.
+weaveffi-gen = { workspace = true }
+# The leak-counter test needs counting on.
+weaveffi-abi = { workspace = true, features = ["leak-check"] }
 
 [lints]
 workspace = true

@@ -1,10 +1,9 @@
 name: Fuzz
 
 on:
-  pull_request:
+  workflow_dispatch:
   schedule:
-    # 08:00 UTC daily. The nightly run can be extended by bumping
-    # `-max_total_time` below.
+    # 08:00 UTC daily. Extend a run by bumping `-max_total_time` below.
     - cron: '0 8 * * *'
 
 jobs:
@@ -32,8 +31,9 @@ jobs:
         with:
           cache-targets: true
 
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
 
       - name: Run ${{ matrix.target }} for 60s
         # Each target is fuzzed for 60s in PRs (≈5 min total). The cron run

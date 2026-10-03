@@ -1,6 +1,6 @@
 // Conformance consumer: kvstore sample, Swift target.
 //
-// Binds through the generated `Kvstore` module and exercises the ABI 2
+// Binds through the generated `Kvstore` package and exercises the full
 // surface: `Store` as a reference-counted final class opened via the throwing
 // static factory `Store.open(path:)`, throwing methods raising the typed
 // `KvError` domain enum (put/get/delete/listKeys), non-throwing methods
@@ -10,15 +10,17 @@
 // `compact()` async method, the `EvictionListener` callback interface
 // implemented as a Swift class (arguments observed, detach by returning
 // false, replace/clear releasing the previous listener, a thrown error
-// surfacing to the caller as `WeaveFFIError` with code -4), and the object
-// graph: `share()` returning a wrapper to the same object, `fork()`,
+// surfacing to the caller as `KvstoreRuntimeError` with code -4), and the
+// object graph: `share()` returning a wrapper to the same object, `fork()`,
 // `larger(other:)` with `Store?` both ways, `describe(label:mirror:)`
 // returning a record that carries objects, `openMany` returning a list of
 // objects, and `totalCount` taking objects inside a list and a record.
 // Release is observed through weak references to the wrappers, whose deinit
 // calls the generated destroy. Typed-error asserts pin the case and the
-// numeric code (keyNotFound 1001, expired 1002, ioError 1004).
+// numeric code (keyNotFound 1001, expired 1002, ioError 1004). At exit, every
+// native object, callback, iterator, token, and allocation has been released.
 
+import CKvstore
 import Foundation
 import Kvstore
 
@@ -31,6 +33,20 @@ func expect(_ cond: Bool, _ msg: String) {
     if !cond { fail(msg) }
 }
 
+/// Every live-object counter the producer keeps must settle at zero.
+func assertNoLeaks() {
+    let kinds = ["objects", "callbacks", "iterators", "cancel tokens", "allocations"]
+    var live: [UInt64] = []
+    for _ in 0..<200 {
+        live = (0..<5).map { kvstore_debug_live(Int32($0)) }
+        if live.allSatisfy({ $0 == 0 }) { return }
+        usleep(10_000)
+    }
+    for (kind, n) in live.enumerated() where n != 0 {
+        fail("\(n) live \(kinds[kind]) at exit")
+    }
+}
+
 struct ListenerFailure: Error, LocalizedError {
     let key: String
     var errorDescription: String? { "listener rejected \(key)" }
@@ -39,7 +55,7 @@ struct ListenerFailure: Error, LocalizedError {
 /// A consumer-side eviction listener. Records every (key, reason) pair,
 /// detaches itself by returning false once `keepAfter` evictions were seen,
 /// and throws for `failKey` so the foreign-error path can be observed.
-final class Listener: EvictionListener {
+final class Listener: EvictionListener, @unchecked Sendable {
     var evicted: [(key: String, reason: EvictionReason)] = []
     var lastEntry: Entry?
     let keepAfter: Int
@@ -184,7 +200,7 @@ do {
     do {
         _ = try store.delete(key: "boom")
         fail("expected a foreign error from the throwing listener")
-    } catch let e as WeaveFFIError {
+    } catch let e as KvstoreRuntimeError {
         expect(e.errorCode == -4, "foreign error code == -4 (got \(e.errorCode))")
         expect(e.localizedDescription.contains("listener rejected boom"),
                "foreign error carries the thrown message (got \(e.localizedDescription))")
@@ -198,7 +214,7 @@ do {
     do {
         _ = try store.get(key: "boom")
         fail("expected a foreign error from the throwing listener on expiry")
-    } catch let e as WeaveFFIError {
+    } catch let e as KvstoreRuntimeError {
         expect(e.errorCode == -4, "expiry foreign error code == -4 (got \(e.errorCode))")
     }
     store.clearEvictionListener()
@@ -334,7 +350,9 @@ do {
     }
 
     // No explicit close: every Store deinit calls the generated destroy.
-    print("swift/kvstore: OK")
 } catch {
     fail("threw: \(error)")
 }
+
+assertNoLeaks()
+print("swift/kvstore: OK")

@@ -1,39 +1,34 @@
 # WeaveFFI Architecture
 
-The canonical architecture reference lives in
-[`docs/src/architecture.md`](docs/src/architecture.md).
+The contributor guide to the architecture lives in
+[`docs/src/architecture.md`](docs/src/architecture.md), and the normative C
+ABI is [`docs/src/reference/abi.md`](docs/src/reference/abi.md). Read them
+before changing a generator, the IDL or IR, validation, the producer macro,
+the runtime, or the orchestrator.
 
-Start there if you are:
-
-- Adding or changing a generator.
-- Touching the IDL, IR, validator, or schema version.
-- Changing generator configuration, output determinism, or cache behavior.
-- Reviewing snapshot-test output.
-
-At a high level, WeaveFFI follows this pipeline:
+The pipeline:
 
 ```text
-IDL (YAML/JSON/TOML)
-  → Parse
-  → IR
-  → Validate
-  → Resolve generator config
-  → Generate target outputs
-  → Write files and per-generator cache entries
+annotated Rust (.rs) or IDL (YAML/JSON/TOML)
+  → IR (Api)
+  → validate (every rule, including the C symbol table)
+  → ResolvedApi + Identity (names from weaveffi.toml / Cargo.toml)
+  → BindingModel (C symbols and ABI signatures, computed once)
+  → marshalling plan
+  → Target::render (pure, per language)
+  → Orchestrator (capability gate, cache records, changed-file writes,
+    stale-file removal)
 ```
 
-The workspace is split into small crates:
+The workspace crates:
 
-- `weaveffi-ir` owns the IR and parsers.
-- `weaveffi-abi` owns the stable C ABI runtime.
-- `weaveffi-core` owns validation, the ABI/binding model, the marshalling
-  plan (the language-neutral calling contracts every backend renders), the
-  language-backend framework, generator orchestration, configuration, and
-  caching.
-- `weaveffi-gen-*` crates own target-specific code generation, each implemented
-  as a `LanguageBackend` over the shared driver.
-- `weaveffi-cli` wires the pipeline into the `weaveffi` command.
-- `weaveffi-fuzz` contains unpublished fuzz harnesses.
-
-See the full architecture guide for the dependency graph, data-flow diagram,
-cache-key strategy, generator responsibilities, and snapshot-test layout.
+- `weaveffi-model`: the IR, IDL parsing, Rust extraction, validation, the
+  resolved view, package identity, the binding model, ABI lowering, the
+  marshalling plan, and contract checksums.
+- `weaveffi-gen`: the backend framework, the orchestrator and cache, and the
+  eleven language targets under `targets/`.
+- `weaveffi-cli`: the `weaveffi` command.
+- `weaveffi-abi`: the C ABI runtime linked into every producer.
+- `weaveffi-macros`: `#[weaveffi::module]` and `export_runtime!`.
+- `weaveffi`: the producer facade crate.
+- `weaveffi-fuzz`: unpublished fuzz harnesses.

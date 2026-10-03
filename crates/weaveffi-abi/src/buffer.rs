@@ -7,7 +7,7 @@
 //! than as an opaque object pointer or parallel arrays. Parameters are
 //! borrowed for the duration of the call (the consumer owns and frees its own
 //! encoding); returns are producer-allocated and released by the consumer
-//! with `weaveffi_free_bytes` after decoding.
+//! with `{prefix}_free_bytes` after decoding.
 //!
 //! # Encoding
 //!
@@ -47,6 +47,11 @@
 //! Encoded lengths and counts are `u32`, capping any single string, byte
 //! buffer, or collection at `u32::MAX` entries; [`BufferWriter`] panics past
 //! that bound rather than truncating.
+//!
+//! Lists of bytes and fixed-width numbers (every integer and float type, but
+//! not `bool`, whose bytes must be validated) encode and decode with a single
+//! copy on little-endian targets, and [`encode_value`] sizes its allocation
+//! exactly up front from [`BufferValue::encoded_len`].
 
 use std::sync::Arc;
 
@@ -89,10 +94,23 @@ impl BufferWriter {
         Self::default()
     }
 
+    /// Create an empty writer with room for `capacity` bytes.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(capacity),
+        }
+    }
+
     /// Consume the writer and return the encoded bytes.
     #[must_use]
     pub fn finish(self) -> Vec<u8> {
         self.buf
+    }
+
+    /// Append already-encoded bytes verbatim.
+    pub fn write_raw(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
     }
 
     /// Write a `bool` as one byte (`0` or `1`).
@@ -165,12 +183,19 @@ impl BufferWriter {
     /// Write a string as a `u32` byte length followed by its UTF-8 bytes.
     /// Interior NUL bytes round-trip unchanged (the format is not
     /// NUL-terminated).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the string is longer than `u32::MAX` bytes.
     pub fn write_string(&mut self, v: &str) {
-        self.write_len(v.len());
-        self.buf.extend_from_slice(v.as_bytes());
+        self.write_bytes(v.as_bytes());
     }
 
     /// Write a byte buffer as a `u32` length followed by the raw bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the buffer is longer than `u32::MAX` bytes.
     pub fn write_bytes(&mut self, v: &[u8]) {
         self.write_len(v.len());
         self.buf.extend_from_slice(v);
@@ -337,23 +362,45 @@ impl<'a> BufferReader<'a> {
         ]))
     }
 
-    /// Read a length or element count (a `u32`).
+    /// Read the byte length of a string or byte buffer (a `u32`).
     ///
     /// # Errors
     ///
     /// Returns an error when the buffer is exhausted or the decoded length
-    /// exceeds the bytes remaining (which would make follow-up reads fail
-    /// anyway; rejecting here gives a clearer error).
+    /// exceeds the bytes remaining, which would make the follow-up read fail
+    /// anyway; rejecting here gives a clearer error.
     pub fn read_len(&mut self) -> Result<usize, BufferDecodeError> {
-        let len = self.read_u32()? as usize;
-        // A length can never exceed what is left in the buffer: even the
-        // densest elements occupy at least one byte each.
+        let len = self.read_count()?;
         if len > self.remaining() {
             return Err(BufferDecodeError {
                 context: "length prefix exceeds remaining buffer",
             });
         }
         Ok(len)
+    }
+
+    /// Read a collection's element count (a `u32`).
+    ///
+    /// Unlike [`read_len`](Self::read_len) this doesn't bound the count by
+    /// the bytes remaining: an element's encoding can be empty (a record with
+    /// no fields), so a large count is legitimate. Decoders bound their
+    /// preallocation by [`remaining`](Self::remaining) instead, and a hostile
+    /// count fails as soon as the elements run out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the buffer is exhausted.
+    pub fn read_count(&mut self) -> Result<usize, BufferDecodeError> {
+        Ok(self.read_u32()? as usize)
+    }
+
+    /// Read `n` raw bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when fewer than `n` bytes remain.
+    pub fn read_raw(&mut self, n: usize) -> Result<&'a [u8], BufferDecodeError> {
+        self.take(n, "raw bytes")
     }
 
     /// Read a string: `u32` byte length + UTF-8 bytes.
@@ -365,9 +412,11 @@ impl<'a> BufferReader<'a> {
     pub fn read_string(&mut self) -> Result<String, BufferDecodeError> {
         let len = self.read_len()?;
         let bytes = self.take(len, "string bytes")?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| BufferDecodeError {
-            context: "string is not valid UTF-8",
-        })
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| BufferDecodeError {
+                context: "string is not valid UTF-8",
+            })
     }
 
     /// Read a byte buffer: `u32` length + raw bytes.
@@ -412,15 +461,36 @@ impl<'a> BufferReader<'a> {
     }
 }
 
+/// Proof that a type's buffer encoding is exactly its little-endian
+/// in-memory representation, which lets lists of it encode and decode with
+/// one copy.
+///
+/// Only this crate can construct it, so only the built-in integer and float
+/// implementations of [`BufferValue`] can opt into the fast path; a type with
+/// invalid bit patterns (`bool`, an enum) can never be copied in unchecked.
+#[derive(Debug, Clone, Copy)]
+pub struct FixedWidth(());
+
 /// A value that can serialize itself into (and decode itself from) the
 /// WeaveFFI buffer format.
 ///
 /// The `#[weaveffi::record]`, `#[weaveffi::enumeration]`, and
 /// `#[weaveffi::error]` expansions implement this for annotated types, and
-/// blanket implementations below cover primitives, `String`, `Vec<u8>`,
-/// `Option<T>`, `Vec<T>`, the map types, and `Arc<T>` (an interface object
-/// token), so nested composites compose automatically.
+/// blanket implementations below cover primitives, `String`, `Option<T>`,
+/// `Vec<T>` (bytes are `Vec<u8>`), the map types, and `Arc<T>` (an interface
+/// object token), so nested composites compose automatically.
 pub trait BufferValue: Sized {
+    /// `Some` when this type's encoding is its little-endian memory layout
+    /// (see [`FixedWidth`]). Leave the default.
+    const FIXED_WIDTH: Option<FixedWidth> = None;
+
+    /// The exact number of bytes [`write_value`](Self::write_value) appends,
+    /// used to size encodings up front. The default of `0` is a valid (if
+    /// slower) hint; every built-in and generated implementation is exact.
+    fn encoded_len(&self) -> usize {
+        0
+    }
+
     /// Append this value's encoding to `w`.
     fn write_value(&self, w: &mut BufferWriter);
 
@@ -433,10 +503,53 @@ pub trait BufferValue: Sized {
     fn read_value(r: &mut BufferReader<'_>) -> Result<Self, BufferDecodeError>;
 }
 
+/// Marks a type that crosses the C ABI as a value buffer: a
+/// `#[weaveffi::record]` or a rich `#[weaveffi::enumeration]`.
+///
+/// The `#[weaveffi::module]` expansion asserts it for every type a module
+/// names but doesn't declare in its own module tree, because such a type is
+/// lowered as a value buffer without the macro seeing its declaration. A
+/// C-style enum, an interface, or a callback interface from another tree
+/// would cross differently in the generated header, so it must fail to
+/// compile instead of silently mismatching.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is declared in a different `#[weaveffi::module]` tree and isn't a record or rich enum",
+    label = "declared outside this module tree",
+    note = "a `#[weaveffi::module]` only sees the declarations inside its own tree, so it can pass a type from another tree only as a value buffer (a record or rich enum)",
+    note = "nest the modules under one `#[weaveffi::module]` root (as inner `mod`s) so the macro can see the declaration"
+)]
+pub trait ByValue {}
+
 macro_rules! scalar_buffer_value {
     ($($t:ty => ($write:ident, $read:ident)),* $(,)?) => {
         $(
             impl BufferValue for $t {
+                fn encoded_len(&self) -> usize {
+                    std::mem::size_of::<$t>()
+                }
+                fn write_value(&self, w: &mut BufferWriter) {
+                    w.$write(*self);
+                }
+                fn read_value(r: &mut BufferReader<'_>) -> Result<Self, BufferDecodeError> {
+                    r.$read()
+                }
+            }
+        )*
+    };
+}
+
+macro_rules! fixed_width_buffer_value {
+    ($($t:ty => ($write:ident, $read:ident)),* $(,)?) => {
+        $(
+            impl BufferValue for $t {
+                const FIXED_WIDTH: Option<FixedWidth> = if cfg!(target_endian = "little") {
+                    Some(FixedWidth(()))
+                } else {
+                    None
+                };
+                fn encoded_len(&self) -> usize {
+                    std::mem::size_of::<$t>()
+                }
                 fn write_value(&self, w: &mut BufferWriter) {
                     w.$write(*self);
                 }
@@ -450,6 +563,9 @@ macro_rules! scalar_buffer_value {
 
 scalar_buffer_value! {
     bool => (write_bool, read_bool),
+}
+
+fixed_width_buffer_value! {
     i8 => (write_i8, read_i8),
     u8 => (write_u8, read_u8),
     i16 => (write_i16, read_i16),
@@ -463,6 +579,9 @@ scalar_buffer_value! {
 }
 
 impl BufferValue for String {
+    fn encoded_len(&self) -> usize {
+        4 + self.len()
+    }
     fn write_value(&self, w: &mut BufferWriter) {
         w.write_string(self);
     }
@@ -477,6 +596,9 @@ impl BufferValue for String {
 /// guarantee this). A zero token is a contract violation and decodes as an
 /// error.
 impl<T> BufferValue for Arc<T> {
+    fn encoded_len(&self) -> usize {
+        8
+    }
     fn write_value(&self, w: &mut BufferWriter) {
         w.write_u64(crate::object::object_to_token(self));
     }
@@ -492,6 +614,9 @@ impl<T> BufferValue for Arc<T> {
 }
 
 impl<T: BufferValue> BufferValue for Option<T> {
+    fn encoded_len(&self) -> usize {
+        1 + self.as_ref().map_or(0, BufferValue::encoded_len)
+    }
     fn write_value(&self, w: &mut BufferWriter) {
         match self {
             Some(v) => {
@@ -511,23 +636,76 @@ impl<T: BufferValue> BufferValue for Option<T> {
 }
 
 impl<T: BufferValue> BufferValue for Vec<T> {
+    fn encoded_len(&self) -> usize {
+        if T::FIXED_WIDTH.is_some() {
+            return 4 + std::mem::size_of_val(self.as_slice());
+        }
+        4 + self.iter().map(BufferValue::encoded_len).sum::<usize>()
+    }
+
     fn write_value(&self, w: &mut BufferWriter) {
         w.write_len(self.len());
+        if let Some(proof) = T::FIXED_WIDTH {
+            w.write_raw(fixed_width_bytes(proof, self));
+            return;
+        }
         for item in self {
             item.write_value(w);
         }
     }
+
     fn read_value(r: &mut BufferReader<'_>) -> Result<Self, BufferDecodeError> {
-        let len = r.read_len()?;
-        let mut out = Vec::with_capacity(len.min(r.remaining()));
-        for _ in 0..len {
+        let count = r.read_count()?;
+        if let Some(proof) = T::FIXED_WIDTH {
+            let size = count
+                .checked_mul(std::mem::size_of::<T>())
+                .ok_or(BufferDecodeError {
+                    context: "list length overflows",
+                })?;
+            let bytes = r.take(size, "fixed-width list")?;
+            return Ok(fixed_width_from_bytes(proof, bytes, count));
+        }
+        let mut out = Vec::with_capacity(count.min(r.remaining()));
+        for _ in 0..count {
             out.push(T::read_value(r)?);
         }
         Ok(out)
     }
 }
 
+/// View a fixed-width slice as its encoded bytes.
+fn fixed_width_bytes<T: BufferValue>(_proof: FixedWidth, items: &[T]) -> &[u8] {
+    // SAFETY: `FixedWidth` is only constructed for the integer and float
+    // types on little-endian targets, which have no padding and whose memory
+    // layout is exactly their encoding, so every byte is initialized.
+    unsafe { std::slice::from_raw_parts(items.as_ptr().cast::<u8>(), std::mem::size_of_val(items)) }
+}
+
+/// Copy `count` fixed-width elements out of their encoded bytes.
+fn fixed_width_from_bytes<T: BufferValue>(
+    _proof: FixedWidth,
+    bytes: &[u8],
+    count: usize,
+) -> Vec<T> {
+    let mut out = Vec::<T>::with_capacity(count);
+    // SAFETY: `FixedWidth` guarantees every bit pattern of `T` is valid and
+    // that its encoding is its memory layout; `bytes` holds exactly `count`
+    // elements, the destination has room for them, and a byte-wise copy has
+    // no alignment requirement.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr().cast::<u8>(), bytes.len());
+        out.set_len(count);
+    }
+    out
+}
+
 impl<K: BufferValue + Ord, V: BufferValue> BufferValue for std::collections::BTreeMap<K, V> {
+    fn encoded_len(&self) -> usize {
+        4 + self
+            .iter()
+            .map(|(k, v)| k.encoded_len() + v.encoded_len())
+            .sum::<usize>()
+    }
     fn write_value(&self, w: &mut BufferWriter) {
         w.write_len(self.len());
         for (k, v) in self {
@@ -536,7 +714,7 @@ impl<K: BufferValue + Ord, V: BufferValue> BufferValue for std::collections::BTr
         }
     }
     fn read_value(r: &mut BufferReader<'_>) -> Result<Self, BufferDecodeError> {
-        let len = r.read_len()?;
+        let len = r.read_count()?;
         let mut out = Self::new();
         for _ in 0..len {
             let k = K::read_value(r)?;
@@ -550,6 +728,12 @@ impl<K: BufferValue + Ord, V: BufferValue> BufferValue for std::collections::BTr
 impl<K: BufferValue + std::hash::Hash + Eq, V: BufferValue> BufferValue
     for std::collections::HashMap<K, V>
 {
+    fn encoded_len(&self) -> usize {
+        4 + self
+            .iter()
+            .map(|(k, v)| k.encoded_len() + v.encoded_len())
+            .sum::<usize>()
+    }
     fn write_value(&self, w: &mut BufferWriter) {
         w.write_len(self.len());
         for (k, v) in self {
@@ -558,7 +742,7 @@ impl<K: BufferValue + std::hash::Hash + Eq, V: BufferValue> BufferValue
         }
     }
     fn read_value(r: &mut BufferReader<'_>) -> Result<Self, BufferDecodeError> {
-        let len = r.read_len()?;
+        let len = r.read_count()?;
         let mut out = Self::with_capacity(len.min(r.remaining()));
         for _ in 0..len {
             let k = K::read_value(r)?;
@@ -569,10 +753,11 @@ impl<K: BufferValue + std::hash::Hash + Eq, V: BufferValue> BufferValue
     }
 }
 
-/// Encode one [`BufferValue`] into a fresh byte buffer.
+/// Encode one [`BufferValue`] into a fresh byte buffer, allocated once at
+/// the size [`BufferValue::encoded_len`] reports.
 #[must_use]
 pub fn encode_value<T: BufferValue>(value: &T) -> Vec<u8> {
-    let mut w = BufferWriter::new();
+    let mut w = BufferWriter::with_capacity(value.encoded_len());
     value.write_value(&mut w);
     w.finish()
 }
@@ -700,5 +885,62 @@ mod tests {
     fn invalid_utf8_is_rejected() {
         let bytes = [2, 0, 0, 0, 0xFF, 0xFE];
         assert!(decode_value::<String>(&bytes).is_err());
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct NoFields;
+
+    impl BufferValue for NoFields {
+        fn write_value(&self, _w: &mut BufferWriter) {}
+        fn read_value(_r: &mut BufferReader<'_>) -> Result<Self, BufferDecodeError> {
+            Ok(NoFields)
+        }
+    }
+
+    #[test]
+    fn zero_sized_elements_allow_counts_beyond_the_remaining_bytes() {
+        roundtrip(vec![NoFields, NoFields, NoFields]);
+        assert_eq!(encode_value(&vec![NoFields, NoFields]), [2, 0, 0, 0]);
+    }
+
+    #[test]
+    fn encoded_len_is_exact() {
+        fn check<T: BufferValue>(v: T) {
+            let bytes = encode_value(&v);
+            assert_eq!(bytes.len(), v.encoded_len());
+            assert_eq!(bytes.capacity(), bytes.len());
+        }
+        check(vec![1u16, 2, 3]);
+        check(vec![1.5f64]);
+        check(vec![true, false]);
+        check(Some("text".to_string()));
+        check(vec![Some(vec![1i64]), None]);
+        let mut m = BTreeMap::new();
+        m.insert("k".to_string(), vec![Some(1u8)]);
+        check(m);
+    }
+
+    #[test]
+    fn fixed_width_lists_use_the_scalar_layout() {
+        let v = vec![1i32, -2, 0x0102_0304];
+        let mut slow = BufferWriter::new();
+        slow.write_len(v.len());
+        for x in &v {
+            slow.write_i32(*x);
+        }
+        assert_eq!(encode_value(&v), slow.finish());
+        roundtrip(v);
+        roundtrip(vec![f32::MIN, 0.0, f32::MAX]);
+        roundtrip(Vec::<u64>::new());
+    }
+
+    #[test]
+    fn truncated_fixed_width_list_is_rejected() {
+        let mut bytes = encode_value(&vec![7u32, 8]);
+        bytes.pop();
+        assert!(decode_value::<Vec<u32>>(&bytes).is_err());
+        let huge = [0xFF, 0xFF, 0xFF, 0xFF];
+        assert!(decode_value::<Vec<u64>>(&huge).is_err());
+        assert!(decode_value::<Vec<String>>(&huge).is_err());
     }
 }

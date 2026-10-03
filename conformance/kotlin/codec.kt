@@ -1,56 +1,35 @@
 // Conformance consumer: codec sample, Kotlin (JVM via JNI) target.
 //
 // Drives the value-buffer round-trip oracle through the generated Kotlin
-// encoder and decoder (`WeaveBufferWriter`/`WeaveBufferReader` plus the
-// per-type `pack*`/`unpack*` routines). For `Scalars` and `Composite` the
-// consumer decodes the producer's canonical fixture and checks every field
-// against concrete values, hands the same value back through `verify*` (which
-// proves the Kotlin encoder produced exactly the bytes Rust encodes), and
-// compares `roundtrip*` output field by field. It then builds its own values
-// from scratch with edge cases (empty strings, lists, maps, and byte arrays;
-// present-but-empty optionals; BMP and supplementary unicode; the i8..u64
-// extremes, with unsigned values carried in Kotlin's signed types; NaN, both
-// infinities, negative zero, and a subnormal) and round-trips them, exercises
-// every `Shape` variant alone and inside lists and optionals, checks the
-// typed `CodecException.Mismatch` from a rejected fixture, and exercises
-// `Holder` (objects inside records, optionals, and lists: `sumHolder`,
-// `primaryOf` returning the same native object as `holder.primary`,
-// `samePrimary`, and clean release of every adopted reference with double
-// `close()` safe and use after close rejected). Compiled in-module with the
-// generated `WeaveFFI.kt`, so the `internal` buffer helpers and `handle` are
-// reachable.
+// encoder and decoder (`BufferWriter`/`BufferReader` plus the per-type
+// `pack*`/`unpack*` routines). For `Scalars` and `Composite` the consumer
+// decodes the producer's canonical fixture and checks every field, hands the
+// same value back through `verify*` (proving the Kotlin encoder produced
+// exactly the bytes Rust encodes), and compares `roundtrip*` output field by
+// field. It then round-trips its own edge cases (empty strings, lists, maps,
+// and byte arrays; present-but-empty optionals; BMP and supplementary
+// unicode; strings with interior NULs, both inside buffers and as direct
+// arguments; the i8..u64 extremes; NaN, infinities, negative zero, and a
+// subnormal), every `Shape` variant, the typed `CodecException.Mismatch`,
+// and `Holder` (objects inside records, optionals, and lists, with clean
+// release of every adopted reference). At exit it checks that every native
+// resource was released.
 @file:JvmName("Main")
 
-import com.weaveffi.CodecException
-import com.weaveffi.Color
-import com.weaveffi.Composite
-import com.weaveffi.Holder
-import com.weaveffi.Scalars
-import com.weaveffi.Shape
-import com.weaveffi.Token
-import com.weaveffi.WeaveFFI
-import com.weaveffi.WeaveFFIException
-import com.weaveffi.packComposite
-import com.weaveffi.unpackComposite
-import com.weaveffi.weaveDecode
-import com.weaveffi.weaveEncode
-import kotlin.system.exitProcess
-
-fun expect(cond: Boolean, msg: String) {
-    if (!cond) {
-        System.err.println("assertion failed: $msg")
-        exitProcess(1)
-    }
-}
-
-/** Run `block` and return the exception it threw, or null if it completed. */
-inline fun thrownBy(block: () -> Unit): Throwable? =
-    try {
-        block()
-        null
-    } catch (e: Throwable) {
-        e
-    }
+import codec.CodecException
+import codec.Color
+import codec.Composite
+import codec.Holder
+import codec.Scalars
+import codec.Shape
+import codec.Token
+import codec.Codec
+import codec.JniBridge
+import codec.FfiException
+import codec.packComposite
+import codec.unpackComposite
+import codec.decodeBuffer
+import codec.encodeBuffer
 
 /** The canonical `Scalars` fixture, spelled with Kotlin's signed carriers for the unsigned fields. */
 fun canonicalScalars(): Scalars = Scalars(
@@ -95,7 +74,7 @@ fun compositeEquals(a: Composite, b: Composite): Boolean =
 
 fun checkScalars() {
     val canonical = canonicalScalars()
-    val sample = WeaveFFI.sampleScalars()
+    val sample = Codec.sampleScalars()
     // Producer encodes, consumer decodes: every field, with the unsigned ones
     // read back through their signed carriers.
     expect(sample.i8_value.toInt() == -8, "i8 (got ${sample.i8_value})")
@@ -113,17 +92,17 @@ fun checkScalars() {
     expect(sample == canonical, "sample equals the locally built canonical Scalars")
 
     // Consumer encodes, producer decodes and compares with its canonical.
-    expect(WeaveFFI.verifyScalars(sample), "verifyScalars(sample)")
-    expect(WeaveFFI.verifyScalars(canonical), "verifyScalars(locally built canonical)")
-    expect(WeaveFFI.roundtripScalars(sample) == sample, "roundtripScalars(sample) equals sample")
+    expect(Codec.verifyScalars(sample), "verifyScalars(sample)")
+    expect(Codec.verifyScalars(canonical), "verifyScalars(locally built canonical)")
+    expect(Codec.roundtripScalars(sample) == sample, "roundtripScalars(sample) equals sample")
 
     // A rejected fixture is the typed domain error.
-    val mismatch = thrownBy { WeaveFFI.verifyScalars(canonical.copy(flag = false)) }
+    val mismatch = thrownBy { Codec.verifyScalars(canonical.copy(flag = false)) }
     expect(mismatch is CodecException.Mismatch, "verifyScalars(modified) throws Mismatch (got $mismatch)")
-    expect((mismatch as WeaveFFIException).code == 1, "Mismatch code 1 (got ${mismatch.code})")
+    expect((mismatch as FfiException).code == 1, "Mismatch code 1 (got ${mismatch.code})")
     expect(mismatch.message == "value does not match the canonical fixture", "Mismatch message (got ${mismatch.message})")
-    expect(thrownBy { WeaveFFI.verifyScalars(canonical.copy(u64_value = 0L)) } is CodecException.Mismatch, "u64 difference detected")
-    expect(thrownBy { WeaveFFI.verifyScalars(canonical.copy(color = Color.Red)) } is CodecException.Mismatch, "enum difference detected")
+    expect(thrownBy { Codec.verifyScalars(canonical.copy(u64_value = 0L)) } is CodecException.Mismatch, "u64 difference detected")
+    expect(thrownBy { Codec.verifyScalars(canonical.copy(color = Color.Red)) } is CodecException.Mismatch, "enum difference detected")
 
     // From scratch, at the extremes of every width, plus the special floats.
     val edge = Scalars(
@@ -140,7 +119,7 @@ fun checkScalars() {
         flag = false,
         color = Color.Red,
     )
-    val edgeBack = WeaveFFI.roundtripScalars(edge)
+    val edgeBack = Codec.roundtripScalars(edge)
     expect(edgeBack.i8_value == Byte.MIN_VALUE, "i8 min round-trips")
     expect(edgeBack.u8_value.toUByte() == UByte.MAX_VALUE, "u8 255 round-trips")
     expect(edgeBack.i16_value == Short.MIN_VALUE, "i16 min round-trips")
@@ -168,14 +147,14 @@ fun checkScalars() {
         f64_value = Double.POSITIVE_INFINITY,
         color = Color.Green,
     )
-    expect(WeaveFFI.roundtripScalars(maxes) == maxes, "max Scalars round-trip")
+    expect(Codec.roundtripScalars(maxes) == maxes, "max Scalars round-trip")
     val subnormal = edge.copy(f32_value = Float.MIN_VALUE, f64_value = Double.MIN_VALUE)
-    expect(WeaveFFI.roundtripScalars(subnormal) == subnormal, "subnormal floats round-trip")
+    expect(Codec.roundtripScalars(subnormal) == subnormal, "subnormal floats round-trip")
 }
 
 fun checkComposite() {
     val canonical = canonicalScalars()
-    val sample = WeaveFFI.sampleComposite()
+    val sample = Codec.sampleComposite()
     expect(sample.name == "héllo wörld ✓", "name (got ${sample.name})")
     expect(sample.blob.contentEquals(byteArrayOf(0, 1, 2, 253.toByte(), 254.toByte(), 255.toByte())), "blob (got ${sample.blob.toList()})")
     expect(sample.some_i64 == Long.MIN_VALUE, "some_i64 is i64::MIN (got ${sample.some_i64})")
@@ -206,25 +185,25 @@ fun checkComposite() {
     expect(sample.colors == listOf(Color.Red, Color.Green, Color.Blue), "colors (got ${sample.colors})")
 
     // Consumer encodes, producer decodes and compares.
-    expect(WeaveFFI.verifyComposite(sample), "verifyComposite(sample)")
-    val back = WeaveFFI.roundtripComposite(sample)
+    expect(Codec.verifyComposite(sample), "verifyComposite(sample)")
+    val back = Codec.roundtripComposite(sample)
     expect(compositeEquals(back, sample), "roundtripComposite(sample) equals sample")
     // The local encoder and decoder agree with each other too.
-    val local = weaveDecode(weaveEncode { w -> packComposite(w, sample) }) { r -> unpackComposite(r) }
+    val local = decodeBuffer(encodeBuffer { w -> packComposite(w, sample) }) { r -> unpackComposite(r) }
     expect(compositeEquals(local, sample), "local encode/decode round trip")
 
     // The producer's rendering is a debugging aid: check it saw our unicode.
-    val described = WeaveFFI.describeComposite(sample)
+    val described = Codec.describeComposite(sample)
     expect(described.contains("héllo wörld ✓"), "describeComposite carries the name (got $described)")
     expect(described.contains("Labeled { label: \"tag\", count: 3 }"), "describeComposite carries the shape")
 
     // Any single change is detected by the producer.
     val changed = sample.copy(sparse = listOf(true, true, false))
-    val mismatch = thrownBy { WeaveFFI.verifyComposite(changed) }
+    val mismatch = thrownBy { Codec.verifyComposite(changed) }
     expect(mismatch is CodecException.Mismatch, "verifyComposite(changed) throws Mismatch (got $mismatch)")
-    expect(thrownBy { WeaveFFI.verifyComposite(sample.copy(none_i64 = 0L)) } is CodecException.Mismatch, "present vs absent optional detected")
-    expect(thrownBy { WeaveFFI.verifyComposite(sample.copy(maybe_list = null)) } is CodecException.Mismatch, "absent list detected")
-    expect(thrownBy { WeaveFFI.verifyComposite(sample.copy(some_text = null)) } is CodecException.Mismatch, "absent empty string detected")
+    expect(thrownBy { Codec.verifyComposite(sample.copy(none_i64 = 0L)) } is CodecException.Mismatch, "present vs absent optional detected")
+    expect(thrownBy { Codec.verifyComposite(sample.copy(maybe_list = null)) } is CodecException.Mismatch, "absent list detected")
+    expect(thrownBy { Codec.verifyComposite(sample.copy(some_text = null)) } is CodecException.Mismatch, "absent empty string detected")
 
     // From scratch: everything empty or absent, with supplementary unicode.
     val bare = Composite(
@@ -246,8 +225,8 @@ fun checkComposite() {
         sparse = listOf(),
         colors = listOf(),
     )
-    val bareBack = WeaveFFI.roundtripComposite(bare)
-    expect(compositeEquals(bareBack, bare), "bare Composite round-trips (got ${WeaveFFI.describeComposite(bareBack)})")
+    val bareBack = Codec.roundtripComposite(bare)
+    expect(compositeEquals(bareBack, bare), "bare Composite round-trips (got ${Codec.describeComposite(bareBack)})")
     expect(bareBack.maybe_list == null && bareBack.some_text == null, "absent optionals stay absent")
 
     val full = Composite(
@@ -269,14 +248,14 @@ fun checkComposite() {
         sparse = listOf(null, null, true),
         colors = listOf(Color.Blue, Color.Blue, Color.Red),
     )
-    val fullBack = WeaveFFI.roundtripComposite(full)
-    expect(compositeEquals(fullBack, full), "full Composite round-trips (got ${WeaveFFI.describeComposite(fullBack)})")
+    val fullBack = Codec.roundtripComposite(full)
+    expect(compositeEquals(fullBack, full), "full Composite round-trips (got ${Codec.describeComposite(fullBack)})")
     expect(fullBack.maybe_list != null && fullBack.maybe_list.isEmpty(), "present-but-empty bytes stay present")
     expect(fullBack.empty[0].isNaN() && fullBack.empty[2].toRawBits() == (-0.0).toRawBits(), "special doubles inside a list")
     expect((fullBack.shapes[0] as Shape.Circle).radius.isNaN(), "NaN inside a rich enum")
     expect((fullBack.shapes[1] as Shape.Rect).width.toRawBits() == (-0.0f).toRawBits(), "-0.0f inside a rich enum")
     expect(fullBack.name == full.name, "supplementary characters and NUL survive inside a buffer")
-    expect(WeaveFFI.describeComposite(full).contains("日本語 🚀 \\0 emoji and NUL"), "producer decoded the unicode name")
+    expect(Codec.describeComposite(full).contains("日本語 🚀 \\0 emoji and NUL"), "producer decoded the unicode name")
 }
 
 fun checkShapes() {
@@ -290,95 +269,95 @@ fun checkShapes() {
         Shape.Nested(canonical.copy(flag = false), null),
     )
     for (s in all) {
-        expect(WeaveFFI.roundtripShape(s) == s, "roundtripShape($s)")
+        expect(Codec.roundtripShape(s) == s, "roundtripShape($s)")
     }
-    expect(WeaveFFI.roundtripShapes(all) == all, "roundtripShapes(all)")
-    expect(WeaveFFI.roundtripShapes(listOf()).isEmpty(), "roundtripShapes(empty)")
-    expect(WeaveFFI.roundtripShape(Shape.Empty) === Shape.Empty, "Empty decodes to the singleton")
-    expect(WeaveFFI.describeShape(Shape.Empty) == "Empty", "describe Empty")
-    expect(WeaveFFI.describeShape(Shape.Circle(2.5)) == "Circle { radius: 2.5 }", "describe Circle (got ${WeaveFFI.describeShape(Shape.Circle(2.5))})")
-    expect(WeaveFFI.describeShape(Shape.Rect(1.0f, 0.5f)) == "Rect { width: 1.0, height: 0.5 }", "describe Rect")
-    expect(WeaveFFI.describeShape(Shape.Labeled("tag", 3)) == "Labeled { label: \"tag\", count: 3 }", "describe Labeled")
-    val nested = WeaveFFI.describeShape(Shape.Nested(canonical, null))
+    expect(Codec.roundtripShapes(all) == all, "roundtripShapes(all)")
+    expect(Codec.roundtripShapes(listOf()).isEmpty(), "roundtripShapes(empty)")
+    expect(Codec.roundtripShape(Shape.Empty) === Shape.Empty, "Empty decodes to the singleton")
+    expect(Codec.describeShape(Shape.Empty) == "Empty", "describe Empty")
+    expect(Codec.describeShape(Shape.Circle(2.5)) == "Circle { radius: 2.5 }", "describe Circle (got ${Codec.describeShape(Shape.Circle(2.5))})")
+    expect(Codec.describeShape(Shape.Rect(1.0f, 0.5f)) == "Rect { width: 1.0, height: 0.5 }", "describe Rect")
+    expect(Codec.describeShape(Shape.Labeled("tag", 3)) == "Labeled { label: \"tag\", count: 3 }", "describe Labeled")
+    val nested = Codec.describeShape(Shape.Nested(canonical, null))
     expect(nested.startsWith("Nested { inner: Scalars { i8_value: -8, u8_value: 200,") && nested.endsWith("note: None }"), "describe Nested (got $nested)")
-    expect(WeaveFFI.describeShape(Shape.Labeled("🚀", -1)) == "Labeled { label: \"🚀\", count: -1 }", "describe Labeled with emoji")
+    expect(Codec.describeShape(Shape.Labeled("🚀", -1)) == "Labeled { label: \"🚀\", count: -1 }", "describe Labeled with emoji")
 }
 
 fun checkPrimitives() {
-    expect(WeaveFFI.roundtripOptI64(null) == null, "roundtripOptI64(null)")
-    expect(WeaveFFI.roundtripOptI64(Long.MIN_VALUE) == Long.MIN_VALUE, "roundtripOptI64(min)")
-    expect(WeaveFFI.roundtripOptI64(0L) == 0L, "roundtripOptI64(0)")
-    expect(WeaveFFI.roundtripMap(mapOf()) == mapOf<String, Long>(), "roundtripMap(empty)")
+    expect(Codec.roundtripOptI64(null) == null, "roundtripOptI64(null)")
+    expect(Codec.roundtripOptI64(Long.MIN_VALUE) == Long.MIN_VALUE, "roundtripOptI64(min)")
+    expect(Codec.roundtripOptI64(0L) == 0L, "roundtripOptI64(0)")
+    expect(Codec.roundtripMap(mapOf()) == mapOf<String, Long>(), "roundtripMap(empty)")
     val m = mapOf("" to 0L, "a" to -1L, "héllo 🚀" to Long.MAX_VALUE)
-    expect(WeaveFFI.roundtripMap(m) == m, "roundtripMap (got ${WeaveFFI.roundtripMap(m)})")
+    expect(Codec.roundtripMap(m) == m, "roundtripMap (got ${Codec.roundtripMap(m)})")
 
     // Direct strings: BMP and supplementary characters both survive the JNI
     // crossing (the bridge converts to standard UTF-8, not modified UTF-8).
     for (s in listOf("", "plain", "héllo wörld ✓", "rocket 🚀 end", "🚀", "\uFFFF")) {
-        expect(WeaveFFI.roundtripString(s) == s, "roundtripString(${s.toByteArray().toList()})")
+        expect(Codec.roundtripString(s) == s, "roundtripString(${s.toByteArray().toList()})")
     }
-    // A C string can't carry U+0000: the producer reports a marshalling error
-    // rather than truncating.
-    val nul = thrownBy { WeaveFFI.roundtripString("a\u0000b") }
-    expect(nul is WeaveFFIException && nul.code == -3, "embedded NUL is rejected with code -3 (got $nul)")
-    expect(WeaveFFI.roundtripBytes(byteArrayOf()).isEmpty(), "roundtripBytes(empty)")
+    // Strings cross as UTF-8 bytes plus a length, so interior NULs survive.
+    for (s in listOf("a\u0000b", "\u0000", "\u0000\u0000end", "\uD83D\uDE80\u0000\uD83D\uDE80")) {
+        expect(Codec.roundtripString(s) == s, "roundtripString with NUL (${s.toByteArray().toList()})")
+    }
+    expect(Codec.roundtripBytes(byteArrayOf()).isEmpty(), "roundtripBytes(empty)")
     val allBytes = ByteArray(256) { it.toByte() }
-    expect(WeaveFFI.roundtripBytes(allBytes).contentEquals(allBytes), "roundtripBytes(0..255)")
+    expect(Codec.roundtripBytes(allBytes).contentEquals(allBytes), "roundtripBytes(0..255)")
 
-    expect(WeaveFFI.roundtripI64(Long.MIN_VALUE) == Long.MIN_VALUE, "roundtripI64(min)")
-    expect(WeaveFFI.roundtripI64(Long.MAX_VALUE) == Long.MAX_VALUE, "roundtripI64(max)")
-    expect(WeaveFFI.roundtripI64(-1L) == -1L, "roundtripI64(-1)")
-    expect(WeaveFFI.roundtripU64(ULong.MAX_VALUE.toLong()).toULong() == ULong.MAX_VALUE, "roundtripU64(max)")
-    expect(WeaveFFI.roundtripU64(Long.MIN_VALUE).toULong() == 9_223_372_036_854_775_808UL, "roundtripU64(2^63)")
-    expect(WeaveFFI.roundtripU64(0L) == 0L, "roundtripU64(0)")
-    expect(WeaveFFI.roundtripF64(Double.NaN).isNaN(), "roundtripF64(NaN)")
-    expect(WeaveFFI.roundtripF64(Double.POSITIVE_INFINITY) == Double.POSITIVE_INFINITY, "roundtripF64(+inf)")
-    expect(WeaveFFI.roundtripF64(Double.NEGATIVE_INFINITY) == Double.NEGATIVE_INFINITY, "roundtripF64(-inf)")
-    expect(WeaveFFI.roundtripF64(-0.0).toRawBits() == (-0.0).toRawBits(), "roundtripF64(-0.0) keeps the sign")
-    expect(WeaveFFI.roundtripF64(Double.MIN_VALUE) == Double.MIN_VALUE, "roundtripF64(subnormal)")
-    expect(WeaveFFI.roundtripF64(Double.MAX_VALUE) == Double.MAX_VALUE, "roundtripF64(max)")
-    expect(WeaveFFI.roundtripBool(true) && !WeaveFFI.roundtripBool(false), "roundtripBool")
-    expect(WeaveFFI.roundtripColor(Color.Blue) == Color.Blue, "roundtripColor(Blue)")
-    expect(WeaveFFI.roundtripColor(Color.Red) == Color.Red, "roundtripColor(Red)")
+    expect(Codec.roundtripI64(Long.MIN_VALUE) == Long.MIN_VALUE, "roundtripI64(min)")
+    expect(Codec.roundtripI64(Long.MAX_VALUE) == Long.MAX_VALUE, "roundtripI64(max)")
+    expect(Codec.roundtripI64(-1L) == -1L, "roundtripI64(-1)")
+    expect(Codec.roundtripU64(ULong.MAX_VALUE.toLong()).toULong() == ULong.MAX_VALUE, "roundtripU64(max)")
+    expect(Codec.roundtripU64(Long.MIN_VALUE).toULong() == 9_223_372_036_854_775_808UL, "roundtripU64(2^63)")
+    expect(Codec.roundtripU64(0L) == 0L, "roundtripU64(0)")
+    expect(Codec.roundtripF64(Double.NaN).isNaN(), "roundtripF64(NaN)")
+    expect(Codec.roundtripF64(Double.POSITIVE_INFINITY) == Double.POSITIVE_INFINITY, "roundtripF64(+inf)")
+    expect(Codec.roundtripF64(Double.NEGATIVE_INFINITY) == Double.NEGATIVE_INFINITY, "roundtripF64(-inf)")
+    expect(Codec.roundtripF64(-0.0).toRawBits() == (-0.0).toRawBits(), "roundtripF64(-0.0) keeps the sign")
+    expect(Codec.roundtripF64(Double.MIN_VALUE) == Double.MIN_VALUE, "roundtripF64(subnormal)")
+    expect(Codec.roundtripF64(Double.MAX_VALUE) == Double.MAX_VALUE, "roundtripF64(max)")
+    expect(Codec.roundtripBool(true) && !Codec.roundtripBool(false), "roundtripBool")
+    expect(Codec.roundtripColor(Color.Blue) == Color.Blue, "roundtripColor(Blue)")
+    expect(Codec.roundtripColor(Color.Red) == Color.Red, "roundtripColor(Red)")
     expect(Color.Blue.value == 7 && Color.fromValue(7) == Color.Blue, "Color discriminants")
 }
 
 fun checkHolders() {
     // Objects inside a record decoded from a buffer: each token is one adopted
     // strong reference wrapped in a Token.
-    val holder = WeaveFFI.makeHolder(10L, true)
+    val holder = Codec.makeHolder(10L, true)
     expect(holder.primary.value() == 10L, "primary value (got ${holder.primary.value()})")
     expect(holder.spare != null && holder.spare.value() == 11L, "spare value (got ${holder.spare?.value()})")
     expect(holder.many.map { it.value() } == listOf(12L, 13L, 14L), "many values (got ${holder.many.map { it.value() }})")
-    expect(holder.many.map { it.handle }.toSet().size == 3, "many are distinct objects")
+    expect(holder.many.map { it.handle.address }.toSet().size == 3, "many are distinct objects")
 
     // Encoding a holder mints one fresh reference per token, so the wrappers
     // stay valid after the producer consumed the buffer.
-    expect(WeaveFFI.sumHolder(holder) == 10L + 11L + 12L + 13L + 14L, "sumHolder (got ${WeaveFFI.sumHolder(holder)})")
-    expect(WeaveFFI.sumHolder(holder) == 60L, "sumHolder again (wrappers still alive)")
+    expect(Codec.sumHolder(holder) == 10L + 11L + 12L + 13L + 14L, "sumHolder (got ${Codec.sumHolder(holder)})")
+    expect(Codec.sumHolder(holder) == 60L, "sumHolder again (wrappers still alive)")
     expect(holder.primary.value() == 10L, "primary still usable after encoding")
 
     // An object return is the same native object as the record's field.
-    val primary = WeaveFFI.primaryOf(holder)
+    val primary = Codec.primaryOf(holder)
     expect(primary !== holder.primary, "primaryOf returns a new wrapper")
-    expect(primary.handle == holder.primary.handle, "primaryOf wraps the same native object")
+    expect(primary.handle.address == holder.primary.handle.address, "primaryOf wraps the same native object")
     expect(primary.value() == 10L, "primaryOf value")
-    expect(WeaveFFI.samePrimary(holder, holder), "samePrimary(holder, holder)")
-    val other = WeaveFFI.makeHolder(10L, false)
+    expect(Codec.samePrimary(holder, holder), "samePrimary(holder, holder)")
+    val other = Codec.makeHolder(10L, false)
     expect(other.spare == null, "spare absent when not requested")
     expect(other.primary.value() == 10L, "other primary value equal but ...")
-    expect(!WeaveFFI.samePrimary(holder, other), "... samePrimary distinguishes distinct objects")
-    expect(WeaveFFI.sumHolder(other) == 10L + 12L + 13L + 14L, "sumHolder without spare")
+    expect(!Codec.samePrimary(holder, other), "... samePrimary distinguishes distinct objects")
+    expect(Codec.sumHolder(other) == 10L + 12L + 13L + 14L, "sumHolder without spare")
 
     // A holder assembled in Kotlin from consumer-created tokens, sharing one
     // token across positions.
     val shared = Token(100L)
     val mine = Holder(primary = shared, spare = shared, many = listOf(shared, Token(1L), primary))
-    expect(WeaveFFI.sumHolder(mine) == 100L + 100L + 100L + 1L + 10L, "sumHolder over a Kotlin-built holder")
-    expect(WeaveFFI.samePrimary(mine, Holder(shared, null, listOf())), "samePrimary across Kotlin-built holders")
-    expect(WeaveFFI.samePrimary(Holder(primary, null, listOf()), holder), "samePrimary through primaryOf's wrapper")
-    val mineBack = WeaveFFI.primaryOf(mine)
-    expect(mineBack.handle == shared.handle && mineBack.value() == 100L, "primaryOf a Kotlin-built holder")
+    expect(Codec.sumHolder(mine) == 100L + 100L + 100L + 1L + 10L, "sumHolder over a Kotlin-built holder")
+    expect(Codec.samePrimary(mine, Holder(shared, null, listOf())), "samePrimary across Kotlin-built holders")
+    expect(Codec.samePrimary(Holder(primary, null, listOf()), holder), "samePrimary through primaryOf's wrapper")
+    val mineBack = Codec.primaryOf(mine)
+    expect(mineBack.handle.address == shared.handle.address && mineBack.value() == 100L, "primaryOf a Kotlin-built holder")
 
     // Release everything. Closing one wrapper over a shared object leaves the
     // others valid; double close is safe; use after close throws; closing a
@@ -387,7 +366,7 @@ fun checkHolders() {
     primary.close()
     expect(thrownBy { primary.value() } is IllegalStateException, "closed token rejects use")
     expect(holder.primary.value() == 10L, "the record's wrapper survives closing primaryOf's wrapper")
-    expect(thrownBy { WeaveFFI.sumHolder(mine) } is IllegalStateException, "encoding a holder with a closed token throws")
+    expect(thrownBy { Codec.sumHolder(mine) } is IllegalStateException, "encoding a holder with a closed token throws")
     mineBack.close()
     expect(shared.value() == 100L, "shared token alive after closing its second wrapper")
     shared.close()
@@ -398,19 +377,25 @@ fun checkHolders() {
     holder.many.forEach { it.close() }
     other.primary.close()
     other.many.forEach { it.close() }
-    expect(thrownBy { WeaveFFI.sumHolder(holder) } is IllegalStateException, "fully closed holder rejects encoding")
+    expect(thrownBy { Codec.sumHolder(holder) } is IllegalStateException, "fully closed holder rejects encoding")
 
     // Wrappers that are never closed are released by the Cleaner; create a
     // batch and let them go.
-    repeat(50) { WeaveFFI.makeHolder(it.toLong(), true) }
+    repeat(50) { Codec.makeHolder(it.toLong(), true) }
     System.gc()
 }
 
-fun main() {
+fun run() {
     checkScalars()
     checkComposite()
     checkShapes()
     checkPrimitives()
     checkHolders()
     println("kotlin/codec: OK")
+}
+
+fun main() {
+    run()
+    expectNoLeaks { JniBridge.debug_live(it) }
+    println("kotlin/codec: no leaks")
 }

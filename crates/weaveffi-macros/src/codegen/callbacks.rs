@@ -4,65 +4,60 @@
 //! lift `Arc<dyn Trait>` parameters.
 //!
 //! This is the producer half of the contract stated by
-//! [`weaveffi_core::plan::CallbackProtocol`]: each method lowers its
-//! arguments (strings and buffers are borrowed for the call and freed after
-//! the vtable entry returns; objects transfer one strong reference the
-//! consumer adopts), calls the entry with `(ctx, args…, &mut err)`, and then
-//! checks `err`. A consumer failure is raised through
-//! `weaveffi::abi::raise_foreign_error`: on unwinding builds it unwinds with a
-//! `ForeignError` payload that the enclosing thunk reports as
-//! `FOREIGN_ERROR_CODE`; on `panic = "abort"` builds it is recorded and the
-//! thunk picks it up after the producer returns.
+//! [`weaveffi_model::plan::CallbackProtocol`]: each method lowers its
+//! arguments (strings, bytes, and buffers are borrowed for the call as
+//! `(ptr, len)`; objects transfer one strong reference the consumer adopts),
+//! calls the entry with `(ctx, args…, &mut err)`, and then checks `err`. A
+//! method declared to return `Result<T, weaveffi::ForeignError>` returns the
+//! consumer's failure as an `Err`; one returning a plain `T` raises it
+//! through `weaveffi::abi::raise_foreign_error` (an unwind on unwinding
+//! builds, a deferred report to the enclosing thunk on `panic = "abort"`
+//! builds).
 
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::TokenStream;
 use quote::{quote, ToTokens};
-use weaveffi_core::model::{CallbackInterfaceBinding, CallbackMethodBinding, ParamBinding, Ty};
+use syn::spanned::Spanned as _;
+use weaveffi_model::model::{CallbackInterfaceBinding, CallbackMethodBinding, ParamBinding, Ty};
 
 use super::helpers::{ident, is_copy, ret_arrow, rust_type_ident, slot_type_for, UserSig};
 use super::unsupported;
 
 /// Build the lowering for one callback-method argument as `(preamble, C
-/// arguments, cleanup)`. The Rust parameter is whatever the producer's trait
-/// declares; `is_ref` says whether it arrives borrowed.
+/// arguments)`. The Rust parameter is whatever the producer's trait
+/// declares; everything is borrowed for the duration of the vtable call.
 fn lower_callback_arg(
     pb: &ParamBinding,
     user: &UserSig<'_>,
-) -> syn::Result<(TokenStream, Vec<TokenStream>, TokenStream)> {
+) -> syn::Result<(TokenStream, Vec<TokenStream>)> {
     let n = ident(&pb.name);
     let is_ref = user.param_is_ref(&pb.name);
     let none = TokenStream::new();
-    // Borrow the value for encoding whether it arrived owned or borrowed.
+    // Borrow the value whether it arrived owned or borrowed.
     let borrowed = if is_ref { quote!(#n) } else { quote!(&#n) };
+    let tmp = ident(&format!("__wv_cb_{}", pb.name));
 
     // A buffered payload is borrowed for the call: encode it into a local
     // value buffer, hand the consumer its `(ptr, len)` view, and let the
     // encoding drop afterward.
     if pb.ty.is_buffered() {
-        let tmp = ident(&format!("__wv_cb_{}", pb.name));
         return Ok((
             quote!(let #tmp = ::weaveffi::abi::encode_value(#borrowed);),
             vec![quote!(#tmp.as_ptr()), quote!(#tmp.len())],
-            none,
         ));
     }
     Ok(match &pb.ty {
-        Ty::Enum(_) => (none.clone(), vec![quote!(#n.__weaveffi_to_i32())], none),
+        Ty::Enum(_) => (none, vec![quote!(#n.__weaveffi_to_i32())]),
         ty if is_copy(ty) => {
             let v = if is_ref { quote!(*#n) } else { quote!(#n) };
-            (none.clone(), vec![v], none)
+            (none, vec![v])
         }
-        Ty::StringUtf8 => {
-            let tmp = ident(&format!("__wv_cb_{}", pb.name));
-            (
-                quote!(let #tmp = ::weaveffi::abi::string_to_c_ptr(&#n);),
-                vec![quote!(#tmp)],
-                quote!(::weaveffi::abi::free_string(#tmp);),
-            )
-        }
+        Ty::StringUtf8 => (
+            quote!(let #tmp: &str = ::std::convert::AsRef::<str>::as_ref(#borrowed);),
+            vec![quote!(#tmp.as_ptr()), quote!(#tmp.len())],
+        ),
         Ty::Bytes => (
-            none.clone(),
-            vec![quote!(#n.as_ptr()), quote!(#n.len())],
-            none,
+            quote!(let #tmp: &[u8] = ::std::convert::AsRef::<[u8]>::as_ref(#borrowed);),
+            vec![quote!(#tmp.as_ptr()), quote!(#tmp.len())],
         ),
         // An object transfers one strong reference the consumer adopts (and
         // eventually `_destroy`s). The producer must hold it as an `Arc<T>`,
@@ -70,6 +65,7 @@ fn lower_callback_arg(
         Ty::Interface(_) => {
             if !user.param_wants_arc(&pb.name) {
                 return Err(unsupported(
+                    user.param_span(&pb.name),
                     &pb.name,
                     "callback-interface object parameter that is not an `Arc<T>` (the consumer \
                      adopts a reference, so spell it `Arc<T>`)",
@@ -77,57 +73,79 @@ fn lower_callback_arg(
             }
             let obj = user.param_object(&pb.name);
             (
-                none.clone(),
+                none,
                 vec![
                     quote!(::weaveffi::abi::lower_object::<#obj>(::std::sync::Arc::clone(#borrowed))),
                 ],
-                none,
             )
         }
         Ty::Optional(inner) if matches!(inner.as_ref(), Ty::Interface(_)) => {
             if !user.param_wants_arc(&pb.name) {
                 return Err(unsupported(
+                    user.param_span(&pb.name),
                     &pb.name,
                     "callback-interface object parameter that is not an `Option<Arc<T>>`",
                 ));
             }
             let obj = user.param_object(&pb.name);
             (
-                none.clone(),
-                vec![quote!(::weaveffi::abi::lower_object_opt::<#obj>(#n.clone()))],
                 none,
+                vec![
+                    quote!(::weaveffi::abi::lower_object_opt::<#obj>(::std::clone::Clone::clone(#borrowed))),
+                ],
             )
         }
-        _ => return Err(unsupported(&pb.name, "callback-interface parameter type")),
+        _ => {
+            return Err(unsupported(
+                user.param_span(&pb.name),
+                &pb.name,
+                "callback-interface parameter type",
+            ))
+        }
     })
 }
 
-/// The expression that lifts a vtable entry's return value `__wv_ret` into
-/// the trait method's return type. Callback returns are direct-family only.
-fn lift_callback_ret(ret: Option<&Ty>, user: &UserSig<'_>) -> syn::Result<TokenStream> {
+/// The lift of a successful vtable return `__wv_ret` into the method's value
+/// type, as `(lift, fallback)`. `lift` evaluates to
+/// `Result<T, ForeignError>` (an out-of-range enum discriminant is a
+/// marshalling failure); `fallback` is the value a plain-`T` method returns
+/// after raising a failure on a `panic = "abort"` build. Callback returns are
+/// direct-family only.
+fn lift_callback_ret(
+    ret: Option<&Ty>,
+    user: &UserSig<'_>,
+) -> syn::Result<(TokenStream, TokenStream)> {
     Ok(match ret {
-        None => TokenStream::new(),
+        None => (quote!(::std::result::Result::Ok(())), TokenStream::new()),
         Some(Ty::Enum(name)) => {
             let et = user
                 .ret_object()
                 .unwrap_or_else(|| rust_type_ident(name).into_token_stream());
-            quote! {
-                match <#et>::__weaveffi_from_i32(__wv_ret) {
-                    ::std::option::Option::Some(__wv_e) => __wv_e,
-                    ::std::option::Option::None => {
-                        ::weaveffi::abi::raise_foreign_error(::weaveffi::abi::ForeignError {
+            (
+                quote! {
+                    <#et>::__weaveffi_from_i32(__wv_ret).ok_or_else(|| {
+                        ::weaveffi::abi::ForeignError {
                             code: ::weaveffi::abi::MARSHAL_ERROR_CODE,
                             message: ::std::string::String::from(
                                 "callback interface returned an invalid enum discriminant",
                             ),
-                        });
-                        <#et>::__weaveffi_placeholder()
-                    }
-                }
-            }
+                        }
+                    })
+                },
+                quote!(<#et>::__weaveffi_placeholder()),
+            )
         }
-        Some(ty) if is_copy(ty) => quote!(__wv_ret),
-        Some(_) => return Err(unsupported("callback return", "non-direct return type")),
+        Some(ty) if is_copy(ty) => (
+            quote!(::std::result::Result::Ok(__wv_ret)),
+            quote!(__wv_ret),
+        ),
+        Some(_) => {
+            return Err(unsupported(
+                user.ret_span(),
+                "callback return",
+                "non-direct return type",
+            ))
+        }
     })
 }
 
@@ -137,25 +155,39 @@ fn gen_foreign_method(m: &CallbackMethodBinding, sig: &syn::Signature) -> syn::R
     let field = ident(&m.name);
     let mut pre = TokenStream::new();
     let mut c_args: Vec<TokenStream> = Vec::new();
-    let mut cleanup = TokenStream::new();
     for pb in &m.params {
-        let (p, args, free) = lower_callback_arg(pb, &user)?;
+        let (p, args) = lower_callback_arg(pb, &user)?;
         pre.extend(p);
         c_args.extend(args);
-        cleanup.extend(free);
     }
-    let lifted = lift_callback_ret(m.ret.as_ref(), &user)?;
+    let (lift, fallback) = lift_callback_ret(m.ret.as_ref(), &user)?;
+    let result = quote! {
+        ::weaveffi::abi::foreign_status(&__wv_err).and_then(|()| #lift)
+    };
+    let tail = if user.returns_result() {
+        result
+    } else {
+        quote! {
+            match #result {
+                ::std::result::Result::Ok(__wv_v) => __wv_v,
+                ::std::result::Result::Err(__wv_e) => {
+                    ::weaveffi::abi::raise_foreign_error(__wv_e);
+                    #fallback
+                }
+            }
+        }
+    };
     Ok(quote! {
-        #[allow(unsafe_code, unused_variables, clippy::let_unit_value)]
+        #[allow(unsafe_code, unused_variables, clippy::let_unit_value, clippy::unit_arg)]
         #sig {
             #pre
-            let mut __wv_err = ::weaveffi::abi::weaveffi_error::default();
+            let mut __wv_err = ::weaveffi::abi::FfiError::default();
+            // SAFETY: the vtable and `ctx` are live for the life of the
+            // `ForeignCallback`, and every argument outlives the call.
             let __wv_ret = unsafe {
                 (self.0.vtable().#field)(self.0.ctx(), #(#c_args,)* &mut __wv_err)
             };
-            #cleanup
-            ::weaveffi::abi::check_foreign_error(__wv_err);
-            #lifted
+            #tail
         }
     })
 }
@@ -174,6 +206,7 @@ fn gen_foreign_method(m: &CallbackMethodBinding, sig: &syn::Signature) -> syn::R
 pub(crate) fn gen_callback_interface(
     cb: &CallbackInterfaceBinding,
     item: &syn::ItemTrait,
+    prefix: &str,
 ) -> syn::Result<TokenStream> {
     let vt = ident(&cb.vtable_tag);
     let trait_ident = ident(&cb.name);
@@ -191,7 +224,7 @@ pub(crate) fn gen_callback_interface(
             })
             .ok_or_else(|| {
                 syn::Error::new(
-                    Span::call_site(),
+                    item.span(),
                     format!(
                         "internal error: no source for callback method `{}::{}`",
                         cb.name, m.name
@@ -203,9 +236,9 @@ pub(crate) fn gen_callback_interface(
         let slots = m
             .abi_params
             .iter()
-            .map(|p| slot_type_for(p, &m.params, &user))
+            .map(|p| slot_type_for(p, &m.params, &user, prefix))
             .collect::<syn::Result<Vec<_>>>()?;
-        let arrow = ret_arrow(&m.abi_ret);
+        let arrow = ret_arrow(&m.abi_ret, prefix);
         fields.push(quote!(pub #field: unsafe extern "C" fn(#(#slots),*) #arrow,));
         methods.push(gen_foreign_method(m, sig)?);
     }

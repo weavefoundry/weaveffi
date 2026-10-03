@@ -1,357 +1,130 @@
-# Naming and Package Conventions
+# Naming
 
-This page has two halves. The first is the naming policy for the WeaveFFI
-project itself: brand names, repository slugs, package names across
-registries, and the names of the generator targets. The second is the
-naming policy the **generators** apply to
-the identifiers they emit from your IDL: C symbols, wrapper classes,
-functions, error types, and the Kotlin package. Every rule in the second
-half was checked against the output of `weaveffi generate` for the
-`kvstore` and `events` samples.
+Every name WeaveFFI emits derives from two things: the library's
+**identity** (what the library is called) and the **IDL names** (what the
+API calls things). This page states both sets of rules.
 
-## Project names
+## Identity
 
-### Human-facing brand names (prose)
+The CLI resolves one identity per library from `weaveffi.toml` and, for a
+Rust producer, `Cargo.toml` (the full rules are in
+[Project Configuration](../guides/config.md#package)):
 
-Use the condensed names in sentences and documentation: WeaveFFI,
-WeaveHeap. The brand stem is spelled `WeaveFFI` with an uppercase `FFI`
-everywhere, including in generated code (`WeaveFFIError`,
-`WeaveFFIException`), never the case-converter's `Weaveffi`.
+| Field | Meaning | Rust producer | IDL |
+|-------|---------|---------------|-----|
+| `name` | package name as published | `[package] name`, else the crate's package name | `[package] name`, else the input file stem |
+| `prefix` | C symbol prefix | the crate's library name | `[package] c_prefix`, else snake(`name`) |
+| `library` | native library base name | same as `prefix` | `[package] library`, else snake(`name`) |
+| `version`, `description`, `license`, `authors`, `homepage`, `repository` | metadata | `[package]`, falling back to `Cargo.toml` | `[package]` |
 
-### Repository and package slugs (URLs and registries)
+Two conversions turn an arbitrary name into identifiers:
 
-- Use condensed lowercase slugs for top-level repositories: GitHub
-  `weavefoundry/weaveffi`, `weavefoundry/weaveheap`.
-- Use hyphenated slugs for subpackages and components, prefixed with the
-  top-level slug: `weaveffi-core`, `weaveffi-ir`, `weaveffi-gen-kotlin`.
-- Planned package names (not yet published): crates.io `weaveffi`,
-  `weaveffi-core`, `weaveffi-ir`, and so on; npm `@weavefoundry/weaveffi`;
-  PyPI `weaveffi`; SPM repo slug `weaveffi`.
+- **snake**: lowercase ASCII letters and digits, with every run of other
+  characters collapsed to one `_` and trailing `_` trimmed; a leading digit
+  gets a `lib_` prefix. `my-kv.store` becomes `my_kv_store`, `3d-engine`
+  becomes `lib_3d_engine`.
+- **PascalCase**: each run of letters and digits starts a word whose first
+  letter is uppercased, and existing capitals are kept; a leading digit gets
+  an `N` prefix. `my-kv.store` becomes `MyKvStore`.
 
-Rationale: condensed top-level slugs unify handles across registries and
-are ergonomic to type; hyphenated subpackages remain idiomatic and map
-cleanly to ecosystems that normalize to underscores or CamelCase.
+`{PREFIX}` is the prefix uppercased.
 
-### Target names
+## Per-target defaults
 
-A generator's target name is the one identifier that appears everywhere
-the generator does: the `--target` flag, the `[generators.<target>]`
-table in `weaveffi.toml`, the output directory under `generated/`, the
-`weaveffi-gen-<target>` crate, and the page under
-[Generators](../generators/README.md). The eleven targets are `c`, `cpp`,
-`swift`, `kotlin`, `node`, `wasm`, `python`, `dotnet`, `dart`, `go`, and
-`ruby`.
+| Target | Default names (each overridable in `[generators.<target>]`) |
+|--------|---------------------------------------------------------------|
+| C | header `{library}.h`; include guard `{PREFIX}_H`; export macro `{PREFIX}_API` |
+| C++ | header `{library}.hpp`, which includes `{library}.h` (shipped alongside); namespace `{prefix}` |
+| Swift | SwiftPM package, product, and module `PascalCase(name)`; C module `C{PascalCase(name)}` |
+| Kotlin | package `{prefix}`; one Kotlin `object` per IDL module; JNI library `{library}_jni` |
+| Node.js | npm package `{name}`; addon `{library}_node.node`; one namespace export per module |
+| WebAssembly | npm package `{name}`; ES module; one namespace export per module |
+| Python | distribution `{name}`; import package `{prefix}` |
+| .NET | namespace and assembly `PascalCase(name)` |
+| Dart | package `{prefix}` |
+| Go | module path `{name}` unless `module_path` is set; package `{prefix}` |
+| Ruby | gem `{name}`; module `PascalCase(name)`; require path `{prefix}` |
 
-The rule is to name the target after the thing a consumer holds and
-identifies with, which is sometimes a language and sometimes a runtime:
+For the `kvstore` sample (crate `kvstore`) that's `kvstore.h`, Swift module
+`Kvstore`, `import kvstore` in Python, and `require "kvstore"` in Ruby.
 
-- When the emitted surface is idiomatic to one language, the target is
-  that language (`swift`, `python`, `dart`, `go`, `ruby`, `kotlin`).
-- When one runtime serves several languages equally, the target is the
-  runtime (`dotnet`, `node`, `wasm`). Two targets that emit the same
-  language for different runtimes are named by runtime so they can be
-  told apart (`node` and `wasm` both emit JavaScript).
-- A deployment platform is never a target name. Where a target runs on
-  more than one platform, the platform is a setting under its
-  `[generators.<target>]` table, so adding a platform never renames the
-  target.
+**Library loading.** Every target loads the native library by its
+`library` name using the platform's file naming (`lib{library}.dylib`,
+`lib{library}.so`, `{library}.dll`). Every loader first honors the
+environment variable `{PREFIX}_LIBRARY` (for example `KVSTORE_LIBRARY`), an
+explicit path that wins over bundled and system copies.
 
-The two cases that look inconsistent are both applications of the same
-rule:
+Nothing a generator emits is named after WeaveFFI; the only mentions are the
+generated-file header comment and runtime-version comments. Two libraries
+built with WeaveFFI therefore never collide in symbols, packages, types, or
+environment variables.
 
-- `dotnet`, not `csharp`. The generator emits C#, but the P/Invoke surface
-  and the NuGet package are consumed equally from C#, F#, and Visual Basic,
-  so the runtime is what a consumer identifies with.
-- `kotlin`, not `android` or `jvm`. The generator was called `android`
-  through schema `0.8.0`. It was renamed because the same output runs on
-  Android and on a desktop JVM (the conformance harness drives it with
-  `kotlinc` and `java`, with no Android SDK), so a platform name described
-  only one of its runtimes. It isn't `jvm` because the emitted API depends
-  on Kotlin-only features (`suspend fun` for async, sealed classes for rich
-  enums, data classes for records), and a Java caller would not find it
-  idiomatic; naming it after the runtime would promise a language-neutral
-  surface the generator doesn't provide.
+## C identifiers
 
-A new generator should pick its name by the same test: if a second
-language could consume the output as naturally as the first, name the
-target after the runtime; otherwise name it after the language. Don't
-name it after the platform it happens to ship on first.
+C identifiers are the prefix, the underscore-joined module path, and the IDL
+name, verbatim: `kvstore_kv_Store_open`, `kvstore_kv_KvError_KeyNotFound`.
+IDL names are never re-cased in C, except that an iterator type's function
+part is PascalCase (`kvstore_kv_Store_ListKeysIterator`). The full table is
+in the [C ABI contract](abi.md#symbol-names); validation rejects any API in
+which two declarations produce the same identifier.
 
-### Code identifiers by ecosystem
+## Identifiers in generated code
 
-- Rust: hyphenated subcrates on crates.io (`weaveffi-core`), imported with
-  underscores (`weaveffi_core`); the facade crate is `weaveffi`. Modules
-  and paths are snake_case; types, traits, and enums are CamelCase.
-- Swift: package products and modules are UpperCamelCase (`WeaveFFI`);
-  the repo slug stays condensed and the SPM product provides the CamelCase
-  surface.
-- Java and Kotlin: group ID and package base are reverse-DNS lowercase
-  (`com.weavefoundry.weaveffi`); artifact IDs are condensed at the top level
-  (`weaveffi`) and hyphenated for sub-artifacts (`weaveffi-android`); class
-  names are UpperCamelCase (`WeaveFFI`).
-- JavaScript and TypeScript: scope plus condensed name for the top-level
-  package (`@weavefoundry/weaveffi`), hyphenated for subpackages
-  (`@weavefoundry/weaveffi-core`).
-- Python: PyPI name condensed at the top level (`weaveffi`), hyphenated for
-  subpackages (`weaveffi-core`); import as `weaveffi` and `weaveffi_core`.
-- C and CMake: target and library names are snake_case (`weaveffi`,
-  `weaveffi_core`); includes are directory based (`#include <weaveffi/weaveffi.h>`).
+IDL names are expected in `snake_case` for modules, functions, parameters,
+and fields, and in `PascalCase` for types, variants, and error codes. The
+validator only requires identifiers, so other styles are re-cased on a
+best-effort basis.
 
-### Writing guidelines
+**Functions, methods, parameters, and fields** follow each language's
+convention:
 
-- In prose, prefer the condensed brand names.
-- In code snippets, follow the host language conventions above.
-- For cross-language docs, show both the repo or package slug and the
-  language-appropriate identifier on first mention: "Install `weaveffi`
-  (import as `weaveffi`, Swift module `WeaveFFI`)."
-- New crates and packages follow the condensed-top-level plus
-  hyphenated-subpackage pattern (`weaveffi-*`, `weaveheap-*`). Avoid
-  hyphenated top-level slugs such as `weave-ffi`.
+| Target | Style | `get_stats`, `created_at` |
+|--------|-------|---------------------------|
+| C, C++, Python, Ruby | `snake_case` | `get_stats`, `created_at` |
+| Swift, Kotlin, Node.js, WebAssembly, Dart | `camelCase` | `getStats`, `createdAt` |
+| Go, .NET | `PascalCase` | `GetStats`, `CreatedAt` |
 
-## Generated identifiers
+**Types** (records, enums, interfaces, callback interfaces, error domains)
+keep their IDL names in every target, except where a language idiom adds a
+prefix or suffix (.NET prefixes interfaces it generates for callback
+interfaces with `I`, for example). **C-style enum variants** follow the
+target's enum idiom: `Volatile` in most targets, `.volatile` in Swift,
+`EntryKindVolatile` in Go, `EntryKind::VOLATILE` in Ruby.
 
-The generators derive every emitted name from three inputs: the IDL name,
-the module path, and the target's casing idiom. The rules below are what
-the shared model in `weaveffi-core` decides once for all targets
-(`weaveffi_core::utils`, `weaveffi_core::errors`, and the ABI slot
-assignment in `weaveffi_core::model`), followed by each target's casing.
-IDL names are expected to be `snake_case` for modules, functions,
-parameters, and fields and `PascalCase` for types, variants, and error
-codes; the validator only enforces that they are identifiers, so a name
-written in another style is re-cased on a best-effort basis.
+**Constructors.** A constructor named `new` becomes the language's
+constructor (`init`, `__init__`, `initialize`, a C++ or C# constructor);
+other constructors become static factories (`Store.open`). Go has no
+constructors, so they become package functions (`NewEventBus`, `OpenStore`).
 
-### C ABI symbols
+**Modules.** How module members are grouped depends on the target's notion
+of a namespace. Kotlin emits one `object` per IDL module, and Node.js and
+WebAssembly export one namespace object per module (nested modules nest),
+so two modules can both declare `get`. Targets that place members in one
+flat namespace drop the module name from free functions by default and
+offer `strip_module_prefix = false` to keep it (`kv_stats_get_stats`); see
+[Project Configuration](../guides/config.md#global). Each language page
+documents its layout.
 
-The C names are normative in the [C ABI Contract](abi.md); this is the
-summary. `{prefix}` is `weaveffi` unless a project sets `c_prefix`, and
-`{path}` is the module path joined with underscores (`kv`, `kv_stats`).
+**Errors.** Each target has a root error type named after the package and
+one type (or case) per error domain and code, named from the IDL with at
+most one idiomatic suffix (`Error` or `Exception`). Write code names without
+a suffix (`KeyNotFound`, not `KeyNotFoundError`) and let the generator add
+it. Code names are unique across the API because several targets flatten
+them into one namespace.
 
-| Declaration                          | C spelling                                   | `kvstore` example                                 |
-|--------------------------------------|----------------------------------------------|---------------------------------------------------|
-| free function `f` in module `{path}` | `{prefix}_{path}_f`                          | `weaveffi_kv_stats_get_stats`                     |
-| interface `T` (opaque tag)           | `{prefix}_{path}_T`                          | `weaveffi_kv_Store`                               |
-| interface member `m` (ctor, method, static) | `{tag}_m`                             | `weaveffi_kv_Store_open`, `weaveffi_kv_Store_get` |
-| implicit lifecycle                   | `{tag}_clone`, `{tag}_destroy`               | `weaveffi_kv_Store_clone`, `weaveffi_kv_Store_destroy` |
-| callback interface `L` (vtable type) | `{prefix}_{path}_L_vtable`                   | `weaveffi_kv_EvictionListener_vtable`             |
-| callback parameter `p`               | `void* p_ctx, const {vtable}* p_vtable`      | `listener_ctx`, `listener_vtable`                 |
-| C-style enum `E` and variant `V`     | `{prefix}_{path}_E`, `{prefix}_{path}_E_V`   | `weaveffi_kv_EntryKind_Volatile`                  |
-| error domain `D` and code `C`        | `{prefix}_{path}_D` enum, `{prefix}_{path}_D_C` | `weaveffi_kv_KvError_KeyNotFound`              |
-| iterator returned by `f`             | `{owner}_{PascalF}Iterator` tag with `_next` and `_destroy` | `weaveffi_kv_Store_ListKeysIterator` |
-| async function `f`                   | `{sym}_async` launcher, `{sym}_callback` typedef | `weaveffi_kv_Store_compact_async`             |
-| `bytes` or buffered parameter `p`    | `p_ptr`, `p_len`                             | `value_ptr`, `value_len`                          |
-| out-length of a returned buffer      | `out_len`                                    |                                                   |
-| error out-parameter                  | `out_err`                                    |                                                   |
+**Reserved words.** A name that's a keyword in the target language gains a
+trailing `_` (`type` becomes `type_`), a rule that's stable under repetition.
+A user type whose name would shadow a standard type in the target (a Kotlin
+type named `Result`, say) is referenced in a way that avoids the clash; the
+language pages describe how.
 
-The iterator `{owner}` is `{prefix}_{path}` for a free function and
-`{prefix}_{path}_T` for a method or static of interface `T`; the function
-name is re-cased to PascalCase (`list_keys` becomes `ListKeys`). Types are
-never re-cased: the IDL spelling of `Store`, `EntryKind`, and `KeyNotFound`
-appears verbatim in every C symbol. A cross-module type reference resolves
-to its owner's path, so a `stats` function taking the parent module's
-`Store` still spells the parameter `const weaveffi_kv_Store*`.
+## Target names
 
-Runtime symbols (`weaveffi_error`, `weaveffi_error_set`,
-`weaveffi_error_clear`, `weaveffi_error_free`, `weaveffi_free_string`,
-`weaveffi_free_bytes`, `weaveffi_abi_version`, and the four
-`weaveffi_cancel_token_*` functions) always keep the `weaveffi_` spelling
-in the producer. Under a non-default prefix the generated header adds
-`#define {prefix}_{name} weaveffi_{name}` aliases for each of them, so
-consumer code may use either spelling.
-
-Because free functions and interface members share `{prefix}_{path}_`, a
-free function named `Store_get` next to a `get` method on `Store` is a
-validation error (`AbiSymbolCollision`), as is a free function named
-`Store_clone` or `Store_destroy`.
-
-### Functions, methods, and parameters
-
-Free functions, methods, statics, constructors, and parameters are re-cased
-to the target's idiom:
-
-| Target        | Callables and parameters | Example (`get_stats`, `open_many`)              |
-|---------------|--------------------------|------------------------------------------------|
-| C, C++, Python, Ruby | `snake_case` (unchanged) | `get_stats`, `open_many`                 |
-| Swift, Kotlin, Dart, Node, Wasm | `camelCase`   | `getStats`, `openMany`                          |
-| Go, .NET      | `PascalCase`             | `GetStats`, `OpenMany`                           |
-
-A free function keeps its bare name by default. Every target except `c`,
-`cpp`, and `wasm` has a `strip_module_prefix` option (see
-[Project Configuration](../guides/config.md)); setting it to `false`
-prepends `{module}_` before re-casing, giving `kv_stats_get_stats`,
-`kvStatsGetStats`, or `KvStatsGetStats`.
-
-Where a free function lives depends on the target's notion of a
-namespace. Python, Ruby, C++, Dart, Node, and Wasm emit module-level
-functions (Ruby's live on the package module, `Kvstore.get_stats`). Swift
-nests them in one `enum` per module path segment (`Kv.Stats.getStats`).
-.NET puts them on a static class per module whose name is the PascalCase
-module path (`Kv.GetStats`, `KvStats.GetStats`). Kotlin puts every free
-function on the companion object of a single `WeaveFFI` holder class
-(`WeaveFFI.getStats(...)`). Go exports them at package level.
-
-Constructors follow the interface: a constructor named `new` becomes the
-canonical constructor where the target has one (Swift `init`, Python
-`__init__`, Ruby `initialize`, a C# or C++ constructor, a Dart `factory
-EventBus()`, JavaScript `new EventBus()`, and in Kotlin a companion
-`operator fun invoke()` so `EventBus()` reads like a constructor); every
-other constructor becomes a static factory in the target's casing
-(`Store.open`, `Store.openMany`, `Store.Open`). Go has no constructors, so
-each becomes a package-level function named `{PascalCtor}{Type}`
-(`NewEventBus`, `OpenStore`); Dart uses a named constructor
-(`Store.open`).
-
-### Records and enums
-
-Struct and rich-enum names are kept verbatim (`Entry`, `StoreInfo`,
-`Shape`) in every target; each is an idiomatic value type (a Kotlin `data
-class`, a Swift `struct`, a Go `struct`, a .NET `sealed class`, a
-TypeScript `interface`, a Python class with annotated attributes).
-Fields are re-cased like parameters (`created_at` becomes `createdAt` in
-Swift, Kotlin, Dart, and JavaScript and `CreatedAt` in Go and .NET).
-
-C-style enum names are kept verbatim. Variant casing follows each target's
-enum idiom:
-
-| Target                                  | Variant of `EntryKind { Volatile }` |
-|-----------------------------------------|-------------------------------------|
-| C, C++, Kotlin, Python, .NET, Node, Wasm, Dart | `Volatile`                    |
-| Swift                                   | `.volatile` (lowerCamelCase case)   |
-| Go                                      | `EntryKindVolatile` (type-prefixed constant) |
-| Ruby                                    | `EntryKind::VOLATILE` (module constant) |
-
-### Interfaces
-
-An interface `Store` is a class named `Store` in every target (a Swift
-`final class`, a Kotlin `class ... : AutoCloseable`, a Python class, a Ruby
-class over an `FFI::AutoPointer`, a Go `struct` used through `*Store`, a
-.NET `class Store : IDisposable`, a Dart `class Store implements
-Finalizable`, a C++ RAII class with copy semantics that call `_clone`, a
-TypeScript class). Methods and statics are re-cased like free functions
-and attached to the class; statics use the target's static idiom
-(`static func`, `companion object`, `@staticmethod`, `def self.`, C#
-`static`, and package-level functions in Go).
-
-The wrapper's disposal method is named by the target's convention, never
-by the IDL: `close()` in Kotlin, Python, Dart, Node, and Wasm (also
-`Symbol.dispose` in JavaScript and `AutoCloseable` in Kotlin), `Close()`
-in Go, `Dispose()` in .NET, and the destructor or `deinit` in C++ and
-Swift. Ruby releases through the `AutoPointer` and exposes `close`. No
-target exposes `clone`; copying a wrapper (C++ copy constructor, or simply
-holding two references) is the only way to get a second reference from the
-consumer side.
-
-### Callback interfaces
-
-A callback interface `EvictionListener` becomes the target's "abstract
-method set" type, named after the IDL with at most one idiomatic prefix:
-
-| Target   | Declaration                                              |
-|----------|----------------------------------------------------------|
-| C        | `weaveffi_kv_EvictionListener_vtable` struct             |
-| C++      | `class EvictionListener` with pure virtual methods       |
-| Swift    | `protocol EvictionListener`                              |
-| Kotlin   | `interface EvictionListener`                             |
-| Python   | `class EvictionListener(abc.ABC)`                        |
-| Ruby     | `module EvictionListener` (mixin with `NotImplementedError` stubs) |
-| Go       | `type EvictionListener interface`                        |
-| .NET     | `interface IEvictionListener` (C#'s `I` prefix)          |
-| Dart     | `abstract class EvictionListener`                        |
-| Node, Wasm | `interface EvictionListener` in the `.d.ts`            |
-
-Methods are re-cased like other callables (`on_evict` becomes `onEvict`,
-`OnEvict`, or stays `on_evict`). No lifecycle name is exposed to the
-consumer: the vtable's trailing `free` entry and the `ctx` handle are
-generated glue, and the consumer only ever hands over an implementation.
-
-### Error domains and codes
-
-The base error type is branded, and every target uses one of two brands
-from `weaveffi_core::errors`: `WeaveFFIError` where the ecosystem's errors
-end in `Error` (Swift, Python, TypeScript, C++, Go) and
-`WeaveFFIException` where they end in `Exception` (Kotlin, .NET, Dart).
-Ruby is the one exception: its base class is `Error` nested in the package
-module (`Kvstore::Error`), because the module already provides the brand.
-
-A domain `KvError` with codes `KeyNotFound` and `IoError` yields:
-
-| Target  | Domain type                      | Per-code name                                    |
-|---------|----------------------------------|--------------------------------------------------|
-| C, C++ header enum | `weaveffi_kv_KvError` | `weaveffi_kv_KvError_KeyNotFound` constants           |
-| C++     | `class KvError : WeaveFFIError`  | `class KeyNotFoundError : KvError`, `class IoError`  |
-| Swift   | `enum KvError: Error`            | `case keyNotFound(message:)`, `case ioError(message:)` |
-| Kotlin  | `sealed class KvException : WeaveFFIException` | nested `KvException.KeyNotFound`, `KvException.IoError` |
-| Python  | `class KvError(WeaveFFIError)`   | `class KeyNotFound(KvError)`, also reachable as `KvError.KeyNotFound` |
-| Ruby    | `class KvError < Kvstore::Error` | nested `KvError::KeyNotFound`, `KvError::IoError`    |
-| Go      | `type KvError struct`            | `KvErrorKeyNotFound` and `KvErrorIoError` code constants |
-| .NET    | `class KvException : WeaveFFIException` | `KvException.KeyNotFound` code constants        |
-| Dart    | `class KvException extends WeaveFFIException` | `class KeyNotFoundException`, `class IoException` |
-| Node, Wasm | `class KvError extends WeaveFFIError` | `class KeyNotFoundError`, `class IoError`     |
-
-The rules behind the table:
-
-- `type_name(raw, suffix)` re-cases a name to PascalCase and appends the
-  suffix exactly once: `KEY_NOT_FOUND` with `Error` is `KeyNotFoundError`,
-  and `AlreadyError` stays `AlreadyError`. C++, Node, and Wasm use it with
-  `Error`; Dart uses it with `Exception`.
-- `exception_type_name(raw)` swaps a trailing `Error` stem for `Exception`
-  instead of stacking them: `KvError` becomes `KvException` (Kotlin, .NET,
-  Dart), `Failure` becomes `FailureException`, and a domain named just
-  `Error` falls back to the brand.
-- `pascal(raw)` is the suffix-free PascalCase form used where codes are
-  nested cases or constants (Kotlin, Ruby, Python, .NET, Go).
-- Swift lowerCamelCases the code into an enum case (`keyNotFound`).
-
-The upshot for IDL authors: write PascalCase code names and let the
-generator add or replace suffixes. Writing `KeyNotFoundError` as the code
-name produces `KeyNotFoundError` in C++ and `KeyNotFoundException` in Dart
-(the stem is normalized), but `KeyNotFoundError` as the Kotlin nested class
-and `keyNotFoundError` as the Swift case, which is why the samples leave
-the suffix off. Code names are unique across the whole API for exactly this
-reason: every target flattens them into one namespace.
-
-### Package, module, and file names
-
-Ecosystem package names come from `[package] name` in `weaveffi.toml`
-(`kvstore` in the samples) and are re-cased per ecosystem; see
-[Project Configuration](../guides/config.md#package). The names that
-appear in code:
-
-| Target  | Namespace derived from the package name                              |
-|---------|----------------------------------------------------------------------|
-| Swift   | module `Kvstore` (PascalCase); free functions under per-module enums  |
-| Ruby    | `module Kvstore` wrapping everything                                 |
-| .NET    | `namespace Kvstore`                                                  |
-| C++     | `namespace kvstore` (lowercase)                                      |
-| Go      | `package kvstore`; the import path comes from `[generators.go] module_path` |
-| Python  | package directory `kvstore/` containing `weaveffi.py` and `weaveffi.pyi` |
-| Kotlin  | Gradle `rootProject.name = "kvstore"`; the JVM package comes from config |
-
-### Kotlin package and class names
-
-The `kotlin` target is configured under `[generators.kotlin]`:
-
-```toml
-[generators.kotlin]
-package = "com.example.kv"      # default "com.weaveffi"
-strip_module_prefix = true      # default
-```
-
-- **Package.** Every generated Kotlin file starts with `package {package}`
-  and is written under `src/main/kotlin/{package with dots as slashes}/`,
-  so the default lands at `src/main/kotlin/com/weaveffi/WeaveFFI.kt`. The
-  JNI glue is `src/main/cpp/weaveffi_jni.c`, and its exported JNI symbols
-  are derived from the package (`Java_com_weaveffi_WeaveFFI_...`), so
-  changing the package regenerates both files consistently.
-- **Holder class.** Free functions live on the companion object of
-  `class WeaveFFI`, together with `setCallbackExceptionHandler`. The
-  holder's name is fixed; only the package is configurable.
-- **Types.** Interfaces, records, enums, callback interfaces, and errors
-  are top-level declarations in the same package, named as in the tables
-  above (`Store`, `Entry`, `EntryKind`, `EvictionListener`, `KvException`).
-  An iterator returned by `list_keys` on `Store` is
-  `KvStoreListKeysIterator` (`{PascalModule}{Interface}{PascalFn}Iterator`),
-  implementing `Iterator<T>` and `AutoCloseable`.
-- **Runtime glue.** Internal helpers are prefixed `Weave` or `weave`
-  (`WeaveNativeLibrary`, `WeaveBufferReader`, `weaveCleaner`) and marked
-  `internal`, so they never collide with an IDL type whose name starts
-  with `WeaveFFI`.
+A target is named after what its consumer identifies with: the language when
+the output is idiomatic to one language (`swift`, `python`, `kotlin`), and
+the runtime when several languages consume it equally or two targets share a
+language (`dotnet` serves C#, F#, and Visual Basic; `node` and `wasm` both
+emit JavaScript). A deployment platform is never a target name: `kotlin`
+covers Android and the desktop JVM, selected by a setting. The same token
+names the `--target` value, the `[generators.<target>]` table, the output
+directory, and the page under [Generators](../generators/README.md).

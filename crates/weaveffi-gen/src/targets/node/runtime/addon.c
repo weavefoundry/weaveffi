@@ -1,0 +1,603 @@
+#ifndef NAPI_VERSION
+#define NAPI_VERSION 8
+#endif
+#include <node_api.h>
+#include <uv.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* The addon wraps deprecated functions too; the JavaScript API carries the
+ * deprecation instead. */
+#define {{MACRO}}_DEPRECATED(msg)
+#include "{{HEADER}}"
+
+/*
+ * The N-API transport of the JavaScript bindings. Every C symbol of the
+ * library is exported to `index.js` under its own name and called with the
+ * raw convention the shared JavaScript layer documents: direct values as
+ * numbers, bigints, and booleans; strings as strings; bytes and value
+ * buffers as Uint8Arrays; objects, iterators, and cancel tokens as bigint
+ * handles (null when absent); callback interfaces as adapter objects. A
+ * failure throws an instance of the runtime's `$Fault` class.
+ */
+
+typedef {{PREFIX}}_error js_error;
+
+/* Helpers an API may not need. */
+#if defined(__GNUC__) || defined(__clang__)
+#define JS_HELPER static inline __attribute__((unused))
+#else
+#define JS_HELPER static inline
+#endif
+
+/* Per-environment state (one per main thread or worker): the `$Fault`
+ * constructor `index.js` registers through `$setup`. */
+typedef struct {
+  napi_ref fault;
+} js_env;
+
+static void js_env_free(napi_env env, void* data, void* hint) {
+  (void)hint;
+  js_env* e = (js_env*)data;
+  if (e->fault != NULL) napi_delete_reference(env, e->fault);
+  free(e);
+}
+
+JS_HELPER napi_value js_undefined(napi_env env) {
+  napi_value v;
+  napi_get_undefined(env, &v);
+  return v;
+}
+
+static napi_value js_setup(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  js_env* e = NULL;
+  napi_get_instance_data(env, (void**)&e);
+  if (e->fault != NULL) napi_delete_reference(env, e->fault);
+  napi_create_reference(env, argv[0], 1, &e->fault);
+  return js_undefined(env);
+}
+
+/* ---------------------------------------------------------------------------
+ * Value conversions
+ * ------------------------------------------------------------------------- */
+
+JS_HELPER napi_value js_new_bytes(napi_env env, const uint8_t* ptr, size_t len) {
+  napi_value ab, out;
+  void* data = NULL;
+  napi_create_arraybuffer(env, len, &data, &ab);
+  if (len > 0) memcpy(data, ptr, len);
+  napi_create_typedarray(env, napi_uint8_array, len, ab, 0, &out);
+  return out;
+}
+
+JS_HELPER napi_value js_new_str(napi_env env, const uint8_t* ptr, size_t len) {
+  napi_value out;
+  napi_create_string_utf8(env, len == 0 ? "" : (const char*)ptr, len, &out);
+  return out;
+}
+
+JS_HELPER napi_value js_new_i32(napi_env env, int32_t v) {
+  napi_value out;
+  napi_create_int32(env, v, &out);
+  return out;
+}
+
+JS_HELPER napi_value js_new_u32(napi_env env, uint32_t v) {
+  napi_value out;
+  napi_create_uint32(env, v, &out);
+  return out;
+}
+
+JS_HELPER napi_value js_new_i64(napi_env env, int64_t v) {
+  napi_value out;
+  napi_create_bigint_int64(env, v, &out);
+  return out;
+}
+
+JS_HELPER napi_value js_new_u64(napi_env env, uint64_t v) {
+  napi_value out;
+  napi_create_bigint_uint64(env, v, &out);
+  return out;
+}
+
+JS_HELPER napi_value js_new_f64(napi_env env, double v) {
+  napi_value out;
+  napi_create_double(env, v, &out);
+  return out;
+}
+
+JS_HELPER napi_value js_new_bool(napi_env env, bool v) {
+  napi_value out;
+  napi_get_boolean(env, v, &out);
+  return out;
+}
+
+/* An object, iterator, or cancel token handle: the pointer as a bigint, or
+ * null for NULL. */
+JS_HELPER napi_value js_new_handle(napi_env env, const void* p) {
+  napi_value out;
+  if (p == NULL) {
+    napi_get_null(env, &out);
+  } else {
+    napi_create_bigint_uint64(env, (uint64_t)(uintptr_t)p, &out);
+  }
+  return out;
+}
+
+/* Returned strings and buffers: convert, then release the producer's copy. */
+JS_HELPER napi_value js_take_str(napi_env env, const uint8_t* ptr, size_t len) {
+  napi_value out = js_new_str(env, ptr, len);
+  if (ptr != NULL) {{PREFIX}}_free_bytes((uint8_t*)ptr, len);
+  return out;
+}
+
+JS_HELPER napi_value js_take_bytes(napi_env env, const uint8_t* ptr, size_t len) {
+  napi_value out = js_new_bytes(env, ptr, len);
+  if (ptr != NULL) {{PREFIX}}_free_bytes((uint8_t*)ptr, len);
+  return out;
+}
+
+JS_HELPER napi_value js_fault(napi_env env, int32_t code, const char* message,
+                           const uint8_t* payload, size_t payload_len) {
+  napi_value argv[3], ctor, out = NULL;
+  napi_create_int32(env, code, &argv[0]);
+  napi_create_string_utf8(env, message != NULL ? message : "", NAPI_AUTO_LENGTH, &argv[1]);
+  if (payload != NULL) {
+    argv[2] = js_new_bytes(env, payload, payload_len);
+  } else {
+    napi_get_null(env, &argv[2]);
+  }
+  js_env* e = NULL;
+  napi_get_instance_data(env, (void**)&e);
+  if (e == NULL || e->fault == NULL || napi_get_reference_value(env, e->fault, &ctor) != napi_ok ||
+      ctor == NULL || napi_new_instance(env, ctor, 3, argv, &out) != napi_ok) {
+    napi_create_error(env, NULL, argv[1], &out);
+    napi_set_named_property(env, out, "code", argv[0]);
+  }
+  return out;
+}
+
+/* Throw the error a call reported, then release it. */
+JS_HELPER napi_value js_throw(napi_env env, js_error* err) {
+  napi_throw(env, js_fault(env, err->code, err->message, err->payload_ptr, err->payload_len));
+  {{PREFIX}}_error_clear(err);
+  return NULL;
+}
+
+JS_HELPER bool js_type_error(napi_env env, const char* expected) {
+  bool pending = false;
+  napi_is_exception_pending(env, &pending);
+  if (!pending) napi_throw_type_error(env, NULL, expected);
+  return false;
+}
+
+JS_HELPER bool js_arg_i32(napi_env env, napi_value v, int32_t* out) {
+  return napi_get_value_int32(env, v, out) == napi_ok || js_type_error(env, "expected a number");
+}
+
+JS_HELPER bool js_arg_u32(napi_env env, napi_value v, uint32_t* out) {
+  return napi_get_value_uint32(env, v, out) == napi_ok || js_type_error(env, "expected a number");
+}
+
+JS_HELPER bool js_arg_i8(napi_env env, napi_value v, int8_t* out) {
+  int32_t t = 0;
+  if (!js_arg_i32(env, v, &t)) return false;
+  *out = (int8_t)t;
+  return true;
+}
+
+JS_HELPER bool js_arg_i16(napi_env env, napi_value v, int16_t* out) {
+  int32_t t = 0;
+  if (!js_arg_i32(env, v, &t)) return false;
+  *out = (int16_t)t;
+  return true;
+}
+
+JS_HELPER bool js_arg_u8(napi_env env, napi_value v, uint8_t* out) {
+  uint32_t t = 0;
+  if (!js_arg_u32(env, v, &t)) return false;
+  *out = (uint8_t)t;
+  return true;
+}
+
+JS_HELPER bool js_arg_u16(napi_env env, napi_value v, uint16_t* out) {
+  uint32_t t = 0;
+  if (!js_arg_u32(env, v, &t)) return false;
+  *out = (uint16_t)t;
+  return true;
+}
+
+/* 64-bit integers: a bigint that fits, or an integral number. */
+JS_HELPER bool js_arg_i64(napi_env env, napi_value v, int64_t* out) {
+  napi_valuetype t;
+  napi_typeof(env, v, &t);
+  if (t == napi_bigint) {
+    bool lossless = false;
+    napi_get_value_bigint_int64(env, v, out, &lossless);
+    if (lossless) return true;
+    napi_throw_range_error(env, NULL, "bigint does not fit in a signed 64-bit integer");
+    return false;
+  }
+  double d = 0;
+  if (t == napi_number && napi_get_value_double(env, v, &d) == napi_ok && d == (double)(int64_t)d) {
+    *out = (int64_t)d;
+    return true;
+  }
+  return js_type_error(env, "expected a bigint");
+}
+
+JS_HELPER bool js_arg_u64(napi_env env, napi_value v, uint64_t* out) {
+  napi_valuetype t;
+  napi_typeof(env, v, &t);
+  if (t == napi_bigint) {
+    bool lossless = false;
+    napi_get_value_bigint_uint64(env, v, out, &lossless);
+    if (lossless) return true;
+    napi_throw_range_error(env, NULL, "bigint does not fit in an unsigned 64-bit integer");
+    return false;
+  }
+  double d = 0;
+  if (t == napi_number && napi_get_value_double(env, v, &d) == napi_ok && d >= 0 &&
+      d == (double)(uint64_t)d) {
+    *out = (uint64_t)d;
+    return true;
+  }
+  return js_type_error(env, "expected a bigint");
+}
+
+JS_HELPER bool js_arg_f64(napi_env env, napi_value v, double* out) {
+  return napi_get_value_double(env, v, out) == napi_ok || js_type_error(env, "expected a number");
+}
+
+JS_HELPER bool js_arg_f32(napi_env env, napi_value v, float* out) {
+  double d = 0;
+  if (!js_arg_f64(env, v, &d)) return false;
+  *out = (float)d;
+  return true;
+}
+
+JS_HELPER bool js_arg_bool(napi_env env, napi_value v, bool* out) {
+  return napi_get_value_bool(env, v, out) == napi_ok || js_type_error(env, "expected a boolean");
+}
+
+/* A handle argument; null or undefined is NULL when `nullable`. */
+JS_HELPER bool js_arg_handle(napi_env env, napi_value v, void** out, bool nullable) {
+  napi_valuetype t;
+  napi_typeof(env, v, &t);
+  if (t == napi_null || t == napi_undefined) {
+    *out = NULL;
+    return nullable || js_type_error(env, "expected an object handle");
+  }
+  uint64_t raw = 0;
+  bool lossless = false;
+  if (t != napi_bigint || napi_get_value_bigint_uint64(env, v, &raw, &lossless) != napi_ok ||
+      raw == 0) {
+    return js_type_error(env, "expected an object handle");
+  }
+  *out = (void*)(uintptr_t)raw;
+  return true;
+}
+
+/* A borrowed byte run: a Uint8Array (or Buffer). */
+JS_HELPER bool js_arg_bytes(napi_env env, napi_value v, const uint8_t** ptr, size_t* len) {
+  bool is_typed = false;
+  napi_is_typedarray(env, v, &is_typed);
+  if (is_typed) {
+    napi_typedarray_type type;
+    void* data = NULL;
+    napi_get_typedarray_info(env, v, &type, len, &data, NULL, NULL);
+    if (type == napi_uint8_array || type == napi_uint8_clamped_array) {
+      *ptr = (const uint8_t*)data;
+      return true;
+    }
+  }
+  return js_type_error(env, "expected a Uint8Array");
+}
+
+/* A string argument encoded as UTF-8: short strings live in the inline
+ * buffer, longer ones on the heap until js_str_free. */
+typedef struct {
+  char* ptr;
+  size_t len;
+  char inline_buf[256];
+} js_str;
+
+#define JS_STR_INIT {NULL, 0, {0}}
+
+JS_HELPER bool js_arg_str(napi_env env, napi_value v, js_str* s) {
+  size_t len = 0;
+  if (napi_get_value_string_utf8(env, v, NULL, 0, &len) != napi_ok) {
+    return js_type_error(env, "expected a string");
+  }
+  s->ptr = len < sizeof s->inline_buf ? s->inline_buf : (char*)malloc(len + 1);
+  napi_get_value_string_utf8(env, v, s->ptr, len + 1, &s->len);
+  return true;
+}
+
+JS_HELPER void js_str_free(js_str* s) {
+  if (s->ptr != NULL && s->ptr != s->inline_buf) free(s->ptr);
+  s->ptr = NULL;
+}
+
+#define JS_STR_PTR(s) ((const uint8_t*)(s).ptr)
+
+/* Read up to `n` arguments; missing ones are undefined. */
+#define JS_ARGS(n)                                              \
+  size_t argc = (n);                                            \
+  napi_value argv[(n) + 1];                                     \
+  napi_get_cb_info(env, info, &argc, argv, NULL, NULL)
+
+/* ---------------------------------------------------------------------------
+ * Async calls: the completion may run on any thread, so it only records the
+ * result and queues the settlement on the JavaScript thread through a
+ * thread-safe function (which also keeps the event loop alive meanwhile).
+ * ------------------------------------------------------------------------- */
+
+typedef enum {
+  JS_R_VOID,
+  JS_R_I32,
+  JS_R_U32,
+  JS_R_I64,
+  JS_R_U64,
+  JS_R_F64,
+  JS_R_BOOL,
+  JS_R_STR,
+  JS_R_BYTES,
+  JS_R_HANDLE
+} js_kind;
+
+typedef struct {
+  napi_deferred deferred;
+  napi_threadsafe_function tsfn;
+  js_kind kind;
+  js_error* err;
+  union {
+    int64_t i;
+    uint64_t u;
+    double f;
+    bool b;
+    const void* p;
+  } v;
+  size_t len;
+} js_async;
+
+JS_HELPER void js_async_settle(napi_env env, napi_value cb, void* context, void* data) {
+  (void)cb;
+  (void)context;
+  js_async* a = (js_async*)data;
+  bool failed = a->err != NULL && a->err->code != 0;
+  if (env != NULL && failed) {
+    napi_reject_deferred(env, a->deferred, js_fault(env, a->err->code, a->err->message,
+                                                    a->err->payload_ptr, a->err->payload_len));
+  } else if (env != NULL) {
+    napi_value v = NULL;
+    switch (a->kind) {
+      case JS_R_VOID: v = js_undefined(env); break;
+      case JS_R_I32: v = js_new_i32(env, (int32_t)a->v.i); break;
+      case JS_R_U32: v = js_new_u32(env, (uint32_t)a->v.u); break;
+      case JS_R_I64: v = js_new_i64(env, a->v.i); break;
+      case JS_R_U64: v = js_new_u64(env, a->v.u); break;
+      case JS_R_F64: v = js_new_f64(env, a->v.f); break;
+      case JS_R_BOOL: v = js_new_bool(env, a->v.b); break;
+      case JS_R_STR: v = js_take_str(env, (const uint8_t*)a->v.p, a->len); break;
+      case JS_R_BYTES: v = js_take_bytes(env, (const uint8_t*)a->v.p, a->len); break;
+      case JS_R_HANDLE: v = js_new_handle(env, a->v.p); break;
+    }
+    napi_resolve_deferred(env, a->deferred, v);
+  } else if (!failed && (a->kind == JS_R_STR || a->kind == JS_R_BYTES) && a->v.p != NULL) {
+    /* The environment is shutting down: just release the result. */
+    {{PREFIX}}_free_bytes((uint8_t*)a->v.p, a->len);
+  }
+  {{PREFIX}}_error_free(a->err);
+  napi_release_threadsafe_function(a->tsfn, napi_tsfn_release);
+  free(a);
+}
+
+/* Create the promise and its settlement queue for one async call. */
+JS_HELPER js_async* js_async_begin(napi_env env, js_kind kind, const char* name, napi_value* promise) {
+  js_async* a = (js_async*)calloc(1, sizeof *a);
+  a->kind = kind;
+  napi_create_promise(env, &a->deferred, promise);
+  napi_value resource;
+  napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &resource);
+  napi_create_threadsafe_function(env, NULL, NULL, resource, 0, 1, NULL, NULL, NULL,
+                                  js_async_settle, &a->tsfn);
+  return a;
+}
+
+/* Called by each completion once it has recorded its result. */
+JS_HELPER void js_async_done(js_async* a, js_error* err) {
+  a->err = err;
+  napi_call_threadsafe_function(a->tsfn, a, napi_tsfn_blocking);
+}
+
+/* ---------------------------------------------------------------------------
+ * Callback interfaces. One registration per implementation passed to the
+ * producer: a reference to the adapter object, the JavaScript thread it
+ * belongs to, and a thread-safe function that runs calls made from any other
+ * thread on that thread while the caller waits.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+  napi_env env;
+  napi_ref ref;
+  napi_threadsafe_function tsfn;
+  uv_thread_t js_thread;
+} js_cb;
+
+/* Every callback frame starts with this header so the dispatcher can reach
+ * `out_err` without knowing the method. */
+typedef struct {
+  js_error* out_err;
+} js_cb_frame;
+
+/* A call queued from another thread: `method` is the vtable index, or -1 to
+ * release the registration. */
+typedef struct {
+  js_cb* cb;
+  int method;
+  void* frame;
+  uv_mutex_t mu;
+  uv_cond_t cv;
+  bool done;
+} js_cb_req;
+
+JS_HELPER bool js_cb_on_js_thread(js_cb* cb) {
+  uv_thread_t self = uv_thread_self();
+  return uv_thread_equal(&self, &cb->js_thread) != 0;
+}
+
+JS_HELPER js_cb* js_cb_register(napi_env env, napi_value adapter, const char* name,
+                             napi_threadsafe_function_call_js dispatch) {
+  js_cb* cb = (js_cb*)calloc(1, sizeof *cb);
+  cb->env = env;
+  cb->js_thread = uv_thread_self();
+  napi_create_reference(env, adapter, 1, &cb->ref);
+  napi_value resource;
+  napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &resource);
+  napi_create_threadsafe_function(env, NULL, NULL, resource, 0, 1, NULL, NULL, NULL, dispatch,
+                                  &cb->tsfn);
+  /* A live implementation must not keep the process alive by itself. */
+  napi_unref_threadsafe_function(env, cb->tsfn);
+  return cb;
+}
+
+JS_HELPER void js_cb_release(napi_env env, js_cb* cb) {
+  if (env != NULL) napi_delete_reference(env, cb->ref);
+  napi_release_threadsafe_function(cb->tsfn, napi_tsfn_release);
+  free(cb);
+}
+
+/* A callback-interface argument: the adapter object `index.js` built. */
+JS_HELPER bool js_arg_cb(napi_env env, napi_value v, const char* name,
+                             napi_threadsafe_function_call_js dispatch, js_cb** out) {
+  napi_valuetype t;
+  napi_typeof(env, v, &t);
+  if (t != napi_object) return js_type_error(env, "expected a callback interface implementation");
+  *out = js_cb_register(env, v, name, dispatch);
+  return true;
+}
+
+/* The vtable's `free`: the producer is done with the implementation. The
+ * reference can only be deleted on its own thread. */
+JS_HELPER void js_cb_free(void* ctx) {
+  js_cb* cb = (js_cb*)ctx;
+  if (cb == NULL) return;
+  if (js_cb_on_js_thread(cb)) {
+    js_cb_release(cb->env, cb);
+    return;
+  }
+  js_cb_req* req = (js_cb_req*)calloc(1, sizeof *req);
+  req->cb = cb;
+  req->method = -1;
+  if (napi_call_threadsafe_function(cb->tsfn, req, napi_tsfn_nonblocking) != napi_ok) free(req);
+}
+
+/* Run `req` on the JavaScript thread and wait for it. */
+JS_HELPER void js_cb_hop(js_cb_req* req) {
+  uv_mutex_init(&req->mu);
+  uv_cond_init(&req->cv);
+  req->done = false;
+  if (napi_call_threadsafe_function(req->cb->tsfn, req, napi_tsfn_blocking) == napi_ok) {
+    uv_mutex_lock(&req->mu);
+    while (!req->done) uv_cond_wait(&req->cv, &req->mu);
+    uv_mutex_unlock(&req->mu);
+  } else {
+    {{PREFIX}}_error_set(((js_cb_frame*)req->frame)->out_err, -4,
+                         "the callback implementation is no longer reachable");
+  }
+  uv_cond_destroy(&req->cv);
+  uv_mutex_destroy(&req->mu);
+}
+
+JS_HELPER void js_cb_finish(js_cb_req* req) {
+  uv_mutex_lock(&req->mu);
+  req->done = true;
+  uv_cond_signal(&req->cv);
+  uv_mutex_unlock(&req->mu);
+}
+
+/* Report the pending JavaScript exception (or `fallback`) through `out_err`
+ * as a foreign failure (code -4); nothing unwinds through the C frame. */
+JS_HELPER void js_cb_report(napi_env env, js_error* out_err, const char* fallback) {
+  char msg[512];
+  msg[0] = 0;
+  bool pending = false;
+  napi_is_exception_pending(env, &pending);
+  if (pending) {
+    napi_value exc, text, str;
+    napi_get_and_clear_last_exception(env, &exc);
+    napi_valuetype t;
+    napi_typeof(env, exc, &t);
+    text = exc;
+    if (t == napi_object) napi_get_named_property(env, exc, "message", &text);
+    if (napi_coerce_to_string(env, text, &str) == napi_ok) {
+      napi_get_value_string_utf8(env, str, msg, sizeof msg, NULL);
+    }
+    napi_is_exception_pending(env, &pending);
+    if (pending) napi_get_and_clear_last_exception(env, &exc);
+  }
+  {{PREFIX}}_error_set(out_err, -4, msg[0] != 0 ? msg : fallback);
+}
+
+/* Look up and call `method` on the adapter; false when it threw. */
+JS_HELPER bool js_cb_call(napi_env env, js_cb* cb, const char* method, size_t argc,
+                       const napi_value* argv, napi_value* result) {
+  napi_value adapter, fn;
+  napi_get_reference_value(env, cb->ref, &adapter);
+  napi_get_named_property(env, adapter, method, &fn);
+  return napi_call_function(env, adapter, fn, argc, argv, result) == napi_ok;
+}
+
+/* ---------------------------------------------------------------------------
+ * The runtime symbols every library exports.
+ * ------------------------------------------------------------------------- */
+
+static napi_value js_abi_version(napi_env env, napi_callback_info info) {
+  (void)info;
+  return js_new_u32(env, {{PREFIX}}_abi_version());
+}
+
+static napi_value js_debug_live(napi_env env, napi_callback_info info) {
+  JS_ARGS(1);
+  int32_t kind = 0;
+  if (!js_arg_i32(env, argv[0], &kind)) return NULL;
+  return js_new_u64(env, {{PREFIX}}_debug_live(kind));
+}
+
+static napi_value js_cancel_token_create(napi_env env, napi_callback_info info) {
+  (void)info;
+  return js_new_handle(env, {{PREFIX}}_cancel_token_create());
+}
+
+static napi_value js_cancel_token_cancel(napi_env env, napi_callback_info info) {
+  JS_ARGS(1);
+  void* token = NULL;
+  if (!js_arg_handle(env, argv[0], &token, false)) return NULL;
+  {{PREFIX}}_cancel_token_cancel(({{PREFIX}}_cancel_token*)token);
+  return js_undefined(env);
+}
+
+static napi_value js_cancel_token_destroy(napi_env env, napi_callback_info info) {
+  JS_ARGS(1);
+  void* token = NULL;
+  if (!js_arg_handle(env, argv[0], &token, false)) return NULL;
+  {{PREFIX}}_cancel_token_destroy(({{PREFIX}}_cancel_token*)token);
+  return js_undefined(env);
+}
+
+#define JS_RUNTIME_EXPORTS                                                                  \
+  {"$setup", NULL, js_setup, NULL, NULL, NULL, napi_default, NULL},                         \
+  {"{{PREFIX}}_abi_version", NULL, js_abi_version, NULL, NULL, NULL, napi_default, NULL},   \
+  {"{{PREFIX}}_debug_live", NULL, js_debug_live, NULL, NULL, NULL, napi_default, NULL},     \
+  {"{{PREFIX}}_cancel_token_create", NULL, js_cancel_token_create, NULL, NULL, NULL,        \
+   napi_default, NULL},                                                                     \
+  {"{{PREFIX}}_cancel_token_cancel", NULL, js_cancel_token_cancel, NULL, NULL, NULL,        \
+   napi_default, NULL},                                                                     \
+  {"{{PREFIX}}_cancel_token_destroy", NULL, js_cancel_token_destroy, NULL, NULL, NULL,      \
+   napi_default, NULL}

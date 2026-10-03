@@ -9,9 +9,9 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use weaveffi_core::model::InterfaceBinding;
+use weaveffi_model::model::InterfaceBinding;
 
-use super::helpers::ident;
+use super::helpers::{ident, thunk_attrs};
 
 /// Generate the lifecycle surface for one interface:
 ///
@@ -33,6 +33,7 @@ pub(crate) fn gen_interface_lifecycle(i: &InterfaceBinding) -> TokenStream {
          thread; wrap interior state in Mutex/RwLock/atomics",
         i.name
     );
+    let attrs = thunk_attrs();
     quote! {
         const _: () = {
             #[doc = #assert_msg]
@@ -40,15 +41,13 @@ pub(crate) fn gen_interface_lifecycle(i: &InterfaceBinding) -> TokenStream {
             __wv_assert_send_sync::<#ty>();
         };
 
-        #[no_mangle]
-        #[allow(unsafe_code, clippy::not_unsafe_ptr_arg_deref)]
-        pub extern "C" fn #clone_sym(ptr: *const #ty) -> *mut #ty {
+        #attrs
+        pub unsafe extern "C" fn #clone_sym(ptr: *const #ty) -> *mut #ty {
             unsafe { ::weaveffi::abi::object_clone(ptr) }
         }
 
-        #[no_mangle]
-        #[allow(unsafe_code, clippy::not_unsafe_ptr_arg_deref)]
-        pub extern "C" fn #destroy_sym(ptr: *mut #ty) {
+        #attrs
+        pub unsafe extern "C" fn #destroy_sym(ptr: *mut #ty) {
             unsafe { ::weaveffi::abi::object_destroy(ptr) }
         }
     }

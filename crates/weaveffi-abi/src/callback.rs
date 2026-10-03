@@ -11,33 +11,30 @@
 //! calls `free(ctx)` exactly once.
 //!
 //! A consumer implementation that fails reports through the method's
-//! `out_err` slot with [`FOREIGN_ERROR_CODE`](crate::FOREIGN_ERROR_CODE). The
-//! generated trait method can't return that error (callback methods never
-//! `throws`), so [`check_foreign_error`] hands it to [`raise_foreign_error`],
-//! which delivers it to the enclosing thunk by one of two routes:
+//! `out_err` slot (normally with [`FOREIGN_ERROR_CODE`](crate::FOREIGN_ERROR_CODE)),
+//! and [`foreign_status`] turns that slot into a `Result`. What happens next
+//! depends on how the producer declared the trait method:
 //!
-//! * On a `panic = "unwind"` build (every native target by default) it
-//!   unwinds with a [`ForeignError`] payload, aborting the producer's call at
-//!   the point of failure. The thunk's `catch_unwind` recognizes the payload
-//!   and reports it with the consumer's message.
-//! * On a `panic = "abort"` build (notably `wasm32-unknown-unknown`, where
-//!   unwinding is unavailable) it records the failure in a thread-local slot
-//!   and returns, so the producer's code keeps running on the vtable entry's
-//!   default return value. Every thunk checks [`take_foreign_error`] after the
-//!   producer returns and reports the recorded failure instead of the result.
-//!   The first failure recorded wins; later ones on the same call are dropped.
-//!
-//! Both routes surface the same `out_err` code and message to the original
-//! caller, so consumers see identical behaviour. Producers that need the
-//! abort-build route to be correct must tolerate a callback method returning
-//! its type's zero value once the consumer has failed; well-behaved producers
-//! already do, because the consumer could return that value on purpose.
+//! * A method returning `Result<T, ForeignError>` gets the failure as an
+//!   `Err` and nothing unwinds. This is the recommended spelling.
+//! * A method returning a plain `T` can't return the failure, so
+//!   [`raise_foreign_error`] delivers it to the enclosing thunk. On a
+//!   `panic = "unwind"` build (every native target by default) it unwinds
+//!   with a [`ForeignError`] payload, and the thunk's `catch_unwind` reports
+//!   it with the consumer's message. On a `panic = "abort"` build (notably
+//!   `wasm32-unknown-unknown`) it records the failure for the innermost
+//!   active thunk on this thread (see [`ThunkScope`]) and returns the vtable
+//!   entry's default value; the thunk reports the recorded failure in place
+//!   of its result. With no thunk active (the producer called back from a
+//!   thread of its own) the failure is written to stderr and dropped, so it
+//!   can never leak into a later, unrelated call.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::weaveffi_error;
+use crate::FfiError;
 
 /// Implemented by every generated vtable struct so [`ForeignCallback`] can
 /// find the trailing `free` entry without knowing the method layout.
@@ -116,6 +113,7 @@ impl<V: Vtable> ForeignCallback<V> {
         if vtable.is_null() {
             return None;
         }
+        crate::leak::track(crate::leak::CALLBACKS, 1);
         Some(Self { ctx, vtable })
     }
 
@@ -138,81 +136,138 @@ impl<V: Vtable> ForeignCallback<V> {
 impl<V: Vtable> Drop for ForeignCallback<V> {
     fn drop(&mut self) {
         let free = self.vtable().free();
+        crate::leak::track(crate::leak::CALLBACKS, -1);
         // SAFETY: `ctx` is handed back to the consumer's own release hook
         // exactly once, as the ABI contract requires.
         unsafe { free(self.ctx) };
     }
 }
 
-/// The unwind payload [`check_foreign_error`] raises when a consumer
-/// callback-interface implementation reports a failure.
+/// A failure a consumer's callback-interface implementation reported.
 ///
-/// The `#[weaveffi::module]` thunks catch it and report
-/// [`FOREIGN_ERROR_CODE`](crate::FOREIGN_ERROR_CODE) with `message` to the
-/// original caller, so the consumer's own error text round-trips through the
-/// producer.
+/// A trait method declared to return `Result<T, ForeignError>` receives it as
+/// an `Err`. For a method returning a plain `T` it's the unwind payload
+/// [`raise_foreign_error`] raises, which the `#[weaveffi::module]` thunks
+/// catch and report with `code` and `message`, so the consumer's own error
+/// text round-trips through the producer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForeignError {
     /// The code the consumer wrote to `out_err` (normally
     /// [`FOREIGN_ERROR_CODE`](crate::FOREIGN_ERROR_CODE)).
     pub code: i32,
-    /// The consumer's message, copied out of `out_err` before it was cleared.
+    /// The consumer's message, copied out of `out_err` before it was freed.
     pub message: String,
 }
 
 impl std::fmt::Display for ForeignError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
+        f.write_str(&self.message)
     }
 }
 
 impl std::error::Error for ForeignError {}
 
+/// A `ForeignError` is reported with its own code and message, so a producer
+/// function can propagate a callback failure with `?` when its error type is
+/// `ForeignError`.
+impl crate::ErrorReport for ForeignError {
+    fn code(&self) -> i32 {
+        self.code
+    }
+    fn message(&self) -> String {
+        self.message.clone()
+    }
+}
+
 thread_local! {
-    /// The failure recorded by [`raise_foreign_error`] on a `panic = "abort"`
-    /// build, waiting for the enclosing thunk to pick it up.
+    /// How many thunks are running on this thread (nested calls stack).
+    static THUNK_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// The failure recorded for the innermost running thunk on a
+    /// `panic = "abort"` build, waiting for that thunk to pick it up.
     static PENDING_FOREIGN: RefCell<Option<ForeignError>> = const { RefCell::new(None) };
 }
 
-/// Inspect the `out_err` slot a vtable entry wrote and abort the producer
-/// call if the consumer reported a failure.
+/// Marks a WeaveFFI thunk (or one poll of an async call's future) as running
+/// on the current thread, for the lifetime of the value.
 ///
-/// On success (`code == 0`) this is a no-op. Otherwise it copies the message,
-/// releases the error's allocations, and raises a [`ForeignError`] through
-/// [`raise_foreign_error`].
-///
-/// # Panics
-///
-/// On a `panic = "unwind"` build this unwinds with a [`ForeignError`] payload
-/// whenever `err.code != 0`. Generated thunks always run inside
-/// `catch_unwind`, which converts the payload into an `out_err` report.
-pub fn check_foreign_error(mut err: weaveffi_error) {
-    if err.code == 0 {
-        return;
+/// A deferred foreign failure ([`defer_foreign_error`]) is only recorded
+/// while a scope is active, and belongs to the innermost one: entering a
+/// scope sets aside whatever an outer scope had pending and dropping it puts
+/// that back, so a nested call (a consumer callback that calls into the
+/// producer again) can neither steal nor leak its caller's failure. Read the
+/// scope's own failure with [`take_foreign_error`] before it drops.
+#[derive(Debug)]
+pub struct ThunkScope {
+    outer: Option<ForeignError>,
+    // Thread-local bookkeeping: the scope must end on the thread it began.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl ThunkScope {
+    /// Enter a scope on the current thread.
+    #[must_use]
+    pub fn enter() -> Self {
+        THUNK_DEPTH.with(|d| d.set(d.get() + 1));
+        let outer = PENDING_FOREIGN.with(|slot| slot.borrow_mut().take());
+        Self {
+            outer,
+            _not_send: PhantomData,
+        }
     }
-    // Consumers report with `FOREIGN_ERROR_CODE`; any other trap code is kept,
-    // but a positive code must not masquerade as one of the producer's domain
-    // errors on the outer call.
+
+    /// Whether any scope is active on the current thread.
+    #[must_use]
+    pub fn is_active() -> bool {
+        THUNK_DEPTH.with(Cell::get) > 0
+    }
+}
+
+impl Drop for ThunkScope {
+    fn drop(&mut self) {
+        THUNK_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        let outer = self.outer.take();
+        PENDING_FOREIGN.with(|slot| *slot.borrow_mut() = outer);
+    }
+}
+
+/// Read the `out_err` slot a vtable entry wrote: `Ok(())` when the consumer
+/// succeeded, otherwise the consumer's failure (whose allocations `err`'s
+/// drop then releases).
+///
+/// A positive code is reported as
+/// [`FOREIGN_ERROR_CODE`](crate::FOREIGN_ERROR_CODE), since it must not
+/// masquerade as one of the producer's domain errors on the outer call; the
+/// reserved negative codes are kept.
+///
+/// # Errors
+///
+/// Returns the consumer's failure when `err.code` isn't `0`.
+pub fn foreign_status(err: &FfiError) -> Result<(), ForeignError> {
+    if err.code == 0 {
+        return Ok(());
+    }
     let code = if err.code < 0 {
         err.code
     } else {
         crate::FOREIGN_ERROR_CODE
     };
-    let message = crate::c_ptr_to_string(err.message)
-        .unwrap_or_else(|| "callback interface implementation failed".to_string());
-    crate::error_clear(&mut err);
-    raise_foreign_error(ForeignError { code, message });
+    // SAFETY: the consumer fills `out_err` only through `{prefix}_error_set`,
+    // so a non-null message is a NUL-terminated string this runtime owns.
+    let message = unsafe { err.message_str() }
+        .unwrap_or("callback interface implementation failed")
+        .to_string();
+    Err(ForeignError { code, message })
 }
 
-/// Deliver a consumer-side failure to the thunk that is running the current
-/// producer call.
+/// Deliver a consumer-side failure from a callback method that can't return
+/// it (one declared to return a plain `T`).
 ///
 /// On a `panic = "unwind"` build this never returns: it unwinds with `err` as
-/// the payload via [`std::panic::resume_unwind`], so the panic hook does not
-/// fire (this is control flow, not a bug report). On a `panic = "abort"` build
-/// it records `err` for [`take_foreign_error`] and returns, keeping the first
-/// failure if one is already pending. Generated code always follows a call to
-/// this function with a fallback value so that both builds type-check.
+/// the payload via [`std::panic::resume_unwind`], so the panic hook doesn't
+/// fire (this is control flow, not a bug report). On a `panic = "abort"`
+/// build it calls [`defer_foreign_error`] and returns. Generated code always
+/// follows a call to this function with a fallback value so that both builds
+/// type-check.
 ///
 /// # Panics
 ///
@@ -222,19 +277,28 @@ pub fn raise_foreign_error(err: ForeignError) {
     {
         std::panic::resume_unwind(Box::new(err));
     }
-    #[cfg(panic = "abort")]
+    #[cfg(not(panic = "unwind"))]
     {
         defer_foreign_error(err);
     }
 }
 
-/// Record `err` as this thread's pending foreign failure without unwinding,
-/// keeping an already-pending failure if there is one.
+/// Record `err` for the innermost [`ThunkScope`] on this thread without
+/// unwinding, keeping an already-recorded failure if there is one. With no
+/// scope active the failure is written to stderr and dropped.
 ///
-/// This is the `panic = "abort"` half of [`raise_foreign_error`]; it is public
-/// so that tests and unusual producers can exercise the deferred route on any
+/// This is the `panic = "abort"` half of [`raise_foreign_error`]; it's public
+/// so tests and unusual producers can exercise the deferred route on any
 /// build.
 pub fn defer_foreign_error(err: ForeignError) {
+    if !ThunkScope::is_active() {
+        eprintln!(
+            "weaveffi: a callback interface implementation failed outside any exported call \
+             (code {}): {}",
+            err.code, err.message
+        );
+        return;
+    }
     PENDING_FOREIGN.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
@@ -243,13 +307,13 @@ pub fn defer_foreign_error(err: ForeignError) {
     });
 }
 
-/// Take the foreign failure recorded on this thread by [`defer_foreign_error`],
-/// if any.
+/// Take the failure recorded for the innermost [`ThunkScope`] on this
+/// thread, if any.
 ///
-/// Generated thunks call this after the producer's code returns and, when it
-/// yields `Some`, report the failure through `out_err` instead of the result.
-/// On a `panic = "unwind"` build this is normally `None`, because the failure
-/// unwound past the producer's code instead of being recorded.
+/// Generated thunks call this right after the producer's code returns and,
+/// when it yields `Some`, report the failure through `out_err` instead of
+/// the result. On a `panic = "unwind"` build it's normally `None`, because a
+/// failure unwinds past the producer's code instead of being recorded.
 #[must_use]
 pub fn take_foreign_error() -> Option<ForeignError> {
     PENDING_FOREIGN.with(|slot| slot.borrow_mut().take())
@@ -262,7 +326,7 @@ mod tests {
 
     #[repr(C)]
     struct TestVtable {
-        ping: unsafe extern "C" fn(*mut c_void, i32, *mut weaveffi_error) -> i32,
+        ping: unsafe extern "C" fn(*mut c_void, i32, *mut FfiError) -> i32,
         free: unsafe extern "C" fn(*mut c_void),
     }
 
@@ -272,63 +336,88 @@ mod tests {
         }
     }
 
-    static FREED: AtomicUsize = AtomicUsize::new(0);
-
-    unsafe extern "C" fn ping(_ctx: *mut c_void, x: i32, out_err: *mut weaveffi_error) -> i32 {
+    unsafe extern "C" fn ping(_ctx: *mut c_void, x: i32, out_err: *mut FfiError) -> i32 {
         if x < 0 {
-            crate::error_set(out_err, crate::FOREIGN_ERROR_CODE, "negative");
+            unsafe { crate::error_set(out_err, crate::FOREIGN_ERROR_CODE, "negative") };
             return 0;
         }
-        crate::error_set_ok(out_err);
         x * 2
     }
 
-    unsafe extern "C" fn free(_ctx: *mut c_void) {
-        FREED.fetch_add(1, Ordering::SeqCst);
+    /// Each test owns its counter: the context points at it, so tests running
+    /// in parallel never observe each other's releases.
+    unsafe extern "C" fn free(ctx: *mut c_void) {
+        unsafe { &*ctx.cast::<AtomicUsize>() }.fetch_add(1, Ordering::SeqCst);
     }
 
     static VTABLE: TestVtable = TestVtable { ping, free };
 
-    fn call(cb: &ForeignCallback<TestVtable>, x: i32) -> i32 {
-        let mut err = weaveffi_error::default();
+    fn ctx(freed: &AtomicUsize) -> *mut c_void {
+        std::ptr::from_ref(freed).cast_mut().cast()
+    }
+
+    fn call(cb: &ForeignCallback<TestVtable>, x: i32) -> Result<i32, ForeignError> {
+        let mut err = FfiError::default();
         let out = unsafe { (cb.vtable().ping)(cb.ctx(), x, &mut err) };
-        check_foreign_error(err);
-        out
+        foreign_status(&err).map(|()| out)
     }
 
     #[test]
     fn calls_through_and_frees_once() {
-        let before = FREED.load(Ordering::SeqCst);
-        let cb =
-            Arc::new(unsafe { ForeignCallback::from_raw(std::ptr::null_mut(), &VTABLE) }.unwrap());
-        assert_eq!(call(&cb, 21), 42);
+        let freed = AtomicUsize::new(0);
+        let cb = Arc::new(unsafe { ForeignCallback::from_raw(ctx(&freed), &VTABLE) }.unwrap());
+        assert_eq!(call(&cb, 21), Ok(42));
         let second = Arc::clone(&cb);
         drop(cb);
-        assert_eq!(FREED.load(Ordering::SeqCst), before);
+        assert_eq!(freed.load(Ordering::SeqCst), 0);
         drop(second);
-        assert_eq!(FREED.load(Ordering::SeqCst), before + 1);
+        assert_eq!(freed.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn foreign_failure_unwinds_with_the_message() {
-        let cb = unsafe { ForeignCallback::from_raw(std::ptr::null_mut(), &VTABLE) }.unwrap();
-        let payload =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(&cb, -1))).unwrap_err();
-        let fe = payload
-            .downcast_ref::<ForeignError>()
-            .expect("ForeignError payload");
-        assert_eq!(fe.code, crate::FOREIGN_ERROR_CODE);
-        assert_eq!(fe.message, "negative");
+    fn foreign_failure_is_returned() {
+        let freed = AtomicUsize::new(0);
+        let cb = unsafe { ForeignCallback::from_raw(ctx(&freed), &VTABLE) }.unwrap();
+        let err = call(&cb, -1).unwrap_err();
+        assert_eq!(err.code, crate::FOREIGN_ERROR_CODE);
+        assert_eq!(err.message, "negative");
+    }
+
+    #[test]
+    fn raised_failure_unwinds_with_the_payload() {
+        let payload = std::panic::catch_unwind(|| {
+            raise_foreign_error(ForeignError {
+                code: crate::FOREIGN_ERROR_CODE,
+                message: "raised".into(),
+            });
+        })
+        .unwrap_err();
+        let fe = payload.downcast_ref::<ForeignError>().unwrap();
+        assert_eq!(fe.message, "raised");
+    }
+
+    #[test]
+    fn positive_codes_are_reported_as_foreign() {
+        let err = crate::FfiError::new(7, "domain-looking");
+        assert_eq!(
+            foreign_status(&err).unwrap_err().code,
+            crate::FOREIGN_ERROR_CODE
+        );
+        let err = crate::FfiError::new(crate::MARSHAL_ERROR_CODE, "kept");
+        assert_eq!(
+            foreign_status(&err).unwrap_err().code,
+            crate::MARSHAL_ERROR_CODE
+        );
     }
 
     trait Pinger: Send + Sync {
-        fn ping(&self, x: i32) -> i32;
+        fn ping(&self, x: i32) -> Result<i32, ForeignError>;
     }
 
     struct ForeignPinger(ForeignCallback<TestVtable>);
 
     impl Pinger for ForeignPinger {
-        fn ping(&self, x: i32) -> i32 {
+        fn ping(&self, x: i32) -> Result<i32, ForeignError> {
             call(&self.0, x)
         }
     }
@@ -342,12 +431,12 @@ mod tests {
 
     #[test]
     fn lift_callback_builds_the_trait_object() {
-        let before = FREED.load(Ordering::SeqCst);
+        let freed = AtomicUsize::new(0);
         let pinger: Arc<dyn Pinger> =
-            unsafe { lift_callback(std::ptr::null_mut(), &VTABLE) }.expect("non-null vtable");
-        assert_eq!(pinger.ping(4), 8);
+            unsafe { lift_callback(ctx(&freed), &VTABLE) }.expect("non-null vtable");
+        assert_eq!(pinger.ping(4), Ok(8));
         drop(pinger);
-        assert_eq!(FREED.load(Ordering::SeqCst), before + 1);
+        assert_eq!(freed.load(Ordering::SeqCst), 1);
         assert!(
             unsafe { lift_callback::<dyn Pinger>(std::ptr::null_mut(), std::ptr::null()) }
                 .is_none()
@@ -356,6 +445,7 @@ mod tests {
 
     #[test]
     fn deferred_failures_keep_the_first_and_are_taken_once() {
+        let _scope = ThunkScope::enter();
         assert!(take_foreign_error().is_none());
         defer_foreign_error(ForeignError {
             code: crate::FOREIGN_ERROR_CODE,
@@ -366,13 +456,47 @@ mod tests {
             message: "second".into(),
         });
         let taken = take_foreign_error().expect("a pending failure");
-        assert_eq!(taken.code, crate::FOREIGN_ERROR_CODE);
         assert_eq!(taken.message, "first");
         assert!(take_foreign_error().is_none());
     }
 
     #[test]
+    fn deferral_without_a_scope_is_dropped() {
+        assert!(!ThunkScope::is_active());
+        defer_foreign_error(ForeignError {
+            code: crate::FOREIGN_ERROR_CODE,
+            message: "nobody is listening".into(),
+        });
+        let _scope = ThunkScope::enter();
+        assert!(take_foreign_error().is_none());
+    }
+
+    #[test]
+    fn nested_scopes_keep_their_own_failures() {
+        let outer = ThunkScope::enter();
+        defer_foreign_error(ForeignError {
+            code: crate::FOREIGN_ERROR_CODE,
+            message: "outer".into(),
+        });
+        {
+            let _inner = ThunkScope::enter();
+            assert!(take_foreign_error().is_none());
+            defer_foreign_error(ForeignError {
+                code: crate::FOREIGN_ERROR_CODE,
+                message: "inner".into(),
+            });
+        }
+        assert_eq!(
+            take_foreign_error().map(|e| e.message),
+            Some("outer".into())
+        );
+        drop(outer);
+        assert!(!ThunkScope::is_active());
+    }
+
+    #[test]
     fn deferred_failures_are_thread_local() {
+        let _scope = ThunkScope::enter();
         defer_foreign_error(ForeignError {
             code: crate::FOREIGN_ERROR_CODE,
             message: "mine".into(),

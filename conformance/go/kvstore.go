@@ -12,11 +12,11 @@
 // optional TTL and prefix parameters, and the nested kv.stats submodule
 // borrowing the Store across the module boundary.
 //
-// ABI 2 surface: a Go type implementing the EvictionListener callback
+// Callbacks and objects: a Go type implementing the EvictionListener callback
 // interface (called with the decoded Entry and the EvictionReason, its bool
 // return detaching it, replacement and clear releasing the old handle, and a
 // panicking implementation surfacing to the throwing caller as a
-// *WeaveFFIError with code -4), plus reference-counted objects everywhere:
+// *Error with code -4), plus reference-counted objects everywhere:
 // Share() aliasing the same store, Fork() copying it, Store? both ways in
 // Larger, a Store inside the StoreInfo record (Describe), a list of stores
 // returned by StoreOpenMany, and stores encoded into a parameter buffer by
@@ -25,24 +25,18 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"os"
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	wv "__MODPATH__"
 )
-
-func expect(cond bool, msg string) {
-	if !cond {
-		fmt.Fprintln(os.Stderr, "assertion failed:", msg)
-		os.Exit(1)
-	}
-}
 
 type eviction struct {
 	key    string
@@ -250,8 +244,8 @@ func main() {
 	l4 := listen(store, 1000, &freed)
 	put(store, "boom", payload, nil)
 	_, err = store.Delete("boom")
-	var ferr *wv.WeaveFFIError
-	expect(errors.As(err, &ferr), fmt.Sprintf("panicking listener yields *WeaveFFIError (got %T %v)", err, err))
+	var ferr *wv.Error
+	expect(errors.As(err, &ferr), fmt.Sprintf("panicking listener yields *Error (got %T %v)", err, err))
 	expect(ferr.Code == -4, fmt.Sprintf("foreign error code -4 (got %d)", ferr.Code))
 	expect(strings.Contains(ferr.Message, "listener refused boom"),
 		fmt.Sprintf("foreign error carries the panic text (got %q)", ferr.Message))
@@ -342,10 +336,33 @@ func main() {
 	// Async: an immediately-expired entry gives compact 3 bytes to reclaim;
 	// the cgo trampoline bridges the producer's worker thread to a channel.
 	put(store, "doomed", payload, ptrInt64(0))
-	reclaimed, err := store.Compact()
+	reclaimed, err := store.Compact(context.Background())
 	expect(err == nil, "compact async")
 	expect(reclaimed == 3, fmt.Sprintf("compact reclaimed 3 bytes (got %d)", reclaimed))
 	expect(store.Count() == 4, "store count after compact")
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = store.Compact(cancelled)
+	expect(errors.Is(err, context.Canceled), fmt.Sprintf("compact with a cancelled context (got %v)", err))
+
+	// Close racing calls on other goroutines: each call either completes or
+	// panics with "used after Close"; none sees a freed store.
+	racer, err := wv.OpenStore("/tmp/race")
+	expect(err == nil, "open racer")
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 500 {
+				if catchPanic(func() { racer.Count() }) != nil {
+					return
+				}
+			}
+		}()
+	}
+	racer.Close()
+	wg.Wait()
 
 	// Plain void method, then release every object; Close is idempotent.
 	store.Clear()
@@ -362,6 +379,9 @@ func main() {
 	forked.Close()
 	store.Close()
 	store.Close()
+	expect(catchPanic(func() { store.Count() }) != nil, "use after Close panics")
+
+	expectNoLeaks(wv.DebugLive)
 	fmt.Println("go/kvstore: OK")
 }
 

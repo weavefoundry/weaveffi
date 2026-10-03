@@ -22,18 +22,10 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
 	"strings"
 
 	wv "__MODPATH__"
 )
-
-func expect(cond bool, msg string) {
-	if !cond {
-		fmt.Fprintln(os.Stderr, "assertion failed:", msg)
-		os.Exit(1)
-	}
-}
 
 // Bit-exact float comparison so NaN payloads and the sign of zero count.
 func sameF64(a, b float64) bool { return math.Float64bits(a) == math.Float64bits(b) }
@@ -186,12 +178,6 @@ func sameComposite(a, b wv.Composite) (bool, string) {
 func expectSameComposite(a, b wv.Composite, what string) {
 	same, field := sameComposite(a, b)
 	expect(same, fmt.Sprintf("%s: field %s differs\n  a: %+v\n  b: %+v", what, field, a, b))
-}
-
-func catchPanic(f func()) (v any) {
-	defer func() { v = recover() }()
-	f()
-	return nil
 }
 
 func ptrI64(v int64) *int64   { return &v }
@@ -394,6 +380,8 @@ func main() {
 	expect(len(wv.RoundtripMap(nil)) == 0, "roundtrip_map(empty)")
 	expect(wv.RoundtripString("héllo wörld ✓ 😀") == "héllo wörld ✓ 😀", "roundtrip_string unicode")
 	expect(wv.RoundtripString("") == "", "roundtrip_string empty")
+	expect(wv.RoundtripString("a\x00b\x00") == "a\x00b\x00", "roundtrip_string keeps interior NUL bytes")
+	expect(wv.RoundtripString("\x00") == "\x00", "roundtrip_string of a lone NUL")
 	expect(sameBytes(wv.RoundtripBytes([]byte{0, 255, 128}), []byte{0, 255, 128}), "roundtrip_bytes")
 	expect(len(wv.RoundtripBytes([]byte{})) == 0, "roundtrip_bytes empty")
 	expect(wv.RoundtripI64(math.MinInt64) == math.MinInt64, "roundtrip_i64 MinInt64")
@@ -482,5 +470,6 @@ func main() {
 	mp.Close()
 	mp.Close()
 
+	expectNoLeaks(wv.DebugLive)
 	fmt.Println("go/codec: OK")
 }
