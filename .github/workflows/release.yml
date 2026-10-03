@@ -27,7 +27,9 @@ jobs:
         with:
           command: release-pr
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A token other than GITHUB_TOKEN, so CI runs on the release PR
+          # (GitHub doesn't trigger workflows from GITHUB_TOKEN events).
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   # Publishes when the merged release PR bumped the version (a no-op
@@ -49,5 +51,7 @@ jobs:
         with:
           command: release
         env:
+          # A token other than GITHUB_TOKEN, so the GitHub release it creates
+          # triggers release-binaries.yml.
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
