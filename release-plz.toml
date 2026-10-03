@@ -12,6 +12,19 @@ semver_check = false
 dependencies_update = false
 pr_labels = ["release"]
 release_always = false
+# Version rules, matching the semantic-release setup this replaced:
+#   feat                          -> minor (even on 0.x)
+#   fix, perf, revert             -> patch
+#   any type with `!` or a
+#   `BREAKING CHANGE:` footer     -> minor while 0.x
+#   chore, docs, style, refactor,
+#   test, build, ci               -> no release on their own
+# release-plz bumps feat by a patch on 0.x unless told otherwise.
+features_always_increment_minor = true
+# release-plz releases on any commit that changes a crate unless at least one
+# commit must match this pattern. Squash merges make the PR title the commit
+# subject, and pr-lint.yml keeps PR titles conventional.
+release_commits = '^(feat|fix|perf|revert)(\(.*\))?!?:|^[a-z]+(\(.*\))?!:|^Revert "|BREAKING[ -]CHANGE:'
 
 [changelog]
 commit_parsers = [
