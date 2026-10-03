@@ -400,7 +400,10 @@ mod tests {
         let model = BindingModel::build(&api);
         let config = SwiftConfig::default();
         let files = Layout::new(&api, &config).sources(&model, Utf8Path::new("out"), &config);
-        let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        let paths: Vec<String> = files
+            .iter()
+            .map(|(p, _)| p.as_str().replace('\\', "/"))
+            .collect();
         assert_eq!(
             paths,
             [

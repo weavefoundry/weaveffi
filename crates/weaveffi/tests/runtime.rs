@@ -1298,13 +1298,17 @@ fn cancel_then_destroy_races_the_launch_safely() {
     for i in 0..RUNS {
         let token = runtime_cancel_token_create();
         if i % 2 == 0 {
-            // Cancel and destroy from another thread while the launch races.
+            // The launcher takes its own reference before returning, so the
+            // consumer may then cancel and destroy its reference from another
+            // thread while the spawned future starts running. (Destroying the
+            // token before handing it to a launcher would break the contract:
+            // the launcher would adopt a freed token.)
+            unsafe { tasks::runtime_tasks_wait_forever(token, on_i32, ctx) };
             let raw = token as usize;
             let canceller = std::thread::spawn(move || unsafe {
                 runtime_cancel_token_cancel(raw as *mut abi::FfiCancelToken);
                 runtime_cancel_token_destroy(raw as *mut abi::FfiCancelToken);
             });
-            unsafe { tasks::runtime_tasks_wait_forever(token, on_i32, ctx) };
             canceller.join().unwrap();
         } else {
             // Cancel and destroy before the spawned future is ever polled.
