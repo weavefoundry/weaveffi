@@ -288,14 +288,15 @@ fn codecs_round_trip_in_c_and_cpp() {
         let src = dir.join(format!("roundtrip.{ext}"));
         let exe = dir.join(format!("roundtrip_{ext}"));
         std::fs::write(&src, ROUNDTRIP_C).expect("write source");
+        // MinGW (the `cc` on Windows runners) ships no sanitizer runtimes.
+        let sanitize: &[&str] = if cfg!(windows) {
+            &[]
+        } else {
+            &["-fsanitize=address,undefined"]
+        };
         let out = Command::new(cc)
-            .args([
-                std,
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-                "-fsanitize=address,undefined",
-            ])
+            .args([std, "-Wall", "-Wextra", "-Werror"])
+            .args(sanitize)
             .arg("-I")
             .arg(dir.as_str())
             .arg(src.as_str())
