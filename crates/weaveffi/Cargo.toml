@@ -19,12 +19,15 @@ weaveffi-macros = { workspace = true }
 # allocations for `{prefix}_debug_live`. Every sample enables it.
 leak-check = ["weaveffi-abi/leak-check"]
 
+# Dev-dependencies are path-only (no version) so `cargo publish` strips them:
+# a versioned dev-dependency must already be on crates.io when this crate is
+# published, which would force `weaveffi-gen` to publish first.
 [dev-dependencies]
 # Only for the ABI-revision lockstep test; the facade never links the
 # generators at runtime.
-weaveffi-gen = { workspace = true }
+weaveffi-gen = { path = "../weaveffi-gen" }
 # The leak-counter test needs counting on.
-weaveffi-abi = { workspace = true, features = ["leak-check"] }
+weaveffi-abi = { path = "../weaveffi-abi", features = ["leak-check"] }
 
 [lints]
 workspace = true
