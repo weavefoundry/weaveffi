@@ -27,10 +27,10 @@ pub(crate) fn input_format(in_path: &Utf8Path) -> Result<&'static str> {
         "yml" | "yaml" => Ok("yaml"),
         "json" => Ok("json"),
         "toml" => Ok("toml"),
-        other => bail!(
+        other => Err(miette::miette!(
             "unsupported input format: {} (expected rs|yml|yaml|json|toml)",
             other
-        ),
+        )),
     }
 }
 

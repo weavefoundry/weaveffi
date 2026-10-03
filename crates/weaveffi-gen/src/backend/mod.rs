@@ -41,9 +41,19 @@ pub struct OutputFile {
 
 impl OutputFile {
     /// Pair a destination path with its rendered contents.
+    ///
+    /// The path is normalized to `/` separators, which every platform's file
+    /// APIs accept, so listings, cache records, and tests see the same path
+    /// on Windows as elsewhere.
     pub fn new(path: impl Into<Utf8PathBuf>, contents: impl Into<String>) -> Self {
+        let path: Utf8PathBuf = path.into();
+        let path = if path.as_str().contains('\\') {
+            Utf8PathBuf::from(path.as_str().replace('\\', "/"))
+        } else {
+            path
+        };
         Self {
-            path: path.into(),
+            path,
             contents: contents.into(),
         }
     }

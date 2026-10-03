@@ -22,8 +22,17 @@ runs:
     - if: inputs.lang == 'ruby'
       shell: bash
       run: gem install ffi
+    # dart-lang/setup-dart can't run inside a composite action (it registers
+    # a problem matcher relative to the calling action), so fetch the SDK.
     - if: inputs.lang == 'dart'
-      uses: dart-lang/setup-dart@v1
+      shell: bash
+      run: |
+        os=linux; [ "$RUNNER_OS" = macOS ] && os=macos
+        arch=x64; case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; esac
+        curl -fsSL -o "$RUNNER_TEMP/dart.zip" \
+          "https://storage.googleapis.com/dart-archive/channels/stable/release/latest/sdk/dartsdk-$os-$arch-release.zip"
+        unzip -q -o "$RUNNER_TEMP/dart.zip" -d "$RUNNER_TEMP"
+        echo "$RUNNER_TEMP/dart-sdk/bin" >> "$GITHUB_PATH"
     - if: inputs.lang == 'go'
       uses: actions/setup-go@v5
       with:

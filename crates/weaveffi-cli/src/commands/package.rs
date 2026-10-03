@@ -53,14 +53,14 @@ pub(crate) fn cmd_package(args: &PackageArgs<'_>) -> Result<()> {
     } = *args;
     let source = match (binaries, build) {
         (Some(_), Some(_)) => {
-            bail!("--binaries and --build are mutually exclusive; choose one source for the native libraries")
+            return Err(miette::miette!("--binaries and --build are mutually exclusive; choose one source for the native libraries"))
         }
         (Some(dir), None) => BinarySource::Prebuilt(dir),
         (None, Some(crate_name)) => BinarySource::Build(crate_name),
-        (None, None) => bail!(
+        (None, None) => return Err(miette::miette!(
             "provide native libraries with --binaries <dir> (laid out as <dir>/<platform>/<lib>) \
              or --build <crate> to cross-compile a Rust producer"
-        ),
+        )),
     };
 
     let project = super::load_project(args.input, args.config, args.warn)?;
@@ -371,10 +371,10 @@ fn find_library(
             if let Some(hit) = matches.iter().find(|p| p.file_name() == Some(&canonical)) {
                 Ok(Some(hit.clone()))
             } else {
-                bail!(
+                Err(miette::miette!(
                     "multiple .{ext} libraries in {platform_dir}; \
                      name one '{canonical}' to disambiguate"
-                )
+                ))
             }
         }
     }
@@ -481,11 +481,11 @@ fn build_one(crate_name: &str, platform: Platform) -> Result<Utf8PathBuf> {
     }
 
     match produced.len() {
-        0 => bail!(
+        0 => Err(miette::miette!(
             "cargo built {crate_name} for {triple} but produced no .{ext} cdylib; \
              ensure the crate declares `crate-type = [\"cdylib\", \"staticlib\"]` \
              (iOS slices are static libraries)"
-        ),
+        )),
         1 => Ok(produced.into_iter().next().unwrap()),
         _ => {
             // Prefer the artifact whose stem matches the crate's normalized lib name.
