@@ -121,6 +121,10 @@ func open(_ path: String) -> Store {
 
 /// A thread-safe tally shared by the test and the callbacks it creates.
 final class Tally: @unchecked Sendable {
+    /// The thread that created the tally: synchronous calls must notify on
+    /// it. (`Thread.isMainThread` isn't reliable for this on Linux, where
+    /// top-level async code doesn't run on the main thread.)
+    let origin = pthread_self()
     private let lock = NSLock()
     private var counts: [String: Int] = [:]
     private var notes: [String: String] = [:]
@@ -184,7 +188,7 @@ final class RecordingListener: Listener, @unchecked Sendable {
     }
 
     func onChange(change: Change) throws {
-        if !Thread.isMainThread { tally.add("offMain") }
+        if pthread_equal(pthread_self(), tally.origin) == 0 { tally.add("offMain") }
         switch change {
         case let .put(entry, replaced):
             tally.note("version", String(entry.version))

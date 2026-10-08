@@ -14,3 +14,14 @@ mod no_silent_stubs;
 mod package;
 mod project_config;
 mod schema;
+
+/// A command's stderr with miette's wrapping undone: box-drawing gutters
+/// removed and whitespace runs collapsed, so a message matches as one line
+/// whatever width the report was wrapped to.
+fn stderr(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr)
+        .replace(['│', '×'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}

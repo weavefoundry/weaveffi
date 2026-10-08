@@ -126,7 +126,7 @@ fn extract_explains_what_it_cannot_read() {
     let idl = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kitchen_sink.yml");
     let output = weaveffi().arg("extract").arg(&idl).output().unwrap();
     assert!(!output.status.success());
-    let err = String::from_utf8_lossy(&output.stderr);
+    let err = crate::stderr(&output);
     assert!(err.contains("already an IDL"), "{err}");
 
     // The CLI binary itself is a real executable with no metadata.
@@ -137,7 +137,7 @@ fn extract_explains_what_it_cannot_read() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    let err = String::from_utf8_lossy(&output.stderr);
+    let err = crate::stderr(&output);
     assert!(err.contains("no WeaveFFI metadata"), "{err}");
     assert!(err.contains("export_runtime!"), "{err}");
 
@@ -147,6 +147,6 @@ fn extract_explains_what_it_cannot_read() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    let err = String::from_utf8_lossy(&output.stderr);
+    let err = crate::stderr(&output);
     assert!(err.contains("pass the crate"), "{err}");
 }

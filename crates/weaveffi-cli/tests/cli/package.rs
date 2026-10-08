@@ -65,16 +65,6 @@ fn weaveffi() -> assert_cmd::Command {
     assert_cmd::Command::cargo_bin("weaveffi").expect("binary not found")
 }
 
-/// The command's stderr with miette's wrapping undone: box-drawing gutters
-/// removed and whitespace runs collapsed, so messages match as one line.
-fn stderr(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr)
-        .replace(['│', '×'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// The `(path, bytes)` entries of a gzipped tarball.
 fn untar_gz(path: &Path) -> Vec<(String, Vec<u8>)> {
     let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -195,7 +185,7 @@ fn package_reports_targets_with_no_platform() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    let err = stderr(&output);
+    let err = crate::stderr(&output);
     assert!(err.contains("no artifacts for wasm"), "{err}");
     assert!(
         err.contains("none of the selected targets produced"),
@@ -215,7 +205,7 @@ fn package_names_the_missing_platform_library() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    let err = stderr(&output);
+    let err = crate::stderr(&output);
     assert!(err.contains("libcalculator.so"), "{err}");
     assert!(
         err.contains("weaveffi build --platforms android-arm64"),
@@ -238,7 +228,7 @@ fn build_without_a_cargo_toml_explains_the_alternatives() {
             .output()
             .unwrap();
         assert!(!output.status.success(), "{command} succeeded");
-        let err = stderr(&output);
+        let err = crate::stderr(&output);
         assert!(err.contains("no Cargo.toml at"), "{command}: {err}");
         assert!(err.contains("--binaries"), "{command}: {err}");
     }
@@ -257,7 +247,7 @@ fn build_rejects_unknown_and_foreign_platforms_before_compiling() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    let err = stderr(&output);
+    let err = crate::stderr(&output);
     assert!(err.contains("unknown platform `solaris-sparc`"), "{err}");
     assert!(err.contains("darwin-arm64"), "{err}");
 
@@ -271,7 +261,7 @@ fn build_rejects_unknown_and_foreign_platforms_before_compiling() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    let err = stderr(&output);
+    let err = crate::stderr(&output);
     assert!(err.contains("can only be built on a"), "{err}");
     assert!(!err.contains("Compiling"), "checks run before cargo: {err}");
 }

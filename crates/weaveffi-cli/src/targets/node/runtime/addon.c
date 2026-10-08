@@ -1,3 +1,8 @@
+/* libuv's Unix headers use POSIX types (pthread_rwlock_t, struct addrinfo)
+ * that glibc hides under a strict -std=c11; ask for them explicitly. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #ifndef NAPI_VERSION
 #define NAPI_VERSION 8
 #endif

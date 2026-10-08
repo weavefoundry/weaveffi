@@ -15,10 +15,13 @@ swift_consumer() {
     local sample="$1" src="$2"
     local gen="$GENROOT/$sample/swift"
     local pkg="$OUT/swift-$sample"
-    local cdir mod
-    cdir=$(ls -d "$gen"/Sources/C*/ | head -1)
-    mod=$(basename "$cdir")
-    mod=${mod#C}
+    # The Swift module is the target whose C shim `C<module>` sits beside it
+    # (`ls` order differs across locales, so don't rely on sorting).
+    local dir name mod=""
+    for dir in "$gen"/Sources/*/; do
+        name=$(basename "$dir")
+        if [ -d "$gen/Sources/C$name" ]; then mod=$name; fi
+    done
     rm -rf "$pkg"
     mkdir -p "$pkg/Sources/conformance"
     cp "$ROOT/conformance/swift/$src" "$pkg/Sources/conformance/main.swift"

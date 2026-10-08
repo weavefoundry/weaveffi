@@ -145,7 +145,7 @@ fn rust_source_input_points_at_the_crate() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = crate::stderr(&output);
     assert!(stderr.contains("pass the crate"), "{stderr}");
 }
 
