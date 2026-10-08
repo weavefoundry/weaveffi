@@ -4,7 +4,7 @@ Records, rich enums, optionals, lists, maps, and error payloads cross the C
 ABI *by value*, serialized in one compact binary format. A buffered value
 occupies one `(const uint8_t*, size_t)` slot pair however deeply it nests.
 This page is the normative wire format every generator and the
-`weaveffi-abi` runtime (`weaveffi_abi::buffer`) implement.
+`weaveffi::abi` runtime (`weaveffi::abi::buffer`) implement.
 
 ## Which types are buffered
 
@@ -12,7 +12,8 @@ This page is the normative wire format every generator and the
 - a rich enum (any variant has fields)
 - `[T]`, `{K:V}`
 - `T?`, except `Interface?`, which stays a nullable object pointer at the top
-  level of a parameter or return
+  level of a parameter or return, and `Cb?`, an optional callback parameter
+  whose null vtable means none
 
 Everything else keeps its own slot shape at the top level (see the
 [C ABI contract](abi.md#families-and-slots)): direct values by value, strings
@@ -41,14 +42,15 @@ encoder refuses to write more rather than truncate.
 | `bytes` | `u32` length, then raw bytes |
 | `T?` | 1 flag byte (`0` absent, `1` present), then the value if present |
 | `[T]` | `u32` count, then each element |
-| `{K:V}` | `u32` count, then alternating key and value |
+| `{K:V}` | `u32` count, then alternating key and value; no key appears twice |
 | struct | each field, in declaration order |
 | rich enum | `i32` tag (the variant's `value`), then the variant's fields in order |
 | error payload | the code's fields, in declaration order |
 
 The format is compositional, so `{string:[T?]}`, records inside records, and
-lists of rich enums need no special cases. `[u8]` is canonicalized to `bytes`
-at parse time; the two encode identically.
+lists of rich enums need no special cases. A map's encoding never repeats a
+key, so no entry can silently disappear between the two sides. `[u8]` is
+canonicalized to `bytes` at parse time; the two encode identically.
 
 Example: a `Point { x: f64, y: f64 }` with `x = 1.5`, `y = -2.0` is 16
 bytes, `00 00 00 00 00 00 F8 3F 00 00 00 00 00 00 00 C0`; a `[string]` of
@@ -63,6 +65,7 @@ A decoder rejects a buffer that:
 - holds invalid UTF-8 in a string;
 - declares a string or byte length larger than the bytes remaining;
 - holds an enum value or rich-enum tag that isn't declared;
+- repeats a key in a map;
 - has bytes left over after the complete value.
 
 A collection count is not checked against the bytes remaining, because an
@@ -91,6 +94,14 @@ exactly one strong reference, in either direction.
 
 A zero token is invalid in a non-optional position; `Interface?` inside a
 buffer uses the optional flag byte followed by the token.
+
+A callback method's error payload can't carry object tokens: an error code
+whose fields include an interface can't be reported from a callback, and a
+Rust producer decodes a callback's payload with a reader that refuses every
+token. That reader (`BufferReader::token_free`) is also why decoding is
+otherwise `unsafe` in the Rust runtime: only a reader that refuses tokens can
+safely decode arbitrary bytes, because no safe function can turn an arbitrary
+`u64` into an object reference.
 
 ## Slots and ownership
 

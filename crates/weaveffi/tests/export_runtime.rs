@@ -16,6 +16,8 @@ weaveffi::export_runtime!();
 fn every_runtime_symbol_has_its_c_signature() {
     let _: extern "C" fn() -> u32 = export_runtime_abi_version;
     let _: unsafe extern "C" fn(*mut FfiError, i32, *const c_char) = export_runtime_error_set;
+    let _: unsafe extern "C" fn(*mut FfiError, *const u8, usize) = export_runtime_error_set_payload;
+    let _: extern "C" fn(usize) -> *mut u8 = export_runtime_alloc;
     let _: unsafe extern "C" fn(*mut FfiError) = export_runtime_error_clear;
     let _: unsafe extern "C" fn(*mut FfiError) = export_runtime_error_free;
     let _: unsafe extern "C" fn(*mut u8, usize) = export_runtime_free_bytes;
@@ -25,7 +27,7 @@ fn every_runtime_symbol_has_its_c_signature() {
         export_runtime_cancel_token_is_cancelled;
     let _: unsafe extern "C" fn(*mut FfiCancelToken) = export_runtime_cancel_token_destroy;
     let _: extern "C" fn(i32) -> u64 = export_runtime_debug_live;
-    assert_eq!(export_runtime_abi_version(), 3);
+    assert_eq!(export_runtime_abi_version(), 4);
 }
 
 #[test]
@@ -47,10 +49,31 @@ fn error_set_copies_and_clear_frees() {
 }
 
 #[test]
-fn free_bytes_releases_returned_runs() {
+fn error_set_payload_copies_the_run() {
+    let mut err = FfiError::default();
+    let fields = abi::encode_value(&"key".to_string());
+    unsafe {
+        export_runtime_error_set(&mut err, 1, ptr::null());
+        export_runtime_error_set_payload(&mut err, fields.as_ptr(), fields.len());
+    }
+    drop(fields);
+    assert_eq!(
+        unsafe { abi::decode_value::<String>(err.payload()) }.unwrap(),
+        "key"
+    );
+    unsafe { export_runtime_error_clear(&mut err) };
+    assert!(err.payload_ptr.is_null());
+}
+
+#[test]
+fn free_bytes_releases_returned_and_allocated_runs() {
     let (p, len) = abi::bytes_into_raw(vec![1, 2, 3]);
+    let staged = export_runtime_alloc(16);
+    assert!(!staged.is_null());
+    assert!(export_runtime_alloc(0).is_null());
     unsafe {
         export_runtime_free_bytes(p.cast_mut(), len);
+        export_runtime_free_bytes(staged, 16);
         export_runtime_free_bytes(ptr::null_mut(), 0);
     }
 }
@@ -73,7 +96,9 @@ fn cancel_tokens_round_trip() {
 }
 
 #[test]
-fn unknown_leak_kinds_read_zero() {
-    assert_eq!(export_runtime_debug_live(-1), 0);
+fn debug_live_reports_whether_it_counts() {
+    // This crate's tests enable `leak-check`, so kind -1 reads 1.
+    assert_eq!(export_runtime_debug_live(-1), 1);
+    assert_eq!(export_runtime_debug_live(-2), 0);
     assert_eq!(export_runtime_debug_live(99), 0);
 }

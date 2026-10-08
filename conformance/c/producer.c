@@ -6,11 +6,11 @@
 //
 //   * the API's own functions (`calculator_calculator_add`, ...);
 //   * the runtime surface every consumer relies on: the ABI revision, the
-//     error helpers, `free_bytes` for returned strings and buffers, cancel
-//     tokens, and the debug leak counter;
-//   * one checksum function per top-level module, returning the constant the
+//     error helpers, `alloc` and `free_bytes` for byte runs, cancel tokens,
+//     and the debug leak counter;
+//   * one contract table per top-level module, returning the entries the
 //     header was generated with, so a consumer generated from a different
-//     contract refuses to load.
+//     contract refuses to load and names what changed.
 //
 // The harness builds this file with -fvisibility=hidden and checks with `nm`
 // that every symbol is still exported (the header's CALCULATOR_API macro
@@ -29,7 +29,13 @@ static atomic_uint_fast64_t live_tokens;
 
 uint32_t calculator_abi_version(void) { return CALCULATOR_ABI_VERSION; }
 
-uint64_t calculator_calculator_checksum(void) { return CALCULATOR_CALCULATOR_CHECKSUM; }
+// The table the header was generated with is exactly what this producer
+// implements, so it returns the header's own entries (sorted by id).
+const calculator_contract_entry* calculator_calculator_contract(size_t* out_len) {
+    static const calculator_contract_entry table[] = CALCULATOR_CALCULATOR_CONTRACT;
+    if (out_len != NULL) *out_len = CALCULATOR_CALCULATOR_CONTRACT_LEN;
+    return table;
+}
 
 void calculator_error_set(calculator_error* err, int32_t code, const char* message) {
     if (err == NULL) return;
@@ -41,6 +47,19 @@ void calculator_error_set(calculator_error* err, int32_t code, const char* messa
         if (copy != NULL) memcpy(copy, message, n);
         err->message = copy;
     }
+}
+
+void calculator_error_set_payload(calculator_error* err, const uint8_t* ptr, size_t len) {
+    if (err == NULL) return;
+    free((void*)err->payload_ptr);
+    err->payload_ptr = NULL;
+    err->payload_len = 0;
+    if (ptr == NULL || len == 0) return;
+    uint8_t* copy = (uint8_t*)malloc(len);
+    if (copy == NULL) return;
+    memcpy(copy, ptr, len);
+    err->payload_ptr = copy;
+    err->payload_len = len;
 }
 
 void calculator_error_clear(calculator_error* err) {
@@ -58,9 +77,17 @@ void calculator_error_free(calculator_error* err) {
     free(err);
 }
 
+// Every byte run, whether this library returned it or a consumer
+// allocated it, is one malloc block, so one release function covers both.
+uint8_t* calculator_alloc(size_t len) {
+    if (len == 0) return NULL;
+    uint8_t* run = (uint8_t*)calloc(len, 1);
+    if (run != NULL) atomic_fetch_add(&live_allocations, 1);
+    return run;
+}
+
 void calculator_free_bytes(uint8_t* ptr, size_t len) {
-    (void)len;
-    if (ptr != NULL) {
+    if (ptr != NULL && len != 0) {
         atomic_fetch_sub(&live_allocations, 1);
         free(ptr);
     }
@@ -97,6 +124,8 @@ void calculator_cancel_token_destroy(calculator_cancel_token* token) {
 
 uint64_t calculator_debug_live(int32_t kind) {
     switch (kind) {
+    case -1:
+        return 1;  // this producer counts tokens and allocations
     case 3:
         return atomic_load(&live_tokens);
     case 4:
@@ -110,40 +139,39 @@ uint64_t calculator_debug_live(int32_t kind) {
 
 int32_t calculator_calculator_add(int32_t a, int32_t b, calculator_error* out_err) {
     (void)out_err;
-    return a + b;
+    return (int32_t)((uint32_t)a + (uint32_t)b);
 }
 
-int32_t calculator_calculator_mul(int32_t a, int32_t b, calculator_error* out_err) {
-    (void)out_err;
-    return a * b;
-}
-
-int32_t calculator_calculator_div(int32_t a, int32_t b, calculator_error* out_err) {
+int32_t calculator_calculator_divide(int32_t a, int32_t b, calculator_error* out_err) {
     if (b == 0) {
         calculator_error_set(out_err, calculator_calculator_CalcError_DivisionByZero,
                              "division by zero");
         return 0;
     }
+    if (a == INT32_MIN && b == -1) return INT32_MIN;  // wraps, like the Rust sample
     return a / b;
 }
 
 // Strings arrive as borrowed (ptr, len) and return as an owned run the
 // consumer releases with calculator_free_bytes; NULL + 0 is the empty string.
-const uint8_t* calculator_calculator_echo(const uint8_t* s_ptr, size_t s_len, size_t* out_len,
-                                          calculator_error* out_err) {
+const uint8_t* calculator_calculator_greet(const uint8_t* name_ptr, size_t name_len,
+                                           size_t* out_len, calculator_error* out_err) {
+    static const char prefix[] = "Hello, ";
     *out_len = 0;
-    if (s_ptr == NULL && s_len != 0) {
+    if (name_ptr == NULL && name_len != 0) {
         calculator_error_set(out_err, -3, "null string with a nonzero length");
         return NULL;
     }
-    if (s_len == 0) return NULL;
-    uint8_t* copy = (uint8_t*)malloc(s_len);
-    if (copy == NULL) {
+    size_t n = (sizeof prefix - 1) + name_len + 1;
+    uint8_t* run = (uint8_t*)malloc(n);
+    if (run == NULL) {
         calculator_error_set(out_err, -1, "out of memory");
         return NULL;
     }
-    memcpy(copy, s_ptr, s_len);
+    memcpy(run, prefix, sizeof prefix - 1);
+    if (name_len != 0) memcpy(run + sizeof prefix - 1, name_ptr, name_len);
+    run[n - 1] = '!';
     atomic_fetch_add(&live_allocations, 1);
-    *out_len = s_len;
-    return copy;
+    *out_len = n;
+    return run;
 }

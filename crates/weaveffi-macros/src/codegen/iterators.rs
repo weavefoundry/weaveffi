@@ -5,27 +5,24 @@
 //! [`weaveffi_model::plan::IteratorProtocol`]: each `_next` call yields exactly
 //! one element the consumer then owns (and releases per the protocol's
 //! `elem` pass), and `_destroy` releases the handle exactly once. Errors from
-//! the launcher and from each `_next` follow the owning function's
-//! [`ErrorStrategy`](weaveffi_model::plan::ErrorStrategy).
+//! the launcher follow the owning function's
+//! [`ErrorStrategy`](weaveffi_model::plan::ErrorStrategy); `_next` fails only
+//! on a null handle or a concurrent or re-entrant `_next`.
 
 use proc_macro2::TokenStream;
 use quote::quote;
 use weaveffi_model::model::{FnBinding, IteratorBinding};
 
-use super::helpers::{
-    deferred_failure_check, fn_slots, ident, reject, slot_tokens, thunk_attrs, wrap_unwind,
-    CallTarget, UserSig,
-};
-use super::marshal::{lift_param, lower_value};
-use super::sync::throws;
+use super::helpers::{fn_slots, ident, slot_tokens, thunk_attrs, CallTarget, UserSig};
+use super::lift::lower_ret;
+use super::sync::{checked_call, sync_lifts};
 use super::unsupported;
 
 /// Generate the launcher / `_next` / `_destroy` trio for a function returning
 /// `iter<T>`. The producer returns a `weaveffi::Iter<T>` (optionally wrapped in
 /// `Result`); the launcher boxes it behind a
-/// [`weaveffi_abi::IterHandle`], `_next` pulls one element under the
-/// handle's lock and lowers it through `out_item`, and `_destroy` drops the
-/// handle.
+/// [`weaveffi::abi::IterHandle`], `_next` pulls one element and lowers it
+/// through `out_item`, and `_destroy` drops the handle.
 pub(crate) fn gen_iterator_function(
     f: &FnBinding,
     it: &IteratorBinding,
@@ -55,51 +52,18 @@ pub(crate) fn gen_iterator_function(
     // ── launcher: lift inputs, run the producer's fn, box the iterator ──
     let launch_sym = ident(&it.launch.symbol);
     let launch_params = fn_slots(&it.launch.params, &f.params, user, prefix)?;
-    let null = quote!(::std::ptr::null_mut());
-    let launch_sentinel = Some(&null);
-
-    let self_pre = target.self_preamble(launch_sentinel, user.receiver_is_arc());
-    let mut preamble = TokenStream::new();
-    let mut call_args: Vec<TokenStream> = Vec::new();
-    for pb in &f.params {
-        let (pre, arg) = lift_param(pb, user, launch_sentinel)?;
-        preamble.extend(pre);
-        call_args.push(arg);
-    }
-    let call = target.call(&f.name, &call_args);
-    let deferred = deferred_failure_check(launch_sentinel);
-    let bind_iter = if throws(f) {
-        quote! {
-            let __wv_iter = match __wv_out {
-                ::std::result::Result::Ok(__wv_v) => __wv_v,
-                ::std::result::Result::Err(__wv_err) => {
-                    ::weaveffi::abi::error_store(
-                        out_err,
-                        ::weaveffi::abi::FfiError::from_report(&__wv_err),
-                    );
-                    return ::std::ptr::null_mut();
-                }
-            };
-        }
-    } else {
-        quote!(let __wv_iter = __wv_out;)
-    };
-    let launch_body = wrap_unwind(
-        quote! {
-            #self_pre
-            #preamble
-            let __wv_out = #call;
-            #deferred
-            #bind_iter
-            ::weaveffi::abi::error_clear(out_err);
-            ::weaveffi::abi::iter_into_raw(__wv_iter)
-        },
-        launch_sentinel,
-    );
+    let lifts = sync_lifts(f, user, target)?;
+    let lifted = lifts.finish();
+    let call = checked_call(f, target.call(&f.name, &lifts.args), user);
     let launch = quote! {
         #attrs
         pub unsafe extern "C" fn #launch_sym(#(#launch_params),*) -> *mut #handle {
-            #launch_body
+            unsafe {
+                ::weaveffi::abi::call_sync(out_err, move || unsafe {
+                    #lifted
+                    ::std::result::Result::Ok(::weaveffi::abi::iter_into_raw(#call))
+                })
+            }
         }
     };
 
@@ -116,36 +80,27 @@ pub(crate) fn gen_iterator_function(
             _ => slot_tokens(p, prefix),
         })
         .collect();
-    let item_lowered = lower_value(&it.elem, quote!(__wv_item), elem_object.as_ref(), user)?;
-    let zero = quote!(0);
-    let next_sentinel = Some(&zero);
-    let null_fail = reject("iterator or out_item is null", next_sentinel);
-    let deferred = deferred_failure_check(next_sentinel);
-    let next_body = wrap_unwind(
-        quote! {
-            if out_item.is_null() {
-                #null_fail
-            }
-            let __wv_pulled = match ::weaveffi::abi::iter_next(iter) {
-                ::std::option::Option::Some(__wv_p) => __wv_p,
-                ::std::option::Option::None => { #null_fail }
-            };
-            #deferred
-            ::weaveffi::abi::error_clear(out_err);
-            match __wv_pulled {
-                ::std::option::Option::Some(__wv_item) => {
-                    *out_item = #item_lowered;
-                    1
-                }
-                ::std::option::Option::None => 0,
-            }
-        },
-        next_sentinel,
-    );
+    let item = lower_ret(&it.elem, &quote!(__wv_item), elem_object.as_ref());
     let next = quote! {
         #attrs
         pub unsafe extern "C" fn #next_sym(iter: *const #handle, #(#rest_params),*) -> i32 {
-            #next_body
+            unsafe {
+                ::weaveffi::abi::call_sync(out_err, move || unsafe {
+                    if out_item.is_null() {
+                        return ::std::result::Result::Err(::weaveffi::abi::FfiError::new(
+                            ::weaveffi::abi::MARSHAL_ERROR_CODE,
+                            "out_item is null",
+                        ));
+                    }
+                    ::std::result::Result::Ok(match ::weaveffi::abi::iter_next(iter)? {
+                        ::std::option::Option::Some(__wv_item) => {
+                            *out_item = #item;
+                            1
+                        }
+                        ::std::option::Option::None => 0,
+                    })
+                })
+            }
         }
     };
 

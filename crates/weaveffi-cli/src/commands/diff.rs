@@ -1,5 +1,5 @@
 //! `weaveffi diff`: show how regenerating would change an existing output
-//! directory, without writing anything or running hooks. `--check` turns it
+//! directory, without writing anything. `--check` turns it
 //! into a CI gate.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -7,17 +7,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use camino::Utf8Path;
 use miette::{IntoDiagnostic, Result};
 use similar::TextDiff;
-use weaveffi_gen::cache;
-use weaveffi_gen::codegen::relative_path;
+use weaveffi_cli::cache;
+use weaveffi_cli::codegen::relative_path;
 
 /// Options for [`cmd_diff`].
 pub(crate) struct DiffArgs<'a> {
-    pub(crate) input: Option<&'a str>,
+    pub(crate) locate: super::Locate<'a>,
     pub(crate) out: Option<&'a str>,
     pub(crate) targets: Option<&'a str>,
-    pub(crate) config: Option<&'a str>,
     pub(crate) check: bool,
-    pub(crate) quiet: bool,
 }
 
 /// Exit status of `diff --check` when files differ.
@@ -26,14 +24,15 @@ const EXIT_MODIFIED: i32 = 2;
 const EXIT_ADDED_OR_REMOVED: i32 = 3;
 
 pub(crate) fn cmd_diff(args: &DiffArgs<'_>) -> Result<()> {
-    let project = super::load_project(args.input, args.config, false)?;
+    let project = args.locate.project()?;
+    let model = super::load_model(&project, false)?;
     let out_dir = project.config.out_dir(args.out);
     let targets = project.config.select_targets(args.targets)?;
 
     let mut generated: BTreeMap<String, String> = BTreeMap::new();
     let mut existing: BTreeSet<String> = BTreeSet::new();
     for target in &targets {
-        for file in target.render(&project.api, &out_dir) {
+        for file in target.render(&model, &out_dir) {
             generated.insert(relative_path(&out_dir, &file.path), file.contents);
         }
         // Files a previous generation recorded are the generator's; without a
@@ -42,7 +41,7 @@ pub(crate) fn cmd_diff(args: &DiffArgs<'_>) -> Result<()> {
             Some(record) => existing.extend(
                 record
                     .files
-                    .into_keys()
+                    .into_iter()
                     .filter(|rel| out_dir.join(rel).exists()),
             ),
             None => collect_files(&out_dir, &out_dir.join(target.name()), &mut existing)?,
@@ -87,7 +86,7 @@ pub(crate) fn cmd_diff(args: &DiffArgs<'_>) -> Result<()> {
         if modified > 0 {
             std::process::exit(EXIT_MODIFIED);
         }
-    } else if added == 0 && removed == 0 && modified == 0 && !args.quiet {
+    } else if added == 0 && removed == 0 && modified == 0 && !args.locate.quiet {
         println!("No differences found.");
     }
     Ok(())

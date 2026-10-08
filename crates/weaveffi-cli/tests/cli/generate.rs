@@ -5,7 +5,7 @@ use std::path::Path;
 fn generate_produces_expected_files() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/calculator/src/lib.rs");
+    let input = repo_root.join("samples/calculator");
 
     let out_dir = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = out_dir.path();
@@ -43,7 +43,7 @@ fn generate_produces_expected_files() {
 fn generate_with_target_filter() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/calculator/src/lib.rs");
+    let input = repo_root.join("samples/calculator");
 
     let out_dir = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = out_dir.path();
@@ -75,7 +75,7 @@ fn generate_with_target_filter() {
 fn generate_cpp_target_filter() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/calculator/src/lib.rs");
+    let input = repo_root.join("samples/calculator");
 
     let out_dir = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = out_dir.path();
@@ -107,7 +107,7 @@ fn generate_cpp_target_filter() {
 fn validate_command_succeeds() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/calculator/src/lib.rs");
+    let input = repo_root.join("samples/calculator");
 
     assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")
@@ -121,7 +121,7 @@ fn validate_command_succeeds() {
 fn quiet_flag_suppresses_output() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/calculator/src/lib.rs");
+    let input = repo_root.join("samples/calculator");
 
     let out_dir = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = out_dir.path();
@@ -143,4 +143,46 @@ fn quiet_flag_suppresses_output() {
         out_path.join("c/calculator.h").exists(),
         "files should still be generated with --quiet"
     );
+}
+
+/// `weaveffi dev` builds the debug library, generates, and copies the
+/// library into the Python package, which loads a bundled copy first; the
+/// targets that can't bundle it are told which variable to set.
+#[test]
+fn dev_bundles_the_debug_library_into_the_python_package() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
+    let input = repo_root.join("samples/calculator");
+    let out_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let out_path = out_dir.path();
+
+    let output = assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args(["dev", input.to_str().unwrap(), "-o"])
+        .arg(out_path)
+        .args(["--target", "c,python,dotnet"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let library = if cfg!(target_os = "macos") {
+        "libcalculator.dylib"
+    } else if cfg!(windows) {
+        "calculator.dll"
+    } else {
+        "libcalculator.so"
+    };
+    assert!(
+        out_path.join("python/calculator").join(library).is_file(),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("dotnet: export CALCULATOR_LIBRARY="),
+        "{stdout}"
+    );
+    assert!(stdout.contains("c: link with"), "{stdout}");
 }

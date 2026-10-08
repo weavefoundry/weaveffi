@@ -1,4 +1,4 @@
-version: "0.10.0"
+version: "0.11.0"
 # Exercises multi-level nested modules and type references that cross nesting
 # boundaries in every direction:
 #   * parent  -> nested child   (graphics.Canvas.root : shapes.Shape)
@@ -6,9 +6,9 @@ version: "0.10.0"
 #   * nested  -> deeper nested   (graphics.shapes.Shape.detail : geometry.Detail)
 #   * nested  -> ancestor return (graphics.shapes.describe -> Canvas)
 #   * deeper  -> ancestor param  (geometry.compute(shape: Shape))
-# All bare names below are auto-qualified by the resolver to their full
-# dot-joined module path, which the C ABI then flattens to underscores
-# (e.g. graphics.shapes.geometry.Detail -> weaveffi_graphics_shapes_geometry_Detail).
+# Type names are global, so every reference is the bare name; the C ABI
+# names each type after its declaring module's underscore-joined path
+# (e.g. Detail in graphics.shapes.geometry -> {prefix}_graphics_shapes_geometry_Detail).
 # The root module also declares an error domain that geometry.compute (two
 # levels down) relies on through domain inheritance for its `throws: true`.
 modules:

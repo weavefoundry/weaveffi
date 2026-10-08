@@ -8,7 +8,6 @@ mod diagnostics;
 mod diff;
 mod errors;
 mod extract;
-mod extract_roundtrip;
 mod formats;
 mod generate;
 mod no_silent_stubs;

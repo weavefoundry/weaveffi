@@ -34,6 +34,27 @@ export ROOT TARGET_DIR LIBDIR GENROOT OUT RESULTS LANE_TIMEOUT EXT
 
 LANES_FAILED=0
 
+# require_tools <lang> <tool>...: check a language's toolchain before its
+# lanes run. Under CI (CI=true), where the toolchains action installs
+# everything, a missing tool fails the language; elsewhere its lanes are
+# skipped with a note. Either way the outcome lands in $RESULTS.
+require_tools() {
+    local lang=$1 tool missing=""
+    shift
+    for tool in "$@"; do
+        command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+    done
+    [ -z "$missing" ] && return 0
+    if [ "${CI:-}" = true ]; then
+        echo "[FAIL] $lang: missing$missing" >&2
+        echo "FAIL $lang-toolchain" >> "$RESULTS"
+        exit 1
+    fi
+    echo "[SKIP] $lang: missing$missing"
+    echo "SKIP $lang" >> "$RESULTS"
+    exit 0
+}
+
 # Is lane `$1` selected by ONLY / SKIP (comma-separated lane names or
 # language names)?
 selected() {
@@ -79,7 +100,7 @@ finish_lanes() {
 }
 
 # The platform file name of a sample's cdylib. Cargo maps `-` in crate names
-# to `_` in artifact names (async-demo -> libasync_demo).
+# to `_` in artifact names (my-sample -> libmy_sample).
 sample_lib() {
     local n=${1//-/_}
     case "$EXT" in

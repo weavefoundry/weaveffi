@@ -54,9 +54,13 @@ should also pass that target's fixture check and conformance lanes.
 ### Snapshot tests
 
 Snapshot tests (`crates/weaveffi-cli/tests/snapshots.rs`) pin the exact
-output of every generator for every fixture in
+output of every generator for the fixtures in
 `crates/weaveffi-cli/tests/fixtures/`, using
-[`cargo-insta`](https://insta.rs/). When output changes on purpose:
+[`cargo-insta`](https://insta.rs/). Fixed files (runtimes, package
+manifests, and READMEs, listed per target in `FIXED_FILES`) are snapshotted
+once, from `kitchen_sink`; a target's copy of the C header is asserted
+byte-equal to the C target's own header instead of snapshotted; every other
+file is snapshotted for every fixture. When output changes on purpose:
 
 ```bash
 cargo install cargo-insta --locked
@@ -74,13 +78,20 @@ Snapshots prove the text didn't change, not that it compiles.
 `scripts/check-fixtures.sh <target>` generates every fixture and compiles or
 type-checks it with the target language's toolchain (through
 `scripts/fixtures/<target>.sh`). Run it for any target whose output you
-change; CI runs one job per target.
+change; CI runs one job per target. A missing tool (including `mypy` 1.x for
+Python and the node-gyp headers from `npx node-gyp install` for Node.js) is
+reported as a skip locally and fails the check when `CI=true`.
 
 ### Conformance
 
-`conformance/run.sh` builds every sample producer with leak counters on,
-generates bindings, and runs real consumers in every language against them.
-Each consumer must exit 0 with every leak counter at zero.
+`conformance/run.sh` builds the three sample producers (`calculator`,
+`codec`, and `kvstore`; see [Samples](docs/src/samples.md)) with leak counters
+on, generates bindings, and runs real consumers in every language against
+them: one lane per sample per language, named `<lang>-<sample>`, with its
+consumer in `conformance/<lang>/`. Each consumer must exit 0 with every leak
+counter at zero. A new feature belongs in `samples/kvstore` (or in
+`samples/codec`'s vector table, for a new wire shape), with assertions in
+every language's consumer.
 
 ```bash
 ONLY=python bash conformance/run.sh             # one language
@@ -89,7 +100,8 @@ SKIP=wasm SKIP_GEN=1 bash conformance/run.sh    # skip lanes; reuse generated bi
 ```
 
 `LANE_TIMEOUT` sets the per-lane limit in seconds (default 300). A missing
-toolchain fails its lanes; install it or skip them.
+toolchain skips its language with a note locally and fails it when
+`CI=true`.
 
 ## Documentation
 
@@ -109,7 +121,7 @@ Preview the book with `mdbook serve docs -p 3000 -n 127.0.0.1`.
 
 Read the [architecture guide](docs/src/architecture.md) first; its "Adding a
 generator" section is the checklist. In short: add
-`crates/weaveffi-gen/src/targets/<lang>/` implementing `LanguageBackend`,
+`crates/weaveffi-cli/src/targets/<lang>/` implementing `LanguageBackend`,
 register it with one line in the `cli_targets!` registry in
 `crates/weaveffi-cli/src/config.rs`, add it to the snapshot tests, add
 `scripts/fixtures/<lang>.sh` and `conformance/<lang>/`, and document it under
@@ -117,7 +129,8 @@ register it with one line in the `cli_targets!` registry in
 
 ## Fuzzing
 
-Parser and validator fuzz harnesses live in `crates/weaveffi-fuzz` and are
+Fuzz harnesses for the parsers, the validator, and the runtime's
+value-buffer decoders live in `crates/weaveffi-fuzz` and are
 driven by [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) +
 `libFuzzer`. They require nightly Rust because the libFuzzer sanitizer flags
 are unstable.
@@ -129,15 +142,19 @@ rustup toolchain install nightly
 cargo install cargo-fuzz --locked
 ```
 
-Run a target for 60 seconds (swap the target name for any of `fuzz_parse_yaml`,
-`fuzz_parse_json`, `fuzz_parse_toml`, `fuzz_parse_type_ref`, `fuzz_validate`):
+Seed a target's corpus from its committed seeds and the snapshot fixtures
+(needs `pip install pyyaml tomli-w`), then run it for 60 seconds (swap the
+target name for any of `fuzz_parse_yaml`, `fuzz_parse_json`,
+`fuzz_parse_toml`, `fuzz_parse_type_ref`, `fuzz_validate`,
+`fuzz_value_buffer`):
 
 ```bash
+python3 crates/weaveffi-fuzz/seed_corpus.py fuzz_parse_yaml \
+    crates/weaveffi-fuzz/corpus/fuzz_parse_yaml
 cargo +nightly fuzz run \
     --fuzz-dir crates/weaveffi-fuzz \
     --features fuzzing \
     fuzz_parse_yaml \
-    crates/weaveffi-fuzz/fuzz/seeds/fuzz_parse_yaml \
     -- -max_total_time=60
 ```
 
@@ -146,7 +163,7 @@ Drop `-max_total_time=60` to fuzz indefinitely.
 ### Triaging a crash
 
 When libFuzzer finds an input that panics or aborts it writes the bytes to
-`crates/weaveffi-fuzz/fuzz/artifacts/<target>/crash-<hash>`. To triage:
+`crates/weaveffi-fuzz/artifacts/<target>/crash-<hash>`. To triage:
 
 1. Pretty-print the input as the target sees it:
 
@@ -155,7 +172,7 @@ When libFuzzer finds an input that panics or aborts it writes the bytes to
        --fuzz-dir crates/weaveffi-fuzz \
        --features fuzzing \
        <target> \
-       crates/weaveffi-fuzz/fuzz/artifacts/<target>/crash-<hash>
+       crates/weaveffi-fuzz/artifacts/<target>/crash-<hash>
    ```
 
 2. Minimize the reproducer:
@@ -165,12 +182,13 @@ When libFuzzer finds an input that panics or aborts it writes the bytes to
        --fuzz-dir crates/weaveffi-fuzz \
        --features fuzzing \
        <target> \
-       crates/weaveffi-fuzz/fuzz/artifacts/<target>/crash-<hash>
+       crates/weaveffi-fuzz/artifacts/<target>/crash-<hash>
    ```
 
 3. Convert the minimized input into a regression test in `weaveffi-model`
-   (which owns the parsers and the validator) **before** fixing the bug, so
-   the failure is locked in and can't regress.
+   (which owns the parsers and the validator) or `weaveffi` (which owns the
+   value-buffer decoders) **before** fixing the bug, so the failure is
+   locked in and can't regress.
 
 ## Commit conventions
 
@@ -285,14 +303,19 @@ fix/android-jni-crash
 - **CI** (`ci.yml`): formatting, clippy, rustdoc, and a build of
   `weaveffi-model` without its IDL features; the test suite with snapshot
   checks on Linux, macOS, and Windows; `weaveffi diff --check` on every
-  sample, the JSON Schema drift check, and a `wasm32` build of every sample;
-  the fixture compile check per target; the conformance harness per language
-  on Linux and macOS; and an Android NDK link of the Kotlin JNI shim.
+  sample, the JSON Schema drift check, and a `wasm32` build of every sample
+  whose embedded metadata must match the native build's; the fixture compile
+  check per target; the conformance harness per language on Linux and macOS;
+  an Android job that links the Kotlin JNI shim with the NDK and runs
+  `weaveffi build` for Android; and a package install smoke test
+  (`scripts/package-smoke.sh`) on Linux and macOS.
 - **Quality** (`quality.yml`): `cargo deny`, `cargo audit`, `cargo machete`,
   coverage with `cargo llvm-cov`, and the docs link check.
 - **Docs** (`docs.yml`): builds and deploys the mdBook and rustdoc.
-- **Bench** (`bench.yml`), **Fuzz** (`fuzz.yml`): benchmark and fuzzing
-  runs.
+- **Bench** (`bench.yml`): a weekly sampled benchmark run, uploaded as an
+  artifact. Pull requests run each benchmark once in `ci.yml`.
+- **Fuzz** (`fuzz.yml`): a daily 60-second run of every fuzz target from a
+  corpus seeded with the committed seeds and the snapshot fixtures.
 - **PR Lint** (`pr-lint.yml`): checks the PR title and commit messages
   against Conventional Commits.
 - **Release** (`release.yml`) and **Release binaries**

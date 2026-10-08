@@ -2,17 +2,20 @@
 
 Every consumer imports the generated package as-is (conformance/python/run.sh
 puts it on PYTHONPATH and selects the producer library through the loader's
-`{PREFIX}_LIBRARY` override). This module adds the assertion helper, a hook
+`{PREFIX}_LIBRARY` override). This module adds the assertion helpers, a hook
 that turns any exception Python could only report as "unraisable" (raised in
 a ctypes callback or a finalizer) into a failure, and the end-of-run leak
-check against the producer's live-allocation counters.
+check against the producer's live-resource counters.
 """
 import gc
 import sys
+import time
 import types
-from typing import Any, List
+from typing import Any, Callable, List, Type, TypeVar
 
 _unraisable: List[str] = []
+
+E = TypeVar("E", bound=BaseException)
 
 
 def _record_unraisable(info: Any) -> None:
@@ -25,25 +28,42 @@ sys.unraisablehook = _record_unraisable
 class Consumer:
     """Assertions for one consumer, labelled `python/<name>`."""
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, package: types.ModuleType) -> None:
         self.name = name
+        self.impl = sys.modules[f"{package.__name__}.{package.__name__}"]
+        self.check(self.impl._debug_live(-1) == 1, "the producer counts live resources")
 
     def check(self, cond: bool, what: str) -> None:
         if not cond:
             print(f"python/{self.name}: FAIL: {what}", file=sys.stderr)
             sys.exit(1)
 
-    def finish(self, package: types.ModuleType) -> None:
+    def raises(self, cls: Type[E], fn: Callable[[], Any], what: str) -> E:
+        """Call `fn`, require it to raise `cls`, and return the exception."""
+        try:
+            fn()
+        except cls as exc:
+            return exc
+        except BaseException as exc:  # noqa: BLE001
+            self.check(False, f"{what}: expected {cls.__name__}, got {exc!r}")
+        self.check(False, f"{what}: expected {cls.__name__}, nothing raised")
+        raise AssertionError  # unreachable
+
+    def finish(self) -> None:
         """Collect garbage (running every finalizer), then require that the
         producer holds no live object, callback, iterator, cancel token, or
-        returned allocation, and that nothing was raised where Python could
-        not propagate it."""
-        for _ in range(3):
+        byte run, and that nothing was raised where Python could not
+        propagate it. A producer worker may still be dropping a finished
+        async call, so the counters get up to two seconds to settle."""
+        kinds = ["objects", "callbacks", "iterators", "cancel tokens", "byte runs"]
+        deadline = time.monotonic() + 2.0
+        while True:
             gc.collect()
-        impl = sys.modules[f"{package.__name__}.{package.__name__}"]
-        kinds = ["objects", "callbacks", "iterators", "cancel tokens", "allocations"]
-        for kind, label in enumerate(kinds):
-            live = impl._debug_live(kind)
-            self.check(live == 0, f"{live} live {label} at exit")
+            live = [self.impl._debug_live(kind) for kind in range(len(kinds))]
+            if not any(live) or time.monotonic() > deadline:
+                break
+            time.sleep(0.001)
+        for label, count in zip(kinds, live):
+            self.check(count == 0, f"{count} live {label} at exit")
         self.check(not _unraisable, f"unraisable exceptions: {_unraisable}")
         print(f"python/{self.name}: OK")

@@ -7,10 +7,15 @@ on:
 permissions:
   pull-requests: read
 
+concurrency:
+  group: pr-lint-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   pr-title:
     name: PR title (Conventional Commits)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Validate PR title
         uses: amannn/action-semantic-pull-request@v5
@@ -39,6 +44,7 @@ jobs:
   commits:
     name: Commit messages
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:

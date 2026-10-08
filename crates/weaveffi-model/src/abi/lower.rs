@@ -16,9 +16,16 @@
 //! * [`Family::Object`] is an interface pointer, borrowed as a parameter and
 //!   one strong reference as a return; a nullable one is `Interface?`.
 //! * [`Family::Callback`] is a `void* ctx` plus `const {tag}_vtable*` pair,
-//!   only ever a parameter.
+//!   only ever a parameter; a nullable one (`Cb?`) passes a null vtable for
+//!   none.
+//!
+//! A callback-interface method's return lowers differently from a producer
+//! return ([`lower_callback_return`]): the consumer produces the value, so a
+//! string, bytes, or buffer return is a run the consumer allocates with
+//! `{prefix}_alloc` and hands back through `uint8_t** out_ptr` and
+//! `size_t* out_len`.
 
-use crate::model::{Family, Ty};
+use crate::ty::{Family, Prim, Ty, TypeIndex};
 
 use super::ctype::{CType, ConstPos};
 
@@ -52,57 +59,59 @@ pub struct AbiReturn {
     pub out_params: Vec<AbiParam>,
 }
 
-/// Split a (possibly qualified) type reference into its C module-path segment
-/// and bare type name.
+/// The underscore-joined C path of the module declaring the user type
+/// `name`.
 ///
-/// Qualified references use dot-separated module paths (`a.b.Name`); the C ABI
-/// flattens those to underscore-joined symbol prefixes (`a_b`). An unqualified
-/// reference belongs to `current_module`. Using `rsplit_once` (rather than
-/// `split_once`) is what makes *multi-level* nesting work: only the final
-/// segment is the type name, everything before it is the module path.
+/// # Panics
 ///
-/// * `a.b.Name`, current `x`  -> (`a_b`, `Name`)
-/// * `shared.Status`, current `orders` -> (`shared`, `Status`)
-/// * `Name`, current `a_b`    -> (`a_b`, `Name`)
-pub fn split_qualified(name: &str, current_module: &str) -> (String, String) {
-    match name.rsplit_once('.') {
-        Some((module_path, type_name)) => (module_path.replace('.', "_"), type_name.to_string()),
-        None => (current_module.to_string(), name.to_string()),
+/// Panics when `name` isn't declared. Only records and rich enums may be
+/// undeclared (the proc-macro assumes a name from a sibling module tree is
+/// one of those), and they cross as value buffers, which never name a C
+/// type.
+fn owner_path(name: &str, types: &TypeIndex) -> String {
+    types
+        .module_path(name)
+        .unwrap_or_else(|| panic!("type '{name}' is not declared"))
+        .to_string()
+}
+
+/// The opaque C tag type of the interface `name`.
+fn struct_tag(name: &str, types: &TypeIndex) -> CType {
+    CType::StructTag {
+        module: owner_path(name, types),
+        name: name.to_string(),
     }
 }
 
-/// Resolve an interface reference (possibly `module.Name`) to its opaque C
-/// tag type.
-pub fn struct_tag(name: &str, current_module: &str) -> CType {
-    let (module, name) = split_qualified(name, current_module);
-    CType::StructTag { module, name }
-}
-
-/// Resolve a callback interface reference (possibly `module.Name`) to its
-/// vtable struct type.
-pub fn vtable_tag(name: &str, current_module: &str) -> CType {
-    let (module, name) = split_qualified(name, current_module);
-    CType::VtableTag { module, name }
+/// The vtable struct type of the callback interface `name`.
+fn vtable_tag(name: &str, types: &TypeIndex) -> CType {
+    CType::VtableTag {
+        module: owner_path(name, types),
+        name: name.to_string(),
+    }
 }
 
 /// The by-value C type of a [`Family::Direct`] type.
-fn direct_ctype(ty: &Ty, module: &str) -> CType {
+fn direct_ctype(ty: &Ty, types: &TypeIndex) -> CType {
     match ty {
-        Ty::I8 => CType::Int8,
-        Ty::I16 => CType::Int16,
-        Ty::I32 => CType::Int32,
-        Ty::I64 => CType::Int64,
-        Ty::U8 => CType::Uint8,
-        Ty::U16 => CType::Uint16,
-        Ty::U32 => CType::Uint32,
-        Ty::U64 => CType::Uint64,
-        Ty::F32 => CType::Float,
-        Ty::F64 => CType::Double,
-        Ty::Bool => CType::Bool,
-        Ty::Enum(e) => {
-            let (module, name) = split_qualified(e, module);
-            CType::Enum { module, name }
-        }
+        Ty::Prim(p) => match p {
+            Prim::I8 => CType::Int8,
+            Prim::I16 => CType::Int16,
+            Prim::I32 => CType::Int32,
+            Prim::I64 => CType::Int64,
+            Prim::U8 => CType::Uint8,
+            Prim::U16 => CType::Uint16,
+            Prim::U32 => CType::Uint32,
+            Prim::U64 => CType::Uint64,
+            Prim::F32 => CType::Float,
+            Prim::F64 => CType::Double,
+            Prim::Bool => CType::Bool,
+            Prim::String | Prim::Bytes => unreachable!("{p} is not a direct type"),
+        },
+        Ty::Enum(e) => CType::Enum {
+            module: owner_path(e, types),
+            name: e.clone(),
+        },
         other => unreachable!("{other} is not a direct type"),
     }
 }
@@ -121,9 +130,9 @@ fn ptr_len_slots(name: &str) -> Vec<AbiParam> {
 /// # Panics
 ///
 /// Panics on an iterator type, which validation never admits as a parameter.
-pub fn lower_param(name: &str, ty: &Ty, module: &str) -> Vec<AbiParam> {
+pub fn lower_param(name: &str, ty: &Ty, types: &TypeIndex) -> Vec<AbiParam> {
     match ty.family() {
-        Family::Direct => vec![AbiParam::new(name, direct_ctype(ty, module))],
+        Family::Direct => vec![AbiParam::new(name, direct_ctype(ty, types))],
         Family::String | Family::Bytes | Family::Buffer => ptr_len_slots(name),
         // An interface parameter borrows the object for the call: the callee
         // reads through the const pointer and clones if it wants to retain
@@ -136,13 +145,14 @@ pub fn lower_param(name: &str, ty: &Ty, module: &str) -> Vec<AbiParam> {
                 name,
                 CType::Ptr {
                     konst: ConstPos::West,
-                    pointee: Box::new(struct_tag(iface, module)),
+                    pointee: Box::new(struct_tag(iface, types)),
                 },
             )]
         }
         // A callback interface is an opaque consumer context plus the
-        // consumer's static vtable for the interface.
-        Family::Callback => {
+        // consumer's static vtable for the interface. A nullable one passes a
+        // null vtable for none.
+        Family::Callback { .. } => {
             let cb = ty
                 .callback_interface_name()
                 .expect("callback family names a callback interface");
@@ -150,7 +160,7 @@ pub fn lower_param(name: &str, ty: &Ty, module: &str) -> Vec<AbiParam> {
                 AbiParam::new(format!("{name}_ctx"), CType::ptr(CType::Void)),
                 AbiParam::new(
                     format!("{name}_vtable"),
-                    CType::const_ptr(vtable_tag(cb, module)),
+                    CType::const_ptr(vtable_tag(cb, types)),
                 ),
             ]
         }
@@ -165,13 +175,13 @@ pub fn lower_param(name: &str, ty: &Ty, module: &str) -> Vec<AbiParam> {
 /// Panics on an iterator type, whose launcher is lowered by the function
 /// lowering in [`crate::model`] rather than as a plain value return, and on a
 /// callback interface, which validation never admits as a return.
-pub fn lower_return(ty: &Ty, module: &str) -> AbiReturn {
+pub fn lower_return(ty: &Ty, types: &TypeIndex) -> AbiReturn {
     let no_out = |ret| AbiReturn {
         ret,
         out_params: vec![],
     };
     match ty.family() {
-        Family::Direct => no_out(direct_ctype(ty, module)),
+        Family::Direct => no_out(direct_ctype(ty, types)),
         // String, bytes, and buffered returns are producer-allocated byte
         // runs: the caller copies or decodes them and then calls
         // `{prefix}_free_bytes(ptr, len)`.
@@ -185,12 +195,41 @@ pub fn lower_return(ty: &Ty, module: &str) -> AbiReturn {
             let iface = ty
                 .interface_name()
                 .expect("object family names an interface");
-            no_out(CType::ptr(struct_tag(iface, module)))
+            no_out(CType::ptr(struct_tag(iface, types)))
         }
-        Family::Callback => unreachable!("callback interfaces are never returned"),
+        Family::Callback { .. } => unreachable!("callback interfaces are never returned"),
         Family::Iterator => {
             unreachable!("iterator return handled specially by the function lowering")
         }
+    }
+}
+
+/// Lower the return type of a callback-interface method to its C return type
+/// plus trailing out-parameters (placed before the method's `out_err`).
+///
+/// A direct value is returned by value and an object as one strong
+/// reference (`{tag}*`) the producer adopts. A string, bytes, or buffer
+/// return is `void` with `uint8_t** out_ptr` and `size_t* out_len` slots:
+/// the consumer allocates the run with `{prefix}_alloc`, writes it there,
+/// and the producer adopts and frees it.
+///
+/// # Panics
+///
+/// Panics on an iterator or a callback interface, which validation never
+/// admits as a callback method return.
+pub fn lower_callback_return(ty: &Ty, types: &TypeIndex) -> AbiReturn {
+    match ty.family() {
+        Family::String | Family::Bytes | Family::Buffer => AbiReturn {
+            ret: CType::Void,
+            out_params: vec![
+                AbiParam::new("out_ptr", CType::ptr(CType::ptr(CType::Uint8))),
+                AbiParam::new("out_len", CType::ptr(CType::Size)),
+            ],
+        },
+        Family::Callback { .. } | Family::Iterator => {
+            unreachable!("{ty} is never a callback method return")
+        }
+        _ => lower_return(ty, types),
     }
 }
 
@@ -200,19 +239,20 @@ pub fn lower_return(ty: &Ty, module: &str) -> AbiReturn {
 /// String, bytes, and buffered results are passed as an owned `ptr` + `len`
 /// pair (released by the consumer with `{prefix}_free_bytes`); everything
 /// else reuses its return slot type by value.
-pub fn callback_result_params(ty: &Ty, module: &str) -> Vec<AbiParam> {
+pub fn callback_result_params(ty: &Ty, types: &TypeIndex) -> Vec<AbiParam> {
     match ty.family() {
         Family::String | Family::Bytes | Family::Buffer => vec![
             AbiParam::new("result_ptr", CType::const_ptr(CType::Uint8)),
             AbiParam::new("result_len", CType::Size),
         ],
-        _ => vec![AbiParam::new("result", lower_return(ty, module).ret)],
+        _ => vec![AbiParam::new("result", lower_return(ty, types).ret)],
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ty::{TypeDecl, TypeKind};
 
     fn render(params: &[AbiParam]) -> Vec<String> {
         params
@@ -221,50 +261,68 @@ mod tests {
             .collect()
     }
 
+    /// `Store` in `kv`, `Status` in `shared`, `Listener` in `events`.
+    fn types() -> TypeIndex {
+        let mut types = TypeIndex::default();
+        for (module, name, kind) in [
+            ("kv", "Store", TypeKind::Interface),
+            ("shared", "Status", TypeKind::Enum),
+            ("events", "Listener", TypeKind::CallbackInterface),
+        ] {
+            let module = types.push_module(module.into());
+            types.declare(
+                name,
+                TypeDecl {
+                    kind,
+                    module,
+                    index: 0,
+                },
+            );
+        }
+        types
+    }
+
+    const I32: Ty = Ty::Prim(Prim::I32);
+
     #[test]
     fn params_lower_by_family() {
-        assert_eq!(render(&lower_param("x", &Ty::I32, "m")), ["int32_t x"]);
+        let t = types();
+        assert_eq!(render(&lower_param("x", &I32, &t)), ["int32_t x"]);
         assert_eq!(
-            render(&lower_param("s", &Ty::StringUtf8, "m")),
+            render(&lower_param("s", &Ty::Prim(Prim::String), &t)),
             ["const uint8_t* s_ptr", "size_t s_len"]
         );
         assert_eq!(
-            render(&lower_param("data", &Ty::Bytes, "m")),
+            render(&lower_param("data", &Ty::Prim(Prim::Bytes), &t)),
             ["const uint8_t* data_ptr", "size_t data_len"]
         );
         assert_eq!(
-            render(&lower_param("xs", &Ty::List(Box::new(Ty::I32)), "m")),
+            render(&lower_param("xs", &Ty::List(Box::new(I32)), &t)),
             ["const uint8_t* xs_ptr", "size_t xs_len"]
         );
+        // An undeclared record (a proc-macro's sibling-tree type) is fine:
+        // value buffers never name a C type.
         assert_eq!(
-            render(&lower_param(
-                "c",
-                &Ty::Record("other.Contact".into()),
-                "ops"
-            )),
+            render(&lower_param("c", &Ty::Record("Contact".into()), &t)),
             ["const uint8_t* c_ptr", "size_t c_len"]
         );
         assert_eq!(
             render(&lower_param(
                 "s",
                 &Ty::Optional(Box::new(Ty::Interface("Store".into()))),
-                "kv"
+                &t
             )),
             ["const weaveffi_kv_Store* s"]
         );
         assert_eq!(
-            render(&lower_param(
-                "s",
-                &Ty::Enum("shared.Status".into()),
-                "orders"
-            )),
+            render(&lower_param("s", &Ty::Enum("Status".into()), &t)),
             ["weaveffi_shared_Status s"]
         );
         assert_eq!(
             render(&lower_param(
                 "listener",
-                &Ty::CallbackInterface("events.Listener".into()),
-                "kv"
+                &Ty::CallbackInterface("Listener".into()),
+                &t
             )),
             [
                 "void* listener_ctx",
@@ -275,7 +333,8 @@ mod tests {
 
     #[test]
     fn returns_lower_by_family() {
-        let r = lower_return(&Ty::Bytes, "m");
+        let t = types();
+        let r = lower_return(&Ty::Prim(Prim::Bytes), &t);
         assert_eq!(r.ret.render_c("weaveffi"), "const uint8_t*");
         assert_eq!(render(&r.out_params), ["size_t* out_len"]);
         for ty in [
@@ -283,18 +342,18 @@ mod tests {
             Ty::RichEnum("Shape".into()),
             Ty::List(Box::new(Ty::Record("Contact".into()))),
             Ty::List(Box::new(Ty::Interface("Store".into()))),
-            Ty::Map(Box::new(Ty::StringUtf8), Box::new(Ty::I32)),
-            Ty::Optional(Box::new(Ty::I64)),
+            Ty::Map(Box::new(Ty::Prim(Prim::String)), Box::new(I32)),
+            Ty::Optional(Box::new(Ty::Prim(Prim::I64))),
         ] {
-            let r = lower_return(&ty, "m");
+            let r = lower_return(&ty, &t);
             assert_eq!(r.ret.render_c("weaveffi"), "const uint8_t*", "{ty}");
             assert_eq!(render(&r.out_params), ["size_t* out_len"], "{ty}");
         }
-        let r = lower_return(&Ty::Optional(Box::new(Ty::Interface("Store".into()))), "kv");
+        let r = lower_return(&Ty::Optional(Box::new(Ty::Interface("Store".into()))), &t);
         assert_eq!(r.ret.render_c("weaveffi"), "weaveffi_kv_Store*");
         assert!(r.out_params.is_empty());
         assert_eq!(
-            lower_return(&Ty::Enum("shared.Status".into()), "orders")
+            lower_return(&Ty::Enum("Status".into()), &t)
                 .ret
                 .render_c("weaveffi"),
             "weaveffi_shared_Status"
@@ -302,33 +361,48 @@ mod tests {
     }
 
     #[test]
-    fn callback_results() {
+    fn callback_method_returns_use_consumer_allocated_runs() {
+        let t = types();
+        let r = lower_callback_return(&Ty::Prim(Prim::String), &t);
+        assert_eq!(r.ret, CType::Void);
         assert_eq!(
-            render(&callback_result_params(
-                &Ty::List(Box::new(Ty::StringUtf8)),
-                "m"
+            render(&r.out_params),
+            ["uint8_t** out_ptr", "size_t* out_len"]
+        );
+        let r = lower_callback_return(&Ty::Interface("Store".into()), &t);
+        assert_eq!(r.ret.render_c("weaveffi"), "weaveffi_kv_Store*");
+        assert!(r.out_params.is_empty());
+        assert_eq!(lower_callback_return(&I32, &t).ret, CType::Int32);
+        assert_eq!(
+            render(&lower_param(
+                "l",
+                &Ty::Optional(Box::new(Ty::CallbackInterface("Listener".into()))),
+                &t
             )),
-            ["const uint8_t* result_ptr", "size_t result_len"]
-        );
-        assert_eq!(
-            render(&callback_result_params(&Ty::Bytes, "m")),
-            ["const uint8_t* result_ptr", "size_t result_len"]
-        );
-        assert_eq!(
-            render(&callback_result_params(&Ty::I32, "m")),
-            ["int32_t result"]
+            [
+                "void* l_ctx",
+                "const weaveffi_events_Listener_vtable* l_vtable"
+            ]
         );
     }
 
     #[test]
-    fn split_qualified_handles_levels() {
+    fn callback_results() {
+        let t = types();
         assert_eq!(
-            split_qualified("Name", "current"),
-            ("current".to_string(), "Name".to_string())
+            render(&callback_result_params(
+                &Ty::List(Box::new(Ty::Prim(Prim::String))),
+                &t
+            )),
+            ["const uint8_t* result_ptr", "size_t result_len"]
         );
         assert_eq!(
-            split_qualified("a.b.c.Name", "x"),
-            ("a_b_c".to_string(), "Name".to_string())
+            render(&callback_result_params(&Ty::Prim(Prim::Bytes), &t)),
+            ["const uint8_t* result_ptr", "size_t result_len"]
+        );
+        assert_eq!(
+            render(&callback_result_params(&I32, &t)),
+            ["int32_t result"]
         );
     }
 }

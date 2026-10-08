@@ -1,26 +1,18 @@
 # Roadmap
 
-WeaveFFI is in active `0.x` development. Schema 0.10 and ABI revision 3 made
-every name derive from the library's identity, moved strings to `(ptr, len)`
-runs, added contract checksums, and made cancellation work idiomatically on
-every target. This page lists what comes next. Items are **planned** (the
-design is settled) or **exploring** (wanted, with open design questions).
-Nothing carries a date; the
+WeaveFFI is in active `0.x` development. Schema 0.11 and ABI revision 4 made
+names global, replaced the per-module checksums with per-declaration contract
+tables, gave callback methods rich returns, typed `throws`, optional callback
+parameters, and a size-checked vtable header, made `{prefix}_alloc` the one
+allocator contract on every target, moved the codec conformance lanes onto
+shared test vectors, and taught the CLI to read a Rust producer's API from
+its built library. This page lists what comes next. Items are **planned**
+(the design is settled) or **exploring** (wanted, with open design
+questions). Nothing carries a date; the
 [changelog](https://github.com/weavefoundry/weaveffi/blob/main/CHANGELOG.md)
 records what shipped.
 
 ## Callback interfaces
-
-### Rich callback returns (planned)
-
-Callback methods return nothing or a direct value, because a consumer
-allocation can't safely cross back to a producer with a different allocator.
-The plan is an allocator contract for callback returns: the consumer writes
-the result into producer-owned storage obtained through the runtime (as the
-Wasm glue already does with `{prefix}_alloc`), or returns its own allocation
-with a release function the producer calls after copying. With that,
-strings, bytes, records, rich enums, optionals, lists, maps, and objects
-become valid callback returns, and typed `throws` on callback methods follows.
 
 ### Async callback methods (planned)
 
@@ -29,23 +21,26 @@ completion flowing the other way and a cancellation story when the producer
 drops the future. The vtable shape is simple (a completion function and
 context per async method); the hard part is one producer working the same way
 whether the consumer runtime is an event loop, a thread pool, or the
-single-threaded Wasm host. This follows the allocator contract above.
+single-threaded Wasm host.
 
-### Vtable versioning (exploring)
-
-A vtable is a fixed struct, so adding a method to a callback interface is a
-breaking change even when no consumer needs it. A size or version field at
-the head of each vtable would let a newer producer detect an older consumer's
-shorter table and fall back, which matters once 1.0 promises additive
-changes are compatible.
-
-### Callback thread affinity (exploring)
+### Off-thread callbacks in Dart (exploring)
 
 Dart can't run a value-returning callback method synchronously on a thread
-other than its isolate's, so a producer that calls one from a worker thread
-aborts the process today (void methods are forwarded safely). A per-vtable
-thread-affinity hint, or a runtime helper that lets a consumer refuse an
-off-thread call with `-4`, would turn that abort into an error.
+that isn't a Dart isolate thread, so a producer that calls one from its own
+worker thread aborts the process today (void methods are forwarded to the
+isolate safely). Pure `dart:ffi` can't route that return, so the fix is
+either a small native shim that hops to the isolate and waits, or a
+per-vtable thread-affinity hint that lets the producer refuse the call with
+`-4` instead. See the [Dart page](generators/dart.md#known-limitations).
+
+### Synchronous calls that wait on Node.js callbacks (exploring)
+
+A synchronous Node.js call that blocks the JS thread while a producer thread
+waits on a callback the JS thread must run would deadlock, so the addon
+gives such a callback about a second to reach the JS thread and then fails
+it with `-4`. A long synchronous call that legitimately overlaps callbacks
+hits that guard. Making the call itself pump callbacks while it waits would
+remove the heuristic. See the [Node.js page](generators/node.md#threading).
 
 ## Definitions
 
@@ -54,17 +49,8 @@ off-thread call with `-4`, would turn that abort into an error.
 An IDL API is one document. Large APIs want to split by module, and a
 monorepo wants to reference another package's types. The plan is an
 `imports:` list resolved at parse time, with bare type names still unique
-across the merged API, and `diff`, `validate`, the cache, and checksums
-tracking every imported file.
-
-### Extraction from the compiled library (exploring)
-
-The CLI reads a Rust producer's API by parsing source, so it sees only
-inline `#[weaveffi::module]`s in one file and can't expand macros. The macro
-already lowers each module to the IR at compile time; embedding that IR in
-the built library (a custom section or an exported symbol) would let
-`weaveffi generate` read the exact API from the artifact, removing the
-one-file limit and any chance of the parser and the compiler disagreeing.
+across the merged API, and `diff`, `validate`, and contract tables covering
+every imported file.
 
 ### Generic and trait-object interfaces (exploring)
 
@@ -78,6 +64,13 @@ parameterized interfaces monomorphized per instantiation.
 Producers pass time as `i64` with a documented unit. `duration` and
 `timestamp` primitives mapped to each language's types would remove the
 ambiguity; the open question is the representation.
+
+### Custom types (exploring)
+
+A producer type that crosses as a builtin (a `Uuid` as `string`, a `Url` as
+`string`, a fixed-point amount as `i64`) has to be converted by hand on both
+sides today. A declared custom type with per-language conversion hooks would
+let each binding expose the language's own type.
 
 ## Targets and runtime
 
@@ -94,6 +87,22 @@ a call is on the stack. A spawner that schedules on the JS event loop, or
 shared-memory builds with Web Workers, would lift both limits and let
 Emscripten mode support async functions and callback interfaces.
 
+### Zero-copy blittable records (exploring)
+
+Every record crosses as a serialized value buffer. A record of fixed-size
+scalars could instead cross as a `#[repr(C)]` struct passed by pointer, which
+matters for hot paths that move many small records. The open questions are
+how a record opts in, and how the contract hash and every target's layout
+checks keep the two sides agreeing on the layout.
+
+### Poll-based async (exploring)
+
+Async functions complete through a callback the producer fires on its own
+thread, and each binding hops back to its scheduler. A poll-based protocol,
+where the consumer's runtime drives the future and the producer only wakes
+it, would fit event-loop runtimes better and avoid that hop. It would be an
+option next to the completion-callback ABI, not a replacement.
+
 ### Per-language support packages (exploring)
 
 Every package inlines its helpers (codec, error types, object base), which
@@ -108,27 +117,23 @@ consideration; inlining would stay the default.
 The workspace's tests run on Windows, Linux, and macOS, but the conformance
 harness runs only on Linux and macOS. Adding Windows lanes means making
 `conformance/run.sh` and the per-language scripts portable (or adding
-PowerShell equivalents) and installing each toolchain on Windows runners.
-
-### Shared codec vectors (planned)
-
-Each language's `codec` conformance consumer asserts the same round-trip
-values by hand. Moving those values into one data file that every consumer
-reads (or into producer-side golden values) would shrink the consumers and
-keep the eleven lanes from drifting apart.
+PowerShell equivalents), installing each toolchain on Windows runners, and
+prebuilding the Node.js addon and JNI shim for `windows-x64`, which
+`weaveffi build` can't do yet.
 
 ## Toward 1.0
 
 1.0 means the surfaces in [What 1.0 will cover](stability.md#what-10-will-cover)
 stop changing without a major release. It needs:
 
-- ABI revision 3 stable for several releases, with the callback-return
-  allocator contract and vtable versioning settled so 1.0 doesn't need
-  revision 4;
+- ABI revision 4 stable for several releases, so 1.0 doesn't need
+  revision 5;
 - every target passing the full conformance matrix on Linux, macOS, and
   Windows;
 - multi-file IDL and the deprecation policy in place;
 - a schema migration tool and more than one accepted schema version;
+- the known limitations on each generator page resolved or documented as
+  permanent;
 - a review of every published crate's public API.
 
 ## Contributing

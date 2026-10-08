@@ -1,7 +1,7 @@
 # C
 
 The C target emits the canonical header for a library's
-[C ABI](../reference/abi.md) (revision 3). Every other target binds to the
+[C ABI](../reference/abi.md) (revision 4). Every other target binds to the
 symbols it declares, and a C or C++ producer implementing an IDL by hand
 implements exactly those symbols. Alongside it, the target emits a helper
 header with C structs and codecs for the API's value buffers, so a C
@@ -27,9 +27,12 @@ turned off:
 buffer_helpers = false
 ```
 
-`weaveffi package` lays the same headers out under `include/`, adds the
-prebuilt library for each platform under `lib/<platform>/`, and writes a
-`CMakeLists.txt` that exposes it as the imported target `kvstore::kvstore`.
+`weaveffi package` writes `kvstore-{version}-c.tar.gz`: the same headers
+under `include/`, the library of every platform built under
+`lib/<platform>/` (with the import library on Windows), a README, and a
+`CMakeLists.txt` (CMake 3.15 or later) that exposes the host's library as
+the imported target `kvstore::kvstore` (see
+[Packaging](../guides/packaging.md)).
 
 ## Build and load
 
@@ -37,7 +40,7 @@ Both headers are plain C11 that also compiles as C++. Point the compiler at
 the `c/` directory and link the producer's library:
 
 ```sh
-cc -std=c11 -I generated/c app.c -L target/release -lkvstore -o app
+cc -std=c11 -I bindings/c app.c -L target/release -lkvstore -o app
 ```
 
 C links the library at build time, so the platform loader finds it at run
@@ -47,18 +50,29 @@ the library dynamically; a C program that wants it calls `dlopen` itself.
 
 Every C identifier starts with the prefix, so any number of WeaveFFI
 libraries link into one program. Before its first call, a consumer should
-check the contract it was generated against:
+check the ABI revision and the contract it was generated against:
 
 ```c
-if (kvstore_abi_version() != KVSTORE_ABI_VERSION ||
-    kvstore_kv_checksum() != KVSTORE_KV_CHECKSUM) {
+if (kvstore_abi_version() != KVSTORE_ABI_VERSION) {
+    fprintf(stderr, "kvstore: library does not match kvstore.h's ABI revision\n");
+    exit(1);
+}
+if (kvstore_kv_contract_check() != 0) {
     fprintf(stderr, "kvstore: library does not match kvstore.h (module kv)\n");
     exit(1);
 }
 ```
 
-There's one `{PREFIX}_{ROOT}_CHECKSUM` constant and one
-`{prefix}_{root}_checksum()` function per top-level module.
+Each top-level module has a contract table: the library exports
+`{p}_{m}_contract(size_t* out_len)`, and the header defines the entries the
+bindings were generated with as `{P}_{M}_CONTRACT` (each commented with its
+declaration's dotted path), their count as `{P}_{M}_CONTRACT_LEN`, and a
+`static inline uint64_t {p}_{m}_contract_check(void)`. The checker returns
+`0` when every expected entry is in the library's table with an equal hash,
+and otherwise the id of the first one that's missing or changed, which you
+can look up in the macro to name the declaration. A library with extra
+entries passes, so adding a declaration doesn't break existing consumers.
+See [load-time checks](../reference/abi.md#load-time-checks).
 
 ## Type mapping
 
@@ -74,7 +88,7 @@ There's one `{PREFIX}_{ROOT}_CHECKSUM` constant and one
 | `T?` | value buffer | value buffer | `T*` (`NULL` is absent) |
 | interface `I` | `const {p}_{path}_I*` (borrowed) | `{p}_{path}_I*` (owned) | `{p}_{path}_I*` |
 | `I?` | `const {p}_{path}_I*` (`NULL` is absent) | `{p}_{path}_I*` | `{p}_{path}_I*` |
-| callback interface | `void* x_ctx, const {p}_{path}_{Cb}_vtable* x_vtable` | not allowed | not allowed |
+| callback interface, `Cb?` | `void* x_ctx, const {p}_{path}_{Cb}_vtable* x_vtable` (`NULL` vtable is absent for `Cb?`) | not allowed | not allowed |
 | `iter<T>` | not allowed | iterator handle | not applicable |
 
 Strings are UTF-8 without a NUL terminator and may contain NUL bytes. A
@@ -163,8 +177,9 @@ Every synchronous function takes a trailing `{p}_error* out_err`. On
 failure `code` is nonzero and `message` is NUL-terminated UTF-8; release
 both with `{p}_error_clear`. Positive codes are the module's error domain
 (`kvstore_kv_KvError_KeyNotFound`); negative codes are runtime traps: `-1`
-generic, `-2` panic, `-3` marshalling failure, `-4` a callback
-implementation failed, and `-5` cancelled. An error code with fields carries
+generic (or an async call that couldn't start), `-2` panic, `-3`
+marshalling failure, `-4` a callback implementation failed, and `-5`
+cancelled. An error code with fields carries
 them in `payload_ptr`/`payload_len`, which the helper decodes with
 `{code constant}_payload_decode`.
 
@@ -193,23 +208,85 @@ with code `-5`, even if it was cancelled before launch.
 ## Callback interfaces
 
 A callback interface is a vtable the consumer fills in, passed with a
-context pointer:
+context pointer. The vtable starts with a header (`size`, `flags`, and the
+`free` hook), followed by one entry per method in declaration order:
 
 ```c
 typedef struct kitchen_sink_kitchen_ReadyListener_vtable {
+    uint32_t size;
+    uint32_t flags;
+    void (*free)(void* ctx);
     /** Fires when an item is ready */
     void (*on_ready)(void* ctx, int32_t code, const uint8_t* msg_ptr, size_t msg_len, kitchen_sink_error* out_err);
     /** Receives the item itself and says whether to keep listening */
     bool (*on_item)(void* ctx, const uint8_t* item_ptr, size_t item_len, kitchen_sink_kitchen_Gadget* gadget, kitchen_sink_error* out_err);
-    void (*free)(void* ctx);
+    /** A display label, failing with a kitchen error */
+    void (*label)(void* ctx, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err);
+    /** The most recent item the listener kept, if any */
+    void (*latest)(void* ctx, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err);
+    /** The listener's favorite gadget */
+    kitchen_sink_kitchen_Gadget* (*favorite)(void* ctx, kitchen_sink_error* out_err);
 } kitchen_sink_kitchen_ReadyListener_vtable;
 ```
 
+Define one static vtable per interface, with `size` set to `sizeof` the
+vtable and `flags` to `0`. The producer rejects a vtable smaller than its
+own with `-3` (calling `free(ctx)` first), so a consumer built from an older
+header can't make it call a missing entry:
+
+```c
+static const kitchen_sink_kitchen_ReadyListener_vtable LISTENER = {
+    sizeof(kitchen_sink_kitchen_ReadyListener_vtable),
+    0,
+    listener_free,
+    listener_on_ready,
+    listener_on_item,
+    listener_label,
+    listener_latest,
+    listener_favorite,
+};
+```
+
 The producer may call any entry from any thread, so the context must be
-thread-safe. String and buffer arguments are borrowed for the call; an
-object argument carries one reference the method adopts. A method reports
-failure with `{p}_error_set(out_err, -4, "message")`. The producer calls
-`free(ctx)` exactly once, when it drops its last reference.
+thread-safe, and it calls `free(ctx)` exactly once, from any thread, when it
+drops its last reference. For an optional parameter (`ReadyListener?`), pass
+a `NULL` vtable for none.
+
+String and buffer arguments are borrowed for the call; an object argument
+carries one reference the method adopts. Returns go the other way:
+
+- A direct value is the C return.
+- An object (`favorite`) is the C return, one strong reference the producer
+  adopts: return a fresh `_clone`, never `NULL` for a non-optional type.
+- A string, bytes, or buffer (`label`, `latest`) is written to the trailing
+  `out_ptr` and `out_len` slots as a run allocated with `{p}_alloc`, which
+  the producer adopts and frees. Leave them `NULL` and `0` for an empty
+  value.
+
+A method reports failure with `{p}_error_set(out_err, code, "message")`,
+which copies the message. A method declared `throws` (`label`) may use a
+code of its module's error domain and attach the code's fields, encoded as a
+value buffer, with `{p}_error_set_payload(out_err, ptr, len)`; any other
+failure reaches the producer as `-4`:
+
+```c
+static void listener_label(void* ctx, uint8_t** out_ptr, size_t* out_len,
+                           kitchen_sink_error* out_err) {
+    const char* label = ((listener*)ctx)->label;
+    if (label == NULL) {
+        kitchen_sink_error_set(out_err, kitchen_sink_kitchen_KitchenErrors_NotFound, "no label");
+        return;
+    }
+    size_t n = strlen(label);
+    uint8_t* run = kitchen_sink_alloc(n);
+    if (n > 0) memcpy(run, label, n);
+    *out_ptr = run;
+    *out_len = n;
+}
+```
+
+The producer adopts whatever the out slots hold even when the method fails,
+so a method that fails after allocating doesn't leak.
 
 ## Iterators
 
@@ -228,25 +305,35 @@ String, bytes, and buffer items are owned (release each with
 ## Implementing an IDL in C
 
 A hand-written producer defines every function the header declares,
-including the runtime and one checksum per top-level module. For the
-calculator sample that's:
+including the runtime and one contract function per top-level module, which
+returns the header's table. For the calculator sample that's:
 
 ```c
 uint32_t calculator_abi_version(void) { return CALCULATOR_ABI_VERSION; }
-uint64_t calculator_calculator_checksum(void) { return CALCULATOR_CALCULATOR_CHECKSUM; }
+
+const calculator_contract_entry* calculator_calculator_contract(size_t* out_len) {
+    static const calculator_contract_entry table[] = CALCULATOR_CALCULATOR_CONTRACT;
+    *out_len = CALCULATOR_CALCULATOR_CONTRACT_LEN;
+    return table;
+}
 
 void calculator_error_set(calculator_error* err, int32_t code, const char* message);
+void calculator_error_set_payload(calculator_error* err, const uint8_t* ptr, size_t len);
 void calculator_error_clear(calculator_error* err);
 void calculator_error_free(calculator_error* err);
+uint8_t* calculator_alloc(size_t len);
 void calculator_free_bytes(uint8_t* ptr, size_t len);
 calculator_cancel_token* calculator_cancel_token_create(void);
 void calculator_cancel_token_cancel(calculator_cancel_token* token);
 bool calculator_cancel_token_is_cancelled(const calculator_cancel_token* token);
 void calculator_cancel_token_destroy(calculator_cancel_token* token);
-uint64_t calculator_debug_live(int32_t kind);  /* may return 0 */
+uint64_t calculator_debug_live(int32_t kind);  /* may return 0 for every kind */
 ```
 
-`{p}_alloc` and `{p}_dealloc` are needed only on wasm32. Every prototype
+`{p}_alloc` returns a zero-filled run (`NULL` for `0`), and `{p}_free_bytes`
+must release both the runs the producer returns and the runs `{p}_alloc`
+hands out, so both use one allocator. `{p}_debug_live(-1)` returns `1` when
+the producer counts live resources and `0` when it doesn't. Every prototype
 carries `{PREFIX}_API`, so the definitions stay exported under
 `-fvisibility=hidden`; on Windows, define `{PREFIX}_BUILD` while building
 the producer. `conformance/c/producer.c` is a complete example.
@@ -257,6 +344,3 @@ the producer. `conformance/c/producer.c` is a complete example.
   loader, so `{PREFIX}_LIBRARY` isn't consulted.
 - The helper's decoders don't validate UTF-8 in decoded strings; the
   producer has already done so.
-- Composite helper names are derived from the type (`{p}_list_kv_Entry`,
-  `{p}_map_string_i64`), so a module or function named like one of them
-  can collide with it.

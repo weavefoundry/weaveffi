@@ -12,11 +12,11 @@
 # (conformance/node/*.mjs): both targets generate the same JavaScript API.
 set -uo pipefail
 . "$(dirname "$0")/../lib.sh"
+require_tools wasm node npm rustup
 
 wasm_consumer() {
     local sample="$1" src="$2"
     local dir="$OUT/wasm-$sample" tarball
-    command -v npm >/dev/null 2>&1 || { echo "npm not found" >&2; return 1; }
     rustup target list --installed 2>/dev/null | grep -qx 'wasm32-unknown-unknown' \
         || { echo "wasm32-unknown-unknown target missing (rustup target add wasm32-unknown-unknown)" >&2; return 1; }
     cargo build -q -p "$sample" --release --target wasm32-unknown-unknown \
@@ -34,20 +34,12 @@ wasm_consumer() {
     ( cd "$dir" && env "$(library_env "$sample")=$wasm" node --expose-gc "$src" )
 }
 
-wasm_contacts()   { wasm_consumer contacts contacts.mjs; }
+wasm_calculator() { wasm_consumer calculator calculator.mjs; }
+wasm_codec() { wasm_consumer codec codec.mjs; }
+wasm_kvstore() { wasm_consumer kvstore kvstore.mjs; }
 
-wasm_events()     { wasm_consumer events events.mjs; }
-
-wasm_kvstore()    { wasm_consumer kvstore kvstore.mjs; }
-
-wasm_async_demo() { wasm_consumer async-demo async_demo.mjs; }
-
-wasm_codec()      { wasm_consumer codec codec.mjs; }
-
-lane wasm-contacts wasm_contacts
-lane wasm-events wasm_events
-lane wasm-kvstore wasm_kvstore
-lane wasm-async-demo wasm_async_demo
+lane wasm-calculator wasm_calculator
 lane wasm-codec wasm_codec
+lane wasm-kvstore wasm_kvstore
 
 finish_lanes

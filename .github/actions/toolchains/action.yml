@@ -11,10 +11,20 @@ runs:
       uses: actions/setup-node@v4
       with:
         node-version: '22'
+    # The node fixture check compiles the N-API addon against these headers.
+    - if: inputs.lang == 'node'
+      shell: bash
+      run: npx --yes node-gyp install
     - if: inputs.lang == 'python'
       uses: actions/setup-python@v5
       with:
         python-version: '3.12'
+    # The python fixture check type-checks the generated package with mypy
+    # against Python 3.9, the oldest version it supports; mypy 2 can't
+    # target 3.9.
+    - if: inputs.lang == 'python'
+      shell: bash
+      run: python -m pip install 'mypy==1.20.2'
     - if: inputs.lang == 'ruby'
       uses: ruby/setup-ruby@v1
       with:
@@ -26,11 +36,13 @@ runs:
     # a problem matcher relative to the calling action), so fetch the SDK.
     - if: inputs.lang == 'dart'
       shell: bash
+      env:
+        DART_VERSION: 3.13.5
       run: |
         os=linux; [ "$RUNNER_OS" = macOS ] && os=macos
         arch=x64; case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; esac
         curl -fsSL -o "$RUNNER_TEMP/dart.zip" \
-          "https://storage.googleapis.com/dart-archive/channels/stable/release/latest/sdk/dartsdk-$os-$arch-release.zip"
+          "https://storage.googleapis.com/dart-archive/channels/stable/release/$DART_VERSION/sdk/dartsdk-$os-$arch-release.zip"
         unzip -q -o "$RUNNER_TEMP/dart.zip" -d "$RUNNER_TEMP"
         echo "$RUNNER_TEMP/dart-sdk/bin" >> "$GITHUB_PATH"
     - if: inputs.lang == 'go'
@@ -51,7 +63,7 @@ runs:
         distribution: temurin
         java-version: '17'
     - if: inputs.lang == 'kotlin'
-      uses: fwilhe2/setup-kotlin@main
+      uses: fwilhe2/setup-kotlin@v2.1
       with:
         version: '2.0.21'
     - if: (inputs.lang == 'c' || inputs.lang == 'cpp') && runner.os == 'Linux'

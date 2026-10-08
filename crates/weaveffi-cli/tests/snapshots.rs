@@ -12,32 +12,43 @@
 //! deeply nested composites, optional parameters, interfaces and callback
 //! interfaces in every legal position, async functions with non-string
 //! results, type-level deprecation, and scalar and string iterators). One
-//! test per generator runs it over all
-//! five fixtures into a fresh tempdir, walks the
-//! resulting files in sorted order, and snapshots each file under
-//! `tests/snapshots/`. Regressions in any generator's output fail the
-//! affected `cargo insta test` job; behavioral regressions are the
-//! conformance harness's job.
+//! test per generator renders all five fixtures and checks each file, in
+//! sorted order, by one of three rules:
+//!
+//! - A file that shares its name with a C target output is that target's
+//!   copy of the C header. It must be byte-equal to the C target's own
+//!   header, which `snapshot_c` snapshots, so it gets no snapshot of its own.
+//! - A file matching the target's entry in [`FIXED_FILES`] (fixed runtimes,
+//!   package manifests, READMEs) is the same for every fixture apart from
+//!   its name, so it's snapshotted once, from [`FIXED_FROM`].
+//! - Every other file depends on the fixture and is snapshotted for every
+//!   fixture.
+//!
+//! Snapshots live under `tests/snapshots/`. Regressions in any generator's
+//! output fail the affected `cargo insta test` job; behavioral regressions
+//! are the conformance harness's job.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
 use camino::Utf8Path;
-use weaveffi_gen::codegen::{ConfiguredBackend, Target};
-use weaveffi_gen::targets::c::{CConfig, CGenerator};
-use weaveffi_gen::targets::cpp::{CppConfig, CppGenerator};
-use weaveffi_gen::targets::dart::{DartConfig, DartGenerator};
-use weaveffi_gen::targets::dotnet::{DotnetConfig, DotnetGenerator};
-use weaveffi_gen::targets::go::{GoConfig, GoGenerator};
-use weaveffi_gen::targets::kotlin::{KotlinConfig, KotlinGenerator};
-use weaveffi_gen::targets::node::{NodeConfig, NodeGenerator};
-use weaveffi_gen::targets::python::{PythonConfig, PythonGenerator};
-use weaveffi_gen::targets::ruby::{RubyConfig, RubyGenerator};
-use weaveffi_gen::targets::swift::{SwiftConfig, SwiftGenerator};
-use weaveffi_gen::targets::wasm::{WasmConfig, WasmGenerator};
+use weaveffi_cli::codegen::{ConfiguredBackend, Target};
+use weaveffi_cli::targets::c::{CConfig, CGenerator};
+use weaveffi_cli::targets::cpp::{CppConfig, CppGenerator};
+use weaveffi_cli::targets::dart::{DartConfig, DartGenerator};
+use weaveffi_cli::targets::dotnet::{DotnetConfig, DotnetGenerator};
+use weaveffi_cli::targets::go::{GoConfig, GoGenerator};
+use weaveffi_cli::targets::kotlin::{KotlinConfig, KotlinGenerator};
+use weaveffi_cli::targets::node::{NodeConfig, NodeGenerator};
+use weaveffi_cli::targets::python::{PythonConfig, PythonGenerator};
+use weaveffi_cli::targets::ruby::{RubyConfig, RubyGenerator};
+use weaveffi_cli::targets::swift::{SwiftConfig, SwiftGenerator};
+use weaveffi_cli::targets::wasm::{WasmConfig, WasmGenerator};
+use weaveffi_model::model::Model;
 use weaveffi_model::parse::parse_api_str;
-use weaveffi_model::resolved::ResolvedApi;
-use weaveffi_model::validate::validate_api;
+use weaveffi_model::pkg::Identity;
+use weaveffi_model::validate::validate;
 
 const FIXTURES: [&str; 5] = [
     "kitchen_sink",
@@ -47,7 +58,82 @@ const FIXTURES: [&str; 5] = [
     "edge_cases",
 ];
 
-fn load_api(stem: &str) -> ResolvedApi {
+/// The fixture that fixed files are snapshotted from. It exercises every
+/// feature, so it also emits every optional fixed file (such as Kotlin's
+/// `Async.kt`).
+const FIXED_FROM: &str = "kitchen_sink";
+
+/// Per target, the files whose content doesn't depend on the fixture beyond
+/// its name: fixed runtimes, package manifests, and READMEs. (A README's
+/// usage example names the top-level modules, and Kotlin's
+/// `build.gradle.kts` adds the coroutines dependency only for async APIs;
+/// [`FIXED_FROM`] covers both.) A pattern starting with `*` matches a
+/// file-name suffix; any other pattern matches the whole file name. Every
+/// pattern must match a [`FIXED_FROM`] output, so a renamed or removed file
+/// can't leave a stale entry behind.
+const FIXED_FILES: &[(&str, &[&str])] = &[
+    ("c", &[]),
+    ("cpp", &["CMakeLists.txt", "README.md"]),
+    ("swift", &["Package.swift", "module.modulemap"]),
+    (
+        "kotlin",
+        &[
+            "Async.kt",
+            "Buffers.kt",
+            "CMakeLists.txt",
+            "Runtime.kt",
+            "build.gradle.kts",
+            "consumer-rules.pro",
+            "settings.gradle.kts",
+        ],
+    ),
+    (
+        "node",
+        &["README.md", "binding.gyp", "package.json", "runtime.js"],
+    ),
+    (
+        "wasm",
+        &["README.md", "linear.js", "package.json", "runtime.js"],
+    ),
+    (
+        "python",
+        &["README.md", "__init__.py", "py.typed", "pyproject.toml"],
+    ),
+    ("dotnet", &["*.csproj", "README.md", "Runtime.cs"]),
+    ("dart", &["README.md", "pubspec.yaml"]),
+    ("go", &["README.md", "codec.go", "go.mod", "runtime.go"]),
+    ("ruby", &["*.gemspec", "README.md", "runtime.rb"]),
+];
+
+fn fixed_patterns(target: &str) -> &'static [&'static str] {
+    FIXED_FILES
+        .iter()
+        .find(|(name, _)| *name == target)
+        .map(|(_, patterns)| *patterns)
+        .unwrap_or_else(|| panic!("target {target} has no FIXED_FILES entry"))
+}
+
+fn matches_pattern(pattern: &str, file_name: &str) -> bool {
+    match pattern.strip_prefix('*') {
+        Some(suffix) => file_name.ends_with(suffix),
+        None => file_name == pattern,
+    }
+}
+
+/// The C target's outputs for `api`, keyed by file name. Other targets copy
+/// the C header verbatim, under the same file name.
+fn c_outputs(model: &Model) -> BTreeMap<String, String> {
+    ConfiguredBackend::new(CGenerator, CConfig::default())
+        .render(model, Utf8Path::new("out"))
+        .into_iter()
+        .map(|file| {
+            let name = file.path.file_name().expect("file name").to_owned();
+            (name, file.contents)
+        })
+        .collect()
+}
+
+fn load_model(stem: &str) -> Model {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(format!("{stem}.yml"));
@@ -55,9 +141,8 @@ fn load_api(stem: &str) -> ResolvedApi {
         .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
     let api = parse_api_str(&contents, "yaml")
         .unwrap_or_else(|e| panic!("parse fixture {}: {e}", path.display()));
-    validate_api(api, None)
+    validate(&api, &Identity::named(stem), None)
         .unwrap_or_else(|e| panic!("validate fixture {}: {e}", path.display()))
-        .with_identity(weaveffi_model::pkg::Identity::named(stem))
 }
 
 fn sanitize(rel: &Path) -> String {
@@ -98,9 +183,16 @@ fn assert_prelude_present(contents: &str, file: &Path) {
 
 fn run_snapshots(target: &dyn Target) {
     let out_dir = Utf8Path::new("out");
+    let fixed = fixed_patterns(target.name());
+    let mut unmatched: BTreeSet<&str> = fixed.iter().copied().collect();
     for stem in FIXTURES {
-        let api = load_api(stem);
-        let mut files = target.render(&api, out_dir);
+        let model = load_model(stem);
+        let c_headers = if target.name() == "c" {
+            BTreeMap::new()
+        } else {
+            c_outputs(&model)
+        };
+        let mut files = target.render(&model, out_dir);
         files.sort_by(|a, b| a.path.cmp(&b.path));
         assert!(
             !files.is_empty(),
@@ -115,16 +207,36 @@ fn run_snapshots(target: &dyn Target) {
             omit_expression => true,
         }, {
             for file in files {
+                assert_prelude_present(&file.contents, file.path.as_std_path());
+                let file_name = file.path.file_name().expect("file name");
+                if let Some(header) = c_headers.get(file_name) {
+                    assert!(
+                        file.contents == *header,
+                        "{} in fixture {stem} isn't a byte-equal copy of the C target's {file_name}",
+                        file.path,
+                    );
+                    continue;
+                }
+                if let Some(pattern) = fixed.iter().find(|p| matches_pattern(p, file_name)) {
+                    if stem != FIXED_FROM {
+                        continue;
+                    }
+                    unmatched.remove(pattern);
+                }
                 let rel = file
                     .path
                     .strip_prefix(&root)
                     .expect("file under generator root");
                 let name = format!("{}_{stem}__{}", target.name(), sanitize(rel.as_std_path()));
                 insta::assert_snapshot!(name, redact_version(&file.contents));
-                assert_prelude_present(&file.contents, file.path.as_std_path());
             }
         });
     }
+    assert!(
+        unmatched.is_empty(),
+        "FIXED_FILES patterns for {} match no {FIXED_FROM} output: {unmatched:?}",
+        target.name(),
+    );
 }
 
 macro_rules! snapshot_tests {

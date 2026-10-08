@@ -11,23 +11,26 @@ keywords = ["ffi", "abi", "bindings", "codegen", "proc-macro"]
 categories = ["development-tools::ffi"]
 
 [dependencies]
-weaveffi-abi = { workspace = true }
 weaveffi-macros = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"], optional = true }
 
 [features]
-# Count live objects, callbacks, iterators, cancel tokens, and returned
-# allocations for `{prefix}_debug_live`. Every sample enables it.
-leak-check = ["weaveffi-abi/leak-check"]
+# Count live objects, callbacks, iterators, cancel tokens, and returned byte
+# allocations so `{prefix}_debug_live` can report leaks. Off by default
+# because every counted operation pays for an atomic update. Every sample
+# enables it.
+leak-check = []
+# Run exported `async fn`s on Tokio: the current runtime when a launcher is
+# called from inside one, otherwise a multi-thread runtime created on first
+# use. `set_spawner` still overrides it.
+tokio = ["dep:tokio"]
 
-# Dev-dependencies are path-only (no version) so `cargo publish` strips them:
-# a versioned dev-dependency must already be on crates.io when this crate is
-# published, which would force `weaveffi-gen` to publish first.
 [dev-dependencies]
-# Only for the ABI-revision lockstep test; the facade never links the
-# generators at runtime.
-weaveffi-gen = { path = "../weaveffi-gen" }
-# The leak-counter test needs counting on.
-weaveffi-abi = { path = "../weaveffi-abi", features = ["leak-check"] }
+# The leak-counter test needs counting on. A path-only self dependency turns
+# the feature on for this crate's tests, and `cargo publish` strips it.
+weaveffi = { path = ".", features = ["leak-check"] }
+proptest = "1.11.0"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
 
 [lints]
 workspace = true

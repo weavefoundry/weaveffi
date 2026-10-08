@@ -1,7 +1,7 @@
 //! The shared error **naming policy**.
 //!
 //! The error *model* (which domains exist, which codes they carry, which
-//! module owns them) lives in the binding model as
+//! module owns them) lives in the model as
 //! [`ErrorBinding`](crate::model::ErrorBinding). This module holds only the
 //! idiomatic naming rules every backend applies to those names, centralized so
 //! no target drifts into `KEY_NOT_FOUNDError` (raw SCREAMING_SNAKE with a

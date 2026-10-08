@@ -1,0 +1,20 @@
+# A small Rust producer for the CLI's library-mode tests: `weaveffi extract`
+# and `weaveffi generate` read its API from the library it builds.
+[package]
+name = "producer-fixture"
+version = "0.3.0"
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Compiles in the declarations marked `#[cfg(feature = "extra")]`.
+extra = []
+
+[dependencies]
+weaveffi = { path = "../../../../weaveffi" }
+
+[lints]
+workspace = true

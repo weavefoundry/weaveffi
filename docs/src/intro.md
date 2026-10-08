@@ -10,11 +10,12 @@ Go, and Ruby that all call the same C functions.
 ## The design in one page
 
 **One definition, two front doors.** A Rust producer annotates ordinary
-modules; the `#[weaveffi::module]` macro emits the `extern "C"` thunks, and
-the CLI reads the same source to emit the bindings. Both run one shared
-extractor, so the library you compile and the bindings you ship are two views
-of one parse. A non-Rust producer writes an [IDL](reference/idl.md) instead
-and implements the C header WeaveFFI generates from it.
+modules; the `#[weaveffi::module]` macro emits the `extern "C"` thunks and
+embeds a description of the API in the compiled library, and the CLI reads
+that description back out to emit the bindings, so the bindings you ship
+describe exactly the library you compiled, `#[cfg]` included. A non-Rust
+producer writes an [IDL](reference/idl.md) instead and implements the C
+header WeaveFFI generates from it.
 
 **Identity drives every name.** A library has one resolved
 [identity](reference/naming.md): a package `name`, a C symbol `prefix`, and a
@@ -23,15 +24,16 @@ native `library` base name. For a Rust producer all three come from the crate
 or NuGet package named `kvstore`). Nothing a generator emits is named after
 WeaveFFI, so any number of WeaveFFI-built libraries can live in one process.
 
-**A small, explicit C ABI.** [Revision 3](reference/abi.md) has five value
+**A small, explicit C ABI.** [Revision 4](reference/abi.md) has five value
 families: direct scalars, UTF-8 strings and bytes as `(ptr, len)` runs,
 serialized [value buffers](reference/value-buffers.md) for records, enums,
 optionals, lists, and maps, reference-counted objects, and
 consumer-implemented callback vtables. Every fallible call reports through a
 `{prefix}_error` struct. Async functions complete through a callback that
 fires exactly once, and cancellation is a first-class runtime code. Every
-consumer checks the ABI revision and a per-module contract checksum when it
-loads the library, so a stale binding fails loudly instead of misreading
+consumer checks the ABI revision and each module's contract table (a hash of
+every declaration's signature) when it loads the library, so a stale binding
+fails loudly, naming the declaration that changed, instead of misreading
 memory.
 
 **Idiomatic generators.** Each target maps the model onto its own idioms:
@@ -56,5 +58,5 @@ bundles prebuilt native libraries into publishable packages per ecosystem.
   boundary.
 - [Comparison](comparison.md) and [FAQ](faq.md): how WeaveFFI relates to
   UniFFI, Diplomat, cbindgen, and the single-language bridges.
-- [Stability and Versioning](stability.md): what changed in schema 0.10 and
-  ABI 3, and how to migrate.
+- [Stability and Versioning](stability.md): what the version numbers
+  promise, and how to migrate to schema 0.11 and ABI revision 4.

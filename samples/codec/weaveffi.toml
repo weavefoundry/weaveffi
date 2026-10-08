@@ -11,16 +11,16 @@ repository = "https://github.com/weavefoundry/weaveffi"
 module_name = "Codec"
 
 [generators.dotnet]
-namespace = "Codec"
+name = "Codec"
 
 [generators.swift]
-module_name = "Codec"
+name = "Codec"
 
 [generators.cpp]
-namespace = "codec"
+name = "codec"
 
 [generators.dart]
-package_name = "codec"
+name = "codec"
 
 [generators.go]
-module_path = "github.com/example/codec"
+name = "github.com/example/codec"

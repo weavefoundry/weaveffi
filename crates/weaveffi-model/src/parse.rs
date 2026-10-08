@@ -171,6 +171,7 @@ pub fn parse_api_str(s: &str, format: &str) -> Result<Api, ParseError> {
 mod tests {
     use super::*;
     use crate::ir::{Function, Module, Param, TypeRef, CURRENT_SCHEMA_VERSION};
+    use crate::ty::Prim;
 
     fn expected_api() -> Api {
         Api {
@@ -183,16 +184,16 @@ mod tests {
                     params: vec![
                         Param {
                             name: "a".to_string(),
-                            ty: TypeRef::I32,
+                            ty: TypeRef::Prim(Prim::I32),
                             doc: None,
                         },
                         Param {
                             name: "b".to_string(),
-                            ty: TypeRef::I32,
+                            ty: TypeRef::Prim(Prim::I32),
                             doc: None,
                         },
                     ],
-                    returns: Some(TypeRef::I32),
+                    returns: Some(TypeRef::Prim(Prim::I32)),
                     doc: Some("Adds two numbers".to_string()),
                     throws: false,
                     r#async: false,
@@ -212,7 +213,7 @@ mod tests {
     #[test]
     fn every_format_parses_the_same_document() {
         let yaml = r#"
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: math
     functions:
@@ -226,7 +227,7 @@ modules:
         doc: "Adds two numbers"
 "#;
         let json = r#"{
-            "version": "0.10.0",
+            "version": "0.11.0",
             "modules": [{
                 "name": "math",
                 "functions": [{
@@ -241,7 +242,7 @@ modules:
             }]
         }"#;
         let toml_str = r#"
-version = "0.10.0"
+version = "0.11.0"
 
 [[modules]]
 name = "math"
@@ -285,7 +286,7 @@ type = "i32"
 
     #[test]
     fn parse_errors_carry_spans() {
-        let yaml = "version: \"0.10.0\"\nmodules:\n  - name: [oops\n";
+        let yaml = "version: \"0.11.0\"\nmodules:\n  - name: [oops\n";
         match parse_api_str(yaml, "yaml").unwrap_err() {
             ParseError::Yaml { line, span, .. } => {
                 assert!(line > 0);
@@ -305,7 +306,7 @@ type = "i32"
 
     #[test]
     fn unknown_type_syntax_is_a_parse_error() {
-        let yaml = "version: \"0.10.0\"\nmodules:\n  - name: m\n    functions:\n      - name: f\n        params: [{ name: x, type: \"{string}\" }]\n";
+        let yaml = "version: \"0.11.0\"\nmodules:\n  - name: m\n    functions:\n      - name: f\n        params: [{ name: x, type: \"{string}\" }]\n";
         let err = parse_api_str(yaml, "yaml").unwrap_err();
         assert!(err.to_string().contains("map type missing"), "{err}");
     }

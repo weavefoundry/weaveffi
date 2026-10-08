@@ -19,15 +19,20 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
+        # `native` marks a binary the runner can execute, so the job runs its
+        # `--version` before uploading. x86_64-apple-darwin is cross-compiled
+        # on the arm64 macOS runner (GitHub retired the Intel images) and
+        # isn't run there.
         include:
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
-          - { target: x86_64-apple-darwin, os: macos-13 }
-          - { target: aarch64-apple-darwin, os: macos-latest }
-          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, native: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, native: true }
+          - { target: x86_64-apple-darwin, os: macos-latest, native: false }
+          - { target: aarch64-apple-darwin, os: macos-latest, native: true }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, native: true }
     env:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
@@ -38,6 +43,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: cargo build -p weaveffi-cli --release --locked --target ${{ matrix.target }}
+      - name: Smoke-test the binary
+        if: matrix.native
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$("target/${{ matrix.target }}/release/weaveffi" --version)
+          echo "$version"
+          case "$version" in
+            *" ${TAG#v}"*) ;;
+            *) echo "expected version ${TAG#v} from $TAG" >&2; exit 1 ;;
+          esac
       - name: Package and upload
         shell: bash
         env:

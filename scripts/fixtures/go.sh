@@ -3,6 +3,8 @@
 # C warnings as errors. No producer exists for a fixture, so the module links
 # against an empty stand-in library with unresolved symbols allowed.
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+require go gofmt cc
 dir=$1
 mod="$dir/go"
 header=$(ls "$mod"/*.h | head -1)

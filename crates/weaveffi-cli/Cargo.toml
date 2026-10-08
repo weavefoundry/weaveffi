@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Command-line tool for generating multi-language FFI bindings from API definitions"
+description = "The WeaveFFI command-line tool and code-generation library: the orchestrator and the eleven language generators"
 keywords = ["ffi", "codegen", "bindings", "cli", "code-generation"]
 categories = ["development-tools::ffi", "command-line-utilities"]
 exclude = [
@@ -20,6 +20,10 @@ path = "src/main.rs"
 # The binary shares its name with the `weaveffi` library crate; documenting
 # both would collide in `target/doc`.
 doc = false
+
+[[bench]]
+name = "codegen_bench"
+harness = false
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/weaveffi-{ target }{ archive-suffix }"
@@ -38,12 +42,18 @@ camino = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 weaveffi-model = { workspace = true, features = ["idl"] }
-weaveffi-gen = { workspace = true }
+rayon = { workspace = true }
+heck = { workspace = true }
 serde_yaml = { workspace = true }
 serde_json = { workspace = true }
 similar = { workspace = true }
 tempfile = { workspace = true }
 schemars = { workspace = true }
+flate2 = "1"
+crc32fast = "1"
+sha2 = "0.10"
+tar = { version = "0.4", default-features = false }
+object = { version = "0.37", default-features = false, features = ["read", "wasm", "std"] }
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -52,7 +62,10 @@ serde_yaml = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 insta = { workspace = true }
-
+criterion = { workspace = true }
+# Only for the ABI-revision lockstep test. Path-only, so `cargo publish`
+# strips it and this crate never has to wait for `weaveffi` on crates.io.
+weaveffi = { path = "../weaveffi" }
 
 [lints]
 workspace = true

@@ -1,0 +1,5 @@
+error: weaveffi: `#[cfg]` on a record field isn't supported, because the generated bindings can't follow it; put the `#[cfg]` on the whole type
+ --> tests/ui/fail_member_cfg.rs:9:9
+  |
+9 |         #[cfg(unix)]
+  |         ^

@@ -1,18 +1,19 @@
 //! IDL validation. This module owns the [`ValidationError`] catalog and the
-//! [`validate_api`] entry point; the work is split across submodules:
-//! `rules` (per-module checks), `diagnostic` (miette span attachment), and
-//! `warnings` (advisory lints).
+//! [`validate`] entry point, which checks an [`Api`] against the library's
+//! [`Identity`] and builds the one [`Model`] every generator consumes. The
+//! work is split across submodules: `rules` (name, type, and shape checks),
+//! `diagnostic` (miette span attachment), and `warnings` (advisory lints).
 //!
 //! Validation collects *every* rule violation before failing, so a document
 //! with several problems reports them all in one run rather than one per
 //! invocation.
 
 use crate::ir::{Api, SUPPORTED_VERSIONS};
+use crate::model::{Model, RESERVED_SYMBOL_FAMILIES, RUNTIME_SYMBOLS};
+use crate::pkg::Identity;
 #[cfg(feature = "idl")]
 use miette::Diagnostic;
-use std::collections::BTreeSet;
-
-use crate::resolved::ResolvedApi;
+use std::collections::BTreeMap;
 
 mod diagnostic;
 mod rules;
@@ -25,13 +26,32 @@ pub use warnings::{collect_warnings, ValidationWarning};
 
 /// Every way an [`Api`] can fail validation.
 ///
-/// `validate_api` collects every variant it encounters. Each variant carries
+/// [`validate`] collects every variant it encounters. Each variant carries
 /// the names needed to render an actionable diagnostic, and the
 /// `#[error]`/`#[diagnostic]` attributes supply the message and help text
-/// shown to the user.
-#[derive(Debug, thiserror::Error)]
+/// shown to the user. Module fields hold the module's dotted path
+/// (`outer.inner`). The variant serializes as an object whose `code` is the
+/// variant name, with the variant's fields alongside (the shape of
+/// `weaveffi validate --format json` failures).
+#[derive(Debug, thiserror::Error, serde::Serialize)]
 #[cfg_attr(feature = "idl", derive(Diagnostic))]
+#[serde(tag = "code")]
 pub enum ValidationError {
+    /// The document declares a schema version this build doesn't support.
+    #[error("unsupported schema version '{version}'; supported versions: {supported}")]
+    #[cfg_attr(
+        feature = "idl",
+        diagnostic(help(
+            "set the version field to the current schema version and update the \
+         document to match the current schema (see docs/src/reference/idl.md)"
+        ))
+    )]
+    UnsupportedSchemaVersion {
+        /// Version requested by the document.
+        version: String,
+        /// Comma-separated list of versions this build accepts.
+        supported: String,
+    },
     /// A module is missing its required `name` field.
     #[error("module has no name")]
     #[cfg_attr(
@@ -39,125 +59,133 @@ pub enum ValidationError {
         diagnostic(help("every module must have a non-empty 'name' field"))
     )]
     NoModuleName,
-    /// Two modules share the same name.
-    #[error("duplicate module name: {0}")]
+    /// Two sibling modules share a name.
+    #[error("duplicate module name: {module}")]
     #[cfg_attr(
         feature = "idl",
         diagnostic(help(
-            "module names must be unique within an API definition; rename or merge the duplicate"
+            "module names must be unique among siblings; rename or merge the duplicate"
         ))
     )]
-    DuplicateModuleName(String),
-    /// A module name is not a valid identifier; the second field explains why.
-    #[error("invalid module name '{0}': {1}")]
+    DuplicateModuleName {
+        /// Dotted path of the duplicated module.
+        module: String,
+    },
+    /// A module name is not a valid identifier.
+    #[error("invalid module name '{name}': {reason}")]
     #[cfg_attr(
         feature = "idl",
         diagnostic(help(
             "choose a valid identifier (a-z, A-Z, 0-9, _) that is not a reserved word"
         ))
     )]
-    InvalidModuleName(String, &'static str),
-    /// Two functions in the same module share a name.
-    #[error("duplicate function name in module '{module}': {function}")]
-    #[cfg_attr(
-        feature = "idl",
-        diagnostic(help("function names must be unique within a module; rename the duplicate"))
-    )]
-    DuplicateFunctionName {
-        /// Module that contains the colliding functions.
-        module: String,
-        /// Duplicated function name.
-        function: String,
-    },
-    /// Two parameters of one function share a name.
-    #[error("duplicate param name in function '{function}' of module '{module}': {param}")]
-    #[cfg_attr(
-        feature = "idl",
-        diagnostic(help(
-            "parameter names must be unique within a function; rename the duplicate"
-        ))
-    )]
-    DuplicateParamName {
-        /// Module that contains the function.
-        module: String,
-        /// Function that contains the colliding parameters.
-        function: String,
-        /// Duplicated parameter name.
-        param: String,
+    InvalidModuleName {
+        /// The rejected module name.
+        name: String,
+        /// Why the name was rejected.
+        reason: &'static str,
     },
     /// A name matches a reserved keyword in one of the target languages.
-    #[error("reserved keyword used: {0}")]
+    #[error("reserved keyword used: {name}")]
     #[cfg_attr(
         feature = "idl",
         diagnostic(help("choose a different name that is not a language reserved word"))
     )]
-    ReservedKeyword(String),
-    /// An identifier is malformed; the second field explains why.
-    #[error("invalid identifier '{0}': {1}")]
+    ReservedKeyword {
+        /// The reserved name.
+        name: String,
+    },
+    /// An identifier is malformed.
+    #[error("invalid identifier '{name}': {reason}")]
     #[cfg_attr(feature = "idl", diagnostic(help("identifiers must start with a letter or underscore and contain only alphanumeric or underscore characters")))]
-    InvalidIdentifier(String, &'static str),
-    /// An error domain in the named module is missing its `name` field.
-    #[error("error domain missing name in module '{0}'")]
-    #[cfg_attr(
-        feature = "idl",
-        diagnostic(help("add a non-empty 'name' field to the error domain"))
-    )]
-    ErrorDomainMissingName(String),
-    /// Two error codes in the same module share a name.
-    #[error("duplicate error code name in module '{module}': {name}")]
-    #[cfg_attr(
-        feature = "idl",
-        diagnostic(help("error code names must be unique within a module; rename the duplicate"))
-    )]
-    DuplicateErrorName {
-        /// Module that contains the error domain.
-        module: String,
-        /// Duplicated error code name.
+    InvalidIdentifier {
+        /// The rejected identifier.
         name: String,
+        /// Why the identifier was rejected.
+        reason: &'static str,
     },
-    /// Two error codes in the same module share a numeric value.
-    #[error("duplicate error numeric code in module '{module}': {code}")]
+    /// Two types (records, enums, interfaces, callback interfaces, or error
+    /// domains) share a name.
+    ///
+    /// Type names are global: generators emit flat per-language type names
+    /// and a reference names a type by its bare name, so two types called
+    /// `Config` would collide in generated code and make references
+    /// ambiguous.
+    #[error("duplicate type name '{name}' (declared in '{first}' and '{second}')")]
     #[cfg_attr(
         feature = "idl",
         diagnostic(help(
-            "numeric error codes must be unique within a module; assign a different value"
+            "struct, enum, interface, callback interface, and error domain names must be unique \
+         across the whole API; rename one of the declarations"
         ))
     )]
-    DuplicateErrorCode {
-        /// Module that contains the error domain.
-        module: String,
-        /// Conflicting numeric error code.
-        code: i32,
+    DuplicateTypeName {
+        /// The colliding type name.
+        name: String,
+        /// Module path of the first declaration.
+        first: String,
+        /// Module path of the second declaration.
+        second: String,
     },
-    /// An error code uses a reserved value: `0` means success and the
-    /// negative range belongs to the runtime's trap codes.
-    #[error("invalid error code in module '{module}' for '{name}': must be a positive integer")]
+    /// Two free functions share a name.
+    ///
+    /// Function names are global: several targets flatten every module's
+    /// functions into one namespace, so `a.open` and `b.open` would collide
+    /// there.
+    #[error("duplicate function name '{name}' (declared in '{first}' and '{second}')")]
     #[cfg_attr(
         feature = "idl",
         diagnostic(help(
-            "0 means success and negative codes are reserved for the runtime (-1 generic, \
-         -2 panic, -3 marshalling failure, -4 foreign callback error, -5 cancelled); use a positive integer"
+            "free function names must be unique across the whole API, because targets \
+         flatten module functions into one namespace; rename one of them (for example \
+         'open_store')"
         ))
     )]
-    InvalidErrorCode {
-        /// Module that contains the error domain.
-        module: String,
-        /// Error code name with the invalid value.
+    DuplicateFunctionName {
+        /// The colliding function name.
         name: String,
+        /// Module path of the first declaration.
+        first: String,
+        /// Module path of the second declaration.
+        second: String,
     },
-    /// A function name collides with an error domain name in the same module.
-    #[error("function name collides with error domain name in module '{module}': {name}")]
+    /// A free function has the same name as an error domain.
+    #[error("function '{function}.{name}' has the same name as error domain '{domain}.{name}'")]
     #[cfg_attr(
         feature = "idl",
         diagnostic(help(
-            "function and error domain names share a namespace; rename one to avoid the collision"
+            "function and error domain names share one flat namespace in several targets; \
+         rename one of them"
         ))
     )]
     NameCollisionWithErrorDomain {
-        /// Module where the collision occurs.
-        module: String,
-        /// Name shared by the function and the error domain.
+        /// The shared name.
         name: String,
+        /// Module path of the function.
+        function: String,
+        /// Module path of the error domain.
+        domain: String,
+    },
+    /// Two error codes share a name.
+    ///
+    /// Code names are global: backends with flat namespaces (Python, Node,
+    /// Go) derive one error class or constant per code, so `NotFound` in two
+    /// domains would collide in generated code.
+    #[error("duplicate error code name '{name}' (declared in '{first}' and '{second}')")]
+    #[cfg_attr(
+        feature = "idl",
+        diagnostic(help(
+            "error code names must be unique across the whole API; qualify one of them \
+         (for example 'OrderNotFound')"
+        ))
+    )]
+    DuplicateErrorCodeName {
+        /// The colliding code name.
+        name: String,
+        /// Domain of the first declaration, as `module.Domain`.
+        first: String,
+        /// Domain of the second declaration, as `module.Domain`.
+        second: String,
     },
     /// Two declarations lower to the same C identifier.
     ///
@@ -182,6 +210,22 @@ pub enum ValidationError {
         /// The declaration that collided with it.
         second: String,
     },
+    /// Two parameters of one function share a name.
+    #[error("duplicate param name in function '{function}' of module '{module}': {param}")]
+    #[cfg_attr(
+        feature = "idl",
+        diagnostic(help(
+            "parameter names must be unique within a function; rename the duplicate"
+        ))
+    )]
+    DuplicateParamName {
+        /// Module that contains the function.
+        module: String,
+        /// Function that contains the colliding parameters.
+        function: String,
+        /// Duplicated parameter name.
+        param: String,
+    },
     /// A synchronous callable declares `cancellable: true`.
     #[error("function '{module}::{function}' is cancellable but not async")]
     #[cfg_attr(
@@ -197,13 +241,15 @@ pub enum ValidationError {
         /// The offending function.
         function: String,
     },
-    /// A function declares `throws: true` but no error domain is in scope.
+    /// A function or callback-interface method declares `throws: true` but
+    /// no error domain is in scope.
     #[error("function '{module}::{function}' declares throws but no error domain is in scope")]
     #[cfg_attr(
         feature = "idl",
         diagnostic(help(
-            "a throwing function reports codes from its module's error domain; declare an \
-         `errors:` block on this module (or an ancestor module), or remove `throws: true`"
+            "a throwing function (or callback-interface method) reports codes from its \
+         module's error domain; declare an `errors:` block on this module (or an ancestor \
+         module), or remove `throws: true`"
         ))
     )]
     ThrowsWithoutErrorDomain {
@@ -212,74 +258,60 @@ pub enum ValidationError {
         /// Function marked `throws` with no domain in scope.
         function: String,
     },
-    /// Two types (structs, enums, interfaces, or callback interfaces) share a
-    /// bare name.
-    ///
-    /// Type names must be unique across the whole API: generators emit flat
-    /// per-language type names, and unqualified cross-module references
-    /// resolve by bare name, so two types called `Config` would collide in
-    /// generated code and make references ambiguous.
-    #[error("duplicate type name '{name}' (declared in '{first}' and '{second}')")]
+    /// An async function tries to return an iterator, which has no async ABI.
+    #[error("async function '{module}::{function}' cannot return an iterator")]
     #[cfg_attr(
         feature = "idl",
         diagnostic(help(
-            "struct, enum, interface, callback interface, and error domain names must be unique \
-         across the whole API; rename one of the declarations"
+            "the callback-completed async ABI has no streaming protocol; return a list ([T]) \
+         from the async function, or make the function synchronous and return iter<T>"
         ))
     )]
-    DuplicateTypeName {
-        /// The colliding bare type name.
-        name: String,
-        /// Module path of the first declaration.
-        first: String,
-        /// Module path of the second declaration.
-        second: String,
-    },
-    /// Two error domains declare a code with the same name.
-    ///
-    /// Code names must be unique across every domain in the API: backends
-    /// with flat namespaces (Python, Node, Go) derive one error class or
-    /// constant per code, so `NotFound` in two domains would collide in
-    /// generated code.
-    #[error("duplicate error code name '{name}' (declared in '{first}' and '{second}')")]
-    #[cfg_attr(
-        feature = "idl",
-        diagnostic(help(
-            "error code names must be unique across the whole API; qualify one of them \
-         (e.g. 'OrderNotFound')"
-        ))
-    )]
-    DuplicateErrorCodeName {
-        /// The colliding code name.
-        name: String,
-        /// Domain of the first declaration, as `module.Domain`.
-        first: String,
-        /// Domain of the second declaration, as `module.Domain`.
-        second: String,
-    },
-    /// Two structs in the same module share a name.
-    #[error("duplicate struct name in module '{module}': {name}")]
-    #[cfg_attr(
-        feature = "idl",
-        diagnostic(help("struct names must be unique within a module; rename the duplicate"))
-    )]
-    DuplicateStructName {
-        /// Module that contains the structs.
+    AsyncIteratorReturn {
+        /// Module that contains the function.
         module: String,
-        /// Duplicated struct name.
-        name: String,
+        /// Async function with the iterator return.
+        function: String,
     },
-    /// Two fields of one struct share a name.
-    #[error("duplicate field name in struct '{struct_name}': {field}")]
+    /// An error domain in the named module is missing its `name` field.
+    #[error("error domain missing name in module '{module}'")]
     #[cfg_attr(
         feature = "idl",
-        diagnostic(help("field names must be unique within a struct; rename the duplicate"))
+        diagnostic(help("add a non-empty 'name' field to the error domain"))
     )]
-    DuplicateStructField {
-        /// Struct that contains the colliding fields.
-        struct_name: String,
-        /// Duplicated field name.
-        field: String,
+    ErrorDomainMissingName {
+        /// Module that declares the error domain.
+        module: String,
+    },
+    /// Two error codes in one domain share a numeric value.
+    #[error("duplicate error numeric code in module '{module}': {value}")]
+    #[cfg_attr(
+        feature = "idl",
+        diagnostic(help(
+            "numeric error codes must be unique within a domain; assign a different value"
+        ))
+    )]
+    DuplicateErrorCode {
+        /// Module that declares the error domain.
+        module: String,
+        /// Conflicting numeric error code.
+        value: i32,
+    },
+    /// An error code uses a reserved value: `0` means success and the
+    /// negative range belongs to the runtime's trap codes.
+    #[error("invalid error code in module '{module}' for '{name}': must be a positive integer")]
+    #[cfg_attr(
+        feature = "idl",
+        diagnostic(help(
+            "0 means success and negative codes are reserved for the runtime (-1 generic, \
+         -2 panic, -3 marshalling failure, -4 foreign callback error, -5 cancelled); use a positive integer"
+        ))
+    )]
+    InvalidErrorCode {
+        /// Module that declares the error domain.
+        module: String,
+        /// Error code name with the invalid value.
+        name: String,
     },
     /// A struct declares no fields.
     #[error("empty struct in module '{module}': {name}")]
@@ -295,17 +327,17 @@ pub enum ValidationError {
         /// Name of the empty struct.
         name: String,
     },
-    /// Two enums in the same module share a name.
-    #[error("duplicate enum name in module '{module}': {name}")]
+    /// Two fields of one struct share a name.
+    #[error("duplicate field name in struct '{struct_name}': {field}")]
     #[cfg_attr(
         feature = "idl",
-        diagnostic(help("enum names must be unique within a module; rename the duplicate"))
+        diagnostic(help("field names must be unique within a struct; rename the duplicate"))
     )]
-    DuplicateEnumName {
-        /// Module that contains the enums.
-        module: String,
-        /// Duplicated enum name.
-        name: String,
+    DuplicateStructField {
+        /// Struct that contains the colliding fields.
+        struct_name: String,
+        /// Duplicated field name.
+        field: String,
     },
     /// An enum declares no variants.
     #[error("empty enum in module '{module}': {name}")]
@@ -363,16 +395,19 @@ pub enum ValidationError {
         /// Conflicting numeric discriminant.
         value: i32,
     },
-    /// Two interfaces in the same module share a name.
-    #[error("duplicate interface name in module '{module}': {name}")]
+    /// An interface declares no members at all.
+    #[error("empty interface in module '{module}': {name}")]
     #[cfg_attr(
         feature = "idl",
-        diagnostic(help("interface names must be unique within a module; rename the duplicate"))
+        diagnostic(help(
+            "interfaces must declare at least one constructor, method, or static; \
+         add a member or remove the interface"
+        ))
     )]
-    DuplicateInterfaceName {
-        /// Module that contains the interfaces.
+    EmptyInterface {
+        /// Module that contains the interface.
         module: String,
-        /// Duplicated interface name.
+        /// Name of the empty interface.
         name: String,
     },
     /// Two members (constructors, methods, or statics) of one interface share
@@ -389,21 +424,6 @@ pub enum ValidationError {
         /// Interface that contains the colliding members.
         interface: String,
         /// Duplicated member name.
-        name: String,
-    },
-    /// An interface declares no members at all.
-    #[error("empty interface in module '{module}': {name}")]
-    #[cfg_attr(
-        feature = "idl",
-        diagnostic(help(
-            "interfaces must declare at least one constructor, method, or static; \
-         add a member or remove the interface"
-        ))
-    )]
-    EmptyInterface {
-        /// Module that contains the interface.
-        module: String,
-        /// Name of the empty interface.
         name: String,
     },
     /// An interface constructor declares an explicit return type.
@@ -435,63 +455,6 @@ pub enum ValidationError {
         interface: String,
         /// The offending constructor.
         constructor: String,
-    },
-    /// An interface reference appears as a map key.
-    #[error("interface type '{name}' is not valid in {location}")]
-    #[cfg_attr(
-        feature = "idl",
-        diagnostic(help(
-            "interface objects may appear anywhere except as map keys; key a map by a scalar, \
-         string, or C-style enum instead"
-        ))
-    )]
-    InterfaceInInvalidPosition {
-        /// The referenced interface name.
-        name: String,
-        /// Position where the interface reference appeared.
-        location: String,
-    },
-    /// A type reference names a struct, enum, interface, or callback interface
-    /// that doesn't exist.
-    #[error("unknown type reference: {name}")]
-    #[cfg_attr(
-        feature = "idl",
-        diagnostic(help(
-            "define a struct, enum, interface, or callback interface with this name, or check \
-         for typos"
-        ))
-    )]
-    UnknownTypeRef {
-        /// Unresolved type name.
-        name: String,
-    },
-    /// A map uses a key type the C ABI can't represent.
-    #[error("invalid map key type: {key_type}; only integers, bools, strings, and C-style enums are allowed as map keys")]
-    #[cfg_attr(feature = "idl", diagnostic(help("map keys must be integers (i8 through u64), bool, string, or a C-style enum; structs, rich enums, interfaces, optionals, lists, and maps cannot be keys")))]
-    InvalidMapKey {
-        /// Rejected key type, rendered as it appears in the IDL.
-        key_type: String,
-    },
-    /// An iterator type appears somewhere other than a function return.
-    #[error("iterator type is only valid as a function return type, found in {location}")]
-    #[cfg_attr(feature = "idl", diagnostic(help("iterator types can only be used as function return types, not as parameters or struct fields")))]
-    IteratorInInvalidPosition {
-        /// Position where the iterator type appeared.
-        location: String,
-    },
-    /// Two callback interfaces in the same module share a name.
-    #[error("duplicate callback interface name in module '{module}': {name}")]
-    #[cfg_attr(
-        feature = "idl",
-        diagnostic(help(
-            "callback interface names must be unique within a module; rename the duplicate"
-        ))
-    )]
-    DuplicateCallbackInterfaceName {
-        /// Module that contains the callback interfaces.
-        module: String,
-        /// Duplicated callback interface name.
-        name: String,
     },
     /// A callback interface declares no methods.
     #[error("empty callback interface in module '{module}': {name}")]
@@ -528,9 +491,9 @@ pub enum ValidationError {
     #[cfg_attr(
         feature = "idl",
         diagnostic(help(
-            "callback-interface methods are synchronous, never throw, and return either nothing \
-         or a direct value (a scalar, bool, or C-style enum): the consumer implements them, \
-         so no producer-owned allocation or error payload can flow back"
+            "callback-interface methods are synchronous calls the consumer implements: they \
+         can't be async or cancellable, and they return nothing or any value except an \
+         iterator or a callback interface"
         ))
     )]
     InvalidCallbackMethod {
@@ -541,15 +504,78 @@ pub enum ValidationError {
         /// Why the method was rejected.
         reason: &'static str,
     },
+    /// A type reference names a struct, enum, interface, or callback interface
+    /// that doesn't exist.
+    #[error("unknown type reference: {name}")]
+    #[cfg_attr(
+        feature = "idl",
+        diagnostic(help(
+            "define a struct, enum, interface, or callback interface with this name, or check \
+         for typos"
+        ))
+    )]
+    UnknownTypeRef {
+        /// Unresolved type name.
+        name: String,
+    },
+    /// A type reference is module-qualified (`a.b.T`).
+    #[error("qualified type reference '{name}': type names are global, so refer to a type by its bare name")]
+    #[cfg_attr(
+        feature = "idl",
+        diagnostic(help(
+            "every type name is unique across the API, so a reference is just the name: write \
+         'Contact', not 'contacts.Contact'"
+        ))
+    )]
+    QualifiedTypeRef {
+        /// The dotted name as written.
+        name: String,
+    },
+    /// A type reference names a primitive WeaveFFI doesn't support.
+    #[error("unsupported primitive type '{name}'")]
+    #[cfg_attr(
+        feature = "idl",
+        diagnostic(help(
+            "`usize` and `isize` vary with the platform and `u128`/`i128` have no portable C \
+         type: use `u64` or `i64`; for `char`, use `string`"
+        ))
+    )]
+    UnsupportedPrimitive {
+        /// The primitive's name as written.
+        name: String,
+    },
+    /// A map uses a key type the C ABI can't represent.
+    #[error("invalid map key type: {key_type}; only integers, bools, strings, and C-style enums are allowed as map keys")]
+    #[cfg_attr(feature = "idl", diagnostic(help("map keys must be integers (i8 through u64), bool, string, or a C-style enum; structs, rich enums, interfaces, optionals, lists, and maps cannot be keys")))]
+    InvalidMapKey {
+        /// Rejected key type, rendered as it appears in the IDL.
+        key_type: String,
+    },
+    /// An interface reference appears as a map key.
+    #[error("interface type '{name}' is not valid in {location}")]
+    #[cfg_attr(
+        feature = "idl",
+        diagnostic(help(
+            "interface objects may appear anywhere except as map keys; key a map by a scalar, \
+         string, or C-style enum instead"
+        ))
+    )]
+    InterfaceInInvalidPosition {
+        /// The referenced interface name.
+        name: String,
+        /// Position where the interface reference appeared.
+        location: String,
+    },
     /// A callback-interface type appears in a position other than a callable
     /// parameter.
     #[error("callback interface '{name}' is not valid in {location}")]
     #[cfg_attr(
         feature = "idl",
         diagnostic(help(
-            "a callback interface is a consumer-implemented vtable: it may be passed as a \
-         parameter of a function, constructor, static, or method, but it can't be returned, \
-         nested inside another type, or passed to another callback-interface method"
+            "a callback interface is a consumer-implemented vtable: it may be passed (bare, or \
+         optional as `Cb?`) as a parameter of a function, constructor, static, or method, but \
+         it can't be returned, nested inside another type, or passed to another \
+         callback-interface method"
         ))
     )]
     CallbackInterfaceInInvalidPosition {
@@ -558,35 +584,12 @@ pub enum ValidationError {
         /// Position where the reference appeared.
         location: String,
     },
-    /// An async function tries to return an iterator, which has no async ABI.
-    #[error("async function '{module}::{function}' cannot return an iterator")]
-    #[cfg_attr(
-        feature = "idl",
-        diagnostic(help(
-            "the callback-completed async ABI has no streaming protocol; return a list ([T]) \
-         from the async function, or make the function synchronous and return iter<T>"
-        ))
-    )]
-    AsyncIteratorReturn {
-        /// Module that contains the function.
-        module: String,
-        /// Async function with the iterator return.
-        function: String,
-    },
-    /// The document declares a schema version this build doesn't support.
-    #[error("unsupported schema version '{version}'; supported versions: {supported}")]
-    #[cfg_attr(
-        feature = "idl",
-        diagnostic(help(
-            "set the version field to the current schema version and update the \
-         document to match the current schema (see docs/src/reference/idl.md)"
-        ))
-    )]
-    UnsupportedSchemaVersion {
-        /// Version requested by the document.
-        version: String,
-        /// Comma-separated list of versions this build accepts.
-        supported: String,
+    /// An iterator type appears somewhere other than a function return.
+    #[error("iterator type is only valid as a function return type, found in {location}")]
+    #[cfg_attr(feature = "idl", diagnostic(help("iterator types can only be used as function return types, not as parameters or struct fields")))]
+    IteratorInInvalidPosition {
+        /// Position where the iterator type appeared.
+        location: String,
     },
 }
 
@@ -650,94 +653,125 @@ impl Diagnostic for ValidationDiagnostics {
     }
 }
 
-/// Validate an [`Api`] document, reporting **every** rule violation found.
-/// The optional `source` is `(filename, contents)` of the IDL file and is
-/// used to attach spans to the returned diagnostics. Pass `None` when the
-/// API is constructed in memory (tests, programmatic builds) and there is no
-/// on-disk source.
+/// Validate an [`Api`] document against the library's `identity`, reporting
+/// **every** rule violation found, and build its [`Model`].
 ///
-/// This is the one checked way to turn a parsed document into the
-/// [`ResolvedApi`] every generator consumes. The document is never rewritten;
-/// the resolved view indexes its declarations so that
-/// [`ResolvedApi::resolve`] can turn each written reference into a
-/// [`Ty`](crate::model::Ty) whose kind and owning module are known.
+/// This is the one checked way to obtain the [`Model`] every generator
+/// consumes, and it builds the model exactly once. The C symbol table is
+/// checked with the real `identity`, in the same pass. The optional `source`
+/// is `(filename, contents)` of the IDL file and is used to attach spans to
+/// the returned diagnostics, each located within its enclosing declaration.
+/// Pass `None` when the API is constructed in memory and there is no on-disk
+/// source.
 ///
 /// # Errors
 ///
 /// Returns [`ValidationDiagnostics`] carrying one [`ValidationDiagnostic`]
 /// per violation: an unsupported schema version, a duplicate or invalid name,
-/// an unknown or misplaced type, an empty struct or enum, a `throws` without
-/// an error domain, or any other rule violation in the catalog above.
-pub fn validate_api(
-    api: Api,
+/// an unknown, qualified, or misplaced type, an empty struct or enum, a
+/// `throws` without an error domain, a C symbol collision, or any other rule
+/// violation in the catalog above.
+pub fn validate(
+    api: &Api,
+    identity: &Identity,
     source: Option<(&str, &str)>,
-) -> Result<ResolvedApi, ValidationDiagnostics> {
-    let errors = validate_api_inner(&api);
-    if errors.is_empty() {
-        return Ok(ResolvedApi::assume_valid(api));
-    }
-    Err(ValidationDiagnostics {
+) -> Result<Model, ValidationDiagnostics> {
+    validate_scoped(api, identity, Options::default()).map_err(|errors| ValidationDiagnostics {
         diagnostics: errors
             .into_iter()
-            .map(|e| ValidationDiagnostic::new(e, source))
+            .map(|(error, scope)| ValidationDiagnostic::new(error, &scope, source))
             .collect(),
     })
 }
 
-fn validate_api_inner(api: &Api) -> Vec<ValidationError> {
-    let mut errors = Vec::new();
+/// Options for [`validate_scoped`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Accept a type name that no declaration in the document provides,
+    /// assuming it's a record or rich enum declared elsewhere, and resolve
+    /// it to [`Ty::Record`](crate::ty::Ty::Record). The `#[weaveffi::module]`
+    /// macro sets this: it validates one module tree at a time, and asserts
+    /// at compile time that each such name really crosses as a value buffer.
+    pub foreign_names: bool,
+}
+
+/// A rule violation paired with the declaration path that encloses it
+/// (module segments, then the declaration, member, and parameter or field
+/// names). [`validate`] uses the path to locate the offending IDL text; the
+/// `#[weaveffi::module]` macro uses it to find the offending Rust item.
+pub type Found = (ValidationError, Vec<String>);
+
+/// Validate `api` against `identity` exactly like [`validate`], with
+/// `options`, returning each violation with the declaration path that
+/// encloses it instead of a located diagnostic.
+///
+/// # Errors
+///
+/// Returns every rule violation found, each paired with its declaration
+/// path.
+pub fn validate_scoped(
+    api: &Api,
+    identity: &Identity,
+    options: Options,
+) -> Result<Model, Vec<Found>> {
     if !SUPPORTED_VERSIONS.contains(&api.version.as_str()) {
         // A wrong-schema document is checked no further: the rules below
         // assume the current schema's shape.
-        return vec![ValidationError::UnsupportedSchemaVersion {
-            version: api.version.clone(),
-            supported: SUPPORTED_VERSIONS.join(", "),
-        }];
+        return Err(vec![(
+            ValidationError::UnsupportedSchemaVersion {
+                version: api.version.clone(),
+                supported: SUPPORTED_VERSIONS.join(", "),
+            },
+            vec![],
+        )]);
     }
-    let types = rules::TypeIndex::build(&api.modules);
-    let mut module_names = BTreeSet::new();
-    for m in &api.modules {
-        if !module_names.insert(m.name.clone()) {
-            errors.push(ValidationError::DuplicateModuleName(m.name.clone()));
-        }
-        rules::validate_module(m, &types, false, &mut errors);
+    let types = crate::model::index(api);
+    let mut found = Vec::new();
+    rules::check(api, &types, options, &mut found);
+    if !found.is_empty() {
+        // The model's lowering assumes every rule holds, so the symbol
+        // table is only built for an otherwise valid document.
+        return Err(found);
     }
-    rules::check_global_type_names(&api.modules, &mut errors);
-    rules::check_global_error_code_names(&api.modules, &mut errors);
-    if errors.is_empty() {
-        check_symbol_collisions(api, &mut errors);
+    let model = crate::model::build_indexed(api, identity.clone(), types);
+    check_symbol_collisions(&model, &mut found);
+    if found.is_empty() {
+        Ok(model)
+    } else {
+        Err(found)
     }
-    errors
 }
 
-/// Build the binding model (any prefix works: collisions are invariant under
-/// a shared prefix) and reject any C identifier claimed twice.
-fn check_symbol_collisions(api: &Api, errors: &mut Vec<ValidationError>) {
-    let resolved = ResolvedApi::assume_valid(api.clone());
-    let model = crate::model::BindingModel::build(&resolved);
-    let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    let runtime = crate::model::RUNTIME_SYMBOLS.len();
+/// Reject any C identifier the model claims twice, or that falls in a
+/// family the generated C value-buffer helpers reserve.
+fn check_symbol_collisions(model: &Model, found: &mut Vec<Found>) {
+    let prefix = model.prefix();
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
     for (i, (symbol, origin)) in model.c_symbols().into_iter().enumerate() {
-        let family = symbol
-            .strip_prefix(&format!("{}_", model.prefix))
-            .and_then(|rest| {
-                crate::model::RESERVED_SYMBOL_FAMILIES
-                    .iter()
-                    .find(|f| rest.starts_with(*f))
-            });
-        if let (Some(family), true) = (family, i >= runtime) {
-            errors.push(ValidationError::SymbolCollision {
-                symbol: symbol.clone(),
-                first: format!("the C value-buffer helpers ('{}_{family}*')", model.prefix),
-                second: origin.clone(),
-            });
+        let family = symbol.strip_prefix(&format!("{prefix}_")).and_then(|rest| {
+            RESERVED_SYMBOL_FAMILIES
+                .iter()
+                .find(|f| rest.starts_with(*f))
+        });
+        if let (Some(family), true) = (family, i >= RUNTIME_SYMBOLS.len()) {
+            found.push((
+                ValidationError::SymbolCollision {
+                    symbol: symbol.clone(),
+                    first: format!("the C value-buffer helpers ('{prefix}_{family}*')"),
+                    second: origin.clone(),
+                },
+                vec![],
+            ));
         }
         match seen.get(&symbol) {
-            Some(first) => errors.push(ValidationError::SymbolCollision {
-                symbol,
-                first: first.clone(),
-                second: origin,
-            }),
+            Some(first) => found.push((
+                ValidationError::SymbolCollision {
+                    symbol,
+                    first: first.clone(),
+                    second: origin,
+                },
+                vec![],
+            )),
             None => {
                 seen.insert(symbol, origin);
             }

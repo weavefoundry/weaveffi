@@ -8,14 +8,13 @@ migrate to the current release.
 
 ## Three version numbers
 
-- **The crate version** (`0.23.x`) is shared by every published crate
-  (`weaveffi`, `weaveffi-abi`, `weaveffi-macros`, `weaveffi-model`,
-  `weaveffi-gen`, `weaveffi-cli`) and by the CLI. Releases are cut from
-  Conventional Commits by release-plz.
-- **The IDL schema version** (`0.10.0`) is the `version:` an IDL document
+- **The crate version** (`0.24.x`) is shared by every published crate
+  (`weaveffi`, `weaveffi-macros`, `weaveffi-model`, `weaveffi-cli`) and by
+  the CLI. Releases are cut from Conventional Commits by release-plz.
+- **The IDL schema version** (`0.11.0`) is the `version:` an IDL document
   declares. Pre-1.0, only the current version is accepted; a document
   declaring any other is rejected with `UnsupportedSchemaVersion`.
-- **The C ABI revision** (`3`) is what `{prefix}_abi_version()` returns. It
+- **The C ABI revision** (`4`) is what `{prefix}_abi_version()` returns. It
   changes only when the runtime surface or a calling convention changes
   incompatibly, independently of the other two.
 
@@ -52,103 +51,213 @@ the definition that triggers it.
 Pin the CLI version and commit the generated output, so an upgrade is an
 explicit, reviewable change. Then gate CI on `weaveffi diff --check`, which
 regenerates in memory and compares with the committed directory without
-writing anything or running hooks:
+writing anything:
 
 ```yaml
 - name: Bindings are up to date
   run: |
-    cargo install weaveffi-cli --locked --version =0.23.0
+    cargo install weaveffi-cli --locked --version =0.24.0
     weaveffi validate --warn
     weaveffi diff --check
 ```
 
 `diff --check` exits `0` when the output matches, `2` when files would
-change, and `3` when files would be added or removed.
+change, and `3` when files would be added or removed. For a Rust producer,
+both commands build the crate first (see [Library Mode](guides/extract.md)),
+so the job needs the Rust toolchain; pass `--library <path>` to reuse a
+library an earlier step built.
 
-## Migrating to schema 0.10 and ABI 3
+## Migrating to schema 0.11 and ABI 4
 
-This release renames every C symbol after the library and changes how
-strings cross the boundary, so every consumer must be regenerated and every
-hand-written producer or consumer updated. There are no compatibility shims.
+This release makes names global, replaces the per-module checksums with
+contract tables, lets callback interfaces return any value and report typed
+errors, and reads a Rust producer's API from its built library instead of
+its source. Every consumer must be regenerated, and every hand-written
+producer or consumer updated. There are no compatibility shims.
 
 ### IDL
 
-- Set `version: "0.10.0"`.
-- Map keys can't be floats (`f32`, `f64`); key by an integer, `bool`,
-  `string`, or C-style enum.
-- A qualified type reference (`a.b.T`) must spell the declaring module's
-  path exactly, and an unknown type name is always an error.
-- `cancellable: true` on a synchronous callable is an error
-  (`CancellableNotAsync`).
-- Every C identifier is checked across the whole API, including module path
-  flattening (`m.x_y` versus `m.x.y`) and async completion types
-  (`foo_callback`). `SymbolCollision` replaces `AbiSymbolCollision`.
+Names are global: a declaration is identified by its bare name alone, and
+modules only group declarations and namespace C symbols.
+
+- Set `version: "0.11.0"`.
+- Type names (records, enums, interfaces, callback interfaces, and error
+  domains), free-function names, and error-code names must each be unique
+  across the whole API. Two modules can no longer both declare a function
+  `open`; rename one (`DuplicateFunctionName`). A free function also can't
+  share its name with an error domain.
+- Qualified type references are removed: write `Contact`, not
+  `contacts.Contact` (`QualifiedTypeRef`).
+- `usize`, `isize`, `u128`, `i128`, and `char` are reported as
+  `UnsupportedPrimitive`, with a suggested replacement.
+- `DuplicateStructName`, `DuplicateEnumName`, `DuplicateInterfaceName`,
+  `DuplicateCallbackInterfaceName`, and `DuplicateErrorName` are gone:
+  `DuplicateTypeName` and `DuplicateErrorCodeName` report those once.
+- A callback-interface method may return any type except an iterator or a
+  callback interface, and may set `throws: true` when an error domain is in
+  scope for its module.
+- A callback-interface parameter may be optional (`Cb?`), as a top-level
+  parameter of a function or interface member.
 
 ### C ABI
 
-- `{prefix}_abi_version()` returns `3`.
-- Every symbol, type, constant, and macro carries the library's prefix:
-  `weaveffi_error` is `{prefix}_error`, `weaveffi_free_bytes` is
-  `{prefix}_free_bytes`, `WEAVEFFI_API` is `{PREFIX}_API`, and
-  `weaveffi_kv_Store_open` is `{prefix}_kv_Store_open`. The header is
-  `{library}.h` instead of `weaveffi.h`, and no `weaveffi_*` aliases remain.
-- Strings cross as UTF-8 `(ptr, len)` everywhere: parameters, returns,
-  callback arguments, async results, and iterator elements. Returned strings
-  are freed with `{prefix}_free_bytes`; `free_string` is gone.
-- Async launchers are named after the function, without the `_async`
-  suffix.
-- New runtime code `-5` (cancelled). Cancel tokens are reference counted:
-  the launcher takes its own reference, cancelling completes the call with
-  `-5`, and the consumer may destroy its token at any time.
-- Each top-level module exports `{prefix}_{module}_checksum()` and the
-  header defines `{PREFIX}_{MODULE}_CHECKSUM`. Generated consumers check
-  both the revision and every checksum at load time.
-- New runtime symbol `{prefix}_debug_live`, which a hand-written producer
-  may implement as returning `0`.
-
-### Configuration and CLI
-
-- The C prefix and library name come from the library's identity.
-  `[global] c_prefix` and every per-target `prefix`, `c_prefix`, and
-  `input_basename` key are removed. For an IDL, set `[package] c_prefix` or
-  `[package] library`; for a Rust producer they're the crate's library name
-  and can't be set.
-- Generated packages, modules, namespaces, and error types are named from
-  the identity; nothing is named after WeaveFFI. Loaders look for
-  `{library}` and honor `{PREFIX}_LIBRARY` instead of `WEAVEFFI_LIBRARY`.
-- New `[project]` table (`input`, `out`, `targets`), so `weaveffi generate`
-  runs without arguments, and new `weaveffi init`.
-- Cache records moved to `{out}/.weaveffi-cache/{target}.json`; generation
-  rewrites only changed files and deletes files it previously wrote but no
-  longer produces.
-- `weaveffi diff` accepts `--target` and never runs hooks.
-- `weaveffi extract --warn` is now `--lenient`.
-- `weaveffi package` packages for the host platform unless `--platforms` is
-  given (it used to default to every platform).
+- `{prefix}_abi_version()` returns `4`.
+- Contract tables replace checksums. `{prefix}_{module}_checksum()` and
+  `{PREFIX}_{MODULE}_CHECKSUM` are gone; each top-level module exports
+  `const {prefix}_contract_entry* {prefix}_{module}_contract(size_t* out_len)`,
+  one `{id, hash}` entry per declaration, sorted by id. The header defines
+  `{PREFIX}_{MODULE}_CONTRACT`, `{PREFIX}_{MODULE}_CONTRACT_LEN`, and
+  `{prefix}_{module}_contract_check()`, which returns the id of the first
+  entry the library lacks or has with a different hash, or `0`. Adding a
+  declaration no longer breaks deployed bindings. A hand-written producer
+  returns the header's table (see
+  [Producers in other languages](reference/abi.md#producers-in-other-languages)).
+- Every callback vtable starts with a header, `uint32_t size; uint32_t
+  flags; void (*free)(void*);`, then the methods in declaration order (`free`
+  used to come last). Set `size` to `sizeof` the vtable and `flags` to `0`.
+  A producer rejects a vtable smaller than its own with `-3`.
+- Callback methods may return strings, bytes, buffers, and objects. A
+  string, bytes, or buffer return adds trailing `uint8_t** out_ptr, size_t*
+  out_len` slots holding a run the consumer allocates with `{prefix}_alloc`;
+  an object return is one strong reference. The producer adopts both.
+- A callback method declared `throws` may report a positive code of its
+  domain, with the code's fields set by the new
+  `{prefix}_error_set_payload(err, ptr, len)` (which copies). Every other
+  callback failure still reaches the producer as `-4`.
+- An optional callback parameter passes a null vtable for none.
+- `{prefix}_alloc(size_t len)` is exported on every target (it was `wasm32`
+  only) and returns a zero-filled run, or null for `0`. `{prefix}_dealloc` is
+  removed: `{prefix}_free_bytes` frees both returned runs and `alloc` runs,
+  and is a no-op for length `0`.
+- `{prefix}_debug_live(-1)` returns `1` when the producer counts and `0`
+  when it doesn't.
+- An async call the executor can't start completes with `-1` and a message.
+- A value buffer whose map repeats a key, and an iterator `_next` that
+  arrives while the same iterator is being advanced, fail with `-3`.
 
 ### Rust producers
 
-- Symbols start with the crate's library name instead of `weaveffi`; a crate
-  `kvstore` exports `kvstore_kv_Store_open`.
-- The runtime is exported with the `weaveffi::export_runtime!()` proc macro;
-  `weaveffi_abi::export_runtime!` is gone.
-- A `#[weaveffi::error]` enum must implement `Display`, whose output is the
-  runtime error message. Doc comments remain the documented default.
-- A callback-interface method may return `Result<T, weaveffi::ForeignError>`
-  to receive consumer failures as values. A plain-return method's failure
-  is deferred only while a WeaveFFI call is active on the thread.
-- A reference to a C-style enum, interface, or callback interface declared
-  in a different `#[weaveffi::module]` root is a compile error; nest the
-  modules under one root.
-- A cancellable function no longer has to notice cancellation: the runtime
-  drops its future and completes with `-5`.
-- The model and generator crates were consolidated: `weaveffi-ir`,
-  `weaveffi-core`, and `weaveffi-bridge` are now `weaveffi-model`, and the
-  eleven `weaveffi-gen-*` crates are now `weaveffi-gen`. The runtime's
-  Rust error type is `weaveffi_abi::FfiError`, and its string helpers work
-  on `(ptr, len)` runs (`lift_str`, `lower_string`).
+- The crates are consolidated. `weaveffi-abi` is now the `weaveffi::abi`
+  module, and `weaveffi-gen` moved into `weaveffi-cli`, which is a library
+  as well as the `weaveffi` binary. Depend on `weaveffi` alone.
+- Every callback-interface method must return `Result<T,
+  weaveffi::ForeignError>`; a plain `T` is a compile error. `ForeignError`
+  gains a `payload` field and `domain::<E>()`, which decodes a declared
+  domain error. Mark a method `#[weaveffi::throws]` to let its consumer
+  report the domain in scope.
+- The deferred-error API is removed: `ThunkScope`, `defer_foreign_error`,
+  `raise_foreign_error`, and `take_foreign_error` no longer exist, and a
+  callback failure never unwinds or waits for the thunk. To propagate one,
+  return `Result<T, ForeignError>` from the exported function (which then
+  needs an error domain in scope) and use `?`.
+- Accept an optional callback as `Option<Arc<dyn Trait>>`.
+- `weaveffi::abi::decode_value` and `BufferValue::read_value` are `unsafe
+  fn`, because decoding an object token adopts a reference. A reader built
+  with `BufferReader::token_free` refuses tokens instead.
+- C-style enums implement the runtime trait `weaveffi::abi::CEnum`, which
+  replaces the generated `__weaveffi_from_i32` and `__weaveffi_to_i32`
+  inherent methods.
+- The macro validates its module tree with the CLI's validator and reports
+  each error on the offending item. A type from another module tree that
+  isn't a record or rich enum fails with "is not a WeaveFFI record or rich
+  enum".
+- `#[cfg]` on an item applies to its thunks, metadata, and contract entries,
+  and non-generic type aliases in the tree (`pub type Id = u64;`) are
+  substituted. A `#[cfg]` on a member (a field, variant, or method) and an
+  out-of-line submodule (`mod x;`) are compile errors.
+- The default async executor is a fixed pool of worker threads instead of a
+  thread per call. The `weaveffi` crate gains a `tokio` feature that runs
+  futures on the current Tokio runtime, or on one it creates;
+  `weaveffi::set_spawner` still overrides both.
+
+### CLI and configuration
+
+- **Library mode.** The CLI no longer reads Rust source. The macro embeds
+  the API in the library (one exported `{PREFIX}_META_{HASH}` static per
+  declaration, or the `weaveffi_meta` custom section on `wasm32`), and
+  `generate`, `validate`, `diff`, and `extract` build the crate with `cargo
+  build --lib` and read it from there, so generated bindings follow
+  `#[cfg]`. `--library <path>` reads an existing build instead, and
+  `--release` builds in release mode. See [Library Mode](guides/extract.md).
+- **The input is the crate.** Set `[project] input = "."` (instead of
+  `"src/lib.rs"`), and pass a crate directory or its `Cargo.toml` on the
+  command line instead of a `.rs` file.
+- **`weaveffi extract`** prints the IDL a built library embeds (`--library`,
+  or the project's crate) instead of parsing a source file. Its `--lenient`
+  flag is gone: what it prints always validates.
+- **`generate --force` is gone,** along with the input-hash freshness check
+  it bypassed. Every run renders every selected target and rewrites only the
+  files whose contents changed.
+- **`[global]` is gone,** with its `pre_generate` and `post_generate` hooks
+  and every `strip_module_prefix` key (per target, too). Run formatters as a
+  separate step. Targets that flatten module functions into one namespace use
+  the bare function name, which global names keep collision-free.
+- **One `name` key per target.** `[generators.cpp] namespace`,
+  `swift.module_name`, `kotlin.package`, `node.package_name`,
+  `wasm.package_name`, `python.package_name`, `dotnet.namespace`,
+  `dart.package_name`, `go.module_path`, and `ruby.gem_name` all become
+  `name`. Ruby's `module_name` and Python's `import_name` stay.
+- `[project] out` defaults to `bindings` instead of `generated`, and
+  generated files' headers no longer name the input file.
+- `weaveffi dev` is new: it builds the debug library, generates, copies the
+  library into the generated Python, Node.js, and Ruby packages, and prints
+  how to point the other targets at it.
+- `weaveffi build` is new, and `weaveffi package` writes installable
+  artifacts (wheels, npm tarballs, gems, an `XCFramework` SwiftPM package, a
+  `.nupkg`) instead of source trees. `package --build <crate>` is gone:
+  `package` builds the project's producer itself, or reads
+  `--binaries <dir>`. The dist directory is `-o`, else `[package] dist`,
+  else `dist`. See [Packaging](guides/packaging.md).
+- The `weaveffi-cli` library exposes `project::Project`, which locates a
+  project and generates it, for use from a `build.rs` (with an IDL input or
+  a previously built library).
+
+### Generated bindings
+
+Regenerate every target. Beyond the ABI changes, a few generated APIs
+changed shape:
+
+- Every callback-interface method in every language may now return a value
+  and, when it's declared `throws`, raise the module's domain error.
+- Kotlin maps `u8`, `u16`, `u32`, and `u64` to `UByte`, `UShort`, `UInt`,
+  and `ULong` instead of the signed types.
+- Python ships one fully annotated module plus `py.typed`; the separate
+  `.pyi` stub is gone.
+- The Node.js package loads a prebuilt addon when one matches the platform
+  and compiles it only as a fallback.
+- Load failures name the declaration that's missing or changed, instead of
+  reporting a checksum mismatch.
 
 ### Samples
 
-The `inventory` and `shapes` samples were removed; `contacts` covers nested
-and sibling modules, and the `shapes` test fixture covers rich enums.
+The six samples are now three: `calculator` (minimal), `codec` (the
+value-buffer oracle, rebuilt around shared test vectors), and `kvstore`
+(every feature). `contacts`, `events`, and `async-demo` were folded into
+`kvstore` and removed, and every language's conformance consumers follow
+suit: three lanes per language. See [Samples](samples.md).
+
+## Migrating to schema 0.10 and ABI 3
+
+WeaveFFI 0.24.0 shipped schema 0.10 and ABI revision 3. Coming from an
+older release, apply these changes first, then the ones above:
+
+- Every symbol, type, constant, and macro carries the library's prefix
+  (`{prefix}_error`, `{prefix}_free_bytes`, `{PREFIX}_API`,
+  `{prefix}_kv_Store_open`), the header is `{library}.h`, and generated
+  packages and loaders are named after the library's identity, never after
+  WeaveFFI. `[global] c_prefix` and every per-target prefix key are gone; an
+  IDL sets `[package] c_prefix` or `library`, and a Rust producer's prefix is
+  its crate's library name.
+- Strings cross as UTF-8 `(ptr, len)` runs everywhere, and returned strings
+  are freed with `{prefix}_free_bytes`.
+- Async launchers drop the `_async` suffix, cancel tokens are reference
+  counted, and runtime code `-5` means cancelled.
+- Map keys can't be floats, and `cancellable: true` on a synchronous
+  callable is an error.
+- The runtime is exported with `weaveffi::export_runtime!()`, and a
+  `#[weaveffi::error]` enum must implement `Display`.
+- The `[project]` table and `weaveffi init` are new, and generation rewrites
+  only changed files and deletes stale ones.
+
+The [changelog](https://github.com/weavefoundry/weaveffi/blob/main/CHANGELOG.md)
+lists every release.

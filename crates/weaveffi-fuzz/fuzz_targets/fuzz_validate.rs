@@ -6,7 +6,9 @@ use libfuzzer_sys::fuzz_target;
 #[cfg(fuzzing)]
 use weaveffi_model::parse::parse_api_str;
 #[cfg(fuzzing)]
-use weaveffi_model::validate::validate_api;
+use weaveffi_model::pkg::Identity;
+#[cfg(fuzzing)]
+use weaveffi_model::validate::validate;
 
 #[cfg(fuzzing)]
 fuzz_target!(|data: &[u8]| {
@@ -16,7 +18,7 @@ fuzz_target!(|data: &[u8]| {
     let Ok(api) = parse_api_str(s, "yaml") else {
         return;
     };
-    let _ = validate_api(api, None);
+    let _ = validate(&api, &Identity::default(), None);
 });
 
 #[cfg(not(fuzzing))]

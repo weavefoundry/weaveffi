@@ -1,29 +1,90 @@
-// Conformance consumer: codec sample (node and wasm lanes).
+// Conformance consumer: codec sample, the wire oracle (node and wasm lanes).
 //
-// The value-buffer codec against the producer's oracle in both directions:
-// `sample*` fixtures decoded field by field, `verify*` accepting them back,
-// and `roundtrip*` returning consumer-built edge cases (empty and unicode
-// strings, strings with an interior NUL, 64-bit extremes, NaN, the
-// infinities and -0, every Shape variant), the typed MismatchError, range
-// and type checks, and objects inside buffers through `Holder`.
+// The shared-vector loop: for every vector the producer serves, decode it,
+// hand it back to `checkVector` (which re-encodes it), and push each
+// primitive vector's value through the matching direct-family `echo*`. Then
+// vectors built from literals (so a symmetric encode/decode bug can't hide),
+// spot checks of decoded fields (64-bit integers exact as bigints, float
+// bits, astral text), the typed out-of-range error and its payload, the
+// marshalling failures the API can express, and object identity and
+// reference counting through buffers. Ends with every leak counter at zero.
 
 import { expect, finish, load, same, throws } from './harness.mjs';
 
 const api = await load('codec');
 const { codec, CodecError } = api;
-const { Color } = codec;
+const { Color, Token } = codec;
 
-const bytes = (...xs) => new Uint8Array(xs);
+const I64_MIN = -(2n ** 63n);
+const I64_MAX = 2n ** 63n - 1n;
+const U64_MAX = 2n ** 64n - 1n;
 
-function mismatch(fn, msg) {
-  throws(
-    fn,
-    (e) => e instanceof codec.MismatchError && e instanceof codec.CodecError && e instanceof CodecError && e.code === 1,
-    msg,
-  );
+expect(api.__debugLive(-1) === 1n, 'the sample counts live resources');
+
+const n = codec.vectorCount();
+expect(n >= 60, `at least 60 vectors (got ${n})`);
+const names = Array.from({ length: n }, (_, i) => codec.vectorName(i));
+
+/** The index of the vector named `name`. */
+function find(name) {
+  const i = names.indexOf(name);
+  if (i < 0) throw new Error(`no vector named ${name}`);
+  return i;
 }
 
-const canonicalScalars = {
+/** Close every object wrapper inside a decoded value. */
+function release(v) {
+  if (v instanceof Token) {
+    v.close();
+  } else if (Array.isArray(v)) {
+    v.forEach(release);
+  } else if (v !== null && typeof v === 'object' && !(v instanceof Uint8Array)) {
+    Object.values(v).forEach(release);
+  }
+}
+
+const f32Bits = (x) => {
+  const view = new DataView(new ArrayBuffer(4));
+  view.setFloat32(0, x, true);
+  return view.getUint32(0, true);
+};
+
+// The direct-family echo of each primitive vector, and how to compare.
+const echoes = {
+  I8: codec.echoI8,
+  U8: codec.echoU8,
+  I16: codec.echoI16,
+  U16: codec.echoU16,
+  I32: codec.echoI32,
+  U32: codec.echoU32,
+  I64: codec.echoI64,
+  U64: codec.echoU64,
+  F32: codec.echoF32,
+  F64: codec.echoF64,
+  Flag: codec.echoBool,
+  Text: codec.echoText,
+  Blob: codec.echoBlob,
+  Hue: codec.echoColor,
+};
+
+// 1. The loop.
+for (let i = 0; i < n; i++) {
+  const v = codec.vector(i);
+  if (!codec.checkVector(i, v)) {
+    expect(false, `vector ${i} (${names[i]}) did not round-trip; producer saw ${codec.describeVector(v)}`);
+  }
+  expect(!codec.checkVector((i + 1) % n, v), `vector ${i} (${names[i]}) never matches its neighbor`);
+  const echo = echoes[v.tag];
+  if (echo !== undefined) {
+    // Object.is: NaN is NaN, and the sign of zero counts.
+    same(echo(v.value), v.value, `echo of vector ${i} (${names[i]})`);
+    if (v.tag === 'F32') expect(f32Bits(echo(v.value)) === f32Bits(v.value), `f32 bits of ${names[i]}`);
+  }
+  release(v);
+}
+
+// 2. Literal vectors.
+const canonical = {
   i8_value: -8,
   u8_value: 200,
   i16_value: -16000,
@@ -31,197 +92,153 @@ const canonicalScalars = {
   i32_value: -2000000000,
   u32_value: 4000000000,
   i64_value: -9007199254740993n,
-  u64_value: 18446744073709551615n,
+  u64_value: U64_MAX,
   f32_value: 1.5,
   f64_value: -2.25e100,
   flag: true,
   color: Color.Blue,
 };
-const extremes = {
-  i8_value: -128,
-  u8_value: 255,
-  i16_value: -32768,
-  u16_value: 65535,
-  i32_value: -2147483648,
-  u32_value: 4294967295,
-  i64_value: -9223372036854775808n,
-  u64_value: 0n,
-  f32_value: -0,
-  f64_value: NaN,
-  flag: false,
-  color: Color.Red,
-};
-const maxes = {
-  ...extremes,
-  i8_value: 127,
-  i16_value: 32767,
-  i32_value: 2147483647,
-  i64_value: 9223372036854775807n,
-  u64_value: 18446744073709551615n,
-  f32_value: Infinity,
-  f64_value: -Infinity,
-  color: Color.Green,
-};
+expect(codec.checkVector(find('scalars canonical'), { tag: 'AllScalars', value: canonical }), 'scalars canonical');
+expect(
+  !codec.checkVector(find('scalars canonical'), { tag: 'AllScalars', value: { ...canonical, u16_value: 60001 } }),
+  'scalars canonical with one field changed',
+);
+expect(
+  codec.checkVector(find('shape labeled'), { tag: 'Figure', value: { tag: 'Labeled', label: 'tag', count: 3 } }),
+  'shape labeled',
+);
+expect(codec.checkVector(find('string interior nul'), { tag: 'Text', value: 'nul\0inside\0' }), 'string interior nul');
+const nanView = new DataView(new ArrayBuffer(8));
+nanView.setBigUint64(0, 0x7ff8000000000001n, true);
+expect(codec.checkVector(find('f64 nan'), { tag: 'F64', value: nanView.getFloat64(0, true) }), 'any NaN is the NaN vector');
+expect(codec.checkVector(find('f64 -0'), { tag: 'F64', value: -0 }), 'negative zero');
+expect(!codec.checkVector(find('f64 -0'), { tag: 'F64', value: 0 }), 'positive zero is not negative zero');
+expect(codec.checkVector(find('u64 max'), { tag: 'U64', value: U64_MAX }), 'u64 max');
+expect(codec.checkVector(find('enum infrared'), { tag: 'Hue', value: Color.Infrared }), 'enum infrared');
+expect(Color.Infrared === -1 && Color[-1] === 'Infrared', 'a negative enum value maps both ways');
+expect(codec.checkVector(find('optional zero'), { tag: 'MaybeI64', value: 0n }), 'optional zero');
+expect(codec.checkVector(find('optional absent'), { tag: 'MaybeI64', value: null }), 'optional absent');
+expect(!codec.checkVector(find('optional zero'), { tag: 'MaybeI64', value: null }), 'absent is not zero');
+expect(
+  codec.checkVector(find('map of strings'), { tag: 'Counts', value: { x: 0n, 'héllo': -1n, '': I64_MAX } }),
+  'a map built in another order',
+);
+expect(
+  codec.checkVector(
+    find('map of strings'),
+    { tag: 'Counts', value: new Map([['héllo', -1n], ['', I64_MAX], ['x', 0n]]) },
+  ),
+  'a Map is a map too',
+);
+expect(codec.checkVector(find('blank'), { tag: 'Blank' }), 'blank');
+const lone = new Token(-1n);
+expect(
+  codec.checkVector(find('objects sparse'), { tag: 'Objects', value: { primary: lone, spare: null, many: [], by_name: {} } }),
+  'objects sparse from a consumer-made token',
+);
+lone.close();
 
-function scalars() {
-  expect(Color.Red === 0 && Color.Blue === 7 && Color[7] === 'Blue', 'Color values');
-  const s = codec.sampleScalars();
-  same(s, canonicalScalars, 'sampleScalars');
-  expect(codec.verifyScalars(s) && codec.verifyScalars(canonicalScalars), 'verifyScalars');
-  same(codec.roundtripScalars(canonicalScalars), canonicalScalars, 'roundtripScalars');
-  mismatch(() => codec.verifyScalars({ ...canonicalScalars, u64_value: 18446744073709551614n }), 'u64 off by one');
-  mismatch(() => codec.verifyScalars({ ...canonicalScalars, flag: false }), 'flag flipped');
-  const back = codec.roundtripScalars(extremes);
-  same(back, extremes, 'extreme scalars');
-  expect(Object.is(back.f32_value, -0) && Number.isNaN(back.f64_value), '-0 and NaN survive');
-  same(codec.roundtripScalars(maxes), maxes, 'max scalars');
-  same(
-    codec.roundtripScalars({ ...extremes, i64_value: 42, u64_value: 7 }),
-    { ...extremes, i64_value: 42n, u64_value: 7n },
-    'integral numbers widen to bigint',
-  );
-  throws(() => codec.roundtripScalars({ ...extremes, u64_value: -1n }), (e) => e instanceof RangeError, 'an out-of-range bigint field');
-  throws(() => codec.roundtripScalars({ ...extremes, i32_value: '1' }), (e) => e instanceof TypeError, 'a string for a number field');
-  throws(() => codec.roundtripScalars({ ...extremes, flag: 1 }), (e) => e instanceof TypeError, 'a number for a bool field');
+// 3. Spot checks on decoded values.
+same(codec.vector(find('i64 past 2^53')), { tag: 'I64', value: -9007199254740993n }, 'i64 past 2^53 is exact');
+const subnormal = codec.vector(find('f32 min subnormal'));
+expect(subnormal.tag === 'F32' && f32Bits(subnormal.value) === 1, 'f32 min subnormal bits');
+same(codec.vector(find('string astral')), { tag: 'Text', value: '🦀 crab 😀' }, 'string astral');
+const minimum = codec.vector(find('scalars minimum')).value;
+expect(
+  minimum.i8_value === -128 &&
+    minimum.i16_value === -32768 &&
+    minimum.i32_value === -2147483648 &&
+    minimum.i64_value === I64_MIN &&
+    minimum.u64_value === 0n,
+  'scalars minimum integers',
+);
+expect(minimum.f32_value === -Infinity && Number.isNaN(minimum.f64_value), 'scalars minimum floats');
+expect(minimum.color === Color.Infrared && minimum.flag === false, 'scalars minimum enum and flag');
+const deep = codec.vector(find('composite canonical'));
+expect(deep.tag === 'Deep', 'composite canonical is Deep');
+const c = deep.value;
+expect(c.name === 'héllo wörld ✓', 'composite name');
+expect(c.blob instanceof Uint8Array && c.blob.length === 6 && c.blob[5] === 255, 'composite blob');
+expect(c.some_i64 === I64_MIN && c.none_i64 === null && c.some_text === '', 'composite optionals');
+expect(c.names.length === 3 && c.names[1] === '', 'composite names');
+expect(c.matrix.length === 3 && c.matrix[1].length === 0 && c.matrix[2][0] === -4, 'composite matrix');
+expect(
+  c.floats.length === 6 && Number.isNaN(c.floats[0]) && (Object.is(c.floats[3], -0) || c.floats[3] < 0),
+  'composite floats',
+);
+expect(
+  Object.keys(c.by_name).length === 4 &&
+    Object.keys(c.by_id).length === 3 &&
+    Object.keys(c.by_color).length === 2 &&
+    Object.keys(c.flags).length === 2,
+  'composite maps',
+);
+expect(c.scalars.u32_value === 4000000000, 'composite scalars');
+expect(c.shape.tag === 'Labeled' && c.shape.count === 3, 'composite shape');
+expect(c.shapes.length === 6 && c.shapes[5].tag === 'Nested' && c.shapes[5].note === null, 'composite shapes');
+expect(c.maybe_shape !== null && c.maybe_shape.tag === 'Nested', 'composite maybe_shape');
+expect(c.maybe_list instanceof Uint8Array && c.maybe_list.length === 2, 'composite maybe_list');
+expect(c.sparse.length === 3 && c.sparse[0] === true && c.sparse[1] === null, 'composite sparse');
+expect(c.colors.length === 4 && c.colors[3] === Color.Infrared, 'composite colors');
 
-  for (const v of [0n, -1n, 9007199254740993n, 9223372036854775807n, -9223372036854775808n]) {
-    expect(codec.roundtripI64(v) === v, `roundtripI64(${v})`);
-  }
-  expect(codec.roundtripI64(5) === 5n, 'roundtripI64 accepts an integral number');
-  for (const v of [0n, 9223372036854775808n, 18446744073709551615n]) {
-    expect(codec.roundtripU64(v) === v, `roundtripU64(${v})`);
-  }
-  for (const bad of [9223372036854775808n, -9223372036854775809n]) {
-    throws(() => codec.roundtripI64(bad), (e) => e instanceof RangeError, `roundtripI64(${bad})`);
-  }
-  throws(() => codec.roundtripU64(-1n), (e) => e instanceof RangeError, 'roundtripU64(-1n)');
-  throws(() => codec.roundtripI64(1.5), (e) => e instanceof TypeError, 'a fraction for an i64');
-  for (const v of [0, -0, 1.5, 5e-324, Number.MAX_VALUE, Infinity, -Infinity]) {
-    expect(Object.is(codec.roundtripF64(v), v), `roundtripF64(${v})`);
-  }
-  expect(Number.isNaN(codec.roundtripF64(NaN)), 'roundtripF64(NaN)');
-  expect(codec.roundtripBool(true) === true && codec.roundtripBool(false) === false, 'roundtripBool');
-  throws(() => codec.roundtripBool(1), (e) => e instanceof TypeError, 'a number for a bool');
-  expect(codec.roundtripColor(Color.Blue) === 7, 'roundtripColor');
-}
+// 4. The typed error with its payload.
+throws(
+  () => codec.vector(n),
+  (e) =>
+    e instanceof codec.OutOfRangeError &&
+    e instanceof codec.CodecError &&
+    e instanceof CodecError &&
+    e.code === 1 &&
+    e.index === n &&
+    e.count === n &&
+    e.message === `vector ${n} is out of range (count ${n})`,
+  'vector past the end',
+);
+throws(
+  () => codec.vectorName(n + 5),
+  (e) => e instanceof codec.OutOfRangeError && e.index === n + 5 && e.count === n,
+  'vectorName past the end',
+);
+expect(!codec.checkVector(n, { tag: 'Blank' }), 'checkVector past the end is false');
 
-function strings() {
-  for (const s of ['', 'ascii', 'héllo wörld ✓', '日本語', 'emoji 🎉 pair', 'nul\0inside\0', '\0', 'a'.repeat(70000)]) {
-    expect(codec.roundtripString(s) === s, `roundtripString(${JSON.stringify(s.slice(0, 20))})`);
-  }
-  throws(() => codec.roundtripString(5), (e) => e instanceof TypeError, 'a number for a string');
-  const all = new Uint8Array(256).map((_, i) => i);
-  same(codec.roundtripBytes(all), all, 'roundtripBytes(0..255)');
-  const empty = codec.roundtripBytes(new Uint8Array(0));
-  expect(empty instanceof Uint8Array && empty.length === 0, 'empty bytes');
-  same(codec.roundtripBytes(all.subarray(10, 20)), all.slice(10, 20), 'a Uint8Array view');
-  throws(() => codec.roundtripBytes([1, 2]), (e) => e instanceof TypeError, 'an array for bytes');
-  expect(codec.roundtripOptI64(null) === null && codec.roundtripOptI64(undefined) === null, 'absent optional');
-  expect(codec.roundtripOptI64(0n) === 0n, 'present zero');
-  same(codec.roundtripMap({}), {}, 'empty map');
-  same(codec.roundtripMap({ a: 1n, '': -2n, 'ключ': 9223372036854775807n }), { a: 1n, '': -2n, 'ключ': 9223372036854775807n }, 'odd keys');
-  same(codec.roundtripMap(new Map([['k', 3n]])), { k: 3n }, 'a Map argument');
-}
+// 5. Malformed input: an undeclared enum value reaches the producer (and
+// fails the non-throwing call as a marshalling trap); the encoder refuses
+// what the wire format can't carry.
+throws(
+  () => codec.echoColor(3),
+  (e) => e instanceof CodecError && !(e instanceof codec.CodecError) && e.code === -3,
+  'an undeclared enum value',
+);
+throws(() => codec.checkVector(0, { tag: 'Flag', value: 2 }), (e) => e instanceof TypeError, 'a non-boolean bool');
+throws(() => codec.checkVector(0, { tag: 'Nope' }), (e) => e instanceof TypeError, 'an unknown tag');
+throws(() => codec.checkVector(0, { tag: 'I64', value: 2n ** 64n }), (e) => e instanceof RangeError, 'an i64 out of range');
+throws(() => codec.echoText(null), (e) => e instanceof TypeError, 'a null string');
 
-function shapes() {
-  const cases = [
-    { tag: 'Empty' },
-    { tag: 'Circle', radius: 2.5 },
-    { tag: 'Circle', radius: -0 },
-    { tag: 'Rect', width: 1, height: 0.5 },
-    { tag: 'Labeled', label: 'tag', count: 3 },
-    { tag: 'Labeled', label: '', count: -2147483648 },
-    { tag: 'Nested', inner: canonicalScalars, note: 'n' },
-    { tag: 'Nested', inner: extremes, note: null },
-  ];
-  for (const s of cases) same(codec.roundtripShape(s), s, `roundtripShape(${s.tag})`);
-  same(codec.roundtripShapes(cases), cases, 'roundtripShapes');
-  expect(codec.describeShape({ tag: 'Circle', radius: 2.5 }) === 'Circle { radius: 2.5 }', 'describeShape');
-  throws(() => codec.roundtripShape({ tag: 'Hexagon' }), (e) => e instanceof TypeError, 'an unknown tag');
-}
+// 6. Objects.
+const full = codec.vector(find('objects full'));
+expect(full.tag === 'Objects', 'objects full is Objects');
+const h = full.value;
+expect(h.primary instanceof Token && h.primary.value() === 10n, 'primary token');
+expect(h.spare !== null && h.spare.value() === 11n, 'spare token');
+expect(h.many.length === 3 && h.many[2].value() === I64_MIN, 'many tokens');
+expect(Object.keys(h.by_name).length === 2 && h.by_name.b.value() === 21n, 'tokens by name');
+// Each encoding mints fresh references, so the holder can be sent twice.
+const expected = BigInt.asIntN(64, 10n + 11n + 12n + 13n + 20n + 21n + I64_MIN);
+expect(codec.sumHolder(h) === expected && codec.sumHolder(h) === expected, 'sumHolder twice');
+// primaryOf returns the very same object (a new wrapper of it).
+const p = codec.primaryOf(h);
+const holder = (primary) => ({ primary, spare: null, many: [], by_name: {} });
+expect(codec.samePrimary(h, holder(p)), 'primaryOf is the same object');
+const twin = new Token(10n);
+expect(!codec.samePrimary(h, holder(twin)), 'an equal value is not the same object');
+// A holder of consumer-made tokens, one wrapper in every slot.
+const minus4 = new Token(-4n);
+expect(
+  codec.sumHolder({ primary: twin, spare: twin, many: [twin, twin, minus4], by_name: { k: twin } }) === 46n,
+  'a holder of consumer tokens',
+);
+for (const t of [p, twin, minus4]) t.close();
+release(full);
+throws(() => p.value(), (e) => e instanceof CodecError && e.code === -3, 'a closed token');
 
-function composites() {
-  const canonical = {
-    name: 'héllo wörld ✓',
-    blob: bytes(0, 1, 2, 253, 254, 255),
-    some_i64: -9223372036854775808n,
-    none_i64: null,
-    some_text: '',
-    names: ['a', '', 'ccc'],
-    matrix: [[1, 2, 3], [], [-4]],
-    empty: [],
-    by_name: { one: 1n, two: 2n, neg: -3n },
-    by_id: { '-1': canonicalScalars, 42: { ...canonicalScalars, flag: false } },
-    scalars: canonicalScalars,
-    shape: { tag: 'Labeled', label: 'tag', count: 3 },
-    shapes: [
-      { tag: 'Empty' },
-      { tag: 'Circle', radius: 2.5 },
-      { tag: 'Rect', width: 1, height: 0.5 },
-      { tag: 'Labeled', label: '', count: -1 },
-      { tag: 'Nested', inner: canonicalScalars, note: 'n' },
-    ],
-    maybe_shape: { tag: 'Nested', inner: canonicalScalars, note: null },
-    maybe_list: bytes(9, 8),
-    sparse: [true, null, false],
-    colors: [Color.Red, Color.Green, Color.Blue],
-  };
-  const c = codec.sampleComposite();
-  same(c, canonical, 'sampleComposite');
-  expect(codec.verifyComposite(c) && codec.verifyComposite(canonical), 'verifyComposite');
-  same(codec.roundtripComposite(c), canonical, 'roundtripComposite');
-  expect(codec.describeComposite(c).startsWith('Composite {'), 'describeComposite');
-  mismatch(() => codec.verifyComposite({ ...canonical, sparse: [true, true, false] }), 'sparse changed');
-  mismatch(() => codec.verifyComposite({ ...canonical, by_name: { one: 1n, two: 2n } }), 'map entry missing');
-  const edge = {
-    name: '',
-    blob: new Uint8Array(0),
-    some_i64: 9223372036854775807n,
-    none_i64: -1n,
-    some_text: null,
-    names: [],
-    matrix: [[], [-2147483648, 2147483647]],
-    empty: [NaN, -0, Infinity, -Infinity, 5e-324],
-    by_name: {},
-    by_id: { '-2147483648': extremes, 0: maxes },
-    scalars: extremes,
-    shape: { tag: 'Empty' },
-    shapes: [],
-    maybe_shape: null,
-    maybe_list: null,
-    sparse: [null, null],
-    colors: [],
-  };
-  same(codec.roundtripComposite(edge), edge, 'edge composite');
-  const big = { ...edge, names: Array.from({ length: 1000 }, (_, i) => 'name-' + i), blob: new Uint8Array(70000).fill(7) };
-  same(codec.roundtripComposite(big), big, 'a large composite');
-}
-
-function holders() {
-  const holder = codec.makeHolder(10n, true);
-  expect(holder.primary instanceof codec.Token && holder.primary.value() === 10n, 'an object field');
-  expect(holder.spare.value() === 11n && holder.many.length === 3, 'optional and list object fields');
-  expect(codec.sumHolder(holder) === 60n && codec.sumHolder(holder) === 60n, 'encoding clones each object');
-  const primary = codec.primaryOf(holder);
-  expect(primary !== holder.primary && primary.value() === 10n, 'a new wrapper over the same object');
-  expect(codec.samePrimary(holder, { primary, spare: null, many: [] }), 'samePrimary');
-  const other = codec.makeHolder(10n, false);
-  expect(!codec.samePrimary(holder, other) && other.spare === null, 'distinct objects');
-  const t1 = new codec.Token(100n);
-  const t2 = new codec.Token(-9223372036854775808n);
-  expect(codec.sumHolder({ primary: t1, spare: t2, many: [t1, t1] }) === 300n - 9223372036854775808n, 'consumer-built objects');
-  for (const t of [holder.primary, holder.spare, ...holder.many, primary, other.primary, ...other.many, t1, t2]) {
-    t.close();
-  }
-  throws(() => holder.primary.value(), (e) => e instanceof CodecError && e.code === -3, 'use after close');
-  throws(() => codec.sumHolder(holder), (e) => e instanceof CodecError && e.code === -3, 'a closed object in a buffer');
-  // A holder dropped without closing its objects is released by the GC.
-  codec.makeHolder(1n, true);
-}
-
-scalars();
-strings();
-shapes();
-composites();
-holders();
-await finish(api, 'codec');
+await finish(api, `codec (${n} vectors)`);

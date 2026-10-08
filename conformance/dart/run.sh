@@ -5,6 +5,7 @@
 # consumer against one sample and must exit 0.
 set -uo pipefail
 . "$(dirname "$0")/../lib.sh"
+require_tools dart dart
 
 # Run one consumer as its own small app that depends on the generated
 # package through a `path:` dependency, exactly as a user would. The library
@@ -21,8 +22,9 @@ dart_consumer() {
 name: ${pkg}_conformance
 publish_to: none
 environment:
-  sdk: '>=3.12.0 <4.0.0'
+  sdk: '>=3.10.0 <4.0.0'
 dependencies:
+  ffi: ^2.1.0
   $pkg:
     path: $pkgdir
 EOF
@@ -34,17 +36,11 @@ EOF
 }
 
 dart_calculator() { dart_consumer calculator calculator.dart; }
-dart_contacts()   { dart_consumer contacts contacts.dart; }
-dart_events()     { dart_consumer events events.dart; }
-dart_kvstore()    { dart_consumer kvstore kvstore.dart; }
-dart_async_demo() { dart_consumer async-demo async_demo.dart; }
-dart_codec()      { dart_consumer codec codec.dart; }
+dart_codec() { dart_consumer codec codec.dart; }
+dart_kvstore() { dart_consumer kvstore kvstore.dart; }
 
 lane dart-calculator dart_calculator
-lane dart-contacts dart_contacts
-lane dart-events dart_events
-lane dart-kvstore dart_kvstore
-lane dart-async-demo dart_async_demo
 lane dart-codec dart_codec
+lane dart-kvstore dart_kvstore
 
 finish_lanes

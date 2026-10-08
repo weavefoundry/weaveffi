@@ -16,7 +16,10 @@ use std::time::Duration;
 
 use weaveffi::abi::{self, FfiError};
 
-const WAIT: Duration = Duration::from_secs(5);
+/// How long a test waits for an async completion. Generous, so a loaded
+/// machine can't turn a slow completion into a failure; a passing run never
+/// waits this long.
+const WAIT: Duration = Duration::from_secs(30);
 
 #[weaveffi::module]
 pub mod demo {
@@ -190,35 +193,151 @@ pub mod dispatch {
     }
 }
 
-/// Stands in for a `panic = "abort"` build, where a consumer callback failure
-/// can't unwind: the producer records it with `defer_foreign_error` and keeps
-/// running, and the thunk must report the recorded failure in place of the
-/// producer's result.
+/// Callback interfaces at full width: returns of every family adopted from
+/// the consumer, a `throws` method decoded into the domain's typed error,
+/// optional callback parameters, a type alias, and `#[cfg]`'d items.
 #[weaveffi::module]
-pub mod deferred {
-    /// Record a foreign failure, then return normally with a value the
-    /// caller must never see.
-    #[weaveffi::export]
-    pub fn sync_then_fail(fail: bool) -> i32 {
-        if fail {
-            weaveffi::abi::defer_foreign_error(weaveffi::ForeignError {
-                code: weaveffi::abi::FOREIGN_ERROR_CODE,
-                message: "consumer said no".to_string(),
-            });
-        }
-        77
+pub mod rich {
+    use std::sync::Arc;
+
+    use weaveffi::ForeignError;
+
+    /// The lookup error domain; `Missing` carries the key.
+    #[weaveffi::error]
+    #[derive(Debug, PartialEq)]
+    #[repr(i32)]
+    pub enum LookupError {
+        /// no such key
+        Missing {
+            /// The key that wasn't found.
+            key: String,
+        } = 1,
+        /// the source is busy
+        Busy = 2,
     }
 
-    /// The async twin of `sync_then_fail`.
-    #[weaveffi::export]
-    pub async fn later_then_fail(fail: bool) -> i32 {
-        if fail {
-            weaveffi::abi::defer_foreign_error(weaveffi::ForeignError {
-                code: weaveffi::abi::FOREIGN_ERROR_CODE,
-                message: "consumer said no, later".to_string(),
-            });
+    impl std::fmt::Display for LookupError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Missing { key } => write!(f, "missing {key}"),
+                Self::Busy => f.write_str("busy"),
+            }
         }
-        88
+    }
+
+    /// A key, spelled through an alias the macro substitutes.
+    pub type Key = String;
+
+    /// A record a callback returns.
+    #[weaveffi::record]
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct Card {
+        /// The card's name.
+        pub name: String,
+        /// Its tags.
+        pub tags: Vec<String>,
+    }
+
+    /// An object a callback returns.
+    #[weaveffi::interface]
+    pub struct Token {
+        n: i64,
+    }
+
+    impl Token {
+        /// Create a token.
+        pub fn new(n: i64) -> Self {
+            Self { n }
+        }
+        /// Read the number.
+        pub fn n(&self) -> i64 {
+            self.n
+        }
+    }
+
+    // Compiled out: neither the member thunk nor its contract entry exist.
+    #[cfg(not(test))]
+    impl Token {
+        /// Never exported.
+        pub fn hidden(&self) -> i64 {
+            0
+        }
+    }
+
+    /// A consumer-implemented source of values of every family.
+    #[weaveffi::callback_interface]
+    pub trait Source: Send + Sync {
+        /// A string, returned as a consumer-allocated run.
+        fn name(&self) -> Result<String, ForeignError>;
+        /// Bytes, returned as a consumer-allocated run.
+        fn blob(&self) -> Result<Vec<u8>, ForeignError>;
+        /// A record, returned as a consumer-allocated value buffer.
+        fn card(&self, key: &str) -> Result<Card, ForeignError>;
+        /// An object, returned as one strong reference.
+        fn token(&self) -> Result<Arc<Token>, ForeignError>;
+        /// An optional object.
+        fn maybe_token(&self) -> Result<Option<Arc<Token>>, ForeignError>;
+        /// Look up a key, failing with a `LookupError`.
+        #[weaveffi::throws]
+        fn lookup(&self, key: &str) -> Result<i64, ForeignError>;
+    }
+
+    /// Call every value-returning method and describe the results.
+    #[weaveffi::export]
+    pub fn describe(source: Arc<dyn Source>) -> Result<String, ForeignError> {
+        let card = source.card("k")?;
+        let token = source.token()?;
+        Ok(format!(
+            "{} {:?} {}:{:?} {} {}",
+            source.name()?,
+            source.blob()?,
+            card.name,
+            card.tags,
+            token.n(),
+            source.maybe_token()?.is_some()
+        ))
+    }
+
+    /// Look up `key` and describe the typed outcome.
+    #[weaveffi::export]
+    pub fn lookup_via(source: Arc<dyn Source>, key: Key) -> String {
+        match source.lookup(&key) {
+            Ok(v) => format!("ok {v}"),
+            Err(e) => match e.domain::<LookupError>() {
+                Some(LookupError::Missing { key }) => format!("missing {key}"),
+                Some(LookupError::Busy) => "busy".to_string(),
+                None => format!("foreign {}: {}", e.code, e.message),
+            },
+        }
+    }
+
+    /// Whether a source was passed (an optional callback parameter).
+    #[weaveffi::export]
+    pub fn has_source(source: Option<Arc<dyn Source>>, label: &str) -> String {
+        format!("{label}:{}", source.is_some())
+    }
+
+    /// Present in every build of this test.
+    #[cfg(test)]
+    #[weaveffi::export]
+    pub fn always() -> i32 {
+        1
+    }
+
+    /// Present in no build: no thunk, no contract entry.
+    #[cfg(not(test))]
+    #[weaveffi::export]
+    pub fn never() -> i32 {
+        0
+    }
+
+    /// A submodule present in no build.
+    #[cfg(not(test))]
+    #[weaveffi::module]
+    pub mod gone {
+        /// Never exported.
+        #[weaveffi::export]
+        pub fn vanished() {}
     }
 }
 
@@ -303,11 +422,52 @@ pub mod stream {
     pub fn squares(count: i32) -> weaveffi::Iter<i32> {
         weaveffi::Iter::new((0..count).map(|i| i * i))
     }
+
+    /// The handle `reentrant`'s iterator advances from inside its own
+    /// `next` (set by the test once the launcher returns it).
+    pub static REENTRANT_HANDLE: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// Yield three elements, each the error code a nested `_next` on the
+    /// same handle reported from inside the producer's `next`.
+    #[weaveffi::export]
+    pub fn reentrant() -> weaveffi::Iter<i32> {
+        weaveffi::Iter::new((0..3).map(|_| {
+            let handle = REENTRANT_HANDLE.load(std::sync::atomic::Ordering::SeqCst);
+            let mut err = weaveffi::abi::FfiError::default();
+            let mut item = 0;
+            unsafe {
+                runtime_stream_ReentrantIterator_next(
+                    handle as *const weaveffi::abi::IterHandle<i32>,
+                    &mut item,
+                    &mut err,
+                )
+            };
+            err.code
+        }))
+    }
 }
 
 #[weaveffi::module]
 pub mod bus {
     use std::sync::{Arc, Mutex, PoisonError};
+
+    use weaveffi::ForeignError;
+
+    /// The bus's error domain. A subscriber failure propagates with its own
+    /// code; the domain lets the bus's calls throw.
+    #[weaveffi::error]
+    #[derive(Debug)]
+    pub enum BusError {
+        /// the bus is closed
+        Closed = 1,
+    }
+
+    impl std::fmt::Display for BusError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("the bus is closed")
+        }
+    }
 
     /// A message priority (a C-style enum crossing a callback boundary).
     #[weaveffi::enumeration]
@@ -334,14 +494,22 @@ pub mod bus {
     #[weaveffi::callback_interface]
     pub trait Subscriber: Send + Sync {
         /// Receive a message; returns the subscriber's running total.
-        fn on_message(&self, text: String, weight: i32, envelope: &Envelope) -> i64;
+        fn on_message(
+            &self,
+            text: String,
+            weight: i32,
+            envelope: &Envelope,
+        ) -> Result<i64, ForeignError>;
         /// Ask the subscriber how urgent it considers `weight`.
-        fn classify(&self, weight: i32) -> Priority;
+        fn classify(&self, weight: i32) -> Result<Priority, ForeignError>;
         /// Inspect a shared object without retaining it.
-        fn on_ticker(&self, ticker: Arc<Ticker>, alt: Option<Arc<Ticker>>) -> bool;
-        /// Weigh a message; a consumer failure comes back as an `Err`
-        /// instead of unwinding.
-        fn weigh(&self, weight: i32) -> Result<i64, weaveffi::ForeignError>;
+        fn on_ticker(
+            &self,
+            ticker: Arc<Ticker>,
+            alt: Option<Arc<Ticker>>,
+        ) -> Result<bool, ForeignError>;
+        /// Weigh a message; a consumer failure comes back as an `Err`.
+        fn weigh(&self, weight: i32) -> Result<i64, ForeignError>;
     }
 
     /// A shared object handed to subscribers.
@@ -383,12 +551,11 @@ pub mod bus {
                 .push(subscriber);
         }
 
-        /// Publish to every subscriber, returning the sum of their totals.
-        ///
-        /// A subscriber failure unwinds through this frame like a panic, so
-        /// the subscriber list is snapshotted and the lock released before
-        /// any callback runs (the same discipline a panic-safe producer uses).
-        pub fn publish(&self, text: &str, weight: i32) -> i64 {
+        /// Publish to every subscriber, returning the sum of their totals. A
+        /// subscriber failure fails the call with the subscriber's code and
+        /// message. The list is snapshotted so no lock is held while a
+        /// callback runs.
+        pub fn publish(&self, text: &str, weight: i32) -> Result<i64, ForeignError> {
             let env = Envelope {
                 seq: 1,
                 topic: Some("t".to_string()),
@@ -404,7 +571,7 @@ pub mod bus {
         }
 
         /// Publish asynchronously.
-        pub async fn publish_later(&self, text: String, weight: i32) -> i64 {
+        pub async fn publish_later(&self, text: String, weight: i32) -> Result<i64, ForeignError> {
             self.publish(&text, weight)
         }
 
@@ -419,16 +586,19 @@ pub mod bus {
 
     /// Call the subscriber once directly without retaining it.
     #[weaveffi::export]
-    pub fn classify_once(subscriber: Arc<dyn Subscriber>, weight: i32) -> Priority {
+    pub fn classify_once(
+        subscriber: Arc<dyn Subscriber>,
+        weight: i32,
+    ) -> Result<Priority, ForeignError> {
         subscriber.classify(weight)
     }
 
     /// Hand the subscriber a ticker object.
     #[weaveffi::export]
-    pub fn tick(subscriber: &Arc<dyn Subscriber>, value: i64) -> bool {
+    pub fn tick(subscriber: &Arc<dyn Subscriber>, value: i64) -> Result<bool, ForeignError> {
         let ticker = Arc::new(Ticker::new(value));
-        subscriber.on_ticker(ticker.clone(), None)
-            && subscriber.on_ticker(ticker.clone(), Some(ticker))
+        Ok(subscriber.on_ticker(ticker.clone(), None)?
+            && subscriber.on_ticker(ticker.clone(), Some(ticker))?)
     }
 
     /// Weigh through the subscriber and describe the outcome, handling a
@@ -444,6 +614,13 @@ pub mod bus {
 
 #[weaveffi::module]
 pub mod tasks {
+    /// A tag for the thread running the call, to observe the executor.
+    #[weaveffi::export]
+    pub async fn thread_tag() -> String {
+        let t = std::thread::current();
+        format!("{:?} {}", t.id(), t.name().unwrap_or(""))
+    }
+
     /// The task module's error domain.
     #[weaveffi::error]
     #[derive(Debug)]
@@ -516,7 +693,8 @@ fn decode_ret<T: abi::BufferValue>(ptr: *const u8, len: usize) -> T {
         "buffered return must not be null on success"
     );
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    let value = abi::decode_value(bytes).expect("well-formed value buffer");
+    // SAFETY: a producer's return; its tokens are ours to adopt, once.
+    let value = unsafe { abi::decode_value(bytes) }.expect("well-formed value buffer");
     unsafe { abi::free_bytes(ptr.cast_mut(), len) };
     value
 }
@@ -709,7 +887,7 @@ fn record_buffer_round_trip() {
     };
     let bytes = abi::encode_value(&original);
     assert_eq!(bytes.len(), abi::BufferValue::encoded_len(&original));
-    let back: demo::Point = abi::decode_value(&bytes).expect("round-trip");
+    let back: demo::Point = unsafe { abi::decode_value(&bytes) }.expect("round-trip");
     assert_eq!(back.x, 7);
     assert_eq!(back.label, "corner");
     assert_eq!(back.nickname.as_deref(), Some("nw"));
@@ -785,19 +963,82 @@ fn sibling_module_record_param_and_return() {
     assert_eq!(c2.label, "gadget");
 }
 
-#[test]
-fn every_top_level_module_exports_a_checksum() {
-    let sums = [
-        demo::runtime_demo_checksum(),
-        warehouse::runtime_warehouse_checksum(),
-        dispatch::runtime_dispatch_checksum(),
-        outer::runtime_outer_checksum(),
-    ];
-    for (i, a) in sums.iter().enumerate() {
-        for b in &sums[i + 1..] {
-            assert_ne!(a, b, "different modules hash differently");
-        }
+/// FNV-1a 64, the contract table's hash.
+fn fnv(data: &str) -> u64 {
+    data.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// A top-level module's contract table, as a consumer reads it.
+fn contract(
+    f: unsafe extern "C" fn(*mut usize) -> *const abi::ContractEntry,
+) -> Vec<abi::ContractEntry> {
+    let mut len = 0usize;
+    let ptr = unsafe { f(&mut len) };
+    if len == 0 {
+        return Vec::new();
     }
+    unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+}
+
+#[test]
+fn contract_tables_hold_one_sorted_entry_per_declaration() {
+    let table = contract(demo::runtime_demo_contract);
+    assert!(table.windows(2).all(|w| w[0].id < w[1].id), "sorted by id");
+    // demo: the error domain, Color, Point, and thirteen functions.
+    assert_eq!(table.len(), 16);
+    let add = table.iter().find(|e| e.id == fnv("demo.add")).unwrap();
+    assert_eq!(add.hash, fnv("function add(a: i32, b: i32) -> i32"));
+    let point = table.iter().find(|e| e.id == fnv("demo.Point")).unwrap();
+    assert_eq!(
+        point.hash,
+        fnv("record Point {x: i32, label: string, nickname: string?, color: Color}")
+    );
+    let div = table
+        .iter()
+        .find(|e| e.id == fnv("demo.checked_div"))
+        .unwrap();
+    assert_eq!(
+        div.hash,
+        fnv("function checked_div(a: i32, b: i32) -> i32 throws")
+    );
+
+    // Nested modules and interface members are in their root's table.
+    let outer = contract(outer::runtime_outer_contract);
+    for path in [
+        "outer.Session",
+        "outer.Session.open",
+        "outer.inner.summarize",
+    ] {
+        assert!(outer.iter().any(|e| e.id == fnv(path)), "{path}");
+    }
+}
+
+#[test]
+fn contract_tables_follow_cfg() {
+    let table = contract(rich::runtime_rich_contract);
+    let has = |path: &str| table.iter().any(|e| e.id == fnv(path));
+    assert!(has("rich.always"));
+    assert!(has("rich.Token.n"));
+    assert!(!has("rich.never"), "a cfg'd-out function has no entry");
+    assert!(
+        !has("rich.Token.hidden"),
+        "nor a member of a cfg'd-out impl"
+    );
+    assert!(
+        !has("rich.gone.vanished"),
+        "nor anything in a cfg'd-out module"
+    );
+    let lookup = table
+        .iter()
+        .find(|e| e.id == fnv("rich.lookup_via"))
+        .unwrap();
+    assert_eq!(
+        lookup.hash,
+        fnv("function lookup_via(source: Source, key: string) -> string"),
+        "the alias resolved to its target"
+    );
 }
 
 #[test]
@@ -836,7 +1077,7 @@ fn widget_optional_field_round_trips() {
             note: None,
         },
     ] {
-        let back: build::Widget = abi::decode_value(&abi::encode_value(&w)).unwrap();
+        let back: build::Widget = unsafe { abi::decode_value(&abi::encode_value(&w)) }.unwrap();
         assert_eq!(back, w);
     }
 }
@@ -858,11 +1099,11 @@ fn rich_enum_encodes_tag_then_fields() {
     };
     let bytes = abi::encode_value(&labeled);
     assert_eq!(&bytes[..4], [2, 0, 0, 0]);
-    let back: geom::Shape = abi::decode_value(&bytes).unwrap();
+    let back: geom::Shape = unsafe { abi::decode_value(&bytes) }.unwrap();
     assert_eq!(back, labeled);
 
     // An out-of-range tag is a decode error, not a silent default.
-    assert!(abi::decode_value::<geom::Shape>(&[9, 0, 0, 0]).is_err());
+    assert!(unsafe { abi::decode_value::<geom::Shape>(&[9, 0, 0, 0]) }.is_err());
 }
 
 #[test]
@@ -918,7 +1159,7 @@ fn iterator_scalar_elements() {
 }
 
 #[test]
-fn concurrent_iterator_next_yields_each_element_once() {
+fn concurrent_iterator_next_yields_each_element_once_or_reports_busy() {
     const N: i32 = 2000;
     let mut err = ok_err();
     let iter = unsafe { stream::runtime_stream_squares(N, &mut err) };
@@ -934,6 +1175,11 @@ fn concurrent_iterator_next_yields_each_element_once() {
                     let has = unsafe {
                         stream::runtime_stream_SquaresIterator_next(iter, &mut item, &mut err)
                     };
+                    // A `_next` racing another fails instead of blocking.
+                    if err.code == abi::MARSHAL_ERROR_CODE {
+                        std::thread::yield_now();
+                        continue;
+                    }
                     assert_eq!(err.code, 0);
                     if has == 0 {
                         break got;
@@ -950,6 +1196,45 @@ fn concurrent_iterator_next_yields_each_element_once() {
     all.sort_unstable();
     assert_eq!(all, (0..N).map(|i| i * i).collect::<Vec<_>>());
     unsafe { stream::runtime_stream_SquaresIterator_destroy(iter) };
+}
+
+#[test]
+fn a_reentrant_next_fails_instead_of_deadlocking() {
+    let mut err = ok_err();
+    let iter = unsafe { stream::runtime_stream_reentrant(&mut err) };
+    stream::REENTRANT_HANDLE.store(iter as usize, std::sync::atomic::Ordering::SeqCst);
+    let mut got = Vec::new();
+    loop {
+        let mut item = 0i32;
+        if unsafe { stream::runtime_stream_ReentrantIterator_next(iter, &mut item, &mut err) } == 0
+        {
+            break;
+        }
+        assert_eq!(err.code, 0);
+        got.push(item);
+    }
+    unsafe { stream::runtime_stream_ReentrantIterator_destroy(iter) };
+    assert_eq!(got, vec![abi::MARSHAL_ERROR_CODE; 3]);
+}
+
+#[test]
+fn duplicate_map_keys_are_marshalling_errors() {
+    let mut err = ok_err();
+    let mut w = abi::BufferWriter::new();
+    w.write_len(2);
+    for v in [1i32, 2] {
+        w.write_string("same");
+        w.write_i32(v);
+    }
+    let bytes = w.finish();
+    let total = unsafe { maps::runtime_maps_total(bytes.as_ptr(), bytes.len(), &mut err) };
+    assert_eq!(total, 0);
+    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
+    assert!(
+        message(&err).contains("duplicate map key"),
+        "{}",
+        message(&err)
+    );
 }
 
 /// A consumer-side `Subscriber` implementation: the context is a heap-allocated
@@ -978,7 +1263,7 @@ mod consumer_subscriber {
         let state = unsafe { &*(ctx as *const SubState) };
         let text = unsafe { abi::lift_str(text_ptr, text_len) }.unwrap();
         let env: bus::Envelope =
-            abi::decode_value(unsafe { std::slice::from_raw_parts(envelope_ptr, envelope_len) })
+            unsafe { abi::decode_value(std::slice::from_raw_parts(envelope_ptr, envelope_len)) }
                 .unwrap();
         *state.last_topic.lock().unwrap() = env.topic.clone();
         if weight == state.fail_at {
@@ -1032,12 +1317,31 @@ mod consumer_subscriber {
     }
 
     pub static VTABLE: bus::runtime_bus_Subscriber_vtable = bus::runtime_bus_Subscriber_vtable {
+        header: abi::VtableHeader {
+            size: std::mem::size_of::<bus::runtime_bus_Subscriber_vtable>() as u32,
+            flags: 0,
+            free,
+        },
         on_message,
         classify,
         on_ticker,
         weigh,
-        free,
     };
+
+    /// A vtable whose `size` claims only the header: a consumer built from
+    /// an older contract.
+    pub static SHORT_VTABLE: bus::runtime_bus_Subscriber_vtable =
+        bus::runtime_bus_Subscriber_vtable {
+            header: abi::VtableHeader {
+                size: std::mem::size_of::<abi::VtableHeader>() as u32,
+                flags: 0,
+                free,
+            },
+            on_message,
+            classify,
+            on_ticker,
+            weigh,
+        };
 
     pub fn new_ctx(fail_at: i32, freed: &Arc<AtomicUsize>) -> *mut c_void {
         Box::into_raw(Box::new(SubState {
@@ -1081,6 +1385,24 @@ fn callback_interface_sync_paths() {
     };
     assert_eq!(r, 0);
     assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
+}
+
+#[test]
+fn a_vtable_smaller_than_the_producers_is_rejected_and_released() {
+    use consumer_subscriber::{new_ctx, SHORT_VTABLE};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let freed = Arc::new(AtomicUsize::new(0));
+    let mut err = ok_err();
+    let r =
+        unsafe { bus::runtime_bus_classify_once(new_ctx(-1, &freed), &SHORT_VTABLE, 9, &mut err) };
+    assert_eq!(r, 0);
+    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
+    assert!(
+        message(&err).contains("regenerate the bindings"),
+        "{}",
+        message(&err)
+    );
+    assert_eq!(freed.load(Ordering::SeqCst), 1, "the context was released");
 }
 
 #[test]
@@ -1158,7 +1480,9 @@ fn drop_ctx<T>(ctx: *mut c_void) {
 }
 
 fn send<T>(ctx: *mut c_void, err: *mut FfiError, value: T) {
-    let tx = unsafe { &*ctx.cast::<Completion<T>>() };
+    // Clone the sender before sending: the test may free the context as soon
+    // as the value arrives, which can be before `send` returns.
+    let tx = unsafe { &*ctx.cast::<Completion<T>>() }.clone();
     let (code, msg) = take_async_err(err);
     tx.send((code, msg, value)).unwrap();
 }
@@ -1219,7 +1543,9 @@ fn async_struct_result_completes_via_callback() {
     // The buffered result is owned by the consumer: decode it, then release
     // the producer allocation with `free_bytes`.
     extern "C" fn cb(ctx: *mut c_void, err: *mut FfiError, ptr: *const u8, len: usize) {
-        let tx = unsafe { &*ctx.cast::<mpsc::Sender<Msg>>() };
+        // Clone the sender before sending: the test may free the context as soon
+        // as the value arrives, which can be before `send` returns.
+        let tx = unsafe { &*ctx.cast::<mpsc::Sender<Msg>>() }.clone();
         let (code, msg) = take_async_err(err);
         let value = (!ptr.is_null()).then(|| {
             let r: tasks::TaskResult = decode_ret(ptr, len);
@@ -1326,60 +1652,6 @@ fn cancel_then_destroy_races_the_launch_safely() {
     assert!(
         rx.recv_timeout(Duration::from_millis(100)).is_err(),
         "each call completed exactly once"
-    );
-    drop_ctx::<i32>(ctx);
-}
-
-#[test]
-fn deferred_foreign_error_replaces_a_sync_result() {
-    let mut err = ok_err();
-    assert_eq!(
-        unsafe { deferred::runtime_deferred_sync_then_fail(false, &mut err) },
-        77
-    );
-    assert_eq!(err.code, 0);
-
-    let r = unsafe { deferred::runtime_deferred_sync_then_fail(true, &mut err) };
-    assert_eq!(r, 0, "the producer's value is discarded for the sentinel");
-    assert_eq!(err.code, abi::FOREIGN_ERROR_CODE);
-    assert_eq!(message(&err), "consumer said no");
-
-    assert_eq!(
-        unsafe { deferred::runtime_deferred_sync_then_fail(false, &mut err) },
-        77
-    );
-    assert_eq!(err.code, 0, "a later call on the same thread is unaffected");
-}
-
-#[test]
-fn deferring_outside_any_call_is_dropped() {
-    // No thunk is running on this thread, so the failure goes to stderr
-    // instead of leaking into the next call.
-    abi::defer_foreign_error(weaveffi::ForeignError {
-        code: abi::FOREIGN_ERROR_CODE,
-        message: "stray".into(),
-    });
-    let mut err = ok_err();
-    assert_eq!(unsafe { demo::runtime_demo_add(1, 2, &mut err) }, 3);
-    assert_eq!(err.code, 0);
-}
-
-#[test]
-fn deferred_foreign_error_fires_the_async_callback_once() {
-    let (tx, rx) = mpsc::channel();
-    let ctx = new_ctx::<i32>(tx);
-
-    unsafe { deferred::runtime_deferred_later_then_fail(false, on_i32, ctx) };
-    assert_eq!(rx.recv_timeout(WAIT).unwrap(), (0, String::new(), 88));
-
-    unsafe { deferred::runtime_deferred_later_then_fail(true, on_i32, ctx) };
-    let (code, message, result) = rx.recv_timeout(WAIT).unwrap();
-    assert_eq!(code, abi::FOREIGN_ERROR_CODE);
-    assert_eq!(message, "consumer said no, later");
-    assert_eq!(result, 0);
-    assert!(
-        rx.recv_timeout(Duration::from_millis(200)).is_err(),
-        "the completion callback fires exactly once"
     );
     drop_ctx::<i32>(ctx);
 }
@@ -2092,4 +2364,215 @@ fn error_payload_fields_cross_the_abi() {
     assert_eq!(r, 0);
     assert_eq!(err.code, 3002);
     assert!(err.payload_ptr.is_null());
+}
+
+/// A consumer-side `Source`: returns of every family, allocated with the
+/// exported `{prefix}_alloc`, and typed failures with a payload.
+mod consumer_source {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    unsafe fn give(bytes: &[u8], out_ptr: *mut *mut u8, out_len: *mut usize) {
+        let run = super::runtime_alloc(bytes.len());
+        unsafe {
+            if !bytes.is_empty() {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), run, bytes.len());
+            }
+            *out_ptr = run;
+            *out_len = bytes.len();
+        }
+    }
+
+    unsafe extern "C" fn name(
+        _ctx: *mut c_void,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+        _err: *mut FfiError,
+    ) {
+        unsafe { give(b"src", out_ptr, out_len) };
+    }
+
+    unsafe extern "C" fn blob(
+        _ctx: *mut c_void,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+        _err: *mut FfiError,
+    ) {
+        unsafe { give(&[1, 2], out_ptr, out_len) };
+    }
+
+    unsafe extern "C" fn card(
+        _ctx: *mut c_void,
+        key_ptr: *const u8,
+        key_len: usize,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+        _err: *mut FfiError,
+    ) {
+        let key = unsafe { abi::lift_string(key_ptr, key_len) }.unwrap();
+        let card = rich::Card {
+            name: format!("card-{key}"),
+            tags: vec!["t".into()],
+        };
+        unsafe { give(&abi::encode_value(&card), out_ptr, out_len) };
+    }
+
+    unsafe extern "C" fn token(_ctx: *mut c_void, _err: *mut FfiError) -> *mut rich::Token {
+        let mut err = FfiError::default();
+        unsafe { rich::runtime_rich_Token_new(5, &mut err) }
+    }
+
+    unsafe extern "C" fn maybe_token(_ctx: *mut c_void, _err: *mut FfiError) -> *mut rich::Token {
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn lookup(
+        _ctx: *mut c_void,
+        key_ptr: *const u8,
+        key_len: usize,
+        out_err: *mut FfiError,
+    ) -> i64 {
+        let key = unsafe { abi::lift_string(key_ptr, key_len) }.unwrap();
+        let fail = |code: i32, payload: Option<&str>| unsafe {
+            let msg = std::ffi::CString::new(format!("failed {key}")).unwrap();
+            super::runtime_error_set(out_err, code, msg.as_ptr());
+            if let Some(p) = payload {
+                let fields = abi::encode_value(&p.to_string());
+                super::runtime_error_set_payload(out_err, fields.as_ptr(), fields.len());
+            }
+        };
+        match key.as_str() {
+            "missing" => fail(1, Some("missing")),
+            "busy" => fail(2, None),
+            "bogus" => fail(99, None),
+            "trap" => fail(-1, None),
+            _ => return 42,
+        }
+        0
+    }
+
+    pub static FREED: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn free(_ctx: *mut c_void) {
+        FREED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub static VTABLE: rich::runtime_rich_Source_vtable = rich::runtime_rich_Source_vtable {
+        header: abi::VtableHeader {
+            size: std::mem::size_of::<rich::runtime_rich_Source_vtable>() as u32,
+            flags: 0,
+            free,
+        },
+        name,
+        blob,
+        card,
+        token,
+        maybe_token,
+        lookup,
+    };
+}
+
+#[test]
+fn callback_returns_of_every_family_are_adopted() {
+    let mut err = ok_err();
+    let mut len = 0usize;
+    let ptr = unsafe {
+        rich::runtime_rich_describe(
+            std::ptr::null_mut(),
+            &consumer_source::VTABLE,
+            &mut len,
+            &mut err,
+        )
+    };
+    assert_eq!(err.code, 0, "{}", message(&err));
+    assert_eq!(take_string(ptr, len), r#"src [1, 2] card-k:["t"] 5 false"#);
+}
+
+#[test]
+fn throwing_callbacks_report_typed_domain_errors() {
+    let lookup = |key: &str| {
+        let mut err = ok_err();
+        let mut len = 0usize;
+        let ptr = unsafe {
+            rich::runtime_rich_lookup_via(
+                std::ptr::null_mut(),
+                &consumer_source::VTABLE,
+                key.as_ptr(),
+                key.len(),
+                &mut len,
+                &mut err,
+            )
+        };
+        assert_eq!(err.code, 0);
+        take_string(ptr, len)
+    };
+    assert_eq!(lookup("a"), "ok 42");
+    assert_eq!(
+        lookup("missing"),
+        "missing missing",
+        "code 1 with its payload"
+    );
+    assert_eq!(lookup("busy"), "busy");
+    // An undeclared positive code, or any negative one, is a foreign failure.
+    assert_eq!(lookup("bogus"), "foreign -4: failed bogus");
+    assert_eq!(lookup("trap"), "foreign -4: failed trap");
+}
+
+#[test]
+fn optional_callback_parameters_accept_null() {
+    let label = "x";
+    let mut err = ok_err();
+    let mut len = 0usize;
+    let none = unsafe {
+        rich::runtime_rich_has_source(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            label.as_ptr(),
+            label.len(),
+            &mut len,
+            &mut err,
+        )
+    };
+    assert_eq!(take_string(none, len), "x:false");
+    let some = unsafe {
+        rich::runtime_rich_has_source(
+            std::ptr::null_mut(),
+            &consumer_source::VTABLE,
+            label.as_ptr(),
+            label.len(),
+            &mut len,
+            &mut err,
+        )
+    };
+    assert_eq!(take_string(some, len), "x:true");
+    assert_eq!(unsafe { rich::runtime_rich_always(&mut err) }, 1);
+}
+
+#[test]
+fn many_concurrent_launches_share_a_few_executor_threads() {
+    extern "C" fn on_tag(ctx: *mut c_void, err: *mut FfiError, ptr: *const u8, len: usize) {
+        on_string(ctx, err, ptr, len);
+    }
+    const CALLS: usize = 64;
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<String>(tx);
+    for _ in 0..CALLS {
+        unsafe { tasks::runtime_tasks_thread_tag(on_tag, ctx) };
+    }
+    let mut threads = std::collections::BTreeSet::new();
+    for _ in 0..CALLS {
+        let (code, _, tag) = rx.recv_timeout(WAIT).unwrap();
+        assert_eq!(code, 0);
+        assert!(tag.contains("weaveffi-async"), "{tag}");
+        threads.insert(tag);
+    }
+    drop_ctx::<String>(ctx);
+    let workers = std::thread::available_parallelism()
+        .map_or(2, |n| n.get())
+        .max(2);
+    assert!(
+        threads.len() <= workers,
+        "{} threads ran {CALLS} calls with {workers} workers",
+        threads.len()
+    );
 }

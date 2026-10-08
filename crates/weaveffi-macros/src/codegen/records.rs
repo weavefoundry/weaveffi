@@ -1,4 +1,4 @@
-//! Codegen for records: the generated [`weaveffi_abi::BufferValue`]
+//! Codegen for records: the generated [`weaveffi::abi::BufferValue`]
 //! implementation that serializes the producer's struct field by field in
 //! declaration (wire) order.
 //!
@@ -11,35 +11,28 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use weaveffi_model::model::StructBinding;
 
-use super::helpers::{ident, rust_type_ident};
-use super::marshal::{field_read_expr, field_write_stmt};
+use super::helpers::ident;
 
 /// Generate the `BufferValue` and `ByValue` implementations for one record.
 pub(crate) fn gen_record(s: &StructBinding) -> TokenStream {
-    let rust_ty = rust_type_ident(&s.name);
+    let rust_ty = ident(&s.name);
     let names: Vec<syn::Ident> = s.fields.iter().map(|f| ident(&f.name)).collect();
-    let writes = s
-        .fields
-        .iter()
-        .zip(&names)
-        .map(|(f, n)| field_write_stmt(f, quote!(self.#n)));
-    let reads = s.fields.iter().zip(&names).map(|(f, n)| {
-        let read = field_read_expr(f);
-        quote!(#n: #read?)
-    });
-
     quote! {
+        #[allow(unsafe_code, unused_unsafe)]
         impl ::weaveffi::abi::BufferValue for #rust_ty {
             fn encoded_len(&self) -> usize {
                 0 #(+ ::weaveffi::abi::BufferValue::encoded_len(&self.#names))*
             }
             fn write_value(&self, __wv_w: &mut ::weaveffi::abi::BufferWriter) {
-                #(#writes)*
+                #(::weaveffi::abi::BufferValue::write_value(&self.#names, __wv_w);)*
             }
-            fn read_value(
+            unsafe fn read_value(
                 __wv_r: &mut ::weaveffi::abi::BufferReader<'_>,
             ) -> ::std::result::Result<Self, ::weaveffi::abi::BufferDecodeError> {
-                ::std::result::Result::Ok(Self { #(#reads),* })
+                // SAFETY: forwarded from the caller.
+                ::std::result::Result::Ok(unsafe {
+                    Self { #(#names: ::weaveffi::abi::BufferValue::read_value(__wv_r)?),* }
+                })
             }
         }
 

@@ -1,388 +1,694 @@
-// Conformance consumer: kvstore sample, Go target.
+// Conformance consumer: kvstore sample, Go target (ABI revision 4).
 //
-// Exercises the Store interface end to end: the throwing factory constructor
-// (OpenStore), methods on the wrapper across every shape (sync put/get/delete,
-// the iterator-backed ListKeys, plain count/clear, the async cancellable
-// Compact, the deprecated LegacyPut), the package-level statics
-// (StoreDefaultCapacity, StoreOpenMany, StoreTotalCount), and the explicit,
-// idempotent Close. Asserts the typed KvError domain via errors.As (IoError
-// on an empty open path, KeyNotFound on a missing get, Expired on a stale
-// get). Covers the Entry record decoded from a value buffer (bytes, optional
-// present and absent, empty list, and empty map fields), the buffered
-// optional TTL and prefix parameters, and the nested kv.stats submodule
-// borrowing the Store across the module boundary.
+// Drives the feature-complete producer through the generated bindings:
 //
-// Callbacks and objects: a Go type implementing the EvictionListener callback
-// interface (called with the decoded Entry and the EvictionReason, its bool
-// return detaching it, replacement and clear releasing the old handle, and a
-// panicking implementation surfacing to the throwing caller as a
-// *Error with code -4), plus reference-counted objects everywhere:
-// Share() aliasing the same store, Fork() copying it, Store? both ways in
-// Larger, a Store inside the StoreInfo record (Describe), a list of stores
-// returned by StoreOpenMany, and stores encoded into a parameter buffer by
-// StoreTotalCount. Exits 0 on success; aborts (non-zero) on any mismatch.
+//   - the load-time checks (ABI revision, both modules' contract tables),
+//     which importing the package performs;
+//   - Store: the throwing OpenStore and plain NewStore factories, methods,
+//     statics (StoreOpenMany, StoreDefaultCapacity, ...), the deprecated
+//     Size, the Entry and StoreInfo structs, the EntryKind constants, maps,
+//     optionals as pointers, and the logical clock;
+//   - KvError code types with their payload fields (*KeyNotFoundError,
+//     *ExpiredError, *StoreFullError, *InvalidPathError, *RejectedError),
+//     matched with errors.As, and runtime failures (-3, -4) as *Error;
+//   - lazy iter.Seq2 and iter.Seq sequences of strings (throwing at launch),
+//     records, and objects, including one abandoned part-way;
+//   - three callback interfaces implemented in Go: a Listener (retained,
+//     filtered by Accepts, told about every Change, detached when it
+//     panics, and called on a producer thread during compaction), a Policy
+//     (a record return, a throwing method whose *RejectedError reaches the
+//     Put caller with its payload, a plain error that arrives as -4, a
+//     malformed record return and a nil required object rejected as -3, an
+//     object parameter and object return), and a Loader passed as an
+//     optional callback (string, bytes, and optional-object returns; typed
+//     errors decoded by the producer or passed through);
+//   - Store objects in every position: parameter, return, optional, list,
+//     map value, record field, sequence element, async result, and callback
+//     parameter and return;
+//   - async calls that block on a context.Context: an async free function
+//     returning an object, a cancellable method cancelled mid-pause
+//     (returning context.Canceled at once while its background work stops
+//     cooperatively, shown by StoreActiveJobs), an async list launched from
+//     32 goroutines, and an async function in the nested kv.stats module;
+//   - the sibling report root (the shared Entry record and its own error
+//     domain).
+//
+// Releases of consumer callbacks are observed through the producer's
+// callback counter (DebugLive(1)). Ends by asserting the producer's leak
+// counters are zero.
 
 package main
+
+/*
+#include <pthread.h>
+
+static pthread_t main_thread;
+static void remember_main_thread(void) { main_thread = pthread_self(); }
+static int on_main_thread(void) { return pthread_equal(pthread_self(), main_thread); }
+*/
+import "C"
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"runtime"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	wv "__MODPATH__"
+	kv "__MODPATH__"
 )
 
-type eviction struct {
-	key    string
-	value  []byte
-	reason wv.EvictionReason
+func init() {
+	// Keep main on the process's main thread so a callback can tell the
+	// calling thread from a producer thread.
+	runtime.LockOSThread()
+	C.remember_main_thread()
 }
 
-// listenerState is the observable side of a listener, held apart from the
-// implementing value so that value can be finalized once the producer
-// releases its handle.
-type listenerState struct {
-	seen  []eviction
-	limit int
+func ptr[T any](v T) *T { return &v }
+
+// liveCallbacks is the number of consumer callbacks the producer holds.
+func liveCallbacks() uint64 { return kv.DebugLive(1) }
+
+func put(s *kv.Store, key, value string) kv.Entry {
+	e, err := s.Put(key, []byte(value), kv.EntryKindPersistent, nil)
+	expect(err == nil, fmt.Sprintf("put(%s): %v", key, err))
+	return e
 }
 
-// watcher implements wv.EvictionListener. It keeps receiving until it has
-// seen `limit` evictions, then returns false to detach itself. A key
-// starting with "boom" makes it panic instead.
-type watcher struct {
-	st *listenerState
+func putKind(s *kv.Store, key, value string, kind kv.EntryKind, ttl *int64) (kv.Entry, error) {
+	return s.Put(key, []byte(value), kind, ttl)
 }
 
-func (l *watcher) OnEvict(entry wv.Entry, reason wv.EvictionReason) bool {
-	if strings.HasPrefix(entry.Key, "boom") {
-		panic("listener refused " + entry.Key)
+// sameStore reports whether a and b wrap the same native object: a write
+// through one is visible through the other.
+func sameStore(a, b *kv.Store) bool {
+	const probe = "\x00identity-probe"
+	put(a, probe, "")
+	same := b.Find(probe) != nil
+	a.Delete(probe)
+	return same
+}
+
+func expectKeyNotFound(err error, key string) {
+	e := expectAs[*kv.KeyNotFoundError](err, "KeyNotFound "+key)
+	expect(e.Code() == 1001 && e.Key == key, fmt.Sprintf("KeyNotFound key %q (got %q)", key, e.Key))
+}
+
+// expectRuntime asserts that err is the runtime *Error with code.
+func expectRuntime(err error, code int32, message string) {
+	e := expectAs[*kv.Error](err, fmt.Sprintf("code %d", code))
+	expect(e.Code == code && e.Message == message, fmt.Sprintf("want %d %q, got %d %q", code, message, e.Code, e.Message))
+	var domain kv.KvError
+	expect(!errors.As(err, &domain), "a runtime failure isn't a KvError")
+}
+
+// ── listener (consumer-implemented, retained) ─────────────────────────────
+
+type recordingListener struct {
+	skip, failOn string
+	mu           sync.Mutex
+	changes      []kv.Change
+	offMain      atomic.Int32
+}
+
+func (l *recordingListener) Accepts(key string) bool {
+	if l.failOn != "" && key == l.failOn {
+		panic("listener refused")
 	}
-	l.st.seen = append(l.st.seen, eviction{key: entry.Key, value: entry.Value, reason: reason})
-	return len(l.st.seen) < l.st.limit
+	return key != l.skip
 }
 
-// listen attaches a fresh watcher and returns only its state; the watcher
-// itself stays reachable solely through the producer's cgo.Handle.
-func listen(store *wv.Store, limit int, freed *atomic.Int32) *listenerState {
-	st := &listenerState{limit: limit}
-	l := &watcher{st: st}
-	runtime.SetFinalizer(l, func(*watcher) { freed.Add(1) })
-	store.SetEvictionListener(l)
-	return st
+func (l *recordingListener) OnChange(change kv.Change) {
+	if C.on_main_thread() == 0 {
+		l.offMain.Add(1)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.changes = append(l.changes, change)
 }
 
-func waitFreed(freed *atomic.Int32, n int32) bool {
-	for i := 0; i < 200; i++ {
-		runtime.GC()
-		if freed.Load() >= n {
-			return true
+func (l *recordingListener) last() kv.Change {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.changes[len(l.changes)-1]
+}
+
+func (l *recordingListener) puts() []kv.ChangePut {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []kv.ChangePut
+	for _, c := range l.changes {
+		if p, ok := c.(kv.ChangePut); ok {
+			out = append(out, p)
 		}
-		time.Sleep(5 * time.Millisecond)
 	}
-	return freed.Load() >= n
+	return out
 }
 
-func put(store *wv.Store, key string, value []byte, ttl *int64) {
-	ok, err := store.Put(key, value, wv.EntryKindPersistent, ttl)
-	expect(err == nil && ok, fmt.Sprintf("put %s (err %v)", key, err))
+func (l *recordingListener) removed(expired bool) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, c := range l.changes {
+		if r, ok := c.(kv.ChangeRemoved); ok && r.Expired == expired {
+			n++
+		}
+	}
+	return n
 }
 
-func main() {
-	store, err := wv.OpenStore("/tmp/conformance-kvstore-go")
-	expect(err == nil, "open store")
+// ── policy (consumer-implemented, rich returns, throws) ───────────────────
 
-	// Typed error: an empty path reports KvError IoError.
-	_, err = wv.OpenStore("")
-	var kerr *wv.KvError
-	expect(errors.As(err, &kerr), "empty path yields a *KvError")
-	expect(kerr.Code == wv.KvErrorIoError,
-		fmt.Sprintf("empty path code == 1004 (got %d)", kerr.Code))
-	expect(kerr.Message == "I/O failure", "io error default message")
+// testPolicy routes "b/" keys to other, a reference it owns.
+type testPolicy struct {
+	other    *kv.Store
+	admitted atomic.Int32
+}
 
-	// Static: package-level func namespaced by the type, plain return.
-	expect(wv.StoreDefaultCapacity() == 1_000_000, "default capacity")
+func (p *testPolicy) Admit(entry kv.Entry) (kv.Entry, error) {
+	p.admitted.Add(1)
+	expect(entry.Version == 0, "the store assigns the version after admission")
+	switch {
+	case strings.HasPrefix(entry.Key, "secret"):
+		return kv.Entry{}, &kv.RejectedError{Key: entry.Key, Reason: "no secrets", Message: "secrets are not stored"}
+	case strings.HasPrefix(entry.Key, "boom"):
+		return kv.Entry{}, errors.New("policy exploded")
+	case strings.HasPrefix(entry.Key, "garbage"):
+		// Go can spell a record the producer can't read: a tag that isn't
+		// UTF-8.
+		entry.Tags = []string{"\xff"}
+		return entry, nil
+	}
+	// Tag it and store it encrypted (and try to rename it, which the store
+	// ignores).
+	entry.Key = "renamed"
+	entry.Kind = kv.EntryKindEncrypted
+	entry.Tags = []string{"admitted"}
+	return entry, nil
+}
 
-	payload := []byte{1, 2, 3}
-	ok, err := store.Put("alpha", payload, wv.EntryKindPersistent, nil)
-	expect(err == nil && ok, "put alpha")
-	ok, err = store.Put("beta", payload, wv.EntryKindVolatile, nil)
-	expect(err == nil && ok, "put beta")
+// Route receives home as a wrapper of its own; the bindings hand the
+// producer a fresh reference to whatever it returns.
+func (p *testPolicy) Route(key string, home *kv.Store) *kv.Store {
+	switch {
+	case strings.HasPrefix(key, "b/"):
+		home.Close()
+		return p.other
+	case strings.HasPrefix(key, "null/"):
+		home.Close()
+		return nil // a required object may not be nil: -3
+	}
+	return home
+}
 
-	// Non-throwing method: plain return.
-	expect(store.Count() == 2, "count == 2")
+// ── loader (consumer-implemented, passed as an optional parameter) ────────
 
-	// Optional record return through a throwing method: the value buffer
-	// decodes into a plain Entry struct (scalars, bytes, the absent optional,
-	// and the empty list and map fields).
-	e, err := store.Get("alpha")
-	expect(err == nil && e != nil, "get alpha")
-	expect(e.Id > 0, "entry id positive")
-	expect(e.Key == "alpha", "entry key")
-	expect(len(e.Value) == 3 && e.Value[0] == 1 && e.Value[2] == 3, "entry value bytes")
-	expect(e.CreatedAt > 0, "entry created_at set")
-	expect(e.ExpiresAt == nil, "no ttl decodes as nil expires_at")
-	expect(len(e.Tags) == 0, "empty tags len 0")
-	expect(len(e.Metadata) == 0, "empty metadata len 0")
+type testLoader struct{ backup *kv.Store }
 
-	// Typed error: a missing key reports KvError KeyNotFound.
-	_, err = store.Get("missing")
-	kerr = nil
-	expect(errors.As(err, &kerr), "missing key yields a *KvError")
-	expect(kerr.Code == wv.KvErrorKeyNotFound,
-		fmt.Sprintf("missing key code == 1001 (got %d)", kerr.Code))
-	expect(kerr.Message == "key not found", "key not found default message")
+func (testLoader) Name() string { return "go-loader" }
 
-	// Iterator-backed method: a lazy iter.Seq2[string, error], with and
-	// without the buffered optional prefix. Errors surface per step through
-	// the second value.
+func (l testLoader) Fallback(key string) *kv.Store {
+	if key == "fb" {
+		return l.backup
+	}
+	return nil
+}
+
+func (testLoader) Load(key string) ([]byte, error) {
+	switch key {
+	case "missing":
+		return nil, &kv.KeyNotFoundError{Key: "missing", Message: "not in the loader"}
+	case "elsewhere":
+		return nil, &kv.KeyNotFoundError{Key: "other", Message: "not in the loader"}
+	case "broken":
+		return nil, errors.New("loader is broken")
+	}
+	return []byte("loaded:" + key), nil
+}
+
+// ── sections ──────────────────────────────────────────────────────────────
+
+func constructors() {
+	s, err := kv.OpenStore("")
+	expect(s == nil, "a failed OpenStore returns nil")
+	e := expectAs[*kv.InvalidPathError](err, `OpenStore("")`)
+	expect(e.Code() == 1004 && e.Error() == "invalid path", "InvalidPath code and message")
+	expectAs[kv.KvError](err, "an InvalidPathError is a KvError")
+
+	s = kv.NewStore()
+	expect(s.Path() == "memory", "NewStore path")
+	expect(s.Capacity() == kv.StoreDefaultCapacity() && kv.StoreDefaultCapacity() == 1000000, "default capacity")
+	s.Close()
+
+	ctx := context.Background()
+	a, err := kv.KvOpenStore(ctx, "/async")
+	expect(err == nil && a.Path() == "/async", fmt.Sprintf("KvOpenStore: %v", err))
+	a.Close()
+	_, err = kv.KvOpenStore(ctx, "")
+	expectAs[*kv.InvalidPathError](err, `KvOpenStore("")`)
+}
+
+func basics() {
+	s, err := kv.OpenStore("/basics")
+	expect(err == nil, "OpenStore")
+	defer s.Close()
+
+	// Put returns the stored entry; the version counts puts of the key.
+	e := put(s, "alpha", "one")
+	expect(e.Key == "alpha" && string(e.Value) == "one" && e.Kind == kv.EntryKindPersistent, "put alpha")
+	expect(e.Version == 1 && e.ExpiresAt == nil && len(e.Tags) == 0 && len(e.Metadata) == 0, "put alpha fields")
+	e, err = putKind(s, "alpha", "two", kv.EntryKindVolatile, nil)
+	expect(err == nil && e.Version == 2 && e.Kind == kv.EntryKindVolatile, "put alpha again")
+
+	got, err := s.Get("alpha")
+	expect(err == nil && string(got.Value) == "two", "get alpha")
+	_, err = s.Get("nope")
+	expectKeyNotFound(err, "nope")
+	expect(err.Error() == "key not found: nope", "KeyNotFound message: "+err.Error())
+	found := s.Find("alpha")
+	expect(found != nil && found.Version == 2, "find alpha")
+	expect(s.Find("nope") == nil, "find nope")
+
+	// TTLs follow the logical clock; an expired get reports when.
+	e, err = putKind(s, "ttl", "x", kv.EntryKindVolatile, ptr(int64(10)))
+	expect(err == nil && e.ExpiresAt != nil && *e.ExpiresAt == 10, "ttl expires_at")
+	expect(s.Now() == 0, "the clock starts at 0")
+	expect(s.Tick(9) == 9 && s.Count() == 2, "tick 9")
+	expect(s.Tick(1) == 10 && s.Count() == 1, "tick 10")
+	_, err = s.Get("ttl")
+	expired := expectAs[*kv.ExpiredError](err, "get(ttl)")
+	expect(expired.Key == "ttl" && expired.ExpiredAt == 10, "Expired payload")
+	_, err = s.Get("ttl")
+	expectKeyNotFound(err, "ttl") // the expired read removed it
+
+	// Capacity: a new key past it is StoreFull { capacity }.
+	s.SetCapacity(1)
+	expect(s.Capacity() == 1, "SetCapacity")
+	put(s, "alpha", "three") // replacing is fine
+	_, err = putKind(s, "beta", "b", kv.EntryKindVolatile, nil)
+	full := expectAs[*kv.StoreFullError](err, "put beta at capacity")
+	expect(full.Capacity == 1, "StoreFull capacity")
+	s.SetCapacity(100)
+
+	// An undeclared enum value and invalid UTF-8 are marshalling failures.
+	_, err = putKind(s, "k", "v", kv.EntryKind(9), nil)
+	expect(expectAs[*kv.Error](err, "an undeclared EntryKind").Code == -3, "an undeclared enum value is -3")
+	_, err = putKind(s, "\xc3\x28", "v", kv.EntryKindVolatile, nil)
+	expect(expectAs[*kv.Error](err, "bad UTF-8 key").Code == -3, "bad UTF-8 key is -3")
+
+	// Delete, Clear, and the deprecated Size.
+	put(s, "beta", "b")
+	expect(s.Delete("beta") && !s.Delete("beta"), "delete twice")
+	size := s.Size() //nolint:staticcheck // the deprecated method still works
+	expect(size == s.Count() && size == 1, "deprecated Size == Count")
+	expect(s.Clear() == 1 && s.Count() == 0, "clear")
+}
+
+func iterators() {
+	s, _ := kv.OpenStore("/iter")
+	defer s.Close()
+	put(s, "user.bob", "b")
+	put(s, "user.alice", "a")
+	put(s, "sys.x", "xx")
+
 	var keys []string
-	for k, serr := range store.ListKeys(nil) {
-		expect(serr == nil, "list_keys step error")
+	for k, err := range s.Keys(nil) {
+		expect(err == nil, fmt.Sprintf("keys: %v", err))
 		keys = append(keys, k)
 	}
-	expect(len(keys) == 2, "list_keys len == 2")
-	sort.Strings(keys)
-	expect(keys[0] == "alpha" && keys[1] == "beta", "list_keys values")
+	expect(slices.Equal(keys, []string{"sys.x", "user.alice", "user.bob"}), fmt.Sprintf("keys in order (got %v)", keys))
+	expect(kv.DebugLive(2) == 0, "an exhausted iterator is released")
 
-	prefix := "al"
-	keys = keys[:0]
-	for k, serr := range store.ListKeys(&prefix) {
-		expect(serr == nil, "list_keys prefix step error")
-		keys = append(keys, k)
+	n := 0
+	for k, err := range s.Keys(ptr("zzz")) {
+		expect(k == "", "a failed sequence yields the zero value")
+		expectKeyNotFound(err, "zzz")
+		n++
 	}
-	expect(len(keys) == 1 && keys[0] == "alpha", "list_keys prefix filter")
+	expect(n == 1, "a failed launch yields one error")
 
-	// Early break destroys the producer iterator without draining it.
-	first := ""
-	for k, serr := range store.ListKeys(nil) {
-		expect(serr == nil, "list_keys early-break step error")
-		first = k
+	// Abandoning a sequence part-way releases its iterator.
+	for k, err := range s.Keys(ptr("user.")) {
+		expect(err == nil && k == "user.alice", "first user key")
+		expect(kv.DebugLive(2) == 1, "the iterator is live")
 		break
 	}
-	expect(first == "alpha", "early break yields the first sorted key")
+	expect(kv.DebugLive(2) == 0, "an abandoned iterator is released")
 
-	// Deprecated member keeps working.
-	ok, err = store.LegacyPut("legacy", payload)
-	expect(err == nil && ok, "legacy put")
-	ok, err = store.Delete("legacy")
-	expect(err == nil && ok, "delete legacy")
-	ok, err = store.Delete("legacy")
-	expect(err == nil && !ok, "second delete reports false")
+	var sys []kv.Entry
+	for e := range s.Entries(ptr("sys.")) {
+		sys = append(sys, e)
+	}
+	expect(len(sys) == 1 && sys[0].Key == "sys.x" && string(sys[0].Value) == "xx", "entries(sys.)")
 
-	// Present optional: a TTL'd put round-trips as a non-nil ExpiresAt
-	// pointing past CreatedAt.
-	put(store, "gamma", payload, ptrInt64(3600))
-	g, err := store.Get("gamma")
-	expect(err == nil && g != nil, "get gamma")
-	expect(g.ExpiresAt != nil, "ttl decodes as non-nil expires_at")
-	expect(*g.ExpiresAt == g.CreatedAt+3600, "expires_at == created_at + ttl")
-	ok, err = store.Delete("gamma")
-	expect(err == nil && ok, "delete gamma")
+	// Partition: objects, created as they're pulled.
+	prefixes := []string{"user.", "sys.", "none."}
+	counts := []uint32{2, 1, 0}
+	i := 0
+	for part := range s.Partition(prefixes) {
+		expect(part.Count() == counts[i] && part.Path() == prefixes[i], fmt.Sprintf("partition %d", i))
+		expect(!sameStore(part, s), "partition yields new stores")
+		part.Close()
+		i++
+	}
+	expect(i == 3, "three partitions")
+}
 
-	// kv.stats submodule borrows the Store across the module boundary and
-	// returns the Stats record by value.
-	st, err := wv.GetStats(store)
-	expect(err == nil, "get stats")
-	expect(st.TotalEntries == 2, "stats total entries == 2")
-	expect(st.TotalBytes == 6, fmt.Sprintf("stats total bytes == 6 (got %d)", st.TotalBytes))
-	expect(st.ExpiredEntries == 0, "stats expired entries == 0")
+func listeners() {
+	base := liveCallbacks()
+	s, _ := kv.OpenStore("/listen")
+	l := &recordingListener{skip: "quiet"}
+	id := s.Subscribe(l)
+	expect(id > 0 && s.ListenerCount() == 1 && liveCallbacks() == base+1, "subscribe")
 
-	// ── Eviction listener (callback interface) ──
-	var freed atomic.Int32
-	l1 := listen(store, 2, &freed)
+	put(s, "a", "1")
+	p := l.puts()
+	expect(len(p) == 1 && p[0].Entry.Version == 1 && !p[0].Replaced, "Put v1")
+	put(s, "a", "2")
+	p = l.puts()
+	expect(len(p) == 2 && p[1].Entry.Version == 2 && p[1].Replaced && p[1].Entry.Key == "a", "Put v2")
+	put(s, "quiet", "x") // Accepts said no
+	expect(len(l.puts()) == 2, "the filter skipped quiet")
+	expect(s.Delete("a"), "delete a")
+	expect(l.last() == kv.ChangeRemoved{Key: "a", Expired: false}, "Removed(a)")
 
-	// Delete fires the trampoline synchronously with the decoded Entry.
-	ok, err = store.Delete("beta")
-	expect(err == nil && ok, "delete beta")
-	expect(len(l1.seen) == 1, fmt.Sprintf("eviction fired once (got %v)", l1.seen))
-	expect(l1.seen[0].key == "beta" && l1.seen[0].reason == wv.EvictionReasonDeleted,
-		fmt.Sprintf("delete evicts with reason Deleted (got %+v)", l1.seen[0]))
-	expect(len(l1.seen[0].value) == 3 && l1.seen[0].value[1] == 2, "evicted entry carries its bytes")
+	// An expired read removes the entry and says so.
+	_, err := putKind(s, "short", "x", kv.EntryKindVolatile, ptr(int64(1)))
+	expect(err == nil, "put short")
+	s.Tick(1)
+	_, err = s.Get("short")
+	expectAs[*kv.ExpiredError](err, "get(short)")
+	expect(l.last() == kv.ChangeRemoved{Key: "short", Expired: true}, "Removed(short, expired)")
 
-	// A stale read evicts with reason Expired and reports KvError Expired.
-	put(store, "stale", []byte{9}, ptrInt64(-1))
-	_, err = store.Get("stale")
-	kerr = nil
-	expect(errors.As(err, &kerr) && kerr.Code == wv.KvErrorExpired,
-		fmt.Sprintf("stale get reports Expired (got %v)", err))
-	expect(len(l1.seen) == 2 && l1.seen[1].key == "stale" && l1.seen[1].reason == wv.EvictionReasonExpired,
-		fmt.Sprintf("expiry evicts with reason Expired (got %v)", l1.seen))
+	expect(s.Clear() == 1, "clear") // "quiet" was left
+	expect(l.last() == kv.ChangeCleared{Count: 1}, "Cleared(1)")
+	expect(l.offMain.Load() == 0, "synchronous calls notify on the calling thread")
 
-	// The second eviction returned false, so the store detached and freed
-	// the listener; a third eviction is not observed.
-	expect(waitFreed(&freed, 1), "detached listener is freed")
-	put(store, "unseen", payload, nil)
-	ok, err = store.Delete("unseen")
-	expect(err == nil && ok, "delete unseen")
-	expect(len(l1.seen) == 2, "no eviction after the listener detached")
+	// Unsubscribing releases the listener once.
+	expect(s.Unsubscribe(id) && liveCallbacks() == base, "unsubscribe releases the listener")
+	expect(!s.Unsubscribe(id) && s.ListenerCount() == 0, "unsubscribe twice")
 
-	// Replacing a listener frees the previous one; clearing frees the last.
-	l2 := listen(store, 1000, &freed)
-	l3 := listen(store, 1000, &freed)
-	expect(waitFreed(&freed, 2), "replaced listener is freed")
-	put(store, "delta", payload, nil)
-	ok, err = store.Delete("delta")
-	expect(err == nil && ok, "delete delta")
-	expect(len(l2.seen) == 0 && len(l3.seen) == 1 && l3.seen[0].key == "delta",
-		"only the current listener observes evictions")
-	store.ClearEvictionListener()
-	expect(waitFreed(&freed, 3), "cleared listener is freed")
-	put(store, "epsilon", payload, nil)
-	ok, err = store.Delete("epsilon")
-	expect(err == nil && ok, "delete epsilon")
-	expect(len(l3.seen) == 1, "no eviction after clear")
-	store.ClearEvictionListener()
+	// A listener that panics is detached (and released); the put succeeds.
+	failing := &recordingListener{failOn: "boom"}
+	s.Subscribe(failing)
+	put(s, "fine", "1")
+	expect(len(failing.puts()) == 1, "the failing listener saw fine")
+	put(s, "boom", "1")
+	expect(s.Count() == 2 && s.ListenerCount() == 0, "a failing listener is detached")
+	expect(liveCallbacks() == base, "the failing listener was released")
 
-	// A panicking listener surfaces to the throwing caller as the generic
-	// error with FOREIGN_ERROR_CODE, and the store keeps working.
-	l4 := listen(store, 1000, &freed)
-	put(store, "boom", payload, nil)
-	_, err = store.Delete("boom")
-	var ferr *wv.Error
-	expect(errors.As(err, &ferr), fmt.Sprintf("panicking listener yields *Error (got %T %v)", err, err))
-	expect(ferr.Code == -4, fmt.Sprintf("foreign error code -4 (got %d)", ferr.Code))
-	expect(strings.Contains(ferr.Message, "listener refused boom"),
-		fmt.Sprintf("foreign error carries the panic text (got %q)", ferr.Message))
-	expect(store.Count() == 1, "entry was removed before the listener ran")
-	ok, err = store.Delete("boom")
-	expect(err == nil && !ok, "store usable after the foreign error")
-	put(store, "zeta", payload, nil)
-	ok, err = store.Delete("zeta")
-	expect(err == nil && ok && len(l4.seen) == 1 && l4.seen[0].key == "zeta",
-		"listener still attached after its panic")
-	store.ClearEvictionListener()
-	expect(waitFreed(&freed, 4), "all four listeners freed")
+	// A required callback can't be nil.
+	expect(catchPanic(func() { s.Subscribe(nil) }) != nil, "Subscribe(nil) panics")
 
-	// ── Objects: share, fork, optional, records, lists ──
-	// Share returns a second wrapper for the SAME object: a write through one
-	// is visible through the other, and releasing one leaves it alive.
-	shared := store.Share()
-	expect(shared != store, "share yields a distinct wrapper")
-	expect(shared.Count() == 1, "shared sees alpha")
-	put(shared, "via-shared", []byte{7, 7}, nil)
-	expect(store.Count() == 2, "put through share visible through the original")
-	got, err := store.Get("via-shared")
-	expect(err == nil && got != nil && len(got.Value) == 2, "value written through share readable")
-	shared.Close()
-	shared.Close()
-	expect(store.Count() == 2, "original alive after the shared wrapper closed")
+	// Closing the store releases the listeners it still holds.
+	s.Subscribe(&recordingListener{})
+	s.Subscribe(&recordingListener{})
+	expect(s.ListenerCount() == 2 && liveCallbacks() == base+2, "two listeners")
+	s.Close()
+	expect(liveCallbacks() == base, "closing the store released its listeners")
+}
 
-	// Fork copies the live entries into an independent object.
-	forked := store.Fork()
-	expect(forked.Count() == 2, "fork copies entries")
-	put(forked, "fork-only", payload, nil)
-	put(forked, "fork-only-2", payload, nil)
-	expect(forked.Count() == 4 && store.Count() == 2, "fork is independent")
+func policies() {
+	base := liveCallbacks()
+	s, _ := kv.OpenStore("/policy")
+	other, _ := kv.OpenStore("/other")
+	p := &testPolicy{other: other.Share()}
+	s.SetPolicy(p)
+	expect(s.HasPolicy() && liveCallbacks() == base+1, "SetPolicy")
 
-	// Store? as parameter and return.
-	empty, err := wv.OpenStore("/tmp/empty")
-	expect(err == nil, "open empty")
-	expect(empty.Larger(nil) == nil, "larger(nil) on an empty store is nil")
-	self := store.Larger(nil)
-	expect(self != nil, "larger(nil) on a non-empty store returns itself")
-	put(self, "via-larger", payload, nil)
-	expect(store.Count() == 3, "larger(nil) aliases the receiver")
-	self.Close()
-	bigger := store.Larger(forked)
-	expect(bigger != nil && bigger.Count() == 4, "larger(other) picks the bigger store")
-	put(bigger, "via-bigger", payload, nil)
-	expect(forked.Count() == 5 && store.Count() == 3, "larger(other) aliases the other store")
-	bigger.Close()
-	own := store.Larger(empty)
-	expect(own != nil && own.Count() == 3, "larger(smaller) returns the receiver")
-	own.Close()
+	// Admit's record return is what's stored (its key and version aside).
+	a, err := putKind(s, "a", "1", kv.EntryKindVolatile, nil)
+	expect(err == nil && a.Key == "a" && a.Version == 1 && a.Kind == kv.EntryKindEncrypted, fmt.Sprintf("admitted entry (%v)", err))
+	expect(slices.Equal(a.Tags, []string{"admitted"}), "admit's rewrite")
 
-	// A record carrying an object (and an absent, then present, optional).
-	info := store.Describe("primary", nil)
-	expect(info.Label == "primary", "describe label")
-	expect(info.Count == 3, fmt.Sprintf("describe count == 3 (got %d)", info.Count))
-	expect(info.Mirror == nil, "describe mirror absent")
-	expect(info.Store != nil && info.Store.Count() == 3, "describe.store is usable")
-	put(info.Store, "via-info", payload, nil)
-	expect(store.Count() == 4, "describe.store aliases the receiver")
-	withMirror := forked.Describe("mirrored", store)
-	expect(withMirror.Count == 5, "mirrored describe count")
-	expect(withMirror.Mirror != nil && withMirror.Mirror.Count() == 4, "describe.mirror adopted")
-	expect(withMirror.Store.Count() == 5, "describe.store on the fork")
+	// Route: the object parameter and object return redirect a write.
+	_, err = putKind(s, "b/x", "2", kv.EntryKindVolatile, nil)
+	expect(err == nil && s.Count() == 1 && other.Count() == 1, "route redirected b/x")
 
-	// A list of objects as a throwing static return.
-	many, err := wv.StoreOpenMany([]string{"/tmp/a", "/tmp/b", "/tmp/c"})
-	expect(err == nil && len(many) == 3, fmt.Sprintf("open_many opens 3 (got %d, %v)", len(many), err))
-	put(many[0], "m0", payload, nil)
-	put(many[2], "m2a", payload, nil)
-	put(many[2], "m2b", payload, nil)
-	expect(many[0].Count() == 1 && many[1].Count() == 0 && many[2].Count() == 2, "open_many stores are independent")
-	_, err = wv.StoreOpenMany([]string{"/tmp/ok", ""})
-	kerr = nil
-	expect(errors.As(err, &kerr) && kerr.Code == wv.KvErrorIoError, "open_many propagates IoError")
-	none, err := wv.StoreOpenMany(nil)
-	expect(err == nil && len(none) == 0, "open_many of nothing is empty")
+	// A typed error from the throwing callback reaches the caller with its
+	// code, message, and payload.
+	_, err = putKind(s, "secret", "3", kv.EntryKindVolatile, nil)
+	r := expectAs[*kv.RejectedError](err, "put(secret)")
+	expect(r.Code() == 1005 && r.Error() == "secrets are not stored", "Rejected code and message")
+	expect(r.Key == "secret" && r.Reason == "no secrets", "Rejected payload")
 
-	// Objects encoded into a parameter buffer (list and record fields).
-	expect(wv.StoreTotalCount(many, nil) == 3, "total_count sums the list")
-	expect(wv.StoreTotalCount(nil, nil) == 0, "total_count of nothing is 0")
-	expect(wv.StoreTotalCount(many, &info) == 3+4, "total_count adds extra.store")
-	expect(wv.StoreTotalCount([]*wv.Store{store, forked}, &withMirror) == 4+5+5,
-		"total_count with a mirrored extra")
-	// The wrappers keep their own references after being encoded.
-	expect(store.Count() == 4 && forked.Count() == 5 && info.Store.Count() == 4, "wrappers alive after encoding")
+	// Any other error arrives as -4 with the consumer's message.
+	_, err = putKind(s, "boom", "4", kv.EntryKindVolatile, nil)
+	expectRuntime(err, -4, "policy exploded")
+	// A return the producer can't accept is -3: a malformed record or a nil
+	// required object.
+	_, err = putKind(s, "garbage", "5", kv.EntryKindVolatile, nil)
+	expect(expectAs[*kv.Error](err, "put(garbage)").Code == -3, "a malformed admit return is -3")
+	_, err = putKind(s, "null/x", "6", kv.EntryKindVolatile, nil)
+	expect(expectAs[*kv.Error](err, "put(null/x)").Code == -3, "a nil route return is -3")
+	expect(s.Count() == 1 && other.Count() == 1 && p.admitted.Load() == 6, "failed puts changed nothing")
 
-	// Async: an immediately-expired entry gives compact 3 bytes to reclaim;
-	// the cgo trampoline bridges the producer's worker thread to a channel.
-	put(store, "doomed", payload, ptrInt64(0))
-	reclaimed, err := store.Compact(context.Background())
-	expect(err == nil, "compact async")
-	expect(reclaimed == 3, fmt.Sprintf("compact reclaimed 3 bytes (got %d)", reclaimed))
-	expect(store.Count() == 4, "store count after compact")
-	cancelled, cancel := context.WithCancel(context.Background())
+	// Replacing the policy releases the old one; nil removes it.
+	s.SetPolicy(&testPolicy{other: other.Share()})
+	expect(liveCallbacks() == base+1, "replacing the policy released the old one")
+	s.SetPolicy(nil)
+	expect(!s.HasPolicy() && liveCallbacks() == base, "SetPolicy(nil) released it")
+	put(s, "secret", "now allowed")
+	expect(s.Count() == 2, "no policy, no veto")
+
+	other.Close()
+	s.Close()
+}
+
+func loaders() {
+	s, _ := kv.OpenStore("/load")
+	defer s.Close()
+	base := liveCallbacks()
+
+	// No loader (a nil optional callback): a miss is none.
+	e, err := s.GetOrLoad("k", nil)
+	expect(err == nil && e == nil, "no loader")
+
+	// Load's bytes are stored, tagged with the loader's name.
+	e, err = s.GetOrLoad("k", testLoader{})
+	expect(err == nil && e != nil && string(e.Value) == "loaded:k", fmt.Sprintf("loaded value (%v)", err))
+	expect(e.Kind == kv.EntryKindVolatile && len(e.Metadata) == 1 && e.Metadata["source"] == "go-loader", "loaded entry")
+	expect(liveCallbacks() == base, "a loader is released after the call")
+	expect(s.Count() == 1, "the loaded entry is stored")
+	// A hit doesn't consult the loader.
+	e, err = s.GetOrLoad("k", testLoader{})
+	expect(err == nil && e != nil && e.Version == 1, "a hit")
+
+	// The fallback store (an optional object return) is consulted first.
+	backup, _ := kv.OpenStore("/backup")
+	put(backup, "fb", "from backup")
+	e, err = s.GetOrLoad("fb", testLoader{backup: backup})
+	expect(err == nil && e != nil && string(e.Value) == "from backup" && e.Kind == kv.EntryKindPersistent, "fallback entry")
+	backup.Close()
+
+	// KeyNotFound for this key: the producer decoded the payload and
+	// answers none.
+	e, err = s.GetOrLoad("missing", testLoader{})
+	expect(err == nil && e == nil, "KeyNotFound for the same key is none")
+	// KeyNotFound for another key: passed through, payload intact.
+	_, err = s.GetOrLoad("elsewhere", testLoader{})
+	expectKeyNotFound(err, "other")
+	expect(err.Error() == "not in the loader", "the loader's message passed through")
+	// Any other error is -4.
+	_, err = s.GetOrLoad("broken", testLoader{})
+	expectRuntime(err, -4, "loader is broken")
+	expect(liveCallbacks() == base, "every loader was released")
+}
+
+func asyncCalls() {
+	ctx := context.Background()
+	s, _ := kv.OpenStore("/async-calls")
+	l := &recordingListener{}
+	s.Subscribe(l)
+	putKind(s, "old1", "x", kv.EntryKindVolatile, ptr(int64(1)))
+	putKind(s, "old2", "x", kv.EntryKindVolatile, ptr(int64(1)))
+	put(s, "keep", "x")
+	s.Tick(5)
+
+	// Compact runs on a producer thread and notifies listeners there.
+	n, err := s.Compact(ctx, 0)
+	expect(err == nil && n == 2, fmt.Sprintf("compact(0) = %d, %v", n, err))
+	expect(l.removed(true) == 2, "the listener saw both expirations")
+	expect(l.offMain.Load() == 2, "notified from a producer thread")
+	expect(s.Count() == 1, "one entry left")
+	n, err = s.Compact(ctx, 5)
+	expect(err == nil && n == 0, "compact(5) removed nothing")
+
+	// Cancel mid-pause: the call returns context.Canceled at once, and the
+	// background pause notices the token and stops.
+	cctx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Compact(cctx, 60000)
+		done <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	select {
+	case <-done:
+		expect(false, "compact(60000) finished early")
+	default:
+	}
+	expect(kv.StoreActiveJobs() >= 1, "the pause is running")
+	started := time.Now()
 	cancel()
-	_, err = store.Compact(cancelled)
-	expect(errors.Is(err, context.Canceled), fmt.Sprintf("compact with a cancelled context (got %v)", err))
+	err = <-done
+	expect(errors.Is(err, context.Canceled), fmt.Sprintf("a cancelled compact returns context.Canceled (got %v)", err))
+	expect(time.Since(started) < 2*time.Second, "cancellation is prompt")
+	stopped := false
+	for range 2000 {
+		if kv.StoreActiveJobs() == 0 {
+			stopped = true
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	expect(stopped, "the cancelled pause stopped cooperatively")
 
-	// Close racing calls on other goroutines: each call either completes or
-	// panics with "used after Close"; none sees a freed store.
-	racer, err := wv.OpenStore("/tmp/race")
-	expect(err == nil, "open racer")
+	// GetMany: an async list of optional records, from 32 goroutines.
 	var wg sync.WaitGroup
-	for range 8 {
+	results := make([][]*kv.Entry, 32)
+	errs := make([]error, 32)
+	for i := range 32 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for range 500 {
-				if catchPanic(func() { racer.Count() }) != nil {
-					return
-				}
-			}
+			results[i], errs[i] = s.GetMany(ctx, []string{"keep", "gone", "keep"})
 		}()
 	}
-	racer.Close()
 	wg.Wait()
-
-	// Plain void method, then release every object; Close is idempotent.
-	store.Clear()
-	expect(store.Count() == 0 && info.Store.Count() == 0, "clear visible through every alias")
-	for _, s := range many {
-		s.Close()
-		s.Close()
+	for i, got := range results {
+		expect(errs[i] == nil && len(got) == 3, "GetMany")
+		expect(got[0] != nil && got[0].Key == "keep" && got[1] == nil && got[2] != nil && got[2].Key == "keep", "GetMany entries")
 	}
-	withMirror.Store.Close()
-	withMirror.Mirror.Close()
-	info.Store.Close()
-	info.Store.Close()
-	empty.Close()
-	forked.Close()
-	store.Close()
-	store.Close()
-	expect(catchPanic(func() { store.Count() }) != nil, "use after Close panics")
 
-	expectNoLeaks(wv.DebugLive)
-	fmt.Println("go/kvstore: OK")
+	// The nested module's async function: objects in a list in, a record out.
+	other, _ := kv.OpenStore("/other")
+	put(other, "a", "123")
+	st, err := kv.SummarizeAll(ctx, []*kv.Store{s, other})
+	expect(err == nil && st.Entries == 2 && st.Bytes == 4, fmt.Sprintf("SummarizeAll (got %+v, %v)", st, err))
+	expect(len(st.ByKind) == 1 && st.ByKind[kv.EntryKindPersistent] == 2, "SummarizeAll by kind")
+
+	// A context that's already done never launches.
+	_, err = s.Compact(cctx, 0)
+	expect(errors.Is(err, context.Canceled), "a done context returns at once")
+
+	other.Close()
+	s.Close()
 }
 
-func ptrInt64(v int64) *int64 { return &v }
+func objectGraph() {
+	s0, _ := kv.OpenStore("/graph")
+	put(s0, "k", "v")
+
+	// Share: the same object; the original wrapper can go.
+	s := s0.Share()
+	expect(sameStore(s, s0), "Share is the same object")
+	s0.Close()
+	expect(s.Count() == 1, "alive through the shared reference")
+
+	// Fork: a distinct object with a copy of the entries.
+	fork := s.Fork()
+	expect(fork.Count() == 1 && fork.Path() == "/graph" && !sameStore(fork, s), "fork")
+	put(fork, "k2", "v")
+	expect(fork.Count() == 2 && s.Count() == 1, "fork is independent")
+
+	// Larger: Store? in and out.
+	empty, _ := kv.OpenStore("/empty")
+	expect(empty.Larger(nil) == nil, "Larger(nil) on an empty store")
+	bigger := empty.Larger(fork)
+	expect(bigger != nil && sameStore(bigger, fork), "Larger(fork) is fork")
+	bigger.Close()
+	bigger = s.Larger(nil)
+	expect(bigger != nil && sameStore(bigger, s), "Larger(nil) is self")
+	bigger.Close()
+
+	// Describe: a record whose fields carry objects.
+	info := s.Describe("main", fork)
+	expect(info.Label == "main" && info.Count == 1, "describe label and count")
+	expect(sameStore(info.Store, s) && info.Mirror != nil && sameStore(info.Mirror, fork), "describe objects")
+	expect(info.Mirror.Count() == 2, "the mirror is live")
+
+	// StoreOpenMany: a list of objects; one bad path fails the whole call.
+	many, err := kv.StoreOpenMany([]string{"/a", "/b"})
+	expect(err == nil && len(many) == 2 && many[0].Path() == "/a" && many[1].Path() == "/b", "StoreOpenMany")
+	_, err = kv.StoreOpenMany([]string{"/a", ""})
+	expectAs[*kv.InvalidPathError](err, "StoreOpenMany with an empty path")
+
+	// StoreByLabel: records with objects in, a map with object values out.
+	named := kv.StoreByLabel([]kv.StoreInfo{info, {Label: "first", Store: many[0]}})
+	expect(len(named) == 2 && sameStore(named["main"], s) && sameStore(named["first"], many[0]), "StoreByLabel")
+
+	// StoreTotalCount: a list, a map, and an optional record, all carrying
+	// objects (each written as a fresh reference the producer adopts).
+	put(many[0], "m", "1")
+	stores := []*kv.Store{many[0], many[1], fork}
+	expect(kv.StoreTotalCount(stores, named, &info) == 6, "StoreTotalCount with extra")
+	expect(kv.StoreTotalCount(stores, named, nil) == 5, "StoreTotalCount without extra")
+
+	// Everything is still intact; release each wrapper once.
+	expect(s.Count() == 1 && fork.Count() == 2 && many[0].Count() == 1, "still usable")
+	for _, n := range named {
+		n.Close()
+	}
+	info.Store.Close()
+	info.Mirror.Close()
+	for _, m := range many {
+		m.Close()
+	}
+	empty.Close()
+	fork.Close()
+	s.Close()
+	expect(catchPanic(func() { s.Count() }) != nil, "a closed wrapper panics")
+	s.Close() // idempotent
+}
+
+func statsAndReport() {
+	s, _ := kv.OpenStore("/stats")
+	defer s.Close()
+	put(s, "b", "12")
+	put(s, "a", "1")
+	put(s, "a", "123")
+	putKind(s, "c", "x", kv.EntryKindEncrypted, nil)
+
+	// kv.stats: the parent's Store as a parameter, the parent's error domain.
+	st, err := kv.Summarize(s, nil)
+	expect(err == nil && st.Entries == 3 && st.Bytes == 6, fmt.Sprintf("Summarize (got %+v)", st))
+	expect(len(st.ByKind) == 2 && st.ByKind[kv.EntryKindPersistent] == 2 && st.ByKind[kv.EntryKindEncrypted] == 1, "Summarize by kind")
+	_, err = kv.Summarize(s, ptr("q"))
+	expectKeyNotFound(err, "q")
+
+	// report: the sibling root shares the Entry record.
+	var entries []kv.Entry
+	for e := range s.Entries(nil) {
+		entries = append(entries, e)
+	}
+	lines, err := kv.RenderReport(entries)
+	want := []string{"a: 3 bytes, Persistent, v2", "b: 2 bytes, Persistent", "c: 1 bytes, Encrypted"}
+	expect(err == nil && slices.Equal(lines, want), fmt.Sprintf("RenderReport (got %q)", lines))
+	_, err = kv.RenderReport(nil)
+	nothing := expectAs[*kv.NothingToReportError](err, "RenderReport(nil)")
+	expect(nothing.Code() == 2001 && nothing.Error() == "nothing to report", "NothingToReport")
+	expectAs[kv.ReportError](err, "a NothingToReportError is a ReportError")
+	var domain kv.KvError
+	expect(!errors.As(err, &domain), "a ReportError isn't a KvError")
+}
+
+func main() {
+	constructors()
+	basics()
+	iterators()
+	listeners()
+	policies()
+	loaders()
+	asyncCalls()
+	objectGraph()
+	statsAndReport()
+
+	expectNoLeaks(kv.DebugLive)
+	fmt.Println("go/kvstore: OK")
+}

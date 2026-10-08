@@ -1,5 +1,6 @@
-//! Codegen for enums: the private `i32 -> enum` conversion plus the
-//! [`weaveffi_abi::BufferValue`] implementation.
+//! Codegen for enums: the [`weaveffi::abi::CEnum`] implementation of a
+//! C-style enum, and the [`weaveffi::abi::BufferValue`] implementation of
+//! every enum.
 //!
 //! A C-style enum crosses the ABI by value as an `i32`, and inside a value
 //! buffer as the same four discriminant bytes. A rich (algebraic) enum is a
@@ -11,100 +12,63 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use weaveffi_model::model::EnumBinding;
 
-use super::helpers::{ident, rust_type_ident};
-use super::marshal::{field_read_expr, field_write_stmt_ref};
+use super::helpers::ident;
 
-/// Generate the surface for one enum: `__weaveffi_from_i32` /
-/// `__weaveffi_to_i32` plus a `BufferValue` impl for a C-style enum, or the
-/// tag-and-fields `BufferValue` impl for a rich (algebraic) enum.
-///
-/// `__weaveffi_to_i32` takes `&self` so a thunk can lower an enum it holds by
-/// value or by reference without requiring `Copy` or `Clone`.
-pub(crate) fn gen_enum(e: &EnumBinding, item: &syn::ItemEnum) -> syn::Result<TokenStream> {
+/// Generate the surface for one enum: `CEnum` plus a `BufferValue` impl for
+/// a C-style enum, or the tag-and-fields `BufferValue` impl for a rich
+/// (algebraic) enum.
+pub(crate) fn gen_enum(e: &EnumBinding) -> TokenStream {
     if e.is_rich() {
-        return gen_rich_enum(e, item);
+        return gen_rich_enum(e);
     }
-    let ty = rust_type_ident(&e.name);
-    let arms = e.variants.iter().map(|v| {
+    let ty = ident(&e.name);
+    let from_arms = e.variants.iter().map(|v| {
         let value = v.value;
         let vident = ident(&v.name);
         quote!(#value => ::std::option::Option::Some(Self::#vident),)
     });
-    let write_arms = e.variants.iter().map(|v| {
+    let to_arms = e.variants.iter().map(|v| {
         let value = v.value;
         let vident = ident(&v.name);
         quote!(Self::#vident => #value,)
     });
-    let first = e.variants.first().map(|v| ident(&v.name)).ok_or_else(|| {
-        syn::Error::new_spanned(
-            &item.ident,
-            format!("weaveffi: enum `{}` must have at least one variant", e.name),
-        )
-    })?;
-    Ok(quote! {
-        #[allow(dead_code)]
-        impl #ty {
-            #[doc(hidden)]
-            pub fn __weaveffi_from_i32(__v: i32) -> ::std::option::Option<Self> {
-                match __v {
-                    #(#arms)*
+    quote! {
+        impl ::weaveffi::abi::CEnum for #ty {
+            fn from_i32(value: i32) -> ::std::option::Option<Self> {
+                match value {
+                    #(#from_arms)*
                     _ => ::std::option::Option::None,
                 }
             }
-
-            /// The value a callback-interface method yields after its
-            /// consumer implementation has already been reported as failed
-            /// (see `weaveffi::abi::raise_foreign_error`); never observed by
-            /// a caller because the thunk discards the producer's result.
-            #[doc(hidden)]
-            pub fn __weaveffi_placeholder() -> Self {
-                Self::#first
-            }
-
-            #[doc(hidden)]
-            pub fn __weaveffi_to_i32(&self) -> i32 {
+            fn to_i32(&self) -> i32 {
                 match self {
-                    #(#write_arms)*
+                    #(#to_arms)*
                 }
             }
         }
 
+        #[allow(unsafe_code, unused_unsafe)]
         impl ::weaveffi::abi::BufferValue for #ty {
             fn encoded_len(&self) -> usize {
                 4
             }
             fn write_value(&self, __wv_w: &mut ::weaveffi::abi::BufferWriter) {
-                __wv_w.write_i32(self.__weaveffi_to_i32());
+                ::weaveffi::abi::write_enum(self, __wv_w);
             }
-            fn read_value(
+            unsafe fn read_value(
                 __wv_r: &mut ::weaveffi::abi::BufferReader<'_>,
             ) -> ::std::result::Result<Self, ::weaveffi::abi::BufferDecodeError> {
-                let __wv_v = __wv_r.read_i32()?;
-                Self::__weaveffi_from_i32(__wv_v).ok_or(::weaveffi::abi::BufferDecodeError {
-                    context: "enum discriminant out of range",
-                })
+                ::weaveffi::abi::read_enum(__wv_r)
             }
         }
-    })
+    }
 }
 
 /// Generate the `BufferValue` impl for a rich (algebraic) enum: the write
 /// side emits the active variant's tag then its fields in declaration order;
 /// the read side dispatches on the tag and reconstructs the variant.
-fn gen_rich_enum(e: &EnumBinding, item: &syn::ItemEnum) -> syn::Result<TokenStream> {
-    let ty = rust_type_ident(&e.name);
-
-    // Reject the variant shapes the codegen can't construct: only unit and
-    // named-field (struct) variants are supported.
-    for v in &item.variants {
-        if matches!(v.fields, syn::Fields::Unnamed(_)) {
-            return Err(syn::Error::new_spanned(
-                v,
-                "weaveffi: tuple-style rich-enum variants are not supported; use named fields",
-            ));
-        }
-    }
-
+fn gen_rich_enum(e: &EnumBinding) -> TokenStream {
+    let ty = ident(&e.name);
     let len_arms = e.variants.iter().map(|v| {
         let vident = ident(&v.name);
         if v.fields.is_empty() {
@@ -118,49 +82,39 @@ fn gen_rich_enum(e: &EnumBinding, item: &syn::ItemEnum) -> syn::Result<TokenStre
             }
         }
     });
-
     let write_arms = e.variants.iter().map(|v| {
         let value = v.value;
         let vident = ident(&v.name);
-        if v.fields.is_empty() {
-            quote!(Self::#vident => { __wv_w.write_i32(#value); })
+        let bindings: Vec<syn::Ident> = v.fields.iter().map(|f| ident(&f.name)).collect();
+        let pattern = if bindings.is_empty() {
+            quote!(Self::#vident)
         } else {
-            let bindings: Vec<syn::Ident> = v.fields.iter().map(|f| ident(&f.name)).collect();
-            let writes: Vec<TokenStream> = v
-                .fields
-                .iter()
-                .zip(&bindings)
-                .map(|(f, b)| field_write_stmt_ref(f, b))
-                .collect();
-            quote! {
-                Self::#vident { #(#bindings),* } => {
-                    __wv_w.write_i32(#value);
-                    #(#writes)*
-                }
+            quote!(Self::#vident { #(#bindings),* })
+        };
+        quote! {
+            #pattern => {
+                __wv_w.write_i32(#value);
+                #(::weaveffi::abi::BufferValue::write_value(#bindings, __wv_w);)*
             }
         }
     });
-
     let read_arms = e.variants.iter().map(|v| {
         let value = v.value;
         let vident = ident(&v.name);
         if v.fields.is_empty() {
             quote!(#value => Self::#vident,)
         } else {
-            let inits: Vec<TokenStream> = v
-                .fields
-                .iter()
-                .map(|f| {
-                    let fname = ident(&f.name);
-                    let read = field_read_expr(f);
-                    quote!(#fname: #read?)
-                })
-                .collect();
-            quote!(#value => Self::#vident { #(#inits),* },)
+            let names: Vec<syn::Ident> = v.fields.iter().map(|f| ident(&f.name)).collect();
+            quote! {
+                #value => Self::#vident {
+                    #(#names: ::weaveffi::abi::BufferValue::read_value(__wv_r)?),*
+                },
+            }
         }
     });
 
-    Ok(quote! {
+    quote! {
+        #[allow(unsafe_code, unused_unsafe)]
         impl ::weaveffi::abi::BufferValue for #ty {
             fn encoded_len(&self) -> usize {
                 match self {
@@ -172,21 +126,26 @@ fn gen_rich_enum(e: &EnumBinding, item: &syn::ItemEnum) -> syn::Result<TokenStre
                     #(#write_arms)*
                 }
             }
-            fn read_value(
+            unsafe fn read_value(
                 __wv_r: &mut ::weaveffi::abi::BufferReader<'_>,
             ) -> ::std::result::Result<Self, ::weaveffi::abi::BufferDecodeError> {
                 let __wv_tag = __wv_r.read_i32()?;
-                ::std::result::Result::Ok(match __wv_tag {
-                    #(#read_arms)*
-                    _ => {
-                        return ::std::result::Result::Err(::weaveffi::abi::BufferDecodeError {
-                            context: "rich enum tag out of range",
-                        })
+                // SAFETY: forwarded from the caller.
+                ::std::result::Result::Ok(unsafe {
+                    match __wv_tag {
+                        #(#read_arms)*
+                        _ => {
+                            return ::std::result::Result::Err(
+                                ::weaveffi::abi::BufferDecodeError {
+                                    context: "rich enum tag out of range",
+                                },
+                            )
+                        }
                     }
                 })
             }
         }
 
         impl ::weaveffi::abi::ByValue for #ty {}
-    })
+    }
 }

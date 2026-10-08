@@ -5,6 +5,7 @@
 # consumer against one sample and must exit 0.
 set -uo pipefail
 . "$(dirname "$0")/../lib.sh"
+require_tools swift swift
 
 # Swift: a throwaway executable package depends on the generated SwiftPM
 # package as-is through a local path dependency. The generated C module links
@@ -26,7 +27,7 @@ swift_consumer() {
 import PackageDescription
 let package = Package(
     name: "conformance",
-    platforms: [.macOS(.v10_15)],
+    platforms: [.macOS("11.0")],
     dependencies: [.package(path: "$gen")],
     targets: [
         .executableTarget(
@@ -39,20 +40,12 @@ EOF
     ( cd "$pkg" && swift build -Xlinker -L"$LIBDIR" 2>&1 && .build/debug/conformance )
 }
 
-swift_contacts()   { swift_consumer contacts contacts.swift; }
+swift_calculator() { swift_consumer calculator calculator.swift; }
+swift_codec() { swift_consumer codec codec.swift; }
+swift_kvstore() { swift_consumer kvstore kvstore.swift; }
 
-swift_events()     { swift_consumer events events.swift; }
-
-swift_kvstore()    { swift_consumer kvstore kvstore.swift; }
-
-swift_async_demo() { swift_consumer async-demo async_demo.swift; }
-
-swift_codec()      { swift_consumer codec codec.swift; }
-
-lane swift-contacts swift_contacts
-lane swift-events swift_events
-lane swift-kvstore swift_kvstore
-lane swift-async-demo swift_async_demo
+lane swift-calculator swift_calculator
 lane swift-codec swift_codec
+lane swift-kvstore swift_kvstore
 
 finish_lanes

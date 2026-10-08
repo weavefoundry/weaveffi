@@ -7,24 +7,24 @@
 //! [`weaveffi_model::plan::CallbackProtocol`]: each method lowers its
 //! arguments (strings, bytes, and buffers are borrowed for the call as
 //! `(ptr, len)`; objects transfer one strong reference the consumer adopts),
-//! calls the entry with `(ctx, args…, &mut err)`, and then checks `err`. A
-//! method declared to return `Result<T, weaveffi::ForeignError>` returns the
-//! consumer's failure as an `Err`; one returning a plain `T` raises it
-//! through `weaveffi::abi::raise_foreign_error` (an unwind on unwinding
-//! builds, a deferred report to the enclosing thunk on `panic = "abort"`
-//! builds).
+//! calls the entry with `(ctx, args…, [out_ptr, out_len,] &mut err)`, adopts
+//! whatever the consumer returned, and then checks `err`. Every method
+//! returns `Result<T, weaveffi::ForeignError>`, so a consumer failure is an
+//! `Err` and nothing unwinds.
 
 use proc_macro2::TokenStream;
-use quote::{quote, ToTokens};
+use quote::quote;
 use syn::spanned::Spanned as _;
-use weaveffi_model::model::{CallbackInterfaceBinding, CallbackMethodBinding, ParamBinding, Ty};
+use weaveffi_model::model::{CallbackInterfaceBinding, CallbackMethodBinding, ParamBinding};
+use weaveffi_model::ty::{Family, Ty};
 
-use super::helpers::{ident, is_copy, ret_arrow, rust_type_ident, slot_type_for, UserSig};
+use super::helpers::{ident, ret_arrow_for, slot_type_for, UserSig};
 use super::unsupported;
 
 /// Build the lowering for one callback-method argument as `(preamble, C
 /// arguments)`. The Rust parameter is whatever the producer's trait
-/// declares; everything is borrowed for the duration of the vtable call.
+/// declares; everything but an object is borrowed for the duration of the
+/// vtable call.
 fn lower_callback_arg(
     pb: &ParamBinding,
     user: &UserSig<'_>,
@@ -34,68 +34,59 @@ fn lower_callback_arg(
     let none = TokenStream::new();
     // Borrow the value whether it arrived owned or borrowed.
     let borrowed = if is_ref { quote!(#n) } else { quote!(&#n) };
-    let tmp = ident(&format!("__wv_cb_{}", pb.name));
-
-    // A buffered payload is borrowed for the call: encode it into a local
-    // value buffer, hand the consumer its `(ptr, len)` view, and let the
-    // encoding drop afterward.
-    if pb.ty.is_buffered() {
-        return Ok((
-            quote!(let #tmp = ::weaveffi::abi::encode_value(#borrowed);),
-            vec![quote!(#tmp.as_ptr()), quote!(#tmp.len())],
-        ));
-    }
-    Ok(match &pb.ty {
-        Ty::Enum(_) => (none, vec![quote!(#n.__weaveffi_to_i32())]),
-        ty if is_copy(ty) => {
-            let v = if is_ref { quote!(*#n) } else { quote!(#n) };
-            (none, vec![v])
+    let ptr = ident(&format!("__wv_{}_ptr", pb.name));
+    let len = ident(&format!("__wv_{}_len", pb.name));
+    let pair = |slots: TokenStream| {
+        (
+            quote!(let (#ptr, #len) = #slots;),
+            vec![quote!(#ptr), quote!(#len)],
+        )
+    };
+    Ok(match pb.ty.family() {
+        Family::Direct => match &pb.ty {
+            Ty::Enum(_) => (
+                none,
+                vec![quote!(::weaveffi::abi::CEnum::to_i32(#borrowed))],
+            ),
+            _ => (none, vec![if is_ref { quote!(*#n) } else { quote!(#n) }]),
+        },
+        Family::String => pair(quote!(::weaveffi::abi::str_slots(&#n))),
+        Family::Bytes => pair(quote!(::weaveffi::abi::byte_slots(&#n))),
+        // A buffered argument is encoded into a local value buffer the
+        // consumer borrows for the call.
+        Family::Buffer => {
+            let tmp = ident(&format!("__wv_{}_buf", pb.name));
+            let value = if user.param_is_slice(&pb.name) {
+                quote!(&<[_]>::to_vec(#n))
+            } else {
+                borrowed
+            };
+            (
+                quote!(let #tmp = ::weaveffi::abi::encode_value(#value);),
+                vec![quote!(#tmp.as_ptr()), quote!(#tmp.len())],
+            )
         }
-        Ty::StringUtf8 => (
-            quote!(let #tmp: &str = ::std::convert::AsRef::<str>::as_ref(#borrowed);),
-            vec![quote!(#tmp.as_ptr()), quote!(#tmp.len())],
-        ),
-        Ty::Bytes => (
-            quote!(let #tmp: &[u8] = ::std::convert::AsRef::<[u8]>::as_ref(#borrowed);),
-            vec![quote!(#tmp.as_ptr()), quote!(#tmp.len())],
-        ),
         // An object transfers one strong reference the consumer adopts (and
         // eventually `_destroy`s). The producer must hold it as an `Arc<T>`,
         // since only an `Arc` allocation can carry a reference count.
-        Ty::Interface(_) => {
+        Family::Object { nullable } => {
             if !user.param_wants_arc(&pb.name) {
                 return Err(unsupported(
                     user.param_span(&pb.name),
                     &pb.name,
                     "callback-interface object parameter that is not an `Arc<T>` (the consumer \
-                     adopts a reference, so spell it `Arc<T>`)",
+                     adopts a reference, so spell it `Arc<T>` or `Option<Arc<T>>`)",
                 ));
             }
             let obj = user.param_object(&pb.name);
-            (
-                none,
-                vec![
-                    quote!(::weaveffi::abi::lower_object::<#obj>(::std::sync::Arc::clone(#borrowed))),
-                ],
-            )
+            let arg = if nullable {
+                quote!(::weaveffi::abi::lower_object_opt::<#obj>(::std::clone::Clone::clone(#borrowed)))
+            } else {
+                quote!(::weaveffi::abi::lower_object::<#obj>(::std::sync::Arc::clone(#borrowed)))
+            };
+            (none, vec![arg])
         }
-        Ty::Optional(inner) if matches!(inner.as_ref(), Ty::Interface(_)) => {
-            if !user.param_wants_arc(&pb.name) {
-                return Err(unsupported(
-                    user.param_span(&pb.name),
-                    &pb.name,
-                    "callback-interface object parameter that is not an `Option<Arc<T>>`",
-                ));
-            }
-            let obj = user.param_object(&pb.name);
-            (
-                none,
-                vec![
-                    quote!(::weaveffi::abi::lower_object_opt::<#obj>(::std::clone::Clone::clone(#borrowed))),
-                ],
-            )
-        }
-        _ => {
+        Family::Callback { .. } | Family::Iterator => {
             return Err(unsupported(
                 user.param_span(&pb.name),
                 &pb.name,
@@ -105,52 +96,55 @@ fn lower_callback_arg(
     })
 }
 
-/// The lift of a successful vtable return `__wv_ret` into the method's value
-/// type, as `(lift, fallback)`. `lift` evaluates to
-/// `Result<T, ForeignError>` (an out-of-range enum discriminant is a
-/// marshalling failure); `fallback` is the value a plain-`T` method returns
-/// after raising a failure on a `panic = "abort"` build. Callback returns are
-/// direct-family only.
-fn lift_callback_ret(
-    ret: Option<&Ty>,
-    user: &UserSig<'_>,
-) -> syn::Result<(TokenStream, TokenStream)> {
-    Ok(match ret {
-        None => (quote!(::std::result::Result::Ok(())), TokenStream::new()),
-        Some(Ty::Enum(name)) => {
-            let et = user
-                .ret_object()
-                .unwrap_or_else(|| rust_type_ident(name).into_token_stream());
-            (
-                quote! {
-                    <#et>::__weaveffi_from_i32(__wv_ret).ok_or_else(|| {
-                        ::weaveffi::abi::ForeignError {
-                            code: ::weaveffi::abi::MARSHAL_ERROR_CODE,
-                            message: ::std::string::String::from(
-                                "callback interface returned an invalid enum discriminant",
-                            ),
-                        }
-                    })
-                },
-                quote!(<#et>::__weaveffi_placeholder()),
-            )
+/// The statements adopting the vtable entry's return (`__wv_ret`, or the
+/// `out_ptr`/`out_len` run) as `__wv_value: Result<T, ForeignError>`.
+fn adopt_callback_ret(ret: Option<&Ty>, user: &UserSig<'_>) -> TokenStream {
+    let Some(ty) = ret else {
+        return quote!(let __wv_value = ::std::result::Result::Ok(__wv_ret););
+    };
+    let value = match ty.family() {
+        Family::Direct => match ty {
+            Ty::Enum(_) => {
+                let et = user.ret_object().unwrap_or_else(|| quote!(_));
+                quote!(::weaveffi::abi::callback_ret_enum::<#et>(__wv_ret))
+            }
+            _ => quote!(::std::result::Result::Ok(__wv_ret)),
+        },
+        Family::Object { nullable: false } => {
+            quote!(unsafe { ::weaveffi::abi::callback_ret_object(__wv_ret) })
         }
-        Some(ty) if is_copy(ty) => (
-            quote!(::std::result::Result::Ok(__wv_ret)),
-            quote!(__wv_ret),
-        ),
-        Some(_) => {
-            return Err(unsupported(
-                user.ret_span(),
-                "callback return",
-                "non-direct return type",
-            ))
+        Family::Object { nullable: true } => {
+            quote!(::std::result::Result::Ok(unsafe {
+                ::weaveffi::abi::callback_ret_object_opt(__wv_ret)
+            }))
         }
-    })
+        Family::String => {
+            quote!(unsafe { ::weaveffi::abi::callback_ret_string(__wv_out_ptr, __wv_out_len) })
+        }
+        Family::Bytes => {
+            quote!(unsafe { ::weaveffi::abi::callback_ret_bytes(__wv_out_ptr, __wv_out_len) })
+        }
+        Family::Buffer => {
+            let ty = user.ret_value_type().unwrap_or_else(|| quote!(_));
+            quote!(unsafe {
+                ::weaveffi::abi::callback_ret_buffer::<#ty>(__wv_out_ptr, __wv_out_len)
+            })
+        }
+        Family::Callback { .. } | Family::Iterator => {
+            unreachable!("validation never admits {ty} as a callback return")
+        }
+    };
+    quote!(let __wv_value = #value;)
 }
 
-/// Emit one method of the foreign wrapper's trait impl.
-fn gen_foreign_method(m: &CallbackMethodBinding, sig: &syn::Signature) -> syn::Result<TokenStream> {
+/// Emit one method of the foreign wrapper's trait impl. `domain` is the path
+/// of the error domain in scope, which a `throws` method's failures are
+/// checked against.
+fn gen_foreign_method(
+    m: &CallbackMethodBinding,
+    sig: &syn::Signature,
+    domain: Option<&TokenStream>,
+) -> syn::Result<TokenStream> {
     let user = UserSig::new(sig, None);
     let field = ident(&m.name);
     let mut pre = TokenStream::new();
@@ -160,25 +154,34 @@ fn gen_foreign_method(m: &CallbackMethodBinding, sig: &syn::Signature) -> syn::R
         pre.extend(p);
         c_args.extend(args);
     }
-    let (lift, fallback) = lift_callback_ret(m.ret.as_ref(), &user)?;
-    let result = quote! {
-        ::weaveffi::abi::foreign_status(&__wv_err).and_then(|()| #lift)
-    };
-    let tail = if user.returns_result() {
-        result
-    } else {
-        quote! {
-            match #result {
-                ::std::result::Result::Ok(__wv_v) => __wv_v,
-                ::std::result::Result::Err(__wv_e) => {
-                    ::weaveffi::abi::raise_foreign_error(__wv_e);
-                    #fallback
-                }
-            }
+    let run = m
+        .ret
+        .as_ref()
+        .is_some_and(|t| matches!(t.family(), Family::String | Family::Bytes | Family::Buffer));
+    if run {
+        pre.extend(quote! {
+            let mut __wv_out_ptr: *mut u8 = ::std::ptr::null_mut();
+            let mut __wv_out_len: usize = 0;
+        });
+        c_args.push(quote!(&mut __wv_out_ptr));
+        c_args.push(quote!(&mut __wv_out_len));
+    }
+    let adopt = adopt_callback_ret(m.ret.as_ref(), &user);
+    let status = match (m.throws, domain) {
+        (true, Some(domain)) => {
+            quote!(::weaveffi::abi::callback_status_in::<#domain>(&__wv_err)?;)
         }
+        (true, None) => {
+            return Err(syn::Error::new(
+                sig.span(),
+                "weaveffi: a #[weaveffi::throws] callback method needs a #[weaveffi::error] \
+                 domain in this module or a parent module",
+            ))
+        }
+        (false, _) => quote!(::weaveffi::abi::callback_status(&__wv_err)?;),
     };
     Ok(quote! {
-        #[allow(unsafe_code, unused_variables, clippy::let_unit_value, clippy::unit_arg)]
+        #[allow(unsafe_code, unused_variables, unused_mut, clippy::let_unit_value, clippy::unit_arg)]
         #sig {
             #pre
             let mut __wv_err = ::weaveffi::abi::FfiError::default();
@@ -187,18 +190,23 @@ fn gen_foreign_method(m: &CallbackMethodBinding, sig: &syn::Signature) -> syn::R
             let __wv_ret = unsafe {
                 (self.0.vtable().#field)(self.0.ctx(), #(#c_args,)* &mut __wv_err)
             };
-            #tail
+            // The consumer's return is adopted (and released on failure)
+            // before its status is checked.
+            #adopt
+            #status
+            __wv_value
         }
     })
 }
 
 /// Emit everything a callback interface needs on the producer side.
 ///
-/// * `{vtable_tag}`: the `#[repr(C)]` vtable struct, one `unsafe extern "C"`
-///   function pointer per method in declaration order plus the trailing
-///   `free`, exactly as the generated header declares it.
+/// * `{vtable_tag}`: the `#[repr(C)]` vtable struct, the runtime's
+///   `VtableHeader` (`size`, `flags`, `free`) followed by one
+///   `unsafe extern "C"` function pointer per method in declaration order,
+///   exactly as the generated header declares it.
 /// * `__WeaveffiForeign_{Trait}`: a newtype over
-///   [`ForeignCallback`](weaveffi_abi::ForeignCallback) implementing the
+///   [`ForeignCallback`](weaveffi::abi::ForeignCallback) implementing the
 ///   producer's trait by forwarding each call through the vtable.
 /// * `impl CallbackInterface for dyn Trait`, which is how a thunk elsewhere
 ///   in the crate (possibly a nested module) names the vtable type and lifts
@@ -206,10 +214,11 @@ fn gen_foreign_method(m: &CallbackMethodBinding, sig: &syn::Signature) -> syn::R
 pub(crate) fn gen_callback_interface(
     cb: &CallbackInterfaceBinding,
     item: &syn::ItemTrait,
+    domain: Option<&TokenStream>,
     prefix: &str,
 ) -> syn::Result<TokenStream> {
     let vt = ident(&cb.vtable_tag);
-    let trait_ident = ident(&cb.name);
+    let trait_ident = &item.ident;
     let foreign = ident(&format!("__WeaveffiForeign_{}", cb.name));
 
     let mut fields: Vec<TokenStream> = Vec::new();
@@ -238,9 +247,9 @@ pub(crate) fn gen_callback_interface(
             .iter()
             .map(|p| slot_type_for(p, &m.params, &user, prefix))
             .collect::<syn::Result<Vec<_>>>()?;
-        let arrow = ret_arrow(&m.abi_ret, prefix);
+        let arrow = ret_arrow_for(&m.abi_ret, m.ret.as_ref(), &user, prefix);
         fields.push(quote!(pub #field: unsafe extern "C" fn(#(#slots),*) #arrow,));
-        methods.push(gen_foreign_method(m, sig)?);
+        methods.push(gen_foreign_method(m, sig, domain)?);
     }
 
     let vtable_doc = format!(
@@ -253,15 +262,13 @@ pub(crate) fn gen_callback_interface(
         #[repr(C)]
         #[allow(non_camel_case_types, non_snake_case)]
         pub struct #vt {
+            pub header: ::weaveffi::abi::VtableHeader,
             #(#fields)*
-            pub free: unsafe extern "C" fn(ctx: *mut ::std::ffi::c_void),
         }
 
-        impl ::weaveffi::abi::Vtable for #vt {
-            fn free(&self) -> unsafe extern "C" fn(*mut ::std::ffi::c_void) {
-                self.free
-            }
-        }
+        // SAFETY: `#[repr(C)]` with the header as its first field.
+        #[allow(unsafe_code)]
+        unsafe impl ::weaveffi::abi::Vtable for #vt {}
 
         #[doc(hidden)]
         #[allow(non_camel_case_types)]

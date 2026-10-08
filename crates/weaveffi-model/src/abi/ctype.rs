@@ -142,7 +142,7 @@ impl CType {
             CType::Size => "usize".to_string(),
             CType::Char => "c_char".to_string(),
             CType::Void => "std::ffi::c_void".to_string(),
-            // The runtime types come from `weaveffi-abi` and keep their fixed
+            // The runtime types come from `weaveffi::abi` and keep their fixed
             // names regardless of the configured business-symbol prefix.
             CType::CancelToken => "::weaveffi::abi::FfiCancelToken".to_string(),
             CType::Error => "::weaveffi::abi::FfiError".to_string(),

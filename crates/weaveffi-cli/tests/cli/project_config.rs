@@ -55,12 +55,12 @@ const ALL_TARGETS: [&str; 11] = [
     "c", "cpp", "swift", "kotlin", "node", "wasm", "python", "dotnet", "dart", "go", "ruby",
 ];
 
-/// The kvstore sample's `weaveffi.toml` sits beside its `src/lib.rs`; running
-/// on the Rust source must pick it up without `--config` and honor every
-/// per-target table plus the `[package]` identity.
+/// The kvstore sample's `weaveffi.toml` sits beside its `Cargo.toml`;
+/// generating from the crate must pick it up without `--config` and honor
+/// every per-target table plus the `[package]` identity.
 #[test]
 fn discovers_weaveffi_toml_above_the_input() {
-    let input = repo_root().join("samples/kvstore/src/lib.rs");
+    let input = repo_root().join("samples/kvstore");
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path();
     generate(&input, out, &[]);
@@ -101,7 +101,7 @@ fn discovers_weaveffi_toml_above_the_input() {
 /// `--config` names the file explicitly and wins over discovery.
 #[test]
 fn explicit_config_overrides_discovery() {
-    let input = repo_root().join("samples/kvstore/src/lib.rs");
+    let input = repo_root().join("samples/kvstore");
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("other.toml");
     fs::write(
@@ -111,7 +111,7 @@ fn explicit_config_overrides_discovery() {
             "name = \"renamed\"\n",
             "version = \"9.9.9\"\n",
             "[generators.cpp]\n",
-            "namespace = \"elsewhere\"\n",
+            "name = \"elsewhere\"\n",
         ),
     )
     .unwrap();
@@ -134,22 +134,19 @@ fn explicit_config_overrides_discovery() {
     );
 }
 
-/// Without any config, a `lib.rs` input names its package after the crate
-/// directory (Cargo's convention), not after the file stem.
+/// Rust source is never read: a `.rs` input fails and points at the crate,
+/// whose API is read from its built library.
 #[test]
-fn lib_rs_without_config_is_named_after_its_crate_directory() {
-    let dir = tempfile::tempdir().unwrap();
-    let crate_dir = dir.path().join("mycrate").join("src");
-    fs::create_dir_all(&crate_dir).unwrap();
-    let input = crate_dir.join("lib.rs");
-    fs::copy(repo_root().join("samples/calculator/src/lib.rs"), &input).unwrap();
-    let out = dir.path().join("out");
-    generate(&input, &out, &["--target", "node"]);
-    let package_json = read(&out.join("node/package.json"));
-    assert!(
-        package_json.contains("\"name\": \"mycrate\""),
-        "{package_json}"
-    );
+fn rust_source_input_points_at_the_crate() {
+    let input = repo_root().join("samples/calculator/src/lib.rs");
+    let output = assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args(["generate", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("pass the crate"), "{stderr}");
 }
 
 /// A stale `package:` or `generators:` block in an IDL document is rejected
@@ -162,7 +159,7 @@ fn inline_package_block_in_idl_is_an_error() {
     fs::write(
         &idl,
         concat!(
-            "version: \"0.10.0\"\n",
+            "version: \"0.11.0\"\n",
             "package:\n",
             "  name: legacy\n",
             "modules:\n",
@@ -185,7 +182,7 @@ fn inline_package_block_in_idl_is_an_error() {
 /// spelling) fail loudly so a misplaced option cannot be silently dropped.
 #[test]
 fn unknown_config_table_is_an_error() {
-    let input = repo_root().join("samples/calculator/src/lib.rs");
+    let input = repo_root().join("samples/calculator");
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("cfg.toml");
     fs::write(&cfg, "[swift]\nmodule_name = \"Old\"\n").unwrap();
@@ -210,7 +207,7 @@ fn unknown_config_table_is_an_error() {
 /// An unknown `--target` fails instead of silently generating nothing.
 #[test]
 fn unknown_target_is_an_error() {
-    let input = repo_root().join("samples/calculator/src/lib.rs");
+    let input = repo_root().join("samples/calculator");
     let dir = tempfile::tempdir().unwrap();
     let output = assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")
@@ -240,7 +237,7 @@ fn idl_c_prefix_reaches_every_target() {
     fs::write(
         &idl,
         concat!(
-            "version: \"0.10.0\"\n",
+            "version: \"0.11.0\"\n",
             "modules:\n",
             "  - name: calculator\n",
             "    functions:\n",
@@ -271,11 +268,11 @@ fn idl_c_prefix_reaches_every_target() {
 }
 
 /// A Rust producer's prefix is its crate name, so `[package] c_prefix` is
-/// rejected for a `.rs` input instead of generating bindings that call
+/// rejected for a crate input instead of generating bindings that call
 /// symbols the producer never exports.
 #[test]
 fn rust_producer_rejects_c_prefix() {
-    let input = repo_root().join("samples/calculator/src/lib.rs");
+    let input = repo_root().join("samples/calculator");
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("cfg.toml");
     fs::write(&cfg, "[package]\nc_prefix = \"myffi\"\n").unwrap();

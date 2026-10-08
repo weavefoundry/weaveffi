@@ -4,9 +4,9 @@
 //! tags the items it wants to export, and calls `weaveffi::export_runtime!()`
 //! once. The module macro lowers the module tree to the WeaveFFI IR (through
 //! [`weaveffi_model::rust`]), builds the canonical
-//! [`BindingModel`](weaveffi_model::model::BindingModel), and emits the
+//! [`Model`](weaveffi_model::model::Model), and emits the
 //! `extern "C"` thunks every generated language binding calls. All of the
-//! `unsafe` marshalling lives in the `weaveffi-abi` runtime, so the producer
+//! `unsafe` marshalling lives in the `weaveffi::abi` runtime, so the producer
 //! writes only safe Rust.
 //!
 //! ```ignore
@@ -22,10 +22,10 @@
 //! weaveffi::export_runtime!();
 //! ```
 //!
-//! Every C symbol starts with the crate's name (`CARGO_CRATE_NAME`), which
-//! is also the prefix `weaveffi generate` derives for a `.rs` input, so the
-//! generated bindings and the producer can't drift: they're two views of one
-//! parse.
+//! Every C symbol starts with the crate's name (`CARGO_CRATE_NAME`). The
+//! macro also embeds the module's API in the library as metadata, which
+//! `weaveffi generate` reads back out of the built library, so the generated
+//! bindings describe exactly what the library was compiled with.
 //!
 //! # Attributes
 //!
@@ -38,7 +38,9 @@
 //! * [`macro@error`] declares the module's error domain from an enum with
 //!   explicit discriminants; a variant's named fields become the code's
 //!   structured payload.
-//! * [`macro@callback_interface`] declares a trait the consumer implements;
+//! * [`macro@callback_interface`] declares a trait the consumer implements,
+//!   whose methods return `Result<T, weaveffi::ForeignError>`;
+//!   [`macro@throws`] lets one of them report the module's domain errors.
 //!   [`macro@cancellable`] marks an async function as cancellable.
 //! * [`export_runtime!`] emits the runtime symbols (memory, errors, cancel
 //!   tokens, ABI version) once per library.
@@ -55,11 +57,13 @@ mod runtime;
 
 /// Mark an inline `mod` as an exported WeaveFFI namespace.
 ///
-/// The macro re-emits the module and appends the generated C ABI thunks for
-/// every tagged item it contains, recursing into nested `#[weaveffi::module]`
-/// submodules (whose symbols carry the joined module path). A top-level
-/// module also exports `{prefix}_{module}_checksum()`, the contract checksum
-/// generated bindings verify when they load the library.
+/// The macro validates the module tree with the same rules the CLI applies
+/// to an IDL, re-emits the module, and appends the generated C ABI thunks
+/// for every tagged item it contains, recursing into nested
+/// `#[weaveffi::module]` submodules (whose symbols carry the joined module
+/// path). A `#[cfg]` on an exported item applies to its thunks too. A
+/// top-level module also exports `{prefix}_{module}_contract()`, the
+/// contract table generated bindings verify when they load the library.
 #[proc_macro_attribute]
 pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_mod = syn::parse_macro_input!(item as syn::ItemMod);
@@ -70,9 +74,9 @@ pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Emit the runtime symbols every WeaveFFI library exports, prefixed with the
 /// crate's name: `{prefix}_abi_version`, `{prefix}_error_set`,
-/// `{prefix}_error_clear`, `{prefix}_error_free`, `{prefix}_free_bytes`, the
-/// four `{prefix}_cancel_token_*` functions, `{prefix}_debug_live`, and on
-/// `wasm32` `{prefix}_alloc` and `{prefix}_dealloc`.
+/// `{prefix}_error_set_payload`, `{prefix}_error_clear`,
+/// `{prefix}_error_free`, `{prefix}_alloc`, `{prefix}_free_bytes`, the four
+/// `{prefix}_cancel_token_*` functions, and `{prefix}_debug_live`.
 ///
 /// Invoke it exactly once, at the crate root of the `cdylib`. It takes no
 /// arguments.
@@ -125,10 +129,17 @@ marker_attr! {
 }
 marker_attr! {
     /// Declare a callback interface: a trait whose `&self` methods the
-    /// consumer implements. Producers accept one as `Arc<dyn Trait>`. A
-    /// method may return `Result<T, weaveffi::ForeignError>` to receive the
-    /// consumer's failure as a value.
+    /// consumer implements. Producers accept one as `Arc<dyn Trait>` (or
+    /// `Option<Arc<dyn Trait>>`). Every method returns
+    /// `Result<T, weaveffi::ForeignError>`, which carries the consumer's
+    /// failure as a value.
     callback_interface
+}
+marker_attr! {
+    /// Mark a callback-interface method as able to report the error domain
+    /// in scope: the consumer may fail with one of its codes, which the
+    /// producer decodes with `weaveffi::ForeignError::domain`.
+    throws
 }
 marker_attr! {
     /// Mark an `async fn` as cancellable: it takes a `weaveffi::CancelToken`

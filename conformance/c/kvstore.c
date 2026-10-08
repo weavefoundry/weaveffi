@@ -1,108 +1,80 @@
-// Conformance consumer: kvstore sample, C target (ABI revision 3).
+// Conformance consumer: kvstore sample, C target (ABI revision 4).
 //
-// Exercises the Store interface ABI end to end: the fallible constructor
-// (`Store_open`), instance methods taking the receiver as the leading
-// argument, the static method (`Store_default_capacity`), (ptr, len) string
-// and bytes parameters, the typed error-domain codes surfaced through the
-// error-out slot, the iterator's owned (ptr, len) items, the `Entry` record
-// (list and map fields included) decoded through `kvstore_buffer.h`, the
-// `kv.stats` submodule, the hand-written `EvictionListener` vtable (set,
-// fire synchronously on delete and on expiry-on-read, replace, clear,
-// detach, `free`), a consumer failure raised from the listener surfacing as
-// code -4, the reference-counted object graph (`share`, `fork`,
-// `clone`/`destroy`, `larger` with `Store?` both ways, `describe` returning
-// a record that carries objects, `open_many` returning a list of objects,
-// `total_count` taking objects inside a list and an optional record), and
-// the cancellable async `compact`, whose cancelled call completes with -5.
+// Drives the feature-complete producer through its generated header and
+// `kvstore_buffer.h`:
+//
+//   * the load-time checks (ABI revision, both modules' contract tables);
+//   * the `Store` interface: fallible and infallible constructors, methods,
+//     statics, the deprecated `size`, records (`Entry`, `StoreInfo`), the
+//     C-style `EntryKind`, maps and optionals, and the logical clock;
+//   * `KvError` codes with their payload fields decoded (`KeyNotFound`,
+//     `Expired`, `StoreFull`, `Rejected`), plus marshalling failures (-3);
+//   * lazy iterators of strings (throwing), records, and objects;
+//   * three callback interfaces implemented in C: a `Listener` (retained,
+//     filtered by `accepts`, told about every `Change`, detached when it
+//     fails, and notified from a producer thread during compaction), a
+//     `Policy` (a record return, a throwing method whose typed error and
+//     payload reach the `put` caller, an object parameter and object
+//     return, a null object and a malformed return rejected), and a `Loader`
+//     passed as an optional callback (string, bytes, and optional-object
+//     returns; typed errors decoded by the producer or passed through);
+//   * `Store` objects in every position: parameter, return, optional, list,
+//     map value, record field, iterator element, async result, and callback
+//     parameter and return;
+//   * async calls: an async free function returning an object, a cancellable
+//     method cancelled mid-pause (completing with -5 while its background
+//     work stops cooperatively, shown by `active_jobs`), an async list, an
+//     async free function in the nested `kv.stats` module, and concurrent
+//     launches;
+//   * the nested `kv.stats` module (the parent's `Store` and error domain)
+//     and the sibling `report` root (the shared `Entry` record and its own
+//     error domain).
+//
 // Ends by asserting the producer's leak counters are zero.
 
 #include "harness.h"
 
+#include <pthread.h>
 #include <stdatomic.h>
 
 #include "kvstore_buffer.h"
 
-// ── eviction listener (consumer-implemented callback interface) ────────────
+static pthread_t g_main_thread;
 
-typedef struct {
-    int evictions;
-    char last_key[64];
-    int32_t last_reason;
-    size_t last_value_len;
-    int detach_after;  // return false (detach) once this many evictions ran
-    int fail;          // report a consumer failure instead of observing
-} listener_ctx;
+// ── small helpers ──────────────────────────────────────────────────────────
 
-static int g_listener_freed = 0;
-
-// The Entry buffer is borrowed for the duration of the dispatch.
-static bool on_evict(void* ctx, const uint8_t* entry_ptr, size_t entry_len,
-                     kvstore_kv_EvictionReason reason, kvstore_error* out_err) {
-    listener_ctx* l = (listener_ctx*)ctx;
-    if (l->fail) {
-        kvstore_error_set(out_err, -4, "listener exploded");
-        return true;
-    }
-    kvstore_kv_Entry e;
-    assert(kvstore_kv_Entry_decode(entry_ptr, entry_len, &e));
-    assert(e.id > 0 && e.created_at > 0);
-    snprintf(l->last_key, sizeof l->last_key, "%s", e.key.ptr);
-    l->last_value_len = e.value.len;
-    kvstore_kv_Entry_free(&e);
-    l->last_reason = (int32_t)reason;
-    l->evictions++;
-    return l->detach_after == 0 || l->evictions < l->detach_after;
+static int str_is(kvstore_str s, const char* expected) {
+    return bytes_eq((const uint8_t*)s.ptr, s.len, expected);
 }
 
-static void listener_free(void* ctx) {
-    free(ctx);
-    g_listener_freed++;
+static int starts_with(kvstore_str s, const char* prefix) {
+    size_t n = strlen(prefix);
+    return s.len >= n && memcmp(s.ptr, prefix, n) == 0;
 }
 
-static const kvstore_kv_EvictionListener_vtable LISTENER_VTABLE = {
-    on_evict,
-    listener_free,
-};
-
-static listener_ctx* new_listener(int detach_after, int fail) {
-    listener_ctx* l = (listener_ctx*)calloc(1, sizeof *l);
-    assert(l != NULL);
-    l->detach_after = detach_after;
-    l->fail = fail;
-    return l;
+static char* take_string(const uint8_t* ptr, size_t len) {
+    char* s = (char*)calloc(len + 1, 1);
+    if (len > 0) memcpy(s, ptr, len);
+    kvstore_free_bytes((uint8_t*)ptr, len);
+    return s;
 }
 
-// ── async completion state ─────────────────────────────────────────────────
-static atomic_int g_compact_done = 0;
-static int64_t g_compact_result = -1;
-static int32_t g_compact_err = -1;
-
-static void on_compact_done(void* context, kvstore_error* err, int64_t result) {
-    assert(context == (void*)0x5150);
-    g_compact_err = err ? err->code : 0;
-    kvstore_error_free(err);
-    g_compact_result = result;
-    atomic_store(&g_compact_done, 1);
+// Copy a writer's bytes into a run the producer adopts.
+static void hand_over(kvstore_writer* w, uint8_t** out_ptr, size_t* out_len) {
+    assert(!w->failed);
+    uint8_t* run = kvstore_alloc(w->len);
+    if (w->len > 0) memcpy(run, w->ptr, w->len);
+    *out_ptr = run;
+    *out_len = w->len;
+    kvstore_writer_free(w);
 }
 
-static void wait_compact(void) {
-    for (int i = 0; i < 5000 && !atomic_load(&g_compact_done); i++) sleep_ms(1);
-    assert(atomic_load(&g_compact_done));
-    atomic_store(&g_compact_done, 0);
-}
-
-// ── helpers ────────────────────────────────────────────────────────────────
-
-// The `ttl_seconds: i64?` parameter, encoded present or absent.
-typedef struct {
-    kvstore_writer w;
-} ttl_buf;
-
-static ttl_buf ttl(const int64_t* seconds) {
-    ttl_buf t;
-    memset(&t, 0, sizeof t);
-    kvstore_opt_i64_write(&t.w, seconds);
-    return t;
+static void hand_over_text(const char* s, uint8_t** out_ptr, size_t* out_len) {
+    size_t n = strlen(s);
+    uint8_t* run = kvstore_alloc(n);
+    if (n > 0) memcpy(run, s, n);
+    *out_ptr = run;
+    *out_len = n;
 }
 
 static kvstore_kv_Store* open_store(const char* path) {
@@ -112,49 +84,852 @@ static kvstore_kv_Store* open_store(const char* path) {
     return s;
 }
 
-static void put_ttl(kvstore_kv_Store* s, const char* key, const uint8_t* v, size_t n,
-                    const int64_t* seconds) {
+static uint32_t count(const kvstore_kv_Store* s) {
     kvstore_error err = {0};
-    ttl_buf t = ttl(seconds);
-    assert(kvstore_kv_Store_put(s, STR(key), v, n, kvstore_kv_EntryKind_Persistent, t.w.ptr,
-                                t.w.len, &err));
-    assert(err.code == 0);
-    kvstore_writer_free(&t.w);
-}
-
-static void put(kvstore_kv_Store* s, const char* key, const uint8_t* v, size_t n) {
-    put_ttl(s, key, v, n, NULL);
-}
-
-static int64_t count(const kvstore_kv_Store* s) {
-    kvstore_error err = {0};
-    int64_t n = kvstore_kv_Store_count(s, &err);
+    uint32_t n = kvstore_kv_Store_count(s, &err);
     assert(err.code == 0);
     return n;
 }
 
-// Collect list_keys(prefix?) into `out`; each key is an owned string.
-static int list_keys(kvstore_kv_Store* s, const char* prefix, char** out, int cap) {
+static char* path_of(const kvstore_kv_Store* s) {
     kvstore_error err = {0};
-    kvstore_str view = kvstore_str_of(prefix);
+    size_t len = 0;
+    const uint8_t* p = kvstore_kv_Store_path(s, &len, &err);
+    assert(err.code == 0);
+    return take_string(p, len);
+}
+
+static int path_is(const kvstore_kv_Store* s, const char* expected) {
+    char* p = path_of(s);
+    int ok = strcmp(p, expected) == 0;
+    free(p);
+    return ok;
+}
+
+// put(key, value, kind, ttl?): decodes the returned entry into `out` on
+// success; on failure leaves the error in `err`.
+static bool try_put(const kvstore_kv_Store* s, const char* key, const char* value,
+                    kvstore_kv_EntryKind kind, const int64_t* ttl, kvstore_kv_Entry* out,
+                    kvstore_error* err) {
+    kvstore_writer t;
+    memset(&t, 0, sizeof t);
+    kvstore_opt_i64_write(&t, ttl);
+    size_t len = 0;
+    const uint8_t* buf = kvstore_kv_Store_put(s, STR(key), (const uint8_t*)value,
+                                              strlen(value), kind, t.ptr, t.len, &len, err);
+    kvstore_writer_free(&t);
+    if (buf == NULL) {
+        assert(err->code != 0);
+        return false;
+    }
+    assert(err->code == 0);
+    kvstore_kv_Entry e;
+    assert(kvstore_kv_Entry_decode(buf, len, &e));
+    kvstore_free_bytes((uint8_t*)buf, len);
+    if (out != NULL) {
+        *out = e;
+    } else {
+        kvstore_kv_Entry_free(&e);
+    }
+    return true;
+}
+
+static void put(const kvstore_kv_Store* s, const char* key, const char* value) {
+    kvstore_error err = {0};
+    assert(try_put(s, key, value, kvstore_kv_EntryKind_Persistent, NULL, NULL, &err));
+}
+
+// The optional-string parameter buffer for a prefix.
+static kvstore_writer prefix_buf(const char* prefix) {
     kvstore_writer w;
     memset(&w, 0, sizeof w);
+    kvstore_str view = kvstore_str_of(prefix);
     kvstore_opt_string_write(&w, prefix ? &view : NULL);
-    kvstore_kv_Store_ListKeysIterator* it = kvstore_kv_Store_list_keys(s, w.ptr, w.len, &err);
+    return w;
+}
+
+static void expect_key_not_found(kvstore_error* err, const char* key) {
+    assert(err->code == kvstore_kv_KvError_KeyNotFound);
+    kvstore_kv_KvError_KeyNotFound_payload p;
+    assert(kvstore_kv_KvError_KeyNotFound_payload_decode(err->payload_ptr, err->payload_len, &p));
+    assert(str_is(p.key, key));
+    kvstore_kv_KvError_KeyNotFound_payload_free(&p);
+    kvstore_error_clear(err);
+}
+
+// ── listener (consumer-implemented, retained) ──────────────────────────────
+
+typedef struct {
+    const char* skip;     // accepts() answers false for this key
+    const char* fail_on;  // accepts() reports a failure for this key
+    atomic_int puts, removed, expired, cleared;
+    atomic_int off_main_thread;  // on_change calls on a producer thread
+    // The last Put's entry fields and the last Removed key.
+    uint32_t last_version;
+    bool last_replaced;
+    char last_key[64];
+    uint32_t last_cleared;
+} listener_ctx;
+
+static atomic_int g_listeners_freed;
+
+static bool listener_accepts(void* ctx, const uint8_t* key_ptr, size_t key_len,
+                             kvstore_error* out_err) {
+    listener_ctx* l = (listener_ctx*)ctx;
+    if (l->fail_on != NULL && bytes_eq(key_ptr, key_len, l->fail_on)) {
+        kvstore_error_set(out_err, -4, "listener refused");
+        return false;
+    }
+    return l->skip == NULL || !bytes_eq(key_ptr, key_len, l->skip);
+}
+
+// The Change buffer is borrowed for the call.
+static void listener_on_change(void* ctx, const uint8_t* change_ptr, size_t change_len,
+                               kvstore_error* out_err) {
+    (void)out_err;
+    listener_ctx* l = (listener_ctx*)ctx;
+    if (!pthread_equal(pthread_self(), g_main_thread)) atomic_fetch_add(&l->off_main_thread, 1);
+    kvstore_kv_Change c;
+    assert(kvstore_kv_Change_decode(change_ptr, change_len, &c));
+    switch (c.tag) {
+    case kvstore_kv_Change_Put:
+        l->last_version = c.as.Put.entry.version;
+        l->last_replaced = c.as.Put.replaced;
+        snprintf(l->last_key, sizeof l->last_key, "%s", c.as.Put.entry.key.ptr);
+        atomic_fetch_add(&l->puts, 1);
+        break;
+    case kvstore_kv_Change_Removed:
+        snprintf(l->last_key, sizeof l->last_key, "%s", c.as.Removed.key.ptr);
+        atomic_fetch_add(c.as.Removed.expired ? &l->expired : &l->removed, 1);
+        break;
+    case kvstore_kv_Change_Cleared:
+        l->last_cleared = c.as.Cleared.count;
+        atomic_fetch_add(&l->cleared, 1);
+        break;
+    }
+    kvstore_kv_Change_free(&c);
+}
+
+static void listener_free(void* ctx) {
+    free(ctx);
+    atomic_fetch_add(&g_listeners_freed, 1);
+}
+
+static const kvstore_kv_Listener_vtable LISTENER_VTABLE = {
+    sizeof(kvstore_kv_Listener_vtable), 0, listener_free, listener_accepts, listener_on_change,
+};
+
+static listener_ctx* new_listener(const char* skip, const char* fail_on) {
+    listener_ctx* l = (listener_ctx*)calloc(1, sizeof *l);
+    assert(l != NULL);
+    l->skip = skip;
+    l->fail_on = fail_on;
+    return l;
+}
+
+// ── policy (consumer-implemented, rich returns, throws) ────────────────────
+
+typedef struct {
+    kvstore_kv_Store* other;  // owned reference: where "b/" keys go
+    atomic_int admitted;
+} policy_ctx;
+
+static atomic_int g_policies_freed;
+
+static void policy_admit(void* ctx, const uint8_t* entry_ptr, size_t entry_len,
+                         uint8_t** out_ptr, size_t* out_len, kvstore_error* out_err) {
+    policy_ctx* p = (policy_ctx*)ctx;
+    atomic_fetch_add(&p->admitted, 1);
+    kvstore_kv_Entry e;
+    assert(kvstore_kv_Entry_decode(entry_ptr, entry_len, &e));
+    assert(e.version == 0 && "the store assigns the version after admission");
+    kvstore_writer w;
+    memset(&w, 0, sizeof w);
+    if (starts_with(e.key, "secret")) {
+        // A typed domain error with its fields as the payload.
+        kvstore_error_set(out_err, kvstore_kv_KvError_Rejected, "secrets are not stored");
+        kvstore_kv_KvError_Rejected_payload r;
+        r.key = e.key;
+        r.reason = kvstore_str_of("no secrets");
+        kvstore_kv_KvError_Rejected_payload_write(&w, &r);
+        kvstore_error_set_payload(out_err, w.ptr, w.len);
+        kvstore_writer_free(&w);
+    } else if (starts_with(e.key, "boom")) {
+        kvstore_error_set(out_err, 4242, "policy exploded");  // not a domain code: -4
+    } else if (starts_with(e.key, "garbage")) {
+        hand_over_text("?", out_ptr, out_len);  // not an Entry: -3
+    } else {
+        // Rewrite: tag it and store it encrypted (and try to rename it,
+        // which the store ignores).
+        kvstore_list_string original_tags = e.tags;
+        kvstore_str original_key = e.key;
+        kvstore_str tags[1] = {kvstore_str_of("admitted")};
+        e.tags.items = tags;
+        e.tags.len = 1;
+        e.kind = kvstore_kv_EntryKind_Encrypted;
+        e.key = kvstore_str_of("renamed");
+        kvstore_kv_Entry_write(&w, &e);
+        e.tags = original_tags;
+        e.key = original_key;
+        hand_over(&w, out_ptr, out_len);
+    }
+    kvstore_kv_Entry_free(&e);
+}
+
+// `home` arrives as one strong reference this policy owns; the return is one
+// strong reference the producer adopts.
+static kvstore_kv_Store* policy_route(void* ctx, const uint8_t* key_ptr, size_t key_len,
+                                      kvstore_kv_Store* home, kvstore_error* out_err) {
+    (void)out_err;
+    policy_ctx* p = (policy_ctx*)ctx;
+    kvstore_str key = {(const char*)key_ptr, key_len};
+    if (starts_with(key, "b/")) {
+        kvstore_kv_Store_destroy(home);
+        return kvstore_kv_Store_clone(p->other);
+    }
+    if (starts_with(key, "null/")) {
+        kvstore_kv_Store_destroy(home);
+        return NULL;  // a required object may not be null: -3
+    }
+    return home;
+}
+
+static void policy_free(void* ctx) {
+    policy_ctx* p = (policy_ctx*)ctx;
+    kvstore_kv_Store_destroy(p->other);
+    free(p);
+    atomic_fetch_add(&g_policies_freed, 1);
+}
+
+static const kvstore_kv_Policy_vtable POLICY_VTABLE = {
+    sizeof(kvstore_kv_Policy_vtable), 0, policy_free, policy_admit, policy_route,
+};
+
+// ── loader (consumer-implemented, passed as an optional parameter) ─────────
+
+typedef struct {
+    kvstore_kv_Store* fallback;  // owned reference or NULL
+} loader_ctx;
+
+static atomic_int g_loaders_freed;
+
+static void loader_name(void* ctx, uint8_t** out_ptr, size_t* out_len, kvstore_error* out_err) {
+    (void)ctx;
+    (void)out_err;
+    hand_over_text("c-loader", out_ptr, out_len);
+}
+
+static kvstore_kv_Store* loader_fallback(void* ctx, const uint8_t* key_ptr, size_t key_len,
+                                         kvstore_error* out_err) {
+    (void)out_err;
+    loader_ctx* l = (loader_ctx*)ctx;
+    if (l->fallback != NULL && bytes_eq(key_ptr, key_len, "fb")) {
+        return kvstore_kv_Store_clone(l->fallback);
+    }
+    return NULL;  // `Store?`: none
+}
+
+static void fail_not_found(kvstore_error* out_err, const char* key) {
+    kvstore_error_set(out_err, kvstore_kv_KvError_KeyNotFound, "not in the loader");
+    kvstore_kv_KvError_KeyNotFound_payload p;
+    p.key = kvstore_str_of(key);
+    kvstore_writer w;
+    memset(&w, 0, sizeof w);
+    kvstore_kv_KvError_KeyNotFound_payload_write(&w, &p);
+    kvstore_error_set_payload(out_err, w.ptr, w.len);
+    kvstore_writer_free(&w);
+}
+
+static void loader_load(void* ctx, const uint8_t* key_ptr, size_t key_len, uint8_t** out_ptr,
+                        size_t* out_len, kvstore_error* out_err) {
+    (void)ctx;
+    if (bytes_eq(key_ptr, key_len, "missing")) {
+        fail_not_found(out_err, "missing");  // this key: get_or_load returns none
+        return;
+    }
+    if (bytes_eq(key_ptr, key_len, "elsewhere")) {
+        fail_not_found(out_err, "other");  // another key: passed through
+        return;
+    }
+    if (bytes_eq(key_ptr, key_len, "broken")) {
+        kvstore_error_set(out_err, -1, "loader is broken");
+        return;
+    }
+    char value[80];
+    snprintf(value, sizeof value, "loaded:%.*s", (int)key_len, (const char*)key_ptr);
+    hand_over_text(value, out_ptr, out_len);
+}
+
+static void loader_free(void* ctx) {
+    loader_ctx* l = (loader_ctx*)ctx;
+    kvstore_kv_Store_destroy(l->fallback);
+    free(l);
+    atomic_fetch_add(&g_loaders_freed, 1);
+}
+
+static const kvstore_kv_Loader_vtable LOADER_VTABLE = {
+    sizeof(kvstore_kv_Loader_vtable), 0, loader_free, loader_name, loader_fallback, loader_load,
+};
+
+static loader_ctx* new_loader(kvstore_kv_Store* fallback) {
+    loader_ctx* l = (loader_ctx*)calloc(1, sizeof *l);
+    assert(l != NULL);
+    l->fallback = fallback;
+    return l;
+}
+
+// get_or_load through a fresh loader (or none); decodes `Entry?` into `out`
+// (NULL when absent) and returns false with `err` set on failure.
+static bool get_or_load(const kvstore_kv_Store* s, const char* key, loader_ctx* loader,
+                        kvstore_kv_Entry** out, kvstore_error* err) {
+    size_t len = 0;
+    const uint8_t* buf = kvstore_kv_Store_get_or_load(
+        s, STR(key), loader, loader ? &LOADER_VTABLE : NULL, &len, err);
+    if (err->code != 0) {
+        assert(buf == NULL);
+        return false;
+    }
+    assert(kvstore_opt_kv_Entry_decode(buf, len, out));
+    kvstore_free_bytes((uint8_t*)buf, len);
+    return true;
+}
+
+// ── async completion state ─────────────────────────────────────────────────
+
+typedef struct {
+    atomic_int done;
+    int32_t code;
+    char message[128];
+    uint32_t u32;
+    kvstore_kv_Store* store;
+    uint8_t* buf;
+    size_t len;
+} call_state;
+
+static void settle(call_state* c, kvstore_error* err) {
+    c->code = err ? err->code : 0;
+    if (err != NULL && err->message != NULL) {
+        snprintf(c->message, sizeof c->message, "%s", err->message);
+    }
+    kvstore_error_free(err);
+}
+
+static void on_u32(void* context, kvstore_error* err, uint32_t result) {
+    call_state* c = (call_state*)context;
+    settle(c, err);
+    c->u32 = result;
+    atomic_store(&c->done, 1);
+}
+
+static void on_store(void* context, kvstore_error* err, kvstore_kv_Store* result) {
+    call_state* c = (call_state*)context;
+    settle(c, err);
+    c->store = result;
+    atomic_store(&c->done, 1);
+}
+
+// A buffered async result is an owned run: copy it, then release it.
+static void on_buffer(void* context, kvstore_error* err, const uint8_t* ptr, size_t len) {
+    call_state* c = (call_state*)context;
+    settle(c, err);
+    if (ptr != NULL) {
+        c->buf = (uint8_t*)malloc(len);
+        memcpy(c->buf, ptr, len);
+        c->len = len;
+        kvstore_free_bytes((uint8_t*)ptr, len);
+    }
+    atomic_store(&c->done, 1);
+}
+
+static void wait_for(call_state* c) {
+    for (int i = 0; i < 5000 && !atomic_load(&c->done); i++) sleep_ms(1);
+    assert(atomic_load(&c->done) && "async call completed");
+}
+
+// ── sections ───────────────────────────────────────────────────────────────
+
+static void constructors(void) {
+    kvstore_error err = {0};
+
+    // Fallible constructor: an empty path is InvalidPath (no payload).
+    assert(kvstore_kv_Store_open(STR(""), &err) == NULL);
+    assert(err.code == kvstore_kv_KvError_InvalidPath);
+    assert(strcmp(err.message, "invalid path") == 0);
+    assert(err.payload_ptr == NULL && err.payload_len == 0);
+    kvstore_error_clear(&err);
+    // A NULL string with a nonzero length is a marshalling failure.
+    assert(kvstore_kv_Store_open(NULL, 4, &err) == NULL && err.code == -3);
+    kvstore_error_clear(&err);
+
+    kvstore_kv_Store* s = kvstore_kv_Store_new(&err);
+    assert(err.code == 0 && s != NULL && path_is(s, "memory"));
+    assert(kvstore_kv_Store_capacity(s, &err) == kvstore_kv_Store_default_capacity(&err));
+    assert(kvstore_kv_Store_default_capacity(&err) == 1000000);
+    kvstore_kv_Store_destroy(s);
+
+    // The async free function completes with a new object...
+    call_state c;
+    memset(&c, 0, sizeof c);
+    kvstore_kv_open_store(STR("/async"), on_store, &c);
+    wait_for(&c);
+    assert(c.code == 0 && c.store != NULL && path_is(c.store, "/async"));
+    kvstore_kv_Store_destroy(c.store);
+    // ...or with the typed error.
+    memset(&c, 0, sizeof c);
+    kvstore_kv_open_store(NULL, 0, on_store, &c);
+    wait_for(&c);
+    assert(c.code == kvstore_kv_KvError_InvalidPath && c.store == NULL);
+    assert(strcmp(c.message, "invalid path") == 0);
+}
+
+static void basics(void) {
+    kvstore_error err = {0};
+    kvstore_kv_Store* s = open_store("/basics");
+    size_t len = 0;
+
+    // put returns the stored entry; the version counts puts of the key.
+    kvstore_kv_Entry e;
+    assert(try_put(s, "alpha", "one", kvstore_kv_EntryKind_Persistent, NULL, &e, &err));
+    assert(str_is(e.key, "alpha") && e.value.len == 3 && memcmp(e.value.ptr, "one", 3) == 0);
+    assert(e.kind == kvstore_kv_EntryKind_Persistent && e.version == 1);
+    assert(e.expires_at == NULL && e.tags.len == 0 && e.metadata.len == 0);
+    kvstore_kv_Entry_free(&e);
+    assert(try_put(s, "alpha", "two", kvstore_kv_EntryKind_Volatile, NULL, &e, &err));
+    assert(e.version == 2 && e.kind == kvstore_kv_EntryKind_Volatile);
+    kvstore_kv_Entry_free(&e);
+
+    // get (throwing record) and find (optional record).
+    const uint8_t* buf = kvstore_kv_Store_get(s, STR("alpha"), &len, &err);
+    assert(err.code == 0 && buf != NULL);
+    assert(kvstore_kv_Entry_decode(buf, len, &e));
+    kvstore_free_bytes((uint8_t*)buf, len);
+    assert(e.value.len == 3 && memcmp(e.value.ptr, "two", 3) == 0);
+    kvstore_kv_Entry_free(&e);
+    assert(kvstore_kv_Store_get(s, STR("nope"), &len, &err) == NULL);
+    assert(strcmp(err.message, "key not found: nope") == 0);
+    expect_key_not_found(&err, "nope");
+
+    buf = kvstore_kv_Store_find(s, STR("alpha"), &len, &err);
+    kvstore_kv_Entry* found = NULL;
+    assert(err.code == 0 && kvstore_opt_kv_Entry_decode(buf, len, &found));
+    kvstore_free_bytes((uint8_t*)buf, len);
+    assert(found != NULL && found->version == 2);
+    kvstore_opt_kv_Entry_free(&found);
+    buf = kvstore_kv_Store_find(s, STR("nope"), &len, &err);
+    assert(err.code == 0 && kvstore_opt_kv_Entry_decode(buf, len, &found) && found == NULL);
+    kvstore_free_bytes((uint8_t*)buf, len);
+
+    // TTLs follow the logical clock; an expired get reports when.
+    const int64_t ttl = 10;
+    assert(try_put(s, "ttl", "x", kvstore_kv_EntryKind_Volatile, &ttl, &e, &err));
+    assert(e.expires_at != NULL && *e.expires_at == 10);
+    kvstore_kv_Entry_free(&e);
+    assert(kvstore_kv_Store_now(s, &err) == 0);
+    assert(kvstore_kv_Store_tick(s, 9, &err) == 9 && count(s) == 2);
+    assert(kvstore_kv_Store_tick(s, 1, &err) == 10 && count(s) == 1);
+    assert(kvstore_kv_Store_get(s, STR("ttl"), &len, &err) == NULL);
+    assert(err.code == kvstore_kv_KvError_Expired);
+    kvstore_kv_KvError_Expired_payload expired;
+    assert(kvstore_kv_KvError_Expired_payload_decode(err.payload_ptr, err.payload_len, &expired));
+    assert(str_is(expired.key, "ttl") && expired.expired_at == 10);
+    kvstore_kv_KvError_Expired_payload_free(&expired);
+    kvstore_error_clear(&err);
+    assert(kvstore_kv_Store_get(s, STR("ttl"), &len, &err) == NULL);
+    expect_key_not_found(&err, "ttl");  // the expired read removed it
+
+    // Capacity: a new key past it is StoreFull { capacity }.
+    kvstore_kv_Store_set_capacity(s, 1, &err);
+    assert(kvstore_kv_Store_capacity(s, &err) == 1);
+    put(s, "alpha", "three");  // replacing is fine
+    assert(!try_put(s, "beta", "b", kvstore_kv_EntryKind_Volatile, NULL, NULL, &err));
+    assert(err.code == kvstore_kv_KvError_StoreFull);
+    kvstore_kv_KvError_StoreFull_payload full;
+    assert(kvstore_kv_KvError_StoreFull_payload_decode(err.payload_ptr, err.payload_len, &full));
+    assert(full.capacity == 1);
+    kvstore_error_clear(&err);
+    kvstore_kv_Store_set_capacity(s, 100, &err);
+
+    // An undeclared enum value and invalid UTF-8 are marshalling failures.
+    assert(!try_put(s, "k", "v", (kvstore_kv_EntryKind)9, NULL, NULL, &err));
+    assert(err.code == -3);
+    kvstore_error_clear(&err);
+    kvstore_writer none = prefix_buf(NULL);
+    const uint8_t bad_utf8[2] = {0xC3, 0x28};
+    assert(kvstore_kv_Store_put(s, BYTES(bad_utf8), BYTES(bad_utf8),
+                                kvstore_kv_EntryKind_Volatile, none.ptr, none.len, &len,
+                                &err) == NULL);
+    assert(err.code == -3);
+    kvstore_error_clear(&err);
+    kvstore_writer_free(&none);
+    // A method on a null receiver too.
+    kvstore_kv_Store_count(NULL, &err);
+    assert(err.code == -3);
+    kvstore_error_clear(&err);
+
+    // delete, clear, and the deprecated size().
+    put(s, "beta", "b");
+    assert(kvstore_kv_Store_delete(s, STR("beta"), &err) && err.code == 0);
+    assert(!kvstore_kv_Store_delete(s, STR("beta"), &err));
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    assert(kvstore_kv_Store_size(s, &err) == 1);
+#pragma clang diagnostic pop
+    assert(kvstore_kv_Store_clear(s, &err) == 1 && count(s) == 0);
+    kvstore_kv_Store_destroy(s);
+}
+
+static void iterators(void) {
+    kvstore_error err = {0};
+    kvstore_kv_Store* s = open_store("/iter");
+    put(s, "user.bob", "b");
+    put(s, "user.alice", "a");
+    put(s, "sys.x", "xx");
+
+    // keys(prefix?): owned (ptr, len) strings in key order.
+    const char* want_all[3] = {"sys.x", "user.alice", "user.bob"};
+    kvstore_writer w = prefix_buf(NULL);
+    kvstore_kv_Store_KeysIterator* it = kvstore_kv_Store_keys(s, w.ptr, w.len, &err);
     kvstore_writer_free(&w);
     assert(err.code == 0 && it != NULL);
-    int n = 0;
     const uint8_t* item = NULL;
     size_t len = 0;
-    while (kvstore_kv_Store_ListKeysIterator_next(it, &item, &len, &err) == 1) {
-        assert(n < cap);
-        out[n] = (char*)calloc(len + 1, 1);
-        memcpy(out[n++], item, len);
+    int n = 0;
+    while (kvstore_kv_Store_KeysIterator_next(it, &item, &len, &err) == 1) {
+        assert(n < 3 && bytes_eq(item, len, want_all[n]));
         kvstore_free_bytes((uint8_t*)item, len);
+        n++;
     }
-    assert(err.code == 0);
-    kvstore_kv_Store_ListKeysIterator_destroy(it);
-    return n;
+    assert(n == 3 && err.code == 0);
+    // Pulling past the end stays at the end.
+    assert(kvstore_kv_Store_KeysIterator_next(it, &item, &len, &err) == 0);
+    kvstore_kv_Store_KeysIterator_destroy(it);
+
+    // A prefix that matches nothing is KeyNotFound { key: prefix }.
+    w = prefix_buf("zzz");
+    assert(kvstore_kv_Store_keys(s, w.ptr, w.len, &err) == NULL);
+    kvstore_writer_free(&w);
+    expect_key_not_found(&err, "zzz");
+
+    // Abandoning an iterator part-way releases it (and its items so far).
+    w = prefix_buf("user.");
+    it = kvstore_kv_Store_keys(s, w.ptr, w.len, &err);
+    kvstore_writer_free(&w);
+    assert(kvstore_kv_Store_KeysIterator_next(it, &item, &len, &err) == 1);
+    assert(bytes_eq(item, len, "user.alice"));
+    kvstore_free_bytes((uint8_t*)item, len);
+    kvstore_kv_Store_KeysIterator_destroy(it);
+
+    // entries(prefix?): records.
+    w = prefix_buf("sys.");
+    kvstore_kv_Store_EntriesIterator* et = kvstore_kv_Store_entries(s, w.ptr, w.len, &err);
+    kvstore_writer_free(&w);
+    assert(kvstore_kv_Store_EntriesIterator_next(et, &item, &len, &err) == 1);
+    kvstore_kv_Entry e;
+    assert(kvstore_kv_Entry_decode(item, len, &e));
+    kvstore_free_bytes((uint8_t*)item, len);
+    assert(str_is(e.key, "sys.x") && e.value.len == 2);
+    kvstore_kv_Entry_free(&e);
+    assert(kvstore_kv_Store_EntriesIterator_next(et, &item, &len, &err) == 0);
+    kvstore_kv_Store_EntriesIterator_destroy(et);
+
+    // partition(prefixes): objects, created as they're pulled.
+    kvstore_str prefixes[3] = {kvstore_str_of("user."), kvstore_str_of("sys."),
+                               kvstore_str_of("none.")};
+    kvstore_list_string pl;
+    pl.items = prefixes;
+    pl.len = 3;
+    memset(&w, 0, sizeof w);
+    kvstore_list_string_write(&w, &pl);
+    kvstore_kv_Store_PartitionIterator* pt = kvstore_kv_Store_partition(s, w.ptr, w.len, &err);
+    kvstore_writer_free(&w);
+    const uint32_t want_counts[3] = {2, 1, 0};
+    kvstore_kv_Store* part = NULL;
+    n = 0;
+    while (kvstore_kv_Store_PartitionIterator_next(pt, &part, &err) == 1) {
+        assert(part != NULL && part != s && count(part) == want_counts[n]);
+        char* p = path_of(part);
+        assert(bytes_eq((const uint8_t*)p, strlen(p), prefixes[n].ptr));
+        free(p);
+        kvstore_kv_Store_destroy(part);  // each element is an owned reference
+        n++;
+    }
+    assert(n == 3 && err.code == 0);
+    kvstore_kv_Store_PartitionIterator_destroy(pt);
+    kvstore_kv_Store_destroy(s);
+}
+
+static void listeners(void) {
+    kvstore_error err = {0};
+    kvstore_kv_Store* s = open_store("/listen");
+    size_t len = 0;
+
+    listener_ctx* l = new_listener("quiet", NULL);
+    uint32_t id = kvstore_kv_Store_subscribe(s, l, &LISTENER_VTABLE, &err);
+    assert(err.code == 0 && id > 0);
+    assert(kvstore_kv_Store_listener_count(s, &err) == 1);
+
+    put(s, "a", "1");
+    assert(atomic_load(&l->puts) == 1 && l->last_version == 1 && !l->last_replaced);
+    put(s, "a", "2");
+    assert(atomic_load(&l->puts) == 2 && l->last_version == 2 && l->last_replaced);
+    assert(strcmp(l->last_key, "a") == 0);
+    put(s, "quiet", "x");  // accepts() said no
+    assert(atomic_load(&l->puts) == 2);
+    assert(kvstore_kv_Store_delete(s, STR("a"), &err));
+    assert(atomic_load(&l->removed) == 1 && strcmp(l->last_key, "a") == 0);
+
+    // An expired read removes the entry and says so.
+    const int64_t ttl = 1;
+    assert(try_put(s, "short", "x", kvstore_kv_EntryKind_Volatile, &ttl, NULL, &err));
+    kvstore_kv_Store_tick(s, 1, &err);
+    assert(kvstore_kv_Store_get(s, STR("short"), &len, &err) == NULL);
+    assert(err.code == kvstore_kv_KvError_Expired);
+    kvstore_error_clear(&err);
+    assert(atomic_load(&l->expired) == 1 && strcmp(l->last_key, "short") == 0);
+
+    assert(kvstore_kv_Store_clear(s, &err) == 1);  // "quiet" was left
+    assert(atomic_load(&l->cleared) == 1 && l->last_cleared == 1);
+    assert(atomic_load(&l->off_main_thread) == 0 && "synchronous calls notify inline");
+
+    // Unsubscribing releases the listener once.
+    assert(kvstore_kv_Store_unsubscribe(s, id, &err));
+    assert(atomic_load(&g_listeners_freed) == 1);
+    assert(!kvstore_kv_Store_unsubscribe(s, id, &err));
+    assert(kvstore_kv_Store_listener_count(s, &err) == 0);
+
+    // A listener that fails is detached (and released); the put succeeds.
+    listener_ctx* failing = new_listener(NULL, "boom");
+    kvstore_kv_Store_subscribe(s, failing, &LISTENER_VTABLE, &err);
+    put(s, "fine", "1");
+    assert(atomic_load(&failing->puts) == 1);
+    put(s, "boom", "1");
+    assert(err.code == 0 && count(s) == 2);
+    assert(kvstore_kv_Store_listener_count(s, &err) == 0);
+    assert(atomic_load(&g_listeners_freed) == 2);
+
+    // A vtable smaller than the producer's is rejected (-3) and released.
+    kvstore_kv_Listener_vtable short_vtable = LISTENER_VTABLE;
+    short_vtable.size = (uint32_t)(sizeof short_vtable - sizeof short_vtable.on_change);
+    kvstore_kv_Store_subscribe(s, new_listener(NULL, NULL), &short_vtable, &err);
+    assert(err.code == -3);
+    kvstore_error_clear(&err);
+    assert(atomic_load(&g_listeners_freed) == 3);
+
+    // Destroying the store releases the listeners it still holds.
+    kvstore_kv_Store_subscribe(s, new_listener(NULL, NULL), &LISTENER_VTABLE, &err);
+    kvstore_kv_Store_subscribe(s, new_listener(NULL, NULL), &LISTENER_VTABLE, &err);
+    assert(kvstore_kv_Store_listener_count(s, &err) == 2);
+    kvstore_kv_Store_destroy(s);
+    assert(atomic_load(&g_listeners_freed) == 5);
+}
+
+static void policies(void) {
+    kvstore_error err = {0};
+    kvstore_kv_Store* s = open_store("/policy");
+    kvstore_kv_Store* other = open_store("/other");
+
+    policy_ctx* p = (policy_ctx*)calloc(1, sizeof *p);
+    p->other = kvstore_kv_Store_clone(other);
+    kvstore_kv_Store_set_policy(s, p, &POLICY_VTABLE, &err);
+    assert(err.code == 0 && kvstore_kv_Store_has_policy(s, &err));
+
+    // admit's record return is what's stored (its key and version aside).
+    kvstore_kv_Entry e;
+    assert(try_put(s, "a", "1", kvstore_kv_EntryKind_Volatile, NULL, &e, &err));
+    assert(str_is(e.key, "a") && e.version == 1 && e.kind == kvstore_kv_EntryKind_Encrypted);
+    assert(e.tags.len == 1 && str_is(e.tags.items[0], "admitted"));
+    kvstore_kv_Entry_free(&e);
+
+    // route: the object parameter and object return redirect a write.
+    assert(try_put(s, "b/x", "2", kvstore_kv_EntryKind_Volatile, NULL, NULL, &err));
+    assert(count(s) == 1 && count(other) == 1);
+
+    // A typed error from the throwing callback reaches the caller with its
+    // code, message, and payload.
+    assert(!try_put(s, "secret", "3", kvstore_kv_EntryKind_Volatile, NULL, NULL, &err));
+    assert(err.code == kvstore_kv_KvError_Rejected);
+    assert(strcmp(err.message, "secrets are not stored") == 0);
+    kvstore_kv_KvError_Rejected_payload r;
+    assert(kvstore_kv_KvError_Rejected_payload_decode(err.payload_ptr, err.payload_len, &r));
+    assert(str_is(r.key, "secret") && str_is(r.reason, "no secrets"));
+    kvstore_kv_KvError_Rejected_payload_free(&r);
+    kvstore_error_clear(&err);
+
+    // A code outside the domain arrives as -4 with the consumer's message.
+    assert(!try_put(s, "boom", "4", kvstore_kv_EntryKind_Volatile, NULL, NULL, &err));
+    assert(err.code == -4 && strcmp(err.message, "policy exploded") == 0);
+    kvstore_error_clear(&err);
+    // A return the runtime can't accept is -3: a malformed record...
+    assert(!try_put(s, "garbage", "5", kvstore_kv_EntryKind_Volatile, NULL, NULL, &err));
+    assert(err.code == -3);
+    kvstore_error_clear(&err);
+    // ...or a null required object.
+    assert(!try_put(s, "null/x", "6", kvstore_kv_EntryKind_Volatile, NULL, NULL, &err));
+    assert(err.code == -3);
+    kvstore_error_clear(&err);
+    assert(count(s) == 1 && count(other) == 1);
+    assert(atomic_load(&p->admitted) == 6);
+
+    // Replacing the policy releases the old one; NULL removes it.
+    policy_ctx* p2 = (policy_ctx*)calloc(1, sizeof *p2);
+    p2->other = kvstore_kv_Store_clone(other);
+    kvstore_kv_Store_set_policy(s, p2, &POLICY_VTABLE, &err);
+    assert(atomic_load(&g_policies_freed) == 1);
+    kvstore_kv_Store_set_policy(s, NULL, NULL, &err);
+    assert(err.code == 0 && atomic_load(&g_policies_freed) == 2);
+    assert(!kvstore_kv_Store_has_policy(s, &err));
+    put(s, "secret", "now allowed");
+    assert(count(s) == 2);
+
+    kvstore_kv_Store_destroy(other);
+    kvstore_kv_Store_destroy(s);
+}
+
+static void loaders(void) {
+    kvstore_error err = {0};
+    kvstore_kv_Store* s = open_store("/load");
+    kvstore_kv_Entry* e = NULL;
+
+    // No loader (a null optional callback): a miss is none.
+    assert(get_or_load(s, "k", NULL, &e, &err) && e == NULL);
+
+    // load's bytes are stored, tagged with the loader's name.
+    assert(get_or_load(s, "k", new_loader(NULL), &e, &err) && e != NULL);
+    assert(e->value.len == 8 && memcmp(e->value.ptr, "loaded:k", 8) == 0);
+    assert(e->kind == kvstore_kv_EntryKind_Volatile && e->metadata.len == 1);
+    assert(str_is(e->metadata.keys[0], "source") && str_is(e->metadata.values[0], "c-loader"));
+    kvstore_opt_kv_Entry_free(&e);
+    assert(atomic_load(&g_loaders_freed) == 1 && "a loader is released after the call");
+    assert(count(s) == 1);
+    // A hit doesn't consult the loader.
+    assert(get_or_load(s, "k", new_loader(NULL), &e, &err) && e != NULL && e->version == 1);
+    kvstore_opt_kv_Entry_free(&e);
+
+    // The fallback store (an optional object return) is consulted first.
+    kvstore_kv_Store* backup = open_store("/backup");
+    put(backup, "fb", "from backup");
+    assert(get_or_load(s, "fb", new_loader(kvstore_kv_Store_clone(backup)), &e, &err));
+    assert(e != NULL && e->value.len == 11 && e->kind == kvstore_kv_EntryKind_Persistent);
+    kvstore_opt_kv_Entry_free(&e);
+    kvstore_kv_Store_destroy(backup);
+
+    // KeyNotFound for this key: the producer decoded the payload and
+    // answers none.
+    assert(get_or_load(s, "missing", new_loader(NULL), &e, &err) && e == NULL);
+    // KeyNotFound for another key: passed through, payload intact.
+    assert(!get_or_load(s, "elsewhere", new_loader(NULL), &e, &err));
+    assert(strcmp(err.message, "not in the loader") == 0);
+    expect_key_not_found(&err, "other");
+    // Any other failure is -4.
+    assert(!get_or_load(s, "broken", new_loader(NULL), &e, &err));
+    assert(err.code == -4 && strcmp(err.message, "loader is broken") == 0);
+    kvstore_error_clear(&err);
+
+    assert(atomic_load(&g_loaders_freed) == 6);
+    kvstore_kv_Store_destroy(s);
+}
+
+static void async_calls(void) {
+    kvstore_error err = {0};
+    kvstore_kv_Store* s = open_store("/async-calls");
+    listener_ctx* l = new_listener(NULL, NULL);
+    kvstore_kv_Store_subscribe(s, l, &LISTENER_VTABLE, &err);
+
+    const int64_t ttl = 1;
+    assert(try_put(s, "old1", "x", kvstore_kv_EntryKind_Volatile, &ttl, NULL, &err));
+    assert(try_put(s, "old2", "x", kvstore_kv_EntryKind_Volatile, &ttl, NULL, &err));
+    put(s, "keep", "x");
+    kvstore_kv_Store_tick(s, 5, &err);
+
+    // compact runs on a producer thread and notifies listeners there.
+    call_state c;
+    memset(&c, 0, sizeof c);
+    kvstore_cancel_token* token = kvstore_cancel_token_create();
+    kvstore_kv_Store_compact(s, 0, token, on_u32, &c);
+    kvstore_cancel_token_destroy(token);
+    wait_for(&c);
+    assert(c.code == 0 && c.u32 == 2);
+    assert(atomic_load(&l->expired) == 2);
+    assert(atomic_load(&l->off_main_thread) == 2 && "notified from a producer thread");
+    assert(count(s) == 1);
+
+    // A null token never cancels.
+    memset(&c, 0, sizeof c);
+    kvstore_kv_Store_compact(s, 5, NULL, on_u32, &c);
+    wait_for(&c);
+    assert(c.code == 0 && c.u32 == 0);
+
+    // Cancel mid-pause: the call completes with -5 at once, and the
+    // background pause notices the token and stops.
+    memset(&c, 0, sizeof c);
+    token = kvstore_cancel_token_create();
+    kvstore_kv_Store_compact(s, 60000, token, on_u32, &c);
+    sleep_ms(20);
+    assert(!atomic_load(&c.done));
+    assert(kvstore_kv_Store_active_jobs(&err) >= 1);
+    kvstore_cancel_token_cancel(token);
+    kvstore_cancel_token_destroy(token);
+    wait_for(&c);
+    assert(c.code == -5);
+    int stopped = 0;
+    for (int i = 0; i < 2000 && !stopped; i++) {
+        stopped = kvstore_kv_Store_active_jobs(&err) == 0;
+        if (!stopped) sleep_ms(1);
+    }
+    assert(stopped && "the cancelled pause stopped cooperatively");
+
+    // get_many: an async list of optional records, launched concurrently.
+    kvstore_str keys[3] = {kvstore_str_of("keep"), kvstore_str_of("gone"),
+                           kvstore_str_of("keep")};
+    kvstore_list_string kl;
+    kl.items = keys;
+    kl.len = 3;
+    kvstore_writer w;
+    memset(&w, 0, sizeof w);
+    kvstore_list_string_write(&w, &kl);
+    enum { CONCURRENT = 32 };
+    static call_state many[CONCURRENT];
+    memset(many, 0, sizeof many);
+    for (int i = 0; i < CONCURRENT; i++) {
+        kvstore_kv_Store_get_many(s, w.ptr, w.len, on_buffer, &many[i]);
+    }
+    kvstore_writer_free(&w);
+    for (int i = 0; i < CONCURRENT; i++) {
+        wait_for(&many[i]);
+        assert(many[i].code == 0);
+        kvstore_list_opt_kv_Entry got;
+        assert(kvstore_list_opt_kv_Entry_decode(many[i].buf, many[i].len, &got));
+        assert(got.len == 3 && got.items[0] != NULL && got.items[1] == NULL);
+        assert(got.items[2] != NULL && str_is(got.items[2]->key, "keep"));
+        kvstore_list_opt_kv_Entry_free(&got);
+        free(many[i].buf);
+    }
+
+    // The nested module's async free function: objects in a list in,
+    // a record out.
+    kvstore_kv_Store* other = open_store("/other");
+    put(other, "a", "123");
+    kvstore_kv_Store* both[2] = {s, other};
+    kvstore_list_kv_Store sl;
+    sl.items = both;
+    sl.len = 2;
+    memset(&w, 0, sizeof w);
+    kvstore_list_kv_Store_write(&w, &sl);
+    memset(&c, 0, sizeof c);
+    kvstore_kv_stats_summarize_all(w.ptr, w.len, on_buffer, &c);
+    kvstore_writer_free(&w);
+    wait_for(&c);
+    assert(c.code == 0);
+    kvstore_kv_stats_Stats st;
+    assert(kvstore_kv_stats_Stats_decode(c.buf, c.len, &st));
+    free(c.buf);
+    assert(st.entries == 2 && st.bytes == 4);
+    assert(st.by_kind.len == 1 && st.by_kind.keys[0] == kvstore_kv_EntryKind_Persistent);
+    assert(st.by_kind.values[0] == 2);
+    kvstore_kv_stats_Stats_free(&st);
+
+    kvstore_kv_Store_destroy(other);
+    kvstore_kv_Store_destroy(s);
 }
 
 static kvstore_kv_StoreInfo describe(kvstore_kv_Store* s, const char* label,
@@ -169,355 +944,225 @@ static kvstore_kv_StoreInfo describe(kvstore_kv_Store* s, const char* label,
     return info;
 }
 
-static void basics(kvstore_kv_Store* store) {
+static void object_graph(void) {
     kvstore_error err = {0};
-    const uint8_t payload[3] = {1, 2, 3};
-
-    // Populate two keys so count/iterator/stats have something to report.
-    put(store, "alpha", BYTES(payload));
-    ttl_buf none = ttl(NULL);
-    assert(kvstore_kv_Store_put(store, STR("beta"), BYTES(payload),
-                                kvstore_kv_EntryKind_Volatile, none.w.ptr, none.w.len, &err));
-    assert(err.code == 0);
-    assert(count(store) == 2);
-
-    // An out-of-range enum discriminant is a marshalling failure (-3).
-    assert(!kvstore_kv_Store_put(store, STR("bad"), BYTES(payload), (kvstore_kv_EntryKind)999,
-                                 none.w.ptr, none.w.len, &err));
-    assert(err.code == -3);
-    kvstore_error_clear(&err);
-    // So is invalid UTF-8 in a string parameter.
-    const uint8_t bad_utf8[2] = {0xC3, 0x28};
-    assert(!kvstore_kv_Store_put(store, BYTES(bad_utf8), BYTES(payload),
-                                 kvstore_kv_EntryKind_Volatile, none.w.ptr, none.w.len, &err));
-    assert(err.code == -3);
-    kvstore_error_clear(&err);
-    kvstore_writer_free(&none.w);
-    assert(count(store) == 2);
-
-    // Typed error path on a method: a missing key reports KeyNotFound.
     size_t len = 0;
-    assert(kvstore_kv_Store_get(store, STR("missing"), &len, &err) == NULL);
-    assert(err.code == kvstore_kv_KvError_KeyNotFound);
-    assert(strcmp(err.message, "key not found") == 0);
-    kvstore_error_clear(&err);
+    kvstore_kv_Store* s = open_store("/graph");
+    put(s, "k", "v");
 
-    // The deprecated method still works; the header marks it deprecated, so
-    // silence the warning for this one deliberate call.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    assert(kvstore_kv_Store_legacy_put(store, STR("old"), BYTES(payload), &err));
-#pragma clang diagnostic pop
-    assert(err.code == 0);
-    assert(kvstore_kv_Store_delete(store, STR("old"), &err) && err.code == 0);
-    assert(!kvstore_kv_Store_delete(store, STR("old"), &err) && err.code == 0);
-
-    // Iterator: keys come back sorted, filtered by the optional prefix.
-    char* keys[4];
-    int n = list_keys(store, NULL, keys, 4);
-    assert(n == 2 && strcmp(keys[0], "alpha") == 0 && strcmp(keys[1], "beta") == 0);
-    for (int i = 0; i < n; i++) free(keys[i]);
-    n = list_keys(store, "be", keys, 4);
-    assert(n == 1 && strcmp(keys[0], "beta") == 0);
-    free(keys[0]);
-    assert(list_keys(store, "zzz", keys, 4) == 0);
-
-    // get -> buffered `Entry?` with nested list and map fields.
-    const uint8_t* buf = kvstore_kv_Store_get(store, STR("alpha"), &len, &err);
-    assert(err.code == 0 && buf != NULL);
-    kvstore_kv_Entry* e = NULL;
-    assert(kvstore_opt_kv_Entry_decode(buf, len, &e));
-    kvstore_free_bytes((uint8_t*)buf, len);
-    assert(e != NULL);
-    assert(e->id == 1 && "first id handed out by this store");
-    assert(strcmp(e->key.ptr, "alpha") == 0);
-    assert(e->value.len == 3 && memcmp(e->value.ptr, payload, 3) == 0);
-    assert(e->created_at > 0);
-    assert(e->expires_at == NULL && "no TTL");
-    assert(e->tags.len == 0 && e->metadata.len == 0);
-    kvstore_opt_kv_Entry_free(&e);
-
-    // kv.stats submodule: takes the parent module's Store.
-    buf = kvstore_kv_stats_get_stats(store, &len, &err);
-    assert(err.code == 0 && buf != NULL);
-    kvstore_kv_stats_Stats stats;
-    assert(kvstore_kv_stats_Stats_decode(buf, len, &stats));
-    kvstore_free_bytes((uint8_t*)buf, len);
-    assert(stats.total_entries == 2);
-    assert(stats.total_bytes == 6 && "two 3-byte values");
-    assert(stats.expired_entries == 0);
-}
-
-static void listeners(kvstore_kv_Store* store) {
-    kvstore_error err = {0};
-    const uint8_t payload[3] = {1, 2, 3};
-    size_t len = 0;
-
-    // delete fires on_evict synchronously with the Entry and reason Deleted.
-    listener_ctx* l1 = new_listener(0, 0);
-    kvstore_kv_Store_set_eviction_listener(store, l1, &LISTENER_VTABLE, &err);
-    assert(err.code == 0);
-    assert(kvstore_kv_Store_delete(store, STR("beta"), &err) && err.code == 0);
-    assert(l1->evictions == 1);
-    assert(strcmp(l1->last_key, "beta") == 0);
-    assert(l1->last_reason == kvstore_kv_EvictionReason_Deleted);
-    assert(l1->last_value_len == 3);
-
-    // An expired entry is evicted on read: get reports Expired and the
-    // listener sees reason Expired.
-    const int64_t past = -1;
-    put_ttl(store, "stale", payload, 2, &past);
-    assert(kvstore_kv_Store_get(store, STR("stale"), &len, &err) == NULL);
-    assert(err.code == kvstore_kv_KvError_Expired);
-    kvstore_error_clear(&err);
-    assert(l1->evictions == 2);
-    assert(strcmp(l1->last_key, "stale") == 0);
-    assert(l1->last_reason == kvstore_kv_EvictionReason_Expired);
-    assert(l1->last_value_len == 2);
-
-    // Replacing the listener frees the previous one; clearing frees the
-    // current one.
-    assert(g_listener_freed == 0);
-    kvstore_kv_Store_set_eviction_listener(store, new_listener(0, 0), &LISTENER_VTABLE, &err);
-    assert(g_listener_freed == 1 && "replaced listener freed");
-    kvstore_kv_Store_clear_eviction_listener(store, &err);
-    assert(err.code == 0 && g_listener_freed == 2);
-    kvstore_kv_Store_clear_eviction_listener(store, &err);
-    assert(err.code == 0 && g_listener_freed == 2);
-
-    // Nothing is attached now: a delete is not observed anywhere.
-    put(store, "gamma", payload, 1);
-    assert(kvstore_kv_Store_delete(store, STR("gamma"), &err));
-
-    // A listener returning false detaches itself (and is freed).
-    kvstore_kv_Store_set_eviction_listener(store, new_listener(1, 0), &LISTENER_VTABLE, &err);
-    put(store, "d1", payload, 1);
-    put(store, "d2", payload, 1);
-    assert(kvstore_kv_Store_delete(store, STR("d1"), &err));
-    assert(g_listener_freed == 3 && "listener that answered false is freed");
-    assert(kvstore_kv_Store_delete(store, STR("d2"), &err));
-    assert(g_listener_freed == 3);
-
-    // A listener that reports a failure aborts the delete with -4; the store
-    // stays usable and still holds the listener until it is cleared.
-    kvstore_kv_Store_set_eviction_listener(store, new_listener(0, 1), &LISTENER_VTABLE, &err);
-    put(store, "boom", payload, 1);
-    kvstore_kv_Store_delete(store, STR("boom"), &err);
-    assert(err.code == -4);
-    assert(err.message != NULL && strstr(err.message, "listener exploded") != NULL);
-    kvstore_error_clear(&err);
-    assert(count(store) == 1 && "the entry was removed before the listener ran");
-    assert(g_listener_freed == 3);
-    kvstore_kv_Store_clear_eviction_listener(store, &err);
-    assert(g_listener_freed == 4);
-}
-
-static void compaction(kvstore_kv_Store* store) {
-    const uint8_t payload[3] = {1, 2, 3};
-
-    // An immediately-expired entry gives compact 3 bytes to reclaim. The
-    // launcher returns at once; completion arrives on a producer thread.
-    const int64_t now = 0;
-    put_ttl(store, "doomed", BYTES(payload), &now);
-    kvstore_kv_Store_compact(store, NULL, on_compact_done, (void*)0x5150);
-    wait_compact();
-    assert(g_compact_err == 0);
-    assert(g_compact_result == 3);
-    assert(count(store) == 1);
-
-    // With a live token, compaction runs normally.
-    kvstore_cancel_token* token = kvstore_cancel_token_create();
-    kvstore_kv_Store_compact(store, token, on_compact_done, (void*)0x5150);
-    wait_compact();
-    assert(g_compact_err == 0 && g_compact_result == 0);
-    kvstore_cancel_token_destroy(token);
-
-    // A cancelled token completes the call with the cancelled code (-5)
-    // through the heap-boxed error.
-    token = kvstore_cancel_token_create();
-    assert(!kvstore_cancel_token_is_cancelled(token));
-    kvstore_cancel_token_cancel(token);
-    assert(kvstore_cancel_token_is_cancelled(token));
-    kvstore_kv_Store_compact(store, token, on_compact_done, (void*)0x5150);
-    kvstore_cancel_token_destroy(token);
-    wait_compact();
-    assert(g_compact_err == -5);
-    assert(count(store) == 1);
-}
-
-static void object_graph(kvstore_kv_Store* store) {
-    kvstore_error err = {0};
-    const uint8_t payload[3] = {1, 2, 3};
-    size_t len = 0;
-
-    // share() returns the very same object; after the original reference is
-    // released the shared one still sees the data.
-    kvstore_kv_Store* shared = kvstore_kv_Store_share(store, &err);
-    assert(err.code == 0 && shared == store);
-    kvstore_kv_Store_destroy(store);
-    assert(count(shared) == 1 && "still alive through the shared reference");
-    put(shared, "via-shared", payload, 1);
-    assert(count(shared) == 2);
-    store = shared;
-
-    // clone: same pointer; destroy the original, the clone still works.
-    kvstore_kv_Store* cloned = kvstore_kv_Store_clone(store);
-    assert(cloned == store);
-    kvstore_kv_Store_destroy(store);
-    assert(count(cloned) == 2 && "clone outlives the destroyed original");
-    store = cloned;
+    // share(): the same object; clone/destroy count references.
+    kvstore_kv_Store* shared = kvstore_kv_Store_share(s, &err);
+    assert(err.code == 0 && shared == s);
+    kvstore_kv_Store_destroy(s);
+    assert(count(shared) == 1 && "alive through the shared reference");
+    s = shared;
+    kvstore_kv_Store* cloned = kvstore_kv_Store_clone(s);
+    assert(cloned == s);
+    kvstore_kv_Store_destroy(cloned);
     assert(kvstore_kv_Store_clone(NULL) == NULL);
     kvstore_kv_Store_destroy(NULL);
 
-    // fork() is a distinct object with a copy of the entries.
-    kvstore_kv_Store* forked = kvstore_kv_Store_fork(store, &err);
-    assert(err.code == 0 && forked != NULL && forked != store);
-    assert(count(forked) == 2);
-    put(forked, "only-in-fork", payload, 1);
-    assert(count(forked) == 3 && count(store) == 2);
+    // fork(): a distinct object with a copy of the entries.
+    kvstore_kv_Store* fork = kvstore_kv_Store_fork(s, &err);
+    assert(fork != NULL && fork != s && count(fork) == 1 && path_is(fork, "/graph"));
+    put(fork, "k2", "v");
+    assert(count(fork) == 2 && count(s) == 1);
 
-    // larger(): `Store?` in and out; NULL is "none" both ways, and a returned
-    // object is an owned reference.
-    kvstore_kv_Store* empty = open_store("/tmp/conformance-kvstore-c-empty");
-    assert(kvstore_kv_Store_larger(empty, NULL, &err) == NULL);
-    assert(err.code == 0);
-    kvstore_kv_Store* bigger = kvstore_kv_Store_larger(empty, forked, &err);
-    assert(bigger == forked);
+    // larger(): `Store?` in and out.
+    kvstore_kv_Store* empty = open_store("/empty");
+    assert(kvstore_kv_Store_larger(empty, NULL, &err) == NULL && err.code == 0);
+    kvstore_kv_Store* bigger = kvstore_kv_Store_larger(empty, fork, &err);
+    assert(bigger == fork);
     kvstore_kv_Store_destroy(bigger);
-    bigger = kvstore_kv_Store_larger(forked, store, &err);
-    assert(bigger == forked && "self wins when it holds more");
-    kvstore_kv_Store_destroy(bigger);
-    bigger = kvstore_kv_Store_larger(store, NULL, &err);
-    assert(bigger == store && "a non-empty self is returned when other is absent");
+    bigger = kvstore_kv_Store_larger(s, NULL, &err);
+    assert(bigger == s);
     kvstore_kv_Store_destroy(bigger);
 
-    // describe(): a record carrying the object itself and an optional object.
-    kvstore_kv_StoreInfo info = describe(store, "primary", NULL);
-    assert(strcmp(info.label.ptr, "primary") == 0);
-    assert(info.store == store && "describe().store is the receiver");
-    assert(info.mirror == NULL && info.count == 2);
-    kvstore_kv_StoreInfo_free(&info);  // releases the adopted reference
+    // describe(): a record whose fields carry objects.
+    kvstore_kv_StoreInfo info = describe(s, "main", fork);
+    assert(str_is(info.label, "main") && info.store == s && info.mirror == fork);
+    assert(info.count == 1 && count(info.mirror) == 2);
 
-    info = describe(forked, "with-mirror", store);
-    assert(info.store == forked && info.mirror == store && info.count == 3);
-    assert(count(info.mirror) == 2 && "the mirror token is a live reference");
-    kvstore_kv_StoreInfo_free(&info);
-
-    // open_many(): a list of objects as a return.
+    // open_many(): a list of objects; one bad path fails the whole call.
     kvstore_str paths[2] = {kvstore_str_of("/a"), kvstore_str_of("/b")};
-    kvstore_list_string path_list;
-    path_list.items = paths;
-    path_list.len = 2;
+    kvstore_list_string pl;
+    pl.items = paths;
+    pl.len = 2;
     kvstore_writer w;
     memset(&w, 0, sizeof w);
-    kvstore_list_string_write(&w, &path_list);
+    kvstore_list_string_write(&w, &pl);
     const uint8_t* buf = kvstore_kv_Store_open_many(w.ptr, w.len, &len, &err);
     kvstore_writer_free(&w);
-    assert(err.code == 0 && buf != NULL);
     kvstore_list_kv_Store many;
-    assert(kvstore_list_kv_Store_decode(buf, len, &many));
+    assert(err.code == 0 && kvstore_list_kv_Store_decode(buf, len, &many));
     kvstore_free_bytes((uint8_t*)buf, len);
-    assert(many.len == 2 && many.items[0] != many.items[1]);
-    put(many.items[0], "m", payload, 1);
-    assert(count(many.items[0]) == 1 && count(many.items[1]) == 0);
-
-    // A failing path fails the whole call with the typed code and no list.
+    assert(many.len == 2 && path_is(many.items[0], "/a") && path_is(many.items[1], "/b"));
     paths[1] = kvstore_str_of("");
     memset(&w, 0, sizeof w);
-    kvstore_list_string_write(&w, &path_list);
+    kvstore_list_string_write(&w, &pl);
     assert(kvstore_kv_Store_open_many(w.ptr, w.len, &len, &err) == NULL);
     kvstore_writer_free(&w);
-    assert(err.code == kvstore_kv_KvError_IoError);
-    assert(strcmp(err.message, "I/O failure") == 0);
+    assert(err.code == kvstore_kv_KvError_InvalidPath);
     kvstore_error_clear(&err);
 
-    // total_count(): objects inside a list and inside an optional record.
-    // The writer stores a fresh `_clone` per object, which the producer
-    // adopts and drops; our own references stay valid.
-    kvstore_kv_Store* three[3] = {many.items[0], many.items[1], forked};
+    // by_label(): records with objects in, a map with object values out.
+    kvstore_kv_StoreInfo infos[2];
+    infos[0] = info;
+    infos[1].label = kvstore_str_of("first");
+    infos[1].store = many.items[0];
+    infos[1].mirror = NULL;
+    infos[1].count = 0;
+    kvstore_list_kv_StoreInfo il;
+    il.items = infos;
+    il.len = 2;
+    memset(&w, 0, sizeof w);
+    kvstore_list_kv_StoreInfo_write(&w, &il);
+    buf = kvstore_kv_Store_by_label(w.ptr, w.len, &len, &err);
+    kvstore_writer_free(&w);
+    kvstore_map_string_kv_Store named;
+    assert(err.code == 0 && kvstore_map_string_kv_Store_decode(buf, len, &named));
+    kvstore_free_bytes((uint8_t*)buf, len);
+    assert(named.len == 2);
+    for (size_t i = 0; i < named.len; i++) {
+        if (str_is(named.keys[i], "main")) assert(named.values[i] == s);
+        else assert(str_is(named.keys[i], "first") && named.values[i] == many.items[0]);
+    }
+
+    // total_count(): a list, a map, and an optional record, all carrying
+    // objects (each written as a fresh reference the producer adopts).
+    put(many.items[0], "m", "1");
+    kvstore_kv_Store* three[3] = {many.items[0], many.items[1], fork};
     kvstore_list_kv_Store stores;
     stores.items = three;
     stores.len = 3;
-    kvstore_kv_StoreInfo extra;
-    extra.label = kvstore_str_of("extra");
-    extra.store = store;
-    extra.mirror = forked;
-    extra.count = count(store);
-    kvstore_writer ws, we;
+    kvstore_writer ws, wn, we;
     memset(&ws, 0, sizeof ws);
+    memset(&wn, 0, sizeof wn);
     memset(&we, 0, sizeof we);
     kvstore_list_kv_Store_write(&ws, &stores);
-    kvstore_opt_kv_StoreInfo_write(&we, &extra);
-    assert(kvstore_kv_Store_total_count(ws.ptr, ws.len, we.ptr, we.len, &err) ==
-           1 + 0 + 3 + 2);
+    kvstore_map_string_kv_Store_write(&wn, &named);
+    kvstore_opt_kv_StoreInfo_write(&we, &info);
+    // stores: 1 + 0 + 2; named: main 1 + first 1; extra: main 1.
+    assert(kvstore_kv_Store_total_count(ws.ptr, ws.len, wn.ptr, wn.len, we.ptr, we.len, &err) ==
+           6);
     assert(err.code == 0);
     kvstore_writer_free(&ws);
+    kvstore_writer_free(&wn);
     kvstore_writer_free(&we);
-
-    // ... and with the optional record absent, plus an empty list.
-    stores.len = 1;
+    // A buffer carrying objects is consumed by the call that receives it
+    // (its references are adopted), so each call gets fresh buffers.
     memset(&ws, 0, sizeof ws);
+    memset(&wn, 0, sizeof wn);
     memset(&we, 0, sizeof we);
     kvstore_list_kv_Store_write(&ws, &stores);
+    kvstore_map_string_kv_Store_write(&wn, &named);
     kvstore_opt_kv_StoreInfo_write(&we, NULL);
-    assert(kvstore_kv_Store_total_count(ws.ptr, ws.len, we.ptr, we.len, &err) == 1);
+    assert(kvstore_kv_Store_total_count(ws.ptr, ws.len, wn.ptr, wn.len, we.ptr, we.len, &err) ==
+           5);
     kvstore_writer_free(&ws);
-    stores.len = 0;
-    memset(&ws, 0, sizeof ws);
-    kvstore_list_kv_Store_write(&ws, &stores);
-    assert(kvstore_kv_Store_total_count(ws.ptr, ws.len, we.ptr, we.len, &err) == 0);
-    kvstore_writer_free(&ws);
+    kvstore_writer_free(&wn);
     kvstore_writer_free(&we);
 
-    // Everything we still hold is intact.
-    assert(count(many.items[0]) == 1 && count(forked) == 3 && count(store) == 2);
-
-    // clear() and release every reference exactly once.
-    kvstore_kv_Store_clear(forked, &err);
-    assert(err.code == 0 && count(forked) == 0);
-    kvstore_list_kv_Store_free(&many);  // destroys both opened stores
+    // Everything we hold is still intact; release each reference once.
+    assert(count(s) == 1 && count(fork) == 2 && count(many.items[0]) == 1);
+    kvstore_map_string_kv_Store_free(&named);
+    kvstore_kv_StoreInfo_free(&info);
+    kvstore_list_kv_Store_free(&many);
     kvstore_kv_Store_destroy(empty);
-    kvstore_kv_Store_destroy(forked);
-    kvstore_kv_Store_destroy(store);
+    kvstore_kv_Store_destroy(fork);
+    kvstore_kv_Store_destroy(s);
+}
+
+static void stats_and_report(void) {
+    kvstore_error err = {0};
+    size_t len = 0;
+    kvstore_kv_Store* s = open_store("/stats");
+    put(s, "b", "12");
+    put(s, "a", "1");
+    put(s, "a", "123");
+    assert(try_put(s, "c", "x", kvstore_kv_EntryKind_Encrypted, NULL, NULL, &err));
+
+    // kv.stats.summarize: the parent's Store as a parameter, the parent's
+    // error domain for a prefix that matches nothing.
+    kvstore_writer w = prefix_buf(NULL);
+    const uint8_t* buf = kvstore_kv_stats_summarize(s, w.ptr, w.len, &len, &err);
+    kvstore_writer_free(&w);
+    kvstore_kv_stats_Stats st;
+    assert(err.code == 0 && kvstore_kv_stats_Stats_decode(buf, len, &st));
+    kvstore_free_bytes((uint8_t*)buf, len);
+    assert(st.entries == 3 && st.bytes == 6 && st.by_kind.len == 2);
+    for (size_t i = 0; i < st.by_kind.len; i++) {
+        if (st.by_kind.keys[i] == kvstore_kv_EntryKind_Persistent) assert(st.by_kind.values[i] == 2);
+        else assert(st.by_kind.keys[i] == kvstore_kv_EntryKind_Encrypted && st.by_kind.values[i] == 1);
+    }
+    kvstore_kv_stats_Stats_free(&st);
+    w = prefix_buf("q");
+    assert(kvstore_kv_stats_summarize(s, w.ptr, w.len, &len, &err) == NULL);
+    kvstore_writer_free(&w);
+    expect_key_not_found(&err, "q");
+
+    // report.render_report: the sibling root shares the Entry record.
+    w = prefix_buf(NULL);
+    kvstore_kv_Store_EntriesIterator* it = kvstore_kv_Store_entries(s, w.ptr, w.len, &err);
+    kvstore_writer_free(&w);
+    kvstore_kv_Entry entries[3];
+    const uint8_t* item = NULL;
+    size_t n = 0;
+    while (kvstore_kv_Store_EntriesIterator_next(it, &item, &len, &err) == 1) {
+        assert(kvstore_kv_Entry_decode(item, len, &entries[n++]));
+        kvstore_free_bytes((uint8_t*)item, len);
+    }
+    kvstore_kv_Store_EntriesIterator_destroy(it);
+    assert(n == 3);
+    kvstore_list_kv_Entry el;
+    el.items = entries;
+    el.len = n;
+    memset(&w, 0, sizeof w);
+    kvstore_list_kv_Entry_write(&w, &el);
+    buf = kvstore_report_render_report(w.ptr, w.len, &len, &err);
+    kvstore_writer_free(&w);
+    kvstore_list_string lines;
+    assert(err.code == 0 && kvstore_list_string_decode(buf, len, &lines));
+    kvstore_free_bytes((uint8_t*)buf, len);
+    assert(lines.len == 3);
+    assert(str_is(lines.items[0], "a: 3 bytes, Persistent, v2"));
+    assert(str_is(lines.items[1], "b: 2 bytes, Persistent"));
+    assert(str_is(lines.items[2], "c: 1 bytes, Encrypted"));
+    kvstore_list_string_free(&lines);
+    for (size_t i = 0; i < n; i++) kvstore_kv_Entry_free(&entries[i]);
+
+    el.len = 0;
+    memset(&w, 0, sizeof w);
+    kvstore_list_kv_Entry_write(&w, &el);
+    assert(kvstore_report_render_report(w.ptr, w.len, &len, &err) == NULL);
+    kvstore_writer_free(&w);
+    assert(err.code == kvstore_report_ReportError_NothingToReport);
+    assert(strcmp(err.message, "nothing to report") == 0);
+    kvstore_error_clear(&err);
+    kvstore_kv_Store_destroy(s);
 }
 
 int main(void) {
-    kvstore_error err = {0};
+    g_main_thread = pthread_self();
 
-    assert(KVSTORE_ABI_VERSION == 3u && kvstore_abi_version() == KVSTORE_ABI_VERSION);
-    assert(kvstore_kv_checksum() == KVSTORE_KV_CHECKSUM);
+    assert(KVSTORE_ABI_VERSION == 4u && kvstore_abi_version() == KVSTORE_ABI_VERSION);
+    assert(kvstore_kv_contract_check() == 0);
+    assert(kvstore_report_contract_check() == 0);
+    assert(kvstore_debug_live(-1) == 1 && "the sample counts live allocations");
 
-    // Static method: no receiver, plain error-out slot.
-    assert(kvstore_kv_Store_default_capacity(&err) == 1000000);
-    assert(err.code == 0);
-
-    // Fallible constructor, typed error path: an empty path reports IoError
-    // with the error's Display message.
-    assert(kvstore_kv_Store_open(STR(""), &err) == NULL);
-    assert(err.code == kvstore_kv_KvError_IoError);
-    assert(err.message != NULL && strcmp(err.message, "I/O failure") == 0);
-    kvstore_error_clear(&err);
-
-    // A NULL string pointer with a nonzero length is a marshalling failure.
-    assert(kvstore_kv_Store_open(NULL, 4, &err) == NULL);
-    assert(err.code == -3);
-    kvstore_error_clear(&err);
-
-    kvstore_kv_Store* store = open_store("/tmp/conformance-kvstore-c");
-    basics(store);
-    listeners(store);
-    compaction(store);
-    object_graph(store);  // consumes `store`
-
-    // A store dropped with a listener attached frees the listener.
-    kvstore_kv_Store* with_listener = open_store("/tmp/conformance-kvstore-c-l");
-    kvstore_kv_Store_set_eviction_listener(with_listener, new_listener(0, 0), &LISTENER_VTABLE,
-                                           &err);
-    assert(g_listener_freed == 4);
-    kvstore_kv_Store_destroy(with_listener);
-    assert(g_listener_freed == 5 && "dropping the store frees its listener");
+    constructors();
+    basics();
+    iterators();
+    listeners();
+    policies();
+    loaders();
+    async_calls();
+    object_graph();
+    stats_and_report();
 
     ASSERT_NO_LEAKS(kvstore_debug_live);
+    assert(atomic_load(&g_listeners_freed) == 6);
+    assert(atomic_load(&g_policies_freed) == 2);
     printf("c/kvstore: OK\n");
     return 0;
 }

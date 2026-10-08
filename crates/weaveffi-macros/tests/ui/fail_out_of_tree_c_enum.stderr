@@ -1,0 +1,18 @@
+error[E0277]: `Color` is not a WeaveFFI record or rich enum; declare C-style enums and interfaces in the module tree that uses them
+  --> tests/ui/fail_out_of_tree_c_enum.rs:20:23
+   |
+20 |     pub fn mix(color: Color) -> i32 {
+   |                       ^^^^^ declared outside this module tree
+   |
+help: the trait `ByValue` is not implemented for `Color`
+  --> tests/ui/fail_out_of_tree_c_enum.rs:9:5
+   |
+ 9 |     pub enum Color {
+   |     ^^^^^^^^^^^^^^
+   = note: a `#[weaveffi::module]` only sees the declarations inside its own tree, so it can pass a type from another tree only as a value buffer (a record or rich enum)
+   = note: nest the modules under one `#[weaveffi::module]` root (as inner `mod`s) so the macro can see the declaration
+note: required by a bound in `__weaveffi_assert_by_value`
+  --> tests/ui/fail_out_of_tree_c_enum.rs:20:23
+   |
+20 |     pub fn mix(color: Color) -> i32 {
+   |                       ^^^^^ required by this bound in `__weaveffi_assert_by_value`

@@ -40,10 +40,6 @@ name = "weaveffi-model"
 version_group = "weaveffi"
 
 [[package]]
-name = "weaveffi-abi"
-version_group = "weaveffi"
-
-[[package]]
 name = "weaveffi-macros"
 version_group = "weaveffi"
 
@@ -52,15 +48,11 @@ name = "weaveffi"
 version_group = "weaveffi"
 
 [[package]]
-name = "weaveffi-gen"
-version_group = "weaveffi"
-
-[[package]]
 name = "weaveffi-cli"
 version_group = "weaveffi"
 changelog_update = true
 changelog_path = "CHANGELOG.md"
-changelog_include = ["weaveffi-model", "weaveffi-abi", "weaveffi-macros", "weaveffi", "weaveffi-gen"]
+changelog_include = ["weaveffi-model", "weaveffi-macros", "weaveffi"]
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
 git_release_enable = true

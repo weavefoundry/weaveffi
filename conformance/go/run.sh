@@ -5,6 +5,7 @@
 # consumer against one sample and must exit 0.
 set -uo pipefail
 . "$(dirname "$0")/../lib.sh"
+require_tools go go
 
 # Run a Go consumer in a throwaway module that requires the generated module
 # as-is (a `replace` points at its directory). The module path follows the
@@ -38,22 +39,11 @@ EOF
 }
 
 go_calculator() { go_consumer calculator calculator.go; }
-
-go_contacts()   { go_consumer contacts contacts.go; }
-
-go_events()     { go_consumer events events.go; }
-
-go_kvstore()    { go_consumer kvstore kvstore.go; }
-
-go_async_demo() { go_consumer async-demo async_demo.go; }
-
-go_codec()      { go_consumer codec codec.go; }
+go_codec() { go_consumer codec codec.go; }
+go_kvstore() { go_consumer kvstore kvstore.go; }
 
 lane go-calculator go_calculator
-lane go-contacts go_contacts
-lane go-events go_events
-lane go-kvstore go_kvstore
-lane go-async-demo go_async_demo
 lane go-codec go_codec
+lane go-kvstore go_kvstore
 
 finish_lanes

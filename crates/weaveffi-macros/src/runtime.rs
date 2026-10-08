@@ -1,7 +1,7 @@
 //! Expansion of `weaveffi::export_runtime!()`: the fixed runtime surface
 //! every library exports under its own prefix.
 //!
-//! The bodies live in `weaveffi-abi`; only the `extern "C"` thunks are
+//! The bodies live in `weaveffi::abi`; only the `extern "C"` thunks are
 //! emitted here, in the producer's crate, because `#[no_mangle]` symbols in
 //! a transitive `rlib` aren't guaranteed to be exported from a `cdylib`.
 //!
@@ -27,6 +27,7 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     let sym = |name: &str| ident(&format!("{p}_{name}"));
     let abi_version = sym("abi_version");
     let error_set = sym("error_set");
+    let error_set_payload = sym("error_set_payload");
     let error_clear = sym("error_clear");
     let error_free = sym("error_free");
     let free_bytes = sym("free_bytes");
@@ -36,7 +37,6 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     let token_destroy = sym("cancel_token_destroy");
     let debug_live = sym("debug_live");
     let alloc = sym("alloc");
-    let dealloc = sym("dealloc");
     Ok(quote! {
             // Consumers compare this against the revision they were generated
             // for before touching any other symbol, so it must stay a plain
@@ -57,6 +57,17 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
                 message: *const ::std::os::raw::c_char,
             ) {
                 unsafe { ::weaveffi::abi::error_set_c(err, code, message) }
+            }
+
+            #[doc(hidden)]
+            #[unsafe(no_mangle)]
+            #[allow(unsafe_code, unused_unsafe, clippy::missing_safety_doc)]
+            pub unsafe extern "C" fn #error_set_payload(
+                err: *mut ::weaveffi::abi::FfiError,
+                ptr: *const u8,
+                len: usize,
+            ) {
+                unsafe { ::weaveffi::abi::error_set_payload_c(err, ptr, len) }
             }
 
             #[doc(hidden)]
@@ -115,22 +126,14 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
                 ::weaveffi::abi::debug_live(kind)
             }
 
-            // Wasm has no host allocator, so the generated JS glue stages
-            // input buffers and return slots through these.
-            #[cfg(target_arch = "wasm32")]
+            // Consumers allocate the runs they hand to the producer (a
+            // callback's string, bytes, or buffer return) and, on wasm32,
+            // stage arguments through this.
             #[doc(hidden)]
             #[unsafe(no_mangle)]
             #[allow(unsafe_code)]
-            pub extern "C" fn #alloc(size: u32) -> *mut u8 {
-                ::weaveffi::abi::wasm_alloc(size as usize)
-            }
-
-            #[cfg(target_arch = "wasm32")]
-            #[doc(hidden)]
-            #[unsafe(no_mangle)]
-            #[allow(unsafe_code, unused_unsafe, clippy::missing_safety_doc)]
-            pub unsafe extern "C" fn #dealloc(ptr: *mut u8, size: u32) {
-                unsafe { ::weaveffi::abi::wasm_dealloc(ptr, size as usize) }
+            pub extern "C" fn #alloc(len: usize) -> *mut u8 {
+                ::weaveffi::abi::alloc(len)
             }
     })
 }

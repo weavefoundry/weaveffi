@@ -5,6 +5,7 @@
 # consumer against one sample and must exit 0.
 set -uo pipefail
 . "$(dirname "$0")/../lib.sh"
+require_tools dotnet dotnet
 
 # .NET: a console app with a ProjectReference to the generated project, used
 # as generated. The generated loader finds the producer through
@@ -39,20 +40,12 @@ EOF
            dotnet run -c Release --nologo -v quiet 2>&1 )
 }
 
-dotnet_contacts()   { dotnet_consumer contacts Contacts.cs; }
+dotnet_calculator() { dotnet_consumer calculator Calculator.cs; }
+dotnet_codec() { dotnet_consumer codec Codec.cs; }
+dotnet_kvstore() { dotnet_consumer kvstore Kvstore.cs; }
 
-dotnet_events()     { dotnet_consumer events Events.cs; }
-
-dotnet_kvstore()    { dotnet_consumer kvstore Kvstore.cs; }
-
-dotnet_async_demo() { dotnet_consumer async-demo AsyncDemo.cs; }
-
-dotnet_codec()      { dotnet_consumer codec Codec.cs; }
-
-lane dotnet-contacts dotnet_contacts
-lane dotnet-events dotnet_events
-lane dotnet-kvstore dotnet_kvstore
-lane dotnet-async-demo dotnet_async_demo
+lane dotnet-calculator dotnet_calculator
 lane dotnet-codec dotnet_codec
+lane dotnet-kvstore dotnet_kvstore
 
 finish_lanes
