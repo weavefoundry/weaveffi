@@ -1,13 +1,12 @@
 //! The library behind the `weaveffi` command-line tool: the
 //! [`Project`](project::Project) that locates a project and loads its API
-//! (from an IDL, or from a Rust producer's built [`library`]), the
-//! `weaveffi.toml` [`config`], the [`LanguageBackend`](backend::LanguageBackend)
-//! trait, the code-generation [`Orchestrator`](codegen::Orchestrator), the
-//! shared C ABI declaration renderer, the eleven language generators under
-//! [`targets`], and the [`build`] and [`package`] layers that turn a producer
-//! crate into installable per-ecosystem artifacts.
+//! (from an IDL, or from a Rust producer's built library), the
+//! `weaveffi.toml` [`config`], the language [`targets`] with their
+//! [`REGISTRY`](targets::REGISTRY), the code-generation
+//! [`Orchestrator`](codegen::Orchestrator), and the [`package`] artifacts
+//! `weaveffi package` writes.
 //!
-//! Every generator renders from the validated
+//! Every target renders from the validated
 //! [`Model`](weaveffi_model::model::Model) alone, so symbol names and
 //! parameter lowering are computed once and shared.
 #![deny(missing_docs)]
@@ -15,19 +14,20 @@
 #![warn(clippy::missing_panics_doc)]
 #![warn(clippy::doc_markdown)]
 
-pub mod backend;
-pub mod build;
-pub mod cabi;
-pub mod cache;
-pub mod cargo;
+pub(crate) mod build;
+pub(crate) mod cabi;
+pub(crate) mod cargo;
 pub mod codegen;
+#[doc(hidden)]
+pub mod commands;
 pub mod config;
-pub mod lang;
-pub mod library;
-pub mod manifest;
+pub(crate) mod lang;
+pub(crate) mod library;
+pub(crate) mod manifest;
 pub mod package;
-pub mod platform;
+pub(crate) mod platform;
 pub mod project;
+pub(crate) mod record;
 mod report;
 pub mod targets;
-pub mod utils;
+pub(crate) mod utils;

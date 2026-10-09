@@ -1,4 +1,4 @@
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: docs
     doc: |
@@ -37,10 +37,10 @@ modules:
               - { name: doc_id, type: i64, doc: Identifier of the saved document }
               - { name: revision, type: i32, doc: Monotonically increasing revision }
     errors:
-      name: DocsErrors
-      codes:
-        - { name: not_found, code: 1, message: "Document not found", doc: Returned when no document matches the requested id }
-        - { name: invalid_status, code: 2, message: "Invalid status transition", doc: Raised when attempting to move into a forbidden state }
+      - name: DocsErrors
+        codes:
+          - { name: not_found, code: 1, message: "Document not found", doc: Returned when no document matches the requested id }
+          - { name: invalid_status, code: 2, message: "Invalid status transition", doc: Raised when attempting to move into a forbidden state }
     interfaces:
       - name: Notebook
         doc: |
@@ -62,7 +62,7 @@ modules:
             params:
               - { name: id, type: i64, doc: Identifier of the document to find }
             return: Document
-            throws: true
+            throws: DocsErrors
           - name: size
             doc: The number of documents currently held
             params: []

@@ -622,6 +622,55 @@ fixed_width_buffer_value! {
     f64 => (write_f64, read_f64),
 }
 
+/// A `usize` encodes as a `u64` (the IDL's `u64`); decoding one past
+/// `usize::MAX` fails.
+impl BufferValue for usize {
+    fn encoded_len(&self) -> usize {
+        8
+    }
+    fn write_value(&self, w: &mut BufferWriter) {
+        w.write_u64(crate::abi::Scalar::to_abi(self));
+    }
+    unsafe fn read_value(r: &mut BufferReader<'_>) -> Result<Self, BufferDecodeError> {
+        usize::try_from(r.read_u64()?).map_err(|_| BufferDecodeError {
+            context: "u64 out of range for usize",
+        })
+    }
+}
+
+/// An `isize` encodes as an `i64` (the IDL's `i64`); decoding one outside
+/// `isize`'s range fails.
+impl BufferValue for isize {
+    fn encoded_len(&self) -> usize {
+        8
+    }
+    fn write_value(&self, w: &mut BufferWriter) {
+        w.write_i64(crate::abi::Scalar::to_abi(self));
+    }
+    unsafe fn read_value(r: &mut BufferReader<'_>) -> Result<Self, BufferDecodeError> {
+        isize::try_from(r.read_i64()?).map_err(|_| BufferDecodeError {
+            context: "i64 out of range for isize",
+        })
+    }
+}
+
+/// A `char` encodes as a one-scalar `string`; decoding any other string
+/// fails.
+impl BufferValue for char {
+    fn encoded_len(&self) -> usize {
+        4 + self.len_utf8()
+    }
+    fn write_value(&self, w: &mut BufferWriter) {
+        w.write_string(self.encode_utf8(&mut [0; 4]));
+    }
+    unsafe fn read_value(r: &mut BufferReader<'_>) -> Result<Self, BufferDecodeError> {
+        let text = r.read_string()?;
+        <char as crate::abi::Text>::from_text(&text).ok_or(BufferDecodeError {
+            context: "string is not exactly one char",
+        })
+    }
+}
+
 impl BufferValue for String {
     fn encoded_len(&self) -> usize {
         4 + self.len()
@@ -875,6 +924,18 @@ mod tests {
         roundtrip(u64::MAX);
         roundtrip(1.5f32);
         roundtrip(-2.25f64);
+    }
+
+    #[test]
+    fn sizes_and_chars_use_their_idl_encodings() {
+        roundtrip(usize::MAX);
+        roundtrip(isize::MIN);
+        roundtrip(vec![1usize, 2]);
+        roundtrip('\u{1F980}');
+        assert_eq!(encode_value(&7usize), encode_value(&7u64));
+        assert_eq!(encode_value(&'a'), encode_value(&"a".to_string()));
+        assert!(decode::<char>(&encode_value(&"ab".to_string())).is_err());
+        assert!(decode::<char>(&encode_value(&String::new())).is_err());
     }
 
     #[test]

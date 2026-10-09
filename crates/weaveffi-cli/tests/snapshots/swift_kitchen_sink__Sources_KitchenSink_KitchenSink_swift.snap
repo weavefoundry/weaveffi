@@ -8,694 +8,199 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 import CKitchenSink
 import Foundation
 
-// MARK: - Runtime support
+// MARK: - Contract
 
-/// A failure the native library reports outside any declared error domain:
-/// an unknown error code or a runtime failure. Throwing wrappers raise it;
-/// non-throwing wrappers stop the process with `fatalError` instead, since
-/// Swift has no unchecked errors.
-public struct KitchenSinkRuntimeError: Error, LocalizedError, Hashable, Sendable {
-    /// The code of a generic runtime failure.
-    public static let genericCode: Int32 = -1
-    /// The code of a panic caught at the library boundary.
-    public static let panicCode: Int32 = -2
-    /// The code of an argument or result that failed to marshal.
-    public static let marshalCode: Int32 = -3
-    /// The code of a callback implementation that threw.
-    public static let foreignCode: Int32 = -4
+/// The first declaration these bindings were generated with that the library
+/// lacks or declares differently, checked once by `KitchenSinkLibrary.check()`.
+func wvCheckContracts() -> KitchenSinkLibrary.LoadError? {
+    if let failure = wvCheckContract(kitchen_sink_shared_contract, [
+        (0x709e234caa962446, 0x3894f2ca452e9f98, "shared.ping"),
+        (0xcfb306fa5801ee5b, 0x18e9fc204a13df6f, "shared.Token"),
+    ]) {
+        return failure
+    }
+    return wvCheckContract(kitchen_sink_kitchen_contract, [
+        (0x01d4f09bbddc986f, 0xffcf2bd3b04aa002, "kitchen.Gadget.new"),
+        (0x02bbd5f31c953704, 0xaca75656ad13d661, "kitchen.Sampler.samples"),
+        (0x10472d8fe748c2ee, 0xcc570a2649bbf7dc, "kitchen.maybe_gadget"),
+        (0x11368eec07a74078, 0xfa049f78b77e146a, "kitchen.gadgets"),
+        (0x137f08a29cde6021, 0xda8de7aeb2dbb8a3, "kitchen.stream_gadgets"),
+        (0x184bfc4ab0e3fe45, 0xb64587477022696b, "kitchen.ids_u64"),
+        (0x2111b54980826dd7, 0x627bf01ab365b209, "kitchen.do_cancellable"),
+        (0x21c70f9371374d74, 0xc582d6ad2392c36c, "kitchen.ReadyListener.favorite"),
+        (0x23de5bd597372f46, 0xcf1bc6bb37872798, "kitchen.stream_chunks"),
+        (0x249f1ddaec6a6cbe, 0x0710d6c9a4de93da, "kitchen.take_from_pantry"),
+        (0x29dddbc60bf8d7db, 0x452a3e573d57f6db, "kitchen.Priority"),
+        (0x2b227003b74a0d16, 0x5dae036b8a6aed30, "kitchen.maybe_subscribe"),
+        (0x2dd66cb0064f0494, 0x74b131724dd0d867, "kitchen.Item"),
+        (0x33c265bbf079b0e9, 0x97c32b764693f2cb, "kitchen.u32_id"),
+        (0x33e6381d01660dfe, 0x05e35a563089bf7d, "kitchen.KitchenErrors"),
+        (0x3d969ae76db6cb23, 0x38ac642c196512a5, "kitchen.ReadyListener.latest"),
+        (0x3f5fc99d73504b76, 0x417e4a2acd3210b3, "kitchen.Gadget.poke"),
+        (0x4082f0085db28781, 0x18848e701962912e, "kitchen.Sampler"),
+        (0x4340a6b1e7ec8c50, 0xf5b4f10f61862b33, "kitchen.Sampler.describe"),
+        (0x4c5764cf109528d1, 0xb374accf14676d90, "kitchen.maybe_item"),
+        (0x4de17dfb93fd494d, 0x78be3203bcd10727, "kitchen.i32_id"),
+        (0x504e95b7f7e65570, 0x01b3e8e0c9a10e23, "kitchen.stream_items"),
+        (0x5dafabb7775fcb2d, 0x6c4b78c7d3f858c1, "kitchen.PantryError.Spoiled"),
+        (0x5e0a8f6be4b00600, 0x3d0dcaec54133637, "kitchen.Sampler.threshold"),
+        (0x5ec0af1d4ecc6fed, 0x6540bdb74246420c, "kitchen.async_samples"),
+        (0x61a358b0571e0a4e, 0x11a24c4b50d11996, "kitchen.async_maybe_count"),
+        (0x68cdb9a4bd3e3dd5, 0xcde022fe6bc3b1bf, "kitchen.bool_id"),
+        (0x69e7cd703d16eb85, 0xb13cb8d39e702c79, "kitchen.do_async"),
+        (0x70865079ce41be82, 0xbe3b69464672af46, "kitchen.Gadget.describe"),
+        (0x71c5a1116cb7c49a, 0x1506cfe6f548fac4, "kitchen.echo_bytes"),
+        (0x735ee1e0049ee91a, 0xa713dbd1be707752, "kitchen.echo_string"),
+        (0x76d7fc58f4e41d84, 0x6bdb4ccea2841d5e, "kitchen.i64_id"),
+        (0x78d91fd617e162b8, 0xd88e2753503b36df, "kitchen.stream_maybe"),
+        (0x79abfe1aa960fd6a, 0xbca7a9e5eb26f3a6, "kitchen.nested.hello"),
+        (0x7b3865b536da998c, 0x1c4e79d60a20e74f, "kitchen.mixed_slices"),
+        (0x7ba266dc26a58989, 0x0f86001cac0c21e8, "kitchen.KitchenErrors.InvalidInput"),
+        (0x7d3dd7d5cf6749e3, 0xa192f5a7298adb39, "kitchen.new_op"),
+        (0x81ded69adee0abf2, 0x8c71141a931906f6, "kitchen.scale_i32"),
+        (0x81fa72769330fed6, 0x2096511ca5c9d8d3, "kitchen.ReadyListener.label"),
+        (0x89a5e664bc25c67b, 0x357fd9b65ad879a9, "kitchen.f64_id"),
+        (0x8cfdbdcecac5f7f1, 0x07e272f09c41fffc, "kitchen.Gadget.version"),
+        (0x8dc42397e47614b9, 0xcddf6fede09b2e7f, "kitchen.opt_priority"),
+        (0x92f060ef68961fc1, 0xd948f51645dc11a0, "kitchen.ReadyListener.on_item"),
+        (0x974b9f3e823c1738, 0xb81b91e975695f27, "kitchen.cross_module_token"),
+        (0x9f0f001aa85f97d5, 0x55815247f895bd45, "kitchen.sum_f64"),
+        (0xab2a29fd1ef5458b, 0x471a34aa4c09ae2b, "kitchen.KitchenErrors.NotFound"),
+        (0xaca0655fac15d230, 0x11c4d2b28abe07bb, "kitchen.list_items"),
+        (0xb57c8e6ae3fb4383, 0x3f857851ab75366c, "kitchen.PantryError"),
+        (0xbdc795b195edd428, 0x36127462f8b0969f, "kitchen.opt_mixed"),
+        (0xbe4821ab3c340e71, 0x17fad5418abe0f50, "kitchen.ReadyListener.on_ready"),
+        (0xc2ad53f2a6a36323, 0x071e29abee823f17, "kitchen.opt_i32_id"),
+        (0xc7ab409554fd3d7b, 0xfea12b6bc219fc46, "kitchen.parse_any"),
+        (0xc82a7f2d85f99f4e, 0xa9bcb8bacedb036c, "kitchen.sample_with"),
+        (0xc883b4afae20543e, 0xc40560e5411ff392, "kitchen.legacy_op"),
+        (0xd180bf646bff59e2, 0xa4515a6d00d7c600, "kitchen.PantryError.OutOfStock"),
+        (0xe6778df0f5c1b82b, 0x38eaafdb350559e1, "kitchen.opt_bool_id"),
+        (0xf2f7753e6e1dffc2, 0xc9047a95bdf49e93, "kitchen.get_attrs"),
+        (0xfae25d3391922ead, 0xcc034cf506cae182, "kitchen.subscribe"),
+        (0xfd0059b05cb2fcfb, 0x248bf8404a5823b4, "kitchen.Gadget"),
+        (0xfed9c551fb9fd2d6, 0xe1020573f084dc1d, "kitchen.ReadyListener"),
+        (0xff3a99b52597dee2, 0x14c4ecac97bdfc9b, "kitchen.Gadget.readings"),
+    ])
+}
 
-    /// The numeric code the native library reported.
-    public let errorCode: Int32
-    /// The message the native library reported.
-    public let message: String
+// MARK: - API
 
-    /// Creates an error carrying a native code and message.
-    public init(errorCode: Int32, message: String) {
-        self.errorCode = errorCode
-        self.message = message
+/// The `KitchenErrors` error domain of the `kitchen` module.
+///
+/// Every case carries the message the library reported (the code's
+/// documented message when it sent none) and the code's fields.
+public enum KitchenError: Error, LocalizedError, Hashable, Sendable {
+    case notFound(message: String)
+    case invalidInput(message: String)
+    /// A code these bindings don't declare, from a newer library.
+    case unknown(code: Int32, message: String)
+
+    /// The numeric code the library reported.
+    public var errorCode: Int32 {
+        switch self {
+        case .notFound: return 1
+        case .invalidInput: return 2
+        case let .unknown(code, _): return code
+        }
+    }
+
+    /// The message the library reported, or the code's documented message.
+    public var message: String {
+        switch self {
+        case let .notFound(message): return message
+        case let .invalidInput(message): return message
+        case let .unknown(_, message): return message
+        }
     }
 
     public var errorDescription: String? { message }
 }
 
-/// The error slot every native call reports through.
-typealias WvError = kitchen_sink_error
-
-/// The C ABI revision these bindings were generated against.
-let wvAbiVersion: UInt32 = 4
-
-/// Runs the load-time checks if they haven't run yet.
-@inline(__always)
-func wvLoad() {
-    _ = wvContract
-}
-
-/// Stops the process unless the library implements the ABI revision these
-/// bindings were generated against.
-func wvCheckAbiVersion() {
-    let abi = kitchen_sink_abi_version()
-    guard abi == wvAbiVersion else {
-        fatalError("KitchenSink: the native library 'kitchen_sink' implements C ABI revision \(abi), but these bindings need revision \(wvAbiVersion)")
-    }
-}
-
-/// Stops the process unless every declaration these bindings were generated
-/// with is in a top-level module's contract table with an equal signature
-/// hash. Declarations the library adds are fine.
-func wvCheckContract(
-    _ table: (UnsafeMutablePointer<Int>?) -> UnsafePointer<kitchen_sink_contract_entry>?,
-    _ expected: [(id: UInt64, hash: UInt64, path: StaticString)]
-) {
-    var len = 0
-    let entries = UnsafeBufferPointer(start: table(&len), count: len)
-    var hashes: [UInt64: UInt64] = [:]
-    for entry in entries {
-        hashes[entry.id] = entry.hash
-    }
-    for (id, hash, path) in expected {
-        guard let actual = hashes[id] else {
-            fatalError("KitchenSink: \(path) is missing from the library 'kitchen_sink'; regenerate the bindings or rebuild the library")
+extension KitchenError: WvDomain {
+    init(wvError err: WvError) {
+        let message = wvErrorMessage(err)
+        switch err.code {
+        case 1:
+            self = .notFound(message: message.isEmpty ? "Item not found" : message)
+        case 2:
+            self = .invalidInput(message: message.isEmpty ? "Invalid input" : message)
+        default:
+            self = .unknown(code: err.code, message: message)
         }
-        guard actual == hash else {
-            fatalError("KitchenSink: \(path) changed since these bindings were generated; regenerate the bindings or rebuild the library 'kitchen_sink'")
+    }
+
+    func wvReport(_ outErr: UnsafeMutablePointer<WvError>?) {
+        switch self {
+        case let .notFound(message):
+            wvSetError(outErr, 1, message)
+        case let .invalidInput(message):
+            wvSetError(outErr, 2, message)
+        case let .unknown(code, message):
+            wvSetError(outErr, code, message)
         }
     }
 }
 
-/// The message carried by an error slot.
-func wvErrorMessage(_ err: WvError) -> String {
-    err.message.map { String(cString: $0) } ?? ""
-}
+/// The `PantryError` error domain of the `kitchen` module.
+///
+/// Every case carries the message the library reported (the code's
+/// documented message when it sent none) and the code's fields.
+public enum PantryError: Error, LocalizedError, Hashable, Sendable {
+    case outOfStock(message: String, item: String)
+    case spoiled(message: String)
+    /// A code these bindings don't declare, from a newer library.
+    case unknown(code: Int32, message: String)
 
-/// The Swift error for a code outside any declared domain: cancellation
-/// (`-5`) becomes `CancellationError`, anything else the runtime error.
-func wvRuntimeError(_ err: WvError) -> Error {
-    if err.code == -5 {
-        return CancellationError()
-    }
-    return KitchenSinkRuntimeError(errorCode: err.code, message: wvErrorMessage(err))
-}
-
-/// Stops the process for a failed call that can't throw, naming the code and
-/// message the library reported.
-func wvFatal(_ code: Int32, _ message: String, _ function: StaticString) -> Never {
-    fatalError("KitchenSink.\(function) failed with code \(code): \(message)")
-}
-
-/// Throws the runtime error for a filled error slot, clearing it.
-@inline(__always)
-func wvCheck(_ err: inout WvError) throws {
-    guard err.code != 0 else { return }
-    let error = wvRuntimeError(err)
-    kitchen_sink_error_clear(&err)
-    throw error
-}
-
-/// Stops the process for a filled error slot of a call that can't throw.
-@inline(__always)
-func wvTrap(_ err: inout WvError, _ function: StaticString = #function) {
-    guard err.code != 0 else { return }
-    let code = err.code
-    let message = wvErrorMessage(err)
-    kitchen_sink_error_clear(&err)
-    wvFatal(code, message, function)
-}
-
-/// Maps and releases the heap-boxed error an async completion received.
-func wvTakeError(_ err: UnsafeMutablePointer<WvError>, _ map: (WvError) -> Error) -> Error {
-    let error = map(err.pointee)
-    kitchen_sink_error_free(err)
-    return error
-}
-
-/// The error mapping of a cancellable call that declares no error domain:
-/// cancellation throws `CancellationError`, anything else stops the process.
-func wvCancelledOrTrap(_ err: WvError) -> Error {
-    if err.code == -5 {
-        return CancellationError()
-    }
-    wvFatal(err.code, wvErrorMessage(err), "async call")
-}
-
-/// Stops the process for the boxed error of an async call that can't throw.
-func wvTrapBoxed(_ err: UnsafeMutablePointer<WvError>, _ function: StaticString = #function) -> Never {
-    wvFatal(err.pointee.code, wvErrorMessage(err.pointee), function)
-}
-
-/// Unwraps a pointer the library promised is non-null.
-@inline(__always)
-func wvNonNull<P>(_ ptr: P?, _ function: StaticString = #function) -> P {
-    guard let ptr = ptr else {
-        wvFatal(KitchenSinkRuntimeError.marshalCode, "the native library returned a null pointer", function)
-    }
-    return ptr
-}
-
-/// The Swift enum case for a C-style enum discriminant.
-func wvEnumCase<E: RawRepresentable>(_ type: E.Type, _ raw: Int32) -> E where E.RawValue == Int32 {
-    guard let value = E(rawValue: raw) else {
-        wvDecodeFailure("unknown \(E.self) discriminant \(raw)")
-    }
-    return value
-}
-
-// MARK: Strings, bytes, and buffers
-
-/// Lends the UTF-8 bytes of `s` (not NUL-terminated) for one call.
-@inline(__always)
-func wvWithUTF8<R>(_ s: String, _ body: (UnsafePointer<UInt8>?, Int) throws -> R) rethrows -> R {
-    var s = s
-    return try s.withUTF8 { try body($0.baseAddress, $0.count) }
-}
-
-/// Lends the bytes of `d` for one call.
-@inline(__always)
-func wvWithBytes<R>(_ d: Data, _ body: (UnsafePointer<UInt8>?, Int) throws -> R) rethrows -> R {
-    try d.withUnsafeBytes { try body($0.baseAddress?.assumingMemoryBound(to: UInt8.self), $0.count) }
-}
-
-/// Encodes `value` as a value buffer and lends it for one call.
-@inline(__always)
-func wvWithEncoded<T: WvCodable, R>(_ value: T, _ body: (UnsafePointer<UInt8>?, Int) throws -> R) rethrows -> R {
-    var w = WvWriter()
-    w.write(value)
-    return try w.bytes.withUnsafeBufferPointer { try body($0.baseAddress, $0.count) }
-}
-
-/// Copies a returned string, then releases the library's allocation.
-func wvTakeString(_ ptr: UnsafePointer<UInt8>?, _ len: Int) -> String {
-    guard let ptr = ptr else { return "" }
-    defer { kitchen_sink_free_bytes(UnsafeMutablePointer(mutating: ptr), len) }
-    return String(decoding: UnsafeBufferPointer(start: ptr, count: len), as: UTF8.self)
-}
-
-/// Copies returned bytes, then releases the library's allocation.
-func wvTakeBytes(_ ptr: UnsafePointer<UInt8>?, _ len: Int) -> Data {
-    guard let ptr = ptr else { return Data() }
-    defer { kitchen_sink_free_bytes(UnsafeMutablePointer(mutating: ptr), len) }
-    return Data(bytes: ptr, count: len)
-}
-
-/// Decodes a returned value buffer in place, then releases it.
-func wvTakeBuffer<T: WvCodable>(_ ptr: UnsafePointer<UInt8>?, _ len: Int, as type: T.Type) -> T {
-    defer {
-        if let ptr = ptr { kitchen_sink_free_bytes(UnsafeMutablePointer(mutating: ptr), len) }
-    }
-    return wvBorrowBuffer(ptr, len, as: type)
-}
-
-/// Copies a borrowed string.
-func wvBorrowString(_ ptr: UnsafePointer<UInt8>?, _ len: Int) -> String {
-    guard let ptr = ptr else { return "" }
-    return String(decoding: UnsafeBufferPointer(start: ptr, count: len), as: UTF8.self)
-}
-
-/// Copies borrowed bytes.
-func wvBorrowBytes(_ ptr: UnsafePointer<UInt8>?, _ len: Int) -> Data {
-    guard let ptr = ptr else { return Data() }
-    return Data(bytes: ptr, count: len)
-}
-
-/// Decodes a borrowed value buffer in place.
-func wvBorrowBuffer<T: WvCodable>(_ ptr: UnsafePointer<UInt8>?, _ len: Int, as type: T.Type) -> T {
-    var r = WvReader(UnsafeRawPointer(ptr), len)
-    let value: T = r.read()
-    r.finish()
-    return value
-}
-
-/// Stops the process on a malformed value buffer, which the wire format
-/// treats like a marshalling failure.
-func wvDecodeFailure(_ context: String) -> Never {
-    fatalError("KitchenSink: malformed value buffer: \(context)")
-}
-
-/// Serializes values in the value-buffer wire format: little-endian, packed,
-/// no alignment.
-struct WvWriter {
-    var bytes: [UInt8] = []
-
-    init() {
-        bytes.reserveCapacity(64)
-    }
-
-    @inline(__always)
-    private mutating func append<T: FixedWidthInteger>(_ v: T) {
-        withUnsafeBytes(of: v.littleEndian) { bytes.append(contentsOf: $0) }
-    }
-
-    mutating func writeBool(_ v: Bool) { bytes.append(v ? 1 : 0) }
-    mutating func writeI8(_ v: Int8) { append(v) }
-    mutating func writeU8(_ v: UInt8) { append(v) }
-    mutating func writeI16(_ v: Int16) { append(v) }
-    mutating func writeU16(_ v: UInt16) { append(v) }
-    mutating func writeI32(_ v: Int32) { append(v) }
-    mutating func writeU32(_ v: UInt32) { append(v) }
-    mutating func writeI64(_ v: Int64) { append(v) }
-    mutating func writeU64(_ v: UInt64) { append(v) }
-    mutating func writeF32(_ v: Float) { append(v.bitPattern) }
-    mutating func writeF64(_ v: Double) { append(v.bitPattern) }
-
-    /// Writes a `u32` length or element count.
-    mutating func writeLen(_ n: Int) {
-        precondition(n >= 0 && n <= Int(UInt32.max), "value buffer length exceeds UInt32.max")
-        append(UInt32(n))
-    }
-
-    mutating func writeString(_ v: String) {
-        let utf8 = v.utf8
-        writeLen(utf8.count)
-        bytes.append(contentsOf: utf8)
-    }
-
-    mutating func writeBytes(_ v: Data) {
-        writeLen(v.count)
-        bytes.append(contentsOf: v)
-    }
-
-    mutating func writeOptionFlag(_ present: Bool) { bytes.append(present ? 1 : 0) }
-
-    /// Writes an object token. `p` must be a strong reference the buffer now
-    /// owns (a freshly cloned pointer), never one a wrapper still holds.
-    mutating func writeObject(_ p: OpaquePointer) { append(UInt64(UInt(bitPattern: p))) }
-
-    /// Writes any value that crosses inside a value buffer.
-    @inline(__always)
-    mutating func write<T: WvCodable>(_ value: T) {
-        value.wvWrite(&self)
-    }
-}
-
-/// Deserializes values from the value-buffer wire format directly from the
-/// library's memory, rejecting truncated buffers, invalid flag bytes,
-/// oversized length prefixes, and trailing bytes.
-struct WvReader {
-    private let base: UnsafeRawPointer?
-    private let count: Int
-    private var pos = 0
-
-    init(_ base: UnsafeRawPointer?, _ count: Int) {
-        self.base = base
-        self.count = base == nil ? 0 : count
-    }
-
-    /// The number of unread bytes.
-    var remaining: Int { count - pos }
-
-    private mutating func take(_ n: Int, _ what: StaticString) -> UnsafeRawPointer {
-        guard n <= remaining, let base = base else { wvDecodeFailure("truncated \(what)") }
-        defer { pos += n }
-        return base + pos
-    }
-
-    @inline(__always)
-    private mutating func load<T: FixedWidthInteger>(_ type: T.Type, _ what: StaticString) -> T {
-        T(littleEndian: take(MemoryLayout<T>.size, what).loadUnaligned(as: T.self))
-    }
-
-    mutating func readBool() -> Bool {
-        switch load(UInt8.self, "bool") {
-        case 0: return false
-        case 1: return true
-        default: wvDecodeFailure("bool byte out of range")
-        }
-    }
-    mutating func readI8() -> Int8 { load(Int8.self, "i8") }
-    mutating func readU8() -> UInt8 { load(UInt8.self, "u8") }
-    mutating func readI16() -> Int16 { load(Int16.self, "i16") }
-    mutating func readU16() -> UInt16 { load(UInt16.self, "u16") }
-    mutating func readI32() -> Int32 { load(Int32.self, "i32") }
-    mutating func readU32() -> UInt32 { load(UInt32.self, "u32") }
-    mutating func readI64() -> Int64 { load(Int64.self, "i64") }
-    mutating func readU64() -> UInt64 { load(UInt64.self, "u64") }
-    mutating func readF32() -> Float { Float(bitPattern: load(UInt32.self, "f32")) }
-    mutating func readF64() -> Double { Double(bitPattern: load(UInt64.self, "f64")) }
-
-    /// Reads a byte length, which can't exceed the unread bytes.
-    mutating func readLen() -> Int {
-        let n = Int(load(UInt32.self, "length"))
-        guard n <= remaining else { wvDecodeFailure("length prefix exceeds remaining buffer") }
-        return n
-    }
-
-    /// Reads an element count. Elements may encode to zero bytes, so the
-    /// count isn't bounded by the unread bytes; callers cap preallocation.
-    mutating func readCount() -> Int {
-        Int(load(UInt32.self, "count"))
-    }
-
-    mutating func readString() -> String {
-        let n = readLen()
-        if n == 0 { return "" }
-        let p = take(n, "string")
-        guard let s = String(bytes: UnsafeRawBufferPointer(start: p, count: n), encoding: .utf8) else {
-            wvDecodeFailure("string is not valid UTF-8")
-        }
-        return s
-    }
-
-    mutating func readBytes() -> Data {
-        let n = readLen()
-        if n == 0 { return Data() }
-        return Data(bytes: take(n, "bytes"), count: n)
-    }
-
-    mutating func readOptionFlag() -> Bool {
-        switch load(UInt8.self, "option flag") {
-        case 0: return false
-        case 1: return true
-        default: wvDecodeFailure("option flag byte out of range")
+    /// The numeric code the library reported.
+    public var errorCode: Int32 {
+        switch self {
+        case .outOfStock: return 1
+        case .spoiled: return 2
+        case let .unknown(code, _): return code
         }
     }
 
-    /// Reads an object token: one strong reference the caller adopts into a
-    /// wrapper whose deinit releases it.
-    mutating func readObject() -> OpaquePointer {
-        guard let p = OpaquePointer(bitPattern: UInt(load(UInt64.self, "object token"))) else {
-            wvDecodeFailure("null object token")
+    /// The message the library reported, or the code's documented message.
+    public var message: String {
+        switch self {
+        case let .outOfStock(message, _): return message
+        case let .spoiled(message): return message
+        case let .unknown(_, message): return message
         }
-        return p
     }
 
-    /// Reads any value that crosses inside a value buffer, typed by context.
-    @inline(__always)
-    mutating func read<T: WvCodable>() -> T {
-        T.wvRead(&self)
-    }
-
-    func finish() {
-        if remaining != 0 { wvDecodeFailure("trailing bytes after value") }
-    }
+    public var errorDescription: String? { message }
 }
 
-// MARK: Value-buffer codecs
-
-/// A type that crosses the C ABI inside a value buffer. Every primitive,
-/// optional, list, and map conforms here; each record, enum, and interface
-/// conforms where it's declared.
-protocol WvCodable {
-    /// Reads one value, adopting the reference of any object token.
-    static func wvRead(_ r: inout WvReader) -> Self
-    /// Writes this value, writing a fresh reference for any object.
-    func wvWrite(_ w: inout WvWriter)
-}
-
-/// A C-style enum, which crosses as its `i32` discriminant.
-protocol WvCEnum: WvCodable, RawRepresentable where RawValue == Int32 {}
-
-extension WvCEnum {
-    static func wvRead(_ r: inout WvReader) -> Self { wvEnumCase(Self.self, r.readI32()) }
-    func wvWrite(_ w: inout WvWriter) { w.writeI32(rawValue) }
-}
-
-extension Bool: WvCodable {
-    static func wvRead(_ r: inout WvReader) -> Bool { r.readBool() }
-    func wvWrite(_ w: inout WvWriter) { w.writeBool(self) }
-}
-
-extension Int8: WvCodable {
-    static func wvRead(_ r: inout WvReader) -> Int8 { r.readI8() }
-    func wvWrite(_ w: inout WvWriter) { w.writeI8(self) }
-}
-
-extension UInt8: WvCodable {
-    static func wvRead(_ r: inout WvReader) -> UInt8 { r.readU8() }
-    func wvWrite(_ w: inout WvWriter) { w.writeU8(self) }
-}
-
-extension Int16: WvCodable {
-    static func wvRead(_ r: inout WvReader) -> Int16 { r.readI16() }
-    func wvWrite(_ w: inout WvWriter) { w.writeI16(self) }
-}
-
-extension UInt16: WvCodable {
-    static func wvRead(_ r: inout WvReader) -> UInt16 { r.readU16() }
-    func wvWrite(_ w: inout WvWriter) { w.writeU16(self) }
-}
-
-extension Int32: WvCodable {
-    static func wvRead(_ r: inout WvReader) -> Int32 { r.readI32() }
-    func wvWrite(_ w: inout WvWriter) { w.writeI32(self) }
-}
-
-extension UInt32: WvCodable {
-    static func wvRead(_ r: inout WvReader) -> UInt32 { r.readU32() }
-    func wvWrite(_ w: inout WvWriter) { w.writeU32(self) }
-}
-
-extension Int64: WvCodable {
-    static func wvRead(_ r: inout WvReader) -> Int64 { r.readI64() }
-    func wvWrite(_ w: inout WvWriter) { w.writeI64(self) }
-}
-
-extension UInt64: WvCodable {
-    static func wvRead(_ r: inout WvReader) -> UInt64 { r.readU64() }
-    func wvWrite(_ w: inout WvWriter) { w.writeU64(self) }
-}
-
-extension Float: WvCodable {
-    static func wvRead(_ r: inout WvReader) -> Float { r.readF32() }
-    func wvWrite(_ w: inout WvWriter) { w.writeF32(self) }
-}
-
-extension Double: WvCodable {
-    static func wvRead(_ r: inout WvReader) -> Double { r.readF64() }
-    func wvWrite(_ w: inout WvWriter) { w.writeF64(self) }
-}
-
-extension String: WvCodable {
-    static func wvRead(_ r: inout WvReader) -> String { r.readString() }
-    func wvWrite(_ w: inout WvWriter) { w.writeString(self) }
-}
-
-extension Data: WvCodable {
-    static func wvRead(_ r: inout WvReader) -> Data { r.readBytes() }
-    func wvWrite(_ w: inout WvWriter) { w.writeBytes(self) }
-}
-
-extension Optional: WvCodable where Wrapped: WvCodable {
-    static func wvRead(_ r: inout WvReader) -> Wrapped? {
-        r.readOptionFlag() ? .some(r.read()) : nil
-    }
-
-    func wvWrite(_ w: inout WvWriter) {
-        w.writeOptionFlag(self != nil)
-        if let value = self { w.write(value) }
-    }
-}
-
-extension Array: WvCodable where Element: WvCodable {
-    static func wvRead(_ r: inout WvReader) -> [Element] {
-        let n = r.readCount()
-        var items: [Element] = []
-        items.reserveCapacity(Swift.min(n, r.remaining))
-        for _ in 0..<n {
-            items.append(r.read())
+extension PantryError: WvDomain {
+    init(wvError err: WvError) {
+        let message = wvErrorMessage(err)
+        switch err.code {
+        case 1:
+            var r = wvPayload(err)
+            self = .outOfStock(message: message.isEmpty ? "Out of stock" : message, item: r.read())
+            r.finish()
+        case 2:
+            self = .spoiled(message: message.isEmpty ? "Spoiled" : message)
+        default:
+            self = .unknown(code: err.code, message: message)
         }
-        return items
     }
 
-    func wvWrite(_ w: inout WvWriter) {
-        w.writeLen(count)
-        for item in self { w.write(item) }
-    }
-}
-
-extension Dictionary: WvCodable where Key: WvCodable, Value: WvCodable {
-    static func wvRead(_ r: inout WvReader) -> [Key: Value] {
-        let n = r.readCount()
-        var map: [Key: Value] = [:]
-        map.reserveCapacity(Swift.min(n, r.remaining))
-        for _ in 0..<n {
-            // Typed bindings: the subscript setter takes `Value?`, which
-            // would decode an optional.
-            let key: Key = r.read()
-            let value: Value = r.read()
-            map[key] = value
-        }
-        return map
-    }
-
-    func wvWrite(_ w: inout WvWriter) {
-        w.writeLen(count)
-        for (key, value) in self {
-            w.write(key)
-            w.write(value)
+    func wvReport(_ outErr: UnsafeMutablePointer<WvError>?) {
+        switch self {
+        case let .outOfStock(message, v0):
+            var payload = WvWriter()
+            payload.write(v0)
+            wvSetError(outErr, 1, message, payload)
+        case let .spoiled(message):
+            wvSetError(outErr, 2, message)
+        case let .unknown(code, message):
+            wvSetError(outErr, code, message)
         }
     }
 }
-
-// MARK: Async and callbacks
-
-/// A native cancel token owned by one cancellable call. The library takes its
-/// own reference at launch, so this one is released whenever the wrapper is
-/// done with it.
-final class WvCancelToken: @unchecked Sendable {
-    let raw: OpaquePointer
-
-    init() {
-        raw = wvNonNull(kitchen_sink_cancel_token_create())
-    }
-
-    deinit {
-        kitchen_sink_cancel_token_destroy(raw)
-    }
-
-    func cancel() {
-        kitchen_sink_cancel_token_cancel(raw)
-    }
-}
-
-/// A continuation boxed for the C `context` slot of an async launch.
-final class WvContinuation<T, E: Error> {
-    let value: CheckedContinuation<T, E>
-
-    init(_ value: CheckedContinuation<T, E>) {
-        self.value = value
-    }
-}
-
-/// One process-wide callback vtable at a stable address the library may hold
-/// for the life of the process.
-final class WvVtable<T>: @unchecked Sendable {
-    let pointer: UnsafePointer<T>
-
-    init(_ value: T) {
-        let cell = UnsafeMutablePointer<T>.allocate(capacity: 1)
-        cell.initialize(to: value)
-        pointer = UnsafePointer(cell)
-    }
-}
-
-/// Holds one callback implementation behind the `ctx` the library keeps.
-final class WvBox<T>: @unchecked Sendable {
-    let value: T
-
-    init(_ value: T) {
-        self.value = value
-    }
-}
-
-/// Retains `impl` for the library: the `ctx` of a callback parameter, which
-/// the vtable's `free` entry releases with ``wvRelease(_:as:)``.
-func wvRetain<T>(_ impl: T) -> UnsafeMutableRawPointer {
-    Unmanaged.passRetained(WvBox(impl)).toOpaque()
-}
-
-/// Releases the implementation behind `ctx`, from the vtable's `free` entry.
-func wvRelease<T>(_ ctx: UnsafeMutableRawPointer?, as type: T.Type) {
-    Unmanaged<WvBox<T>>.fromOpaque(ctx!).release()
-}
-
-/// Runs one callback method on the implementation behind `ctx`. A thrown
-/// error never unwinds through the library: `domain` reports it when it's
-/// the method's declared error, anything else is reported as a callback
-/// failure (`-4`), and the method returns `fallback`.
-func wvInvoke<T, R>(
-    _ ctx: UnsafeMutableRawPointer?,
-    _ outErr: UnsafeMutablePointer<WvError>?,
-    as type: T.Type,
-    fallback: R,
-    domain: (Error, UnsafeMutablePointer<WvError>?) -> Bool = { _, _ in false },
-    _ body: (T) throws -> R
-) -> R {
-    let impl = Unmanaged<WvBox<T>>.fromOpaque(ctx!).takeUnretainedValue().value
-    do {
-        return try body(impl)
-    } catch {
-        if !domain(error, outErr) {
-            let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-            message.withCString { kitchen_sink_error_set(outErr, KitchenSinkRuntimeError.foreignCode, $0) }
-        }
-        return fallback
-    }
-}
-
-/// Reports a declared domain error from a callback method: its code, its
-/// message, and its fields as the payload.
-func wvSetError(_ outErr: UnsafeMutablePointer<WvError>?, _ code: Int32, _ message: String, _ payload: WvWriter? = nil) {
-    message.withCString { kitchen_sink_error_set(outErr, code, $0) }
-    if let payload = payload {
-        payload.bytes.withUnsafeBufferPointer { kitchen_sink_error_set_payload(outErr, $0.baseAddress, $0.count) }
-    }
-}
-
-/// Hands `bytes` to the library as a callback method's return: a run
-/// allocated with `kitchen_sink_alloc` that the library adopts.
-func wvHandOver(_ bytes: UnsafeRawBufferPointer, _ outPtr: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?, _ outLen: UnsafeMutablePointer<Int>?) {
-    let run = kitchen_sink_alloc(bytes.count)
-    if let run = run, let base = bytes.baseAddress {
-        run.initialize(from: base.assumingMemoryBound(to: UInt8.self), count: bytes.count)
-    }
-    outPtr?.pointee = run
-    outLen?.pointee = run == nil ? 0 : bytes.count
-}
-
-/// Returns a string from a callback method through its out slots.
-func wvReturnString(_ value: String, _ outPtr: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?, _ outLen: UnsafeMutablePointer<Int>?) {
-    var value = value
-    value.withUTF8 { wvHandOver(UnsafeRawBufferPointer($0), outPtr, outLen) }
-}
-
-/// Returns bytes from a callback method through its out slots.
-func wvReturnBytes(_ value: Data, _ outPtr: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?, _ outLen: UnsafeMutablePointer<Int>?) {
-    value.withUnsafeBytes { wvHandOver($0, outPtr, outLen) }
-}
-
-/// Returns a value buffer from a callback method through its out slots.
-func wvReturnBuffer<T: WvCodable>(_ value: T, _ outPtr: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?, _ outLen: UnsafeMutablePointer<Int>?) {
-    var w = WvWriter()
-    w.write(value)
-    w.bytes.withUnsafeBytes { wvHandOver($0, outPtr, outLen) }
-}
-
-// MARK: - Load-time checks
-
-/// The load-time checks, run once before the first native call: the library
-/// must implement C ABI revision 4 and carry every declaration these
-/// bindings were generated with, unchanged.
-let wvContract: Void = {
-    wvCheckAbiVersion()
-    wvCheckContract(kitchen_sink_shared_contract, [
-        (0x709e234caa962446, 0x3894f2ca452e9f98, "shared.ping"),
-        (0xcfb306fa5801ee5b, 0x1cbd9e10983cac2c, "shared.Token"),
-    ])
-    wvCheckContract(kitchen_sink_kitchen_contract, [
-        (0x01d4f09bbddc986f, 0x29eb88fecc66544d, "kitchen.Gadget.new"),
-        (0x10472d8fe748c2ee, 0xb265832b6a759fc4, "kitchen.maybe_gadget"),
-        (0x11368eec07a74078, 0xfa049f78b77e146a, "kitchen.gadgets"),
-        (0x137f08a29cde6021, 0xda8de7aeb2dbb8a3, "kitchen.stream_gadgets"),
-        (0x2111b54980826dd7, 0x452783f3e6ca6e1d, "kitchen.do_cancellable"),
-        (0x29dddbc60bf8d7db, 0x452a3e573d57f6db, "kitchen.Priority"),
-        (0x2b227003b74a0d16, 0x12332957470e9782, "kitchen.maybe_subscribe"),
-        (0x2dd66cb0064f0494, 0x60197363fefd92dd, "kitchen.Item"),
-        (0x33c265bbf079b0e9, 0xc3dcd0927e6c1deb, "kitchen.u32_id"),
-        (0x33e6381d01660dfe, 0x077c63c31fd7f90a, "kitchen.KitchenErrors"),
-        (0x3f5fc99d73504b76, 0x2df88d710f1ea10e, "kitchen.Gadget.poke"),
-        (0x4c5764cf109528d1, 0x2a65529af4338a58, "kitchen.maybe_item"),
-        (0x4de17dfb93fd494d, 0xba0ad0dd52ed74af, "kitchen.i32_id"),
-        (0x504e95b7f7e65570, 0x01b3e8e0c9a10e23, "kitchen.stream_items"),
-        (0x68cdb9a4bd3e3dd5, 0xc678b9164348d497, "kitchen.bool_id"),
-        (0x69e7cd703d16eb85, 0xf3b28dd22ae9e689, "kitchen.do_async"),
-        (0x70865079ce41be82, 0xbe3b69464672af46, "kitchen.Gadget.describe"),
-        (0x71c5a1116cb7c49a, 0xcba1837108a89b84, "kitchen.echo_bytes"),
-        (0x735ee1e0049ee91a, 0xca74320bc53eddab, "kitchen.echo_string"),
-        (0x76d7fc58f4e41d84, 0x7373a0e47d30e690, "kitchen.i64_id"),
-        (0x79abfe1aa960fd6a, 0xbca7a9e5eb26f3a6, "kitchen.nested.hello"),
-        (0x7d3dd7d5cf6749e3, 0xa192f5a7298adb39, "kitchen.new_op"),
-        (0x89a5e664bc25c67b, 0x5764a95e81ecfd31, "kitchen.f64_id"),
-        (0x8cfdbdcecac5f7f1, 0x07e272f09c41fffc, "kitchen.Gadget.version"),
-        (0x974b9f3e823c1738, 0xb81b91e975695f27, "kitchen.cross_module_token"),
-        (0xaca0655fac15d230, 0x11c4d2b28abe07bb, "kitchen.list_items"),
-        (0xc883b4afae20543e, 0xc40560e5411ff392, "kitchen.legacy_op"),
-        (0xf2f7753e6e1dffc2, 0xc9047a95bdf49e93, "kitchen.get_attrs"),
-        (0xfae25d3391922ead, 0x1c7f95739f3210b8, "kitchen.subscribe"),
-        (0xfd0059b05cb2fcfb, 0x248bf8404a5823b4, "kitchen.Gadget"),
-        (0xfed9c551fb9fd2d6, 0x59aec980ef3f3291, "kitchen.ReadyListener"),
-    ])
-}()
-
-// MARK: - API
 
 /// A reusable token referenced across modules
 public struct Token: Hashable, Sendable {
@@ -720,60 +225,8 @@ extension Token: WvCodable {
     }
 }
 
-/// Typed errors reported by the `kitchen` module.
-public enum KitchenErrorsError: Error, LocalizedError, Sendable {
-    case notFound(message: String)
-    case invalidInput(message: String)
-
-    /// The message the library reported, or the code's documented default.
-    public var errorDescription: String? {
-        switch self {
-        case let .notFound(message): return message
-        case let .invalidInput(message): return message
-        }
-    }
-
-    /// The numeric ABI code carried by this error.
-    public var errorCode: Int32 {
-        switch self {
-        case .notFound: return 1
-        case .invalidInput: return 2
-        }
-    }
-}
-
-func wvMapKitchen(_ err: WvError) -> Error {
-    let message = wvErrorMessage(err)
-    switch err.code {
-    case 1: return KitchenErrorsError.notFound(message: message.isEmpty ? "Item not found" : message)
-    case 2: return KitchenErrorsError.invalidInput(message: message.isEmpty ? "Invalid input" : message)
-    default: return wvRuntimeError(err)
-    }
-}
-
-func wvCheckKitchen(_ err: inout WvError) throws {
-    guard err.code != 0 else { return }
-    let error = wvMapKitchen(err)
-    kitchen_sink_error_clear(&err)
-    throw error
-}
-
-/// Reports a ``KitchenErrorsError`` thrown by a callback method declared to throw it: its
-/// code, its message, and its fields as the payload. Any other error is left
-/// to the caller, which reports a callback failure.
-func wvReportKitchen(_ error: Error, _ outErr: UnsafeMutablePointer<WvError>?) -> Bool {
-    guard let error = error as? KitchenErrorsError else { return false }
-    switch error {
-    case let .notFound(message):
-        wvSetError(outErr, 1, message)
-    case let .invalidInput(message):
-        wvSetError(outErr, 2, message)
-    }
-    return true
-}
-
 /// Task priority levels
-public enum Priority: Int32, Sendable {
+public enum Priority: Int32, CaseIterable, Sendable {
     /// Low priority
     case low = 0
     /// Normal priority
@@ -785,7 +238,7 @@ public enum Priority: Int32, Sendable {
 extension Priority: WvCEnum {}
 
 /// Kitchen sink struct exercising every field feature
-public struct Item: Sendable {
+public struct Item: Hashable, Sendable {
     /// Stable identifier
     public var id: Int64
     /// Display name
@@ -851,70 +304,116 @@ extension Item: WvCodable {
 ///
 /// Implement this protocol with a class and pass an instance where the API
 /// expects it. The library keeps the instance until it no longer needs it and
-/// may call any method from any thread. A method that throws fails the
-/// library's call in progress: a method documented to throw a module error
-/// reports that error, with its code and fields, and any other error reaches
-/// the library as a callback failure (code -4).
+/// may call any method from any thread.
 public protocol ReadyListener: AnyObject, Sendable {
     /// Fires when an item is ready
-    func onReady(code: Int32, msg: String) throws
+    func onReady(code: Int32, msg: String)
 
     /// Receives the item itself and says whether to keep listening
-    func onItem(item: Item, gadget: Gadget) throws -> Bool
+    func onItem(item: Item, gadget: Gadget) -> Bool
 
     /// A display label, failing with a kitchen error
     ///
-    /// - Throws: ``KitchenErrorsError`` to report a declared failure with its fields, or any other error to fail the call.
+    /// - Throws: ``KitchenError`` to fail the library's call with that error and
+    ///   its fields; any other error fails it with the error's description.
     func label() throws -> String
 
     /// The most recent item the listener kept, if any
-    func latest() throws -> Item?
+    func latest() -> Item?
 
     /// The listener's favorite gadget
-    func favorite() throws -> Gadget
+    func favorite() -> Gadget
 }
 
 /// The process-wide vtable the library calls `ReadyListener` implementations
-/// through (`kitchen_sink_kitchen_ReadyListener_vtable`). Every entry recovers the implementation
-/// from `ctx`, copies or adopts its arguments, hands its result back, and
-/// reports a thrown error through `out_err` instead of unwinding.
+/// through (a `kitchen_sink_kitchen_ReadyListener_vtable`). Every entry
+/// recovers the implementation from `ctx`, copies or adopts its arguments,
+/// hands its result back, and reports a thrown error through `out_err` instead
+/// of unwinding.
 enum WvReadyListenerVtable {
     static let shared = WvVtable(kitchen_sink_kitchen_ReadyListener_vtable(
         size: UInt32(MemoryLayout<kitchen_sink_kitchen_ReadyListener_vtable>.stride),
         flags: 0,
-        free: { ctx in
-            wvRelease(ctx, as: (any ReadyListener).self)
-        },
+        free: { ctx in wvRelease(ctx, as: (any ReadyListener).self) },
         on_ready: { ctx, code, msg_ptr, msg_len, out_err in
             wvInvoke(ctx, out_err, as: (any ReadyListener).self, fallback: ()) { wvImpl in
-                try wvImpl.onReady(code: code, msg: wvBorrowString(msg_ptr, msg_len))
+                wvImpl.onReady(code: code, msg: wvBorrowString(msg_ptr, msg_len))
             }
         },
         on_item: { ctx, item_ptr, item_len, gadget, out_err in
             wvInvoke(ctx, out_err, as: (any ReadyListener).self, fallback: false) { wvImpl in
-                try wvImpl.onItem(item: wvBorrowBuffer(item_ptr, item_len, as: Item.self), gadget: Gadget(ptr: wvNonNull(gadget)))
+                wvImpl.onItem(item: wvBorrowBuffer(item_ptr, item_len, as: Item.self), gadget: Gadget(ptr: wvNonNull(gadget)))
             }
         },
         label: { ctx, out_ptr, out_len, out_err in
-            wvInvoke(ctx, out_err, as: (any ReadyListener).self, fallback: (), domain: wvReportKitchen) { wvImpl in
+            wvInvoke(ctx, out_err, as: (any ReadyListener).self, throwing: KitchenError.self, fallback: ()) { wvImpl in
                 try wvReturnString(wvImpl.label(), out_ptr, out_len)
             }
         },
         latest: { ctx, out_ptr, out_len, out_err in
             wvInvoke(ctx, out_err, as: (any ReadyListener).self, fallback: ()) { wvImpl in
-                try wvReturnBuffer(wvImpl.latest(), out_ptr, out_len)
+                wvReturnBuffer(wvImpl.latest(), out_ptr, out_len)
             }
         },
         favorite: { ctx, out_err in
             wvInvoke(ctx, out_err, as: (any ReadyListener).self, fallback: nil) { wvImpl in
-                try wvImpl.favorite().clonePtr()
+                wvImpl.favorite().clonePtr()
+            }
+        }
+    ))
+}
+
+/// Consumer-implemented source of scalar samples
+///
+/// Implement this protocol with a class and pass an instance where the API
+/// expects it. The library keeps the instance until it no longer needs it and
+/// may call any method from any thread.
+public protocol Sampler: AnyObject, Sendable {
+    /// The cutoff for a level, if the sampler has one
+    func threshold(level: UInt32?) -> Double?
+
+    /// Up to `limit` samples, failing when the pantry is empty
+    ///
+    /// - Throws: ``PantryError`` to fail the library's call with that error and
+    ///   its fields; any other error fails it with the error's description.
+    func samples(limit: UInt32?, weights: [Double]) throws -> [Int16]
+
+    /// A free-form description, failing with an untyped error
+    ///
+    /// - Throws: Any error, which fails the library's call with the error's
+    ///   description.
+    func describe() throws -> String
+}
+
+/// The process-wide vtable the library calls `Sampler` implementations through
+/// (a `kitchen_sink_kitchen_Sampler_vtable`). Every entry recovers the
+/// implementation from `ctx`, copies or adopts its arguments, hands its result
+/// back, and reports a thrown error through `out_err` instead of unwinding.
+enum WvSamplerVtable {
+    static let shared = WvVtable(kitchen_sink_kitchen_Sampler_vtable(
+        size: UInt32(MemoryLayout<kitchen_sink_kitchen_Sampler_vtable>.stride),
+        flags: 0,
+        free: { ctx in wvRelease(ctx, as: (any Sampler).self) },
+        threshold: { ctx, has_level, level, out_value, out_err in
+            wvInvoke(ctx, out_err, as: (any Sampler).self, fallback: false) { wvImpl in
+                wvReturnOptional(wvImpl.threshold(level: has_level ? level : nil), out_value)
+            }
+        },
+        samples: { ctx, has_limit, limit, weights_ptr, weights_len, out_ptr, out_len, out_err in
+            wvInvoke(ctx, out_err, as: (any Sampler).self, throwing: PantryError.self, fallback: ()) { wvImpl in
+                try wvReturnSlice(wvImpl.samples(limit: has_limit ? limit : nil, weights: wvBorrowSlice(weights_ptr, weights_len)), out_ptr, out_len)
+            }
+        },
+        describe: { ctx, out_ptr, out_len, out_err in
+            wvInvoke(ctx, out_err, as: (any Sampler).self, fallback: ()) { wvImpl in
+                try wvReturnString(wvImpl.describe(), out_ptr, out_len)
             }
         }
     ))
 }
 
 /// A pocket-sized interface exercising the object surface
-public final class Gadget: @unchecked Sendable {
+public final class Gadget: WvObject, Hashable, @unchecked Sendable {
     let ptr: OpaquePointer
 
     init(ptr: OpaquePointer) {
@@ -925,10 +424,17 @@ public final class Gadget: @unchecked Sendable {
         kitchen_sink_kitchen_Gadget_destroy(ptr)
     }
 
-    /// Returns a new strong reference to the same object, for a position that
-    /// takes ownership of it.
     func clonePtr() -> OpaquePointer {
         wvNonNull(kitchen_sink_kitchen_Gadget_clone(ptr))
+    }
+
+    /// Whether two wrappers hold the same native object.
+    public static func == (lhs: Gadget, rhs: Gadget) -> Bool {
+        lhs.ptr == rhs.ptr
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(ptr)
     }
 
     /// Create a gadget with the given id
@@ -944,19 +450,31 @@ public final class Gadget: @unchecked Sendable {
     public func describe() -> String {
         var err = WvError()
         var outLen = 0
-        let rv = kitchen_sink_kitchen_Gadget_describe(ptr, &outLen, &err)
+        let rv = kitchen_sink_kitchen_Gadget_describe(self.ptr, &outLen, &err)
         wvTrap(&err)
         return wvTakeString(rv, outLen)
     }
 
     /// Poke the gadget a number of times, failing on a negative count
     ///
-    /// - Throws: ``KitchenErrorsError`` for a declared failure, ``KitchenSinkRuntimeError`` otherwise.
+    /// - Throws: ``KitchenError`` for a declared failure,
+    ///   ``KitchenSinkRuntimeError`` otherwise.
     public func poke(times: Int32) throws -> Int32 {
         var err = WvError()
-        let rv = kitchen_sink_kitchen_Gadget_poke(ptr, times, &err)
-        try wvCheckKitchen(&err)
+        let rv = kitchen_sink_kitchen_Gadget_poke(self.ptr, times, &err)
+        try wvCheck(&err, KitchenError.self)
         return rv
+    }
+
+    /// The gadget's sensor readings, optionally limited
+    ///
+    /// - Throws: ``KitchenSinkRuntimeError`` with the library's message.
+    public func readings(limit: UInt32?) throws -> [Double] {
+        var err = WvError()
+        var outLen = 0
+        let rv = kitchen_sink_kitchen_Gadget_readings(self.ptr, limit != nil, limit ?? 0, &outLen, &err)
+        try wvCheck(&err)
+        return wvTakeSlice(rv, outLen)
     }
 
     /// The gadget subsystem version string
@@ -967,86 +485,6 @@ public final class Gadget: @unchecked Sendable {
         let rv = kitchen_sink_kitchen_Gadget_version(&outLen, &err)
         wvTrap(&err)
         return wvTakeString(rv, outLen)
-    }
-}
-
-extension Gadget: WvCodable {
-    static func wvRead(_ r: inout WvReader) -> Gadget { Gadget(ptr: r.readObject()) }
-    func wvWrite(_ w: inout WvWriter) { w.writeObject(clonePtr()) }
-}
-
-/// A lazy sequence over the `Gadget` elements streamed by `kitchen_sink_kitchen_stream_gadgets`.
-///
-/// Each `next()` call pulls exactly one element from the library. The
-/// underlying iterator is destroyed eagerly on exhaustion and from `deinit`
-/// when iteration is abandoned early.
-public final class KitchenStreamGadgetsIterator: Sequence, IteratorProtocol {
-    private var handle: OpaquePointer?
-
-    init(handle: OpaquePointer) {
-        self.handle = handle
-    }
-
-    deinit {
-        destroyHandle()
-    }
-
-    private func destroyHandle() {
-        guard let handle = handle else { return }
-        kitchen_sink_kitchen_StreamGadgetsIterator_destroy(handle)
-        self.handle = nil
-    }
-
-    /// Pulls the next element from the library, or returns `nil` once the
-    /// stream is exhausted (destroying the underlying iterator).
-    public func next() -> Gadget? {
-        guard let handle = handle else { return nil }
-        var item: OpaquePointer? = nil
-        var err = WvError()
-        if kitchen_sink_kitchen_StreamGadgetsIterator_next(handle, &item, &err) == 0 {
-            wvTrap(&err)
-            destroyHandle()
-            return nil
-        }
-        return Gadget(ptr: wvNonNull(item))
-    }
-}
-
-/// A lazy sequence over the `Item` elements streamed by `kitchen_sink_kitchen_stream_items`.
-///
-/// Each `next()` call pulls exactly one element from the library. The
-/// underlying iterator is destroyed eagerly on exhaustion and from `deinit`
-/// when iteration is abandoned early.
-public final class KitchenStreamItemsIterator: Sequence, IteratorProtocol {
-    private var handle: OpaquePointer?
-
-    init(handle: OpaquePointer) {
-        self.handle = handle
-    }
-
-    deinit {
-        destroyHandle()
-    }
-
-    private func destroyHandle() {
-        guard let handle = handle else { return }
-        kitchen_sink_kitchen_StreamItemsIterator_destroy(handle)
-        self.handle = nil
-    }
-
-    /// Pulls the next element from the library, or returns `nil` once the
-    /// stream is exhausted (destroying the underlying iterator).
-    public func next() -> Item? {
-        guard let handle = handle else { return nil }
-        var item: UnsafePointer<UInt8>? = nil
-        var itemLen = 0
-        var err = WvError()
-        if kitchen_sink_kitchen_StreamItemsIterator_next(handle, &item, &itemLen, &err) == 0 {
-            wvTrap(&err)
-            destroyHandle()
-            return nil
-        }
-        return wvTakeBuffer(item, itemLen, as: Item.self)
     }
 }
 
@@ -1167,24 +605,30 @@ public enum Kitchen {
 
     /// An iterator over objects
     ///
-    /// - Returns: A lazy sequence that pulls one element per step from the library.
-    public static func streamGadgets() -> KitchenStreamGadgetsIterator {
+    /// - Returns: A lazy sequence that pulls one element per step from the
+    ///   library.
+    public static func streamGadgets() -> NativeSequence<Gadget> {
         wvLoad()
         var err = WvError()
         let rv = kitchen_sink_kitchen_stream_gadgets(&err)
         wvTrap(&err)
-        return KitchenStreamGadgetsIterator(handle: wvNonNull(rv))
+        return NativeSequence(wvNonNull(rv), release: { kitchen_sink_kitchen_StreamGadgetsIterator_destroy($0) }, failure: { wvFatal($0) }) { handle, err in
+            var item: OpaquePointer? = nil
+            guard kitchen_sink_kitchen_StreamGadgetsIterator_next(handle, &item, err) != 0 else { return nil }
+            return Gadget(ptr: wvNonNull(item))
+        }
     }
 
     /// Optional struct return
     ///
-    /// - Throws: ``KitchenErrorsError`` for a declared failure, ``KitchenSinkRuntimeError`` otherwise.
+    /// - Throws: ``KitchenError`` for a declared failure,
+    ///   ``KitchenSinkRuntimeError`` otherwise.
     public static func maybeItem(id: Int64) throws -> Item? {
         wvLoad()
         var err = WvError()
         var outLen = 0
         let rv = kitchen_sink_kitchen_maybe_item(id, &outLen, &err)
-        try wvCheckKitchen(&err)
+        try wvCheck(&err, KitchenError.self)
         return wvTakeBuffer(rv, outLen, as: Item?.self)
     }
 
@@ -1210,13 +654,19 @@ public enum Kitchen {
 
     /// Iterator return type
     ///
-    /// - Returns: A lazy sequence that pulls one element per step from the library.
-    public static func streamItems() -> KitchenStreamItemsIterator {
+    /// - Returns: A lazy sequence that pulls one element per step from the
+    ///   library.
+    public static func streamItems() -> NativeSequence<Item> {
         wvLoad()
         var err = WvError()
         let rv = kitchen_sink_kitchen_stream_items(&err)
         wvTrap(&err)
-        return KitchenStreamItemsIterator(handle: wvNonNull(rv))
+        return NativeSequence(wvNonNull(rv), release: { kitchen_sink_kitchen_StreamItemsIterator_destroy($0) }, failure: { wvFatal($0) }) { handle, err in
+            var item: UnsafePointer<UInt8>? = nil
+            var itemLen = 0
+            guard kitchen_sink_kitchen_StreamItemsIterator_next(handle, &item, &itemLen, err) != 0 else { return nil }
+            return wvTakeBuffer(item, itemLen, as: Item.self)
+        }
     }
 
     /// Returns the shared Token type from another module
@@ -1235,12 +685,12 @@ public enum Kitchen {
         return await withCheckedContinuation { (continuation: CheckedContinuation<String, Never>) in
             let context = Unmanaged.passRetained(WvContinuation(continuation)).toOpaque()
             wvWithUTF8(input) { input_ptr, input_len in
-                kitchen_sink_kitchen_do_async(input_ptr, input_len, { context, err, resultPtr, resultLen in
+                kitchen_sink_kitchen_do_async(input_ptr, input_len, { context, err, result_ptr, result_len in
                     let cont = Unmanaged<WvContinuation<String, Never>>.fromOpaque(context!).takeRetainedValue().value
                     if let err = err {
-                        wvTrapBoxed(err)
+                        wvFatal(err.pointee)
                     }
-                    cont.resume(returning: wvTakeString(resultPtr, resultLen))
+                    cont.resume(returning: wvTakeString(result_ptr, result_len))
                 }, context)
             }
         }
@@ -1248,7 +698,8 @@ public enum Kitchen {
 
     /// Cancellable async operation
     ///
-    /// - Throws: `CancellationError` when the calling task is cancelled, which cancels the native call.
+    /// - Throws: `CancellationError` when the calling task is cancelled, which
+    ///   cancels the native call.
     public static func doCancellable(input: String) async throws -> String {
         wvLoad()
         let token = WvCancelToken()
@@ -1256,13 +707,13 @@ public enum Kitchen {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
                 let context = Unmanaged.passRetained(WvContinuation(continuation)).toOpaque()
                 wvWithUTF8(input) { input_ptr, input_len in
-                    kitchen_sink_kitchen_do_cancellable(input_ptr, input_len, token.raw, { context, err, resultPtr, resultLen in
+                    kitchen_sink_kitchen_do_cancellable(input_ptr, input_len, token.raw, { context, err, result_ptr, result_len in
                         let cont = Unmanaged<WvContinuation<String, Error>>.fromOpaque(context!).takeRetainedValue().value
                         if let err = err {
-                            cont.resume(throwing: wvTakeError(err, wvCancelledOrTrap))
+                            cont.resume(throwing: wvTakeCancellation(err))
                             return
                         }
-                        cont.resume(returning: wvTakeString(resultPtr, resultLen))
+                        cont.resume(returning: wvTakeString(result_ptr, result_len))
                     }, context)
                 }
             }
@@ -1272,7 +723,7 @@ public enum Kitchen {
     }
 
     /// Legacy operation kept for compatibility
-    @available(*, deprecated, message: "Use new_op instead")
+    @available(*, deprecated, message: "Use `newOp` instead")
     public static func legacyOp() -> Int32 {
         wvLoad()
         var err = WvError()
@@ -1281,12 +732,223 @@ public enum Kitchen {
         return rv
     }
 
-    /// Replacement for legacy_op
+    /// Replacement for `legacyOp`
     public static func newOp() -> Int32 {
         wvLoad()
         var err = WvError()
         let rv = kitchen_sink_kitchen_new_op(&err)
         wvTrap(&err)
+        return rv
+    }
+
+    /// Optional scalar in both directions
+    public static func optI32Id(x: Int32?) -> Int32? {
+        wvLoad()
+        var err = WvError()
+        var outValue: Int32 = 0
+        let rv = kitchen_sink_kitchen_opt_i32_id(x != nil, x ?? 0, &outValue, &err)
+        wvTrap(&err)
+        return rv ? outValue : nil
+    }
+
+    public static func optBoolId(x: Bool?) -> Bool? {
+        wvLoad()
+        var err = WvError()
+        var outValue: Bool = false
+        let rv = kitchen_sink_kitchen_opt_bool_id(x != nil, x ?? false, &outValue, &err)
+        wvTrap(&err)
+        return rv ? outValue : nil
+    }
+
+    /// Optional C-style enum in both directions
+    public static func optPriority(p: Priority?) -> Priority? {
+        wvLoad()
+        var err = WvError()
+        var outValue: Int32 = 0
+        let rv = kitchen_sink_kitchen_opt_priority(p != nil, p?.rawValue ?? 0, &outValue, &err)
+        wvTrap(&err)
+        return rv ? wvEnumCase(Priority.self, outValue) : nil
+    }
+
+    /// Optional scalars next to ordinary parameters
+    public static func optMixed(base: Double, scale: Float?, offset: Int64?, label: String?) -> UInt16? {
+        wvLoad()
+        var err = WvError()
+        var outValue: UInt16 = 0
+        let rv: Bool = wvWithEncoded(label) { label_ptr, label_len in
+            kitchen_sink_kitchen_opt_mixed(base, scale != nil, scale ?? 0, offset != nil, offset ?? 0, label_ptr, label_len, &outValue, &err)
+        }
+        wvTrap(&err)
+        return rv ? outValue : nil
+    }
+
+    /// A typed-array parameter
+    public static func sumF64(xs: [Double]) -> Double {
+        wvLoad()
+        var err = WvError()
+        let rv: Double = wvWithSlice(xs) { xs_ptr, xs_len in
+            kitchen_sink_kitchen_sum_f64(xs_ptr, xs_len, &err)
+        }
+        wvTrap(&err)
+        return rv
+    }
+
+    /// Typed arrays in both directions
+    public static func scaleI32(xs: [Int32], factor: Int32) -> [Int32] {
+        wvLoad()
+        var err = WvError()
+        var outLen = 0
+        let rv: UnsafeMutablePointer<Int32>? = wvWithSlice(xs) { xs_ptr, xs_len in
+            kitchen_sink_kitchen_scale_i32(xs_ptr, xs_len, factor, &outLen, &err)
+        }
+        wvTrap(&err)
+        return wvTakeSlice(rv, outLen)
+    }
+
+    public static func idsU64(ids: [UInt64]) -> [UInt64] {
+        wvLoad()
+        var err = WvError()
+        var outLen = 0
+        let rv: UnsafeMutablePointer<UInt64>? = wvWithSlice(ids) { ids_ptr, ids_len in
+            kitchen_sink_kitchen_ids_u64(ids_ptr, ids_len, &outLen, &err)
+        }
+        wvTrap(&err)
+        return wvTakeSlice(rv, outLen)
+    }
+
+    /// Every slice element type
+    public static func mixedSlices(a: [Int8], b: [Int16], c: [UInt16], d: [UInt32], e: [Int64], f: [Float]) -> [UInt32] {
+        wvLoad()
+        var err = WvError()
+        var outLen = 0
+        let rv: UnsafeMutablePointer<UInt32>? = wvWithSlice(a) { a_ptr, a_len in
+            wvWithSlice(b) { b_ptr, b_len in
+                wvWithSlice(c) { c_ptr, c_len in
+                    wvWithSlice(d) { d_ptr, d_len in
+                        wvWithSlice(e) { e_ptr, e_len in
+                            wvWithSlice(f) { f_ptr, f_len in
+                                kitchen_sink_kitchen_mixed_slices(a_ptr, a_len, b_ptr, b_len, c_ptr, c_len, d_ptr, d_len, e_ptr, e_len, f_ptr, f_len, &outLen, &err)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        wvTrap(&err)
+        return wvTakeSlice(rv, outLen)
+    }
+
+    /// Async returning an optional scalar
+    public static func asyncMaybeCount() async -> Int64? {
+        wvLoad()
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Int64?, Never>) in
+            let context = Unmanaged.passRetained(WvContinuation(continuation)).toOpaque()
+            kitchen_sink_kitchen_async_maybe_count({ context, err, has_result, result in
+                let cont = Unmanaged<WvContinuation<Int64?, Never>>.fromOpaque(context!).takeRetainedValue().value
+                if let err = err {
+                    wvFatal(err.pointee)
+                }
+                cont.resume(returning: has_result ? result : nil)
+            }, context)
+        }
+    }
+
+    /// Async returning a typed array
+    ///
+    /// - Throws: `CancellationError` when the calling task is cancelled, which
+    ///   cancels the native call.
+    public static func asyncSamples(n: UInt32) async throws -> [Float] {
+        wvLoad()
+        let token = WvCancelToken()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[Float], Error>) in
+                let context = Unmanaged.passRetained(WvContinuation(continuation)).toOpaque()
+                kitchen_sink_kitchen_async_samples(n, token.raw, { context, err, result_ptr, result_len in
+                    let cont = Unmanaged<WvContinuation<[Float], Error>>.fromOpaque(context!).takeRetainedValue().value
+                    if let err = err {
+                        cont.resume(throwing: wvTakeCancellation(err))
+                        return
+                    }
+                    cont.resume(returning: wvTakeSlice(result_ptr, result_len))
+                }, context)
+            }
+        } onCancel: {
+            token.cancel()
+        }
+    }
+
+    /// Iterator of optional scalars
+    ///
+    /// - Returns: A lazy sequence that pulls one element per step from the
+    ///   library.
+    public static func streamMaybe() -> NativeSequence<Int32?> {
+        wvLoad()
+        var err = WvError()
+        let rv = kitchen_sink_kitchen_stream_maybe(&err)
+        wvTrap(&err)
+        return NativeSequence(wvNonNull(rv), release: { kitchen_sink_kitchen_StreamMaybeIterator_destroy($0) }, failure: { wvFatal($0) }) { handle, err in
+            var hasItem = false
+            var item: Int32 = 0
+            guard kitchen_sink_kitchen_StreamMaybeIterator_next(handle, &hasItem, &item, err) != 0 else { return nil }
+            return .some(hasItem ? item : nil)
+        }
+    }
+
+    /// Iterator of typed arrays
+    ///
+    /// - Returns: A lazy sequence that pulls one element per step from the
+    ///   library.
+    public static func streamChunks() -> NativeSequence<[Int32]> {
+        wvLoad()
+        var err = WvError()
+        let rv = kitchen_sink_kitchen_stream_chunks(&err)
+        wvTrap(&err)
+        return NativeSequence(wvNonNull(rv), release: { kitchen_sink_kitchen_StreamChunksIterator_destroy($0) }, failure: { wvFatal($0) }) { handle, err in
+            var item: UnsafeMutablePointer<Int32>? = nil
+            var itemLen = 0
+            guard kitchen_sink_kitchen_StreamChunksIterator_next(handle, &item, &itemLen, err) != 0 else { return nil }
+            return wvTakeSlice(item, itemLen)
+        }
+    }
+
+    /// Drive a consumer-implemented sampler
+    ///
+    /// - Throws: ``PantryError`` for a declared failure,
+    ///   ``KitchenSinkRuntimeError`` otherwise.
+    public static func sampleWith(sampler: any Sampler, level: UInt32?) throws -> [Int16] {
+        wvLoad()
+        var err = WvError()
+        let sampler_ctx = wvRetain(sampler)
+        var outLen = 0
+        let rv = kitchen_sink_kitchen_sample_with(sampler_ctx, WvSamplerVtable.shared.pointer, level != nil, level ?? 0, &outLen, &err)
+        try wvCheck(&err, PantryError.self)
+        return wvTakeSlice(rv, outLen)
+    }
+
+    /// Fails with the second domain
+    ///
+    /// - Throws: ``PantryError`` for a declared failure,
+    ///   ``KitchenSinkRuntimeError`` otherwise.
+    public static func takeFromPantry(item: String) throws -> Int32 {
+        wvLoad()
+        var err = WvError()
+        let rv: Int32 = wvWithUTF8(item) { item_ptr, item_len in
+            kitchen_sink_kitchen_take_from_pantry(item_ptr, item_len, &err)
+        }
+        try wvCheck(&err, PantryError.self)
+        return rv
+    }
+
+    /// Fails with an untyped error
+    ///
+    /// - Throws: ``KitchenSinkRuntimeError`` with the library's message.
+    public static func parseAny(text: String) throws -> Int64 {
+        wvLoad()
+        var err = WvError()
+        let rv: Int64 = wvWithUTF8(text) { text_ptr, text_len in
+            kitchen_sink_kitchen_parse_any(text_ptr, text_len, &err)
+        }
+        try wvCheck(&err)
         return rv
     }
 

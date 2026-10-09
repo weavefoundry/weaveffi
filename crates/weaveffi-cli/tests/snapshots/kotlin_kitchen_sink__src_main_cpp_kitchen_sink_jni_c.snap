@@ -21,67 +21,166 @@ source: crates/weaveffi-cli/tests/snapshots.rs
    (all lowercase `kitchen_sink_...`) and no JNI export (`Java_...`) can
    spell. */
 
+/* Helpers a given shim may not use (it only uses what its API needs). */
+#if defined(__GNUC__)
+#define Jni_helper static inline __attribute__((unused))
+#else
+#define Jni_helper static inline
+#endif
+
 static JavaVM* Jni_vm = NULL;
 static jclass Jni_bridge = NULL;
 static jmethodID Jni_error = NULL;
 
-/* A borrowed view of a Kotlin `ByteArray`: strings, bytes, and value
-   buffers all cross as one. */
-typedef struct {
-    jbyteArray array;
-    jbyte* elems;
-    const uint8_t* ptr;
-    size_t len;
-} Jni_bytes;
+/* The JNI primitive kinds: a direct value's carrier, a typed array's
+   element, and a box's payload. A string, bytes, or a value buffer crosses
+   as a byte array (`Jni_B`). */
+typedef enum { Jni_Z, Jni_B, Jni_S, Jni_I, Jni_J, Jni_F, Jni_D } Jni_kind;
 
-static inline Jni_bytes Jni_borrow_bytes(JNIEnv* env, jbyteArray array) {
-    Jni_bytes b = {array, NULL, NULL, 0};
-    if (array == NULL) {
-        return b;
-    }
-    b.len = (size_t)(*env)->GetArrayLength(env, array);
-    b.elems = (*env)->GetByteArrayElements(env, array, NULL);
-    b.ptr = (const uint8_t*)b.elems;
-    if (b.elems == NULL) {
-        b.len = 0;
-    }
-    return b;
-}
+static const size_t Jni_kind_size[] = {1, 1, 2, 4, 8, 4, 8};
 
-static inline void Jni_release_bytes(JNIEnv* env, Jni_bytes* b) {
-    if (b->elems != NULL) {
-        (*env)->ReleaseByteArrayElements(env, b->array, b->elems, JNI_ABORT);
+Jni_helper void Jni_throw_oom(JNIEnv* env, const char* what) {
+    jclass cls = (*env)->FindClass(env, "java/lang/OutOfMemoryError");
+    if (cls != NULL) {
+        (*env)->ThrowNew(env, cls, what);
     }
 }
 
-/* Copies `len` bytes into a new Kotlin `ByteArray` (never NULL for valid
-   input, so NULL + 0 is the empty array). */
-static inline jbyteArray Jni_new_bytes(JNIEnv* env, const uint8_t* ptr, size_t len) {
-    jbyteArray out = (*env)->NewByteArray(env, (jsize)len);
-    if (out != NULL && len > 0 && ptr != NULL) {
-        (*env)->SetByteArrayRegion(env, out, 0, (jsize)len, (const jbyte*)ptr);
+/* Copies all `n` elements of a Java primitive array into `dst`. */
+Jni_helper void Jni_get_region(JNIEnv* env, jarray array, Jni_kind kind, jsize n, void* dst) {
+    switch (kind) {
+    case Jni_Z: (*env)->GetBooleanArrayRegion(env, (jbooleanArray)array, 0, n, (jboolean*)dst); break;
+    case Jni_B: (*env)->GetByteArrayRegion(env, (jbyteArray)array, 0, n, (jbyte*)dst); break;
+    case Jni_S: (*env)->GetShortArrayRegion(env, (jshortArray)array, 0, n, (jshort*)dst); break;
+    case Jni_I: (*env)->GetIntArrayRegion(env, (jintArray)array, 0, n, (jint*)dst); break;
+    case Jni_J: (*env)->GetLongArrayRegion(env, (jlongArray)array, 0, n, (jlong*)dst); break;
+    case Jni_F: (*env)->GetFloatArrayRegion(env, (jfloatArray)array, 0, n, (jfloat*)dst); break;
+    case Jni_D: (*env)->GetDoubleArrayRegion(env, (jdoubleArray)array, 0, n, (jdouble*)dst); break;
+    }
+}
+
+/* A new Java primitive array holding a copy of the `count` elements at
+   `ptr` (never read when `count` is 0); NULL with an exception pending when
+   the JVM can't make it. */
+Jni_helper jarray Jni_new_array(JNIEnv* env, Jni_kind kind, const void* ptr, size_t count) {
+    if (count > (size_t)INT32_MAX) {
+        Jni_throw_oom(env, "native array is too large for a JVM array");
+        return NULL;
+    }
+    jsize n = (jsize)count;
+    jarray out = NULL;
+    switch (kind) {
+    case Jni_Z: out = (*env)->NewBooleanArray(env, n); break;
+    case Jni_B: out = (*env)->NewByteArray(env, n); break;
+    case Jni_S: out = (*env)->NewShortArray(env, n); break;
+    case Jni_I: out = (*env)->NewIntArray(env, n); break;
+    case Jni_J: out = (*env)->NewLongArray(env, n); break;
+    case Jni_F: out = (*env)->NewFloatArray(env, n); break;
+    case Jni_D: out = (*env)->NewDoubleArray(env, n); break;
+    }
+    if (out == NULL || n == 0 || ptr == NULL) {
+        return out;
+    }
+    switch (kind) {
+    case Jni_Z: (*env)->SetBooleanArrayRegion(env, (jbooleanArray)out, 0, n, (const jboolean*)ptr); break;
+    case Jni_B: (*env)->SetByteArrayRegion(env, (jbyteArray)out, 0, n, (const jbyte*)ptr); break;
+    case Jni_S: (*env)->SetShortArrayRegion(env, (jshortArray)out, 0, n, (const jshort*)ptr); break;
+    case Jni_I: (*env)->SetIntArrayRegion(env, (jintArray)out, 0, n, (const jint*)ptr); break;
+    case Jni_J: (*env)->SetLongArrayRegion(env, (jlongArray)out, 0, n, (const jlong*)ptr); break;
+    case Jni_F: (*env)->SetFloatArrayRegion(env, (jfloatArray)out, 0, n, (const jfloat*)ptr); break;
+    case Jni_D: (*env)->SetDoubleArrayRegion(env, (jdoubleArray)out, 0, n, (const jdouble*)ptr); break;
     }
     return out;
 }
 
-/* Copies a producer-owned allocation into a `ByteArray`, then frees it. */
-static inline jbyteArray Jni_take_bytes(JNIEnv* env, const uint8_t* ptr, size_t len) {
-    jbyteArray out = Jni_new_bytes(env, ptr, len);
+/* Jni_new_array over a run the producer handed over (a string, bytes, a
+   value buffer, or a typed array of `count` elements), which it then frees
+   whether or not the copy succeeded. */
+Jni_helper jarray Jni_take_array(JNIEnv* env, Jni_kind kind, const void* ptr, size_t count) {
+    jarray out = Jni_new_array(env, kind, ptr, count);
     if (ptr != NULL) {
-        kitchen_sink_free_bytes((uint8_t*)ptr, len);
+        kitchen_sink_free_bytes((uint8_t*)(uintptr_t)ptr, count * Jni_kind_size[kind]);
     }
     return out;
 }
 
-/* Throws the Kotlin exception for `err` (mapped through error domain
-   `domain`, or 0 for a call that can't fail, which raises the trap) and
-   clears `err`. */
-static inline void Jni_throw(JNIEnv* env, kitchen_sink_error* err, jint domain) {
-    const char* message = err->message != NULL ? err->message : "";
-    jbyteArray text = Jni_new_bytes(env, (const uint8_t*)message, strlen(message));
-    jbyteArray payload = NULL;
+/* A Java primitive array's elements copied out for one call (strings,
+   bytes, and value buffers as `ByteArray`s, typed arrays as `IntArray`s and
+   the like): one copy, into inline storage when it fits (8-aligned, as the
+   producer requires of typed arrays) and the heap otherwise. */
+typedef struct {
+    const void* ptr; /* NULL when empty */
+    size_t len;      /* element count */
+    void* heap;
+    uint64_t inline_buf[32];
+} Jni_run;
+
+/* Fills `run` from `array` (NULL is empty); 0, with OutOfMemoryError
+   pending, when the heap copy can't be allocated. */
+Jni_helper int Jni_borrow(JNIEnv* env, jarray array, Jni_kind kind, Jni_run* run) {
+    run->ptr = NULL;
+    run->len = 0;
+    run->heap = NULL;
+    if (array == NULL) {
+        return 1;
+    }
+    jsize n = (*env)->GetArrayLength(env, array);
+    if (n <= 0) {
+        return 1;
+    }
+    size_t bytes = (size_t)n * Jni_kind_size[kind];
+    void* dst = run->inline_buf;
+    if (bytes > sizeof run->inline_buf) {
+        run->heap = malloc(bytes);
+        if (run->heap == NULL) {
+            Jni_throw_oom(env, "could not copy an array argument");
+            return 0;
+        }
+        dst = run->heap;
+    }
+    Jni_get_region(env, array, kind, n, dst);
+    run->ptr = dst;
+    run->len = (size_t)n;
+    return 1;
+}
+
+Jni_helper void Jni_unborrow(Jni_run* run) {
+    free(run->heap);
+    run->heap = NULL;
+}
+
+/* A global reference the producer holds on to (a callback implementation
+   or an async completion): NULL for NULL, and NULL with OutOfMemoryError
+   pending when the JVM can't make one. */
+Jni_helper void* Jni_pin(JNIEnv* env, jobject obj) {
+    if (obj == NULL) {
+        return NULL;
+    }
+    jobject ref = (*env)->NewGlobalRef(env, obj);
+    if (ref == NULL && !(*env)->ExceptionCheck(env)) {
+        Jni_throw_oom(env, "could not create a JNI global reference");
+    }
+    return (void*)ref;
+}
+
+Jni_helper void Jni_unpin(JNIEnv* env, void* ref) {
+    if (ref != NULL) {
+        (*env)->DeleteGlobalRef(env, (jobject)ref);
+    }
+}
+
+/* Sets a failure with a C string message on `err`. */
+Jni_helper void Jni_set_error(kitchen_sink_error* err, int32_t code, const char* message) {
+    kitchen_sink_error_set(err, code, (const uint8_t*)message, strlen(message));
+}
+
+/* Throws the Kotlin exception for `err` (mapped through `JniBridge.error`
+   domain `domain`) and clears `err`. */
+Jni_helper void Jni_throw(JNIEnv* env, kitchen_sink_error* err, jint domain) {
+    jarray text = Jni_new_array(env, Jni_B, err->message_ptr, err->message_len);
+    jarray payload = NULL;
     if (err->payload_ptr != NULL) {
-        payload = Jni_new_bytes(env, err->payload_ptr, err->payload_len);
+        payload = Jni_new_array(env, Jni_B, err->payload_ptr, err->payload_len);
     }
     jint code = (jint)err->code;
     kitchen_sink_error_clear(err);
@@ -94,7 +193,7 @@ static inline void Jni_throw(JNIEnv* env, kitchen_sink_error* err, jint domain) 
     }
 }
 
-static jint Jni_load_error(JNIEnv* env, const char* message) {
+Jni_helper jint Jni_load_error(JNIEnv* env, const char* message) {
     jclass cls = (*env)->FindClass(env, "java/lang/UnsatisfiedLinkError");
     if (cls != NULL) {
         (*env)->ThrowNew(env, cls, message);
@@ -114,7 +213,7 @@ typedef struct {
    has every expected entry with an equal hash; entries only the library
    has are fine. Fails loading with an error naming the first declaration
    that's missing or changed. */
-static inline jint Jni_check_contract(JNIEnv* env, const kitchen_sink_contract_entry* (*contract)(size_t*), const Jni_contract_entry* expected, size_t count) {
+Jni_helper jint Jni_check_contract(JNIEnv* env, const kitchen_sink_contract_entry* (*contract)(size_t*), const Jni_contract_entry* expected, size_t count) {
     size_t len = 0;
     const kitchen_sink_contract_entry* table = contract(&len);
     if (table == NULL) {
@@ -146,7 +245,8 @@ static inline jint Jni_check_contract(JNIEnv* env, const kitchen_sink_contract_e
     return JNI_OK;
 }
 
-/* Generated below: the contract checks and the method IDs the shim caches. */
+/* Generated below: the contract checks and the classes and method IDs the
+   shim caches. */
 static jint Jni_load(JNIEnv* env);
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
@@ -156,14 +256,17 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     if ((*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) {
         return JNI_ERR;
     }
-    if (kitchen_sink_abi_version() != 4u) {
-        return Jni_load_error(env, "kitchen_sink: the native library implements a different C ABI revision than these bindings (expected 4)");
+    if (kitchen_sink_abi_version() != 5u) {
+        return Jni_load_error(env, "kitchen_sink: the native library implements a different C ABI revision than these bindings (expected 5)");
     }
     jclass bridge = (*env)->FindClass(env, "kitchen_sink/JniBridge");
     if (bridge == NULL) {
         return JNI_ERR;
     }
-    Jni_bridge = (jclass)(*env)->NewGlobalRef(env, bridge);
+    Jni_bridge = (jclass)Jni_pin(env, bridge);
+    if (Jni_bridge == NULL) {
+        return JNI_ERR;
+    }
     Jni_error = (*env)->GetStaticMethodID(env, Jni_bridge, "error", "(II[B[B)Ljava/lang/Throwable;");
     if (Jni_error == NULL) {
         return JNI_ERR;
@@ -178,6 +281,78 @@ JNIEXPORT jlong JNICALL Java_kitchen_1sink_JniBridge_debug_1live(JNIEnv* env, jc
     (void)env;
     (void)cls;
     return (jlong)kitchen_sink_debug_live((int32_t)kind);
+}
+
+/* Boxes: an optional scalar crossing out of native code is a nullable
+   `java.lang.Integer` (and the like), and an async result or iterator item
+   reaches Kotlin as an `Any?`, so scalars box through `valueOf` (which
+   caches small values) and unbox through `intValue` (and the like). */
+static jclass Jni_box_class[7];
+static jmethodID Jni_box_of[7];
+static jmethodID Jni_unbox_of[7];
+
+static jint Jni_load_boxes(JNIEnv* env) {
+    static const char* const classes[7] = {
+        "java/lang/Boolean", "java/lang/Byte", "java/lang/Short", "java/lang/Integer",
+        "java/lang/Long", "java/lang/Float", "java/lang/Double",
+    };
+    static const char* const value_of[7] = {
+        "(Z)Ljava/lang/Boolean;", "(B)Ljava/lang/Byte;", "(S)Ljava/lang/Short;", "(I)Ljava/lang/Integer;",
+        "(J)Ljava/lang/Long;", "(F)Ljava/lang/Float;", "(D)Ljava/lang/Double;",
+    };
+    static const char* const unbox[7] = {
+        "booleanValue", "byteValue", "shortValue", "intValue", "longValue", "floatValue", "doubleValue",
+    };
+    static const char* const unbox_sig[7] = {"()Z", "()B", "()S", "()I", "()J", "()F", "()D"};
+    for (int i = 0; i < 7; i++) {
+        jclass cls = (*env)->FindClass(env, classes[i]);
+        if (cls == NULL) {
+            return JNI_ERR;
+        }
+        Jni_box_class[i] = (jclass)Jni_pin(env, cls);
+        if (Jni_box_class[i] == NULL) {
+            return JNI_ERR;
+        }
+        Jni_box_of[i] = (*env)->GetStaticMethodID(env, cls, "valueOf", value_of[i]);
+        Jni_unbox_of[i] = (*env)->GetMethodID(env, cls, unbox[i], unbox_sig[i]);
+        if (Jni_box_of[i] == NULL || Jni_unbox_of[i] == NULL) {
+            return JNI_ERR;
+        }
+    }
+    return JNI_OK;
+}
+
+/* The box of `value` (NULL with an exception pending if the JVM can't make
+   one). */
+Jni_helper jobject Jni_box(JNIEnv* env, Jni_kind kind, jvalue value) {
+    return (*env)->CallStaticObjectMethodA(env, Jni_box_class[kind], Jni_box_of[kind], &value);
+}
+
+/* The scalar in the box `obj`. */
+Jni_helper jvalue Jni_unbox(JNIEnv* env, Jni_kind kind, jobject obj) {
+    jvalue v;
+    memset(&v, 0, sizeof v);
+    switch (kind) {
+    case Jni_Z: v.z = (*env)->CallBooleanMethod(env, obj, Jni_unbox_of[kind]); break;
+    case Jni_B: v.b = (*env)->CallByteMethod(env, obj, Jni_unbox_of[kind]); break;
+    case Jni_S: v.s = (*env)->CallShortMethod(env, obj, Jni_unbox_of[kind]); break;
+    case Jni_I: v.i = (*env)->CallIntMethod(env, obj, Jni_unbox_of[kind]); break;
+    case Jni_J: v.j = (*env)->CallLongMethod(env, obj, Jni_unbox_of[kind]); break;
+    case Jni_F: v.f = (*env)->CallFloatMethod(env, obj, Jni_unbox_of[kind]); break;
+    case Jni_D: v.d = (*env)->CallDoubleMethod(env, obj, Jni_unbox_of[kind]); break;
+    }
+    return v;
+}
+
+/* Hands one iterator item (an object, or NULL for an absent optional) to
+   Kotlin through the one-element array `out`; JNI_FALSE when making the item
+   failed (the exception stays pending). */
+Jni_helper jboolean Jni_yield(JNIEnv* env, jobjectArray out, jobject item) {
+    if ((*env)->ExceptionCheck(env)) {
+        return JNI_FALSE;
+    }
+    (*env)->SetObjectArrayElement(env, out, 0, item);
+    return JNI_TRUE;
 }
 
 /* Producer threads (async completions, callback calls, vtable `free`) are
@@ -266,42 +441,42 @@ static void Jni_env_done(int detach) {
     }
 }
 
-/* Async completions deliver to the pinned Kotlin `NativeCompletion`. */
-static jmethodID Jni_on_unit = NULL;
-static jmethodID Jni_on_boolean = NULL;
-static jmethodID Jni_on_byte = NULL;
-static jmethodID Jni_on_short = NULL;
-static jmethodID Jni_on_int = NULL;
-static jmethodID Jni_on_long = NULL;
-static jmethodID Jni_on_float = NULL;
-static jmethodID Jni_on_double = NULL;
-static jmethodID Jni_on_bytes = NULL;
+/* Async completions deliver to the pinned Kotlin `NativeCompletion`: the
+   result as one object (boxed, an array, or NULL), a native failure, or a
+   JVM failure making the result. */
+static jmethodID Jni_on_value = NULL;
 static jmethodID Jni_on_error = NULL;
+static jmethodID Jni_on_failure = NULL;
 
 static jint Jni_load_async(JNIEnv* env) {
     jclass cls = (*env)->FindClass(env, "kitchen_sink/NativeCompletion");
     if (cls == NULL) {
         return JNI_ERR;
     }
-    Jni_on_unit = (*env)->GetMethodID(env, cls, "onUnit", "()V");
-    Jni_on_boolean = (*env)->GetMethodID(env, cls, "onBoolean", "(Z)V");
-    Jni_on_byte = (*env)->GetMethodID(env, cls, "onByte", "(B)V");
-    Jni_on_short = (*env)->GetMethodID(env, cls, "onShort", "(S)V");
-    Jni_on_int = (*env)->GetMethodID(env, cls, "onInt", "(I)V");
-    Jni_on_long = (*env)->GetMethodID(env, cls, "onLong", "(J)V");
-    Jni_on_float = (*env)->GetMethodID(env, cls, "onFloat", "(F)V");
-    Jni_on_double = (*env)->GetMethodID(env, cls, "onDouble", "(D)V");
-    Jni_on_bytes = (*env)->GetMethodID(env, cls, "onBytes", "([B)V");
+    Jni_on_value = (*env)->GetMethodID(env, cls, "onValue", "(Ljava/lang/Object;)V");
     Jni_on_error = (*env)->GetMethodID(env, cls, "onError", "(I[B[B)V");
-    if (Jni_on_unit == NULL || Jni_on_error == NULL || Jni_on_bytes == NULL) {
+    Jni_on_failure = (*env)->GetMethodID(env, cls, "onFailure", "(Ljava/lang/Throwable;)V");
+    if (Jni_on_value == NULL || Jni_on_error == NULL || Jni_on_failure == NULL) {
         return JNI_ERR;
     }
     return JNI_OK;
 }
 
+/* Reports anything the Kotlin side threw (it has no caller to propagate
+   to), then releases the frame, `context`, and the thread. */
+static void Jni_complete_end(JNIEnv* env, void* context, int detach) {
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+    }
+    (*env)->PopLocalFrame(env, NULL);
+    Jni_unpin(env, context);
+    Jni_env_done(detach);
+}
+
 /* Starts a completion on the producer thread: returns the JNIEnv with a
    local frame pushed, or NULL when the call failed (the failure, or the
-   loss of the JVM, has then been handled and `context` released). */
+   loss of the JVM, has then been delivered and `context` released). */
 static JNIEnv* Jni_complete_begin(void* context, kitchen_sink_error* err, int* detach) {
     JNIEnv* env = Jni_env(detach);
     if (env == NULL) {
@@ -311,41 +486,42 @@ static JNIEnv* Jni_complete_begin(void* context, kitchen_sink_error* err, int* d
     if ((*env)->PushLocalFrame(env, 8) != 0) {
         (*env)->ExceptionClear(env);
         kitchen_sink_error_free(err);
+        Jni_unpin(env, context);
         Jni_env_done(*detach);
         return NULL;
     }
     if (err == NULL) {
         return env;
     }
-    const char* message = err->message != NULL ? err->message : "";
-    jbyteArray text = Jni_new_bytes(env, (const uint8_t*)message, strlen(message));
-    jbyteArray payload = NULL;
+    jarray text = Jni_new_array(env, Jni_B, err->message_ptr, err->message_len);
+    jarray payload = NULL;
     if (err->payload_ptr != NULL) {
-        payload = Jni_new_bytes(env, err->payload_ptr, err->payload_len);
+        payload = Jni_new_array(env, Jni_B, err->payload_ptr, err->payload_len);
     }
     jint code = (jint)err->code;
     kitchen_sink_error_free(err);
-    (*env)->CallVoidMethod(env, (jobject)context, Jni_on_error, code, text, payload);
     if ((*env)->ExceptionCheck(env)) {
-        (*env)->ExceptionDescribe(env);
         (*env)->ExceptionClear(env);
+        text = NULL;
+        payload = NULL;
     }
-    (*env)->PopLocalFrame(env, NULL);
-    (*env)->DeleteGlobalRef(env, (jobject)context);
-    Jni_env_done(*detach);
+    (*env)->CallVoidMethod(env, (jobject)context, Jni_on_error, code, text, payload);
+    Jni_complete_end(env, context, *detach);
     return NULL;
 }
 
-/* Finishes a successful completion: reports anything the Kotlin side threw
-   (it has no caller to propagate to) and releases `context`. */
-static void Jni_complete_end(JNIEnv* env, void* context, int detach) {
-    if ((*env)->ExceptionCheck(env)) {
-        (*env)->ExceptionDescribe(env);
+/* Delivers a successful result (`value`, made after Jni_complete_begin)
+   and finishes the completion. A JVM failure making `value` is delivered
+   instead, so the caller always resumes. */
+static void Jni_complete(JNIEnv* env, void* context, int detach, jobject value) {
+    jthrowable failure = (*env)->ExceptionOccurred(env);
+    if (failure != NULL) {
         (*env)->ExceptionClear(env);
+        (*env)->CallVoidMethod(env, (jobject)context, Jni_on_failure, failure);
+    } else {
+        (*env)->CallVoidMethod(env, (jobject)context, Jni_on_value, value);
     }
-    (*env)->PopLocalFrame(env, NULL);
-    (*env)->DeleteGlobalRef(env, (jobject)context);
-    Jni_env_done(detach);
+    Jni_complete_end(env, context, detach);
 }
 
 JNIEXPORT jlong JNICALL Java_kitchen_1sink_JniBridge_cancel_1token_1create(JNIEnv* env, jclass cls) {
@@ -370,19 +546,20 @@ JNIEXPORT void JNICALL Java_kitchen_1sink_JniBridge_cancel_1token_1destroy(JNIEn
    implementation as `ctx`; trampolines call the matching static dispatch
    shim on JniBridge from whatever thread the producer uses. The shim never
    lets an exception escape: it reports a failure itself through `out_err`
-   (with the two exports below) and returns a zero value. */
+   (with the two exports below) and returns a zero value. Every vtable's
+   `flags` is 0: the JVM can run a method on any thread. */
 
 /* Enters a trampoline: the JNIEnv with a local frame pushed, or NULL after
    reporting the failure through `out_err`. */
 static JNIEnv* Jni_callback_begin(kitchen_sink_error* out_err, int* detach) {
     JNIEnv* env = Jni_env(detach);
     if (env == NULL) {
-        kitchen_sink_error_set(out_err, -4, "could not attach the calling thread to the JVM");
+        Jni_set_error(out_err, -4, "could not attach the calling thread to the JVM");
         return NULL;
     }
     if ((*env)->PushLocalFrame(env, 16) != 0) {
         (*env)->ExceptionClear(env);
-        kitchen_sink_error_set(out_err, -4, "JNI local frame exhausted");
+        Jni_set_error(out_err, -4, "JNI local frame exhausted");
         Jni_env_done(*detach);
         return NULL;
     }
@@ -395,7 +572,7 @@ static JNIEnv* Jni_callback_begin(kitchen_sink_error* out_err, int* detach) {
 static void Jni_callback_end(JNIEnv* env, kitchen_sink_error* out_err, int detach) {
     if ((*env)->ExceptionCheck(env)) {
         (*env)->ExceptionClear(env);
-        kitchen_sink_error_set(out_err, -4, "the JVM failed to dispatch the callback");
+        Jni_set_error(out_err, -4, "the JVM failed to dispatch the callback");
     }
     (*env)->PopLocalFrame(env, NULL);
     Jni_env_done(detach);
@@ -407,57 +584,69 @@ static void Jni_release_callback(void* ctx) {
     int detach = 0;
     JNIEnv* env = Jni_env(&detach);
     if (env != NULL) {
-        if (ctx != NULL) {
-            (*env)->DeleteGlobalRef(env, (jobject)ctx);
-        }
+        Jni_unpin(env, ctx);
         Jni_env_done(detach);
     }
 }
 
-/* `JniBridge.error_set`: reports a failed callback through the trampoline's
-   `out_err` (the message is cut at its first NUL). */
-JNIEXPORT void JNICALL Java_kitchen_1sink_JniBridge_error_1set(JNIEnv* env, jclass cls, jlong err, jint code, jbyteArray message) {
-    (void)cls;
-    Jni_bytes m = Jni_borrow_bytes(env, message);
-    char* text = (char*)malloc(m.len + 1u);
-    if (text != NULL) {
-        if (m.len > 0) {
-            memcpy(text, m.ptr, m.len);
-        }
-        text[m.len] = '\0';
+/* Hands a run-shaped callback return (a string, bytes, a value buffer, or a
+   typed array, as a Java array of `kind`) to the producer: a copy in a
+   kitchen_sink_alloc run, which the producer adopts, with its element count in
+   `*out_len`. A NULL `value` (the shim reported a failure) is no run. */
+Jni_helper void* Jni_callback_run(JNIEnv* env, Jni_kind kind, jarray value, size_t* out_len, kitchen_sink_error* out_err) {
+    *out_len = 0;
+    if (value == NULL || (*env)->ExceptionCheck(env)) {
+        return NULL;
     }
-    Jni_release_bytes(env, &m);
-    kitchen_sink_error_set((kitchen_sink_error*)(intptr_t)err, (int32_t)code, text != NULL ? text : "callback failed");
-    free(text);
+    jsize len = (*env)->GetArrayLength(env, value);
+    if (len <= 0) {
+        return NULL;
+    }
+    uint8_t* run = kitchen_sink_alloc((size_t)len * Jni_kind_size[kind]);
+    if (run == NULL) {
+        Jni_set_error(out_err, -4, "out of memory");
+        return NULL;
+    }
+    Jni_get_region(env, value, kind, len, run);
+    *out_len = (size_t)len;
+    return run;
+}
+
+/* Reads an optional scalar callback return (a box, or NULL for none) into
+   `*out`; whether it was present. */
+Jni_helper bool Jni_callback_opt(JNIEnv* env, Jni_kind kind, jobject value, jvalue* out) {
+    if (value == NULL || (*env)->ExceptionCheck(env)) {
+        return false;
+    }
+    *out = Jni_unbox(env, kind, value);
+    return !(*env)->ExceptionCheck(env);
+}
+
+/* `JniBridge.error_set`: reports a failed callback through the trampoline's
+   `out_err`, with the message as UTF-8. */
+JNIEXPORT void JNICALL Java_kitchen_1sink_JniBridge_error_1set(JNIEnv* env, jclass cls, jlong err, jint code, jbyteArray message) {
+    Jni_run m;
+    (void)cls;
+    if (!Jni_borrow(env, message, Jni_B, &m)) {
+        (*env)->ExceptionClear(env);
+        Jni_set_error((kitchen_sink_error*)(intptr_t)err, (int32_t)code, "callback failed");
+        return;
+    }
+    kitchen_sink_error_set((kitchen_sink_error*)(intptr_t)err, (int32_t)code, (const uint8_t*)m.ptr, m.len);
+    Jni_unborrow(&m);
 }
 
 /* `JniBridge.error_set_payload`: attaches a typed error's fields (a value
    buffer) to the failure `error_set` reported. */
 JNIEXPORT void JNICALL Java_kitchen_1sink_JniBridge_error_1set_1payload(JNIEnv* env, jclass cls, jlong err, jbyteArray payload) {
+    Jni_run p;
     (void)cls;
-    Jni_bytes p = Jni_borrow_bytes(env, payload);
-    kitchen_sink_error_set_payload((kitchen_sink_error*)(intptr_t)err, p.ptr, p.len);
-    Jni_release_bytes(env, &p);
-}
-
-/* Hands a string, bytes, or buffer return to the producer: a run allocated
-   with kitchen_sink_alloc in the out slots, which the producer adopts. A NULL
-   `value` (the shim reported a failure) leaves the slots empty. */
-static void Jni_callback_return_bytes(JNIEnv* env, jbyteArray value, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err) {
-    if (value == NULL || (*env)->ExceptionCheck(env)) {
+    if (!Jni_borrow(env, payload, Jni_B, &p)) {
+        (*env)->ExceptionClear(env);
         return;
     }
-    jsize len = (*env)->GetArrayLength(env, value);
-    uint8_t* run = kitchen_sink_alloc((size_t)len);
-    if (len > 0 && run == NULL) {
-        kitchen_sink_error_set(out_err, -4, "out of memory");
-        return;
-    }
-    if (len > 0) {
-        (*env)->GetByteArrayRegion(env, value, 0, len, (jbyte*)run);
-    }
-    *out_ptr = run;
-    *out_len = (size_t)len;
+    kitchen_sink_error_set_payload((kitchen_sink_error*)(intptr_t)err, (const uint8_t*)p.ptr, p.len);
+    Jni_unborrow(&p);
 }
 
 static jmethodID Jni_mid_kitchen_ReadyListener_on_ready = NULL;
@@ -472,7 +661,12 @@ static void Jni_kitchen_ReadyListener_on_ready(void* ctx, int32_t p_code, const 
     if (env == NULL) {
         return;
     }
-    (*env)->CallStaticVoidMethod(env, Jni_bridge, Jni_mid_kitchen_ReadyListener_on_ready, (jobject)ctx, (jlong)(intptr_t)out_err, (jint)p_code, Jni_new_bytes(env, p_msg_ptr, p_msg_len));
+    jarray a_msg = Jni_new_array(env, Jni_B, p_msg_ptr, p_msg_len);
+    if ((*env)->ExceptionCheck(env)) {
+        Jni_callback_end(env, out_err, detach);
+        return;
+    }
+    (*env)->CallStaticVoidMethod(env, Jni_bridge, Jni_mid_kitchen_ReadyListener_on_ready, (jobject)ctx, (jlong)(intptr_t)out_err, (jint)p_code, a_msg);
     Jni_callback_end(env, out_err, detach);
 }
 
@@ -480,10 +674,16 @@ static bool Jni_kitchen_ReadyListener_on_item(void* ctx, const uint8_t* p_item_p
     int detach = 0;
     JNIEnv* env = Jni_callback_begin(out_err, &detach);
     if (env == NULL) {
-        kitchen_sink_kitchen_Gadget_destroy(p_gadget);
+        if (p_gadget != NULL) { kitchen_sink_kitchen_Gadget_destroy(p_gadget); }
         return (bool)0;
     }
-    jboolean rv = (*env)->CallStaticBooleanMethod(env, Jni_bridge, Jni_mid_kitchen_ReadyListener_on_item, (jobject)ctx, (jlong)(intptr_t)out_err, Jni_new_bytes(env, p_item_ptr, p_item_len), (jlong)(intptr_t)p_gadget);
+    jarray a_item = Jni_new_array(env, Jni_B, p_item_ptr, p_item_len);
+    if ((*env)->ExceptionCheck(env)) {
+        if (p_gadget != NULL) { kitchen_sink_kitchen_Gadget_destroy(p_gadget); }
+        Jni_callback_end(env, out_err, detach);
+        return (bool)0;
+    }
+    jboolean rv = (*env)->CallStaticBooleanMethod(env, Jni_bridge, Jni_mid_kitchen_ReadyListener_on_item, (jobject)ctx, (jlong)(intptr_t)out_err, a_item, (jlong)(intptr_t)p_gadget);
     Jni_callback_end(env, out_err, detach);
     return rv == JNI_TRUE;
 }
@@ -494,8 +694,8 @@ static void Jni_kitchen_ReadyListener_label(void* ctx, uint8_t** out_ptr, size_t
     if (env == NULL) {
         return;
     }
-    jbyteArray rv = (jbyteArray)(*env)->CallStaticObjectMethod(env, Jni_bridge, Jni_mid_kitchen_ReadyListener_label, (jobject)ctx, (jlong)(intptr_t)out_err);
-    Jni_callback_return_bytes(env, rv, out_ptr, out_len, out_err);
+    jarray rv = (jarray)(*env)->CallStaticObjectMethod(env, Jni_bridge, Jni_mid_kitchen_ReadyListener_label, (jobject)ctx, (jlong)(intptr_t)out_err);
+    *out_ptr = (uint8_t*)Jni_callback_run(env, Jni_B, rv, out_len, out_err);
     Jni_callback_end(env, out_err, detach);
 }
 
@@ -505,8 +705,8 @@ static void Jni_kitchen_ReadyListener_latest(void* ctx, uint8_t** out_ptr, size_
     if (env == NULL) {
         return;
     }
-    jbyteArray rv = (jbyteArray)(*env)->CallStaticObjectMethod(env, Jni_bridge, Jni_mid_kitchen_ReadyListener_latest, (jobject)ctx, (jlong)(intptr_t)out_err);
-    Jni_callback_return_bytes(env, rv, out_ptr, out_len, out_err);
+    jarray rv = (jarray)(*env)->CallStaticObjectMethod(env, Jni_bridge, Jni_mid_kitchen_ReadyListener_latest, (jobject)ctx, (jlong)(intptr_t)out_err);
+    *out_ptr = (uint8_t*)Jni_callback_run(env, Jni_B, rv, out_len, out_err);
     Jni_callback_end(env, out_err, detach);
 }
 
@@ -523,51 +723,131 @@ static kitchen_sink_kitchen_Gadget* Jni_kitchen_ReadyListener_favorite(void* ctx
 
 static const kitchen_sink_kitchen_ReadyListener_vtable Jni_kitchen_ReadyListener_vtable = {sizeof(kitchen_sink_kitchen_ReadyListener_vtable), 0, Jni_release_callback, Jni_kitchen_ReadyListener_on_ready, Jni_kitchen_ReadyListener_on_item, Jni_kitchen_ReadyListener_label, Jni_kitchen_ReadyListener_latest, Jni_kitchen_ReadyListener_favorite};
 
+static jmethodID Jni_mid_kitchen_Sampler_threshold = NULL;
+static jmethodID Jni_mid_kitchen_Sampler_samples = NULL;
+static jmethodID Jni_mid_kitchen_Sampler_describe = NULL;
+
+static bool Jni_kitchen_Sampler_threshold(void* ctx, bool p_has_level, uint32_t p_level, double* out_value, kitchen_sink_error* out_err) {
+    int detach = 0;
+    JNIEnv* env = Jni_callback_begin(out_err, &detach);
+    if (env == NULL) {
+        return (bool)0;
+    }
+    jvalue value = {0};
+    bool present = Jni_callback_opt(env, Jni_D, (*env)->CallStaticObjectMethod(env, Jni_bridge, Jni_mid_kitchen_Sampler_threshold, (jobject)ctx, (jlong)(intptr_t)out_err, p_has_level ? JNI_TRUE : JNI_FALSE, (jint)p_level), &value);
+    if (present) {
+        *out_value = (double)value.d;
+    }
+    Jni_callback_end(env, out_err, detach);
+    return present;
+}
+
+static void Jni_kitchen_Sampler_samples(void* ctx, bool p_has_limit, uint32_t p_limit, const double* p_weights_ptr, size_t p_weights_len, int16_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err) {
+    int detach = 0;
+    JNIEnv* env = Jni_callback_begin(out_err, &detach);
+    if (env == NULL) {
+        return;
+    }
+    jarray a_weights = Jni_new_array(env, Jni_D, p_weights_ptr, p_weights_len);
+    if ((*env)->ExceptionCheck(env)) {
+        Jni_callback_end(env, out_err, detach);
+        return;
+    }
+    jarray rv = (jarray)(*env)->CallStaticObjectMethod(env, Jni_bridge, Jni_mid_kitchen_Sampler_samples, (jobject)ctx, (jlong)(intptr_t)out_err, p_has_limit ? JNI_TRUE : JNI_FALSE, (jint)p_limit, a_weights);
+    *out_ptr = (int16_t*)Jni_callback_run(env, Jni_S, rv, out_len, out_err);
+    Jni_callback_end(env, out_err, detach);
+}
+
+static void Jni_kitchen_Sampler_describe(void* ctx, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err) {
+    int detach = 0;
+    JNIEnv* env = Jni_callback_begin(out_err, &detach);
+    if (env == NULL) {
+        return;
+    }
+    jarray rv = (jarray)(*env)->CallStaticObjectMethod(env, Jni_bridge, Jni_mid_kitchen_Sampler_describe, (jobject)ctx, (jlong)(intptr_t)out_err);
+    *out_ptr = (uint8_t*)Jni_callback_run(env, Jni_B, rv, out_len, out_err);
+    Jni_callback_end(env, out_err, detach);
+}
+
+static const kitchen_sink_kitchen_Sampler_vtable Jni_kitchen_Sampler_vtable = {sizeof(kitchen_sink_kitchen_Sampler_vtable), 0, Jni_release_callback, Jni_kitchen_Sampler_threshold, Jni_kitchen_Sampler_samples, Jni_kitchen_Sampler_describe};
+
 static const Jni_contract_entry Jni_contract_shared[] = {
-    {UINT64_C(0x709e234caa962446), UINT64_C(0x3894f2ca452e9f98), "shared.ping"},
-    {UINT64_C(0xcfb306fa5801ee5b), UINT64_C(0x1cbd9e10983cac2c), "shared.Token"},
+    {UINT64_C(0x709e234caa962446), UINT64_C(0x3894f2ca452e9f98), "shared.ping"}, /* function ping() -> string */
+    {UINT64_C(0xcfb306fa5801ee5b), UINT64_C(0x18e9fc204a13df6f), "shared.Token"}, /* record Token {i64, string} */
 };
 
 static const Jni_contract_entry Jni_contract_kitchen[] = {
-    {UINT64_C(0x01d4f09bbddc986f), UINT64_C(0x29eb88fecc66544d), "kitchen.Gadget.new"},
-    {UINT64_C(0x10472d8fe748c2ee), UINT64_C(0xb265832b6a759fc4), "kitchen.maybe_gadget"},
-    {UINT64_C(0x11368eec07a74078), UINT64_C(0xfa049f78b77e146a), "kitchen.gadgets"},
-    {UINT64_C(0x137f08a29cde6021), UINT64_C(0xda8de7aeb2dbb8a3), "kitchen.stream_gadgets"},
-    {UINT64_C(0x2111b54980826dd7), UINT64_C(0x452783f3e6ca6e1d), "kitchen.do_cancellable"},
-    {UINT64_C(0x29dddbc60bf8d7db), UINT64_C(0x452a3e573d57f6db), "kitchen.Priority"},
-    {UINT64_C(0x2b227003b74a0d16), UINT64_C(0x12332957470e9782), "kitchen.maybe_subscribe"},
-    {UINT64_C(0x2dd66cb0064f0494), UINT64_C(0x60197363fefd92dd), "kitchen.Item"},
-    {UINT64_C(0x33c265bbf079b0e9), UINT64_C(0xc3dcd0927e6c1deb), "kitchen.u32_id"},
-    {UINT64_C(0x33e6381d01660dfe), UINT64_C(0x077c63c31fd7f90a), "kitchen.KitchenErrors"},
-    {UINT64_C(0x3f5fc99d73504b76), UINT64_C(0x2df88d710f1ea10e), "kitchen.Gadget.poke"},
-    {UINT64_C(0x4c5764cf109528d1), UINT64_C(0x2a65529af4338a58), "kitchen.maybe_item"},
-    {UINT64_C(0x4de17dfb93fd494d), UINT64_C(0xba0ad0dd52ed74af), "kitchen.i32_id"},
-    {UINT64_C(0x504e95b7f7e65570), UINT64_C(0x01b3e8e0c9a10e23), "kitchen.stream_items"},
-    {UINT64_C(0x68cdb9a4bd3e3dd5), UINT64_C(0xc678b9164348d497), "kitchen.bool_id"},
-    {UINT64_C(0x69e7cd703d16eb85), UINT64_C(0xf3b28dd22ae9e689), "kitchen.do_async"},
-    {UINT64_C(0x70865079ce41be82), UINT64_C(0xbe3b69464672af46), "kitchen.Gadget.describe"},
-    {UINT64_C(0x71c5a1116cb7c49a), UINT64_C(0xcba1837108a89b84), "kitchen.echo_bytes"},
-    {UINT64_C(0x735ee1e0049ee91a), UINT64_C(0xca74320bc53eddab), "kitchen.echo_string"},
-    {UINT64_C(0x76d7fc58f4e41d84), UINT64_C(0x7373a0e47d30e690), "kitchen.i64_id"},
-    {UINT64_C(0x79abfe1aa960fd6a), UINT64_C(0xbca7a9e5eb26f3a6), "kitchen.nested.hello"},
-    {UINT64_C(0x7d3dd7d5cf6749e3), UINT64_C(0xa192f5a7298adb39), "kitchen.new_op"},
-    {UINT64_C(0x89a5e664bc25c67b), UINT64_C(0x5764a95e81ecfd31), "kitchen.f64_id"},
-    {UINT64_C(0x8cfdbdcecac5f7f1), UINT64_C(0x07e272f09c41fffc), "kitchen.Gadget.version"},
-    {UINT64_C(0x974b9f3e823c1738), UINT64_C(0xb81b91e975695f27), "kitchen.cross_module_token"},
-    {UINT64_C(0xaca0655fac15d230), UINT64_C(0x11c4d2b28abe07bb), "kitchen.list_items"},
-    {UINT64_C(0xc883b4afae20543e), UINT64_C(0xc40560e5411ff392), "kitchen.legacy_op"},
-    {UINT64_C(0xf2f7753e6e1dffc2), UINT64_C(0xc9047a95bdf49e93), "kitchen.get_attrs"},
-    {UINT64_C(0xfae25d3391922ead), UINT64_C(0x1c7f95739f3210b8), "kitchen.subscribe"},
-    {UINT64_C(0xfd0059b05cb2fcfb), UINT64_C(0x248bf8404a5823b4), "kitchen.Gadget"},
-    {UINT64_C(0xfed9c551fb9fd2d6), UINT64_C(0x59aec980ef3f3291), "kitchen.ReadyListener"},
+    {UINT64_C(0x01d4f09bbddc986f), UINT64_C(0xffcf2bd3b04aa002), "kitchen.Gadget.new"}, /* constructor new(i64) -> Gadget */
+    {UINT64_C(0x02bbd5f31c953704), UINT64_C(0xaca75656ad13d661), "kitchen.Sampler.samples"}, /* callback_method samples(u32?, [f64]) -> [i16] throws PantryError */
+    {UINT64_C(0x10472d8fe748c2ee), UINT64_C(0xcc570a2649bbf7dc), "kitchen.maybe_gadget"}, /* function maybe_gadget(Gadget?) -> Gadget? */
+    {UINT64_C(0x11368eec07a74078), UINT64_C(0xfa049f78b77e146a), "kitchen.gadgets"}, /* function gadgets() -> [Gadget] */
+    {UINT64_C(0x137f08a29cde6021), UINT64_C(0xda8de7aeb2dbb8a3), "kitchen.stream_gadgets"}, /* function stream_gadgets() -> iter<Gadget> */
+    {UINT64_C(0x184bfc4ab0e3fe45), UINT64_C(0xb64587477022696b), "kitchen.ids_u64"}, /* function ids_u64([u64]) -> [u64] */
+    {UINT64_C(0x2111b54980826dd7), UINT64_C(0x627bf01ab365b209), "kitchen.do_cancellable"}, /* function do_cancellable(string) -> string async cancellable */
+    {UINT64_C(0x21c70f9371374d74), UINT64_C(0xc582d6ad2392c36c), "kitchen.ReadyListener.favorite"}, /* callback_method favorite() -> Gadget */
+    {UINT64_C(0x23de5bd597372f46), UINT64_C(0xcf1bc6bb37872798), "kitchen.stream_chunks"}, /* function stream_chunks() -> iter<[i32]> */
+    {UINT64_C(0x249f1ddaec6a6cbe), UINT64_C(0x0710d6c9a4de93da), "kitchen.take_from_pantry"}, /* function take_from_pantry(string) -> i32 throws PantryError */
+    {UINT64_C(0x29dddbc60bf8d7db), UINT64_C(0x452a3e573d57f6db), "kitchen.Priority"}, /* enum Priority {Low = 0, Normal = 1, High = 2} */
+    {UINT64_C(0x2b227003b74a0d16), UINT64_C(0x5dae036b8a6aed30), "kitchen.maybe_subscribe"}, /* function maybe_subscribe(ReadyListener?) -> bool */
+    {UINT64_C(0x2dd66cb0064f0494), UINT64_C(0x74b131724dd0d867), "kitchen.Item"}, /* record Item {i64, string, i32, bool, f64, u32, bytes, [string], {string:string}, i64?, Token, Priority, Gadget?} */
+    {UINT64_C(0x33c265bbf079b0e9), UINT64_C(0x97c32b764693f2cb), "kitchen.u32_id"}, /* function u32_id(u32) -> u32 */
+    {UINT64_C(0x33e6381d01660dfe), UINT64_C(0x05e35a563089bf7d), "kitchen.KitchenErrors"}, /* errors KitchenErrors */
+    {UINT64_C(0x3d969ae76db6cb23), UINT64_C(0x38ac642c196512a5), "kitchen.ReadyListener.latest"}, /* callback_method latest() -> Item? */
+    {UINT64_C(0x3f5fc99d73504b76), UINT64_C(0x417e4a2acd3210b3), "kitchen.Gadget.poke"}, /* method poke(i32) -> i32 throws KitchenErrors */
+    {UINT64_C(0x4082f0085db28781), UINT64_C(0x18848e701962912e), "kitchen.Sampler"}, /* callback Sampler */
+    {UINT64_C(0x4340a6b1e7ec8c50), UINT64_C(0xf5b4f10f61862b33), "kitchen.Sampler.describe"}, /* callback_method describe() -> string throws any */
+    {UINT64_C(0x4c5764cf109528d1), UINT64_C(0xb374accf14676d90), "kitchen.maybe_item"}, /* function maybe_item(i64) -> Item? throws KitchenErrors */
+    {UINT64_C(0x4de17dfb93fd494d), UINT64_C(0x78be3203bcd10727), "kitchen.i32_id"}, /* function i32_id(i32) -> i32 */
+    {UINT64_C(0x504e95b7f7e65570), UINT64_C(0x01b3e8e0c9a10e23), "kitchen.stream_items"}, /* function stream_items() -> iter<Item> */
+    {UINT64_C(0x5dafabb7775fcb2d), UINT64_C(0x6c4b78c7d3f858c1), "kitchen.PantryError.Spoiled"}, /* code Spoiled = 2 */
+    {UINT64_C(0x5e0a8f6be4b00600), UINT64_C(0x3d0dcaec54133637), "kitchen.Sampler.threshold"}, /* callback_method threshold(u32?) -> f64? */
+    {UINT64_C(0x5ec0af1d4ecc6fed), UINT64_C(0x6540bdb74246420c), "kitchen.async_samples"}, /* function async_samples(u32) -> [f32] async cancellable */
+    {UINT64_C(0x61a358b0571e0a4e), UINT64_C(0x11a24c4b50d11996), "kitchen.async_maybe_count"}, /* function async_maybe_count() -> i64? async */
+    {UINT64_C(0x68cdb9a4bd3e3dd5), UINT64_C(0xcde022fe6bc3b1bf), "kitchen.bool_id"}, /* function bool_id(bool) -> bool */
+    {UINT64_C(0x69e7cd703d16eb85), UINT64_C(0xb13cb8d39e702c79), "kitchen.do_async"}, /* function do_async(string) -> string async */
+    {UINT64_C(0x70865079ce41be82), UINT64_C(0xbe3b69464672af46), "kitchen.Gadget.describe"}, /* method describe() -> string */
+    {UINT64_C(0x71c5a1116cb7c49a), UINT64_C(0x1506cfe6f548fac4), "kitchen.echo_bytes"}, /* function echo_bytes(bytes) -> bytes */
+    {UINT64_C(0x735ee1e0049ee91a), UINT64_C(0xa713dbd1be707752), "kitchen.echo_string"}, /* function echo_string(string) -> string */
+    {UINT64_C(0x76d7fc58f4e41d84), UINT64_C(0x6bdb4ccea2841d5e), "kitchen.i64_id"}, /* function i64_id(i64) -> i64 */
+    {UINT64_C(0x78d91fd617e162b8), UINT64_C(0xd88e2753503b36df), "kitchen.stream_maybe"}, /* function stream_maybe() -> iter<i32?> */
+    {UINT64_C(0x79abfe1aa960fd6a), UINT64_C(0xbca7a9e5eb26f3a6), "kitchen.nested.hello"}, /* function hello() -> string */
+    {UINT64_C(0x7b3865b536da998c), UINT64_C(0x1c4e79d60a20e74f), "kitchen.mixed_slices"}, /* function mixed_slices([i8], [i16], [u16], [u32], [i64], [f32]) -> [u32] */
+    {UINT64_C(0x7ba266dc26a58989), UINT64_C(0x0f86001cac0c21e8), "kitchen.KitchenErrors.InvalidInput"}, /* code InvalidInput = 2 */
+    {UINT64_C(0x7d3dd7d5cf6749e3), UINT64_C(0xa192f5a7298adb39), "kitchen.new_op"}, /* function new_op() -> i32 */
+    {UINT64_C(0x81ded69adee0abf2), UINT64_C(0x8c71141a931906f6), "kitchen.scale_i32"}, /* function scale_i32([i32], i32) -> [i32] */
+    {UINT64_C(0x81fa72769330fed6), UINT64_C(0x2096511ca5c9d8d3), "kitchen.ReadyListener.label"}, /* callback_method label() -> string throws KitchenErrors */
+    {UINT64_C(0x89a5e664bc25c67b), UINT64_C(0x357fd9b65ad879a9), "kitchen.f64_id"}, /* function f64_id(f64) -> f64 */
+    {UINT64_C(0x8cfdbdcecac5f7f1), UINT64_C(0x07e272f09c41fffc), "kitchen.Gadget.version"}, /* static version() -> string */
+    {UINT64_C(0x8dc42397e47614b9), UINT64_C(0xcddf6fede09b2e7f), "kitchen.opt_priority"}, /* function opt_priority(Priority?) -> Priority? */
+    {UINT64_C(0x92f060ef68961fc1), UINT64_C(0xd948f51645dc11a0), "kitchen.ReadyListener.on_item"}, /* callback_method on_item(Item, Gadget) -> bool */
+    {UINT64_C(0x974b9f3e823c1738), UINT64_C(0xb81b91e975695f27), "kitchen.cross_module_token"}, /* function cross_module_token() -> Token */
+    {UINT64_C(0x9f0f001aa85f97d5), UINT64_C(0x55815247f895bd45), "kitchen.sum_f64"}, /* function sum_f64([f64]) -> f64 */
+    {UINT64_C(0xab2a29fd1ef5458b), UINT64_C(0x471a34aa4c09ae2b), "kitchen.KitchenErrors.NotFound"}, /* code NotFound = 1 */
+    {UINT64_C(0xaca0655fac15d230), UINT64_C(0x11c4d2b28abe07bb), "kitchen.list_items"}, /* function list_items() -> [Item] */
+    {UINT64_C(0xb57c8e6ae3fb4383), UINT64_C(0x3f857851ab75366c), "kitchen.PantryError"}, /* errors PantryError */
+    {UINT64_C(0xbdc795b195edd428), UINT64_C(0x36127462f8b0969f), "kitchen.opt_mixed"}, /* function opt_mixed(f64, f32?, i64?, string?) -> u16? */
+    {UINT64_C(0xbe4821ab3c340e71), UINT64_C(0x17fad5418abe0f50), "kitchen.ReadyListener.on_ready"}, /* callback_method on_ready(i32, string) -> void */
+    {UINT64_C(0xc2ad53f2a6a36323), UINT64_C(0x071e29abee823f17), "kitchen.opt_i32_id"}, /* function opt_i32_id(i32?) -> i32? */
+    {UINT64_C(0xc7ab409554fd3d7b), UINT64_C(0xfea12b6bc219fc46), "kitchen.parse_any"}, /* function parse_any(string) -> i64 throws any */
+    {UINT64_C(0xc82a7f2d85f99f4e), UINT64_C(0xa9bcb8bacedb036c), "kitchen.sample_with"}, /* function sample_with(Sampler, u32?) -> [i16] throws PantryError */
+    {UINT64_C(0xc883b4afae20543e), UINT64_C(0xc40560e5411ff392), "kitchen.legacy_op"}, /* function legacy_op() -> i32 */
+    {UINT64_C(0xd180bf646bff59e2), UINT64_C(0xa4515a6d00d7c600), "kitchen.PantryError.OutOfStock"}, /* code OutOfStock = 1 {string} */
+    {UINT64_C(0xe6778df0f5c1b82b), UINT64_C(0x38eaafdb350559e1), "kitchen.opt_bool_id"}, /* function opt_bool_id(bool?) -> bool? */
+    {UINT64_C(0xf2f7753e6e1dffc2), UINT64_C(0xc9047a95bdf49e93), "kitchen.get_attrs"}, /* function get_attrs() -> {string:i32} */
+    {UINT64_C(0xfae25d3391922ead), UINT64_C(0xcc034cf506cae182), "kitchen.subscribe"}, /* function subscribe(ReadyListener) -> i32 */
+    {UINT64_C(0xfd0059b05cb2fcfb), UINT64_C(0x248bf8404a5823b4), "kitchen.Gadget"}, /* interface Gadget */
+    {UINT64_C(0xfed9c551fb9fd2d6), UINT64_C(0xe1020573f084dc1d), "kitchen.ReadyListener"}, /* callback ReadyListener */
+    {UINT64_C(0xff3a99b52597dee2), UINT64_C(0x14c4ecac97bdfc9b), "kitchen.Gadget.readings"}, /* method readings(u32?) -> [f64] throws any */
 };
 
 static jint Jni_load(JNIEnv* env) {
-    (void)env;
     if (Jni_check_contract(env, kitchen_sink_shared_contract, Jni_contract_shared, sizeof Jni_contract_shared / sizeof Jni_contract_shared[0]) != JNI_OK) {
         return JNI_ERR;
     }
     if (Jni_check_contract(env, kitchen_sink_kitchen_contract, Jni_contract_kitchen, sizeof Jni_contract_kitchen / sizeof Jni_contract_kitchen[0]) != JNI_OK) {
+        return JNI_ERR;
+    }
+    if (Jni_load_boxes(env) != JNI_OK) {
         return JNI_ERR;
     }
     if (Jni_load_async(env) != JNI_OK) {
@@ -593,19 +873,31 @@ static jint Jni_load(JNIEnv* env) {
     if (Jni_mid_kitchen_ReadyListener_favorite == NULL) {
         return JNI_ERR;
     }
+    Jni_mid_kitchen_Sampler_threshold = (*env)->GetStaticMethodID(env, Jni_bridge, "kitchen_Sampler_threshold", "(Lkitchen_sink/Sampler;JZI)Ljava/lang/Double;");
+    if (Jni_mid_kitchen_Sampler_threshold == NULL) {
+        return JNI_ERR;
+    }
+    Jni_mid_kitchen_Sampler_samples = (*env)->GetStaticMethodID(env, Jni_bridge, "kitchen_Sampler_samples", "(Lkitchen_sink/Sampler;JZI[D)[S");
+    if (Jni_mid_kitchen_Sampler_samples == NULL) {
+        return JNI_ERR;
+    }
+    Jni_mid_kitchen_Sampler_describe = (*env)->GetStaticMethodID(env, Jni_bridge, "kitchen_Sampler_describe", "(Lkitchen_sink/Sampler;J)[B");
+    if (Jni_mid_kitchen_Sampler_describe == NULL) {
+        return JNI_ERR;
+    }
     return JNI_OK;
 }
 
 JNIEXPORT jbyteArray JNICALL Java_kitchen_1sink_JniBridge_shared_1ping(JNIEnv* env, jclass cls) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
-    (void)cls;
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     size_t out_len = 0;
+    (void)cls;
     const uint8_t* rv = kitchen_sink_shared_ping(&out_len, &err);
     if (err.code != 0) {
         Jni_throw(env, &err, 0);
         return NULL;
     }
-    return Jni_take_bytes(env, rv, out_len);
+    return (jbyteArray)Jni_take_array(env, Jni_B, rv, out_len);
 }
 
 JNIEXPORT jlong JNICALL Java_kitchen_1sink_JniBridge_kitchen_1Gadget_1clone(JNIEnv* env, jclass cls, jlong self) {
@@ -621,7 +913,7 @@ JNIEXPORT void JNICALL Java_kitchen_1sink_JniBridge_kitchen_1Gadget_1destroy(JNI
 }
 
 JNIEXPORT jboolean JNICALL Java_kitchen_1sink_JniBridge_kitchen_1bool_1id(JNIEnv* env, jclass cls, jboolean p_x) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     (void)cls;
     bool rv = kitchen_sink_kitchen_bool_id(p_x == JNI_TRUE, &err);
     if (err.code != 0) {
@@ -632,7 +924,7 @@ JNIEXPORT jboolean JNICALL Java_kitchen_1sink_JniBridge_kitchen_1bool_1id(JNIEnv
 }
 
 JNIEXPORT jint JNICALL Java_kitchen_1sink_JniBridge_kitchen_1i32_1id(JNIEnv* env, jclass cls, jint p_x) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     (void)cls;
     int32_t rv = kitchen_sink_kitchen_i32_id((int32_t)p_x, &err);
     if (err.code != 0) {
@@ -643,7 +935,7 @@ JNIEXPORT jint JNICALL Java_kitchen_1sink_JniBridge_kitchen_1i32_1id(JNIEnv* env
 }
 
 JNIEXPORT jint JNICALL Java_kitchen_1sink_JniBridge_kitchen_1u32_1id(JNIEnv* env, jclass cls, jint p_x) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     (void)cls;
     uint32_t rv = kitchen_sink_kitchen_u32_id((uint32_t)p_x, &err);
     if (err.code != 0) {
@@ -654,7 +946,7 @@ JNIEXPORT jint JNICALL Java_kitchen_1sink_JniBridge_kitchen_1u32_1id(JNIEnv* env
 }
 
 JNIEXPORT jlong JNICALL Java_kitchen_1sink_JniBridge_kitchen_1i64_1id(JNIEnv* env, jclass cls, jlong p_x) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     (void)cls;
     int64_t rv = kitchen_sink_kitchen_i64_id((int64_t)p_x, &err);
     if (err.code != 0) {
@@ -665,7 +957,7 @@ JNIEXPORT jlong JNICALL Java_kitchen_1sink_JniBridge_kitchen_1i64_1id(JNIEnv* en
 }
 
 JNIEXPORT jdouble JNICALL Java_kitchen_1sink_JniBridge_kitchen_1f64_1id(JNIEnv* env, jclass cls, jdouble p_x) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     (void)cls;
     double rv = kitchen_sink_kitchen_f64_id((double)p_x, &err);
     if (err.code != 0) {
@@ -676,37 +968,47 @@ JNIEXPORT jdouble JNICALL Java_kitchen_1sink_JniBridge_kitchen_1f64_1id(JNIEnv* 
 }
 
 JNIEXPORT jbyteArray JNICALL Java_kitchen_1sink_JniBridge_kitchen_1echo_1string(JNIEnv* env, jclass cls, jbyteArray p_s) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
-    (void)cls;
-    Jni_bytes p_s_b = Jni_borrow_bytes(env, p_s);
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     size_t out_len = 0;
-    const uint8_t* rv = kitchen_sink_kitchen_echo_string(p_s_b.ptr, p_s_b.len, &out_len, &err);
-    Jni_release_bytes(env, &p_s_b);
+    (void)cls;
+    Jni_run r_s;
+    if (!Jni_borrow(env, p_s, Jni_B, &r_s)) {
+        return NULL;
+    }
+    const uint8_t* rv = kitchen_sink_kitchen_echo_string((const uint8_t*)r_s.ptr, r_s.len, &out_len, &err);
+    Jni_unborrow(&r_s);
     if (err.code != 0) {
         Jni_throw(env, &err, 0);
         return NULL;
     }
-    return Jni_take_bytes(env, rv, out_len);
+    return (jbyteArray)Jni_take_array(env, Jni_B, rv, out_len);
 }
 
 JNIEXPORT jbyteArray JNICALL Java_kitchen_1sink_JniBridge_kitchen_1echo_1bytes(JNIEnv* env, jclass cls, jbyteArray p_b) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
-    (void)cls;
-    Jni_bytes p_b_b = Jni_borrow_bytes(env, p_b);
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     size_t out_len = 0;
-    const uint8_t* rv = kitchen_sink_kitchen_echo_bytes(p_b_b.ptr, p_b_b.len, &out_len, &err);
-    Jni_release_bytes(env, &p_b_b);
+    (void)cls;
+    Jni_run r_b;
+    if (!Jni_borrow(env, p_b, Jni_B, &r_b)) {
+        return NULL;
+    }
+    const uint8_t* rv = kitchen_sink_kitchen_echo_bytes((const uint8_t*)r_b.ptr, r_b.len, &out_len, &err);
+    Jni_unborrow(&r_b);
     if (err.code != 0) {
         Jni_throw(env, &err, 0);
         return NULL;
     }
-    return Jni_take_bytes(env, rv, out_len);
+    return (jbyteArray)Jni_take_array(env, Jni_B, rv, out_len);
 }
 
 JNIEXPORT jint JNICALL Java_kitchen_1sink_JniBridge_kitchen_1subscribe(JNIEnv* env, jclass cls, jobject p_listener) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     (void)cls;
-    int32_t rv = kitchen_sink_kitchen_subscribe((void*)(*env)->NewGlobalRef(env, p_listener), &Jni_kitchen_ReadyListener_vtable, &err);
+    void* c_listener = Jni_pin(env, p_listener);
+    if (p_listener != NULL && c_listener == NULL) {
+        return 0;
+    }
+    int32_t rv = kitchen_sink_kitchen_subscribe(c_listener, &Jni_kitchen_ReadyListener_vtable, &err);
     if (err.code != 0) {
         Jni_throw(env, &err, 0);
         return 0;
@@ -715,9 +1017,13 @@ JNIEXPORT jint JNICALL Java_kitchen_1sink_JniBridge_kitchen_1subscribe(JNIEnv* e
 }
 
 JNIEXPORT jboolean JNICALL Java_kitchen_1sink_JniBridge_kitchen_1maybe_1subscribe(JNIEnv* env, jclass cls, jobject p_listener) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     (void)cls;
-    bool rv = kitchen_sink_kitchen_maybe_subscribe(p_listener != NULL ? (void*)(*env)->NewGlobalRef(env, p_listener) : NULL, p_listener != NULL ? &Jni_kitchen_ReadyListener_vtable : NULL, &err);
+    void* c_listener = Jni_pin(env, p_listener);
+    if (p_listener != NULL && c_listener == NULL) {
+        return 0;
+    }
+    bool rv = kitchen_sink_kitchen_maybe_subscribe(c_listener, p_listener != NULL ? &Jni_kitchen_ReadyListener_vtable : NULL, &err);
     if (err.code != 0) {
         Jni_throw(env, &err, 0);
         return 0;
@@ -726,7 +1032,7 @@ JNIEXPORT jboolean JNICALL Java_kitchen_1sink_JniBridge_kitchen_1maybe_1subscrib
 }
 
 JNIEXPORT jlong JNICALL Java_kitchen_1sink_JniBridge_kitchen_1maybe_1gadget(JNIEnv* env, jclass cls, jlong p_fallback) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     (void)cls;
     kitchen_sink_kitchen_Gadget* rv = kitchen_sink_kitchen_maybe_gadget((const kitchen_sink_kitchen_Gadget*)(intptr_t)p_fallback, &err);
     if (err.code != 0) {
@@ -737,19 +1043,19 @@ JNIEXPORT jlong JNICALL Java_kitchen_1sink_JniBridge_kitchen_1maybe_1gadget(JNIE
 }
 
 JNIEXPORT jbyteArray JNICALL Java_kitchen_1sink_JniBridge_kitchen_1gadgets(JNIEnv* env, jclass cls) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
-    (void)cls;
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     size_t out_len = 0;
+    (void)cls;
     const uint8_t* rv = kitchen_sink_kitchen_gadgets(&out_len, &err);
     if (err.code != 0) {
         Jni_throw(env, &err, 0);
         return NULL;
     }
-    return Jni_take_bytes(env, rv, out_len);
+    return (jbyteArray)Jni_take_array(env, Jni_B, rv, out_len);
 }
 
 JNIEXPORT jlong JNICALL Java_kitchen_1sink_JniBridge_kitchen_1stream_1gadgets(JNIEnv* env, jclass cls) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     (void)cls;
     kitchen_sink_kitchen_StreamGadgetsIterator* rv = kitchen_sink_kitchen_stream_gadgets(&err);
     if (err.code != 0) {
@@ -759,11 +1065,11 @@ JNIEXPORT jlong JNICALL Java_kitchen_1sink_JniBridge_kitchen_1stream_1gadgets(JN
     return (jlong)(intptr_t)rv;
 }
 
-JNIEXPORT jboolean JNICALL Java_kitchen_1sink_JniBridge_kitchen_1StreamGadgetsIterator_1next(JNIEnv* env, jclass cls, jlong iter, jlongArray out) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
-    kitchen_sink_kitchen_Gadget* item = (kitchen_sink_kitchen_Gadget*)0;
+JNIEXPORT jboolean JNICALL Java_kitchen_1sink_JniBridge_kitchen_1StreamGadgetsIterator_1next(JNIEnv* env, jclass cls, jlong iter, jobjectArray out) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    kitchen_sink_kitchen_Gadget* out_item = NULL;
     (void)cls;
-    int32_t has = kitchen_sink_kitchen_StreamGadgetsIterator_next((kitchen_sink_kitchen_StreamGadgetsIterator*)(intptr_t)iter, &item, &err);
+    int32_t has = kitchen_sink_kitchen_StreamGadgetsIterator_next((kitchen_sink_kitchen_StreamGadgetsIterator*)(intptr_t)iter, &out_item, &err);
     if (err.code != 0) {
         Jni_throw(env, &err, 0);
         return JNI_FALSE;
@@ -771,9 +1077,7 @@ JNIEXPORT jboolean JNICALL Java_kitchen_1sink_JniBridge_kitchen_1StreamGadgetsIt
     if (has == 0) {
         return JNI_FALSE;
     }
-    jlong value = (jlong)(intptr_t)item;
-    (*env)->SetLongArrayRegion(env, out, 0, 1, &value);
-    return JNI_TRUE;
+    return Jni_yield(env, out, Jni_box(env, Jni_J, (jvalue){.j = (jlong)(intptr_t)out_item}));
 }
 
 JNIEXPORT void JNICALL Java_kitchen_1sink_JniBridge_kitchen_1StreamGadgetsIterator_1destroy(JNIEnv* env, jclass cls, jlong iter) {
@@ -783,43 +1087,43 @@ JNIEXPORT void JNICALL Java_kitchen_1sink_JniBridge_kitchen_1StreamGadgetsIterat
 }
 
 JNIEXPORT jbyteArray JNICALL Java_kitchen_1sink_JniBridge_kitchen_1maybe_1item(JNIEnv* env, jclass cls, jlong p_id) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
-    (void)cls;
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     size_t out_len = 0;
+    (void)cls;
     const uint8_t* rv = kitchen_sink_kitchen_maybe_item((int64_t)p_id, &out_len, &err);
     if (err.code != 0) {
-        Jni_throw(env, &err, 1);
+        Jni_throw(env, &err, 2);
         return NULL;
     }
-    return Jni_take_bytes(env, rv, out_len);
+    return (jbyteArray)Jni_take_array(env, Jni_B, rv, out_len);
 }
 
 JNIEXPORT jbyteArray JNICALL Java_kitchen_1sink_JniBridge_kitchen_1list_1items(JNIEnv* env, jclass cls) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
-    (void)cls;
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     size_t out_len = 0;
+    (void)cls;
     const uint8_t* rv = kitchen_sink_kitchen_list_items(&out_len, &err);
     if (err.code != 0) {
         Jni_throw(env, &err, 0);
         return NULL;
     }
-    return Jni_take_bytes(env, rv, out_len);
+    return (jbyteArray)Jni_take_array(env, Jni_B, rv, out_len);
 }
 
 JNIEXPORT jbyteArray JNICALL Java_kitchen_1sink_JniBridge_kitchen_1get_1attrs(JNIEnv* env, jclass cls) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
-    (void)cls;
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     size_t out_len = 0;
+    (void)cls;
     const uint8_t* rv = kitchen_sink_kitchen_get_attrs(&out_len, &err);
     if (err.code != 0) {
         Jni_throw(env, &err, 0);
         return NULL;
     }
-    return Jni_take_bytes(env, rv, out_len);
+    return (jbyteArray)Jni_take_array(env, Jni_B, rv, out_len);
 }
 
 JNIEXPORT jlong JNICALL Java_kitchen_1sink_JniBridge_kitchen_1stream_1items(JNIEnv* env, jclass cls) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     (void)cls;
     kitchen_sink_kitchen_StreamItemsIterator* rv = kitchen_sink_kitchen_stream_items(&err);
     if (err.code != 0) {
@@ -829,20 +1133,20 @@ JNIEXPORT jlong JNICALL Java_kitchen_1sink_JniBridge_kitchen_1stream_1items(JNIE
     return (jlong)(intptr_t)rv;
 }
 
-JNIEXPORT jbyteArray JNICALL Java_kitchen_1sink_JniBridge_kitchen_1StreamItemsIterator_1next(JNIEnv* env, jclass cls, jlong iter) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
-    const uint8_t* item = NULL;
+JNIEXPORT jboolean JNICALL Java_kitchen_1sink_JniBridge_kitchen_1StreamItemsIterator_1next(JNIEnv* env, jclass cls, jlong iter, jobjectArray out) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    const uint8_t* out_item = NULL;
     size_t out_len = 0;
     (void)cls;
-    int32_t has = kitchen_sink_kitchen_StreamItemsIterator_next((kitchen_sink_kitchen_StreamItemsIterator*)(intptr_t)iter, &item, &out_len, &err);
+    int32_t has = kitchen_sink_kitchen_StreamItemsIterator_next((kitchen_sink_kitchen_StreamItemsIterator*)(intptr_t)iter, &out_item, &out_len, &err);
     if (err.code != 0) {
         Jni_throw(env, &err, 0);
-        return NULL;
+        return JNI_FALSE;
     }
     if (has == 0) {
-        return NULL;
+        return JNI_FALSE;
     }
-    return Jni_take_bytes(env, item, out_len);
+    return Jni_yield(env, out, Jni_take_array(env, Jni_B, out_item, out_len));
 }
 
 JNIEXPORT void JNICALL Java_kitchen_1sink_JniBridge_kitchen_1StreamItemsIterator_1destroy(JNIEnv* env, jclass cls, jlong iter) {
@@ -852,15 +1156,15 @@ JNIEXPORT void JNICALL Java_kitchen_1sink_JniBridge_kitchen_1StreamItemsIterator
 }
 
 JNIEXPORT jbyteArray JNICALL Java_kitchen_1sink_JniBridge_kitchen_1cross_1module_1token(JNIEnv* env, jclass cls) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
-    (void)cls;
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     size_t out_len = 0;
+    (void)cls;
     const uint8_t* rv = kitchen_sink_kitchen_cross_module_token(&out_len, &err);
     if (err.code != 0) {
         Jni_throw(env, &err, 0);
         return NULL;
     }
-    return Jni_take_bytes(env, rv, out_len);
+    return (jbyteArray)Jni_take_array(env, Jni_B, rv, out_len);
 }
 
 static void Jni_done_kitchen_do_async(void* context, kitchen_sink_error* err, const uint8_t* result_ptr, size_t result_len) {
@@ -869,16 +1173,22 @@ static void Jni_done_kitchen_do_async(void* context, kitchen_sink_error* err, co
     if (env == NULL) {
         return;
     }
-    (*env)->CallVoidMethod(env, (jobject)context, Jni_on_bytes, Jni_take_bytes(env, result_ptr, result_len));
-    Jni_complete_end(env, context, detach);
+    Jni_complete(env, context, detach, Jni_take_array(env, Jni_B, result_ptr, result_len));
 }
 
 JNIEXPORT void JNICALL Java_kitchen_1sink_JniBridge_kitchen_1do_1async(JNIEnv* env, jclass cls, jbyteArray p_input, jobject completion) {
-    void* context = (void*)(*env)->NewGlobalRef(env, completion);
     (void)cls;
-    Jni_bytes p_input_b = Jni_borrow_bytes(env, p_input);
-    kitchen_sink_kitchen_do_async(p_input_b.ptr, p_input_b.len, Jni_done_kitchen_do_async, context);
-    Jni_release_bytes(env, &p_input_b);
+    Jni_run r_input;
+    if (!Jni_borrow(env, p_input, Jni_B, &r_input)) {
+        return;
+    }
+    void* context = Jni_pin(env, completion);
+    if (context == NULL) {
+        Jni_unborrow(&r_input);
+        return;
+    }
+    kitchen_sink_kitchen_do_async((const uint8_t*)r_input.ptr, r_input.len, Jni_done_kitchen_do_async, context);
+    Jni_unborrow(&r_input);
 }
 
 static void Jni_done_kitchen_do_cancellable(void* context, kitchen_sink_error* err, const uint8_t* result_ptr, size_t result_len) {
@@ -887,20 +1197,26 @@ static void Jni_done_kitchen_do_cancellable(void* context, kitchen_sink_error* e
     if (env == NULL) {
         return;
     }
-    (*env)->CallVoidMethod(env, (jobject)context, Jni_on_bytes, Jni_take_bytes(env, result_ptr, result_len));
-    Jni_complete_end(env, context, detach);
+    Jni_complete(env, context, detach, Jni_take_array(env, Jni_B, result_ptr, result_len));
 }
 
 JNIEXPORT void JNICALL Java_kitchen_1sink_JniBridge_kitchen_1do_1cancellable(JNIEnv* env, jclass cls, jbyteArray p_input, jlong cancel_token, jobject completion) {
-    void* context = (void*)(*env)->NewGlobalRef(env, completion);
     (void)cls;
-    Jni_bytes p_input_b = Jni_borrow_bytes(env, p_input);
-    kitchen_sink_kitchen_do_cancellable(p_input_b.ptr, p_input_b.len, (kitchen_sink_cancel_token*)(intptr_t)cancel_token, Jni_done_kitchen_do_cancellable, context);
-    Jni_release_bytes(env, &p_input_b);
+    Jni_run r_input;
+    if (!Jni_borrow(env, p_input, Jni_B, &r_input)) {
+        return;
+    }
+    void* context = Jni_pin(env, completion);
+    if (context == NULL) {
+        Jni_unborrow(&r_input);
+        return;
+    }
+    kitchen_sink_kitchen_do_cancellable((const uint8_t*)r_input.ptr, r_input.len, (kitchen_sink_cancel_token*)(intptr_t)cancel_token, Jni_done_kitchen_do_cancellable, context);
+    Jni_unborrow(&r_input);
 }
 
 JNIEXPORT jint JNICALL Java_kitchen_1sink_JniBridge_kitchen_1legacy_1op(JNIEnv* env, jclass cls) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     (void)cls;
     int32_t rv = kitchen_sink_kitchen_legacy_op(&err);
     if (err.code != 0) {
@@ -911,7 +1227,7 @@ JNIEXPORT jint JNICALL Java_kitchen_1sink_JniBridge_kitchen_1legacy_1op(JNIEnv* 
 }
 
 JNIEXPORT jint JNICALL Java_kitchen_1sink_JniBridge_kitchen_1new_1op(JNIEnv* env, jclass cls) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     (void)cls;
     int32_t rv = kitchen_sink_kitchen_new_op(&err);
     if (err.code != 0) {
@@ -921,8 +1237,318 @@ JNIEXPORT jint JNICALL Java_kitchen_1sink_JniBridge_kitchen_1new_1op(JNIEnv* env
     return (jint)rv;
 }
 
+JNIEXPORT jobject JNICALL Java_kitchen_1sink_JniBridge_kitchen_1opt_1i32_1id(JNIEnv* env, jclass cls, jboolean h_x, jint p_x) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    int32_t out_value = 0;
+    (void)cls;
+    bool rv = kitchen_sink_kitchen_opt_i32_id(h_x == JNI_TRUE, (int32_t)p_x, &out_value, &err);
+    if (err.code != 0) {
+        Jni_throw(env, &err, 0);
+        return NULL;
+    }
+    return rv ? Jni_box(env, Jni_I, (jvalue){.i = (jint)out_value}) : NULL;
+}
+
+JNIEXPORT jobject JNICALL Java_kitchen_1sink_JniBridge_kitchen_1opt_1bool_1id(JNIEnv* env, jclass cls, jboolean h_x, jboolean p_x) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    bool out_value = 0;
+    (void)cls;
+    bool rv = kitchen_sink_kitchen_opt_bool_id(h_x == JNI_TRUE, p_x == JNI_TRUE, &out_value, &err);
+    if (err.code != 0) {
+        Jni_throw(env, &err, 0);
+        return NULL;
+    }
+    return rv ? Jni_box(env, Jni_Z, (jvalue){.z = out_value ? JNI_TRUE : JNI_FALSE}) : NULL;
+}
+
+JNIEXPORT jobject JNICALL Java_kitchen_1sink_JniBridge_kitchen_1opt_1priority(JNIEnv* env, jclass cls, jboolean h_p, jint p_p) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    kitchen_sink_kitchen_Priority out_value = 0;
+    (void)cls;
+    bool rv = kitchen_sink_kitchen_opt_priority(h_p == JNI_TRUE, (kitchen_sink_kitchen_Priority)p_p, &out_value, &err);
+    if (err.code != 0) {
+        Jni_throw(env, &err, 0);
+        return NULL;
+    }
+    return rv ? Jni_box(env, Jni_I, (jvalue){.i = (jint)out_value}) : NULL;
+}
+
+JNIEXPORT jobject JNICALL Java_kitchen_1sink_JniBridge_kitchen_1opt_1mixed(JNIEnv* env, jclass cls, jdouble p_base, jboolean h_scale, jfloat p_scale, jboolean h_offset, jlong p_offset, jbyteArray p_label) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    uint16_t out_value = 0;
+    (void)cls;
+    Jni_run r_label;
+    if (!Jni_borrow(env, p_label, Jni_B, &r_label)) {
+        return NULL;
+    }
+    bool rv = kitchen_sink_kitchen_opt_mixed((double)p_base, h_scale == JNI_TRUE, (float)p_scale, h_offset == JNI_TRUE, (int64_t)p_offset, (const uint8_t*)r_label.ptr, r_label.len, &out_value, &err);
+    Jni_unborrow(&r_label);
+    if (err.code != 0) {
+        Jni_throw(env, &err, 0);
+        return NULL;
+    }
+    return rv ? Jni_box(env, Jni_S, (jvalue){.s = (jshort)out_value}) : NULL;
+}
+
+JNIEXPORT jdouble JNICALL Java_kitchen_1sink_JniBridge_kitchen_1sum_1f64(JNIEnv* env, jclass cls, jdoubleArray p_xs) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    (void)cls;
+    Jni_run r_xs;
+    if (!Jni_borrow(env, p_xs, Jni_D, &r_xs)) {
+        return 0;
+    }
+    double rv = kitchen_sink_kitchen_sum_f64((const double*)r_xs.ptr, r_xs.len, &err);
+    Jni_unborrow(&r_xs);
+    if (err.code != 0) {
+        Jni_throw(env, &err, 0);
+        return 0;
+    }
+    return (jdouble)rv;
+}
+
+JNIEXPORT jintArray JNICALL Java_kitchen_1sink_JniBridge_kitchen_1scale_1i32(JNIEnv* env, jclass cls, jintArray p_xs, jint p_factor) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    size_t out_len = 0;
+    (void)cls;
+    Jni_run r_xs;
+    if (!Jni_borrow(env, p_xs, Jni_I, &r_xs)) {
+        return NULL;
+    }
+    int32_t* rv = kitchen_sink_kitchen_scale_i32((const int32_t*)r_xs.ptr, r_xs.len, (int32_t)p_factor, &out_len, &err);
+    Jni_unborrow(&r_xs);
+    if (err.code != 0) {
+        Jni_throw(env, &err, 0);
+        return NULL;
+    }
+    return (jintArray)Jni_take_array(env, Jni_I, rv, out_len);
+}
+
+JNIEXPORT jlongArray JNICALL Java_kitchen_1sink_JniBridge_kitchen_1ids_1u64(JNIEnv* env, jclass cls, jlongArray p_ids) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    size_t out_len = 0;
+    (void)cls;
+    Jni_run r_ids;
+    if (!Jni_borrow(env, p_ids, Jni_J, &r_ids)) {
+        return NULL;
+    }
+    uint64_t* rv = kitchen_sink_kitchen_ids_u64((const uint64_t*)r_ids.ptr, r_ids.len, &out_len, &err);
+    Jni_unborrow(&r_ids);
+    if (err.code != 0) {
+        Jni_throw(env, &err, 0);
+        return NULL;
+    }
+    return (jlongArray)Jni_take_array(env, Jni_J, rv, out_len);
+}
+
+JNIEXPORT jintArray JNICALL Java_kitchen_1sink_JniBridge_kitchen_1mixed_1slices(JNIEnv* env, jclass cls, jbyteArray p_a, jshortArray p_b, jshortArray p_c, jintArray p_d, jlongArray p_e, jfloatArray p_f) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    size_t out_len = 0;
+    (void)cls;
+    Jni_run r_a;
+    if (!Jni_borrow(env, p_a, Jni_B, &r_a)) {
+        return NULL;
+    }
+    Jni_run r_b;
+    if (!Jni_borrow(env, p_b, Jni_S, &r_b)) {
+        Jni_unborrow(&r_a);
+        return NULL;
+    }
+    Jni_run r_c;
+    if (!Jni_borrow(env, p_c, Jni_S, &r_c)) {
+        Jni_unborrow(&r_b);
+        Jni_unborrow(&r_a);
+        return NULL;
+    }
+    Jni_run r_d;
+    if (!Jni_borrow(env, p_d, Jni_I, &r_d)) {
+        Jni_unborrow(&r_c);
+        Jni_unborrow(&r_b);
+        Jni_unborrow(&r_a);
+        return NULL;
+    }
+    Jni_run r_e;
+    if (!Jni_borrow(env, p_e, Jni_J, &r_e)) {
+        Jni_unborrow(&r_d);
+        Jni_unborrow(&r_c);
+        Jni_unborrow(&r_b);
+        Jni_unborrow(&r_a);
+        return NULL;
+    }
+    Jni_run r_f;
+    if (!Jni_borrow(env, p_f, Jni_F, &r_f)) {
+        Jni_unborrow(&r_e);
+        Jni_unborrow(&r_d);
+        Jni_unborrow(&r_c);
+        Jni_unborrow(&r_b);
+        Jni_unborrow(&r_a);
+        return NULL;
+    }
+    uint32_t* rv = kitchen_sink_kitchen_mixed_slices((const int8_t*)r_a.ptr, r_a.len, (const int16_t*)r_b.ptr, r_b.len, (const uint16_t*)r_c.ptr, r_c.len, (const uint32_t*)r_d.ptr, r_d.len, (const int64_t*)r_e.ptr, r_e.len, (const float*)r_f.ptr, r_f.len, &out_len, &err);
+    Jni_unborrow(&r_a);
+    Jni_unborrow(&r_b);
+    Jni_unborrow(&r_c);
+    Jni_unborrow(&r_d);
+    Jni_unborrow(&r_e);
+    Jni_unborrow(&r_f);
+    if (err.code != 0) {
+        Jni_throw(env, &err, 0);
+        return NULL;
+    }
+    return (jintArray)Jni_take_array(env, Jni_I, rv, out_len);
+}
+
+static void Jni_done_kitchen_async_maybe_count(void* context, kitchen_sink_error* err, bool has_result, int64_t result) {
+    int detach = 0;
+    JNIEnv* env = Jni_complete_begin(context, err, &detach);
+    if (env == NULL) {
+        return;
+    }
+    Jni_complete(env, context, detach, has_result ? Jni_box(env, Jni_J, (jvalue){.j = (jlong)result}) : NULL);
+}
+
+JNIEXPORT void JNICALL Java_kitchen_1sink_JniBridge_kitchen_1async_1maybe_1count(JNIEnv* env, jclass cls, jobject completion) {
+    (void)cls;
+    void* context = Jni_pin(env, completion);
+    if (context == NULL) {
+        return;
+    }
+    kitchen_sink_kitchen_async_maybe_count(Jni_done_kitchen_async_maybe_count, context);
+}
+
+static void Jni_done_kitchen_async_samples(void* context, kitchen_sink_error* err, const float* result_ptr, size_t result_len) {
+    int detach = 0;
+    JNIEnv* env = Jni_complete_begin(context, err, &detach);
+    if (env == NULL) {
+        return;
+    }
+    Jni_complete(env, context, detach, Jni_take_array(env, Jni_F, result_ptr, result_len));
+}
+
+JNIEXPORT void JNICALL Java_kitchen_1sink_JniBridge_kitchen_1async_1samples(JNIEnv* env, jclass cls, jint p_n, jlong cancel_token, jobject completion) {
+    (void)cls;
+    void* context = Jni_pin(env, completion);
+    if (context == NULL) {
+        return;
+    }
+    kitchen_sink_kitchen_async_samples((uint32_t)p_n, (kitchen_sink_cancel_token*)(intptr_t)cancel_token, Jni_done_kitchen_async_samples, context);
+}
+
+JNIEXPORT jlong JNICALL Java_kitchen_1sink_JniBridge_kitchen_1stream_1maybe(JNIEnv* env, jclass cls) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    (void)cls;
+    kitchen_sink_kitchen_StreamMaybeIterator* rv = kitchen_sink_kitchen_stream_maybe(&err);
+    if (err.code != 0) {
+        Jni_throw(env, &err, 0);
+        return 0;
+    }
+    return (jlong)(intptr_t)rv;
+}
+
+JNIEXPORT jboolean JNICALL Java_kitchen_1sink_JniBridge_kitchen_1StreamMaybeIterator_1next(JNIEnv* env, jclass cls, jlong iter, jobjectArray out) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    bool out_has_item = false;
+    int32_t out_item = 0;
+    (void)cls;
+    int32_t has = kitchen_sink_kitchen_StreamMaybeIterator_next((kitchen_sink_kitchen_StreamMaybeIterator*)(intptr_t)iter, &out_has_item, &out_item, &err);
+    if (err.code != 0) {
+        Jni_throw(env, &err, 0);
+        return JNI_FALSE;
+    }
+    if (has == 0) {
+        return JNI_FALSE;
+    }
+    return Jni_yield(env, out, out_has_item ? Jni_box(env, Jni_I, (jvalue){.i = (jint)out_item}) : NULL);
+}
+
+JNIEXPORT void JNICALL Java_kitchen_1sink_JniBridge_kitchen_1StreamMaybeIterator_1destroy(JNIEnv* env, jclass cls, jlong iter) {
+    (void)env;
+    (void)cls;
+    kitchen_sink_kitchen_StreamMaybeIterator_destroy((kitchen_sink_kitchen_StreamMaybeIterator*)(intptr_t)iter);
+}
+
+JNIEXPORT jlong JNICALL Java_kitchen_1sink_JniBridge_kitchen_1stream_1chunks(JNIEnv* env, jclass cls) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    (void)cls;
+    kitchen_sink_kitchen_StreamChunksIterator* rv = kitchen_sink_kitchen_stream_chunks(&err);
+    if (err.code != 0) {
+        Jni_throw(env, &err, 0);
+        return 0;
+    }
+    return (jlong)(intptr_t)rv;
+}
+
+JNIEXPORT jboolean JNICALL Java_kitchen_1sink_JniBridge_kitchen_1StreamChunksIterator_1next(JNIEnv* env, jclass cls, jlong iter, jobjectArray out) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    int32_t* out_item = NULL;
+    size_t out_len = 0;
+    (void)cls;
+    int32_t has = kitchen_sink_kitchen_StreamChunksIterator_next((kitchen_sink_kitchen_StreamChunksIterator*)(intptr_t)iter, &out_item, &out_len, &err);
+    if (err.code != 0) {
+        Jni_throw(env, &err, 0);
+        return JNI_FALSE;
+    }
+    if (has == 0) {
+        return JNI_FALSE;
+    }
+    return Jni_yield(env, out, Jni_take_array(env, Jni_I, out_item, out_len));
+}
+
+JNIEXPORT void JNICALL Java_kitchen_1sink_JniBridge_kitchen_1StreamChunksIterator_1destroy(JNIEnv* env, jclass cls, jlong iter) {
+    (void)env;
+    (void)cls;
+    kitchen_sink_kitchen_StreamChunksIterator_destroy((kitchen_sink_kitchen_StreamChunksIterator*)(intptr_t)iter);
+}
+
+JNIEXPORT jshortArray JNICALL Java_kitchen_1sink_JniBridge_kitchen_1sample_1with(JNIEnv* env, jclass cls, jobject p_sampler, jboolean h_level, jint p_level) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    size_t out_len = 0;
+    (void)cls;
+    void* c_sampler = Jni_pin(env, p_sampler);
+    if (p_sampler != NULL && c_sampler == NULL) {
+        return NULL;
+    }
+    int16_t* rv = kitchen_sink_kitchen_sample_with(c_sampler, &Jni_kitchen_Sampler_vtable, h_level == JNI_TRUE, (uint32_t)p_level, &out_len, &err);
+    if (err.code != 0) {
+        Jni_throw(env, &err, 3);
+        return NULL;
+    }
+    return (jshortArray)Jni_take_array(env, Jni_S, rv, out_len);
+}
+
+JNIEXPORT jint JNICALL Java_kitchen_1sink_JniBridge_kitchen_1take_1from_1pantry(JNIEnv* env, jclass cls, jbyteArray p_item) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    (void)cls;
+    Jni_run r_item;
+    if (!Jni_borrow(env, p_item, Jni_B, &r_item)) {
+        return 0;
+    }
+    int32_t rv = kitchen_sink_kitchen_take_from_pantry((const uint8_t*)r_item.ptr, r_item.len, &err);
+    Jni_unborrow(&r_item);
+    if (err.code != 0) {
+        Jni_throw(env, &err, 3);
+        return 0;
+    }
+    return (jint)rv;
+}
+
+JNIEXPORT jlong JNICALL Java_kitchen_1sink_JniBridge_kitchen_1parse_1any(JNIEnv* env, jclass cls, jbyteArray p_text) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    (void)cls;
+    Jni_run r_text;
+    if (!Jni_borrow(env, p_text, Jni_B, &r_text)) {
+        return 0;
+    }
+    int64_t rv = kitchen_sink_kitchen_parse_any((const uint8_t*)r_text.ptr, r_text.len, &err);
+    Jni_unborrow(&r_text);
+    if (err.code != 0) {
+        Jni_throw(env, &err, 1);
+        return 0;
+    }
+    return (jlong)rv;
+}
+
 JNIEXPORT jlong JNICALL Java_kitchen_1sink_JniBridge_kitchen_1Gadget_1new(JNIEnv* env, jclass cls, jlong p_id) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     (void)cls;
     kitchen_sink_kitchen_Gadget* rv = kitchen_sink_kitchen_Gadget_new((int64_t)p_id, &err);
     if (err.code != 0) {
@@ -933,50 +1559,62 @@ JNIEXPORT jlong JNICALL Java_kitchen_1sink_JniBridge_kitchen_1Gadget_1new(JNIEnv
 }
 
 JNIEXPORT jbyteArray JNICALL Java_kitchen_1sink_JniBridge_kitchen_1Gadget_1describe(JNIEnv* env, jclass cls, jlong self) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
-    (void)cls;
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     size_t out_len = 0;
+    (void)cls;
     const uint8_t* rv = kitchen_sink_kitchen_Gadget_describe((const kitchen_sink_kitchen_Gadget*)(intptr_t)self, &out_len, &err);
     if (err.code != 0) {
         Jni_throw(env, &err, 0);
         return NULL;
     }
-    return Jni_take_bytes(env, rv, out_len);
+    return (jbyteArray)Jni_take_array(env, Jni_B, rv, out_len);
 }
 
 JNIEXPORT jint JNICALL Java_kitchen_1sink_JniBridge_kitchen_1Gadget_1poke(JNIEnv* env, jclass cls, jlong self, jint p_times) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     (void)cls;
     int32_t rv = kitchen_sink_kitchen_Gadget_poke((const kitchen_sink_kitchen_Gadget*)(intptr_t)self, (int32_t)p_times, &err);
     if (err.code != 0) {
-        Jni_throw(env, &err, 1);
+        Jni_throw(env, &err, 2);
         return 0;
     }
     return (jint)rv;
 }
 
-JNIEXPORT jbyteArray JNICALL Java_kitchen_1sink_JniBridge_kitchen_1Gadget_1version(JNIEnv* env, jclass cls) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
-    (void)cls;
+JNIEXPORT jdoubleArray JNICALL Java_kitchen_1sink_JniBridge_kitchen_1Gadget_1readings(JNIEnv* env, jclass cls, jlong self, jboolean h_limit, jint p_limit) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     size_t out_len = 0;
+    (void)cls;
+    double* rv = kitchen_sink_kitchen_Gadget_readings((const kitchen_sink_kitchen_Gadget*)(intptr_t)self, h_limit == JNI_TRUE, (uint32_t)p_limit, &out_len, &err);
+    if (err.code != 0) {
+        Jni_throw(env, &err, 1);
+        return NULL;
+    }
+    return (jdoubleArray)Jni_take_array(env, Jni_D, rv, out_len);
+}
+
+JNIEXPORT jbyteArray JNICALL Java_kitchen_1sink_JniBridge_kitchen_1Gadget_1version(JNIEnv* env, jclass cls) {
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
+    size_t out_len = 0;
+    (void)cls;
     const uint8_t* rv = kitchen_sink_kitchen_Gadget_version(&out_len, &err);
     if (err.code != 0) {
         Jni_throw(env, &err, 0);
         return NULL;
     }
-    return Jni_take_bytes(env, rv, out_len);
+    return (jbyteArray)Jni_take_array(env, Jni_B, rv, out_len);
 }
 
 JNIEXPORT jbyteArray JNICALL Java_kitchen_1sink_JniBridge_kitchen_1nested_1hello(JNIEnv* env, jclass cls) {
-    kitchen_sink_error err = {0, NULL, NULL, 0};
-    (void)cls;
+    kitchen_sink_error err = {0, NULL, 0, NULL, 0};
     size_t out_len = 0;
+    (void)cls;
     const uint8_t* rv = kitchen_sink_kitchen_nested_hello(&out_len, &err);
     if (err.code != 0) {
         Jni_throw(env, &err, 0);
         return NULL;
     }
-    return Jni_take_bytes(env, rv, out_len);
+    return (jbyteArray)Jni_take_array(env, Jni_B, rv, out_len);
 }
 
 

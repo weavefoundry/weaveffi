@@ -28,15 +28,8 @@ pub mod demo {
     #[derive(Debug)]
     pub enum DemoError {
         /// division by zero
+        #[weaveffi(message = "cannot divide by zero")]
         DivisionByZero = 100,
-    }
-
-    impl std::fmt::Display for DemoError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::DivisionByZero => f.write_str("cannot divide by zero"),
-            }
-        }
     }
 
     /// A C-style enum that crosses the ABI as its `i32` discriminant.
@@ -112,7 +105,7 @@ pub mod demo {
         present.then(|| "present".to_string())
     }
 
-    /// Sum a list of scalars.
+    /// Sum a list of scalars (a typed array).
     #[weaveffi::export]
     pub fn sum(xs: Vec<i32>) -> i32 {
         xs.iter().sum()
@@ -208,19 +201,29 @@ pub mod rich {
     #[repr(i32)]
     pub enum LookupError {
         /// no such key
+        #[weaveffi(message = "missing {key}")]
         Missing {
             /// The key that wasn't found.
             key: String,
         } = 1,
         /// the source is busy
+        #[weaveffi(message = "busy")]
         Busy = 2,
+        /// the source failed some other way
+        #[weaveffi(message = "foreign {code}: {message}")]
+        Foreign {
+            /// The failure's runtime code.
+            code: i32,
+            /// The consumer's message.
+            message: String,
+        } = 3,
     }
 
-    impl std::fmt::Display for LookupError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::Missing { key } => write!(f, "missing {key}"),
-                Self::Busy => f.write_str("busy"),
+    impl From<ForeignError> for LookupError {
+        fn from(e: ForeignError) -> Self {
+            Self::Foreign {
+                code: e.code,
+                message: e.message,
             }
         }
     }
@@ -278,8 +281,7 @@ pub mod rich {
         /// An optional object.
         fn maybe_token(&self) -> Result<Option<Arc<Token>>, ForeignError>;
         /// Look up a key, failing with a `LookupError`.
-        #[weaveffi::throws]
-        fn lookup(&self, key: &str) -> Result<i64, ForeignError>;
+        fn lookup(&self, key: &str) -> Result<i64, LookupError>;
     }
 
     /// Call every value-returning method and describe the results.
@@ -303,11 +305,7 @@ pub mod rich {
     pub fn lookup_via(source: Arc<dyn Source>, key: Key) -> String {
         match source.lookup(&key) {
             Ok(v) => format!("ok {v}"),
-            Err(e) => match e.domain::<LookupError>() {
-                Some(LookupError::Missing { key }) => format!("missing {key}"),
-                Some(LookupError::Busy) => "busy".to_string(),
-                None => format!("foreign {}: {}", e.code, e.message),
-            },
+            Err(e) => e.to_string(),
         }
     }
 
@@ -461,12 +459,6 @@ pub mod bus {
     pub enum BusError {
         /// the bus is closed
         Closed = 1,
-    }
-
-    impl std::fmt::Display for BusError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("the bus is closed")
-        }
     }
 
     /// A message priority (a C-style enum crossing a callback boundary).
@@ -629,12 +621,6 @@ pub mod tasks {
         Overflow = 1,
     }
 
-    impl std::fmt::Display for TaskError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("arithmetic overflow")
-        }
-    }
-
     /// The by-value result an async task completes with.
     #[weaveffi::record]
     #[derive(Clone)]
@@ -722,7 +708,7 @@ fn scalar_call_sets_ok() {
     let r = unsafe { demo::runtime_demo_add(2, 40, &mut err) };
     assert_eq!(r, 42);
     assert_eq!(err.code, 0);
-    assert!(err.message.is_null());
+    assert!(err.message_ptr.is_null());
 }
 
 #[test]
@@ -745,7 +731,7 @@ fn fallible_ok_and_err_paths_use_display_for_the_message() {
     // The next successful call resets the slot.
     assert_eq!(unsafe { demo::runtime_demo_add(1, 1, &mut err) }, 2);
     assert_eq!(err.code, 0);
-    assert!(err.message.is_null());
+    assert!(err.message_ptr.is_null());
 }
 
 #[test]
@@ -827,11 +813,21 @@ fn optional_string_return_is_buffered() {
 }
 
 #[test]
-fn scalar_list_param_is_buffered() {
+fn scalar_list_param_is_a_typed_array() {
     let mut err = ok_err();
-    let xs = abi::encode_value(&vec![3i32, 4, 5]);
+    let xs = [3i32, 4, 5];
     let total = unsafe { demo::runtime_demo_sum(xs.as_ptr(), xs.len(), &mut err) };
     assert_eq!(total, 12);
+    assert_eq!(
+        unsafe { demo::runtime_demo_sum(std::ptr::null(), 0, &mut err) },
+        0
+    );
+    assert_eq!(err.code, 0);
+    assert_eq!(
+        unsafe { demo::runtime_demo_sum(std::ptr::null(), 2, &mut err) },
+        0
+    );
+    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
 }
 
 #[test]
@@ -850,8 +846,10 @@ fn malformed_buffer_param_reports_error() {
     // A truncated encoding (count with no elements) must be rejected through
     // `out_err`, never decoded partially.
     let bad = [9u8, 0, 0, 0];
-    let total = unsafe { demo::runtime_demo_sum(bad.as_ptr(), bad.len(), &mut err) };
-    assert_eq!(total, 0, "error path returns the zero sentinel");
+    let mut out_len = 0usize;
+    let joined =
+        unsafe { demo::runtime_demo_join(bad.as_ptr(), bad.len(), &mut out_len, &mut err) };
+    assert!(joined.is_null(), "error path returns the zero sentinel");
     assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
 }
 
@@ -986,14 +984,15 @@ fn contract(
 fn contract_tables_hold_one_sorted_entry_per_declaration() {
     let table = contract(demo::runtime_demo_contract);
     assert!(table.windows(2).all(|w| w[0].id < w[1].id), "sorted by id");
-    // demo: the error domain, Color, Point, and thirteen functions.
-    assert_eq!(table.len(), 16);
+    // demo: the error domain and its code, Color, Point, and thirteen
+    // functions.
+    assert_eq!(table.len(), 17);
     let add = table.iter().find(|e| e.id == fnv("demo.add")).unwrap();
-    assert_eq!(add.hash, fnv("function add(a: i32, b: i32) -> i32"));
+    assert_eq!(add.hash, fnv("function add(i32, i32) -> i32"));
     let point = table.iter().find(|e| e.id == fnv("demo.Point")).unwrap();
     assert_eq!(
         point.hash,
-        fnv("record Point {x: i32, label: string, nickname: string?, color: Color}")
+        fnv("record Point {i32, string, string?, Color}")
     );
     let div = table
         .iter()
@@ -1001,8 +1000,13 @@ fn contract_tables_hold_one_sorted_entry_per_declaration() {
         .unwrap();
     assert_eq!(
         div.hash,
-        fnv("function checked_div(a: i32, b: i32) -> i32 throws")
+        fnv("function checked_div(i32, i32) -> i32 throws DemoError")
     );
+    let code = table
+        .iter()
+        .find(|e| e.id == fnv("demo.DemoError.DivisionByZero"))
+        .unwrap();
+    assert_eq!(code.hash, fnv("code DivisionByZero = 100"));
 
     // Nested modules and interface members are in their root's table.
     let outer = contract(outer::runtime_outer_contract);
@@ -1036,8 +1040,16 @@ fn contract_tables_follow_cfg() {
         .unwrap();
     assert_eq!(
         lookup.hash,
-        fnv("function lookup_via(source: Source, key: string) -> string"),
+        fnv("function lookup_via(Source, string) -> string"),
         "the alias resolved to its target"
+    );
+    let method = table
+        .iter()
+        .find(|e| e.id == fnv("rich.Source.lookup"))
+        .unwrap();
+    assert_eq!(
+        method.hash,
+        fnv("callback_method lookup(string) -> i64 throws LookupError")
     );
 }
 
@@ -1267,9 +1279,9 @@ mod consumer_subscriber {
                 .unwrap();
         *state.last_topic.lock().unwrap() = env.topic.clone();
         if weight == state.fail_at {
-            let msg = std::ffi::CString::new(format!("subscriber rejected {text}")).unwrap();
+            let msg = format!("subscriber rejected {text}");
             // Consumers report through the exported `{prefix}_error_set`.
-            unsafe { super::runtime_error_set(out_err, abi::FOREIGN_ERROR_CODE, msg.as_ptr()) };
+            unsafe { super::runtime_error_set(out_err, -1, msg.as_ptr(), msg.len()) };
             return 0;
         }
         state.total.fetch_add(weight as i64, Ordering::Relaxed) + weight as i64
@@ -1454,9 +1466,10 @@ fn callback_interface_retained_and_foreign_error() {
     assert_eq!(publish(5, &mut err), 16);
 
     // The first subscriber fails on weight 7: the producer call is aborted and
-    // the consumer's own message comes back with FOREIGN_ERROR_CODE.
+    // the consumer's own message comes back. `publish` throws `any`
+    // (`ForeignError` isn't a domain), so the code is the generic one.
     assert_eq!(publish(7, &mut err), 0);
-    assert_eq!(err.code, abi::FOREIGN_ERROR_CODE);
+    assert_eq!(err.code, abi::GENERIC_ERROR_CODE);
     assert_eq!(message(&err), "subscriber rejected hi");
 
     // The bus is still usable afterwards.
@@ -1523,7 +1536,7 @@ fn callback_interface_from_async_method() {
     // A foreign failure inside the future is delivered through the callback.
     unsafe { bus::runtime_bus_Bus_publish_later(b, text.as_ptr(), text.len(), 4, on_i64, ctx) };
     let (code, msg, result) = rx.recv_timeout(WAIT).unwrap();
-    assert_eq!(code, abi::FOREIGN_ERROR_CODE);
+    assert_eq!(code, abi::GENERIC_ERROR_CODE);
     assert_eq!(msg, "subscriber rejected async");
     assert_eq!(result, 0);
 
@@ -1843,64 +1856,61 @@ fn objects_inside_value_buffers_carry_a_reference() {
     }
 }
 
-/// A producer module whose fallible function reports through a hand-written
-/// [`weaveffi::ErrorReport`] type rather than the domain enum itself.
+/// A producer module with a declared domain whose message interpolates a
+/// field, and a function whose error type isn't a domain (`throws any`).
 #[weaveffi::module]
 pub mod vault {
-    use weaveffi::ErrorReport;
-
     /// The vault's declared error domain: the codes consumers can match on.
     #[weaveffi::error]
     #[derive(Debug)]
+    #[repr(i32)]
     pub enum VaultError {
         /// entry not found
         NotFound = 2001,
         /// vault sealed
-        Sealed = 2002,
+        #[weaveffi(message = "vault sealed: {reason}")]
+        Sealed {
+            /// Why the vault is sealed.
+            reason: String,
+        } = 2002,
     }
 
-    impl std::fmt::Display for VaultError {
+    /// The producer's internal failure type: not a domain, so a function
+    /// returning it throws `any` and reports its `Display` with code -1.
+    #[derive(Debug)]
+    pub struct VaultFailure(String);
+
+    impl std::fmt::Display for VaultFailure {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(match self {
-                Self::NotFound => "entry not found",
-                Self::Sealed => "vault sealed",
-            })
-        }
-    }
-
-    /// The producer's internal failure type: it carries data the declared
-    /// domain doesn't, so it maps itself onto the domain's codes with a
-    /// hand-written `ErrorReport` and dynamic messages.
-    pub enum VaultFailure {
-        /// No entry exists for the key.
-        NotFound,
-        /// The vault is sealed for the given reason.
-        Sealed(String),
-    }
-
-    impl ErrorReport for VaultFailure {
-        fn code(&self) -> i32 {
-            match self {
-                VaultFailure::NotFound => 2001,
-                VaultFailure::Sealed(_) => 2002,
-            }
-        }
-        fn message(&self) -> String {
-            match self {
-                VaultFailure::NotFound => "entry not found".to_string(),
-                VaultFailure::Sealed(reason) => format!("vault sealed: {reason}"),
-            }
+            write!(f, "vault failure: {}", self.0)
         }
     }
 
     /// Fetch a doubled value, failing with a domain code for invalid keys.
     #[weaveffi::export]
-    pub fn fetch(key: i64) -> Result<i64, VaultFailure> {
+    pub fn fetch(key: i64) -> Result<i64, VaultError> {
         match key {
-            0 => Err(VaultFailure::NotFound),
-            n if n < 0 => Err(VaultFailure::Sealed("negative key".to_string())),
+            0 => Err(VaultError::NotFound),
+            n if n < 0 => Err(VaultError::Sealed {
+                reason: "negative key".to_string(),
+            }),
             n => Ok(n * 2),
         }
+    }
+
+    /// Fetch, failing with an untyped error.
+    #[weaveffi::export]
+    pub fn fetch_any(key: i64) -> Result<i64, VaultFailure> {
+        if key == 0 {
+            return Err(VaultFailure("no key".to_string()));
+        }
+        Ok(key)
+    }
+
+    /// Parse an integer: a std error type works as `throws any` too.
+    #[weaveffi::export]
+    pub fn parse(text: &str) -> Result<i64, std::num::ParseIntError> {
+        text.parse()
     }
 }
 
@@ -1919,6 +1929,23 @@ fn fallible_with_domain_error_codes() {
     assert_eq!(r, 0);
     assert_eq!(err.code, 2002);
     assert_eq!(message(&err), "vault sealed: negative key");
+}
+
+#[test]
+fn untyped_errors_report_the_generic_code_and_display() {
+    let mut err = ok_err();
+    assert_eq!(unsafe { vault::runtime_vault_fetch_any(5, &mut err) }, 5);
+    assert_eq!(unsafe { vault::runtime_vault_fetch_any(0, &mut err) }, 0);
+    assert_eq!(err.code, abi::GENERIC_ERROR_CODE);
+    assert_eq!(message(&err), "vault failure: no key");
+    assert!(err.payload_ptr.is_null());
+    let text = "x1";
+    assert_eq!(
+        unsafe { vault::runtime_vault_parse(text.as_ptr(), text.len(), &mut err) },
+        0
+    );
+    assert_eq!(err.code, abi::GENERIC_ERROR_CODE);
+    assert_eq!(message(&err), "invalid digit found in string");
 }
 
 /// A producer module that exports a `#[deprecated]` function. The generated
@@ -1953,13 +1980,8 @@ pub mod counters {
     #[derive(Debug)]
     pub enum CounterError {
         /// start value out of range
+        #[weaveffi(message = "step must be positive")]
         OutOfRange = 1,
-    }
-
-    impl std::fmt::Display for CounterError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("step must be positive")
-        }
     }
 
     /// A monotonic counter, exported as an interface.
@@ -2303,6 +2325,7 @@ pub mod quota {
     #[repr(i32)]
     pub enum QuotaError {
         /// quota exceeded
+        #[weaveffi(message = "used {used} of {limit}")]
         Exceeded {
             /// The configured limit.
             limit: i64,
@@ -2311,15 +2334,6 @@ pub mod quota {
         } = 3001,
         /// quota service unavailable
         Unavailable = 3002,
-    }
-
-    impl std::fmt::Display for QuotaError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::Exceeded { limit, used } => write!(f, "used {used} of {limit}"),
-                Self::Unavailable => f.write_str("quota service unavailable"),
-            }
-        }
     }
 
     /// Consume `amount` units against a limit of 100.
@@ -2434,8 +2448,8 @@ mod consumer_source {
     ) -> i64 {
         let key = unsafe { abi::lift_string(key_ptr, key_len) }.unwrap();
         let fail = |code: i32, payload: Option<&str>| unsafe {
-            let msg = std::ffi::CString::new(format!("failed {key}")).unwrap();
-            super::runtime_error_set(out_err, code, msg.as_ptr());
+            let msg = format!("failed {key}");
+            super::runtime_error_set(out_err, code, msg.as_ptr(), msg.len());
             if let Some(p) = payload {
                 let fields = abi::encode_value(&p.to_string());
                 super::runtime_error_set_payload(out_err, fields.as_ptr(), fields.len());
@@ -2548,6 +2562,7 @@ fn optional_callback_parameters_accept_null() {
     assert_eq!(unsafe { rich::runtime_rich_always(&mut err) }, 1);
 }
 
+#[cfg(feature = "tokio")]
 #[test]
 fn many_concurrent_launches_share_a_few_executor_threads() {
     extern "C" fn on_tag(ctx: *mut c_void, err: *mut FfiError, ptr: *const u8, len: usize) {
@@ -2575,4 +2590,29 @@ fn many_concurrent_launches_share_a_few_executor_threads() {
         "{} threads ran {CALLS} calls with {workers} workers",
         threads.len()
     );
+}
+
+/// Without Tokio (`default-features = false`), each call runs on a thread of
+/// its own.
+#[cfg(not(feature = "tokio"))]
+#[test]
+fn without_tokio_each_launch_gets_its_own_thread() {
+    extern "C" fn on_tag(ctx: *mut c_void, err: *mut FfiError, ptr: *const u8, len: usize) {
+        on_string(ctx, err, ptr, len);
+    }
+    const CALLS: usize = 16;
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<String>(tx);
+    for _ in 0..CALLS {
+        unsafe { tasks::runtime_tasks_thread_tag(on_tag, ctx) };
+    }
+    let mut threads = std::collections::BTreeSet::new();
+    for _ in 0..CALLS {
+        let (code, _, tag) = rx.recv_timeout(WAIT).unwrap();
+        assert_eq!(code, 0);
+        assert!(tag.ends_with(" weaveffi-async"), "{tag}");
+        threads.insert(tag);
+    }
+    drop_ctx::<String>(ctx);
+    assert_eq!(threads.len(), CALLS, "one thread per call");
 }

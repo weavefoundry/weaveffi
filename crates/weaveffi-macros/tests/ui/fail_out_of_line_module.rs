@@ -7,4 +7,6 @@ mod outer {
     mod inner;
 }
 
+weaveffi::export_runtime!();
+
 fn main() {}

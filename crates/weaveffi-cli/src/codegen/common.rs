@@ -1,5 +1,5 @@
 //! Shared codegen primitives that every language generator can reuse: the
-//! doc-comment emitter and `PascalCase` conversion.
+//! doc-comment emitter, prose wrapping, and `PascalCase` conversion.
 //!
 //! Specialised flavours that exist in only one generator (Go's
 //! godoc-style first-line symbol prefix, .NET's `<summary>` XML tags,
@@ -18,9 +18,6 @@ pub enum DocCommentStyle {
     TripleSlash,
     /// `# ...` per line (Python `#` comments, Ruby).
     Hash,
-    /// `// ...` per line (Go base case; Go's symbol-prefixed
-    /// godoc convention stays generator-local).
-    DoubleSlash,
     /// `/** ... */` block; single-line collapses to `/** text */`
     /// (C, C++, Kotlin/KDoc, JSDoc, TypeScript .d.ts).
     Javadoc,
@@ -42,7 +39,6 @@ pub fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str, style: Doc
     match style {
         DocCommentStyle::TripleSlash => emit_line_doc(out, doc, indent, "///"),
         DocCommentStyle::Hash => emit_line_doc(out, doc, indent, "#"),
-        DocCommentStyle::DoubleSlash => emit_line_doc(out, doc, indent, "//"),
         DocCommentStyle::Javadoc => emit_javadoc(out, doc, indent),
     }
 }
@@ -63,6 +59,14 @@ fn emit_line_doc(out: &mut String, doc: &str, indent: &str, marker: &str) {
 }
 
 fn emit_javadoc(out: &mut String, doc: &str, indent: &str) {
+    // A `*/` in the text would end the comment early.
+    let escaped;
+    let doc = if doc.contains("*/") {
+        escaped = doc.replace("*/", "*\\/");
+        escaped.as_str()
+    } else {
+        doc
+    };
     if doc.contains('\n') {
         out.push_str(indent);
         out.push_str("/**\n");
@@ -84,6 +88,31 @@ fn emit_javadoc(out: &mut String, doc: &str, indent: &str) {
         out.push_str(doc);
         out.push_str(" */\n");
     }
+}
+
+/// Word-wrap generated prose into lines of at most `width` columns (a
+/// longer word gets a line of its own), keeping blank-line paragraph
+/// breaks. For text the generator writes; IDL docs keep their own breaks.
+#[must_use]
+pub fn wrap(text: &str, width: usize) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for paragraph in text.split("\n\n") {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            if !line.is_empty() && line.len() + 1 + word.len() > width {
+                lines.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
 }
 
 /// Convert a `snake_case` identifier to `PascalCase` by uppercasing the
@@ -168,30 +197,6 @@ mod tests {
     }
 
     #[test]
-    fn emit_doc_double_slash_single_line() {
-        let mut out = String::new();
-        emit_doc(
-            &mut out,
-            &Some("Go-style line comment.".into()),
-            "",
-            DocCommentStyle::DoubleSlash,
-        );
-        assert_eq!(out, "// Go-style line comment.\n");
-    }
-
-    #[test]
-    fn emit_doc_double_slash_multi_line() {
-        let mut out = String::new();
-        emit_doc(
-            &mut out,
-            &Some("first\n\nsecond".into()),
-            "\t",
-            DocCommentStyle::DoubleSlash,
-        );
-        assert_eq!(out, "\t// first\n\t//\n\t// second\n");
-    }
-
-    #[test]
     fn emit_doc_hash_multi_line() {
         let mut out = String::new();
         emit_doc(
@@ -228,6 +233,18 @@ mod tests {
     }
 
     #[test]
+    fn emit_doc_javadoc_escapes_comment_terminators() {
+        let mut out = String::new();
+        emit_doc(
+            &mut out,
+            &Some("a */ b".into()),
+            "",
+            DocCommentStyle::Javadoc,
+        );
+        assert_eq!(out, "/** a *\\/ b */\n");
+    }
+
+    #[test]
     fn emit_doc_trims_outer_whitespace_before_decisions() {
         // A doc that's "single line" after trimming should still
         // collapse to `/** text */` even if it had surrounding blank
@@ -241,6 +258,17 @@ mod tests {
             DocCommentStyle::Javadoc,
         );
         assert_eq!(out, "/** hello */\n");
+    }
+
+    // --- wrap ---
+
+    #[test]
+    fn wrap_keeps_paragraphs_and_width() {
+        let text = format!("{}\n\nshort", "word ".repeat(40));
+        let wrapped = wrap(&text, 30);
+        assert!(wrapped.lines().all(|l| l.len() <= 30), "{wrapped}");
+        assert!(wrapped.ends_with("\n\nshort"), "{wrapped}");
+        assert_eq!(wrap("a-very-long-word b", 4), "a-very-long-word\nb");
     }
 
     // --- pascal_case ---

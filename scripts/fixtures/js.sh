@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared by node.sh and wasm.sh: `js_check <dir> <module.js>...` runs
-# `tsc --noEmit --strict` on <dir>/index.d.ts and `node --check` on each
-# module. Without a `tsc` on PATH, TypeScript is installed once into
+# `tsc --noEmit --strict` on <dir>/index.d.ts and <dir>/debug.d.ts and
+# `node --check` on each module. Without a `tsc` on PATH, TypeScript is installed once into
 # ${WEAVEFFI_TSC_DIR:-$TMPDIR/weaveffi-typescript} (this needs npm and the
 # network). Callers source lib.sh first.
 
@@ -24,8 +24,22 @@ js_check() {
     local tsc
     command -v tsc >/dev/null 2>&1 || require npm
     tsc=$(tsc_bin)
-    "$tsc" --noEmit --strict --target es2022 --module es2022 \
-        --lib es2022,dom,esnext.disposable --types "" "$dir/index.d.ts"
+    # A config file, since `--types ""` (no ambient @types packages) isn't
+    # accepted on the command line by every TypeScript release.
+    cat > "$dir/tsconfig.check.json" <<'EOF'
+{
+  "compilerOptions": {
+    "noEmit": true,
+    "strict": true,
+    "target": "es2022",
+    "module": "es2022",
+    "lib": ["es2022", "dom", "esnext.disposable"],
+    "types": []
+  },
+  "files": ["index.d.ts", "debug.d.ts"]
+}
+EOF
+    "$tsc" -p "$dir/tsconfig.check.json"
     for f in "$@"; do
         node --check "$dir/$f"
     done

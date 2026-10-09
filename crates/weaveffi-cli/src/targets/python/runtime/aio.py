@@ -4,14 +4,14 @@
 # The trampolines live at module scope, so nothing a pending call needs can
 # be garbage collected before the producer fires the completion, even when
 # the awaiting coroutine is gone.
-_pending: Dict[int, Tuple[asyncio.AbstractEventLoop, asyncio.Future[Any]]] = {}
+_pending: dict[int, tuple[asyncio.AbstractEventLoop, asyncio.Future[Any]]] = {}
 _pending_lock = threading.Lock()
 _pending_next = 0
 
 _error_free = _bind("{{PREFIX}}_error_free", None, ctypes.POINTER(_ErrorStruct))
 
 
-def _async_begin() -> Tuple[int, asyncio.Future[Any]]:
+def _async_begin() -> tuple[int, asyncio.Future[Any]]:
     """Register a new pending call on the running event loop."""
     global _pending_next
     loop = asyncio.get_running_loop()
@@ -34,15 +34,15 @@ def _async_error(err: Any, factory: Callable[[int, str, bytes], BaseException]) 
     exception it reports. The cancelled code maps to CancelledError."""
     e = err.contents
     code = e.code
-    message = e.message.decode("utf-8", "replace") if e.message else ""
-    payload = ctypes.string_at(e.payload_ptr, e.payload_len) if e.payload_ptr else b""
+    message = _peek_bytes(e.message_ptr, e.message_len).decode("utf-8", "replace")
+    payload = _peek_bytes(e.payload_ptr, e.payload_len)
     _error_free(err)
     if code == {{ERROR}}.CANCELLED_ERROR_CODE:
         return asyncio.CancelledError(message)
     return factory(code, message, payload)
 
 
-def _async_settle(key: Optional[int], exc: Optional[BaseException], value: Any) -> None:
+def _async_settle(key: int | None, exc: BaseException | None, value: Any) -> None:
     """Hand a completion back to the event loop that awaits it."""
     with _pending_lock:
         entry = _pending.pop(key or 0, None)
@@ -56,7 +56,7 @@ def _async_settle(key: Optional[int], exc: Optional[BaseException], value: Any) 
         pass
 
 
-def _async_resolve(future: asyncio.Future[Any], exc: Optional[BaseException], value: Any) -> None:
+def _async_resolve(future: asyncio.Future[Any], exc: BaseException | None, value: Any) -> None:
     if future.done():
         return
     if isinstance(exc, asyncio.CancelledError):

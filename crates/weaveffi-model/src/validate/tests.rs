@@ -82,15 +82,16 @@ modules:
           - { name: by_status, type: "{Status:i32}" }
   - name: geo
     errors:
-      name: GeoError
-      codes:
-        - { name: NotFound, code: 1, message: "missing" }
-        - { name: Bad, code: 2, message: "bad", fields: [{ name: why, type: string }] }
+      - name: GeoError
+        codes:
+          - { name: NotFound, code: 1, message: "missing" }
+          - { name: Bad, code: 2, message: "bad", fields: [{ name: why, type: string }] }
     interfaces:
       - name: Store
         constructors: [{ name: open, params: [{ name: path, type: string }] }]
         methods:
-          - { name: get, params: [{ name: k, type: string }], return: "Point?", throws: true }
+          - { name: get, params: [{ name: k, type: string }], return: "Point?", throws: GeoError }
+          - { name: nearest, params: [{ name: limit, type: "u32?" }, { name: weights, type: "[f64]" }], return: "[i32]" }
           - { name: scan, params: [], return: "iter<Point>" }
           - { name: stores, params: [], return: "iter<Store>" }
           - { name: sibling, params: [{ name: other, type: "Store?" }], return: Store }
@@ -108,7 +109,9 @@ modules:
             params: [{ name: p, type: Point }, { name: raw, type: bytes }, { name: from, type: Store }]
           - { name: wants_more, params: [{ name: seen, type: u32 }], return: bool }
           - { name: status, params: [], return: Status }
-          - { name: label, params: [], return: string, throws: true }
+          - { name: label, params: [], return: string, throws: GeoError }
+          - { name: guess, params: [{ name: hint, type: "i64?" }], return: "f64?", throws: any }
+          - { name: samples, params: [{ name: xs, type: "[u16]" }], return: "[i16]" }
           - { name: nearest, params: [], return: "Point?" }
           - { name: store, params: [], return: "Store?" }
           - { name: payload, params: [], return: bytes }
@@ -119,7 +122,11 @@ modules:
     modules:
       - name: inner
         functions:
-          - { name: fails, params: [], throws: true }
+          - { name: fails, params: [], throws: GeoError }
+          - { name: anything, params: [], return: "bool?", throws: any }
+          - { name: later, params: [], return: "[f32]", async: true, throws: any }
+          - { name: chunks, params: [], return: "iter<[i32]>" }
+          - { name: maybe, params: [], return: "iter<i32?>" }
 "#,
     ];
     for doc in ok {
@@ -190,7 +197,7 @@ modules:
             r#"
 modules:
   - name: m
-    errors: { name: ' ', codes: [] }
+    errors: [{ name: ' ', codes: [] }]
 "#,
         ),
         (
@@ -199,10 +206,10 @@ modules:
 modules:
   - name: m
     errors:
-      name: E
-      codes:
-        - { name: A, code: 1, message: a }
-        - { name: A, code: 2, message: a }
+      - name: E
+        codes:
+          - { name: A, code: 1, message: a }
+          - { name: A, code: 2, message: a }
 "#,
         ),
         (
@@ -211,10 +218,10 @@ modules:
 modules:
   - name: m
     errors:
-      name: E
-      codes:
-        - { name: A, code: 1, message: a }
-        - { name: B, code: 1, message: b }
+      - name: E
+        codes:
+          - { name: A, code: 1, message: a }
+          - { name: B, code: 1, message: b }
 "#,
         ),
         (
@@ -223,8 +230,8 @@ modules:
 modules:
   - name: m
     errors:
-      name: E
-      codes: [{ name: A, code: 0, message: a }]
+      - name: E
+        codes: [{ name: A, code: 0, message: a }]
 "#,
         ),
         (
@@ -233,8 +240,8 @@ modules:
 modules:
   - name: m
     errors:
-      name: E
-      codes: [{ name: A, code: -2, message: a }]
+      - name: E
+        codes: [{ name: A, code: -2, message: a }]
 "#,
         ),
         (
@@ -243,7 +250,7 @@ modules:
 modules:
   - name: m
     functions: [{ name: E, params: [] }]
-    errors: { name: E, codes: [{ name: A, code: 1, message: a }] }
+    errors: [{ name: E, codes: [{ name: A, code: 1, message: a }] }]
 "#,
         ),
         (
@@ -251,7 +258,7 @@ modules:
             r#"
 modules:
   - name: m
-    errors: { name: E, codes: [{ name: A, code: 1, message: a }] }
+    errors: [{ name: E, codes: [{ name: A, code: 1, message: a }] }]
   - name: n
     functions: [{ name: E, params: [] }]
 "#,
@@ -362,8 +369,111 @@ modules:
 "#,
         ),
         (
-            "ThrowsWithoutErrorDomain",
-            "modules: [{ name: m, functions: [{ name: f, params: [], throws: true }] }]",
+            "UnknownErrorDomain",
+            "modules: [{ name: m, functions: [{ name: f, params: [], throws: Nope }] }]",
+        ),
+        (
+            "UnknownErrorDomain",
+            r#"
+modules:
+  - name: m
+    structs: [{ name: S, fields: [{ name: x, type: i32 }] }]
+    functions: [{ name: f, throws: S }]
+"#,
+        ),
+        (
+            "ErrorDomainAsType",
+            r#"
+modules:
+  - name: m
+    errors: [{ name: E, codes: [{ name: A, code: 1, message: a }] }]
+    functions: [{ name: f, params: [{ name: e, type: "E?" }] }]
+"#,
+        ),
+        (
+            "ReservedKeyword",
+            "modules: [{ name: m, errors: [{ name: any, codes: [{ name: A, code: 1, message: a }] }] }]",
+        ),
+        (
+            "DuplicateTypeName",
+            r#"
+modules:
+  - name: a
+    errors: [{ name: Fault, codes: [{ name: A, code: 1, message: a }] }]
+  - name: b
+    interfaces: [{ name: Fault, methods: [{ name: m }] }]
+"#,
+        ),
+        (
+            "DuplicateTypeName",
+            r#"
+modules:
+  - name: a
+    errors:
+      - { name: E, codes: [{ name: A, code: 1, message: a }] }
+      - { name: E, codes: [{ name: B, code: 1, message: b }] }
+"#,
+        ),
+        (
+            "SlotCollision",
+            r#"
+modules:
+  - name: m
+    functions: [{ name: f, params: [{ name: name, type: string }, { name: name_ptr, type: i32 }] }]
+"#,
+        ),
+        (
+            "SlotCollision",
+            r#"
+modules:
+  - name: m
+    functions: [{ name: f, params: [{ name: x, type: "i32?" }, { name: has_x, type: bool }] }]
+"#,
+        ),
+        (
+            "SlotCollision",
+            "modules: [{ name: m, functions: [{ name: f, params: [{ name: out_err, type: i32 }] }] }]",
+        ),
+        (
+            "SlotCollision",
+            "modules: [{ name: m, functions: [{ name: f, params: [{ name: out_len, type: i32 }], return: string }] }]",
+        ),
+        (
+            "SlotCollision",
+            "modules: [{ name: m, functions: [{ name: f, params: [{ name: out_value, type: i32 }], return: 'i32?' }] }]",
+        ),
+        (
+            "SlotCollision",
+            "modules: [{ name: m, functions: [{ name: f, params: [{ name: callback, type: i32 }], async: true }] }]",
+        ),
+        (
+            "SlotCollision",
+            "modules: [{ name: m, functions: [{ name: f, params: [{ name: context, type: i32 }], async: true }] }]",
+        ),
+        (
+            "SlotCollision",
+            "modules: [{ name: m, functions: [{ name: f, params: [{ name: cancel_token, type: i32 }], async: true, cancellable: true }] }]",
+        ),
+        (
+            "SlotCollision",
+            "modules: [{ name: m, interfaces: [{ name: I, methods: [{ name: f, params: [{ name: self, type: i32 }] }] }] }]",
+        ),
+        (
+            "SlotCollision",
+            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: f, params: [{ name: ctx, type: i32 }] }] }] }]",
+        ),
+        (
+            "SlotCollision",
+            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: f, params: [{ name: out_ptr, type: i32 }], return: '[i32]' }] }] }]",
+        ),
+        (
+            "SlotCollision",
+            r#"
+modules:
+  - name: m
+    callback_interfaces: [{ name: L, methods: [{ name: a }] }]
+    functions: [{ name: f, params: [{ name: l, type: L }, { name: l_ctx, type: i32 }] }]
+"#,
         ),
         (
             "DuplicateTypeName",
@@ -381,7 +491,7 @@ modules:
 modules:
   - name: a
     structs: [{ name: E, fields: [{ name: x, type: i32 }] }]
-    errors: { name: E, codes: [{ name: A, code: 1, message: a }] }
+    errors: [{ name: E, codes: [{ name: A, code: 1, message: a }] }]
 "#,
         ),
         (
@@ -389,9 +499,9 @@ modules:
             r#"
 modules:
   - name: a
-    errors: { name: AErr, codes: [{ name: NotFound, code: 1, message: a }] }
+    errors: [{ name: AErr, codes: [{ name: NotFound, code: 1, message: a }] }]
   - name: b
-    errors: { name: BErr, codes: [{ name: NotFound, code: 1, message: b }] }
+    errors: [{ name: BErr, codes: [{ name: NotFound, code: 1, message: b }] }]
 "#,
         ),
         (
@@ -583,8 +693,56 @@ modules:
             "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [], async: true }] }] }]",
         ),
         (
-            "ThrowsWithoutErrorDomain",
-            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [], throws: true }] }] }]",
+            "UnknownErrorDomain",
+            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [], throws: Nope }] }] }]",
+        ),
+        (
+            "IteratorInInvalidPosition",
+            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [{ name: x, type: '[iter<i32>]' }] }] }] }]",
+        ),
+        (
+            "CallbackInterfaceInInvalidPosition",
+            r#"
+modules:
+  - name: m
+    callback_interfaces: [{ name: L, methods: [{ name: a, params: [] }] }]
+    functions: [{ name: f, params: [], return: "iter<L>" }]
+"#,
+        ),
+        (
+            "CallbackInterfaceInInvalidPosition",
+            r#"
+modules:
+  - name: m
+    callback_interfaces: [{ name: L, methods: [{ name: a, params: [] }] }]
+    functions: [{ name: f, params: [], return: "L?", async: true }]
+"#,
+        ),
+        (
+            "CallbackInterfaceInInvalidPosition",
+            r#"
+modules:
+  - name: m
+    callback_interfaces: [{ name: L, methods: [{ name: a, params: [] }] }]
+    functions: [{ name: f, params: [{ name: ls, type: "{string:L}" }] }]
+"#,
+        ),
+        (
+            "CallbackInterfaceInInvalidPosition",
+            r#"
+modules:
+  - name: m
+    callback_interfaces: [{ name: L, methods: [{ name: a, params: [] }] }]
+    errors: [{ name: E, codes: [{ name: A, code: 1, message: a, fields: [{ name: l, type: "L?" }] }] }]
+"#,
+        ),
+        (
+            "IteratorInInvalidPosition",
+            "modules: [{ name: m, functions: [{ name: f, params: [], return: '{string:iter<i32>}' }] }]",
+        ),
+        (
+            "IteratorInInvalidPosition",
+            "modules: [{ name: m, errors: [{ name: E, codes: [{ name: A, code: 1, message: a, fields: [{ name: x, type: 'iter<i32>' }] }] }] }]",
         ),
         (
             "InvalidCallbackMethod",
@@ -668,11 +826,11 @@ modules:
         ),
         (
             "ReservedKeyword",
-            "modules: [{ name: m, errors: { name: 'if', codes: [{ name: A, code: 1, message: a }] } }]",
+            "modules: [{ name: m, errors: [{ name: 'if', codes: [{ name: A, code: 1, message: a }] }] }]",
         ),
         (
             "InvalidIdentifier",
-            "modules: [{ name: m, errors: { name: E, codes: [{ name: '1bad', code: 1, message: a }] } }]",
+            "modules: [{ name: m, errors: [{ name: E, codes: [{ name: '1bad', code: 1, message: a }] }] }]",
         ),
     ];
     for (expected, doc) in cases {
@@ -707,14 +865,14 @@ modules:
   - name: m
     functions:
       - { name: f, params: [], return: Nope }
-      - { name: f, params: [], throws: true }
+      - { name: f, params: [], throws: Missing }
     structs: [{ name: S, fields: [] }]
 "#,
     );
     for expected in [
         "DuplicateFunctionName",
         "UnknownTypeRef",
-        "ThrowsWithoutErrorDomain",
+        "UnknownErrorDomain",
         "EmptyStruct",
     ] {
         assert!(
@@ -749,10 +907,10 @@ modules:
       - { name: f, params: [] }
       - { name: f, params: [] }
     errors:
-      name: E
-      codes:
-        - { name: A, code: 1, message: a }
-        - { name: A, code: 2, message: a }
+      - name: E
+        codes:
+          - { name: A, code: 1, message: a }
+          - { name: A, code: 2, message: a }
 "#,
     );
     assert_eq!(
@@ -784,14 +942,14 @@ fn buffer_header_structs_and_codecs_are_reserved_symbols() {
     // and `_free`; a function spelled like any of them would redefine it.
     let cases = [
         (
-            "errors: { name: E, codes: [{ name: Busy, code: 1, message: b, fields: [{ name: n, type: i32 }] }] }\n    functions: [{ name: E_Busy_payload }]",
+            "errors: [{ name: E, codes: [{ name: Busy, code: 1, message: b, fields: [{ name: n, type: i32 }] }] }]\n    functions: [{ name: E_Busy_payload }]",
             "'kv_m_E_Busy_payload'",
             "the payload struct of error code 'm.E.Busy'",
         ),
         (
-            "errors: { name: E, codes: [{ name: Busy, code: 1, message: b, fields: [{ name: n, type: i32 }] }] }\n    functions: [{ name: E_Busy_payload_read }]",
+            "errors: [{ name: E, codes: [{ name: Busy, code: 1, message: b, fields: [{ name: n, type: i32 }] }] }]\n    functions: [{ name: E_Busy_payload_read }]",
             "'kv_m_E_Busy_payload_read'",
-            "codec 'kv_m_E_Busy_payload_read'",
+            "codec 'read' of the payload struct of error code 'm.E.Busy'",
         ),
         (
             "structs: [{ name: S, fields: [{ name: x, type: i32 }] }]\n    functions: [{ name: S_free }]",
@@ -814,7 +972,7 @@ fn buffer_header_structs_and_codecs_are_reserved_symbols() {
     }
     // An error code without fields has no payload struct.
     let doc = format!(
-        "version: \"{CURRENT_SCHEMA_VERSION}\"\nmodules:\n  - name: m\n    errors: {{ name: E, codes: [{{ name: Busy, code: 1, message: b }}] }}\n    functions: [{{ name: E_Busy_payload }}]\n"
+        "version: \"{CURRENT_SCHEMA_VERSION}\"\nmodules:\n  - name: m\n    errors: [{{ name: E, codes: [{{ name: Busy, code: 1, message: b }}] }}]\n    functions: [{{ name: E_Busy_payload }}]\n"
     );
     let api = parse_api_str(&doc, "yaml").unwrap();
     assert!(validate(&api, &Identity::named("kv"), None).is_ok());
@@ -894,12 +1052,24 @@ modules:
 "#,
     )
     .unwrap();
-    use crate::ty::Ty;
+    use crate::ty::{ParamTy, RetTy, Ty};
     let f = &model.modules[1].functions[0];
-    assert_eq!(f.params[0].ty, Ty::Interface("Store".into()));
-    assert_eq!(f.params[1].ty, Ty::Enum("Status".into()));
-    assert_eq!(f.params[2].ty, Ty::CallbackInterface("Watcher".into()));
-    assert_eq!(f.ret, Some(Ty::List(Box::new(Ty::Record("Point".into())))));
+    assert_eq!(
+        f.params[0].ty,
+        ParamTy::Value(Ty::Interface("Store".into()))
+    );
+    assert_eq!(f.params[1].ty, ParamTy::Value(Ty::Enum("Status".into())));
+    assert_eq!(
+        f.params[2].ty,
+        ParamTy::Callback {
+            name: "Watcher".into(),
+            nullable: false
+        }
+    );
+    assert_eq!(
+        f.ret,
+        Some(RetTy::Value(Ty::List(Box::new(Ty::Record("Point".into())))))
+    );
     assert_eq!(model.owner("Point").dot_path, "shared");
     assert_eq!(model.prefix(), "api");
     assert_eq!(model.version, CURRENT_SCHEMA_VERSION);
@@ -941,4 +1111,44 @@ modules:
     );
     assert!(warnings[0].to_string().contains("depth 4"));
     assert!(warnings[2].to_string().contains("use new"));
+}
+
+#[test]
+fn slot_collisions_name_the_callable_and_slot() {
+    let err = check(
+        r#"
+modules:
+  - name: m
+    interfaces:
+      - name: I
+        methods:
+          - { name: f, params: [{ name: name, type: string }, { name: name_len, type: u32 }] }
+"#,
+    )
+    .unwrap_err();
+    assert_eq!(err.diagnostics.len(), 1);
+    assert_eq!(
+        err.to_string(),
+        "C slot collision in 'm.I.f': two slots are named 'name_len'"
+    );
+}
+
+#[test]
+fn throws_spans_underline_the_domain_name() {
+    let doc = format!(
+        r#"version: "{CURRENT_SCHEMA_VERSION}"
+modules:
+  - name: a
+    errors:
+      - name: Real
+        codes: [{{ name: A, code: 1, message: a }}]
+    functions:
+      - {{ name: ok, throws: Real }}
+      - {{ name: bad, throws: Nope }}
+"#
+    );
+    assert_eq!(
+        spans(&doc),
+        [("UnknownErrorDomain".to_string(), "9:Nope".to_string())]
+    );
 }

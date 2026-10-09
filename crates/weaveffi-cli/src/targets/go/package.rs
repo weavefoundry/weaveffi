@@ -42,9 +42,10 @@ fn bundled<'a>(
 pub(crate) fn render_go_mod(module_path: &str) -> String {
     let prelude = render_prelude(CommentStyle::DoubleSlash);
     let trailer = render_trailer(CommentStyle::DoubleSlash, "go.mod");
-    // Go 1.23 is required for the standard `iter` package the lazy
-    // `iter<T>` wrappers return.
-    format!("{prelude}module {module_path}\n\ngo 1.23\n\n{trailer}")
+    // Go 1.24 is required for `runtime.AddCleanup`, which releases an
+    // object wrapper nobody closed (1.23 brought the `iter` package the lazy
+    // `iter<T>` wrappers return).
+    format!("{prelude}module {module_path}\n\ngo 1.24\n\n{trailer}")
 }
 
 /// README for the generate-mode output.
@@ -89,26 +90,30 @@ local checkout, a `replace`) of `{module_path}`, then import it:
 import "{module_path}"
 ```
 
-Go 1.23 or newer is required.
+Go 1.24 or newer is required.
 
 ## Usage notes
 
+- Call `Check()` at startup: it returns an error when the linked library
+  isn't the one these bindings were generated for (a different ABI revision,
+  or a declaration that's missing or changed). The first call into the
+  package runs the same checks, and every call after a failed check panics
+  with that error.
 - Records are plain structs and rich enums are sealed interfaces; both cross
-  the boundary by value.
+  the boundary by value. Optional scalars are pointers, and numeric lists
+  pass the slice's own storage.
 - Interfaces are reference-counted objects. Call `Close` when you're done
-  with one (a finalizer releases it otherwise); it's safe to call twice or
-  while a call is in flight.
-- A call that declares errors returns `error` values you match with
-  `errors.As`; any other call panics with an `*Error` when the library
-  reports a failure, since that's a bug.
+  with one (an unreachable wrapper is released eventually otherwise); it's
+  safe to call twice or while a call is in flight.
+- A function that declares an error domain returns that domain's code types,
+  which you match with `errors.As`; one that fails with any error returns an
+  `*Error`. Any other call panics with an `*Error` when the library reports
+  a failure, since that's a bug. Async functions always return the error.
 - Async functions take a `context.Context` first. Cancellable ones cancel
   the native call when the context is done.
 - Callback interfaces are Go interfaces you implement. The library may call
   them from any thread; a panic is reported to the native caller as a
   callback failure instead of crashing.
-- Importing the package checks the library's ABI revision and every
-  module's contract table, and panics naming the first declaration that's
-  missing from the library or changed since the bindings were generated.
 
 {trailer}"#
     )

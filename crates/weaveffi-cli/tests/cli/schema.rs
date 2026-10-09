@@ -1,5 +1,5 @@
 fn cargo_bin() -> assert_cmd::Command {
-    assert_cmd::Command::cargo_bin("weaveffi").expect("binary not found")
+    crate::weaveffi()
 }
 
 #[test]

@@ -37,14 +37,13 @@ pkg-fmt = "zip"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 miette = { workspace = true }
-anyhow = { workspace = true }
 camino = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 weaveffi-model = { workspace = true, features = ["idl"] }
 rayon = { workspace = true }
 heck = { workspace = true }
-serde_yaml = { workspace = true }
+serde_yaml_ng = { workspace = true }
 serde_json = { workspace = true }
 similar = { workspace = true }
 tempfile = { workspace = true }
@@ -58,7 +57,7 @@ object = { version = "0.37", default-features = false, features = ["read", "wasm
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
-serde_yaml = { workspace = true }
+serde_yaml_ng = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 insta = { workspace = true }

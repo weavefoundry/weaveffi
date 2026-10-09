@@ -32,4 +32,6 @@ pub mod canvas {
     }
 }
 
+weaveffi::export_runtime!();
+
 fn main() {}

@@ -34,13 +34,6 @@ doc = false
 required-features = ["fuzzing"]
 
 [[bin]]
-name = "fuzz_parse_toml"
-path = "fuzz_targets/parse_toml.rs"
-test = false
-doc = false
-required-features = ["fuzzing"]
-
-[[bin]]
 name = "fuzz_parse_type_ref"
 path = "fuzz_targets/parse_type_ref.rs"
 test = false

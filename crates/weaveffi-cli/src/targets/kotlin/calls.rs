@@ -1,14 +1,17 @@
 //! Public Kotlin wrappers for callables: how each argument lowers to its
-//! JNI form, how each result lifts back, and the borrow scopes that keep
-//! every object (receiver and arguments) alive and unreleased for the whole
-//! native call.
+//! JNI [`Carrier`], how each result lifts back, and the borrow scopes that
+//! keep every object (receiver and arguments) alive and unreleased for the
+//! whole native call.
 
 use crate::codegen::CodeWriter;
-use weaveffi_model::model::{CallShape, ErrorBinding, FnBinding, ParamBinding};
-use weaveffi_model::ty::{Family, Prim, Ty};
+use weaveffi_model::model::{CallShape, FnBinding};
+use weaveffi_model::plan::{ArgPass, RetPass};
+use weaveffi_model::ty::{ParamTy, Prim, Ty};
 
+use crate::targets::kotlin::carrier::{Carrier, Kind};
 use crate::targets::kotlin::codec::{decode_expr, encode_expr};
-use crate::targets::kotlin::names::{jni_kind, kt_param, unsigned_conversions, Names};
+use crate::targets::kotlin::docs::Speller;
+use crate::targets::kotlin::names::{kt_param, unsigned_conversions, Names};
 
 /// One line of a generated body, with its depth relative to the body's
 /// first line.
@@ -30,70 +33,214 @@ fn receiver(expr: &str) -> String {
     expr.to_string()
 }
 
-/// The Kotlin expression lowering the public value `expr` of `t` to its JNI
-/// form. An object lowers to a new strong reference (a callback method's
-/// return, which the producer adopts); call arguments borrow objects
-/// instead (see [`emit_callable`]).
-pub(crate) fn lower(n: &Names, t: &Ty, expr: &str) -> String {
-    if let Some((_, to_signed)) = unsigned_conversions(t) {
-        return format!("{}.{to_signed}()", receiver(expr));
-    }
-    match t.family() {
-        Family::Direct if matches!(t, Ty::Enum(_)) => format!("{}.value", receiver(expr)),
-        Family::String => format!("encodeUtf8({expr})"),
-        Family::Buffer => encode_expr(n, t, expr),
-        Family::Object { nullable: false } => format!("{}.cloneHandle()", receiver(expr)),
-        Family::Object { nullable: true } => format!("{}?.cloneHandle() ?: 0L", receiver(expr)),
-        _ => expr.to_string(),
+/// The scalar inside an optional (the type itself otherwise).
+fn scalar(t: &Ty) -> &Ty {
+    match t {
+        Ty::Optional(inner) => inner,
+        other => other,
     }
 }
 
-/// The Kotlin expression lifting the JNI form `expr` of `t` back into its
-/// public value. Objects are adopted: the wrapper owes the reference's
-/// release.
-pub(crate) fn lift(n: &Names, t: &Ty, expr: &str) -> String {
-    if let Some((to_unsigned, _)) = unsigned_conversions(t) {
-        return format!("{}.{to_unsigned}()", receiver(expr));
-    }
+/// The element type of a list (the type itself otherwise).
+fn element(t: &Ty) -> &Ty {
     match t {
-        Ty::Enum(name) => format!("{}.fromValue({expr})", n.ty(name)),
-        Ty::Prim(Prim::String) => format!("decodeUtf8({expr})"),
-        Ty::Interface(name) => format!("{}.fromHandle({expr})", n.ty(name)),
-        Ty::Optional(inner) if !t.is_buffered() => {
-            let name = inner
-                .interface_name()
-                .expect("only Interface? is an unbuffered optional value");
-            format!("{}.fromHandleOrNull({expr})", n.ty(name))
-        }
-        _ if t.is_buffered() => decode_expr(n, t, expr),
-        _ => expr.to_string(),
+        Ty::List(inner) => inner,
+        other => other,
     }
+}
+
+/// The Kotlin expression lowering the public value `expr` of `t` to its JNI
+/// form `c`. An object lowers to a new strong reference (a callback
+/// method's return, which the producer adopts); call arguments borrow
+/// objects instead (see [`emit_callable`]).
+///
+/// # Panics
+///
+/// Panics for [`Carrier::Split`], which lowers to two arguments (see
+/// [`lower_split`]).
+pub(crate) fn lower(n: &Names, t: &Ty, c: Carrier, expr: &str) -> String {
+    match c {
+        Carrier::Prim(_) => {
+            if let Some((_, to_signed)) = unsigned_conversions(t) {
+                format!("{}.{to_signed}()", receiver(expr))
+            } else if matches!(t, Ty::Enum(_)) {
+                format!("{}.value", receiver(expr))
+            } else {
+                expr.to_string()
+            }
+        }
+        Carrier::Boxed(_) => {
+            let inner = scalar(t);
+            if let Some((_, to_signed)) = unsigned_conversions(inner) {
+                format!("{}?.{to_signed}()", receiver(expr))
+            } else if matches!(inner, Ty::Enum(_)) {
+                format!("{}?.value", receiver(expr))
+            } else {
+                expr.to_string()
+            }
+        }
+        Carrier::Array(k) => match unsigned_conversions(element(t)) {
+            Some(_) => format!("{}.to{}ArrayBits()", receiver(expr), k.name()),
+            None => format!("{}.to{}Array()", receiver(expr), k.name()),
+        },
+        Carrier::Bytes => match t {
+            Ty::Prim(Prim::String) => format!("encodeUtf8({expr})"),
+            Ty::Prim(Prim::Bytes) => expr.to_string(),
+            _ => encode_expr(n, t, expr),
+        },
+        Carrier::Handle => match t {
+            Ty::Optional(_) => format!("{}?.cloneHandle() ?: 0L", receiver(expr)),
+            _ => format!("{}.cloneHandle()", receiver(expr)),
+        },
+        Carrier::Split(_) => unreachable!("an optional scalar parameter lowers to two arguments"),
+    }
+}
+
+/// The two JNI arguments of an optional scalar `expr` of `t` (`T?`): its
+/// presence, then its value (the kind's zero when absent).
+pub(crate) fn lower_split(t: &Ty, k: Kind, expr: &str) -> (String, String) {
+    let inner = scalar(t);
+    let value = if let Some((_, to_signed)) = unsigned_conversions(inner) {
+        format!("{}?.{to_signed}() ?: {}", receiver(expr), k.zero())
+    } else if matches!(inner, Ty::Enum(_)) {
+        format!("{}?.value ?: 0", receiver(expr))
+    } else {
+        format!("{expr} ?: {}", k.zero())
+    };
+    (format!("{expr} != null"), value)
+}
+
+/// The Kotlin expression lifting the JNI form `expr` (in carrier `c`) of
+/// `t` back into its public value. Objects are adopted: the wrapper owes
+/// the reference's release.
+///
+/// # Panics
+///
+/// Panics for [`Carrier::Split`], which lifts from two values (see
+/// [`lift_split`]).
+pub(crate) fn lift(n: &Names, t: &Ty, c: Carrier, expr: &str) -> String {
+    match c {
+        Carrier::Prim(_) => {
+            if let Some((to_unsigned, _)) = unsigned_conversions(t) {
+                format!("{}.{to_unsigned}()", receiver(expr))
+            } else if let Ty::Enum(name) = t {
+                format!("{}.fromValue({expr})", n.ty(name))
+            } else {
+                expr.to_string()
+            }
+        }
+        Carrier::Boxed(_) => {
+            let inner = scalar(t);
+            if let Some((to_unsigned, _)) = unsigned_conversions(inner) {
+                format!("{}?.{to_unsigned}()", receiver(expr))
+            } else if let Ty::Enum(name) = inner {
+                format!("{}?.let {{ {}.fromValue(it) }}", receiver(expr), n.ty(name))
+            } else {
+                expr.to_string()
+            }
+        }
+        Carrier::Array(k) => match unsigned_conversions(element(t)) {
+            Some(_) => format!("{}.toU{}List()", receiver(expr), k.name()),
+            None => format!("{}.asList()", receiver(expr)),
+        },
+        Carrier::Bytes => match t {
+            Ty::Prim(Prim::String) => format!("decodeUtf8({expr})"),
+            Ty::Prim(Prim::Bytes) => expr.to_string(),
+            _ => decode_expr(n, t, expr),
+        },
+        Carrier::Handle => {
+            let name = n.ty(scalar(t).interface_name().unwrap_or_default());
+            match t {
+                Ty::Optional(_) => format!("{name}.fromHandleOrNull({expr})"),
+                _ => format!("{name}.fromHandle({expr})"),
+            }
+        }
+        Carrier::Split(_) => unreachable!("an optional scalar parameter lifts from two values"),
+    }
+}
+
+/// The Kotlin expression lifting a split optional scalar (`has`, `value`)
+/// of `t` (`T?`).
+pub(crate) fn lift_split(n: &Names, t: &Ty, k: Kind, has: &str, value: &str) -> String {
+    format!(
+        "if ({has}) {} else null",
+        lift(n, scalar(t), Carrier::Prim(k), value)
+    )
+}
+
+/// The Kotlin expression lifting `expr`, an `Any?` holding carrier `c` (an
+/// async result or iterator item), into the public value of `t`.
+pub(crate) fn lift_erased(n: &Names, t: &Ty, c: Carrier, expr: &str) -> String {
+    lift(n, t, c, &format!("{expr} as {}", c.kotlin()))
+}
+
+/// The name of the presence flag of the split optional parameter `name`
+/// (already spelled for Kotlin), mirroring its C slot `has_{name}`. Kotlin
+/// spellings never contain an inner underscore, so it can't collide.
+pub(crate) fn has_name(name: &str) -> String {
+    format!("has_{name}")
+}
+
+/// The `external fun` parameters of callable `f`: the receiver, then every
+/// parameter in its JNI form (an optional scalar as its flag and value, a
+/// callback interface as the implementing object).
+pub(crate) fn jni_params(n: &Names, f: &FnBinding) -> Vec<String> {
+    let mut out = Vec::new();
+    if f.has_self() {
+        out.push("_self: Long".to_string());
+    }
+    for p in &f.params {
+        let name = kt_param(&p.name);
+        match Carrier::of_arg(&p.pass) {
+            Some(Carrier::Split(k)) => {
+                out.push(format!("{}: Boolean", has_name(&name)));
+                out.push(format!("{name}: {}", k.name()));
+            }
+            Some(c) => out.push(format!("{name}: {}", c.kotlin())),
+            None => out.push(format!("{name}: {}", n.kt_param_type(&p.ty))),
+        }
+    }
+    out
 }
 
 /// The borrow scopes and JNI arguments for a call to `f`: the receiver
-/// (when `has_self`) and every object argument open one `borrow` scope each,
-/// a callback interface passes the implementing object (the shim pins it),
-/// and every other argument lowers inline.
-fn lower_args(n: &Names, f: &FnBinding, has_self: bool) -> (Vec<String>, Vec<String>) {
+/// and every object argument open one `borrow` scope each, a callback
+/// interface passes the implementing object (the shim pins it), and every
+/// other argument lowers inline.
+fn lower_args(n: &Names, f: &FnBinding) -> (Vec<String>, Vec<String>) {
     let mut opens = Vec::new();
     let mut args = Vec::new();
-    if has_self {
+    if f.has_self() {
         opens.push("handle.borrow { _self ->".to_string());
         args.push("_self".to_string());
     }
     for (i, p) in f.params.iter().enumerate() {
         let name = kt_param(&p.name);
-        match p.ty.family() {
-            Family::Object { nullable: false } => {
+        let ParamTy::Value(t) = &p.ty else {
+            args.push(name);
+            continue;
+        };
+        match (&p.pass, Carrier::of_arg(&p.pass)) {
+            (
+                ArgPass::Object {
+                    nullable: false, ..
+                },
+                _,
+            ) => {
                 opens.push(format!("{name}.handle.borrow {{ _h{i} ->"));
                 args.push(format!("_h{i}"));
             }
-            Family::Object { nullable: true } => {
+            (ArgPass::Object { nullable: true, .. }, _) => {
                 opens.push(format!("{name}?.handle.borrowOrNull {{ _h{i} ->"));
                 args.push(format!("_h{i}"));
             }
-            Family::Callback { .. } => args.push(name),
-            _ => args.push(lower(n, &p.ty, &name)),
+            (_, Some(Carrier::Split(k))) => {
+                let (has, value) = lower_split(t, k, &name);
+                args.push(has);
+                args.push(value);
+            }
+            (_, Some(c)) => args.push(lower(n, t, c, &name)),
+            (_, None) => args.push(name),
         }
     }
     (opens, args)
@@ -142,21 +289,6 @@ fn emit_body(w: &mut CodeWriter, sig: &str, returns: bool, lines: Vec<Line>) {
     }
 }
 
-/// The Kotlin parameter list of a public wrapper.
-pub(crate) fn params_sig(n: &Names, params: &[ParamBinding]) -> String {
-    params
-        .iter()
-        .map(|p| format!("{}: {}", kt_param(&p.name), n.kt_type(&p.ty)))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// The `: Type` return annotation of a public wrapper, or nothing for void.
-pub(crate) fn ret_sig(n: &Names, ret: Option<&Ty>) -> String {
-    ret.map(|t| format!(": {}", n.kt_type(t)))
-        .unwrap_or_default()
-}
-
 /// The `@Deprecated` annotation for a deprecation message.
 pub(crate) fn deprecated_line(msg: &str) -> String {
     format!("@Deprecated(\"{}\")", kt_string(msg))
@@ -167,148 +299,111 @@ pub(crate) fn kt_string(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('$', "\\$")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
-/// The step function of a `NativeIterator`: pulls one element through the
-/// iterator's `_next` native, returning `NativeIterator.DONE` at the end.
-fn iterator_step(n: &Names, f: &FnBinding) -> Vec<Line> {
-    let CallShape::Iterator(it) = &f.shape else {
-        unreachable!("iterator_step needs an iterator call shape");
-    };
-    let next = n.native(&it.next.symbol);
-    match item_slot(&it.elem) {
-        None => vec![
-            (0, format!("val _item = JniBridge.{next}(_it)")),
-            (
-                0,
-                format!(
-                    "if (_item == null) NativeIterator.DONE else {}",
-                    lift(n, &it.elem, "_item")
-                ),
-            ),
-        ],
-        Some(slot) => vec![
-            (0, format!("val _slot = {}(1)", slot.kotlin_array)),
-            (
-                0,
-                format!(
-                    "if (JniBridge.{next}(_it, _slot)) {} else NativeIterator.DONE",
-                    lift(n, &it.elem, "_slot[0]")
-                ),
-            ),
-        ],
-    }
+/// How a public wrapper is declared.
+pub(crate) struct Decl<'a> {
+    /// The Kotlin name (`count`, `invoke`).
+    pub name: &'a str,
+    /// Whether it's the companion's `operator fun invoke` (a `new`
+    /// constructor).
+    pub operator: bool,
+    /// Whether to annotate it `@JvmStatic` (module object and companion
+    /// functions, so Java sees static methods).
+    pub jvm_static: bool,
 }
 
-/// How an iterator's `_next` native hands back a direct or object element:
-/// through a one-element primitive array of its JNI carrier (strings,
-/// bytes, and buffers come back as a nullable `ByteArray` instead).
-pub(crate) struct ItemSlot {
-    /// The Kotlin array type (`IntArray`).
-    pub kotlin_array: String,
-    /// The JNI array type (`jintArray`).
-    pub jni_array: String,
-    /// The JNI element type (`jint`).
-    pub jni_elem: String,
-    /// The JNI array-region setter stem (`Int` in `SetIntArrayRegion`).
-    pub region: &'static str,
-}
-
-/// The slot an iterator element of `t` comes back through, or `None` for
-/// the `ByteArray` families.
-pub(crate) fn item_slot(t: &Ty) -> Option<ItemSlot> {
-    match t.family() {
-        Family::Direct | Family::Object { .. } => {
-            let kind = jni_kind(t);
-            Some(ItemSlot {
-                kotlin_array: format!("{kind}Array"),
-                jni_array: format!("j{}Array", kind.to_lowercase()),
-                jni_elem: format!("j{}", kind.to_lowercase()),
-                region: kind,
-            })
-        }
-        _ => None,
-    }
-}
-
-/// Emit the public wrapper for callable `f`: `decl` is everything before the
-/// parameter list (`fun count`, `operator fun invoke`; `suspend` is added
-/// for async callables), `has_self` borrows the receiver, and `error` is the
-/// domain a throwing callable maps failures through.
+/// Emit the public wrapper for callable `f`, with its KDoc, annotations,
+/// and body.
 pub(crate) fn emit_callable(
     w: &mut CodeWriter,
     n: &Names,
+    sp: &Speller,
     f: &FnBinding,
-    decl: &str,
-    has_self: bool,
-    error: Option<&ErrorBinding>,
+    decl: Decl,
 ) {
-    if let Some(msg) = &f.deprecated {
-        w.line(deprecated_line(msg));
+    sp.fn_doc(
+        w,
+        sp.text(&f.doc),
+        f.params.iter().map(|p| (p.name.as_str(), &p.doc)),
+    );
+    if let Some(msg) = sp.deprecation(&f.deprecated) {
+        w.line(deprecated_line(&msg));
     }
-    let params = params_sig(n, &f.params);
-    let ret = ret_sig(n, f.ret.as_ref());
-    let (opens, mut args) = lower_args(n, f, has_self);
-    match &f.shape {
-        CallShape::Sync(abi) => {
-            let call = format!("JniBridge.{}({})", n.native(&abi.symbol), args.join(", "));
-            let body = match &f.ret {
-                Some(t) => lift(n, t, &call),
-                None => call,
+    if let Some(exc) = n.thrown(&f.error) {
+        w.line(format!("@Throws({exc}::class)"));
+    }
+    if decl.jvm_static {
+        w.line("@JvmStatic");
+    }
+    let params: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| format!("{}: {}", kt_param(&p.name), n.kt_param_type(&p.ty)))
+        .collect();
+    let params = params.join(", ");
+    let ret = f
+        .ret
+        .as_ref()
+        .map(|t| format!(": {}", n.kt_ret_type(t)))
+        .unwrap_or_default();
+    let head = format!(
+        "{}fun {}",
+        if decl.operator { "operator " } else { "" },
+        decl.name
+    );
+    let (opens, mut args) = lower_args(n, f);
+    let native = n.native(&f.abi.symbol);
+    match (&f.shape, &f.ret_pass) {
+        (CallShape::Sync, RetPass::Iterator(it)) => {
+            let launch = format!("JniBridge.{native}({})", args.join(", "));
+            let c = Carrier::of_item(&it.item, &it.elem);
+            let body = vec![(
+                0,
+                format!(
+                    "NativeIterator({launch}, JniBridge::{}, JniBridge::{}) {{ {} }}",
+                    n.native(&it.destroy_symbol),
+                    n.native(&it.next.symbol),
+                    lift_erased(n, &it.elem, c, "it")
+                ),
+            )];
+            let sig = format!("{head}({params}){ret}");
+            emit_body(w, &sig, true, nest(&opens, body));
+        }
+        (CallShape::Sync, pass) => {
+            let call = format!("JniBridge.{native}({})", args.join(", "));
+            let value = f.ret.as_ref().and_then(|r| r.value());
+            let body = match (Carrier::of_ret(pass, value), value) {
+                (Some(c), Some(t)) => lift(n, t, c, &call),
+                _ => call,
             };
-            let sig = format!("{decl}({params}){ret}");
+            let sig = format!("{head}({params}){ret}");
             if opens.is_empty() && f.ret.is_some() {
                 w.line(format!("{sig} = {body}"));
             } else {
                 emit_body(w, &sig, f.ret.is_some(), nest(&opens, vec![(0, body)]));
             }
         }
-        CallShape::Iterator(it) => {
-            let launch = format!(
-                "JniBridge.{}({})",
-                n.native(&it.launch.symbol),
-                args.join(", ")
-            );
-            let mut body = vec![(
-                0,
-                format!(
-                    "NativeIterator({launch}, JniBridge::{}) {{ _it ->",
-                    n.native(&it.destroy_symbol)
-                ),
-            )];
-            body.extend(iterator_step(n, f).into_iter().map(|(d, l)| (d + 1, l)));
-            body.push((0, "}".to_string()));
-            emit_body(
-                w,
-                &format!("{decl}({params}){ret}"),
-                true,
-                nest(&opens, body),
-            );
-        }
-        CallShape::Async(ab) => {
-            if f.cancellable {
+        (CallShape::Async(ab), _) => {
+            if ab.cancellable() {
                 args.push("_token".to_string());
             }
             args.push("_done".to_string());
-            let call = format!(
-                "JniBridge.{}({})",
-                n.native(&ab.launch.symbol),
-                args.join(", ")
-            );
-            let convert = match &f.ret {
-                None => "{ }".to_string(),
-                Some(t) => format!(
-                    "{{ _raw -> {} }}",
-                    lift(n, t, &format!("_raw as {}", n.jni_type(t)))
-                ),
+            let call = format!("JniBridge.{native}({})", args.join(", "));
+            let value = f.ret.as_ref().and_then(|r| r.value());
+            let convert = match (Carrier::of_result(&ab.result, value), value) {
+                (Some(c), Some(t)) => format!("{{ {} }}", lift_erased(n, t, c, "it")),
+                _ => "{ }".to_string(),
             };
-            let token = if f.cancellable { "_token" } else { "_" };
+            let token = if ab.cancellable() { "_token" } else { "_" };
             let mut body = vec![(
                 0,
                 format!(
                     "awaitNative({}, {}, {convert}) {{ {token}, _done ->",
-                    f.cancellable,
-                    n.domain(f, error)
+                    ab.cancellable(),
+                    n.domain_index(&f.error)
                 ),
             )];
             body.extend(
@@ -319,7 +414,7 @@ pub(crate) fn emit_callable(
             body.push((0, "}".to_string()));
             emit_body(
                 w,
-                &format!("suspend {decl}({params}){ret}"),
+                &format!("suspend {head}({params}){ret}"),
                 f.ret.is_some(),
                 body,
             );

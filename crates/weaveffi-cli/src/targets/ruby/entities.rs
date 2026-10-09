@@ -1,96 +1,46 @@
-//! Entity renderers: plain enums, records, rich enums, interfaces, and the
-//! typed error surface of a module's declared error domain.
+//! Declaration renderers: error domains, C-style enums, records (`Data`
+//! classes), rich enums (a module of `Data` variants), interface wrapper
+//! classes, and the registrations that tell the runtime how each record,
+//! variant, and error payload is laid out in a value buffer and which C
+//! functions clone and release each interface's objects.
 
-use crate::codegen::common::DocCommentStyle;
-use crate::codegen::CodeWriter;
-use heck::{ToShoutySnakeCase, ToSnakeCase};
+use heck::ToShoutySnakeCase;
 use weaveffi_model::errors::pascal;
-use weaveffi_model::model::{
-    EnumBinding, ErrorBinding, FieldBinding, FnBinding, InterfaceBinding, ModuleBinding,
-    StructBinding,
-};
-use weaveffi_model::plan::ErrorStrategy;
+use weaveffi_model::model::{EnumBinding, FieldBinding, InterfaceBinding, Model, StructBinding};
 
-use crate::targets::ruby::calls::{render_attach_function, render_callable, RbScope, ScopeKind};
-use crate::targets::ruby::types::{rb_field_name, rb_str_literal};
+use crate::codegen::common::{wrap, DocCommentStyle};
+use crate::codegen::docs::Doc;
+use crate::codegen::errors::ErrorTable;
+use crate::codegen::CodeWriter;
+use crate::targets::ruby::calls::{render_callable, RbScope, ScopeKind};
+use crate::targets::ruby::docs;
+use crate::targets::ruby::types::{
+    rb_const, rb_doc_type, rb_error_field_name, rb_field_name, rb_str_literal, rb_wire,
+};
 use crate::targets::ruby::RbCtx;
 
-/// The snake_case stem of a domain's generated helpers: `KvError` becomes
-/// `kv_error`, naming `_wv_kv_error_from`, `_wv_check_kv_error!`, and
-/// `_wv_kv_error_payload`. Domain type names are globally unique
-/// (validated), so the helpers can't collide.
-fn rb_error_stem(eb: &ErrorBinding) -> String {
-    eb.type_name.to_snake_case()
-}
+/// The longest line kept on one line before wrapping a member list.
+const MAX_LINE: usize = 100;
 
-/// `_wv_{stem}_from`: builds the domain error matching an ABI code.
-pub(crate) fn rb_error_factory_name(eb: &ErrorBinding) -> String {
-    format!("_wv_{}_from", rb_error_stem(eb))
-}
-
-/// `_wv_check_{stem}!`: raises the typed domain error for a non-zero
-/// out-err slot.
-fn rb_error_checker_name(eb: &ErrorBinding) -> String {
-    format!("_wv_check_{}!", rb_error_stem(eb))
-}
-
-/// `_wv_{stem}_payload`: the code and encoded payload of a domain error a
-/// callback implementation raised.
-pub(crate) fn rb_error_payload_name(eb: &ErrorBinding) -> String {
-    format!("_wv_{}_payload", rb_error_stem(eb))
-}
-
-/// The error-check call a callable's out-err slot goes through, per the
-/// function's [`ErrorStrategy`]: the module domain's typed checker for
-/// [`ErrorStrategy::Throws`], the runtime's trap (`_wv_check!`, raising
-/// `NativeBugError`) for [`ErrorStrategy::Trap`].
-pub(crate) fn rb_checker_name(f: &FnBinding, error: Option<&ErrorBinding>) -> String {
-    match (f.error_strategy(), error) {
-        (ErrorStrategy::Throws, Some(eb)) => rb_error_checker_name(eb),
-        _ => "_wv_check!".to_string(),
-    }
-}
-
-/// Emit `attr_reader` lines for `fields`, each with its doc comment,
-/// separated by blank lines.
-fn emit_readers(w: &mut CodeWriter, fields: &[FieldBinding]) {
-    for (idx, f) in fields.iter().enumerate() {
-        if idx > 0 {
-            w.blank();
-        }
-        w.doc(&f.doc, DocCommentStyle::Hash);
-        w.line(format!("attr_reader :{}", rb_field_name(&f.name)));
-    }
-}
-
-/// Render one module's declared error domain: a domain class subclassing
-/// the root `Error`, one nested subclass per code carrying its stable
-/// `CODE` constant, default message, and any declared payload fields as
-/// attributes, then the private helpers: the factory and checker throwing
-/// wrappers route their out-err slots through, and (when a callback method
-/// may raise the domain, `payload`) the encoder reporting a raised domain
-/// error back to the producer. Nesting the code classes keeps
-/// `KvError::KeyNotFound` spellable and unambiguous even across domains.
-///
-/// Domain codes are validated positive-only; the negative range is reserved
-/// for the runtime. The factory therefore maps only declared codes onto
-/// typed classes and lets everything else fall through to `_wv_error` (the
-/// root `Error`, or `Cancelled`).
-pub(crate) fn render_error(
-    w: &mut CodeWriter,
-    ctx: &RbCtx,
-    module: &ModuleBinding,
-    eb: &ErrorBinding,
-    payload: bool,
-) {
-    let domain = &eb.type_name;
+/// Render one error domain: a class under the library's `Error` with one
+/// nested class per code, each carrying its `CODE`, its documented
+/// `MESSAGE`, and readers for its payload fields (which the runtime's
+/// `Error#initialize` takes as required keywords). A code these bindings
+/// don't know (the library is newer) raises the domain class itself, with
+/// the code and message.
+pub(crate) fn render_error(w: &mut CodeWriter, table: &ErrorTable<'_>) {
+    let domain = rb_const(&table.type_name);
     w.blank();
-    w.line(format!(
-        "# Base error for the `{}` module's error domain.",
-        module.dot_path
-    ));
+    let about = format!(
+        "The `{}` error domain of the `{}` module. A code these bindings don't \
+         know (from a newer library) raises this class itself, with its code \
+         and message.",
+        table.domain.name, table.module.dot_path
+    );
+    w.doc(&Some(wrap(&about, 76)), DocCommentStyle::Hash);
     w.block(format!("class {domain} < Error"), "end", |w| {
-        for (idx, c) in eb.codes.iter().enumerate() {
+        for (idx, row) in table.codes.iter().enumerate() {
+            let c = row.code;
             if idx > 0 {
                 w.blank();
             }
@@ -101,130 +51,25 @@ pub(crate) fn render_error(
                 "end",
                 |w| {
                     w.line(format!("CODE = {}", c.value));
-                    if !c.fields.is_empty() {
+                    w.line(format!("MESSAGE = '{}'", rb_str_literal(&c.message)));
+                    for f in &c.fields {
                         w.blank();
-                        emit_readers(w, &c.fields);
+                        w.doc(&f.doc, DocCommentStyle::Hash);
+                        w.line(format!("# @return [{}]", rb_doc_type(&f.ty)));
+                        w.line(format!("attr_reader :{}", rb_error_field_name(&f.name)));
                     }
-                    w.blank();
-                    let kw: String = c
-                        .fields
-                        .iter()
-                        .map(|f| format!(", {}: nil", rb_field_name(&f.name)))
-                        .collect();
-                    w.block(format!("def initialize(message = nil{kw})"), "end", |w| {
-                        for f in &c.fields {
-                            let field = rb_field_name(&f.name);
-                            w.line(format!("@{field} = {field}"));
-                        }
-                        w.line(format!(
-                            "super(CODE, message || '{}')",
-                            rb_str_literal(&c.message)
-                        ));
-                    });
                 },
             );
         }
     });
-
-    w.blank();
-    w.line("# @api private");
-    w.line(format!(
-        "# The {domain} for a domain `code`, with its payload fields decoded;"
-    ));
-    w.line("# the root Error (or Cancelled) for any other code.");
-    w.block(
-        format!(
-            "def self.{}(code, message, payload = nil)",
-            rb_error_factory_name(eb)
-        ),
-        "end",
-        |w| {
-            w.line("message = nil if message.empty?");
-            w.line("r = WvBufferReader.new(payload)");
-            w.line("error =");
-            w.scope(|w| {
-                w.line("case code");
-                for c in &eb.codes {
-                    w.line(format!("when {}", c.value));
-                    w.scope(|w| {
-                        let class = format!("{domain}::{}", pascal(&c.name));
-                        ctx.codecs
-                            .emit_new(w, "", &class, Some("message"), &c.fields, "");
-                    });
-                }
-                w.line("else");
-                w.scope(|w| {
-                    w.line("return _wv_error(code, message.to_s)");
-                });
-                w.line("end");
-            });
-            w.line("r.expect_end!");
-            w.line("error");
-        },
-    );
-
-    w.blank();
-    w.line("# @api private");
-    w.line(format!("# Raises the {domain} for a non-zero error slot."));
-    w.block(
-        format!("def self.{}(err)", rb_error_checker_name(eb)),
-        "end",
-        |w| {
-            w.line("taken = _wv_take_error(err)");
-            w.line(format!(
-                "raise {}(*taken) unless taken.nil?",
-                rb_error_factory_name(eb)
-            ));
-        },
-    );
-
-    if payload {
-        w.blank();
-        w.line("# @api private");
-        w.line(format!(
-            "# The code and value-buffer payload of a {domain} a callback"
-        ));
-        w.line("# implementation raised, or nil for an error of no declared code.");
-        w.block(
-            format!("def self.{}(error)", rb_error_payload_name(eb)),
-            "end",
-            |w| {
-                w.line("w = WvBufferWriter.new");
-                w.line("code =");
-                w.scope(|w| {
-                    w.line("case error");
-                    for c in &eb.codes {
-                        let class = format!("{domain}::{}", pascal(&c.name));
-                        if c.fields.is_empty() {
-                            w.line(format!("when {class} then {}", c.value));
-                            continue;
-                        }
-                        w.line(format!("when {class}"));
-                        w.scope(|w| {
-                            for f in &c.fields {
-                                let field = rb_field_name(&f.name);
-                                w.line(ctx.codecs.write(&f.ty, "w", &format!("error.{field}"), ""));
-                            }
-                            w.line(c.value.to_string());
-                        });
-                    }
-                    w.line("end");
-                });
-                w.line("code && [code, w.bytes]");
-            },
-        );
-    }
 }
 
-/// Render one plain C-style enum as a module of integer constants, one
+/// Render one C-style enum as a module of integer constants, one
 /// `SHOUTY_SNAKE` constant per variant.
-pub(crate) fn render_enum(w: &mut CodeWriter, e: &EnumBinding) {
+pub(crate) fn render_enum(w: &mut CodeWriter, ctx: &RbCtx, e: &EnumBinding) {
     w.blank();
-    w.doc(&e.doc, DocCommentStyle::Hash);
-    if let Some(msg) = &e.deprecated {
-        w.line(format!("# @deprecated {msg}"));
-    }
-    w.block(format!("module {}", e.name), "end", |w| {
+    docs::emit_plain(w, &ctx.names, &Doc::new(&e.doc, &e.deprecated));
+    w.block(format!("module {}", rb_const(&e.name)), "end", |w| {
         for v in &e.variants {
             w.doc(&v.doc, DocCommentStyle::Hash);
             w.line(format!("{} = {}", v.name.to_shouty_snake_case(), v.value));
@@ -232,200 +77,234 @@ pub(crate) fn render_enum(w: &mut CodeWriter, e: &EnumBinding) {
     });
 }
 
-/// Emit a value class body: documented `attr_reader`s, a keyword-argument
-/// `initialize`, and structural `==` over `class`'s fields.
-fn emit_value_class(w: &mut CodeWriter, class: &str, fields: &[FieldBinding]) {
-    if !fields.is_empty() {
-        emit_readers(w, fields);
-        w.blank();
-        let kw: Vec<String> = fields
-            .iter()
-            .map(|f| format!("{}:", rb_field_name(&f.name)))
-            .collect();
-        let one_line = format!("def initialize({})", kw.join(", "));
-        if w.indent_str().len() + one_line.len() <= 100 {
-            w.line(one_line);
-        } else {
-            w.line("def initialize(");
-            w.scope(|w| {
-                for (i, k) in kw.iter().enumerate() {
-                    let sep = if i + 1 == kw.len() { "" } else { "," };
-                    w.line(format!("{k}{sep}"));
+/// The YARD `@!attribute` tags documenting a `Data` class's members.
+fn emit_attributes(w: &mut CodeWriter, fields: &[FieldBinding]) {
+    for f in fields {
+        w.line(format!("# @!attribute [r] {}", rb_field_name(&f.name)));
+        let doc = f.doc.as_deref().map(str::trim).filter(|d| !d.is_empty());
+        match doc {
+            Some(doc) => {
+                let mut lines = doc.lines();
+                w.line(format!(
+                    "#   @return [{}] {}",
+                    rb_doc_type(&f.ty),
+                    lines.next().unwrap_or_default()
+                ));
+                for line in lines {
+                    w.line(format!("#     {line}").trim_end());
                 }
-            });
-            w.line(")");
-        }
-        w.scope(|w| {
-            for f in fields {
-                let field = rb_field_name(&f.name);
-                w.line(format!("@{field} = {field}"));
             }
-        });
-        w.line("end");
-        w.blank();
+            None => {
+                w.line(format!("#   @return [{}]", rb_doc_type(&f.ty)));
+            }
+        }
     }
-    w.line("# Structural equality over every field.");
-    w.block("def ==(other)", "end", |w| {
-        let mut terms = vec![format!("other.is_a?({class})")];
-        terms.extend(fields.iter().map(|f| {
-            let field = rb_field_name(&f.name);
-            format!("{field} == other.{field}")
-        }));
-        match terms.as_slice() {
-            [one] => {
-                w.line(one.clone());
-            }
-            [first, rest @ ..] => {
-                w.line(format!("{first} &&"));
-                w.scope(|w| {
-                    for (i, t) in rest.iter().enumerate() {
-                        if i + 1 == rest.len() {
-                            w.line(t.clone());
-                        } else {
-                            w.line(format!("{t} &&"));
-                        }
-                    }
-                });
-            }
-            [] => unreachable!("the class test is always present"),
-        }
-    });
 }
 
-/// Render one record as a plain Ruby value class: one documented
-/// `attr_reader` per field, a keyword-argument `initialize`, and structural
-/// `==`. Records are value types: they own no C symbols; they cross the ABI
-/// packed into value buffers by the module's `_wv_write_*`/`_wv_read_*`
-/// codec helpers.
-pub(crate) fn render_struct_class(w: &mut CodeWriter, s: &StructBinding) {
-    w.blank();
-    w.doc(&s.doc, DocCommentStyle::Hash);
-    if let Some(msg) = &s.deprecated {
-        w.line(format!("# @deprecated {msg}"));
+/// `Data.define(:a, :b)`, wrapped one member per line when long. `lead`
+/// precedes it on the first line (`Item = `, `class Circle < `).
+fn emit_data_define(w: &mut CodeWriter, lead: &str, trail: &str, fields: &[FieldBinding]) {
+    let members: Vec<String> = fields
+        .iter()
+        .map(|f| format!(":{}", rb_field_name(&f.name)))
+        .collect();
+    let args = if members.is_empty() {
+        String::new()
+    } else {
+        format!("({})", members.join(", "))
+    };
+    let one_line = format!("{lead}Data.define{args}{trail}");
+    if w.indent_str().len() + one_line.len() <= MAX_LINE {
+        w.line(one_line);
+        return;
     }
-    w.block(format!("class {}", s.name), "end", |w| {
-        emit_value_class(w, &s.name, &s.fields);
+    w.line(format!("{lead}Data.define("));
+    w.scope(|w| {
+        for m in &members {
+            w.line(format!("{m},"));
+        }
     });
+    w.line(format!("){trail}"));
 }
 
-/// Render one rich (algebraic) enum as a tagged class hierarchy: a base
-/// class exposing `tag`, plus one nested value class per variant carrying
-/// that variant's fields. Rich enums own no C symbols; they cross the ABI
-/// packed into value buffers as an `i32` tag followed by the active
-/// variant's fields in declaration order.
-pub(crate) fn render_rich_enum_class(w: &mut CodeWriter, e: &EnumBinding) {
+/// Render one record as a `Data` class: immutable, constructed with
+/// keywords (or positionally), with value equality and hashing, `with`,
+/// `to_h`, and pattern matching.
+pub(crate) fn render_struct(w: &mut CodeWriter, ctx: &RbCtx, s: &StructBinding) {
     w.blank();
-    w.doc(&e.doc, DocCommentStyle::Hash);
-    if let Some(msg) = &e.deprecated {
-        w.line(format!("# @deprecated {msg}"));
+    let doc = Doc::new(&s.doc, &s.deprecated);
+    docs::emit_plain(w, &ctx.names, &doc);
+    if !s.fields.is_empty() && (s.doc.is_some() || s.deprecated.is_some()) {
+        w.line("#");
     }
-    w.block(format!("class {}", e.name), "end", |w| {
-        w.line("# The active variant's integer tag.");
+    emit_attributes(w, &s.fields);
+    emit_data_define(w, &format!("{} = ", rb_const(&s.name)), "", &s.fields);
+}
+
+/// Render one rich enum as a module of `Data` variant classes. Each variant
+/// includes the module (so `shape.is_a?(Shape)` holds) and carries its wire
+/// `TAG`, which `#tag` returns.
+pub(crate) fn render_rich_enum(w: &mut CodeWriter, ctx: &RbCtx, e: &EnumBinding) {
+    let name = rb_const(&e.name);
+    w.blank();
+    docs::emit_plain(w, &ctx.names, &Doc::new(&e.doc, &e.deprecated));
+    w.block(format!("module {name}"), "end", |w| {
+        w.line("# The active variant's wire tag.");
+        w.line("# @return [Integer]");
         w.block("def tag", "end", |w| {
             w.line("self.class::TAG");
         });
         for v in &e.variants {
             w.blank();
             w.doc(&v.doc, DocCommentStyle::Hash);
-            w.block(format!("class {} < {}", v.name, e.name), "end", |w| {
-                w.line(format!("TAG = {}", v.value));
+            if !v.fields.is_empty() && v.doc.is_some() {
+                w.line("#");
+            }
+            emit_attributes(w, &v.fields);
+            emit_data_define(w, &format!("class {} < ", rb_const(&v.name)), "", &v.fields);
+            w.scope(|w| {
+                w.line(format!("include {name}"));
                 w.blank();
-                emit_value_class(w, &v.name, &v.fields);
+                w.line(format!("TAG = {}", v.value));
             });
+            w.line("end");
         }
     });
 }
 
-/// Declare the FFI bindings for one interface: the clone and destroy
-/// lifecycle symbols (which keep the GVL; see [`render_attach_function`])
-/// plus every constructor, method, and static.
-pub(crate) fn render_interface_ffi(w: &mut CodeWriter, i: &InterfaceBinding) {
-    w.line(format!(
-        "attach_function :{}, [:pointer], :pointer",
-        i.clone_symbol
-    ));
-    w.line(format!(
-        "attach_function :{}, [:pointer], :void",
-        i.destroy_symbol
-    ));
-    for f in i
-        .constructors
-        .iter()
-        .chain(i.methods.iter())
-        .chain(i.statics.iter())
-    {
-        render_attach_function(w, f);
-    }
-}
-
-/// Render one interface as a reference-counted wrapper class on the
-/// runtime's `WvObject` base (which supplies `handle`, `close`, `closed?`,
-/// `dup`/`clone`, and the call pinning). A `{Name}Ptr < FFI::AutoPointer`
-/// subclass owns exactly one strong reference and releases it through the
-/// interface's `_destroy` symbol, either from `close` or, as a backstop,
-/// from the GC finalizer. A constructor named `new` becomes `initialize`;
-/// every other constructor becomes a class-method factory; methods borrow
-/// the wrapper's pointer as the leading C argument; statics are class
-/// methods. `_from_ptr` adopts a reference the producer handed over (a
-/// return, an async result, an iterator element, a buffer token, a callback
-/// argument) without re-running `initialize`.
-pub(crate) fn render_interface_class(
-    w: &mut CodeWriter,
-    ctx: &RbCtx,
-    error: Option<&ErrorBinding>,
-    i: &InterfaceBinding,
-) {
-    let ptr_class = format!("{}Ptr", i.name);
-    let module = ctx.module;
+/// Render one interface as a wrapper class on the runtime's `Handle`
+/// (which supplies `close`, `closed?`, `==`/`hash` by native object,
+/// `dup`/`clone`, `inspect`, and the GC backstop). A constructor named
+/// `new` becomes `initialize`; every other constructor is a class-method
+/// factory, and an interface without a `new` hides it; methods pin the
+/// wrapper's pointer for the call; statics are class methods.
+pub(crate) fn render_interface(w: &mut CodeWriter, ctx: &RbCtx, i: &InterfaceBinding) {
+    let class = rb_const(&i.name);
     w.blank();
-    w.line("# @api private");
-    w.line(format!(
-        "# Owns one strong reference to a {}; releases it exactly once.",
-        i.name
-    ));
-    w.block(
-        format!("class {ptr_class} < FFI::AutoPointer"),
-        "end",
-        |w| {
-            w.block("def self.release(ptr)", "end", |w| {
-                w.line(format!("{module}.{}(ptr)", i.destroy_symbol));
-            });
-        },
-    );
-    w.blank();
-    w.doc(&i.doc, DocCommentStyle::Hash);
-    if let Some(msg) = &i.deprecated {
-        w.line(format!("# @deprecated {msg}"));
-    }
-    w.block(format!("class {} < WvObject", i.name), "end", |w| {
-        w.line(format!("WV_PTR = {ptr_class}"));
+    docs::emit_plain(w, &ctx.names, &Doc::new(&i.doc, &i.deprecated));
+    w.block(format!("class {class} < Bridge::Handle"), "end", |w| {
+        let mut first = true;
         if !i.constructors.iter().any(|c| c.name == "new") {
             w.line("private_class_method :new");
+            first = false;
         }
-        w.blank();
-        w.line("# @api private");
-        w.block("def self._wv_clone(ptr)", "end", |w| {
-            w.line(format!("{module}.{}(ptr)", i.clone_symbol));
-        });
-        // Members render at class depth through the shared callable paths,
-        // so sync, async, and iterator members reuse the free-function
-        // marshalling.
+        let mut gap = |w: &mut CodeWriter| {
+            if !std::mem::take(&mut first) {
+                w.blank();
+            }
+        };
         for c in &i.constructors {
+            gap(w);
             let kind = if c.name == "new" {
                 ScopeKind::Init
             } else {
                 ScopeKind::Factory
             };
-            render_callable(w, ctx, error, c, &RbScope::member(kind, module, &i.name));
+            let scope = RbScope {
+                kind,
+                class: Some(&class),
+            };
+            render_callable(w, ctx, c, &scope);
         }
-        for f in i.methods.iter().chain(i.statics.iter()) {
-            let kind = if f.has_self {
+        for f in i.methods.iter().chain(&i.statics) {
+            gap(w);
+            let kind = if f.has_self() {
                 ScopeKind::Method
             } else {
                 ScopeKind::Static
             };
-            let scope = RbScope::member(kind, module, &i.name);
-            render_callable(w, ctx, error, f, &scope);
+            let scope = RbScope {
+                kind,
+                class: Some(&class),
+            };
+            render_callable(w, ctx, f, &scope);
         }
     });
+}
+
+/// `Bridge.record(Class, field: type, ...)`, wrapped one field per line
+/// when long.
+fn emit_layout(w: &mut CodeWriter, class: &str, fields: &[(String, String)]) {
+    let parts: Vec<String> = std::iter::once(class.to_string())
+        .chain(fields.iter().map(|(n, t)| format!("{n}: {t}")))
+        .collect();
+    let one_line = format!("Bridge.record({})", parts.join(", "));
+    if w.indent_str().len() + one_line.len() <= MAX_LINE {
+        w.line(one_line);
+        return;
+    }
+    w.line("Bridge.record(");
+    w.scope(|w| {
+        for p in &parts {
+            w.line(format!("{p},"));
+        }
+    });
+    w.line(")");
+}
+
+/// The private registrations closing the bindings: each interface's
+/// clone and destroy functions, then the wire layout of every record,
+/// rich-enum variant (and the variants of each rich enum), and error code
+/// with a payload.
+pub(crate) fn render_layouts(w: &mut CodeWriter, model: &Model, tables: &[ErrorTable<'_>]) {
+    w.blank();
+    w.line("# How the library clones and releases each interface's objects, and how");
+    w.line("# each record, variant, and error payload is laid out in a value buffer.");
+    for m in &model.modules {
+        for i in &m.interfaces {
+            w.line(format!(
+                "Bridge.interface({}, :{}, :{})",
+                rb_const(&i.name),
+                i.clone_symbol,
+                i.destroy_symbol
+            ));
+        }
+    }
+    let record_fields = |fields: &[FieldBinding]| -> Vec<(String, String)> {
+        fields
+            .iter()
+            .map(|f| (rb_field_name(&f.name), rb_wire(&f.ty)))
+            .collect()
+    };
+    for m in &model.modules {
+        for s in &m.structs {
+            emit_layout(w, &rb_const(&s.name), &record_fields(&s.fields));
+        }
+        for e in m.enums.iter().filter(|e| e.is_rich()) {
+            let name = rb_const(&e.name);
+            let variants: Vec<String> = e
+                .variants
+                .iter()
+                .map(|v| format!("{name}::{}", rb_const(&v.name)))
+                .collect();
+            for (v, class) in e.variants.iter().zip(&variants) {
+                emit_layout(w, class, &record_fields(&v.fields));
+            }
+            let one_line = format!("Bridge.union({name}, {})", variants.join(", "));
+            if w.indent_str().len() + one_line.len() <= MAX_LINE {
+                w.line(one_line);
+            } else {
+                w.line("Bridge.union(");
+                w.scope(|w| {
+                    w.line(format!("{name},"));
+                    for v in &variants {
+                        w.line(format!("{v},"));
+                    }
+                });
+                w.line(")");
+            }
+        }
+    }
+    for table in tables {
+        let domain = rb_const(&table.type_name);
+        for row in table.codes.iter().filter(|r| !r.code.fields.is_empty()) {
+            let fields: Vec<(String, String)> = row
+                .code
+                .fields
+                .iter()
+                .map(|f| (rb_error_field_name(&f.name), rb_wire(&f.ty)))
+                .collect();
+            emit_layout(w, &format!("{domain}::{}", pascal(&row.code.name)), &fields);
+        }
+    }
 }

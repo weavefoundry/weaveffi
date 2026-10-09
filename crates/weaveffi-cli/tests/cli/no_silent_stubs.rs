@@ -106,9 +106,8 @@ fn generated_output_has_no_stub_markers() {
 
     // Case-insensitive marker list. Bare "not supported" is deliberately
     // absent: an explicit, permanently declared unsupported-feature surface
-    // (e.g. wasm async/listener stubs in Emscripten mode, which throw "is
-    // not supported in Emscripten mode") is the *correct* loud behavior. The
-    // "yet" in "not yet supported" is what marks a runtime-throwing TODO stub
+    // that throws when called is the *correct* loud behavior. The "yet" in
+    // "not yet supported" is what marks a runtime-throwing TODO stub
     // for a feature the target claims to implement, the Kotlin `iter<T>`
     // regression this test exists to prevent, so it must stay a hard build
     // failure.
@@ -127,8 +126,7 @@ fn generated_output_has_no_stub_markers() {
         let dir = tempfile::tempdir().expect("temp dir");
         let out = dir.path().join("out");
 
-        assert_cmd::Command::cargo_bin("weaveffi")
-            .expect("binary not found")
+        crate::weaveffi()
             .args([
                 "generate",
                 idl.to_str().unwrap(),
@@ -141,8 +139,8 @@ fn generated_output_has_no_stub_markers() {
         let mut files = Vec::new();
         walk_files(&out, &mut files);
         assert!(
-            files.len() > 10,
-            "expected many generated files for {}, got {}",
+            files.len() >= weaveffi_cli::targets::REGISTRY.len(),
+            "expected a file per target for {}, got {}",
             idl.display(),
             files.len()
         );

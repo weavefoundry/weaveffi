@@ -20,11 +20,22 @@ metadata.
 ## calculator
 
 The getting-started example, small enough to read in a minute: a
-`calculator` module with `add` (wrapping on overflow), `divide`, which
-throws the one-code `CalcError` domain on a zero divisor, and `greet`, a
-string in and a string out. The `c-producer-exports` lane also implements
-the calculator's generated header by hand in C (`conformance/c/producer.c`)
-and checks that every required runtime and contract symbol is exported.
+`calculator` module with
+
+- `add` (wrapping on overflow) and `greet`, a string in and a string out;
+- `divide`, which throws the `CalcError` domain on a zero divisor;
+- `parse`, which throws a second domain, `ParseError`, whose `NotANumber`
+  code carries the input as a field and renders its message from a
+  template (`not a number: 4x`); both domains use code `1`, so a binding
+  must interpret a code by the callable's domain;
+- `sqrt`, a `throws: any` function returning `Result<f64, String>`, which
+  fails with code `-1` and the message `cannot take the square root of -4`;
+- `mean` (`[f64]` in, `f64?` out) and `running_total` (`[i32]` in and out),
+  which cross as typed arrays and an optional scalar.
+
+The `c-producer-exports` lane also implements the calculator's generated
+header by hand in C (`conformance/c/producer.c`) and checks that every
+required runtime and contract symbol is exported.
 
 ## codec
 
@@ -51,9 +62,16 @@ so each consumer also builds a few vectors from literals and checks those,
 and spot-checks decoded fields. The `echo_*` functions return their argument
 through the direct ABI families (scalars by value, strings and bytes as
 `(ptr, len)` runs, the C-style enum as an `int32_t`), and each consumer pushes
-every primitive vector through the matching echo. A `Token` interface with
-`sum_holder`, `primary_of`, and `same_primary` checks object identity and
-reference counting through buffers.
+every primitive vector through the matching echo. The revision 5 families
+have echoes of their own: `echo_opt_i32`, `echo_opt_f64`, `echo_opt_bool`,
+and `echo_opt_color` (optional scalars, including `-0.0`, NaN, and absent),
+`echo_f64s`, `echo_i32s`, and `echo_u64s` (typed arrays, bit-exact at the
+extremes), `echo_usize` (a Rust `usize` as `u64`), `echo_char` (a one-scalar
+string; `"ab"` fails with `-3`), `echo_hex` (a custom type crossing as a
+lowercase hex string; `"xyz"` fails with `-3`), and `chunks`, an iterator of
+typed arrays. A `Token` interface with `sum_holder`, `primary_of`, and
+`same_primary` checks object identity and reference counting through
+buffers.
 
 ## kvstore
 
@@ -65,21 +83,26 @@ concrete assertions. Time is a logical clock per store (`now`, advanced by
 | Feature | Where |
 |---|---|
 | Interface with constructors, methods, and statics | `Store` (`open`, `new`; `put`, `get`, ...; `open_many`, `default_capacity`, ...) |
-| Typed errors with payload fields | `KvError`: `KeyNotFound { key }`, `Expired { key, expired_at }`, `StoreFull { capacity }`, `InvalidPath`, `Rejected { key, reason }` |
+| Typed errors with payload fields and generated messages | `KvError`: `KeyNotFound { key }`, `Expired { key, expired_at }`, `StoreFull { capacity }`, `InvalidPath`, `Rejected { key, reason }`, `CallbackFailed { message }` |
+| An untyped (`throws: any`) error | `import_lines` (a `Result<usize, String>`) |
+| Optional scalars and typed arrays | `put`'s TTL (an `i64?` parameter), `expires_at` (an `i64?` return), `value_sizes` (a `[u64]` return), `expirations` (an iterator of `i64?`), `version_of` and `versions` (async `u32?` and `[u32]` results), and `Scorer::scores` (a `[u64]` parameter and `[f64]` return) |
+| `usize` | `count` and `listener_count` (`u64` in the IDL) |
 | Records, optionals, lists, maps | `Entry` (bytes, an optional TTL, tags, metadata), `StoreInfo`, `Stats` (a map keyed by a C-style enum) |
 | C-style and rich enums | `EntryKind`; `Change` (`Put`, `Removed`, `Cleared`) |
 | Objects in every position | parameters, returns, `Store?` both ways (`larger`), lists (`open_many`, `total_count`), map values (`by_label`), record fields (`StoreInfo`), iterator elements (`partition`), an async result (`open_store`), and a callback's parameter and return (`Policy::route`) |
-| Callback interfaces | `Listener` (retained by `subscribe`; void and direct returns), `Policy` (a record return, a throwing method whose typed error reaches the `put` caller, an object parameter and return), `Loader` (string, bytes, and optional-object returns; passed as an optional callback) |
+| Callback interfaces | `Listener` (retained by `subscribe`; void and direct returns), `Policy` (`ttl_for`, an optional scalar in and out; `admit`, a record return whose typed `KvError` reaches the `put` caller; `route`, an object parameter and return), `Loader` (string, bytes, and optional-object returns; passed as an optional callback), `Scorer` (typed arrays in and out, used by `rank`) |
 | Callbacks from a producer thread | `compact` notifies listeners from the thread it runs on |
 | Lazy iterators | `keys` (strings, throwing), `entries` (records), `partition` (objects) |
 | Async and cancellation | `open_store` (an async free function returning an object), `compact` (cancellable; its background pause stops cooperatively, shown by `Store::active_jobs`), `get_many` (an async list), `summarize_all` |
-| Nested modules | `kv.stats` uses the parent's `Store` and reports the parent's `KvError` |
+| Nested modules | `kv.stats` uses the parent's `Store` and throws the parent's `KvError` |
 | Sibling roots | `report` shares the `Entry` record and has its own `ReportError` |
 | Deprecation | `Store::size` (use `count`) |
 
 A callback's failure surfaces according to its role: a `Listener` that fails
-is unsubscribed while the store operation succeeds; a `Policy` or `Loader`
-failure fails the call with the callback's code, message, and payload, so a
-typed `KvError` a consumer raised reaches the original caller typed. The
-store never holds a lock while a callback runs, so callbacks may call back
-into it.
+is unsubscribed while the store operation succeeds; a `Policy`, `Loader`, or
+`Scorer` failure fails the call. A typed `KvError` a consumer raised (with
+its fields) reaches the original caller typed, its message rendered from the
+fields, and any other consumer failure becomes `KvError::CallbackFailed`
+carrying the consumer's message, through the domain's
+`From<ForeignError>` implementation. The store never holds a lock while a
+callback runs, so callbacks may call back into it.

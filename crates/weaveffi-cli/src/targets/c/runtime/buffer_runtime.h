@@ -7,6 +7,8 @@
  * followed by the value, lists as a `uint32_t` count followed by the
  * elements, maps as a `uint32_t` count followed by alternating keys and
  * values, and objects as a `uint64_t` token holding one strong reference.
+ * Every count and length is a `uint32_t`, so a writer fails on a string,
+ * bytes, list, or map past UINT32_MAX elements.
  * ------------------------------------------------------------------------- */
 
 /* A UTF-8 string view: `len` bytes at `ptr`, which may contain NUL bytes.
@@ -316,9 +318,64 @@ static inline uint8_t* {{p}}_reader_get_run({{p}}_reader* r, size_t* out_len) {
     return copy;
 }
 
+/* Whether the `n` bytes at `s` are well-formed UTF-8: no stray or missing
+   continuation bytes, overlong forms, surrogates, or code points past
+   U+10FFFF. */
+static inline bool {{p}}_reader_utf8(const uint8_t* s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        uint8_t c = s[i];
+        if (c < 0x80) {
+            i++;
+            continue;
+        }
+        size_t len;
+        uint32_t cp;
+        uint32_t min;
+        if ((c & 0xE0) == 0xC0) {
+            len = 2;
+            cp = c & 0x1F;
+            min = 0x80;
+        } else if ((c & 0xF0) == 0xE0) {
+            len = 3;
+            cp = c & 0x0F;
+            min = 0x800;
+        } else if ((c & 0xF8) == 0xF0) {
+            len = 4;
+            cp = c & 0x07;
+            min = 0x10000;
+        } else {
+            return false;
+        }
+        if (n - i < len) {
+            return false;
+        }
+        for (size_t k = 1; k < len; k++) {
+            uint8_t cc = s[i + k];
+            if ((cc & 0xC0) != 0x80) {
+                return false;
+            }
+            cp = (cp << 6) | (uint32_t)(cc & 0x3F);
+        }
+        if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            return false;
+        }
+        i += len;
+    }
+    return true;
+}
+
+/* A string must be well-formed UTF-8: anything else fails the reader (the
+   decoder then returns false, the buffer analog of runtime code -3). */
 static inline {{p}}_str {{p}}_reader_get_string({{p}}_reader* r) {
     {{p}}_str v;
     v.ptr = (const char*){{p}}_reader_get_run(r, &v.len);
+    if (v.ptr != NULL && !{{p}}_reader_utf8((const uint8_t*)v.ptr, v.len)) {
+        free((void*)v.ptr);
+        v.ptr = NULL;
+        v.len = 0;
+        r->failed = true;
+    }
     return v;
 }
 

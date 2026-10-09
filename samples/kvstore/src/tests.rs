@@ -12,7 +12,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
-use weaveffi::abi::{self, ErrorReport, FfiError};
+use weaveffi::abi::{self, ErrorDomain, FfiError};
 use weaveffi::ForeignError;
 
 fn store() -> Arc<Store> {
@@ -22,7 +22,7 @@ fn store() -> Arc<Store> {
 fn put(s: &Arc<Store>, key: &str, value: &[u8]) -> Entry {
     Arc::clone(s)
         .put(key.to_string(), value.to_vec(), EntryKind::Persistent, None)
-        .unwrap_or_else(|e| panic!("put {key}: {}", e.message()))
+        .unwrap_or_else(|e| panic!("put {key}: {e}"))
 }
 
 fn keys(s: &Store, prefix: Option<&str>) -> Result<Vec<String>, KvError> {
@@ -97,7 +97,7 @@ fn capacity_rejects_new_keys_only() {
         .put("b".to_string(), vec![], EntryKind::Volatile, None)
         .unwrap_err();
     assert_eq!(err.code(), 1003);
-    assert_eq!(err.message(), "store is full (1 entries)");
+    assert_eq!(err.to_string(), "store is full (1 entries)");
     assert_eq!(err.payload(), abi::encode_value(&1u32));
     assert_eq!(Store::default_capacity(), 1_000_000);
 }
@@ -197,16 +197,19 @@ struct Gatekeeper {
 }
 
 impl Policy for Gatekeeper {
-    fn admit(&self, entry: &Entry) -> Result<Entry, ForeignError> {
+    fn ttl_for(&self, key: &str, requested: Option<i64>) -> Result<Option<i64>, KvError> {
+        Ok(match key {
+            "short" => Some(1),
+            "forever" => None,
+            _ => requested,
+        })
+    }
+
+    fn admit(&self, entry: &Entry) -> Result<Entry, KvError> {
         if entry.key.starts_with("secret") {
-            let e = KvError::Rejected {
+            return Err(KvError::Rejected {
                 key: entry.key.clone(),
                 reason: "no secrets".to_string(),
-            };
-            return Err(ForeignError {
-                code: e.code(),
-                message: e.message(),
-                payload: e.payload(),
             });
         }
         let mut admitted = entry.clone();
@@ -237,6 +240,13 @@ fn policy_admits_routes_and_rejects() {
     assert_eq!(e.tags, vec!["admitted"]);
     put(&s, "b/x", b"2");
     assert_eq!((s.count(), other.count()), (1, 1));
+    let short = put(&s, "short", b"3");
+    assert_eq!(short.expires_at, Some(1), "the policy picked the TTL");
+    assert_eq!(s.expires_at("short".to_string()), Some(1));
+    let forever = Arc::clone(&s)
+        .put("forever".to_string(), vec![], EntryKind::Volatile, Some(5))
+        .unwrap();
+    assert_eq!(forever.expires_at, None, "the policy dropped the TTL");
     let err = Arc::clone(&s)
         .put("secret".to_string(), vec![], EntryKind::Volatile, None)
         .unwrap_err();
@@ -268,18 +278,14 @@ impl Loader for Shelf {
         Ok(self.fallback.clone())
     }
 
-    fn load(&self, key: &str) -> Result<Vec<u8>, ForeignError> {
+    fn load(&self, key: &str) -> Result<Vec<u8>, KvError> {
         if self.fail {
-            return Err(ForeignError::new(-4, "shelf is broken"));
+            // What a consumer failure that isn't a `KvError` arrives as.
+            return Err(ForeignError::new(-4, "shelf is broken").into());
         }
         if let Some(missing) = &self.missing_key {
-            let e = KvError::KeyNotFound {
+            return Err(KvError::KeyNotFound {
                 key: missing.clone(),
-            };
-            return Err(ForeignError {
-                code: e.code(),
-                message: e.message(),
-                payload: e.payload(),
             });
         }
         Ok(format!("loaded {key}").into_bytes())
@@ -329,8 +335,8 @@ fn loaders_fill_misses() {
         .get_or_load("y".to_string(), Some(shelf(None, None, true)))
         .unwrap_err();
     assert_eq!(
-        (err.code(), err.message()),
-        (-4, "shelf is broken".to_string())
+        (err.code(), err.to_string()),
+        (1006, "shelf is broken".to_string())
     );
 }
 
@@ -407,6 +413,20 @@ struct RejectAll {
     freed: Arc<AtomicBool>,
 }
 
+unsafe extern "C" fn reject_ttl_for(
+    _ctx: *mut c_void,
+    _key_ptr: *const u8,
+    _key_len: usize,
+    has_requested: bool,
+    requested: i64,
+    out_value: *mut i64,
+    _out_err: *mut FfiError,
+) -> bool {
+    // An optional scalar crosses as a presence flag and a value, both ways.
+    unsafe { *out_value = requested * 2 };
+    has_requested
+}
+
 unsafe extern "C" fn reject_admit(
     _ctx: *mut c_void,
     entry_ptr: *const u8,
@@ -422,8 +442,9 @@ unsafe extern "C" fn reject_admit(
         reason: "read-only".to_string(),
     }
     .payload();
+    let message = "rejected";
     unsafe {
-        crate::kvstore_error_set(out_err, 1005, c"rejected".as_ptr());
+        crate::kvstore_error_set(out_err, 1005, message.as_ptr(), message.len());
         crate::kvstore_error_set_payload(out_err, payload.as_ptr(), payload.len());
     }
 }
@@ -449,6 +470,7 @@ static REJECT_VTABLE: kvstore_kv_Policy_vtable = kvstore_kv_Policy_vtable {
         flags: 0,
         free: reject_free,
     },
+    ttl_for: reject_ttl_for,
     admit: reject_admit,
     route: reject_route,
 };
@@ -467,7 +489,6 @@ fn a_typed_callback_error_reaches_the_caller_with_its_payload() {
     assert_eq!(err.code, 0);
 
     let (key, value) = ("k", b"v");
-    let ttl = abi::encode_value(&None::<i64>);
     let mut len = 0usize;
     let out = unsafe {
         kvstore_kv_Store_put(
@@ -477,15 +498,20 @@ fn a_typed_callback_error_reaches_the_caller_with_its_payload() {
             value.as_ptr(),
             value.len(),
             EntryKind::Volatile as i32,
-            ttl.as_ptr(),
-            ttl.len(),
+            false,
+            0,
             &mut len,
             &mut err,
         )
     };
     assert!(out.is_null());
     assert_eq!(err.code, 1005);
-    assert_eq!(unsafe { err.message_str() }, Some("rejected"));
+    // The consumer's code decoded into the typed `KvError`, so the caller
+    // sees that error's own message, rendered from its fields.
+    assert_eq!(
+        unsafe { err.message_str() },
+        Some("write to k rejected: read-only")
+    );
     let mut r = abi::BufferReader::token_free(err.payload());
     assert_eq!(r.read_string().unwrap(), "k");
     assert_eq!(r.read_string().unwrap(), "read-only");
@@ -570,7 +596,7 @@ fn contract_tables_are_exported() {
     assert!(!unsafe { crate::kv::kvstore_kv_contract(&mut len) }.is_null());
     assert!(len > 40);
     assert!(!unsafe { crate::report::kvstore_report_contract(&mut len) }.is_null());
-    assert_eq!(len, 2);
+    assert_eq!(len, 3, "the function, the domain, and its code");
 }
 
 #[test]
@@ -593,7 +619,8 @@ fn listener_vtables_are_released_once() {
         _len: usize,
         out_err: *mut FfiError,
     ) {
-        unsafe { crate::kvstore_error_set(out_err, -4, c"nope".as_ptr()) };
+        let message = "nope";
+        unsafe { crate::kvstore_error_set(out_err, -4, message.as_ptr(), message.len()) };
     }
     static VTABLE: kvstore_kv_Listener_vtable = kvstore_kv_Listener_vtable {
         header: abi::VtableHeader {
@@ -612,4 +639,100 @@ fn listener_vtables_are_released_once() {
     put(&s, "k", b"v");
     assert_eq!(s.listener_count(), 0);
     assert_eq!(FREED.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn optional_scalars_arrays_and_counts() {
+    let s = store();
+    put(&s, "b", b"12");
+    Arc::clone(&s)
+        .put("a".to_string(), vec![1, 2, 3], EntryKind::Volatile, Some(7))
+        .unwrap();
+    assert_eq!(s.count(), 2usize);
+    assert_eq!(s.expires_at("a".to_string()), Some(7));
+    assert_eq!(s.expires_at("b".to_string()), None);
+    assert_eq!(s.expires_at("zzz".to_string()), None);
+    assert_eq!(s.value_sizes(), vec![3, 2]);
+    assert_eq!(collect(s.expirations()), vec![Some(7), None]);
+    assert_eq!(
+        weaveffi::abi::block_on(s.version_of("a".to_string())),
+        Some(1)
+    );
+    assert_eq!(weaveffi::abi::block_on(s.version_of("q".to_string())), None);
+    put(&s, "b", b"x");
+    assert_eq!(
+        weaveffi::abi::block_on(s.versions(vec!["b".into(), "q".into(), "a".into()])),
+        vec![2, 0, 1]
+    );
+}
+
+struct BySize(f64);
+
+impl Scorer for BySize {
+    fn scores(&self, sizes: &[u64]) -> Result<Vec<f64>, ForeignError> {
+        if self.0 < 0.0 {
+            return Err(ForeignError::new(-4, "scorer is broken"));
+        }
+        Ok(sizes.iter().map(|s| *s as f64 * self.0).collect())
+    }
+}
+
+#[test]
+fn rank_orders_by_the_consumers_scores() {
+    let s = store();
+    put(&s, "a", b"1");
+    put(&s, "b", b"333");
+    put(&s, "c", b"22");
+    assert_eq!(s.rank(Arc::new(BySize(1.0))).unwrap(), vec!["b", "c", "a"]);
+    assert_eq!(s.rank(Arc::new(BySize(-1.0))).unwrap_err().code(), 1006);
+}
+
+#[test]
+fn import_lines_fails_untyped() {
+    let s = store();
+    assert_eq!(Arc::clone(&s).import_lines("a=1\n\nb=two\n"), Ok(2));
+    assert_eq!(s.get("b".to_string()).unwrap().value, b"two");
+    assert_eq!(
+        Arc::clone(&s).import_lines("c=3\nbroken\nd=4"),
+        Err("line 2: expected key=value".to_string())
+    );
+    assert_eq!(s.count(), 3, "the lines before the bad one were stored");
+
+    // `import_lines` throws `any`: the generic code and the `String`.
+    let mut err = FfiError::default();
+    let text = "nope";
+    let n = unsafe {
+        kvstore_kv_Store_import_lines(Arc::as_ptr(&s), text.as_ptr(), text.len(), &mut err)
+    };
+    assert_eq!((n, err.code), (0, abi::GENERIC_ERROR_CODE));
+    assert_eq!(
+        unsafe { err.message_str() },
+        Some("line 1: expected key=value")
+    );
+    unsafe { abi::error_clear(&mut err) };
+}
+
+#[test]
+fn a_consumer_policy_returns_optional_scalars() {
+    let freed = Arc::new(AtomicBool::new(false));
+    let ctx = Box::into_raw(Box::new(RejectAll {
+        freed: Arc::clone(&freed),
+    }));
+    // The same wrapper a `set_policy` call builds, driven directly: the
+    // optional TTL crosses as a presence flag plus a value, both ways.
+    let policy = unsafe { abi::lift_callback::<dyn Policy>(ctx.cast(), &REJECT_VTABLE, "p") }
+        .unwrap_or_else(|_| panic!("a valid vtable"));
+    assert_eq!(policy.ttl_for("k", Some(4)), Ok(Some(8)));
+    assert_eq!(policy.ttl_for("k", None), Ok(None));
+    let entry = put(&store(), "k", b"v");
+    assert_eq!(
+        policy.admit(&entry),
+        Err(KvError::Rejected {
+            key: "k".to_string(),
+            reason: "read-only".to_string()
+        }),
+        "a consumer's KvError arrives typed"
+    );
+    drop(policy);
+    assert!(freed.load(Ordering::SeqCst));
 }

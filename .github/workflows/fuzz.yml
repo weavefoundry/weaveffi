@@ -24,7 +24,6 @@ jobs:
         target:
           - fuzz_parse_yaml
           - fuzz_parse_json
-          - fuzz_parse_toml
           - fuzz_parse_type_ref
           - fuzz_validate
           - fuzz_value_buffer
@@ -50,7 +49,7 @@ jobs:
 
       - name: Seed the corpus
         run: |
-          python -m pip install pyyaml tomli-w
+          python -m pip install pyyaml
           python crates/weaveffi-fuzz/seed_corpus.py ${{ matrix.target }} \
             crates/weaveffi-fuzz/corpus/${{ matrix.target }}
 

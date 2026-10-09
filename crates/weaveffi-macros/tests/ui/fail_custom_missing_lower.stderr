@@ -1,0 +1,5 @@
+error: weaveffi: #[weaveffi::custom] needs `lower`; write #[weaveffi::custom(repr = String, lift = parse_fn, lower = format_fn)]
+ --> tests/ui/fail_custom_missing_lower.rs:5:5
+  |
+5 |     #[weaveffi::custom(repr = String, lift = str::parse)]
+  |     ^

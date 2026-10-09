@@ -1,4 +1,4 @@
-version: "0.11.0"
+version: "0.12.0"
 # Exercises multi-level nested modules and type references that cross nesting
 # boundaries in every direction:
 #   * parent  -> nested child   (graphics.Canvas.root : shapes.Shape)
@@ -10,13 +10,14 @@ version: "0.11.0"
 # names each type after its declaring module's underscore-joined path
 # (e.g. Detail in graphics.shapes.geometry -> {prefix}_graphics_shapes_geometry_Detail).
 # The root module also declares an error domain that geometry.compute (two
-# levels down) relies on through domain inheritance for its `throws: true`.
+# levels down) throws by name (`throws: GraphicsError`; domain names are
+# global).
 modules:
   - name: graphics
     errors:
-      name: GraphicsError
-      codes:
-        - { name: OutOfBounds, code: 1, message: "coordinate out of bounds" }
+      - name: GraphicsError
+        codes:
+          - { name: OutOfBounds, code: 1, message: "coordinate out of bounds" }
     enums:
       - name: Unit
         doc: A measurement unit shared with nested submodules.
@@ -64,8 +65,8 @@ modules:
             functions:
               - name: compute
                 doc: Deeper function taking an ancestor-module struct. Throws
-                  through the root module's inherited GraphicsError domain.
+                  the root module's GraphicsError domain.
                 params:
                   - { name: shape, type: Shape }
                 return: Detail
-                throws: true
+                throws: GraphicsError

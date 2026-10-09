@@ -10,7 +10,9 @@ final _errorFree =
 
 /// Builds the error a completion reports and frees its boxed error.
 Object _takeAsyncError(Pointer<_Error> err, _ErrorMapper map) {
-  final error = _readError(err, map);
-  _errorFree(err);
-  return error;
+  try {
+    return _readError(err, map);
+  } finally {
+    _errorFree(err);
+  }
 }

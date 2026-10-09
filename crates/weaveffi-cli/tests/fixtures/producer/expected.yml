@@ -1,4 +1,4 @@
-version: 0.11.0
+version: 0.12.0
 modules:
 - name: receipt
   doc: Receipts, in a sibling tree that uses the shop's record.
@@ -26,7 +26,7 @@ modules:
     doc: |-
       Buy one `name`. Fails with `ShopError::SoldOut` for anything but
       `"tea"`.
-    throws: true
+    throws: ShopError
   - name: list_price
     return: u64
     doc: The list price of everything.
@@ -56,6 +56,7 @@ modules:
       - name: item
         type: Item
       doc: '`item` was added.'
+      throws: any
   structs:
   - name: Item
     doc: Something for sale.
@@ -80,7 +81,7 @@ modules:
       value: 1
       doc: Large.
   errors:
-    name: ShopError
+  - name: ShopError
     codes:
     - name: SoldOut
       code: 1

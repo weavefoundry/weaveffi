@@ -9,22 +9,27 @@
 //! the Android flavor builds it through the NDK's CMake and the JVM flavor
 //! with CMake directly.
 //!
-//! The Kotlin surface: records as `data class`es and rich enums as sealed
-//! classes (decoded from value buffers, with one codec function per
-//! composite type in `Codecs.kt`), C-style enums as `enum class`es, unsigned
-//! integers as `UByte`/`UShort`/`UInt`/`ULong`, interfaces as
-//! `AutoCloseable` wrappers whose calls borrow the native reference (so
-//! neither `close()` nor the phantom-reference cleaner frees it mid-call),
-//! `iter<T>` returns as `NativeIterator<T>`, async callables as `suspend
-//! fun`s (cancellation cancels the native token), callback interfaces as
-//! Kotlin `interface`s (whose methods return any family and may throw the
-//! module's domain exception), and one `object` per module holding its free
-//! functions. A failure of a call that can't fail raises the unchecked
+//! The Kotlin surface: records as `data class`es (with content equality
+//! for `ByteArray` fields) and rich enums as sealed classes (decoded from
+//! value buffers, with one codec function per composite type in
+//! `Codecs.kt`), C-style enums as `enum class`es, unsigned integers as
+//! `UByte`/`UShort`/`UInt`/`ULong`, optional scalars as nullable types and
+//! typed arrays as lists (both crossing JNI without a value buffer),
+//! interfaces as `AutoCloseable` wrappers whose calls borrow the native
+//! reference (so neither `close()` nor the phantom-reference cleaner frees
+//! it mid-call), `iter<T>` returns as `NativeIterator<T>`, async callables
+//! as `suspend fun`s (cancellation cancels the native token), callback
+//! interfaces as Kotlin `interface`s (a `fun interface` with one method),
+//! error domains as exception classes with one subclass per code, and one
+//! `object` per module holding its free functions as `@JvmStatic`s. A
+//! failure of a call that can't fail raises the unchecked
 //! `NativeBugException`. `JNI_OnLoad` checks the ABI revision and every
-//! top-level module's contract table before the first call.
+//! top-level module's contract table before the first call; a failed load
+//! is a catchable `UnsatisfiedLinkError` (see `NativeLibrary.load`).
 
 mod bridge;
 mod calls;
+mod carrier;
 mod codec;
 mod docs;
 mod entities;
@@ -37,11 +42,14 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use weaveffi_model::model::Model;
 
-use crate::backend::{LanguageBackend, OutputFile};
+use crate::codegen::OutputFile;
 use crate::package::{Artifact, PackageContext, PackagedFile};
 use crate::targets::kotlin::runtime::jni_library;
+use crate::targets::{Glue, GlueKind, Target};
 use crate::utils::{render_prelude, render_trailer, CommentStyle};
+use miette::Result;
 
+use crate::targets::kotlin::docs::Speller;
 use crate::targets::kotlin::names::{resolve_package, Names};
 
 /// Which Gradle module the Kotlin target emits.
@@ -94,7 +102,15 @@ impl KotlinConfig {
 }
 
 /// Kotlin backend: a Gradle module with Kotlin sources over a JNI shim.
-pub struct KotlinGenerator;
+pub struct KotlinGenerator {
+    config: KotlinConfig,
+}
+
+impl From<KotlinConfig> for KotlinGenerator {
+    fn from(config: KotlinConfig) -> Self {
+        Self { config }
+    }
+}
 
 /// Everything one generation run renders from.
 struct Plan<'a> {
@@ -105,7 +121,7 @@ struct Plan<'a> {
 }
 
 impl<'a> Plan<'a> {
-    fn new(model: &'a Model, out_dir: &Utf8Path, config: &'a KotlinConfig) -> Self {
+    fn new(model: &'a Model, config: &'a KotlinConfig) -> Self {
         let id = &model.identity;
         let package = resolve_package(config.package(), &id.prefix);
         let names = Names::new(model, &package, &id.library);
@@ -113,7 +129,7 @@ impl<'a> Plan<'a> {
             model,
             names,
             config,
-            dir: out_dir.join("kotlin"),
+            dir: Utf8PathBuf::new(),
         }
     }
 
@@ -214,9 +230,10 @@ impl<'a> Plan<'a> {
                 deprecations,
             ),
         ));
+        let speller = Speller::new(model, n);
         for root in model.roots() {
             let file = format!("{}.kt", n.object(root));
-            let body = entities::render_root(n, model, root);
+            let body = entities::render_root(n, &speller, model, root);
             files.push((
                 src.join(&file),
                 self.kotlin_file(&file, &body, deprecations),
@@ -239,15 +256,31 @@ fn uses_deprecated(model: &Model) -> bool {
     })
 }
 
-impl LanguageBackend for KotlinGenerator {
-    type Config = KotlinConfig;
-
+impl Target for KotlinGenerator {
     fn name(&self) -> &'static str {
         "kotlin"
     }
 
-    fn files(&self, model: &Model, out_dir: &Utf8Path, config: &Self::Config) -> Vec<OutputFile> {
-        Plan::new(model, out_dir, config)
+    fn glue(&self, model: &Model) -> Option<Glue> {
+        let source = format!("{}.c", jni_library(&model.identity.library));
+        Glue::from_files(GlueKind::JniShim, &self.render(model), &source, model)
+    }
+
+    fn fixed_files(&self) -> &'static [&'static str] {
+        &[
+            "Async.kt",
+            "Buffers.kt",
+            "CMakeLists.txt",
+            "Runtime.kt",
+            "build.gradle.kts",
+            "consumer-rules.pro",
+            "settings.gradle.kts",
+        ]
+    }
+
+    fn render(&self, model: &Model) -> Vec<OutputFile> {
+        let config = &self.config;
+        Plan::new(model, config)
             .files()
             .into_iter()
             .map(|(path, contents)| OutputFile::new(path, contents))
@@ -259,12 +292,8 @@ impl LanguageBackend for KotlinGenerator {
     /// `src/main/jniLibs/<abi>/` (so Gradle skips the CMake build), and per
     /// desktop platform under `src/main/resources/natives/<platform>/`,
     /// where the loader extracts them from the classpath.
-    fn package(
-        &self,
-        model: &Model,
-        ctx: &PackageContext,
-        config: &Self::Config,
-    ) -> Option<Vec<Artifact>> {
+    fn package(&self, model: &Model, ctx: &PackageContext<'_>) -> Result<Vec<Artifact>> {
+        let config = &self.config;
         let id = &model.identity;
         let jni = jni_library(&id.library);
         let android: Vec<_> = ctx
@@ -301,9 +330,9 @@ impl LanguageBackend for KotlinGenerator {
             ));
         }
         if natives.is_empty() {
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
-        let plan = Plan::new(model, Utf8Path::new(""), config);
+        let plan = Plan::new(model, config);
         let mut files: Vec<PackagedFile> = plan
             .files()
             .into_iter()
@@ -320,7 +349,7 @@ impl LanguageBackend for KotlinGenerator {
             package::packaged_readme(id, &plan.names.package, ctx),
         ));
         files.extend(natives);
-        Some(vec![Artifact::directory(
+        Ok(vec![Artifact::directory(
             format!("kotlin/{}", id.name),
             files,
         )])

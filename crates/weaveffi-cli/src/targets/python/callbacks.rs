@@ -1,19 +1,21 @@
 //! Callback interfaces: the abstract base class the consumer subclasses,
-//! and the ABI side the producer calls through, satisfying
-//! [`weaveffi_model::plan::CallbackProtocol`]: one `CFUNCTYPE` per method,
+//! and the ABI side the producer calls through: one `CFUNCTYPE` per method,
 //! the `ctypes.Structure` mirroring the C vtable (its `size`, `flags`, and
 //! `free` header first), one trampoline per method, and the single static
 //! vtable whose function objects are pinned at module scope.
 
 use crate::codegen::CodeWriter;
-use weaveffi_model::model::{CallbackInterfaceBinding, CallbackMethodBinding, ParamBinding};
-use weaveffi_model::ty::{Family, Prim, Ty};
+use weaveffi_model::abi::CType;
+use weaveffi_model::model::{
+    CallbackInterfaceBinding, CallbackMethodBinding, CallbackParamBinding,
+};
+use weaveffi_model::plan::{ArgPass, CallbackRetPass, ErrorStrategy};
 
-use crate::targets::python::calls::{adopt_expr, cfunctype, slot_params};
+use crate::targets::python::calls::{adopt_expr, cfunctype, direct_value, slot_params};
 use crate::targets::python::codec::{decode_expr, encode_stmts};
-use crate::targets::python::docs::{fn_docstring, with_deprecation};
+use crate::targets::python::docs::{fn_docstring, ParamDoc};
 use crate::targets::python::types::{
-    py_local, py_member_name, py_name, py_return_hint, py_slot_hint, py_type_hint,
+    int_checker, prim_kind, py_local, py_member_name, py_name, py_slot_hint, py_type_hint, Dir,
 };
 use crate::targets::python::Gen;
 
@@ -22,74 +24,66 @@ use crate::targets::python::Gen;
 ///
 /// Each trampoline looks its implementation up by the integer `ctx`,
 /// converts the arguments, calls the method, and hands the return back
-/// through the C return or the `out_ptr`/`out_len` slots. An exception is
-/// reported through `out_err` (as a domain code when the method declares
-/// errors and raised one, else `-4`) and nothing unwinds through the C
-/// frame. `ctypes` acquires the GIL on entry, so the producer may call from
-/// any thread.
+/// through the C return or the out slots. An exception is reported through
+/// `out_err` (see [`fail_call`]) and nothing unwinds through the C frame.
+/// `ctypes` acquires the GIL on entry, so the producer may call from any
+/// thread; the vtable's `flags` are 0 (not thread-affine).
 pub(crate) fn render_callback_interface(
     w: &mut CodeWriter,
     g: &Gen<'_>,
     cb: &CallbackInterfaceBinding,
-    domain: Option<&str>,
 ) {
     let name = &cb.name;
 
     w.blank().blank();
     w.line(format!("class {name}(abc.ABC):"));
     w.scope(|w| {
-        let mut usage = format!(
+        let usage = format!(
             "Subclass it and implement every method to pass an instance where the\n\
              API takes a `{name}`. The producer may call the methods from any\n\
-             thread until it releases the instance."
+             thread until it releases the instance. An exception a method raises\n\
+             reaches the producer as a failure of that call (a method that throws\n\
+             an error domain reports that domain's codes with their fields)."
         );
-        if let Some(domain) = domain.filter(|_| cb.methods.iter().any(|m| m.throws)) {
-            usage.push_str(&format!(
-                " A method that declares errors may\n\
-                 raise a `{domain}` code, which reaches the producer with its fields;\n\
-                 any other exception reaches it as {}.FOREIGN_ERROR_CODE (-4).",
-                g.root_error
-            ));
-        } else {
-            usage.push_str(&format!(
-                " An exception a method raises\n\
-                 reaches the producer as {}.FOREIGN_ERROR_CODE (-4).",
-                g.root_error
-            ));
-        }
-        let doc = with_deprecation(cb.doc.as_deref(), cb.deprecated.as_deref());
-        let doc = match doc {
+        let doc = match g.doc(&cb.doc, &cb.deprecated) {
             Some(d) => format!("{d}\n\n{usage}"),
             None => usage,
         };
-        fn_docstring(w, Some(&doc), &[], None);
+        fn_docstring(w, Some(&doc), &[], &[]);
         for m in &cb.methods {
             let mut sig: Vec<String> = vec!["self".into()];
             sig.extend(
                 m.params
                     .iter()
-                    .map(|p| format!("{}: {}", py_name(&p.name), py_type_hint(&p.ty))),
+                    .map(|p| format!("{}: {}", py_name(&p.name), py_type_hint(&p.ty, Dir::Out))),
             );
+            let ret = m
+                .ret
+                .as_ref()
+                .map_or_else(|| "None".into(), |t| py_type_hint(t, Dir::In));
             w.blank();
             w.line("@abc.abstractmethod");
             w.line(format!(
-                "def {}({}) -> {}:",
+                "def {}({}) -> {ret}:",
                 py_member_name(&m.name),
                 sig.join(", "),
-                py_return_hint(m.ret.as_ref())
             ));
             w.scope(|w| {
-                let doc = with_deprecation(m.doc.as_deref(), m.deprecated.as_deref());
-                let raises = domain.filter(|_| m.throws).map(|d| {
-                    (
-                        d,
-                        "To report one of the domain's error codes to the producer.",
-                    )
-                });
-                if doc.is_none() && raises.is_none() && m.params.iter().all(|p| p.doc.is_none()) {
+                let doc = g.doc(&m.doc, &m.deprecated);
+                let raises = callback_raises(g, &m.error);
+                let params: Vec<ParamDoc> = m
+                    .params
+                    .iter()
+                    .map(|p| ParamDoc {
+                        name: py_name(&p.name),
+                        hint: py_type_hint(&p.ty, Dir::Out),
+                        doc: g.text(&p.doc),
+                    })
+                    .collect();
+                if doc.is_none() && raises.is_empty() && params.iter().all(|p| p.doc.is_none()) {
                     w.line("...");
                 } else {
-                    fn_docstring(w, doc.as_deref(), &m.params, raises);
+                    fn_docstring(w, doc.as_deref(), &params, &raises);
                 }
             });
         }
@@ -103,7 +97,7 @@ pub(crate) fn render_callback_interface(
         w.line(format!(
             "_{name}_{}_t = {}",
             m.name,
-            cfunctype(&m.abi_ret, &m.abi_params)
+            cfunctype(&m.abi.ret, &m.abi.params)
         ));
     }
     w.blank().blank();
@@ -124,7 +118,7 @@ pub(crate) fn render_callback_interface(
     });
 
     for m in &cb.methods {
-        render_trampoline(w, cb, m, domain.filter(|_| m.throws));
+        render_trampoline(w, g, cb, m);
     }
 
     // The one static vtable. Each field keeps its function object alive, and
@@ -133,7 +127,7 @@ pub(crate) fn render_callback_interface(
     w.line(format!("_{name}_vtable = _{name}Vtable("));
     w.scope(|w| {
         w.line(format!("ctypes.sizeof(_{name}Vtable),"));
-        w.line("0,");
+        w.line("0,  # flags: callable from any thread");
         w.line("_callback_free_fn,");
         for m in &cb.methods {
             w.line(format!("_{name}_{0}_t(_{name}_{0}),", m.name));
@@ -145,63 +139,104 @@ pub(crate) fn render_callback_interface(
     ));
 }
 
+/// The `Raises` entries documenting what an implementation may raise to
+/// report a typed failure.
+fn callback_raises(g: &Gen<'_>, error: &ErrorStrategy) -> Vec<(String, String)> {
+    match error {
+        ErrorStrategy::Domain(name) => vec![(
+            g.domain_class(name).to_string(),
+            "To report one of the domain's codes, with its fields, to the producer.".into(),
+        )],
+        ErrorStrategy::Untyped | ErrorStrategy::Trap => vec![],
+    }
+}
+
 /// The expression converting one trampoline parameter's C slots into the
-/// value handed to the implementation. Strings, bytes, and buffers are
-/// borrowed for the call and copied; an object transfers one strong
-/// reference, which a new wrapper adopts.
-fn trampoline_arg(p: &ParamBinding) -> String {
-    let data = || {
-        format!(
-            "_peek_bytes({}, {})",
-            py_local(&format!("{}_ptr", p.name)),
-            py_local(&format!("{}_len", p.name))
-        )
-    };
-    let n = py_local(&p.name);
-    match p.ty.family() {
-        Family::String => format!("{}.decode(\"utf-8\")", data()),
-        Family::Bytes => data(),
-        Family::Buffer => decode_expr(&data(), &p.ty),
-        Family::Object { nullable } => adopt_expr(&p.ty, &n, nullable),
-        Family::Direct => match &p.ty {
-            Ty::Enum(name) => format!("{name}({n})"),
-            _ => n,
-        },
-        Family::Callback { .. } | Family::Iterator => {
-            unreachable!("callback interfaces and iterators are never callback arguments")
+/// value handed to the implementation. Strings, bytes, buffers, and typed
+/// arrays are borrowed for the call and copied; an object transfers one
+/// strong reference, which a new wrapper adopts.
+fn trampoline_arg(p: &CallbackParamBinding) -> String {
+    let local = |slot: &weaveffi_model::abi::AbiParam| py_local(&slot.name);
+    match &p.pass {
+        ArgPass::Direct { slot } => direct_value(&local(slot), &slot.ty),
+        ArgPass::OptDirect { has, value, .. } => format!(
+            "{} if {} else None",
+            direct_value(&local(value), &value.ty),
+            local(has)
+        ),
+        ArgPass::Slice { ptr, len, elem } => format!(
+            "_peek_array({}, {}, \"{}\")",
+            local(ptr),
+            local(len),
+            prim_kind(*elem)
+        ),
+        ArgPass::String { ptr, len } => {
+            format!(
+                "_peek_bytes({}, {}).decode(\"utf-8\")",
+                local(ptr),
+                local(len)
+            )
+        }
+        ArgPass::Bytes { ptr, len } => format!("_peek_bytes({}, {})", local(ptr), local(len)),
+        ArgPass::Buffer { ptr, len } => decode_expr(
+            &format!("_peek_bytes({}, {})", local(ptr), local(len)),
+            &p.ty,
+        ),
+        ArgPass::Object {
+            slot,
+            nullable,
+            interface,
+        } => adopt_expr(interface, &local(slot), *nullable),
+        ArgPass::Callback { .. } => {
+            unreachable!("validation rejects a callback as a callback method parameter")
         }
     }
 }
 
-/// `(coercion, default)` for a direct return: the conversion applied to the
-/// implementation's result (inside the `try`, so a wrong type is reported
-/// like any other failure), and the value returned after a failure.
-fn direct_return(ty: &Ty) -> (&'static str, &'static str) {
-    match ty {
-        Ty::Prim(Prim::Bool) => ("bool", "False"),
-        Ty::Prim(Prim::F32 | Prim::F64) => ("float", "0.0"),
-        // Integers and C-style enums (an `IntEnum` is an `int`).
-        _ => ("int", "0"),
+/// The statement reporting the caught exception `exc` through `out_err`:
+/// a method that throws a domain reports an exception of that domain as its
+/// code with its fields, and anything else as code -1 with the message
+/// (`throws` a domain or `any`) or -4 (no `throws`).
+fn fail_call(g: &Gen<'_>, error: &ErrorStrategy) -> String {
+    match error {
+        ErrorStrategy::Trap => "_callback_fail(out_err, exc, _FOREIGN)".into(),
+        ErrorStrategy::Untyped => "_callback_fail(out_err, exc, _GENERIC)".into(),
+        ErrorStrategy::Domain(name) => format!(
+            "_callback_fail(out_err, exc, _GENERIC, {})",
+            g.domain_class(name)
+        ),
+    }
+}
+
+/// The expression checking a direct value `expr` an implementation returned
+/// for a slot of C type `ty`, inside the trampoline's `try` (so a wrong type
+/// or an out-of-range integer is reported like any other failure, instead
+/// of `ctypes` truncating it or failing after the trampoline returned).
+fn returned_scalar(expr: &str, ty: &CType, what: &str) -> String {
+    match (int_checker(ty), ty) {
+        (Some(check), _) => format!("{check}({expr}, \"{what}\")"),
+        (None, CType::Bool) => format!("bool({expr})"),
+        (None, _) => format!("_float({expr}, \"{what}\")"),
     }
 }
 
 /// Render the trampoline for one callback method: a `def` whose parameters
 /// are the vtable entry's C slots (`ctx`, the parameter slots, the return's
-/// out slots, `out_err`). `domain` names the error domain whose codes the
-/// method may report (only for a method that declares errors).
+/// out slots, `out_err`).
 fn render_trampoline(
     w: &mut CodeWriter,
+    g: &Gen<'_>,
     cb: &CallbackInterfaceBinding,
     m: &CallbackMethodBinding,
-    domain: Option<&str>,
 ) {
+    let what = format!("{}.{}() result", cb.name, py_member_name(&m.name));
     w.blank().blank();
     w.line(format!(
         "def _{}_{}({}) -> {}:",
         cb.name,
         m.name,
-        slot_params(&m.abi_params),
-        py_slot_hint(&m.abi_ret)
+        slot_params(&m.abi.params),
+        py_slot_hint(&m.abi.ret)
     ));
     w.scope(|w| {
         w.line("try:");
@@ -227,57 +262,98 @@ fn render_trampoline(
                 py_member_name(&m.name),
                 args.join(", ")
             );
-            let Some(ty) = &m.ret else {
-                w.line(call);
-                return;
-            };
-            if ty.family() == Family::Direct {
-                w.line(format!("return {}({call})", direct_return(ty).0));
-                return;
-            }
-            w.line(format!("_ret = {call}"));
-            match ty.family() {
-                Family::Object { nullable } => {
-                    let class = ty.interface_name().expect("object names an interface");
-                    let helper = if nullable {
+            match &m.ret_pass {
+                CallbackRetPass::Void => {
+                    w.line(call);
+                }
+                CallbackRetPass::Direct => {
+                    w.line(format!(
+                        "return {}",
+                        returned_scalar(&call, &m.abi.ret, &what)
+                    ));
+                }
+                CallbackRetPass::OptDirect { out_value } => {
+                    let pointee = match &out_value.ty {
+                        CType::Ptr { pointee, .. } => pointee.as_ref(),
+                        other => other,
+                    };
+                    w.line(format!("_ret = {call}"));
+                    w.line("if _ret is None:");
+                    w.scope(|w| {
+                        w.line("return False");
+                    });
+                    w.line(format!(
+                        "{}[0] = {}",
+                        py_local(&out_value.name),
+                        returned_scalar("_ret", pointee, &what)
+                    ));
+                    w.line("return True");
+                }
+                CallbackRetPass::Slice {
+                    out_ptr,
+                    out_len,
+                    elem,
+                } => {
+                    w.line(format!(
+                        "_callback_return_array({}, {}, {call}, \"{}\", \"{what}\")",
+                        py_local(&out_ptr.name),
+                        py_local(&out_len.name),
+                        prim_kind(*elem)
+                    ));
+                }
+                CallbackRetPass::String { out_ptr, out_len } => {
+                    w.line(format!(
+                        "_callback_return_bytes({}, {}, {call}.encode(\"utf-8\"))",
+                        py_local(&out_ptr.name),
+                        py_local(&out_len.name)
+                    ));
+                }
+                CallbackRetPass::Bytes { out_ptr, out_len } => {
+                    w.line(format!(
+                        "_callback_return_bytes({}, {}, bytes({call}))",
+                        py_local(&out_ptr.name),
+                        py_local(&out_len.name)
+                    ));
+                }
+                CallbackRetPass::Buffer { out_ptr, out_len } => {
+                    let ty = m.ret.as_ref().expect("a buffered return has a type");
+                    w.line(format!("_ret = {call}"));
+                    for line in encode_stmts("_w", "_ret", ty) {
+                        w.line(line);
+                    }
+                    w.line(format!(
+                        "_callback_return_bytes({}, {}, _w.finish())",
+                        py_local(&out_ptr.name),
+                        py_local(&out_len.name)
+                    ));
+                }
+                CallbackRetPass::Object {
+                    nullable,
+                    interface,
+                    ..
+                } => {
+                    let helper = if *nullable {
                         "_callback_return_object_opt"
                     } else {
                         "_callback_return_object"
                     };
-                    w.line(format!("return {helper}(_ret, {class})"));
-                }
-                Family::String => {
-                    w.line("_callback_return_bytes(out_ptr, out_len, _ret.encode(\"utf-8\"))");
-                }
-                Family::Bytes => {
-                    w.line("_callback_return_bytes(out_ptr, out_len, bytes(_ret))");
-                }
-                Family::Buffer => {
-                    for line in encode_stmts("_w", "_ret", ty) {
-                        w.line(line);
-                    }
-                    w.line("_callback_return_bytes(out_ptr, out_len, _w.finish())");
-                }
-                Family::Direct => unreachable!("returned above"),
-                Family::Callback { .. } | Family::Iterator => {
-                    unreachable!("validation rejects {ty} as a callback return")
+                    w.line(format!("return {helper}({call}, {interface})"));
                 }
             }
         });
         w.line("except BaseException as exc:");
         w.scope(|w| {
-            match domain {
-                Some(domain) => w.line(format!("_callback_fail(out_err, exc, {domain})")),
-                None => w.line("_callback_fail(out_err, exc)"),
+            w.line(fail_call(g, &m.error));
+            // The C return after a failure: the producer ignores it.
+            let fallback = match &m.abi.ret {
+                CType::Void => None,
+                CType::Bool => Some("False"),
+                CType::Float | CType::Double => Some("0.0"),
+                ty if py_slot_hint(ty) == "int" => Some("0"),
+                _ => Some("None"),
             };
-            match m.ret.as_ref().map(|ty| (ty, ty.family())) {
-                Some((ty, Family::Direct)) => {
-                    w.line(format!("return {}", direct_return(ty).1));
-                }
-                Some((_, Family::Object { .. })) => {
-                    w.line("return None");
-                }
-                _ => {}
+            if let Some(value) = fallback {
+                w.line(format!("return {value}"));
             }
         });
     });

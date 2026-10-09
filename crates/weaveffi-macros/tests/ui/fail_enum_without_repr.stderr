@@ -1,5 +1,5 @@
 error: enum `Mode` must have #[repr(i32)] to be a #[weaveffi::enumeration]
- --> tests/ui/fail_enum_without_repr.rs:3:5
+ --> tests/ui/fail_enum_without_repr.rs:4:14
   |
-3 |     #[weaveffi::enumeration]
-  |     ^
+4 |     pub enum Mode {
+  |              ^^^^

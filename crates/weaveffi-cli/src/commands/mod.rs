@@ -1,38 +1,52 @@
-//! One module per subcommand. `main.rs` holds only argument parsing and
-//! dispatch; everything a command does lives here, on top of the library's
-//! [`Project`].
+//! The `weaveffi` subcommands, one module each. The binary parses the
+//! arguments and dispatches here; every command returns the process's exit
+//! code, and only the binary renders errors.
+//!
+//! This module is the binary's, not part of the library's API.
 
-pub(crate) mod build;
-pub(crate) mod dev;
-pub(crate) mod diff;
-pub(crate) mod extract;
-pub(crate) mod generate;
-pub(crate) mod init;
-pub(crate) mod package;
-pub(crate) mod validate;
+// The binary is the only caller; its `--help` documents the errors.
+#![allow(clippy::missing_errors_doc)]
+
+pub mod build;
+pub mod dev;
+pub mod extract;
+pub mod generate;
+pub mod init;
+pub mod package;
+pub mod validate;
+
+use std::process::ExitCode;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use miette::{bail, Result};
-use weaveffi_cli::cargo::CargoCrate;
-use weaveffi_cli::project::{Project, Source};
 use weaveffi_model::model::Model;
 
-/// How a command finds its project: the positional input, `--config`, and
-/// `--library`.
+use crate::cargo::CargoCrate;
+use crate::package::Skips;
+use crate::project::{Project, Source};
+
+/// How a command finds its project: the positional input, `--config`,
+/// `--library`, and `--profile`.
 #[derive(Clone, Copy, Default)]
-pub(crate) struct Locate<'a> {
-    pub(crate) input: Option<&'a str>,
-    pub(crate) config: Option<&'a str>,
-    pub(crate) library: Option<&'a str>,
-    pub(crate) release: bool,
-    pub(crate) quiet: bool,
+pub struct Locate<'a> {
+    /// The input: a producer crate or an IDL.
+    pub input: Option<&'a str>,
+    /// `--config`.
+    pub config: Option<&'a str>,
+    /// `--library`.
+    pub library: Option<&'a str>,
+    /// `--profile`.
+    pub profile: Option<&'a str>,
+    /// `--quiet`.
+    pub quiet: bool,
 }
 
 impl Locate<'_> {
-    /// Locate the project.
+    /// Locate the project, building a crate's library with `--profile`
+    /// (default `dev`).
     pub(crate) fn project(&self) -> Result<Project> {
         Ok(Project::locate(self.config, self.input, self.library)?
-            .release(self.release)
+            .profile(self.profile.unwrap_or("dev"))
             .quiet(self.quiet))
     }
 }
@@ -75,5 +89,45 @@ pub(crate) fn producer_crate(project: &Project, manifest: Option<&str>) -> Resul
              --binaries <dir>`"
         );
     }
-    CargoCrate::resolve(&path).map_err(|e| miette::miette!("{e:#}"))
+    CargoCrate::resolve(&path)
+}
+
+/// Summarize the artifacts a `build` or `package` run skipped, returning
+/// the exit code: failure only with `strict`.
+pub(crate) fn finish(skips: &Skips, strict: bool) -> ExitCode {
+    let skipped = skips.list();
+    if skipped.is_empty() {
+        return ExitCode::SUCCESS;
+    }
+    eprintln!(
+        "warning: skipped {} artifact{} because a tool is missing:",
+        skipped.len(),
+        if skipped.len() == 1 { "" } else { "s" }
+    );
+    for s in &skipped {
+        eprintln!("  - {}: {}", s.what, s.reason);
+    }
+    if strict {
+        eprintln!("error: --strict fails on skipped artifacts");
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skipped_artifacts_fail_only_strict_runs() {
+        let code = |skips: &Skips, strict| format!("{:?}", finish(skips, strict));
+        let success = format!("{:?}", ExitCode::SUCCESS);
+        let none = Skips::default();
+        assert_eq!(code(&none, true), success);
+        let some = Skips::default();
+        some.skip("the NuGet package", "no `dotnet` on PATH");
+        assert_eq!(code(&some, false), success);
+        assert_eq!(code(&some, true), format!("{:?}", ExitCode::FAILURE));
+    }
 }

@@ -1,5 +1,5 @@
-error: weaveffi: unsupported primitive type 'usize'; use `u64` or `i64` for sizes and counts (their width is the same on every platform), or `String` for a `char`
+error: weaveffi: unsupported primitive type 'u128'; use `u64`, `i64`, `usize`, or `isize` (which cross as `u64` and `i64`), or a #[weaveffi::custom] type with a `String` repr for wider integers
  --> tests/ui/fail_unsupported_primitive.rs:6:21
   |
-6 |     pub fn count(n: usize) -> i64 {
-  |                     ^^^^^
+6 |     pub fn count(n: u128) -> i64 {
+  |                     ^^^^

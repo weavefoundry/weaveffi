@@ -1,21 +1,19 @@
-//! Unit tests rendering a small IR through the generator: identity-driven
-//! names and layout, configuration overrides, name escaping, the ABI 4 JNI
-//! surface (ptr+len strings, the load-time contract check, cancellation),
-//! unsigned types, the trap, composite codecs, object lifetime, callbacks
-//! (every return family, `throws`, optional callbacks), thread detaching,
-//! iterators, and packaging.
+//! Unit tests of what's specific to the Kotlin target: identity-driven names
+//! and layout, configuration overrides (package, flavor, SDK levels), name
+//! escaping and module objects, JNI name mangling, and packaging. The
+//! `kitchen_sink` snapshot pins the rest of the generated surface.
 
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8PathBuf;
 use weaveffi_model::model::Model;
 use weaveffi_model::pkg::Identity;
 
-use crate::backend::LanguageBackend;
 use crate::package::{FileContent, PackageContext};
 use crate::platform::{BinarySet, NativeBinary, Platform};
 use crate::targets::kotlin::{KotlinConfig, KotlinFlavor, KotlinGenerator};
+use crate::targets::Target;
 
 const FIXTURE: &str = r#"
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: bus
     enums:
@@ -46,21 +44,21 @@ modules:
             params:
               - { name: key, type: string }
             return: bytes
-            throws: true
+            throws: BusError
           - name: weight
             params:
               - { name: count, type: u32 }
             return: u64
     errors:
-      name: BusError
-      codes:
-        - { name: Closed, code: 1, message: "Bus is closed" }
-        - name: Missing
-          code: 2
-          message: "missing"
-          fields:
-            - { name: key, type: string }
-            - { name: tries, type: u16 }
+      - name: BusError
+        codes:
+          - { name: Closed, code: 1, message: "Bus is closed" }
+          - name: Missing
+            code: 2
+            message: "missing"
+            fields:
+              - { name: key, type: string }
+              - { name: tries, type: u16 }
     interfaces:
       - name: Store
         constructors:
@@ -72,7 +70,7 @@ modules:
             params:
               - { name: key, type: string }
             return: "string?"
-            throws: true
+            throws: BusError
           - name: larger
             params:
               - { name: other, type: "Store?" }
@@ -97,7 +95,7 @@ modules:
             return: i64
             async: true
             cancellable: true
-            throws: true
+            throws: BusError
     functions:
       - name: get
         params:
@@ -140,8 +138,8 @@ fn api() -> Model {
 /// Render with `config` and return `(path, contents)` pairs, paths with `/`.
 fn render(config: &KotlinConfig) -> Vec<(String, String)> {
     let model = api();
-    KotlinGenerator
-        .files(&model, Utf8Path::new("out"), config)
+    KotlinGenerator::from(config.clone())
+        .render(&model)
         .into_iter()
         .map(|f| (f.path.as_str().replace('\\', "/"), f.contents))
         .collect()
@@ -165,19 +163,19 @@ fn layout_follows_the_identity() {
     assert_eq!(
         paths,
         [
-            "out/kotlin/settings.gradle.kts",
-            "out/kotlin/build.gradle.kts",
-            "out/kotlin/consumer-rules.pro",
-            "out/kotlin/src/main/cpp/CMakeLists.txt",
-            "out/kotlin/src/main/cpp/event_bus.h",
-            "out/kotlin/src/main/cpp/event_bus_jni.c",
-            "out/kotlin/src/main/kotlin/event_bus/Runtime.kt",
-            "out/kotlin/src/main/kotlin/event_bus/Buffers.kt",
-            "out/kotlin/src/main/kotlin/event_bus/Async.kt",
-            "out/kotlin/src/main/kotlin/event_bus/Codecs.kt",
-            "out/kotlin/src/main/kotlin/event_bus/JniBridge.kt",
-            "out/kotlin/src/main/kotlin/event_bus/Bus.kt",
-            "out/kotlin/src/main/kotlin/event_bus/Units.kt",
+            "settings.gradle.kts",
+            "build.gradle.kts",
+            "consumer-rules.pro",
+            "src/main/cpp/CMakeLists.txt",
+            "src/main/cpp/event_bus.h",
+            "src/main/cpp/event_bus_jni.c",
+            "src/main/kotlin/event_bus/Runtime.kt",
+            "src/main/kotlin/event_bus/Buffers.kt",
+            "src/main/kotlin/event_bus/Async.kt",
+            "src/main/kotlin/event_bus/Codecs.kt",
+            "src/main/kotlin/event_bus/JniBridge.kt",
+            "src/main/kotlin/event_bus/Bus.kt",
+            "src/main/kotlin/event_bus/Units.kt",
         ]
     );
     let runtime = file(&files, "Runtime.kt");
@@ -221,7 +219,7 @@ fn configuration_overrides_package_and_flavor() {
         .all(|(p, _)| !p.ends_with("consumer-rules.pro")));
     assert!(files
         .iter()
-        .any(|(p, _)| p == "out/kotlin/src/main/kotlin/com/example/bus/JniBridge.kt"));
+        .any(|(p, _)| p == "src/main/kotlin/com/example/bus/JniBridge.kt"));
     let gradle = file(&files, "build.gradle.kts");
     assert!(gradle.contains("kotlin(\"jvm\")"));
     assert!(gradle.contains("group = \"com.example.bus\""));
@@ -254,262 +252,6 @@ fn modules_are_objects_and_shadowing_names_are_escaped() {
 }
 
 #[test]
-fn strings_cross_as_bytes_with_lengths() {
-    let files = render(&KotlinConfig::default());
-    let bus = file(&files, "Bus.kt");
-    assert!(bus.contains(
-        "fun get(key: String): String? = handle.borrow { _self ->\n        decodeBuffer(JniBridge.bus_Store_get(_self, encodeUtf8(key))) { _r -> unpackOptionalOfString(_r) }"
-    ));
-    let c = file(&files, "event_bus_jni.c");
-    assert!(c.contains("Jni_bytes p_key_b = Jni_borrow_bytes(env, p_key);"));
-    assert!(c.contains(
-        "event_bus_bus_Store_get((const event_bus_bus_Store*)(intptr_t)self, p_key_b.ptr, p_key_b.len, &out_len, &err);"
-    ));
-    assert!(c.contains("return Jni_take_bytes(env, rv, out_len);"));
-    assert!(c.contains("event_bus_free_bytes((uint8_t*)ptr, len);"));
-    assert!(!c.contains("free_string"));
-    assert!(!c.contains("GetStringUTFChars"));
-}
-
-#[test]
-fn load_checks_the_abi_revision_and_every_root_contract() {
-    let model = api();
-    let files = render(&KotlinConfig::default());
-    let c = file(&files, "event_bus_jni.c");
-    assert!(c.contains("if (event_bus_abi_version() != 4u) {"));
-    assert!(!c.contains("checksum"));
-    for root in model.roots() {
-        let entries = weaveffi_model::contract::entries(&model, root);
-        let var = format!("Jni_contract_{}", root.name);
-        assert!(c.contains(&format!("static const Jni_contract_entry {var}[] = {{")));
-        for e in &entries {
-            assert!(c.contains(&format!(
-                "{{UINT64_C(0x{:016x}), UINT64_C(0x{:016x}), \"{}\"}},",
-                e.id, e.hash, e.path
-            )));
-        }
-        assert!(c.contains(&format!(
-            "if (Jni_check_contract(env, event_bus_{}_contract, {var}, sizeof {var} / sizeof {var}[0]) != JNI_OK) {{",
-            root.name
-        )));
-    }
-    assert!(c.contains("problem = \"is missing from the library\";"));
-    assert!(c.contains("problem = \"changed since these bindings were generated\";"));
-}
-
-#[test]
-fn unsigned_integers_are_kotlin_unsigned_types() {
-    let files = render(&KotlinConfig::default());
-    let bus = file(&files, "Bus.kt");
-    // Public signatures use the unsigned types; the JNI natives carry the
-    // signed type of the same width, converted bit for bit.
-    assert!(bus.contains(
-        "fun scale(by: UByte, totals: Map<ULong, UShort>): List<UInt> = decodeBuffer(JniBridge.bus_scale(by.toByte(), encodeBuffer { _w -> packMapOfU64ToU16(_w, totals) })) { _r -> unpackListOfU32(_r) }"
-    ));
-    assert!(bus.contains(
-        "class Missing(val key: String, val tries: UShort, message: String = \"missing\")"
-    ));
-    assert!(bus.contains("fun weight(count: UInt): ULong"));
-    assert!(bus.contains(
-        "if (JniBridge.bus_Store_SizesIterator_next(_it, _slot)) _slot[0].toUInt() else NativeIterator.DONE"
-    ));
-    let bridge = file(&files, "JniBridge.kt");
-    assert!(bridge
-        .contains("@JvmStatic external fun bus_scale(by: Byte, totals: ByteArray): ByteArray"));
-    assert!(bridge.contains("_impl.weight(count.toUInt()).toLong()"));
-    let buffers = file(&files, "Buffers.kt");
-    assert!(buffers.contains("fun writeU32(v: UInt) = writeI32(v.toInt())"));
-    assert!(buffers.contains("fun readU64(): ULong = readI64().toULong()"));
-    let c = file(&files, "event_bus_jni.c");
-    assert!(c.contains("JNICALL Java_event_1bus_JniBridge_bus_1scale(JNIEnv* env, jclass cls, jbyte p_by, jbyteArray p_totals)"));
-    assert!(c.contains("event_bus_bus_scale((uint8_t)p_by, "));
-    assert!(c.contains("static uint64_t Jni_bus_Subscriber_weight(void* ctx, uint32_t p_count, event_bus_error* out_err)"));
-}
-
-#[test]
-fn composites_have_one_codec_each() {
-    let files = render(&KotlinConfig::default());
-    let codecs = file(&files, "Codecs.kt");
-    assert!(codecs.contains(
-        "internal fun packMapOfU64ToU16(_w: BufferWriter, _v: Map<ULong, UShort>) = _w.writeMap(_v, { _w.writeU64(it) }, { _w.writeU16(it) })"
-    ));
-    assert!(codecs.contains(
-        "internal fun unpackOptionalOfString(_r: BufferReader): String? = _r.readOptional { _r.readString() }"
-    ));
-    assert_eq!(codecs.matches("internal fun packListOfU32(").count(), 1);
-    // Call sites call the codec instead of inlining a loop.
-    for (path, contents) in files.iter().filter(|(p, _)| p.ends_with(".kt")) {
-        if !path.ends_with("Codecs.kt") && !path.ends_with("Buffers.kt") {
-            assert!(
-                !contents.contains("writeList(") && !contents.contains("readOptional"),
-                "{path}"
-            );
-        }
-    }
-}
-
-#[test]
-fn a_failed_call_that_cannot_fail_traps() {
-    let files = render(&KotlinConfig::default());
-    let runtime = file(&files, "Runtime.kt");
-    assert!(runtime.contains(
-        "class NativeBugException(val code: Int, message: String) :\n    IllegalStateException(\"native call failed with code $code: $message\")"
-    ));
-    let bridge = file(&files, "JniBridge.kt");
-    assert!(bridge.contains("1 -> BusException.fromCode(code, text, payload)"));
-    assert!(bridge.contains("else -> NativeBugException(code, text)"));
-    let c = file(&files, "event_bus_jni.c");
-    // `get` throws (domain 1); `larger` can't fail, so its failure traps.
-    assert!(c.contains("\"(II[B[B)Ljava/lang/Throwable;\""));
-    let larger = &c[c.find("bus_1Store_1larger(").unwrap()..];
-    assert!(larger.contains("Jni_throw(env, &err, 0);"));
-    let get = &c[c.find("bus_1Store_1get(").unwrap()..];
-    assert!(get.contains("Jni_throw(env, &err, 1);"));
-}
-
-#[test]
-fn objects_are_borrowed_for_every_call() {
-    let files = render(&KotlinConfig::default());
-    let bus = file(&files, "Bus.kt");
-    assert!(bus.contains("class Store private constructor(address: Long) : AutoCloseable {"));
-    assert!(bus.contains(
-        "internal val handle: NativeHandle = NativeCleaner.register(this, NativeHandle(address, JniBridge::bus_Store_destroy))"
-    ));
-    assert!(bus.contains(
-        "fun larger(other: Store?): Store? = handle.borrow { _self ->\n        other?.handle.borrowOrNull { _h0 ->\n            Store.fromHandleOrNull(JniBridge.bus_Store_larger(_self, _h0))"
-    ));
-    // Objects inside buffers are cloned on the way in and released again if
-    // the encoding fails.
-    assert!(bus.contains("_w.writeObject(_v.source.cloneHandle(), JniBridge::bus_Store_destroy)"));
-    let runtime = file(&files, "Runtime.kt");
-    assert!(runtime.contains("PhantomReference"));
-    assert!(!runtime.contains("java.lang.ref.Cleaner"));
-}
-
-#[test]
-fn cancellable_async_wires_the_token() {
-    let files = render(&KotlinConfig::default());
-    let bus = file(&files, "Bus.kt");
-    assert!(bus.contains(
-        "suspend fun drain(): Long = awaitNative(true, 1, { _raw -> _raw as Long }) { _token, _done ->"
-    ));
-    assert!(bus.contains("JniBridge.bus_Store_drain(_self, _token, _done)"));
-    let runtime = file(&files, "Async.kt");
-    assert!(runtime.contains("cont.invokeOnCancellation { completion.cancel() }"));
-    assert!(runtime.contains("if (code == -5)"));
-    let c = file(&files, "event_bus_jni.c");
-    assert!(c.contains(
-        "(event_bus_cancel_token*)(intptr_t)cancel_token, Jni_done_bus_Store_drain, context);"
-    ));
-    assert!(c.contains("CallVoidMethod(env, (jobject)context, Jni_on_long, (jlong)result);"));
-    assert!(c.contains("Jni_complete_end(env, context, detach);"));
-}
-
-#[test]
-fn callbacks_dispatch_through_cached_static_shims() {
-    let files = render(&KotlinConfig::default());
-    let bridge = file(&files, "JniBridge.kt");
-    assert!(bridge.contains(
-        "fun bus_Subscriber_on_event(_impl: Subscriber, _err: Long, event: ByteArray, note: ByteArray): Int = try {\n        _impl.onEvent(decodeBuffer(event) { _r -> unpackEvent(_r) }, decodeUtf8(note)).value\n    } catch (_e: Throwable) {\n        fail(_err, _e, null)\n        0\n    }"
-    ));
-    let c = file(&files, "event_bus_jni.c");
-    assert!(c.contains(
-        "GetStaticMethodID(env, Jni_bridge, \"bus_Subscriber_on_event\", \"(Levent_bus/Subscriber;J[B[B)I\");"
-    ));
-    assert!(c.contains("AttachCurrentThreadAsDaemon"));
-    assert!(c.contains(
-        "static const event_bus_bus_Subscriber_vtable Jni_bus_Subscriber_vtable = {sizeof(event_bus_bus_Subscriber_vtable), 0, Jni_release_callback, Jni_bus_Subscriber_on_event, Jni_bus_Subscriber_label, Jni_bus_Subscriber_pick, Jni_bus_Subscriber_fetch, Jni_bus_Subscriber_weight};"
-    ));
-    // The shim reports failures itself through these two exports.
-    assert!(c.contains("Java_event_1bus_JniBridge_error_1set(JNIEnv* env, jclass cls, jlong err, jint code, jbyteArray message)"));
-    assert!(
-        c.contains("event_bus_error_set_payload((event_bus_error*)(intptr_t)err, p.ptr, p.len);")
-    );
-    assert!(!c.contains("_dealloc"));
-}
-
-#[test]
-fn callback_methods_return_every_family() {
-    let files = render(&KotlinConfig::default());
-    let bridge = file(&files, "JniBridge.kt");
-    // A string return is encoded; the trampoline copies it into an alloc'd run.
-    assert!(bridge.contains(
-        "fun bus_Subscriber_label(_impl: Subscriber, _err: Long): ByteArray? = try {\n        encodeUtf8(_impl.label())"
-    ));
-    // An object parameter is adopted before anything can fail; an optional
-    // object return is a fresh reference the producer adopts.
-    assert!(bridge.contains(
-        "fun bus_Subscriber_pick(_impl: Subscriber, _err: Long, home: Long): Long {\n        val _home = Store.fromHandle(home)\n        return try {\n            _impl.pick(_home)?.cloneHandle() ?: 0L"
-    ));
-    let c = file(&files, "event_bus_jni.c");
-    assert!(c.contains(
-        "static void Jni_bus_Subscriber_label(void* ctx, uint8_t** out_ptr, size_t* out_len, event_bus_error* out_err) {"
-    ));
-    assert!(c.contains("Jni_callback_return_bytes(env, rv, out_ptr, out_len, out_err);"));
-    assert!(c.contains("uint8_t* run = event_bus_alloc((size_t)len);"));
-    assert!(c.contains("return (event_bus_bus_Store*)(intptr_t)rv;"));
-    // A call that can't reach the JVM still releases the adopted object.
-    assert!(c.contains(
-        "        event_bus_bus_Store_destroy(p_home);\n        return (event_bus_bus_Store*)0;"
-    ));
-}
-
-#[test]
-fn throwing_callbacks_report_their_domain_error() {
-    let files = render(&KotlinConfig::default());
-    let bridge = file(&files, "JniBridge.kt");
-    assert!(bridge.contains("fail(_err, _e, _e as? BusException)"));
-    assert!(bridge.contains("error_set(err, typed.code, encodeUtf8(typed.message ?: \"\"))"));
-    assert!(bridge.contains("typed.encodePayload()?.let { error_set_payload(err, it) }"));
-    assert!(bridge.contains("error_set(err, -4, encodeUtf8(error.message ?: error.toString()))"));
-    let bus = file(&files, "Bus.kt");
-    assert!(bus.contains(
-        "override fun encodePayload(): ByteArray = encodeBuffer { _w ->\n            _w.writeString(key)\n            _w.writeU16(tries)\n        }"
-    ));
-    assert!(bus.contains("Throw a [BusException] to report a typed error to the library."));
-}
-
-#[test]
-fn optional_callbacks_pass_a_null_vtable() {
-    let files = render(&KotlinConfig::default());
-    let bus = file(&files, "Bus.kt");
-    assert!(bus.contains("fun watch(sub: Subscriber?) {"));
-    assert!(bus.contains("JniBridge.bus_Store_watch(_self, sub)"));
-    let bridge = file(&files, "JniBridge.kt");
-    assert!(
-        bridge.contains("@JvmStatic external fun bus_Store_watch(_self: Long, sub: Subscriber?)")
-    );
-    let c = file(&files, "event_bus_jni.c");
-    assert!(c.contains(
-        "p_sub != NULL ? (void*)(*env)->NewGlobalRef(env, p_sub) : NULL, p_sub != NULL ? &Jni_bus_Subscriber_vtable : NULL, &err);"
-    ));
-}
-
-#[test]
-fn producer_threads_detach_on_every_platform() {
-    let files = render(&KotlinConfig::default());
-    let c = file(&files, "event_bus_jni.c");
-    assert!(c.contains("pthread_key_create(&Jni_env_key, Jni_thread_exit) == 0;"));
-    assert!(c.contains("Jni_env_slot = FlsAlloc(Jni_thread_exit);"));
-    assert!(c.contains("*detach = !Jni_remember_attach();"));
-    assert!(c.contains("Jni_env_done(detach);"));
-}
-
-#[test]
-fn iterators_stream_through_native_iterator() {
-    let files = render(&KotlinConfig::default());
-    let bus = file(&files, "Bus.kt");
-    assert!(bus.contains(
-        "fun keys(): NativeIterator<String> = handle.borrow { _self ->\n        NativeIterator(JniBridge.bus_Store_keys(_self), JniBridge::bus_Store_KeysIterator_destroy) { _it ->"
-    ));
-    assert!(bus.contains(
-        "if (JniBridge.bus_Store_CountsIterator_next(_it, _slot)) _slot[0] else NativeIterator.DONE"
-    ));
-    let c = file(&files, "event_bus_jni.c");
-    assert!(c.contains("(*env)->SetIntArrayRegion(env, out, 0, 1, &value);"));
-}
-
-#[test]
 fn package_bundles_prebuilt_binaries() {
     let model = api();
     let mut binaries = BinarySet::new("event_bus");
@@ -534,8 +276,8 @@ fn package_bundles_prebuilt_binaries() {
         "/prebuilt/wasm32/event_bus.wasm",
     ));
     let ctx = PackageContext::new(&binaries);
-    let artifacts = KotlinGenerator
-        .package(&model, &ctx, &KotlinConfig::default())
+    let artifacts = KotlinGenerator::from(KotlinConfig::default())
+        .package(&model, &ctx)
         .expect("kotlin supports packaging");
     assert_eq!(artifacts.len(), 1);
     assert_eq!(artifacts[0].path, "kotlin/event-bus");
@@ -572,12 +314,8 @@ fn package_bundles_prebuilt_binaries() {
         "/prebuilt/android-x64/libevent_bus.so",
     ));
     partial.insert(binaries.get(Platform::AndroidArm64).unwrap().clone());
-    let artifacts = KotlinGenerator
-        .package(
-            &model,
-            &PackageContext::new(&partial),
-            &KotlinConfig::default(),
-        )
+    let artifacts = KotlinGenerator::from(KotlinConfig::default())
+        .package(&model, &PackageContext::new(&partial))
         .unwrap();
     assert!(!artifacts[0]
         .files

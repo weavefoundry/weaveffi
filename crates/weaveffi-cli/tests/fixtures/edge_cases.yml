@@ -1,4 +1,4 @@
-version: "0.11.0"
+version: "0.12.0"
 # Shapes the mainstream fixtures do not reach: identifiers that are reserved
 # words in one or more target languages, interface members spelled like the
 # members object wrappers declare or inherit (close, dispose, handle,
@@ -157,9 +157,9 @@ modules:
             params: []
             return: i32
     errors:
-      name: EdgeErrors
-      codes:
-        - { name: Busy, code: 7, message: "Resource is busy" }
+      - name: EdgeErrors
+        codes:
+          - { name: Busy, code: 7, message: "Resource is busy" }
     interfaces:
       - name: Widget
         doc: Interface with no constructor; instances come from make_widget
@@ -167,7 +167,7 @@ modules:
           - name: refresh
             doc: Void method that can fail
             params: []
-            throws: true
+            throws: EdgeErrors
           - name: rename
             params:
               - { name: class, type: string }
@@ -179,7 +179,7 @@ modules:
               - { name: id, type: i64 }
             return: Outer
             async: true
-            throws: true
+            throws: EdgeErrors
           - name: old_name
             deprecated: "Use rename instead"
             params: []
@@ -200,7 +200,7 @@ modules:
             doc: Fails when the vault is busy
             params:
               - { name: path, type: string }
-            throws: true
+            throws: EdgeErrors
         methods:
           - name: peek
             params: []
@@ -214,7 +214,7 @@ modules:
             doc: Throwing static
             params: []
             return: bool
-            throws: true
+            throws: EdgeErrors
           - name: to_string
             doc: Static spelled like an inherited object member
             params: []
@@ -268,7 +268,7 @@ modules:
         params: []
         return: Widget
         async: true
-        throws: true
+        throws: EdgeErrors
       - name: make_widget
         doc: Factory for an interface with no constructor
         params:
@@ -279,7 +279,7 @@ modules:
         params:
           - { name: id, type: i64 }
         return: "Widget?"
-        throws: true
+        throws: EdgeErrors
       - name: inspect_widget
         doc: Interface parameter, including an optional one
         params:
@@ -311,13 +311,13 @@ modules:
         params: []
         return: Outer
         async: true
-        throws: true
+        throws: EdgeErrors
       - name: async_list
         params: []
         return: "[Outer]"
         async: true
         cancellable: true
-        throws: true
+        throws: EdgeErrors
       - name: async_optional
         params: []
         return: "i64?"

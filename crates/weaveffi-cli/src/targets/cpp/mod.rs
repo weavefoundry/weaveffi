@@ -4,40 +4,39 @@
 //! header `{library}.h` (the same file the [`c`](super::c) target emits), a
 //! wrapper header `{library}.hpp` that includes it, a `CMakeLists.txt`
 //! exporting an INTERFACE target, and a README. Everything lives in
-//! `namespace {prefix}` by default. Implements [`LanguageBackend`]; the
-//! shared driver bridges it into the generator pipeline.
+//! `namespace {prefix}` by default.
 //!
-//! The generated surface follows C ABI revision 4:
+//! The generated surface follows C ABI revision 5, reading every transport
+//! decision from the model's passing contracts:
 //!
 //! * Strings cross as a UTF-8 pointer and length: parameters are
 //!   `std::string_view`, returns are `std::string` copied out of the
 //!   producer's run and released with `{prefix}_free_bytes`.
-//! * Records are plain value structs; rich enums are `std::variant`-backed
-//!   sum types with one payload struct per variant. Both cross as value
-//!   buffers through one generated writer and reader per record, rich enum,
-//!   and distinct composite type (`[Entry]`, `{string:i64}`, `Store?`) in
-//!   `detail`.
-//! * Interfaces are RAII classes holding one strong reference: the destructor
-//!   calls `_destroy`, copying calls `_clone`, and moving transfers the
-//!   pointer. A parameter is borrowed; a returned object, an async result,
-//!   an iterator element, and an object argument handed to a callback are
-//!   adopted. Inside a value buffer an object is a token minted with
-//!   `_clone`.
-//! * Callback interfaces are abstract classes passed as `std::shared_ptr`
-//!   (empty for an optional `Cb?`). The wrapper boxes the pointer as `ctx`
-//!   and hands the producer a static vtable with the `{size, flags, free}`
-//!   header. Methods return any family (strings, bytes, and buffers through
-//!   a `{prefix}_alloc` run); a `throws` method reports the module's domain
-//!   exception with its fields as the payload, and any other exception as
-//!   -4.
-//! * Free functions live in a nested namespace per IDL module
-//!   (`kvstore::kv::stats::summarize`).
-//! * An `iter<T>` callable returns a move-only lazy range; async callables
-//!   return `std::future<T>`, and a cancellable one takes a trailing
-//!   `const CancelToken&`.
-//! * A throwing call throws its module's domain exception (`KvError` and a
-//!   subclass per code), the root `Error` for a runtime code, or `Cancelled`.
-//!   A call that declares no errors throws `InternalError` (the trap policy).
+//! * Optional scalars and enums (OptDirect) are `std::optional<T>` passed
+//!   as a presence flag and a value; numeric lists (Slice) are
+//!   `std::vector<T>` whose storage is passed as is, and returned typed
+//!   arrays are copied into a vector.
+//! * Records are aggregates with default member initializers and memberwise
+//!   `operator==`; rich enums are `std::variant`-backed sum types. Both
+//!   cross as value buffers through one `detail::write` and `detail::read`
+//!   overload each; optionals, vectors, and maps are encoded by generic
+//!   templates in the runtime, never by a function per composite.
+//! * Interfaces are classes holding a Rule-of-Zero `detail::Handle` (one
+//!   strong reference: copies `_clone`, destruction `_destroy`), compared
+//!   by identity.
+//! * Callback interfaces are abstract classes passed as `std::shared_ptr`.
+//!   A `detail::Callbacks<I>` specialization holds the trampolines and the
+//!   static vtable (flags 0); each method reports exceptions per its own
+//!   error strategy.
+//! * Every exception derives from `{namespace}::Error`: an error domain's
+//!   class and its codes' classes (an unknown positive code is the domain
+//!   class: domains are open), `Error` itself for `throws: any` and runtime
+//!   codes, `InternalError` for a call that declares no errors (the trap
+//!   policy), `Cancelled`, and `LoadError`. One `detail::Errors<E>`
+//!   policy per exception class raises and reports them.
+//! * An `iter<T>` callable returns the generic lazy `Range<T>`; async
+//!   callables return `std::future<T>`, and a cancellable one takes a
+//!   trailing `const CancelToken&`.
 //! * `check_library()` verifies the producer's ABI revision and every
 //!   top-level module's contract table once, and throws `LoadError` naming
 //!   the first declaration the library lacks or changed. Every free
@@ -51,29 +50,32 @@ mod package;
 mod runtime;
 mod types;
 
-use crate::backend::{LanguageBackend, OutputFile};
 use crate::codegen::CodeWriter;
+use crate::codegen::OutputFile;
 use crate::package::{per_platform_libraries, Artifact, PackageContext, PackagedFile};
 use crate::platform::Platform;
 use crate::targets::c::{header_name as c_header_name, render_c_header_from_model};
+use crate::targets::{Linkage, Target};
 use crate::utils::{render_prelude, render_trailer, CommentStyle};
-use camino::Utf8Path;
+use camino::Utf8PathBuf;
+use miette::Result;
 use serde::{Deserialize, Serialize};
 use weaveffi_model::model::{EnumBinding, Model};
 use weaveffi_model::pkg::Identity;
 
+use crate::codegen::errors;
 use crate::targets::cpp::callbacks::render_callback_interface;
 use crate::targets::cpp::calls::render_cpp_module_ns;
 use crate::targets::cpp::codec::render_codecs;
 use crate::targets::cpp::entities::{
-    render_cpp_enums, render_cpp_interface_class, render_cpp_interface_forward_decls,
-    render_cpp_interface_iterators, render_cpp_interface_members, render_domain_error,
-    value_types_in_order,
+    render_cpp_enums, render_cpp_interface_class, render_cpp_interface_members,
+    render_domain_error, value_types_in_order,
 };
 use crate::targets::cpp::package::{
     render_cmake, render_packaged_cmake, render_packaged_readme, render_readme, CmakeNames,
 };
 use crate::targets::cpp::runtime::{render_buffer_runtime, render_prelude_runtime};
+use crate::targets::cpp::types::Ctx;
 
 /// Per-target configuration for [`CppGenerator`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -113,7 +115,15 @@ impl CppConfig {
 
 /// C++ backend: emits a wrapper header (`{library}.hpp` by default), a copy
 /// of the C header it includes, a `CMakeLists.txt`, and a README.
-pub struct CppGenerator;
+pub struct CppGenerator {
+    config: CppConfig,
+}
+
+impl From<CppConfig> for CppGenerator {
+    fn from(config: CppConfig) -> Self {
+        Self { config }
+    }
+}
 
 /// The names every rendered file agrees on, resolved once per run.
 struct Names {
@@ -145,15 +155,22 @@ impl Names {
     }
 }
 
-impl LanguageBackend for CppGenerator {
-    type Config = CppConfig;
-
+impl Target for CppGenerator {
     fn name(&self) -> &'static str {
         "cpp"
     }
 
-    fn files(&self, model: &Model, out_dir: &Utf8Path, config: &Self::Config) -> Vec<OutputFile> {
-        let dir = out_dir.join("cpp");
+    fn linkage(&self) -> Linkage {
+        Linkage::Link
+    }
+
+    fn fixed_files(&self) -> &'static [&'static str] {
+        &["CMakeLists.txt", "README.md"]
+    }
+
+    fn render(&self, model: &Model) -> Vec<OutputFile> {
+        let config = &self.config;
+        let dir = Utf8PathBuf::new();
         let names = Names::new(model, config);
         let cmake = names.cmake(&model.identity, config);
         vec![
@@ -171,12 +188,8 @@ impl LanguageBackend for CppGenerator {
     /// `include/`, the desktop libraries under `lib/<platform>/`, and a
     /// `CMakeLists.txt` that links the host's library into the wrapper's
     /// interface target.
-    fn package(
-        &self,
-        model: &Model,
-        ctx: &PackageContext,
-        config: &Self::Config,
-    ) -> Option<Vec<Artifact>> {
+    fn package(&self, model: &Model, ctx: &PackageContext<'_>) -> Result<Vec<Artifact>> {
+        let config = &self.config;
         let identity = &model.identity;
         let names = Names::new(model, config);
         let cmake = names.cmake(identity, config);
@@ -198,11 +211,11 @@ impl LanguageBackend for CppGenerator {
         // packages) are not bundled here.
         let desktop = per_platform_libraries(ctx.binaries, "lib", Platform::is_desktop);
         if desktop.is_empty() {
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
         files.extend(desktop);
         let stem = format!("{lib}-{}", identity.version);
-        Some(vec![Artifact::tar_gz(
+        Ok(vec![Artifact::tar_gz(
             format!("cpp/{stem}-cpp.tar.gz"),
             stem,
             files,
@@ -216,55 +229,53 @@ impl LanguageBackend for CppGenerator {
 /// Layout inside `namespace {namespace}`, in an order that keeps every type
 /// complete before it's held by value or marshalled:
 ///
-/// 1. the runtime: error types, the adopt tag, `CancelToken`, helpers,
-///    `check_library()` with the expected contract tables, and the
-///    value-buffer reader and writer (when any value crosses as a buffer);
+/// 1. the runtime: exceptions, the generic `detail` machinery, `Range`,
+///    `CancelToken`, `check_library()` with the expected contract tables,
+///    and the value-buffer codecs (when any value crosses as a buffer);
 /// 2. C-style enums;
-/// 3. forward declarations of every value type, interface class,
-///    callback-interface class, and member range class;
-/// 4. interface classes (the RAII skeleton plus member *declarations*), so
-///    records can hold objects by value;
+/// 3. forward declarations of every value type, interface class, and
+///    callback-interface class;
+/// 4. interface classes (the handle plus member *declarations*), so records
+///    can hold objects by value;
 /// 5. value types (records and rich enums) in dependency order;
-/// 6. the codecs of every value and composite type;
-/// 7. typed exception domains;
-/// 8. callback-interface abstract classes, trampolines, and vtables;
-/// 9. the range classes of iterator-returning members;
-/// 10. the out-of-line definitions of every interface member; and
-/// 11. one nested namespace per module holding its free functions.
+/// 6. the codec overloads of every value type;
+/// 7. error domains and their `detail::Errors` policies;
+/// 8. callback-interface abstract classes and their `detail::Callbacks`;
+/// 9. the out-of-line definitions of every interface member; and
+/// 10. one nested namespace per module holding its free functions.
 pub(crate) fn render_cpp_header(
     model: &Model,
     namespace: &str,
     c_header: &str,
     filename: &str,
 ) -> String {
-    let prefix = model.prefix();
+    let ctx = Ctx::new(model);
     let mut includes = vec![
         "cstddef",
         "cstdint",
         "cstring",
         "exception",
+        "future",
+        "iterator",
         "memory",
         "new",
         "optional",
         "stdexcept",
         "string",
         "string_view",
-        "unordered_map",
+        "type_traits",
         "utility",
         "vector",
     ];
+    if model.has_buffers() {
+        includes.push("unordered_map");
+    }
     if model
         .modules
         .iter()
         .any(|m| m.enums.iter().any(EnumBinding::is_rich))
     {
         includes.push("variant");
-    }
-    if model.has_async() {
-        includes.push("future");
-    }
-    if model.has_iterators() {
-        includes.push("iterator");
     }
     includes.sort_unstable();
 
@@ -281,12 +292,14 @@ pub(crate) fn render_cpp_header(
     w.line(format!("namespace {namespace} {{"));
     w.blank();
     render_prelude_runtime(&mut w, model);
+    w.blank();
     if model.has_buffers() {
-        render_buffer_runtime(&mut w, prefix);
+        render_buffer_runtime(&mut w, ctx.prefix);
+        w.blank();
     }
 
     for module in &model.modules {
-        render_cpp_enums(&mut w, module);
+        render_cpp_enums(&mut w, &ctx, module);
     }
 
     // Forward declarations let member declarations name any type before its
@@ -302,7 +315,7 @@ pub(crate) fn render_cpp_header(
             forward = true;
         }
         for i in &module.interfaces {
-            render_cpp_interface_forward_decls(&mut w, i);
+            w.line(format!("class {};", i.name));
             forward = true;
         }
         for cb in &module.callback_interfaces {
@@ -316,40 +329,27 @@ pub(crate) fn render_cpp_header(
 
     for module in &model.modules {
         for i in &module.interfaces {
-            render_cpp_interface_class(&mut w, i, model.error_domain(module));
+            render_cpp_interface_class(&mut w, &ctx, i);
         }
     }
-    for def in value_types_in_order(&model.modules) {
-        def.render(&mut w);
+    let values = value_types_in_order(&model.modules);
+    for def in &values {
+        def.render(&mut w, &ctx);
     }
-    render_codecs(&mut w, model);
-
-    // A domain reports exceptions back to the producer only when a throwing
-    // callback method has it in scope.
-    for module in &model.modules {
-        if let Some(eb) = &module.errors {
-            let reports = model.callback_interfaces().any(|(m, cb)| {
-                model.error_domain(m).is_some_and(|d| d.c_tag == eb.c_tag)
-                    && cb.methods.iter().any(|meth| meth.throws)
-            });
-            render_domain_error(&mut w, module, eb, prefix, reports);
-        }
+    render_codecs(&mut w, &values);
+    for table in errors::tables(model, "Error") {
+        render_domain_error(&mut w, &ctx, &table);
     }
-    for (module, cb) in model.callback_interfaces() {
-        render_callback_interface(&mut w, cb, model.error_domain(module), prefix);
+    for (_, cb) in model.callback_interfaces() {
+        render_callback_interface(&mut w, &ctx, cb);
     }
     for module in &model.modules {
         for i in &module.interfaces {
-            render_cpp_interface_iterators(&mut w, i, model.error_domain(module), prefix);
+            render_cpp_interface_members(&mut w, &ctx, i);
         }
     }
     for module in &model.modules {
-        for i in &module.interfaces {
-            render_cpp_interface_members(&mut w, i, model.error_domain(module), prefix);
-        }
-    }
-    for module in &model.modules {
-        render_cpp_module_ns(&mut w, module, model.error_domain(module), prefix);
+        render_cpp_module_ns(&mut w, &ctx, module);
     }
     w.line(format!("}} // namespace {namespace}"));
     w.blank();

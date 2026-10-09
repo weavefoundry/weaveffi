@@ -128,8 +128,10 @@ pub struct FfiError {
     /// Status code. `0` means success; a positive value is a domain error
     /// code and a negative value is one of the reserved runtime codes.
     pub code: i32,
-    /// Owned, NUL-terminated UTF-8 message, or null when `code` is `0`.
-    pub message: *const c_char,
+    /// Owned UTF-8 message (not NUL-terminated), or null when it's empty.
+    pub message_ptr: *const u8,
+    /// Byte length of `message_ptr`; `0` when null.
+    pub message_len: usize,
     /// Owned value buffer holding the error code's payload fields, or null
     /// when the code declares no fields.
     pub payload_ptr: *const u8,
@@ -190,7 +192,7 @@ is the Rust analog of the docs site's autorefs:
 /// Renders from the shared [`Model`], never re-deriving lowering.
 ///
 /// See [`Api`](weaveffi_model::ir::Api) for the input model and
-/// [`LanguageBackend`](crate::backend::LanguageBackend) for the trait every
+/// [`Target`](crate::targets::Target) for the trait every
 /// generator implements.
 ```
 

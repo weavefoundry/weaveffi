@@ -1,5 +1,4 @@
-//! Multi-format IDL parsing: turn YAML, JSON, or TOML source text into an
-//! [`Api`].
+//! Multi-format IDL parsing: turn YAML or JSON source text into an [`Api`].
 //!
 //! [`parse_api_str`] is the entry point. On failure it returns a [`ParseError`]
 //! that carries the source text and, where available, a `miette` span, so the
@@ -15,10 +14,10 @@ use miette::{Diagnostic, SourceSpan};
 /// span into the original source so the CLI can render a caret-annotated error.
 #[derive(Debug, thiserror::Error, Diagnostic)]
 pub enum ParseError {
-    /// The requested format wasn't one of `yaml`, `yml`, `json`, or `toml`.
-    /// Carries the unrecognized format string.
+    /// The requested format wasn't one of `yaml`, `yml`, or `json`. Carries
+    /// the unrecognized format string.
     #[error("unsupported format: {0}")]
-    #[diagnostic(help("supported formats are 'yaml', 'yml', 'json', and 'toml'"))]
+    #[diagnostic(help("supported formats are 'yaml', 'yml', and 'json'"))]
     UnsupportedFormat(String),
     /// The YAML deserializer rejected the document.
     #[error("YAML parse error at line {line}, column {column}: {message}")]
@@ -30,21 +29,6 @@ pub enum ParseError {
         line: usize,
         /// 1-indexed column of the error, or `0` when the location is unknown.
         column: usize,
-        /// Message reported by the underlying deserializer.
-        message: String,
-        /// Full source text, retained so the diagnostic can render a snippet.
-        #[source_code]
-        src: String,
-        /// Byte span of the offending location within `src`, when known.
-        #[label("here")]
-        span: Option<SourceSpan>,
-    },
-    /// The TOML deserializer rejected the document.
-    #[error("TOML parse error: {message}")]
-    #[diagnostic(help(
-        "check TOML syntax: keys, table headers, and that values use the correct types"
-    ))]
-    Toml {
         /// Message reported by the underlying deserializer.
         message: String,
         /// Full source text, retained so the diagnostic can render a snippet.
@@ -102,20 +86,20 @@ pub fn line_col_to_offset(src: &str, line: usize, col: usize) -> usize {
 
 /// Parse IDL source text in the given format into an [`Api`].
 ///
-/// `format` selects the deserializer: `yaml` or `yml` for YAML, `json` for
-/// JSON, and `toml` for TOML. On failure the returned [`ParseError`] captures
+/// `format` selects the deserializer: `yaml` or `yml` for YAML and `json`
+/// for JSON. On failure the returned [`ParseError`] captures
 /// the source text and, when the deserializer reports one, a span for a rich
 /// diagnostic.
 ///
 /// # Errors
 ///
 /// Returns [`ParseError::UnsupportedFormat`] when `format` isn't a recognized
-/// format string, or the matching [`Yaml`](ParseError::Yaml),
-/// [`Json`](ParseError::Json), or [`Toml`](ParseError::Toml) variant when the
-/// source text is malformed or doesn't match the schema.
+/// format string, or the matching [`Yaml`](ParseError::Yaml) or
+/// [`Json`](ParseError::Json) variant when the source text is malformed or
+/// doesn't match the schema.
 pub fn parse_api_str(s: &str, format: &str) -> Result<Api, ParseError> {
     match format {
-        "yaml" | "yml" => serde_yaml::from_str(s).map_err(|e| {
+        "yaml" | "yml" => serde_yaml_ng::from_str(s).map_err(|e| {
             let (line, column) = e
                 .location()
                 .map(|m| (m.line(), m.column()))
@@ -155,14 +139,6 @@ pub fn parse_api_str(s: &str, format: &str) -> Result<Api, ParseError> {
                 span,
             }
         }),
-        "toml" => toml::from_str(s).map_err(|e| {
-            let span = e.span().map(|r| SourceSpan::new(r.start.into(), r.len()));
-            ParseError::Toml {
-                message: e.to_string(),
-                src: s.to_string(),
-                span,
-            }
-        }),
         other => Err(ParseError::UnsupportedFormat(other.to_string())),
     }
 }
@@ -195,7 +171,7 @@ mod tests {
                     ],
                     returns: Some(TypeRef::Prim(Prim::I32)),
                     doc: Some("Adds two numbers".to_string()),
-                    throws: false,
+                    throws: None,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -204,7 +180,7 @@ mod tests {
                 callback_interfaces: vec![],
                 structs: vec![],
                 enums: vec![],
-                errors: None,
+                errors: vec![],
                 modules: vec![],
             }],
         }
@@ -213,7 +189,7 @@ mod tests {
     #[test]
     fn every_format_parses_the_same_document() {
         let yaml = r#"
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: math
     functions:
@@ -227,7 +203,7 @@ modules:
         doc: "Adds two numbers"
 "#;
         let json = r#"{
-            "version": "0.11.0",
+            "version": "0.12.0",
             "modules": [{
                 "name": "math",
                 "functions": [{
@@ -241,29 +217,9 @@ modules:
                 }]
             }]
         }"#;
-        let toml_str = r#"
-version = "0.11.0"
-
-[[modules]]
-name = "math"
-
-[[modules.functions]]
-name = "add"
-return = "i32"
-doc = "Adds two numbers"
-
-[[modules.functions.params]]
-name = "a"
-type = "i32"
-
-[[modules.functions.params]]
-name = "b"
-type = "i32"
-"#;
         assert_eq!(parse_api_str(yaml, "yaml").unwrap(), expected_api());
         assert_eq!(parse_api_str(yaml, "yml").unwrap(), expected_api());
         assert_eq!(parse_api_str(json, "json").unwrap(), expected_api());
-        assert_eq!(parse_api_str(toml_str, "toml").unwrap(), expected_api());
     }
 
     #[test]
@@ -271,6 +227,10 @@ type = "i32"
         assert!(matches!(
             parse_api_str("", "xml"),
             Err(ParseError::UnsupportedFormat(f)) if f == "xml"
+        ));
+        assert!(matches!(
+            parse_api_str("version = \"0.12.0\"", "toml"),
+            Err(ParseError::UnsupportedFormat(f)) if f == "toml"
         ));
     }
 
@@ -286,7 +246,7 @@ type = "i32"
 
     #[test]
     fn parse_errors_carry_spans() {
-        let yaml = "version: \"0.11.0\"\nmodules:\n  - name: [oops\n";
+        let yaml = "version: \"0.12.0\"\nmodules:\n  - name: [oops\n";
         match parse_api_str(yaml, "yaml").unwrap_err() {
             ParseError::Yaml { line, span, .. } => {
                 assert!(line > 0);
@@ -298,15 +258,11 @@ type = "i32"
             ParseError::Json { line, column, .. } => assert!(line > 0 && column > 0),
             other => panic!("expected JSON error, got {other:?}"),
         }
-        match parse_api_str("version = ", "toml").unwrap_err() {
-            ParseError::Toml { span, .. } => assert!(span.is_some()),
-            other => panic!("expected TOML error, got {other:?}"),
-        }
     }
 
     #[test]
     fn unknown_type_syntax_is_a_parse_error() {
-        let yaml = "version: \"0.11.0\"\nmodules:\n  - name: m\n    functions:\n      - name: f\n        params: [{ name: x, type: \"{string}\" }]\n";
+        let yaml = "version: \"0.12.0\"\nmodules:\n  - name: m\n    functions:\n      - name: f\n        params: [{ name: x, type: \"{string}\" }]\n";
         let err = parse_api_str(yaml, "yaml").unwrap_err();
         assert!(err.to_string().contains("map type missing"), "{err}");
     }

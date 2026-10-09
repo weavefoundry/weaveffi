@@ -8,4 +8,4 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/js.sh"
 require node
 
-js_check "$dir" index.js runtime.js linear.js
+js_check "$dir" index.js runtime.js debug.js linear.js

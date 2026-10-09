@@ -5,7 +5,7 @@ use crate::targets::js::test_api;
 
 fn files(name: &str, config: &NodeConfig) -> Vec<OutputFile> {
     let model = test_api(name);
-    NodeGenerator.files(&model, Utf8Path::new("out"), config)
+    NodeGenerator::from(config.clone()).render(&model)
 }
 
 fn file(files: &[OutputFile], name: &str) -> String {
@@ -31,6 +31,8 @@ fn the_package_is_named_after_the_identity() {
             "index.js",
             "index.d.ts",
             "runtime.js",
+            "debug.js",
+            "debug.d.ts",
             "acme_kv_node.c",
             "acme_kv.h",
             "binding.gyp",
@@ -38,17 +40,34 @@ fn the_package_is_named_after_the_identity() {
             "README.md"
         ]
     );
-    has(&file(&out, "package.json"), "\"name\": \"acme-kv\",");
-    has(
-        &file(&out, "binding.gyp"),
-        "\"target_name\": \"acme_kv_node\",",
+    let manifest: serde_json::Value =
+        serde_json::from_str(&file(&out, "package.json")).expect("valid package.json");
+    assert_eq!(manifest["name"], "acme-kv");
+    assert_eq!(
+        manifest["exports"]["./debug"],
+        serde_json::json!({ "types": "./debug.d.ts", "default": "./debug.js" })
     );
-    has(&file(&out, "binding.gyp"), "\"-lacme_kv\"");
+    assert_eq!(
+        manifest["files"],
+        serde_json::json!([
+            "index.js",
+            "index.d.ts",
+            "runtime.js",
+            "debug.js",
+            "debug.d.ts",
+            "binding.gyp",
+            "acme_kv_node.c",
+            "acme_kv.h"
+        ])
+    );
+    let gyp = file(&out, "binding.gyp");
+    has(&gyp, "\"target_name\": \"acme_kv_node\",");
+    has(&gyp, "\"-lacme_kv\"");
     has(
-        &file(&out, "binding.gyp"),
+        &gyp,
         "process.env.ACME_KV_LIBRARY || process.env.npm_config_acme_kv_library",
     );
-    has(&file(&out, "binding.gyp"), "-Wl,-rpath,@loader_path");
+    has(&gyp, "-Wl,-rpath,@loader_path");
     has(
         &file(&out, "index.js"),
         "const $raw = $loadAddon('acme_kv_node.node');",
@@ -70,124 +89,52 @@ fn the_package_is_named_after_the_identity() {
 }
 
 #[test]
-fn index_checks_the_contract_at_load() {
-    let js = file(&files("kv", &NodeConfig::default()), "index.js");
-    has(&js, "$raw.$setup($Fault);");
-    has(&js, "const $contract = [\n  ['kv', [\n");
-    has(&js, "'kv.Store.get'],\n");
-    has(&js, "\n$verify($raw, 'kv', 'kv', 4, $contract);\n");
+fn the_leak_counters_are_not_public_api() {
+    let out = files("kv", &NodeConfig::default());
+    let index = file(&out, "index.js");
+    assert!(!index.contains("export function __debugLive"), "{index}");
+    has(&index, "$setLive((kind) => $raw.kv_debug_live(kind));");
+    assert!(!file(&out, "index.d.ts").contains("debugLive"));
     has(
-        &js,
-        "export { KvError, CancelledError } from './runtime.js';",
+        &file(&out, "debug.d.ts"),
+        "export declare function debugLive(kind: number): bigint;",
     );
-    assert!(!js.contains("checksum"), "{js}");
 }
 
 #[test]
-fn addon_exports_every_symbol_with_the_raw_convention() {
+fn addon_symbols_and_slots_follow_the_lowered_signatures() {
     let c = file(&files("kv", &NodeConfig::default()), "kv_node.c");
     assert!(!c.contains("{{"), "unsubstituted placeholder");
-    assert!(!c.contains("checksum") && !c.contains("dealloc"), "{c}");
     has(&c, "#include \"kv.h\"");
-    has(&c, "typedef kv_error js_error;");
-    for symbol in [
-        "kv_kv_contract",
-        "kv_kv_Store_new",
-        "kv_kv_Store_clone",
-        "kv_kv_Store_destroy",
-        "kv_kv_Store_ScanIterator_next",
-        "kv_kv_Store_ScanIterator_destroy",
-        "kv_kv_Store_wait",
-        "kv_kv_stats_count",
-    ] {
-        has(
-            &c,
-            &format!("{{\"{symbol}\", NULL, nx_{symbol}, NULL, NULL, NULL, napi_default, NULL}},"),
-        );
-    }
+    // Optional scalars cross as a flag and a value; their absence is null.
     has(
         &c,
-        "  const kv_contract_entry* table = kv_kv_contract(&len);\n  return js_new_contract(env, table, len);",
-    );
-    // Strings cross as (ptr, len); a returned string is freed after copying.
-    // Every call into the library is bracketed for the callback hop.
-    has(
-        &c,
-        "js_sync_begin();\n    const uint8_t* r = kv_kv_Store_get((const kv_kv_Store*)self_h, JS_STR_PTR(a0), a0.len, &out_len, &err);\n    js_sync_end();",
-    );
-    has(&c, "ret = js_take_bytes(env, r, out_len);");
-    // A cancellable launcher takes the token handle after its inputs.
-    has(
-        &c,
-        "if (!js_arg_handle(env, argv[2], &token, true)) goto done;",
-    );
-    has(&c, "kv_kv_Store_wait((const kv_kv_Store*)self_h, a0, (kv_cancel_token*)token, done_kv_kv_Store_wait, a);");
-    has(
-        &c,
-        "static void done_kv_kv_Store_wait(void* context, kv_error* err, int64_t result) {",
+        "if (js_present(env, argv[0], &a0_has) && !js_arg_u16(env, argv[0], &a0)) goto done;",
     );
     has(
         &c,
-        "js_async* a = js_async_begin(env, JS_R_HANDLE, \"kv_kv_Store_fetch\", &ret);",
-    );
-    // Every declaration precedes the first read that can fail.
-    has(
-        &c,
-        "  js_cb* a0 = NULL;\n  int32_t a1 = 0;\n  if (!js_arg_cb(",
-    );
-    // An optional callback passes a null vtable for none.
-    has(
-        &c,
-        "if (!js_arg_cb(env, argv[0], \"kv_kv_Policy\", dispatch_kv_kv_Policy, true, &a0)) goto done;",
+        "bool r = kv_kv_maybe(a0_has, a0, a1_has, a1, &out_value, &err);",
     );
     has(
         &c,
-        "kv_kv_install((void*)a0, a0 != NULL ? &vtable_kv_kv_Policy : NULL, &err);",
+        "ret = r ? js_new_f64(env, (double)out_value) : js_null(env);",
     );
-    has(&c, "NAPI_MODULE_INIT() {\n  js_env_init(env);");
-}
-
-#[test]
-fn callback_vtables_hop_to_the_javascript_thread() {
-    let c = file(&files("kv", &NodeConfig::default()), "kv_node.c");
-    has(&c, "static bool tramp_kv_kv_Listener_on_message(void* ctx, const uint8_t* p0, size_t p1, uint64_t p2, kv_error* out_err) {");
-    has(&c, "  if (js_cb_on_js_thread(cb)) {");
+    // Typed arrays cross as the matching TypedArray, freed by byte length.
     has(
         &c,
-        "    js_cb_hop(cb, 0, &f, out_err, \"Listener.onMessage\");",
+        "if (!js_arg_slice(env, argv[1], napi_biguint64_array, &a1, &a1_len)) goto done;",
     );
-    has(&c, "argv[0] = js_new_str(env, f->p0, f->p1);");
-    has(&c, "argv[1] = js_new_u64(env, f->p2);");
-    has(&c, "argv[2] = js_new_handle(env, f->p3);");
+    has(
+        &c,
+        "ret = js_take_slice(env, napi_float64_array, r, out_len, sizeof(double));",
+    );
+    // Callback trampolines take every slot of the method's signature.
+    has(&c, "static bool tramp_kv_kv_Policy_limit(void* ctx, bool p_has_hint, int32_t p_hint, int16_t* p_out_value, kv_error* p_out_err) {");
+    has(
+        &c,
+        "if (js_ret_slice(env, result, napi_float32_array, sizeof(float), &run, &n)) {",
+    );
     has(&c, "static const kv_kv_Listener_vtable vtable_kv_kv_Listener = {sizeof(kv_kv_Listener_vtable), 0, js_cb_free, tramp_kv_kv_Listener_on_message, tramp_kv_kv_Listener_on_bundle};");
-    has(&c, "  if (!js_cb_take(req)) return;");
-}
-
-#[test]
-fn callback_returns_of_every_family_reach_the_producer() {
-    let c = file(&files("kv", &NodeConfig::default()), "kv_node.c");
-    // A buffer return travels as a {p}_alloc run in the out slots.
-    has(&c, "static void tramp_kv_kv_Policy_admit(void* ctx, const uint8_t* p0, size_t p1, uint8_t** out_ptr, size_t* out_len, kv_error* out_err) {");
-    has(
-        &c,
-        "    if (!js_ret_bytes(env, result, f->out_ptr, f->out_len)) {\n      js_cb_report(env, f->out_err, \"Policy.admit returned a value of the wrong type\");",
-    );
-    has(
-        &c,
-        "    if (!js_ret_str(env, result, f->out_ptr, f->out_len)) {",
-    );
-    // Objects are returned by value; `I` must be a handle, `I?` may be null.
-    has(&c, "static kv_kv_Store* tramp_kv_kv_Policy_pick(void* ctx, const uint8_t* p0, size_t p1, kv_error* out_err) {");
-    has(
-        &c,
-        "    if (js_arg_handle(env, result, &h, false)) {\n      f->result = (kv_kv_Store*)h;",
-    );
-    has(&c, "    if (js_arg_handle(env, result, &h, true)) {");
-    has(
-        &c,
-        "static kv_kv_Mode tramp_kv_kv_Policy_mode(void* ctx, kv_error* out_err) {",
-    );
-    has(&c, "      f->result = (kv_kv_Mode)v;");
 }
 
 #[test]
@@ -200,8 +147,8 @@ fn package_ships_one_npm_package_per_node_platform() {
     binaries.insert(NativeBinary::new(Platform::LinuxX64, "lib/libkv.so"));
     binaries.insert(NativeBinary::new(Platform::Wasm32, "lib/kv.wasm"));
     let ctx = PackageContext::new(&binaries);
-    let artifacts = NodeGenerator
-        .package(&model, &ctx, &NodeConfig::default())
+    let artifacts = NodeGenerator::from(NodeConfig::default())
+        .package(&model, &ctx)
         .expect("node packages");
     let paths: Vec<&str> = artifacts.iter().map(|a| a.path.as_str()).collect();
     assert_eq!(
@@ -251,13 +198,4 @@ fn package_ships_one_npm_package_per_node_platform() {
         "{install}"
     );
     assert_eq!(node_platform_tokens(Platform::AndroidArm64), None);
-}
-
-#[test]
-fn npm_tarball_names_follow_npm_pack() {
-    assert_eq!(super::npm_tarball_name("kv", "1.0.0"), "kv-1.0.0.tgz");
-    assert_eq!(
-        super::npm_tarball_name("@acme/kv", "1.0.0"),
-        "acme-kv-1.0.0.tgz"
-    );
 }

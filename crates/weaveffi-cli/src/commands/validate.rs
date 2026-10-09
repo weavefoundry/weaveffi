@@ -1,10 +1,13 @@
 //! `weaveffi validate`: schema validation with human-readable or `--format
 //! json` output, plus advisory warnings under `--warn`.
 
+use std::process::ExitCode;
+
 use miette::{Report, Result};
 use weaveffi_model::validate::{ValidationError, ValidationWarning};
 
-pub(crate) fn cmd_validate(locate: &super::Locate<'_>, warn: bool, json_mode: bool) -> Result<()> {
+/// Run `weaveffi validate`, printing one JSON object with `json_mode`.
+pub fn cmd_validate(locate: &super::Locate<'_>, warn: bool, json_mode: bool) -> Result<ExitCode> {
     let quiet = locate.quiet;
     let definition = locate.project()?.definition()?;
     match definition.validate() {
@@ -35,7 +38,7 @@ pub(crate) fn cmd_validate(locate: &super::Locate<'_>, warn: bool, json_mode: bo
                 println!("Validation passed");
                 println!("  {}", counts.summary());
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Err(diags) => {
             if json_mode {
@@ -48,7 +51,7 @@ pub(crate) fn cmd_validate(locate: &super::Locate<'_>, warn: bool, json_mode: bo
                         .collect::<Vec<_>>(),
                 });
                 println!("{json}");
-                std::process::exit(1);
+                return Ok(ExitCode::FAILURE);
             }
             Err(Report::new(diags))
         }
@@ -82,7 +85,7 @@ impl Counts {
             self.callback_interfaces += m.callback_interfaces.len();
             self.records += m.structs.len();
             self.enums += m.enums.len();
-            self.error_domains += usize::from(m.errors.is_some());
+            self.error_domains += m.errors.len();
             self.add(&m.modules);
         }
     }

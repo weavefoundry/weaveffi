@@ -91,7 +91,7 @@ Python bindings for the `{library}` native library, built on `ctypes`.
 
 ## Requirements
 
-- Python 3.9 or later
+- Python 3.10 or later
 - The native library (`{linux}`, `{darwin}`, or `{windows}`)
 
 ## Install
@@ -102,9 +102,11 @@ pip install .
 
 ## Loading the native library
 
-The bindings load the library from `{env}` when it is set (a full path),
+The bindings load the library from `{env}` when it's set (a full path),
 then from inside the installed package, then from the system loader's search
-path.
+path. Importing the package checks that the library is the one the bindings
+were generated for; when it can't be loaded or doesn't match, the import
+raises `LibraryLoadError`, an `ImportError`.
 
 ## Usage
 

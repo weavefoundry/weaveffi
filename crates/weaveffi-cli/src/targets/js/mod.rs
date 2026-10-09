@@ -4,28 +4,31 @@
 //! Both targets generate the same ES module: one exported namespace object
 //! per top-level IDL module (`export const kv = { Store, get, ... }`, with
 //! nested modules as nested namespaces), the same error classes (a root
-//! `{Package}Error`, one `{Domain}Error` per error domain, one `{Code}Error`
-//! per code, and `CancelledError`), records as plain objects, rich enums as
-//! tagged unions, interfaces as classes with `close()`, `[Symbol.dispose]`,
-//! and a `FinalizationRegistry` backstop, lazy iterators, `Promise`-returning
-//! async functions with `AbortSignal` cancellation, and the same `.d.ts`.
-//! Only the transport differs: Node.js calls an N-API addon, WebAssembly
-//! stages values in linear memory. Both expose the raw calling convention
-//! documented in [`api`] as an object named `$raw`.
+//! `{Package}Error`, one class per error domain, one subclass per code, and
+//! `CancelledError`), records as plain objects, rich enums as tagged unions,
+//! interfaces as classes with `close()`, `[Symbol.dispose]`, and a
+//! `FinalizationRegistry` backstop, lazy iterators with `close()`,
+//! `Promise`-returning async functions with `AbortSignal` cancellation, and
+//! the same `.d.ts`. Optional scalars cross as a flag and a value, numeric
+//! lists as typed arrays. Only the transport differs: Node.js calls an
+//! N-API addon, WebAssembly stages values in linear memory. Both expose the
+//! raw calling convention documented in [`api`] as an object named `$raw`.
 //!
-//! The fixed runtime (codec, error classes, object and iterator wrappers,
-//! cancellation, the load-time checks) is a real JavaScript file,
-//! `runtime/runtime.js`, emitted next to `index.js`.
+//! The fixed runtime (codec, argument checks, error classes, object and
+//! iterator wrappers, cancellation, the load-time checks) is a real
+//! JavaScript file, `runtime/runtime.js`, emitted next to `index.js`. The
+//! leak counters tests read are the package's `./debug` export
+//! (`debug.js`), not part of its API.
 
 mod api;
 mod codec;
 mod dts;
 pub(crate) mod names;
 
-use weaveffi_model::contract;
 use weaveffi_model::model::{Model, ABI_VERSION};
 use weaveffi_model::pkg::Identity;
 
+use crate::codegen::contract;
 use crate::codegen::CodeWriter;
 use crate::manifest::{JsonObject, JsonValue};
 use crate::utils::{render_prelude, render_trailer, CommentStyle};
@@ -41,9 +44,13 @@ const RUNTIME_IMPORTS: &[&str] = &[
     "$fault",
     "$domain",
     "$raise",
+    "$untyped",
     "$W",
     "$WK",
     "$R",
+    "$check",
+    "$opt",
+    "$slice",
     "$encode",
     "$decode",
     "$Object",
@@ -58,8 +65,17 @@ const RUNTIME_IMPORTS: &[&str] = &[
     "$Iterator",
     "$cancellable",
     "$impl",
-    "$ret",
     "$verify",
+    "$setLive",
+];
+
+/// The files every JavaScript package ships beside the transport's own.
+pub(crate) const PACKAGE_FILES: &[&str] = &[
+    "index.js",
+    "index.d.ts",
+    "runtime.js",
+    "debug.js",
+    "debug.d.ts",
 ];
 
 /// The root error class of a package: `{PascalName}Error` (`KvstoreError`).
@@ -94,25 +110,26 @@ pub(crate) fn render_imports(w: &mut CodeWriter, identity: &Identity) {
 }
 
 /// The contract these bindings were generated with (`const $contract`):
-/// for every top-level module, each declaration's `[id, hash, path]` from
-/// [`contract::entries`], which the load-time check looks up in the
-/// library's own tables.
+/// for every top-level module, its table function and each declaration's
+/// `[id, hash, path]` row from [`contract::tables`], which the load-time
+/// check looks up in the library's own tables.
 pub(crate) fn render_contract(w: &mut CodeWriter, model: &Model) {
     w.line("// The declarations these bindings were generated with, per top-level");
-    w.line("// module, as [id, hash, path]: the library's contract tables must hold");
-    w.line("// each one (see $verify).");
+    w.line("// module's table function, as [id, hash, path]: the library's tables must");
+    w.line("// hold each one (see $verify).");
     w.block("const $contract = [", "];", |w| {
-        for root in model.roots() {
+        for table in contract::tables(model) {
             w.block(
-                format!("[{}, [", names::js_string(&root.name)),
+                format!("[{}, [", names::js_string(&table.symbol)),
                 "]],",
                 |w| {
-                    for e in contract::entries(model, root) {
+                    for row in &table.rows {
                         w.line(format!(
-                            "[0x{:016x}n, 0x{:016x}n, {}],",
-                            e.id,
-                            e.hash,
-                            names::js_string(&e.path)
+                            "[{}n, {}n, {}], // {}",
+                            contract::hex(row.id),
+                            contract::hex(row.hash),
+                            names::js_string(&row.path),
+                            row.signature
                         ));
                     }
                 },
@@ -123,26 +140,76 @@ pub(crate) fn render_contract(w: &mut CodeWriter, model: &Model) {
 
 /// The load-time check of the ABI revision and of `$contract` (see
 /// [`render_contract`]) against the library behind `$raw`.
-pub(crate) fn verify_call(model: &Model, identity: &Identity) -> String {
+pub(crate) fn verify_call(model: &Model) -> String {
     format!(
         "$verify($raw, {}, '{}', {ABI_VERSION}, $contract);",
-        names::js_string(&identity.name),
+        names::js_string(&model.identity.name),
         model.prefix(),
     )
 }
 
 /// Render `index.d.ts`. `extra` carries the transport's own declarations.
-pub(crate) fn render_dts(model: &Model, identity: &Identity, extra: &str) -> String {
+pub(crate) fn render_dts(model: &Model, extra: &str) -> String {
     let mut w = CodeWriter::two_space();
     w.raw(render_prelude(CommentStyle::DoubleSlash));
-    dts::render_declarations(&mut w, model, &root_error_class(identity), extra);
+    dts::render_declarations(&mut w, model, &root_error_class(&model.identity), extra);
     w.blank();
     w.raw(render_trailer(CommentStyle::DoubleSlash, "index.d.ts"));
     w.finish()
 }
 
+/// Render `debug.js`, the package's `./debug` export: the leak counters a
+/// test reads once the bindings are loaded (after `init()` on
+/// WebAssembly).
+pub(crate) fn render_debug_js() -> String {
+    let mut w = CodeWriter::two_space();
+    w.raw(render_prelude(CommentStyle::DoubleSlash));
+    w.line("// Diagnostics for tests of these bindings; not part of their API.");
+    w.line("import './index.js';");
+    w.line("import { $live } from './runtime.js';");
+    w.blank();
+    w.line("/**");
+    w.line(" * The native library's live-resource counter of `kind`: 0 objects,");
+    w.line(" * 1 callback implementations, 2 iterators, 3 cancel tokens, 4 byte runs.");
+    w.line(" * Kind -1 is `1n` when the library counts at all (its `leak-check`");
+    w.line(" * feature); otherwise every kind is `0n`.");
+    w.line(" */");
+    w.block("export function debugLive(kind) {", "}", |w| {
+        w.line("return $live(kind);");
+    });
+    w.blank();
+    w.raw(render_trailer(CommentStyle::DoubleSlash, "debug.js"));
+    w.finish()
+}
+
+/// Render `debug.d.ts`.
+pub(crate) fn render_debug_dts() -> String {
+    let mut w = CodeWriter::two_space();
+    w.raw(render_prelude(CommentStyle::DoubleSlash));
+    w.line("/**");
+    w.line(" * The native library's live-resource counter of `kind`: 0 objects,");
+    w.line(" * 1 callback implementations, 2 iterators, 3 cancel tokens, 4 byte runs.");
+    w.line(" * Kind -1 is `1n` when the library counts at all (its `leak-check`");
+    w.line(" * feature); otherwise every kind is `0n`.");
+    w.line(" */");
+    w.line("export declare function debugLive(kind: number): bigint;");
+    w.blank();
+    w.raw(render_trailer(CommentStyle::DoubleSlash, "debug.d.ts"));
+    w.finish()
+}
+
+/// The npm tarball file name `npm pack` gives `name` at `version`
+/// (`kvstore-1.2.0.tgz`, or `acme-kv-1.2.0.tgz` for `@acme/kv`).
+pub(crate) fn npm_tarball_name(name: &str, version: &str) -> String {
+    format!(
+        "{}-{version}.tgz",
+        name.trim_start_matches('@').replace('/', "-")
+    )
+}
+
 /// The npm metadata both `package.json` files share: the generated-file
-/// notice, then name, version, description, and the optional fields.
+/// notice, then name, version, description, the optional fields, and the
+/// ES module entry points (`.` and `./debug`).
 pub(crate) fn npm_metadata(identity: &Identity, name: &str) -> JsonObject {
     let version = env!("CARGO_PKG_VERSION");
     let mut obj = JsonObject::new()
@@ -170,44 +237,50 @@ pub(crate) fn npm_metadata(identity: &Identity, name: &str) -> JsonObject {
             ),
         );
     }
+    let entry = |types: &str, js: &str| {
+        JsonValue::Object(
+            JsonObject::new()
+                .str_entry("types", types)
+                .str_entry("default", js),
+        )
+    };
     obj.str_entry("type", "module")
         .str_entry("main", "index.js")
         .str_entry("types", "index.d.ts")
         .entry(
             "exports",
             JsonValue::Object(
-                JsonObject::new().entry(
-                    ".",
-                    JsonValue::Object(
-                        JsonObject::new()
-                            .str_entry("types", "./index.d.ts")
-                            .str_entry("default", "./index.js"),
-                    ),
-                ),
+                JsonObject::new()
+                    .entry(".", entry("./index.d.ts", "./index.js"))
+                    .entry("./debug", entry("./debug.d.ts", "./debug.js")),
             ),
         )
 }
 
 /// A small API exercising every shape both JavaScript targets render, for
-/// their unit tests: an error domain with a payload, a C-style and a rich
-/// enum, a record holding objects, two callback interfaces (one with a
-/// return of every family and a method that throws), an interface with a
-/// canonical constructor, a method named `close`, a throwing method, an
-/// iterator of objects, a nullable async result, and a cancellable async
-/// method, free functions (one named after a keyword, one taking an
+/// their unit tests: two error domains (one with a payload), a C-style and
+/// a rich enum, a record holding objects, a callback interface with a
+/// return of every family and methods of every error strategy, an
+/// interface with a canonical constructor, a method named `close`, a
+/// throwing method, an iterator of objects, a nullable async result, and a
+/// cancellable async method, optional scalars and typed arrays in every
+/// position, free functions (one named after a keyword, one taking an
 /// optional callback), and a nested module.
 #[cfg(test)]
-pub(crate) fn test_api(name: &str) -> weaveffi_model::model::Model {
+pub(crate) fn test_api(name: &str) -> Model {
     const YAML: &str = r#"
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: kv
     doc: A key-value store.
     errors:
-      name: KvError
-      codes:
-        - { name: KEY_NOT_FOUND, code: 1, message: "key not found", fields: [{ name: key, type: string }] }
-        - { name: FULL, code: 2, message: "it's full" }
+      - name: KvError
+        codes:
+          - { name: KEY_NOT_FOUND, code: 1, message: "key not found", fields: [{ name: key, type: string }] }
+          - { name: FULL, code: 2, message: "it's full" }
+      - name: Other
+        codes:
+          - { name: Broken, code: 1, message: "broken" }
     enums:
       - name: Mode
         variants:
@@ -225,44 +298,53 @@ modules:
           - { name: extras, type: "[Store]" }
           - { name: stamp, type: i64 }
           - { name: by_mode, type: "{Mode:bool}" }
+          - { name: weights, type: "[f64]" }
     callback_interfaces:
       - name: Listener
         methods:
           - name: on_message
-            params: [{ name: text, type: string }, { name: weight, type: u64 }]
+            params: [{ name: text, type: string }, { name: weight, type: u64 }, { name: level, type: "u8?" }]
             return: bool
           - name: on_bundle
             params: [{ name: bundle, type: Bundle }, { name: store, type: Store }, { name: alt, type: "Store?" }]
       - name: Policy
         methods:
-          - { name: admit, params: [{ name: bundle, type: Bundle }], return: Bundle, throws: true }
-          - { name: label, params: [], return: string }
+          - { name: admit, params: [{ name: bundle, type: Bundle }], return: Bundle, throws: KvError }
+          - { name: label, params: [], return: string, throws: any }
           - { name: blob, params: [], return: bytes }
           - { name: pick, params: [{ name: key, type: string }], return: Store }
           - { name: maybe, params: [], return: "Store?" }
           - { name: mode, params: [], return: Mode }
           - { name: weight, params: [], return: i64 }
+          - { name: limit, params: [{ name: hint, type: "i32?" }], return: "i16?" }
+          - { name: scores, params: [{ name: sizes, type: "[u64]" }], return: "[f32]", throws: Other }
     interfaces:
       - name: Store
         doc: A store.
         constructors:
           - { name: new, params: [{ name: path, type: string }] }
         methods:
-          - { name: get, params: [{ name: key, type: string }], return: bytes, throws: true }
+          - { name: get, params: [{ name: key, type: string }], return: bytes, throws: KvError }
           - { name: close, params: [] }
           - { name: scan, params: [], return: "iter<Store>" }
           - { name: fetch, params: [{ name: path, type: string }], return: "Store?", async: true }
           - { name: wait, params: [{ name: ms, type: i64 }], return: i64, async: true, cancellable: true }
+          - { name: ttl, params: [{ name: key, type: string }], return: "i64?", async: true }
+          - { name: sizes, params: [], return: "[u32]", async: true, throws: any }
     functions:
       - { name: subscribe, params: [{ name: listener, type: Listener }, { name: mode, type: Mode }] }
       - { name: install, params: [{ name: policy, type: "Policy?" }] }
-      - { name: widen, params: [{ name: n, type: i64 }, { name: m, type: u64 }], return: u64 }
+      - { name: widen, params: [{ name: n, type: i64 }, { name: m, type: u64 }, { name: b, type: i8 }], return: u64 }
       - { name: delete, params: [{ name: class, type: "Store?" }], return: bool }
       - { name: shapes, params: [], return: "iter<Shape>" }
+      - { name: maybe, params: [{ name: x, type: "u16?" }, { name: mode, type: "Mode?" }], return: "f32?", throws: Other }
+      - { name: totals, params: [{ name: xs, type: "[i32]" }, { name: ys, type: "[u64]" }], return: "[f64]" }
+      - { name: levels, params: [], return: "iter<bool?>" }
+      - { name: chunks, params: [], return: "iter<[i16]>" }
     modules:
       - name: stats
         functions:
-          - { name: count, params: [{ name: store, type: Store }], return: i64, throws: true }
+          - { name: count, params: [{ name: store, type: Store }], return: i64, throws: KvError }
 "#;
     let api = weaveffi_model::parse::parse_api_str(YAML, "yaml").expect("test fixture parses");
     weaveffi_model::validate::validate(&api, &Identity::named(name), None)
@@ -282,196 +364,44 @@ mod tests {
         );
         assert!(rt.contains("export class CancelledError extends MyKvError {"));
         assert!(!rt.contains("{{"));
-        assert!(!rt.contains("checksum"));
         assert_eq!(root_error_class(&Identity::named("io_error")), "IoError");
     }
 
-    fn api_js() -> String {
-        let mut w = CodeWriter::two_space();
-        render_api(&mut w, &test_api("acme-kv"));
-        w.finish()
-    }
-
-    fn has(src: &str, needle: &str) {
-        assert!(src.contains(needle), "missing `{needle}` in:\n{src}");
-    }
-
     #[test]
-    fn the_contract_lists_every_declaration_with_its_path() {
+    fn the_contract_lists_every_row_by_table_function() {
         let model = test_api("acme-kv");
         let mut w = CodeWriter::two_space();
         render_contract(&mut w, &model);
         let js = w.finish();
-        let root = model.roots().next().unwrap();
-        let entries = contract::entries(&model, root);
-        assert_eq!(js.matches("n, 0x").count(), entries.len());
-        let put = entries.iter().find(|e| e.path == "kv.Store.get").unwrap();
-        has(&js, "const $contract = [\n  ['kv', [\n");
-        has(
-            &js,
-            &format!(
-                "    [0x{:016x}n, 0x{:016x}n, 'kv.Store.get'],\n",
-                put.id, put.hash
-            ),
-        );
+        let tables = contract::tables(&model);
+        assert_eq!(js.matches("n, 0x").count(), tables[0].rows.len());
+        assert!(js.contains("const $contract = [\n  ['acme_kv_kv_contract', [\n"));
         assert_eq!(
-            verify_call(&model, &model.identity),
-            "$verify($raw, 'acme-kv', 'acme_kv', 4, $contract);"
+            verify_call(&model),
+            "$verify($raw, 'acme-kv', 'acme_kv', 5, $contract);"
         );
+    }
+
+    #[test]
+    fn npm_tarball_names_follow_npm_pack() {
+        assert_eq!(npm_tarball_name("kv", "1.0.0"), "kv-1.0.0.tgz");
+        assert_eq!(npm_tarball_name("@acme/kv", "1.0.0"), "acme-kv-1.0.0.tgz");
     }
 
     #[test]
     fn modules_are_frozen_namespaces_with_escaped_members() {
-        let js = api_js();
-        has(&js, "export const kv = Object.freeze({");
-        has(&js, "  Store: kv$Store,\n");
-        has(&js, "  delete_: kv$delete_,\n");
-        has(
-            &js,
+        let mut w = CodeWriter::two_space();
+        render_api(&mut w, &test_api("acme-kv"));
+        let js = w.finish();
+        for needle in [
+            "export const kv = Object.freeze({",
+            "  delete_: kv$delete_,\n",
             "  stats: Object.freeze({\n    count: kv$stats$count,\n  }),\n});",
-        );
-        has(&js, "const kv$delete_ = function delete_(class_) {");
-        has(&js, "  close_() {");
-        has(&js, "  7: 'Safe',\n  '-1': 'Off',\n");
-    }
-
-    #[test]
-    fn calls_lend_objects_and_map_faults_by_strategy() {
-        let js = api_js();
-        has(
-            &js,
-            "  get(key) {\n    const $self = $lend(this, kv$Store);\n    try {\n      return $raw.acme_kv_kv_Store_get($self, key);\n    } catch ($e) {\n      throw $from$kv$KvError($e);\n    } finally {\n      $unlend(this);\n    }\n  }",
-        );
-        has(&js, "const $o0 = $lendOpt(class_, kv$Store);");
-        has(&js, "throw $fault($e);");
-        has(
-            &js,
-            "return $domain(e, $codes$kv$KvError, $payloads$kv$KvError);",
-        );
-        has(
-            &js,
-            "const $payloads$kv$KvError = new Map([\n  [1, (r) => ({ key: r.readString() })],\n]);",
-        );
-    }
-
-    #[test]
-    fn error_codes_with_fields_take_them_first() {
-        let js = api_js();
-        has(
-            &js,
-            "  constructor(fields, message = 'key not found') {\n    super(1, message);\n    this.key = fields.key;\n  }",
-        );
-        has(
-            &js,
-            "  constructor(message = 'it\\'s full') {\n    super(2, message);\n  }",
-        );
-        has(
-            &js,
-            "const $fields$kv$KvError = new Map([\n  [1, (w, e) => { w.writeString(e.key); }],\n]);",
-        );
-        has(
-            &js,
-            "return $raise(e, kv$KvError, $codes$kv$KvError, $fields$kv$KvError);",
-        );
-    }
-
-    #[test]
-    fn async_and_iterators_follow_the_raw_convention() {
-        let js = api_js();
-        has(
-            &js,
-            "return await $cancellable($options?.signal, $tokens, ($t) => $raw.acme_kv_kv_Store_wait($self, ms, $t));",
-        );
-        has(
-            &js,
-            "return $adoptOpt(kv$Store, await $raw.acme_kv_kv_Store_fetch($self, path));",
-        );
-        has(
-            &js,
-            "return new $Iterator($raw.acme_kv_kv_Store_scan($self), $it$kv$Store$scan);",
-        );
-        has(&js, "convert: (v) => $adopt(kv$Store, v),");
-        has(&js, "convert: (v) => $decode(v, $r$kv$Shape),");
-    }
-
-    #[test]
-    fn adapters_convert_arguments_and_every_return_family() {
-        let js = api_js();
-        has(
-            &js,
-            "return $ret.Bool(impl.onMessage($a0, $a1), 'Listener.onMessage');",
-        );
-        has(&js, "impl.onBundle($decode($a0, $r$kv$Bundle), $adopt(kv$Store, $a1), $adoptOpt(kv$Store, $a2));");
-        has(
-            &js,
-            "    admit($a0) {\n      try {\n        return $encode(impl.admit($decode($a0, $r$kv$Bundle)), $w$kv$Bundle);\n      } catch ($e) {\n        throw $raise$kv$KvError($e);\n      }\n    },",
-        );
-        has(&js, "return $ret.String(impl.label(), 'Policy.label');");
-        has(&js, "return $ret.Bytes(impl.blob(), 'Policy.blob');");
-        has(&js, "return $clone(impl.pick($a0), kv$Store);");
-        has(&js, "return $cloneOpt(impl.maybe(), kv$Store);");
-        has(&js, "return $ret.I32(impl.mode(), 'Policy.mode');");
-        has(&js, "return $ret.I64(impl.weight(), 'Policy.weight');");
-        has(
-            &js,
-            "$raw.acme_kv_kv_subscribe($adapt$kv$Listener(listener), mode);",
-        );
-        has(
-            &js,
-            "$raw.acme_kv_kv_install(policy == null ? null : $adapt$kv$Policy(policy));",
-        );
-    }
-
-    #[test]
-    fn codecs_name_one_function_per_type() {
-        let js = api_js();
-        has(&js, "  $w$kv$Store(w, v.primary);\n");
-        has(&js, "    primary: $r$kv$Store(r),\n");
-        has(&js, "  $w_list_Store(w, v.extras);\n");
-        has(
-            &js,
-            "function $w_map_Mode_bool(w, v) {\n  w.writeMap(v, $WK.I32, $W.Bool);\n}",
-        );
-        has(
-            &js,
-            "function $w$kv$Store(w, v) {\n  w.writeU64(BigInt($clone(v, kv$Store)));\n}",
-        );
-        has(
-            &js,
-            "function $r$kv$Store(r) {\n  return $adopt(kv$Store, $token(r.readU64()));\n}",
-        );
-    }
-
-    #[test]
-    fn declarations_qualify_types_and_alias_the_root_error() {
-        let model = test_api("kv");
-        let dts = render_dts(&model, &Identity::named("kv"), "");
-        has(&dts, "export declare class KvError extends Error {");
-        has(&dts, "declare const $Error: typeof KvError;");
-        has(&dts, "export declare namespace kv {");
-        has(&dts, "  export class KvError extends $Error {");
-        has(&dts, "  export class KeyNotFoundError extends kv.KvError {");
-        has(&dts, "    readonly key: string;");
-        has(
-            &dts,
-            "    constructor(fields: { key: string }, message?: string);",
-        );
-        has(
-            &dts,
-            "    wait(ms: bigint, options?: { signal?: AbortSignal }): Promise<bigint>;",
-        );
-        has(&dts, "    scan(): IterableIterator<kv.Store>;");
-        has(&dts, "    close_(): void;");
-        has(&dts, "    by_mode: Partial<Record<kv.Mode, boolean>>;");
-        has(
-            &dts,
-            "  export function delete_(class_: kv.Store | null): boolean;",
-        );
-        has(
-            &dts,
-            "  export function install(policy: kv.Policy | null): void;",
-        );
-        has(&dts, "    maybe(): kv.Store | null;");
-        has(&dts, "    export function count(store: kv.Store): bigint;");
+            "const kv$delete_ = function delete_(class_) {",
+            "  close_() {",
+            "  7: 'Safe',\n  '-1': 'Off',\n",
+        ] {
+            assert!(js.contains(needle), "missing `{needle}` in:\n{js}");
+        }
     }
 }

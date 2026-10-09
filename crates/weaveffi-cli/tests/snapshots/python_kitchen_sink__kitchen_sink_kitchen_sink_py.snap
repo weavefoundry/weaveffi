@@ -10,28 +10,32 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import array
 import builtins
 import ctypes
+import operator
 import os
 import platform
 import struct
 import threading
 import warnings
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Type, TypeVar
+from typing import Any, ClassVar, Generic, TypeVar
 
 
 class Error(Exception):
     """An error a fallible call reports.
 
     `code` is positive for one of the API's declared error codes, raised as
-    the declaring module's typed subclasses, and negative for a runtime
-    failure of a call that declares errors: a generic failure (-1), a
-    producer panic (-2), a marshalling failure (-3), or an exception raised
-    by a callback-interface implementation (-4). A cancelled async call (-5)
-    raises `asyncio.CancelledError` instead. A call that declares no errors
-    never raises this; its failures are bugs and raise `InternalError`.
+    the domain's typed subclasses, and negative for a runtime failure of a
+    call that throws: a generic failure (-1, also every failure of a call
+    declared `throws: any`), a producer panic (-2), a marshalling failure
+    (-3), or a failed callback-interface implementation (-4). A cancelled
+    async call (-5) raises `asyncio.CancelledError` instead. A call that
+    declares no errors never raises this; its failures are bugs and raise
+    `InternalError`.
     """
 
     GENERIC_ERROR_CODE = -1
@@ -64,15 +68,33 @@ class InternalError(RuntimeError):
         self.message = message
 
 
+class LibraryLoadError(ImportError):
+    """The native library couldn't be loaded, or it isn't the library these
+    bindings were generated for (another C ABI revision, or a declaration
+    that's missing or changed). Raised while the package is imported, so
+    catch it as `ImportError` around the import; `path` names the library.
+    """
+
+
 class _ErrorStruct(ctypes.Structure):
     """The C `kitchen_sink_error` out-parameter every call reports through."""
 
     _fields_ = [
         ("code", ctypes.c_int32),
-        ("message", ctypes.c_char_p),
+        ("message_ptr", ctypes.c_void_p),
+        ("message_len", ctypes.c_size_t),
         ("payload_ptr", ctypes.c_void_p),
         ("payload_len", ctypes.c_size_t),
     ]
+
+
+def _open(path: str, what: str) -> ctypes.CDLL:
+    try:
+        return ctypes.CDLL(path)
+    except OSError as exc:
+        raise LibraryLoadError(
+            f"cannot load {what}: {exc}", name=__name__, path=path
+        ) from exc
 
 
 def _load_library() -> ctypes.CDLL:
@@ -80,7 +102,7 @@ def _load_library() -> ctypes.CDLL:
     # platform wheel); then the system loader's search path.
     override = os.environ.get("KITCHEN_SINK_LIBRARY")
     if override:
-        return ctypes.CDLL(override)
+        return _open(override, f"the kitchen_sink native library from KITCHEN_SINK_LIBRARY={override!r}")
     system = platform.system()
     if system == "Darwin":
         name = "libkitchen_sink.dylib"
@@ -90,14 +112,12 @@ def _load_library() -> ctypes.CDLL:
         name = "libkitchen_sink.so"
     bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
     if os.path.exists(bundled):
-        return ctypes.CDLL(bundled)
-    try:
-        return ctypes.CDLL(name)
-    except OSError as exc:
-        raise ImportError(
-            f"cannot load the native library {name!r} ({exc}); "
-            "set KITCHEN_SINK_LIBRARY to its path"
-        ) from exc
+        return _open(bundled, f"the bundled kitchen_sink native library {bundled!r}")
+    return _open(
+        name,
+        f"the kitchen_sink native library {name!r} (set KITCHEN_SINK_LIBRARY to its path, "
+        "or install a wheel that bundles it)",
+    )
 
 
 _lib = _load_library()
@@ -120,47 +140,81 @@ class _ContractEntry(ctypes.Structure):
 
 # The C ABI revision these bindings were generated against and, per
 # top-level module's contract symbol, the declarations they rely on:
-# (id, hash, dotted path).
-_ABI_VERSION = 4
-_CONTRACTS: Dict[str, List[Tuple[int, int, str]]] = {
+# (id, hash, dotted path), with each declaration's canonical signature.
+_ABI_VERSION = 5
+_CONTRACTS: dict[str, list[tuple[int, int, str]]] = {
     "kitchen_sink_shared_contract": [
-        (0x709e234caa962446, 0x3894f2ca452e9f98, "shared.ping"),
-        (0xcfb306fa5801ee5b, 0x1cbd9e10983cac2c, "shared.Token"),
+        (0x709e234caa962446, 0x3894f2ca452e9f98, "shared.ping"),  # function ping() -> string
+        (0xcfb306fa5801ee5b, 0x18e9fc204a13df6f, "shared.Token"),  # record Token {i64, string}
     ],
     "kitchen_sink_kitchen_contract": [
-        (0x01d4f09bbddc986f, 0x29eb88fecc66544d, "kitchen.Gadget.new"),
-        (0x10472d8fe748c2ee, 0xb265832b6a759fc4, "kitchen.maybe_gadget"),
-        (0x11368eec07a74078, 0xfa049f78b77e146a, "kitchen.gadgets"),
-        (0x137f08a29cde6021, 0xda8de7aeb2dbb8a3, "kitchen.stream_gadgets"),
-        (0x2111b54980826dd7, 0x452783f3e6ca6e1d, "kitchen.do_cancellable"),
-        (0x29dddbc60bf8d7db, 0x452a3e573d57f6db, "kitchen.Priority"),
-        (0x2b227003b74a0d16, 0x12332957470e9782, "kitchen.maybe_subscribe"),
-        (0x2dd66cb0064f0494, 0x60197363fefd92dd, "kitchen.Item"),
-        (0x33c265bbf079b0e9, 0xc3dcd0927e6c1deb, "kitchen.u32_id"),
-        (0x33e6381d01660dfe, 0x077c63c31fd7f90a, "kitchen.KitchenErrors"),
-        (0x3f5fc99d73504b76, 0x2df88d710f1ea10e, "kitchen.Gadget.poke"),
-        (0x4c5764cf109528d1, 0x2a65529af4338a58, "kitchen.maybe_item"),
-        (0x4de17dfb93fd494d, 0xba0ad0dd52ed74af, "kitchen.i32_id"),
-        (0x504e95b7f7e65570, 0x01b3e8e0c9a10e23, "kitchen.stream_items"),
-        (0x68cdb9a4bd3e3dd5, 0xc678b9164348d497, "kitchen.bool_id"),
-        (0x69e7cd703d16eb85, 0xf3b28dd22ae9e689, "kitchen.do_async"),
-        (0x70865079ce41be82, 0xbe3b69464672af46, "kitchen.Gadget.describe"),
-        (0x71c5a1116cb7c49a, 0xcba1837108a89b84, "kitchen.echo_bytes"),
-        (0x735ee1e0049ee91a, 0xca74320bc53eddab, "kitchen.echo_string"),
-        (0x76d7fc58f4e41d84, 0x7373a0e47d30e690, "kitchen.i64_id"),
-        (0x79abfe1aa960fd6a, 0xbca7a9e5eb26f3a6, "kitchen.nested.hello"),
-        (0x7d3dd7d5cf6749e3, 0xa192f5a7298adb39, "kitchen.new_op"),
-        (0x89a5e664bc25c67b, 0x5764a95e81ecfd31, "kitchen.f64_id"),
-        (0x8cfdbdcecac5f7f1, 0x07e272f09c41fffc, "kitchen.Gadget.version"),
-        (0x974b9f3e823c1738, 0xb81b91e975695f27, "kitchen.cross_module_token"),
-        (0xaca0655fac15d230, 0x11c4d2b28abe07bb, "kitchen.list_items"),
-        (0xc883b4afae20543e, 0xc40560e5411ff392, "kitchen.legacy_op"),
-        (0xf2f7753e6e1dffc2, 0xc9047a95bdf49e93, "kitchen.get_attrs"),
-        (0xfae25d3391922ead, 0x1c7f95739f3210b8, "kitchen.subscribe"),
-        (0xfd0059b05cb2fcfb, 0x248bf8404a5823b4, "kitchen.Gadget"),
-        (0xfed9c551fb9fd2d6, 0x59aec980ef3f3291, "kitchen.ReadyListener"),
+        (0x01d4f09bbddc986f, 0xffcf2bd3b04aa002, "kitchen.Gadget.new"),  # constructor new(i64) -> Gadget
+        (0x02bbd5f31c953704, 0xaca75656ad13d661, "kitchen.Sampler.samples"),  # callback_method samples(u32?, [f64]) -> [i16] throws PantryError
+        (0x10472d8fe748c2ee, 0xcc570a2649bbf7dc, "kitchen.maybe_gadget"),  # function maybe_gadget(Gadget?) -> Gadget?
+        (0x11368eec07a74078, 0xfa049f78b77e146a, "kitchen.gadgets"),  # function gadgets() -> [Gadget]
+        (0x137f08a29cde6021, 0xda8de7aeb2dbb8a3, "kitchen.stream_gadgets"),  # function stream_gadgets() -> iter<Gadget>
+        (0x184bfc4ab0e3fe45, 0xb64587477022696b, "kitchen.ids_u64"),  # function ids_u64([u64]) -> [u64]
+        (0x2111b54980826dd7, 0x627bf01ab365b209, "kitchen.do_cancellable"),  # function do_cancellable(string) -> string async cancellable
+        (0x21c70f9371374d74, 0xc582d6ad2392c36c, "kitchen.ReadyListener.favorite"),  # callback_method favorite() -> Gadget
+        (0x23de5bd597372f46, 0xcf1bc6bb37872798, "kitchen.stream_chunks"),  # function stream_chunks() -> iter<[i32]>
+        (0x249f1ddaec6a6cbe, 0x0710d6c9a4de93da, "kitchen.take_from_pantry"),  # function take_from_pantry(string) -> i32 throws PantryError
+        (0x29dddbc60bf8d7db, 0x452a3e573d57f6db, "kitchen.Priority"),  # enum Priority {Low = 0, Normal = 1, High = 2}
+        (0x2b227003b74a0d16, 0x5dae036b8a6aed30, "kitchen.maybe_subscribe"),  # function maybe_subscribe(ReadyListener?) -> bool
+        (0x2dd66cb0064f0494, 0x74b131724dd0d867, "kitchen.Item"),  # record Item {i64, string, i32, bool, f64, u32, bytes, [string], {string:string}, i64?, Token, Priority, Gadget?}
+        (0x33c265bbf079b0e9, 0x97c32b764693f2cb, "kitchen.u32_id"),  # function u32_id(u32) -> u32
+        (0x33e6381d01660dfe, 0x05e35a563089bf7d, "kitchen.KitchenErrors"),  # errors KitchenErrors
+        (0x3d969ae76db6cb23, 0x38ac642c196512a5, "kitchen.ReadyListener.latest"),  # callback_method latest() -> Item?
+        (0x3f5fc99d73504b76, 0x417e4a2acd3210b3, "kitchen.Gadget.poke"),  # method poke(i32) -> i32 throws KitchenErrors
+        (0x4082f0085db28781, 0x18848e701962912e, "kitchen.Sampler"),  # callback Sampler
+        (0x4340a6b1e7ec8c50, 0xf5b4f10f61862b33, "kitchen.Sampler.describe"),  # callback_method describe() -> string throws any
+        (0x4c5764cf109528d1, 0xb374accf14676d90, "kitchen.maybe_item"),  # function maybe_item(i64) -> Item? throws KitchenErrors
+        (0x4de17dfb93fd494d, 0x78be3203bcd10727, "kitchen.i32_id"),  # function i32_id(i32) -> i32
+        (0x504e95b7f7e65570, 0x01b3e8e0c9a10e23, "kitchen.stream_items"),  # function stream_items() -> iter<Item>
+        (0x5dafabb7775fcb2d, 0x6c4b78c7d3f858c1, "kitchen.PantryError.Spoiled"),  # code Spoiled = 2
+        (0x5e0a8f6be4b00600, 0x3d0dcaec54133637, "kitchen.Sampler.threshold"),  # callback_method threshold(u32?) -> f64?
+        (0x5ec0af1d4ecc6fed, 0x6540bdb74246420c, "kitchen.async_samples"),  # function async_samples(u32) -> [f32] async cancellable
+        (0x61a358b0571e0a4e, 0x11a24c4b50d11996, "kitchen.async_maybe_count"),  # function async_maybe_count() -> i64? async
+        (0x68cdb9a4bd3e3dd5, 0xcde022fe6bc3b1bf, "kitchen.bool_id"),  # function bool_id(bool) -> bool
+        (0x69e7cd703d16eb85, 0xb13cb8d39e702c79, "kitchen.do_async"),  # function do_async(string) -> string async
+        (0x70865079ce41be82, 0xbe3b69464672af46, "kitchen.Gadget.describe"),  # method describe() -> string
+        (0x71c5a1116cb7c49a, 0x1506cfe6f548fac4, "kitchen.echo_bytes"),  # function echo_bytes(bytes) -> bytes
+        (0x735ee1e0049ee91a, 0xa713dbd1be707752, "kitchen.echo_string"),  # function echo_string(string) -> string
+        (0x76d7fc58f4e41d84, 0x6bdb4ccea2841d5e, "kitchen.i64_id"),  # function i64_id(i64) -> i64
+        (0x78d91fd617e162b8, 0xd88e2753503b36df, "kitchen.stream_maybe"),  # function stream_maybe() -> iter<i32?>
+        (0x79abfe1aa960fd6a, 0xbca7a9e5eb26f3a6, "kitchen.nested.hello"),  # function hello() -> string
+        (0x7b3865b536da998c, 0x1c4e79d60a20e74f, "kitchen.mixed_slices"),  # function mixed_slices([i8], [i16], [u16], [u32], [i64], [f32]) -> [u32]
+        (0x7ba266dc26a58989, 0x0f86001cac0c21e8, "kitchen.KitchenErrors.InvalidInput"),  # code InvalidInput = 2
+        (0x7d3dd7d5cf6749e3, 0xa192f5a7298adb39, "kitchen.new_op"),  # function new_op() -> i32
+        (0x81ded69adee0abf2, 0x8c71141a931906f6, "kitchen.scale_i32"),  # function scale_i32([i32], i32) -> [i32]
+        (0x81fa72769330fed6, 0x2096511ca5c9d8d3, "kitchen.ReadyListener.label"),  # callback_method label() -> string throws KitchenErrors
+        (0x89a5e664bc25c67b, 0x357fd9b65ad879a9, "kitchen.f64_id"),  # function f64_id(f64) -> f64
+        (0x8cfdbdcecac5f7f1, 0x07e272f09c41fffc, "kitchen.Gadget.version"),  # static version() -> string
+        (0x8dc42397e47614b9, 0xcddf6fede09b2e7f, "kitchen.opt_priority"),  # function opt_priority(Priority?) -> Priority?
+        (0x92f060ef68961fc1, 0xd948f51645dc11a0, "kitchen.ReadyListener.on_item"),  # callback_method on_item(Item, Gadget) -> bool
+        (0x974b9f3e823c1738, 0xb81b91e975695f27, "kitchen.cross_module_token"),  # function cross_module_token() -> Token
+        (0x9f0f001aa85f97d5, 0x55815247f895bd45, "kitchen.sum_f64"),  # function sum_f64([f64]) -> f64
+        (0xab2a29fd1ef5458b, 0x471a34aa4c09ae2b, "kitchen.KitchenErrors.NotFound"),  # code NotFound = 1
+        (0xaca0655fac15d230, 0x11c4d2b28abe07bb, "kitchen.list_items"),  # function list_items() -> [Item]
+        (0xb57c8e6ae3fb4383, 0x3f857851ab75366c, "kitchen.PantryError"),  # errors PantryError
+        (0xbdc795b195edd428, 0x36127462f8b0969f, "kitchen.opt_mixed"),  # function opt_mixed(f64, f32?, i64?, string?) -> u16?
+        (0xbe4821ab3c340e71, 0x17fad5418abe0f50, "kitchen.ReadyListener.on_ready"),  # callback_method on_ready(i32, string) -> void
+        (0xc2ad53f2a6a36323, 0x071e29abee823f17, "kitchen.opt_i32_id"),  # function opt_i32_id(i32?) -> i32?
+        (0xc7ab409554fd3d7b, 0xfea12b6bc219fc46, "kitchen.parse_any"),  # function parse_any(string) -> i64 throws any
+        (0xc82a7f2d85f99f4e, 0xa9bcb8bacedb036c, "kitchen.sample_with"),  # function sample_with(Sampler, u32?) -> [i16] throws PantryError
+        (0xc883b4afae20543e, 0xc40560e5411ff392, "kitchen.legacy_op"),  # function legacy_op() -> i32
+        (0xd180bf646bff59e2, 0xa4515a6d00d7c600, "kitchen.PantryError.OutOfStock"),  # code OutOfStock = 1 {string}
+        (0xe6778df0f5c1b82b, 0x38eaafdb350559e1, "kitchen.opt_bool_id"),  # function opt_bool_id(bool?) -> bool?
+        (0xf2f7753e6e1dffc2, 0xc9047a95bdf49e93, "kitchen.get_attrs"),  # function get_attrs() -> {string:i32}
+        (0xfae25d3391922ead, 0xcc034cf506cae182, "kitchen.subscribe"),  # function subscribe(ReadyListener) -> i32
+        (0xfd0059b05cb2fcfb, 0x248bf8404a5823b4, "kitchen.Gadget"),  # interface Gadget
+        (0xfed9c551fb9fd2d6, 0xe1020573f084dc1d, "kitchen.ReadyListener"),  # callback ReadyListener
+        (0xff3a99b52597dee2, 0x14c4ecac97bdfc9b, "kitchen.Gadget.readings"),  # method readings(u32?) -> [f64] throws any
     ],
 }
+
+
+def _refuse(message: str) -> LibraryLoadError:
+    return LibraryLoadError(f"{message} ({_lib._name})", name=__name__, path=_lib._name)
 
 
 def _check_contract() -> None:
@@ -170,15 +224,16 @@ def _check_contract() -> None:
     try:
         abi_version = _bind("kitchen_sink_abi_version", ctypes.c_uint32)
     except AttributeError:
-        raise ImportError(
-            f"{_lib._name} does not export kitchen_sink_abi_version; "
-            "it is not the library these bindings were generated for"
+        raise _refuse(
+            "the library doesn't export kitchen_sink_abi_version, so it isn't the "
+            "kitchen_sink library these bindings were generated for"
         ) from None
     found = abi_version()
     if found != _ABI_VERSION:
-        raise ImportError(
-            f"C ABI mismatch: these bindings expect revision {_ABI_VERSION}, "
-            f"but {_lib._name} reports revision {found}"
+        raise _refuse(
+            f"C ABI mismatch: these bindings expect revision {_ABI_VERSION}, but the "
+            f"library reports revision {found}; regenerate the bindings or rebuild "
+            "the library"
         )
     for symbol, expected in _CONTRACTS.items():
         try:
@@ -186,18 +241,16 @@ def _check_contract() -> None:
                 symbol, ctypes.POINTER(_ContractEntry), ctypes.POINTER(ctypes.c_size_t)
             )
         except AttributeError:
-            raise ImportError(f"{_lib._name} does not export {symbol}") from None
+            raise _refuse(f"the library doesn't export {symbol}") from None
         length = ctypes.c_size_t()
         table = contract(ctypes.byref(length))
         hashes = {table[i].id: table[i].hash for i in range(length.value)} if table else {}
         for entry_id, entry_hash, path in expected:
             actual = hashes.get(entry_id)
             if actual is None:
-                raise ImportError(f"{path} is missing from the library ({_lib._name})")
+                raise _refuse(f"{path} is missing from the library")
             if actual != entry_hash:
-                raise ImportError(
-                    f"{path} changed since these bindings were generated ({_lib._name})"
-                )
+                raise _refuse(f"{path} changed since these bindings were generated")
 
 
 _check_contract()
@@ -216,12 +269,18 @@ def _debug_live(kind: int) -> int:
     return live
 
 
-def _read_error(err: _ErrorStruct) -> Tuple[int, str, bytes]:
+def _peek_bytes(ptr: int | None, length: int) -> bytes:
+    """Copy a byte run the producer only lends (a zero-length run's pointer
+    is never read)."""
+    return ctypes.string_at(ptr, length) if ptr and length else b""
+
+
+def _read_error(err: _ErrorStruct) -> tuple[int, str, bytes]:
     """Copy a filled out-err slot's code, message, and payload, then release
     them."""
     code = err.code
-    message = err.message.decode("utf-8", "replace") if err.message else ""
-    payload = ctypes.string_at(err.payload_ptr, err.payload_len) if err.payload_ptr else b""
+    message = _peek_bytes(err.message_ptr, err.message_len).decode("utf-8", "replace")
+    payload = _peek_bytes(err.payload_ptr, err.payload_len)
     _error_clear(ctypes.byref(err))
     return code, message, payload
 
@@ -231,7 +290,19 @@ def _trap_from(code: int, message: str, payload: bytes = b"") -> InternalError:
     return InternalError(code, message)
 
 
-def _take_bytes(ptr: Optional[int], length: int) -> bytes:
+def _error_from(code: int, message: str, payload: bytes = b"") -> Error:
+    """The exception for a failed call declared `throws: any`."""
+    return Error(code, message)
+
+
+def _unknown_code(domain: type[Error], code: int, message: str) -> Error:
+    """The exception for a code a domain's factory doesn't know: a positive
+    code (from a library newer than these bindings) raises the domain's base
+    class with the code and message; a runtime code raises the root error."""
+    return domain(code, message) if code > 0 else Error(code, message)
+
+
+def _take_bytes(ptr: int | None, length: int) -> bytes:
     """Copy a producer-owned byte run (a string, bytes, or value buffer) and
     release it with kitchen_sink_free_bytes."""
     if not ptr:
@@ -242,17 +313,100 @@ def _take_bytes(ptr: Optional[int], length: int) -> bytes:
         _free_bytes(ptr, length)
 
 
-def _take_str(ptr: Optional[int], length: int) -> str:
+def _take_str(ptr: int | None, length: int) -> str:
     """Copy and release a producer-owned UTF-8 string."""
     return _take_bytes(ptr, length).decode("utf-8")
 
 
-def _peek_bytes(ptr: Optional[int], length: int) -> bytes:
-    """Copy a byte run the producer only lends for the current call."""
-    return ctypes.string_at(ptr, length) if ptr and length else b""
+# Range checks. ctypes truncates an out-of-range integer argument to the C
+# width silently, so every integer crossing directly is checked first.
+
+
+def _int_check(kind: str, lo: int, hi: int) -> Callable[[int, str], int]:
+    def check(value: int, what: str) -> int:
+        try:
+            v = operator.index(value)
+        except TypeError:
+            raise TypeError(f"{what}: expected an integer, got {type(value).__name__}") from None
+        if lo <= v <= hi:
+            return v
+        raise OverflowError(f"{what}: {v} is out of range for {kind}")
+
+    return check
+
+
+_i8 = _int_check("i8", -(1 << 7), (1 << 7) - 1)
+_i16 = _int_check("i16", -(1 << 15), (1 << 15) - 1)
+_i32 = _int_check("i32", -(1 << 31), (1 << 31) - 1)
+_i64 = _int_check("i64", -(1 << 63), (1 << 63) - 1)
+_u8 = _int_check("u8", 0, (1 << 8) - 1)
+_u16 = _int_check("u16", 0, (1 << 16) - 1)
+_u32 = _int_check("u32", 0, (1 << 32) - 1)
+_u64 = _int_check("u64", 0, (1 << 64) - 1)
+
+
+def _float(value: float, what: str) -> float:
+    """A number as a float, rejecting anything else."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    raise TypeError(f"{what}: expected a number, got {type(value).__name__}")
+
+
+# Typed arrays: numeric lists crossing directly. Each element kind's
+# `array` typecode and ctypes element type.
+_ARRAY_TYPES: dict[str, tuple[str, Any]] = {
+    "i8": ("b", ctypes.c_int8),
+    "i16": ("h", ctypes.c_int16),
+    "i32": ("i", ctypes.c_int32),
+    "i64": ("q", ctypes.c_int64),
+    "u16": ("H", ctypes.c_uint16),
+    "u32": ("I", ctypes.c_uint32),
+    "u64": ("Q", ctypes.c_uint64),
+    "f32": ("f", ctypes.c_float),
+    "f64": ("d", ctypes.c_double),
+}
+
+
+def _array(values: Iterable[Any], kind: str, what: str) -> array.array[Any]:
+    """Pack a sequence of numbers into a range-checked typed array whose
+    buffer is lent to one call. An `array.array` of the matching typecode
+    is lent as is, without a copy."""
+    code = _ARRAY_TYPES[kind][0]
+    if isinstance(values, array.array) and values.typecode == code:
+        return values
+    if isinstance(values, (str, bytes, bytearray, memoryview)):
+        raise TypeError(f"{what}: expected a sequence of numbers, got {type(values).__name__}")
+    try:
+        return array.array(code, values)
+    except OverflowError:
+        raise OverflowError(f"{what}: an element is out of range for {kind}") from None
+    except TypeError as exc:
+        raise TypeError(f"{what}: {exc}") from None
+
+
+def _peek_array(ptr: int | None, count: int, kind: str) -> list[Any]:
+    """Copy a typed array the producer only lends."""
+    if not ptr or not count:
+        return []
+    values: list[Any] = (_ARRAY_TYPES[kind][1] * count).from_address(ptr)[:]
+    return values
+
+
+def _take_array(ptr: int | None, count: int, kind: str) -> list[Any]:
+    """Copy a producer-owned typed array and release it with
+    kitchen_sink_free_bytes."""
+    if not ptr:
+        return []
+    ctype = _ARRAY_TYPES[kind][1]
+    try:
+        values: list[Any] = (ctype * count).from_address(ptr)[:]
+        return values
+    finally:
+        _free_bytes(ptr, count * ctypes.sizeof(ctype))
 
 
 _H = TypeVar("_H", bound="_Handle")
+_T = TypeVar("_T")
 
 
 class _Handle:
@@ -263,22 +417,15 @@ class _Handle:
     last such call returns instead of freeing the object mid-call.
     """
 
-    # The native destroy (or iterator release) function, set per subclass.
-    _destroy: Callable[[int], None]
-
     def _init_handle(self, ptr: int) -> None:
-        self._ptr: Optional[int] = ptr
+        self._ptr: int | None = ptr
         self._key = ptr
         self._calls = 0
         self._closing = False
         self._lock = threading.Lock()
 
-    @classmethod
-    def _adopt(cls: Type[_H], ptr: int) -> _H:
-        """Wrap one strong reference the producer handed over."""
-        obj = cls.__new__(cls)
-        obj._init_handle(ptr)
-        return obj
+    def _free(self, ptr: int) -> None:
+        """Release the native reference (each subclass releases its kind)."""
 
     def _acquire(self) -> int:
         with self._lock:
@@ -295,10 +442,10 @@ class _Handle:
                 return
             ptr, self._ptr = self._ptr, None
         if ptr is not None:
-            type(self)._destroy(ptr)
+            self._free(ptr)
 
     def close(self) -> None:
-        """Release the native reference. Idempotent; the wrapper is unusable
+        """Release the native reference. Idempotent; the object is unusable
         afterwards."""
         lock = getattr(self, "_lock", None)
         if lock is None:
@@ -311,7 +458,7 @@ class _Handle:
                 return
             ptr, self._ptr = self._ptr, None
         if ptr is not None:
-            type(self)._destroy(ptr)
+            self._free(ptr)
 
     def __enter__(self: _H) -> _H:
         return self
@@ -320,19 +467,30 @@ class _Handle:
         self.close()
 
     def __del__(self) -> None:
-        # An unreachable wrapper has no call in flight: release directly.
+        # An unreachable handle has no call in flight: release directly.
         ptr = getattr(self, "_ptr", None)
         if ptr is not None:
             self._ptr = None
-            type(self)._destroy(ptr)
+            self._free(ptr)
 
 
 class _Object(_Handle):
     """Base of every interface wrapper: a reference-counted native object.
     Two wrappers are equal when they hold the same native object."""
 
-    # The native clone function, set per subclass.
-    _clone: Callable[[int], int]
+    # The native destroy and clone functions, set per subclass.
+    _destroy: ClassVar[Callable[[int], None]]
+    _clone: ClassVar[Callable[[int], int]]
+
+    @classmethod
+    def _adopt(cls: type[_H], ptr: int) -> _H:
+        """Wrap one strong reference the producer handed over."""
+        obj = cls.__new__(cls)
+        obj._init_handle(ptr)
+        return obj
+
+    def _free(self, ptr: int) -> None:
+        type(self)._destroy(ptr)
 
     def _clone_ref(self) -> int:
         """A new strong reference to the same object, for a receiver that
@@ -352,64 +510,106 @@ class _Object(_Handle):
         return hash(self._key)
 
 
-class _Iterator(_Handle):
-    """Base of every lazy iterator over a producer stream: one native `next`
-    call per step; the handle is released on exhaustion, `close()`, or
-    garbage collection."""
+class NativeIterator(Iterator[_T], _Handle, Generic[_T]):
+    """A lazy iterator over a sequence the native library produces.
 
-    def __iter__(self: _H) -> _H:
-        return self
+    Each step pulls one element from the producer. The native handle is
+    released when the iterator is exhausted, on `close()`, at the end of a
+    `with` block, or by garbage collection; a closed iterator is exhausted.
+    Iterator-returning calls create these; there's no public constructor.
+    """
 
-    def _step(self) -> int:
+    _pull: Callable[[int], _T]
+    _destroy_fn: Callable[[int], None]
+
+    def __init__(self) -> None:
+        raise TypeError("NativeIterator objects come from the API's iterator-returning calls")
+
+    def _free(self, ptr: int) -> None:
+        self._destroy_fn(ptr)
+
+    def __next__(self) -> _T:
         with self._lock:
             ptr = self._ptr
             if ptr is None or self._closing:
                 raise StopIteration
             self._calls += 1
-            return ptr
+        try:
+            item = self._pull(ptr)
+        except StopIteration:
+            self._release()
+            self.close()
+            raise
+        except BaseException:
+            self._release()
+            raise
+        self._release()
+        return item
+
+    def __repr__(self) -> str:
+        state = "closed" if self._ptr is None or self._closing else "open"
+        return f"<NativeIterator ({state})>"
 
 
-def _required(ptr: Optional[int]) -> int:
+def _iterate(
+    ptr: int, pull: Callable[[int], _T], destroy: Callable[[int], None]
+) -> NativeIterator[_T]:
+    """Wrap an iterator handle the producer returned."""
+    it: NativeIterator[_T] = NativeIterator.__new__(NativeIterator)
+    it._init_handle(ptr)
+    it._pull = pull
+    it._destroy_fn = destroy
+    return it
+
+
+def _required(ptr: int | None) -> int:
     """A non-null object pointer the producer returned."""
     if not ptr:
         raise InternalError(-3, "the producer returned a null object")
     return ptr
 
 
-def _lend(obj: Any, cls: Type[_Object]) -> int:
+def _lend(obj: Any, cls: type[_Object]) -> int:
     """Lend `obj`'s native pointer to one call; pair with `obj._release()`."""
     if not isinstance(obj, cls):
         raise TypeError(f"expected {cls.__name__}, got {type(obj).__name__}")
     return obj._acquire()
 
 
-def _lend_opt(obj: Any, cls: Type[_Object]) -> Optional[int]:
+def _lend_opt(obj: Any, cls: type[_Object]) -> int | None:
     """`_lend` for an optional object: None lends a null pointer."""
     return None if obj is None else _lend(obj, cls)
 
 
-def _release_opt(obj: Optional[_Object]) -> None:
+def _release_opt(obj: _Object | None) -> None:
     if obj is not None:
         obj._release()
 
 
-_I8 = struct.Struct("<b")
-_U8 = struct.Struct("<B")
-_I16 = struct.Struct("<h")
-_U16 = struct.Struct("<H")
-_I32 = struct.Struct("<i")
-_U32 = struct.Struct("<I")
-_I64 = struct.Struct("<q")
-_U64 = struct.Struct("<Q")
-_F32 = struct.Struct("<f")
-_F64 = struct.Struct("<d")
+_S_I8 = struct.Struct("<b")
+_S_U8 = struct.Struct("<B")
+_S_I16 = struct.Struct("<h")
+_S_U16 = struct.Struct("<H")
+_S_I32 = struct.Struct("<i")
+_S_U32 = struct.Struct("<I")
+_S_I64 = struct.Struct("<q")
+_S_U64 = struct.Struct("<Q")
+_S_F32 = struct.Struct("<f")
+_S_F64 = struct.Struct("<d")
 
-_T = TypeVar("_T")
 _E = TypeVar("_E", bound=IntEnum)
 
 
 def _malformed(what: str) -> InternalError:
     return InternalError(-3, f"malformed value buffer: {what}")
+
+
+def _bad_value(kind: str, value: object) -> Exception:
+    """The exception for a value `struct` can't pack as `kind`: out of range
+    for a number, else the wrong type."""
+    if isinstance(value, (int, float)):
+        return OverflowError(f"{value} is out of range for {kind}")
+    return TypeError(f"expected a number for {kind}, got {type(value).__name__}")
 
 
 class _Writer:
@@ -420,17 +620,17 @@ class _Writer:
 
     def __init__(self) -> None:
         self._buf = bytearray()
-        self._objects: List[Tuple[int, _Object]] = []
+        self._objects: list[tuple[int, _Object]] = []
 
     def finish(self) -> bytes:
         # Object tokens are minted last, so an encoding that fails part-way
         # never leaks a strong reference.
-        minted: List[Tuple[_Object, int]] = []
+        minted: list[tuple[_Object, int]] = []
         try:
             for pos, obj in self._objects:
                 ptr = obj._clone_ref()
                 minted.append((obj, ptr))
-                _U64.pack_into(self._buf, pos, ptr)
+                _S_U64.pack_into(self._buf, pos, ptr)
         except BaseException:
             for obj, ptr in minted:
                 type(obj)._destroy(ptr)
@@ -438,61 +638,77 @@ class _Writer:
         self._objects = []
         return bytes(self._buf)
 
+    def _put(self, fmt: struct.Struct, kind: str, v: Any) -> None:
+        try:
+            self._buf += fmt.pack(v)
+        except struct.error:
+            raise _bad_value(kind, v) from None
+
     def write_bool(self, v: bool) -> None:
         self._buf.append(1 if v else 0)
 
     def write_i8(self, v: int) -> None:
-        self._buf += _I8.pack(v)
+        self._put(_S_I8, "i8", v)
 
     def write_u8(self, v: int) -> None:
-        self._buf += _U8.pack(v)
+        self._put(_S_U8, "u8", v)
 
     def write_i16(self, v: int) -> None:
-        self._buf += _I16.pack(v)
+        self._put(_S_I16, "i16", v)
 
     def write_u16(self, v: int) -> None:
-        self._buf += _U16.pack(v)
+        self._put(_S_U16, "u16", v)
 
     def write_i32(self, v: int) -> None:
-        self._buf += _I32.pack(v)
+        self._put(_S_I32, "i32", v)
 
     def write_u32(self, v: int) -> None:
-        self._buf += _U32.pack(v)
+        self._put(_S_U32, "u32", v)
 
     def write_i64(self, v: int) -> None:
-        self._buf += _I64.pack(v)
+        self._put(_S_I64, "i64", v)
 
     def write_u64(self, v: int) -> None:
-        self._buf += _U64.pack(v)
+        self._put(_S_U64, "u64", v)
 
     def write_f32(self, v: float) -> None:
-        self._buf += _F32.pack(v)
+        self._put(_S_F32, "f32", v)
 
     def write_f64(self, v: float) -> None:
-        self._buf += _F64.pack(v)
+        self._put(_S_F64, "f64", v)
 
     def write_count(self, n: int) -> None:
-        self._buf += _U32.pack(n)
+        self._buf += _S_U32.pack(n)
 
     def write_flag(self, present: bool) -> None:
         self._buf.append(1 if present else 0)
 
     def write_string(self, v: str) -> None:
         data = v.encode("utf-8")
-        self._buf += _U32.pack(len(data))
+        self._buf += _S_U32.pack(len(data))
         self._buf += data
 
     def write_bytes(self, v: bytes) -> None:
-        self._buf += _U32.pack(len(v))
+        self._buf += _S_U32.pack(len(v))
         self._buf += v
 
-    def write_numbers(self, code: str, values: List[Any]) -> None:
+    def write_numbers(self, code: str, kind: str, values: Sequence[Any]) -> None:
         """A list of one fixed-width numeric primitive (`code` is its struct
         format character), packed in one call."""
-        self._buf += _U32.pack(len(values))
-        self._buf += struct.pack(f"<{len(values)}{code}", *values)
+        try:
+            data = struct.pack(f"<{len(values)}{code}", *values)
+        except struct.error:
+            one = struct.Struct(f"<{code}")
+            for v in values:
+                try:
+                    one.pack(v)
+                except struct.error:
+                    raise _bad_value(kind, v) from None
+            raise
+        self._buf += _S_U32.pack(len(values))
+        self._buf += data
 
-    def write_object(self, obj: Any, cls: Type[_Object]) -> None:
+    def write_object(self, obj: Any, cls: type[_Object]) -> None:
         """Reserve an object token: one strong reference to `obj` the reader
         adopts, cloned in `finish()`. A closed wrapper is rejected now."""
         if not isinstance(obj, cls):
@@ -528,39 +744,39 @@ class _Reader:
         return b == 1
 
     def read_i8(self) -> int:
-        return int(_I8.unpack_from(self._data, self._take(1, "i8"))[0])
+        return int(_S_I8.unpack_from(self._data, self._take(1, "i8"))[0])
 
     def read_u8(self) -> int:
         return self._data[self._take(1, "u8")]
 
     def read_i16(self) -> int:
-        return int(_I16.unpack_from(self._data, self._take(2, "i16"))[0])
+        return int(_S_I16.unpack_from(self._data, self._take(2, "i16"))[0])
 
     def read_u16(self) -> int:
-        return int(_U16.unpack_from(self._data, self._take(2, "u16"))[0])
+        return int(_S_U16.unpack_from(self._data, self._take(2, "u16"))[0])
 
     def read_i32(self) -> int:
-        return int(_I32.unpack_from(self._data, self._take(4, "i32"))[0])
+        return int(_S_I32.unpack_from(self._data, self._take(4, "i32"))[0])
 
     def read_u32(self) -> int:
-        return int(_U32.unpack_from(self._data, self._take(4, "u32"))[0])
+        return int(_S_U32.unpack_from(self._data, self._take(4, "u32"))[0])
 
     def read_i64(self) -> int:
-        return int(_I64.unpack_from(self._data, self._take(8, "i64"))[0])
+        return int(_S_I64.unpack_from(self._data, self._take(8, "i64"))[0])
 
     def read_u64(self) -> int:
-        return int(_U64.unpack_from(self._data, self._take(8, "u64"))[0])
+        return int(_S_U64.unpack_from(self._data, self._take(8, "u64"))[0])
 
     def read_f32(self) -> float:
-        return float(_F32.unpack_from(self._data, self._take(4, "f32"))[0])
+        return float(_S_F32.unpack_from(self._data, self._take(4, "f32"))[0])
 
     def read_f64(self) -> float:
-        return float(_F64.unpack_from(self._data, self._take(8, "f64"))[0])
+        return float(_S_F64.unpack_from(self._data, self._take(8, "f64"))[0])
 
     def read_count(self) -> int:
         # An element count, not a byte length: elements can encode to zero
-        # bytes, so it is not bounded by the remaining data.
-        return int(_U32.unpack_from(self._data, self._take(4, "count"))[0])
+        # bytes, so it isn't bounded by the remaining data.
+        return int(_S_U32.unpack_from(self._data, self._take(4, "count"))[0])
 
     def read_flag(self) -> bool:
         b = self._data[self._take(1, "option flag")]
@@ -569,7 +785,7 @@ class _Reader:
         return b == 1
 
     def read_bytes(self) -> bytes:
-        n = int(_U32.unpack_from(self._data, self._take(4, "length"))[0])
+        n = int(_S_U32.unpack_from(self._data, self._take(4, "length"))[0])
         pos = self._take(n, "bytes")
         return self._data[pos:pos + n]
 
@@ -579,14 +795,14 @@ class _Reader:
         except UnicodeDecodeError:
             raise _malformed("string is not valid UTF-8") from None
 
-    def read_enum(self, cls: Type[_E]) -> _E:
+    def read_enum(self, cls: type[_E]) -> _E:
         value = self.read_i32()
         try:
             return cls(value)
         except ValueError:
             raise _malformed(f"undeclared {cls.__name__} value {value}") from None
 
-    def read_numbers(self, code: str, size: int) -> List[Any]:
+    def read_numbers(self, code: str, size: int) -> list[Any]:
         """A list of one fixed-width numeric primitive, unpacked in one call."""
         n = self.read_count()
         pos = self._take(n * size, "list")
@@ -594,7 +810,7 @@ class _Reader:
 
     def read_object(self) -> int:
         """An object token: one strong reference the caller adopts."""
-        ptr = int(_U64.unpack_from(self._data, self._take(8, "object token"))[0])
+        ptr = int(_S_U64.unpack_from(self._data, self._take(8, "object token"))[0])
         if ptr == 0:
             raise _malformed("null object token")
         return ptr
@@ -618,14 +834,14 @@ def _decode(data: bytes, read: Callable[[_Reader], _T]) -> _T:
 # The trampolines live at module scope, so nothing a pending call needs can
 # be garbage collected before the producer fires the completion, even when
 # the awaiting coroutine is gone.
-_pending: Dict[int, Tuple[asyncio.AbstractEventLoop, asyncio.Future[Any]]] = {}
+_pending: dict[int, tuple[asyncio.AbstractEventLoop, asyncio.Future[Any]]] = {}
 _pending_lock = threading.Lock()
 _pending_next = 0
 
 _error_free = _bind("kitchen_sink_error_free", None, ctypes.POINTER(_ErrorStruct))
 
 
-def _async_begin() -> Tuple[int, asyncio.Future[Any]]:
+def _async_begin() -> tuple[int, asyncio.Future[Any]]:
     """Register a new pending call on the running event loop."""
     global _pending_next
     loop = asyncio.get_running_loop()
@@ -648,15 +864,15 @@ def _async_error(err: Any, factory: Callable[[int, str, bytes], BaseException]) 
     exception it reports. The cancelled code maps to CancelledError."""
     e = err.contents
     code = e.code
-    message = e.message.decode("utf-8", "replace") if e.message else ""
-    payload = ctypes.string_at(e.payload_ptr, e.payload_len) if e.payload_ptr else b""
+    message = _peek_bytes(e.message_ptr, e.message_len).decode("utf-8", "replace")
+    payload = _peek_bytes(e.payload_ptr, e.payload_len)
     _error_free(err)
     if code == Error.CANCELLED_ERROR_CODE:
         return asyncio.CancelledError(message)
     return factory(code, message, payload)
 
 
-def _async_settle(key: Optional[int], exc: Optional[BaseException], value: Any) -> None:
+def _async_settle(key: int | None, exc: BaseException | None, value: Any) -> None:
     """Hand a completion back to the event loop that awaits it."""
     with _pending_lock:
         entry = _pending.pop(key or 0, None)
@@ -670,7 +886,7 @@ def _async_settle(key: Optional[int], exc: Optional[BaseException], value: Any) 
         pass
 
 
-def _async_resolve(future: asyncio.Future[Any], exc: Optional[BaseException], value: Any) -> None:
+def _async_resolve(future: asyncio.Future[Any], exc: BaseException | None, value: Any) -> None:
     if future.done():
         return
     if isinstance(exc, asyncio.CancelledError):
@@ -714,13 +930,18 @@ async def _async_wait_cancellable(future: asyncio.Future[Any], token: int) -> An
 # producer never holds a raw reference to a Python object. ctypes acquires
 # the GIL on entry to a trampoline, so the producer may call (and free) from
 # any thread.
-_callbacks: Dict[int, Any] = {}
+_callbacks: dict[int, Any] = {}
 _callbacks_lock = threading.Lock()
 _callbacks_next = 0
 
 _alloc = _bind("kitchen_sink_alloc", ctypes.c_void_p, ctypes.c_size_t)
 _error_set = _bind(
-    "kitchen_sink_error_set", None, ctypes.POINTER(_ErrorStruct), ctypes.c_int32, ctypes.c_char_p
+    "kitchen_sink_error_set",
+    None,
+    ctypes.POINTER(_ErrorStruct),
+    ctypes.c_int32,
+    ctypes.c_char_p,
+    ctypes.c_size_t,
 )
 _error_set_payload = _bind(
     "kitchen_sink_error_set_payload",
@@ -743,16 +964,16 @@ def _callback_register(impl: Any, cls: type) -> int:
     return ctx
 
 
-def _callback_register_opt(impl: Any, cls: type) -> Optional[int]:
+def _callback_register_opt(impl: Any, cls: type) -> int | None:
     """`_callback_register` for an optional callback: None passes none."""
     return None if impl is None else _callback_register(impl, cls)
 
 
-def _callback_get(ctx: Optional[int]) -> Any:
+def _callback_get(ctx: int | None) -> Any:
     return _callbacks[ctx or 0]
 
 
-def _callback_free(ctx: Optional[int]) -> None:
+def _callback_free(ctx: int | None) -> None:
     # The producer's last reference is gone; it never passes `ctx` again.
     with _callbacks_lock:
         _callbacks.pop(ctx or 0, None)
@@ -776,7 +997,24 @@ def _callback_return_bytes(out_ptr: Any, out_len: Any, data: bytes) -> None:
     out_len[0] = n
 
 
-def _callback_return_object(obj: Any, cls: Type[_Object]) -> int:
+def _callback_return_array(
+    out_ptr: Any, out_len: Any, values: Iterable[Any], kind: str, what: str
+) -> None:
+    """Hand a typed-array return to the producer: a range-checked run
+    allocated with kitchen_sink_alloc, which the producer adopts and frees.
+    `out_len` is the element count."""
+    data = _array(values, kind, what)
+    size = len(data) * data.itemsize
+    ptr = _alloc(size) if size else None
+    if size:
+        if not ptr:
+            raise MemoryError(f"kitchen_sink_alloc({size}) failed")
+        ctypes.memmove(ptr, data.buffer_info()[0], size)
+    out_ptr[0] = ptr
+    out_len[0] = len(data)
+
+
+def _callback_return_object(obj: Any, cls: type[_Object]) -> int:
     """Hand an object return to the producer: one fresh strong reference it
     adopts."""
     if not isinstance(obj, cls):
@@ -784,34 +1022,46 @@ def _callback_return_object(obj: Any, cls: Type[_Object]) -> int:
     return obj._clone_ref()
 
 
-def _callback_return_object_opt(obj: Any, cls: Type[_Object]) -> Optional[int]:
+def _callback_return_object_opt(obj: Any, cls: type[_Object]) -> int | None:
     """`_callback_return_object` for an optional object: None returns null."""
     return None if obj is None else _callback_return_object(obj, cls)
 
 
-def _callback_fail(out_err: Any, exc: BaseException, domain: Optional[Type[Error]] = None) -> None:
+# The codes a failed callback method reports when it raised anything but a
+# code of its domain: -1 for a method that throws (a domain or `any`), -4
+# for one that declares no errors.
+_GENERIC = Error.GENERIC_ERROR_CODE
+_FOREIGN = Error.FOREIGN_ERROR_CODE
+
+
+def _callback_fail(
+    out_err: Any, exc: BaseException, code: int, domain: type[Error] | None = None
+) -> None:
     """Report an implementation's exception to the producer. A method that
-    declares errors passes its module's error domain, and an exception of
-    that domain carrying a declared code travels as that code with its
-    fields; every other exception reaches the producer as the foreign error
-    code (-4). Nothing unwinds through C."""
+    throws an error domain passes it, and an exception of that domain
+    carrying a positive code travels as that code with its fields as the
+    payload; every other exception travels as `code` with its message.
+    Nothing unwinds through C."""
     if domain is not None and isinstance(exc, domain) and exc.code > 0:
-        _error_set(out_err, exc.code, exc.message.encode("utf-8", "replace"))
+        code = exc.code
         payload = exc._payload()
-        if payload:
-            _error_set_payload(out_err, payload, len(payload))
-        return
-    if isinstance(exc, (Error, InternalError)):
         message = exc.message
     else:
-        message = str(exc) or type(exc).__name__
-    _error_set(out_err, Error.FOREIGN_ERROR_CODE, message.encode("utf-8", "replace"))
+        payload = b""
+        if isinstance(exc, (Error, InternalError)):
+            message = exc.message
+        else:
+            message = str(exc) or type(exc).__name__
+    data = message.encode("utf-8", "replace")
+    _error_set(out_err, code, data, len(data))
+    if payload:
+        _error_set_payload(out_err, payload, len(payload))
 
 
 # === Module: shared ===
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class Token:
     """A reusable token referenced across modules"""
 
@@ -836,8 +1086,8 @@ _c_shared_ping = _bind("kitchen_sink_shared_ping", ctypes.c_void_p, ctypes.POINT
 
 def ping() -> str:
     """Trivial cross-module helper"""
-    _err = _ErrorStruct()
     _out_len = ctypes.c_size_t()
+    _err = _ErrorStruct()
     _ret = _c_shared_ping(ctypes.byref(_out_len), ctypes.byref(_err))
     if _err.code:
         raise _trap_from(*_read_error(_err))
@@ -847,14 +1097,19 @@ def ping() -> str:
 # === Module: kitchen ===
 
 
-class KitchenErrorsError(Error):
-    """Base exception for the `kitchen` module's error domain."""
+class KitchenError(Error):
+    """Base exception of the `KitchenErrors` error domain (module `kitchen`).
 
-    NotFound: Type[NotFound]
-    InvalidInput: Type[InvalidInput]
+    Each declared code raises its own subclass. A positive code these
+    bindings don't know (from a newer library) raises this class itself,
+    with `code` and `message` preserved.
+    """
+
+    NotFound: ClassVar[type[NotFoundError]]
+    InvalidInput: ClassVar[type[InvalidInputError]]
 
 
-class NotFound(KitchenErrorsError):
+class NotFoundError(KitchenError):
     """Item not found"""
 
     CODE = 1
@@ -863,7 +1118,7 @@ class NotFound(KitchenErrorsError):
         super().__init__(1, message)
 
 
-class InvalidInput(KitchenErrorsError):
+class InvalidInputError(KitchenError):
     """Invalid input"""
 
     CODE = 2
@@ -872,19 +1127,71 @@ class InvalidInput(KitchenErrorsError):
         super().__init__(2, message)
 
 
-KitchenErrorsError.NotFound = NotFound
-KitchenErrorsError.InvalidInput = InvalidInput
+KitchenError.NotFound = NotFoundError
+KitchenError.InvalidInput = InvalidInputError
 
 
-def _kitchen_errors_error_from(code: int, message: str, payload: bytes = b"") -> Error:
-    """The KitchenErrorsError subclass for `code` with its payload fields, or the
-    plain Error for a runtime code (a panic, a marshalling failure).
-    """
+def _kitchen_error_from(code: int, message: str, payload: bytes = b"") -> Error:
+    """The exception for a failure of a call that throws KitchenError."""
     if code == 1:
-        return NotFound(message)
+        return NotFoundError(message)
     if code == 2:
-        return InvalidInput(message)
-    return Error(code, message)
+        return InvalidInputError(message)
+    return _unknown_code(KitchenError, code, message)
+
+
+class PantryError(Error):
+    """Base exception of the `PantryError` error domain (module `kitchen`).
+
+    Each declared code raises its own subclass. A positive code these
+    bindings don't know (from a newer library) raises this class itself,
+    with `code` and `message` preserved.
+    """
+
+    OutOfStock: ClassVar[type[OutOfStockError]]
+    Spoiled: ClassVar[type[SpoiledError]]
+
+
+class OutOfStockError(PantryError):
+    """Out of stock"""
+
+    CODE = 1
+
+    item: str
+
+    def __init__(self, item: str, message: str = "Out of stock") -> None:
+        super().__init__(1, message)
+        self.item = item
+
+    def _payload(self) -> bytes:
+        _w = _Writer()
+        _w.write_string(self.item)
+        return _w.finish()
+
+
+class SpoiledError(PantryError):
+    """Spoiled"""
+
+    CODE = 2
+
+    def __init__(self, message: str = "Spoiled") -> None:
+        super().__init__(2, message)
+
+
+PantryError.OutOfStock = OutOfStockError
+PantryError.Spoiled = SpoiledError
+
+
+def _pantry_error_from(code: int, message: str, payload: bytes = b"") -> Error:
+    """The exception for a failure of a call that throws PantryError."""
+    if code == 1:
+        return _decode(payload, lambda _r: OutOfStockError(
+            item=_r.read_string(),
+            message=message,
+        ))
+    if code == 2:
+        return SpoiledError(message)
+    return _unknown_code(PantryError, code, message)
 
 
 class Priority(IntEnum):
@@ -898,7 +1205,7 @@ class Priority(IntEnum):
     High = 2
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class Item:
     """Kitchen sink struct exercising every field feature"""
 
@@ -914,14 +1221,14 @@ class Item:
     ratio: float
     nick: int
     payload: bytes
-    tags: List[str]
-    attrs: Dict[str, str]
-    parent: Optional[int]
+    tags: list[str]
+    attrs: dict[str, str]
+    parent: int | None
     # Cross-module struct reference
     token: Token
     priority: Priority
     # An optional object inside a record
-    gadget: Optional[Gadget]
+    gadget: Gadget | None
 
 
 def _write_Item(_w: _Writer, value: Item) -> None:
@@ -963,9 +1270,9 @@ class ReadyListener(abc.ABC):
 
     Subclass it and implement every method to pass an instance where the
     API takes a `ReadyListener`. The producer may call the methods from any
-    thread until it releases the instance. A method that declares errors may
-    raise a `KitchenErrorsError` code, which reaches the producer with its fields;
-    any other exception reaches it as Error.FOREIGN_ERROR_CODE (-4).
+    thread until it releases the instance. An exception a method raises
+    reaches the producer as a failure of that call (a method that throws
+    an error domain reports that domain's codes with their fields).
     """
 
     @abc.abstractmethod
@@ -982,12 +1289,12 @@ class ReadyListener(abc.ABC):
 
         Raises
         ------
-        KitchenErrorsError
-            To report one of the domain's error codes to the producer.
+        KitchenError
+            To report one of the domain's codes, with its fields, to the producer.
         """
 
     @abc.abstractmethod
-    def latest(self) -> Optional[Item]:
+    def latest(self) -> Item | None:
         """The most recent item the listener kept, if any"""
 
     @abc.abstractmethod
@@ -1017,52 +1324,50 @@ class _ReadyListenerVtable(ctypes.Structure):
     ]
 
 
-def _ReadyListener_on_ready(ctx: Optional[int], code: int, msg_ptr: Optional[int], msg_len: int, out_err: Any) -> None:
+def _ReadyListener_on_ready(ctx: int | None, code: int, msg_ptr: int | None, msg_len: int, out_err: Any) -> None:
     try:
         _callback_get(ctx).on_ready(code, _peek_bytes(msg_ptr, msg_len).decode("utf-8"))
     except BaseException as exc:
-        _callback_fail(out_err, exc)
+        _callback_fail(out_err, exc, _FOREIGN)
 
 
-def _ReadyListener_on_item(ctx: Optional[int], item_ptr: Optional[int], item_len: int, gadget: Optional[int], out_err: Any) -> bool:
+def _ReadyListener_on_item(ctx: int | None, item_ptr: int | None, item_len: int, gadget: int | None, out_err: Any) -> bool:
     try:
         _gadget = Gadget._adopt(_required(gadget))
         return bool(_callback_get(ctx).on_item(_decode(_peek_bytes(item_ptr, item_len), _read_Item), _gadget))
     except BaseException as exc:
-        _callback_fail(out_err, exc)
+        _callback_fail(out_err, exc, _FOREIGN)
         return False
 
 
-def _ReadyListener_label(ctx: Optional[int], out_ptr: Any, out_len: Any, out_err: Any) -> None:
+def _ReadyListener_label(ctx: int | None, out_ptr: Any, out_len: Any, out_err: Any) -> None:
     try:
-        _ret = _callback_get(ctx).label()
-        _callback_return_bytes(out_ptr, out_len, _ret.encode("utf-8"))
+        _callback_return_bytes(out_ptr, out_len, _callback_get(ctx).label().encode("utf-8"))
     except BaseException as exc:
-        _callback_fail(out_err, exc, KitchenErrorsError)
+        _callback_fail(out_err, exc, _GENERIC, KitchenError)
 
 
-def _ReadyListener_latest(ctx: Optional[int], out_ptr: Any, out_len: Any, out_err: Any) -> None:
+def _ReadyListener_latest(ctx: int | None, out_ptr: Any, out_len: Any, out_err: Any) -> None:
     try:
         _ret = _callback_get(ctx).latest()
         _w = _Writer()
         _write_opt_Item(_w, _ret)
         _callback_return_bytes(out_ptr, out_len, _w.finish())
     except BaseException as exc:
-        _callback_fail(out_err, exc)
+        _callback_fail(out_err, exc, _FOREIGN)
 
 
-def _ReadyListener_favorite(ctx: Optional[int], out_err: Any) -> Optional[int]:
+def _ReadyListener_favorite(ctx: int | None, out_err: Any) -> int | None:
     try:
-        _ret = _callback_get(ctx).favorite()
-        return _callback_return_object(_ret, Gadget)
+        return _callback_return_object(_callback_get(ctx).favorite(), Gadget)
     except BaseException as exc:
-        _callback_fail(out_err, exc)
+        _callback_fail(out_err, exc, _FOREIGN)
         return None
 
 
 _ReadyListener_vtable = _ReadyListenerVtable(
     ctypes.sizeof(_ReadyListenerVtable),
-    0,
+    0,  # flags: callable from any thread
     _callback_free_fn,
     _ReadyListener_on_ready_t(_ReadyListener_on_ready),
     _ReadyListener_on_item_t(_ReadyListener_on_item),
@@ -1073,9 +1378,94 @@ _ReadyListener_vtable = _ReadyListenerVtable(
 _ReadyListener_vtable_ptr = ctypes.addressof(_ReadyListener_vtable)
 
 
+class Sampler(abc.ABC):
+    """Consumer-implemented source of scalar samples
+
+    Subclass it and implement every method to pass an instance where the
+    API takes a `Sampler`. The producer may call the methods from any
+    thread until it releases the instance. An exception a method raises
+    reaches the producer as a failure of that call (a method that throws
+    an error domain reports that domain's codes with their fields).
+    """
+
+    @abc.abstractmethod
+    def threshold(self, level: int | None) -> float | None:
+        """The cutoff for a level, if the sampler has one"""
+
+    @abc.abstractmethod
+    def samples(self, limit: int | None, weights: list[float]) -> Sequence[int]:
+        """Up to `limit` samples, failing when the pantry is empty
+
+        Raises
+        ------
+        PantryError
+            To report one of the domain's codes, with its fields, to the producer.
+        """
+
+    @abc.abstractmethod
+    def describe(self) -> str:
+        """A free-form description, failing with an untyped error"""
+
+
+_Sampler_threshold_t = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_bool, ctypes.c_uint32, ctypes.POINTER(ctypes.c_double), ctypes.POINTER(_ErrorStruct))
+_Sampler_samples_t = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_bool, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_ErrorStruct))
+_Sampler_describe_t = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_ErrorStruct))
+
+
+class _SamplerVtable(ctypes.Structure):
+    """The C vtable `kitchen_sink_kitchen_Sampler_vtable`."""
+
+    _fields_ = [
+        ("size", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("free", _CallbackFree),
+        ("threshold", _Sampler_threshold_t),
+        ("samples", _Sampler_samples_t),
+        ("describe", _Sampler_describe_t),
+    ]
+
+
+def _Sampler_threshold(ctx: int | None, has_level: bool, level: int, out_value: Any, out_err: Any) -> bool:
+    try:
+        _ret = _callback_get(ctx).threshold(level if has_level else None)
+        if _ret is None:
+            return False
+        out_value[0] = _float(_ret, "Sampler.threshold() result")
+        return True
+    except BaseException as exc:
+        _callback_fail(out_err, exc, _FOREIGN)
+        return False
+
+
+def _Sampler_samples(ctx: int | None, has_limit: bool, limit: int, weights_ptr: int | None, weights_len: int, out_ptr: Any, out_len: Any, out_err: Any) -> None:
+    try:
+        _callback_return_array(out_ptr, out_len, _callback_get(ctx).samples(limit if has_limit else None, _peek_array(weights_ptr, weights_len, "f64")), "i16", "Sampler.samples() result")
+    except BaseException as exc:
+        _callback_fail(out_err, exc, _GENERIC, PantryError)
+
+
+def _Sampler_describe(ctx: int | None, out_ptr: Any, out_len: Any, out_err: Any) -> None:
+    try:
+        _callback_return_bytes(out_ptr, out_len, _callback_get(ctx).describe().encode("utf-8"))
+    except BaseException as exc:
+        _callback_fail(out_err, exc, _GENERIC)
+
+
+_Sampler_vtable = _SamplerVtable(
+    ctypes.sizeof(_SamplerVtable),
+    0,  # flags: callable from any thread
+    _callback_free_fn,
+    _Sampler_threshold_t(_Sampler_threshold),
+    _Sampler_samples_t(_Sampler_samples),
+    _Sampler_describe_t(_Sampler_describe),
+)
+_Sampler_vtable_ptr = ctypes.addressof(_Sampler_vtable)
+
+
 _c_kitchen_Gadget_new = _bind("kitchen_sink_kitchen_Gadget_new", ctypes.c_void_p, ctypes.c_int64, ctypes.POINTER(_ErrorStruct))
 _c_kitchen_Gadget_describe = _bind("kitchen_sink_kitchen_Gadget_describe", ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_ErrorStruct))
 _c_kitchen_Gadget_poke = _bind("kitchen_sink_kitchen_Gadget_poke", ctypes.c_int32, ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(_ErrorStruct))
+_c_kitchen_Gadget_readings = _bind("kitchen_sink_kitchen_Gadget_readings", ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool, ctypes.c_uint32, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_ErrorStruct))
 _c_kitchen_Gadget_version = _bind("kitchen_sink_kitchen_Gadget_version", ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_ErrorStruct))
 _c_kitchen_Gadget_clone = _bind("kitchen_sink_kitchen_Gadget_clone", ctypes.c_void_p, ctypes.c_void_p)
 _c_kitchen_Gadget_destroy = _bind("kitchen_sink_kitchen_Gadget_destroy", None, ctypes.c_void_p)
@@ -1090,15 +1480,15 @@ class Gadget(_Object):
     def __init__(self, id: int) -> None:
         """Create a gadget with the given id"""
         _err = _ErrorStruct()
-        _ret = _c_kitchen_Gadget_new(id, ctypes.byref(_err))
+        _ret = _c_kitchen_Gadget_new(_i64(id, "id"), ctypes.byref(_err))
         if _err.code:
             raise _trap_from(*_read_error(_err))
         self._init_handle(_required(_ret))
 
     def describe(self) -> str:
         """Render the gadget as a human-readable string"""
-        _err = _ErrorStruct()
         _out_len = ctypes.c_size_t()
+        _err = _ErrorStruct()
         _self_p = self._acquire()
         try:
             _ret = _c_kitchen_Gadget_describe(_self_p, ctypes.byref(_out_len), ctypes.byref(_err))
@@ -1113,24 +1503,45 @@ class Gadget(_Object):
 
         Raises
         ------
-        KitchenErrorsError
-            If the call reports one of the domain's error codes.
+        KitchenError
+            If the call fails with one of the domain's codes.
         """
+        _times_v = _i32(times, "times")
         _err = _ErrorStruct()
         _self_p = self._acquire()
         try:
-            _ret: int = _c_kitchen_Gadget_poke(_self_p, times, ctypes.byref(_err))
+            _ret: int = _c_kitchen_Gadget_poke(_self_p, _times_v, ctypes.byref(_err))
         finally:
             self._release()
         if _err.code:
-            raise _kitchen_errors_error_from(*_read_error(_err))
+            raise _kitchen_error_from(*_read_error(_err))
         return _ret
+
+    def readings(self, limit: int | None) -> list[float]:
+        """The gadget's sensor readings, optionally limited
+
+        Raises
+        ------
+        Error
+            If the call fails.
+        """
+        _limit_v = _u32(limit, "limit") if limit is not None else 0
+        _out_len = ctypes.c_size_t()
+        _err = _ErrorStruct()
+        _self_p = self._acquire()
+        try:
+            _ret = _c_kitchen_Gadget_readings(_self_p, limit is not None, _limit_v, ctypes.byref(_out_len), ctypes.byref(_err))
+        finally:
+            self._release()
+        if _err.code:
+            raise _error_from(*_read_error(_err))
+        return _take_array(_ret, _out_len.value, "f64")
 
     @staticmethod
     def version() -> str:
         """The gadget subsystem version string"""
-        _err = _ErrorStruct()
         _out_len = ctypes.c_size_t()
+        _err = _ErrorStruct()
         _ret = _c_kitchen_Gadget_version(ctypes.byref(_out_len), ctypes.byref(_err))
         if _err.code:
             raise _trap_from(*_read_error(_err))
@@ -1154,7 +1565,7 @@ _c_kitchen_i32_id = _bind("kitchen_sink_kitchen_i32_id", ctypes.c_int32, ctypes.
 
 def i32_id(x: int) -> int:
     _err = _ErrorStruct()
-    _ret: int = _c_kitchen_i32_id(x, ctypes.byref(_err))
+    _ret: int = _c_kitchen_i32_id(_i32(x, "x"), ctypes.byref(_err))
     if _err.code:
         raise _trap_from(*_read_error(_err))
     return _ret
@@ -1165,7 +1576,7 @@ _c_kitchen_u32_id = _bind("kitchen_sink_kitchen_u32_id", ctypes.c_uint32, ctypes
 
 def u32_id(x: int) -> int:
     _err = _ErrorStruct()
-    _ret: int = _c_kitchen_u32_id(x, ctypes.byref(_err))
+    _ret: int = _c_kitchen_u32_id(_u32(x, "x"), ctypes.byref(_err))
     if _err.code:
         raise _trap_from(*_read_error(_err))
     return _ret
@@ -1176,7 +1587,7 @@ _c_kitchen_i64_id = _bind("kitchen_sink_kitchen_i64_id", ctypes.c_int64, ctypes.
 
 def i64_id(x: int) -> int:
     _err = _ErrorStruct()
-    _ret: int = _c_kitchen_i64_id(x, ctypes.byref(_err))
+    _ret: int = _c_kitchen_i64_id(_i64(x, "x"), ctypes.byref(_err))
     if _err.code:
         raise _trap_from(*_read_error(_err))
     return _ret
@@ -1198,8 +1609,8 @@ _c_kitchen_echo_string = _bind("kitchen_sink_kitchen_echo_string", ctypes.c_void
 
 def echo_string(s: str) -> str:
     _s_b = s.encode("utf-8")
-    _err = _ErrorStruct()
     _out_len = ctypes.c_size_t()
+    _err = _ErrorStruct()
     _ret = _c_kitchen_echo_string(_s_b, len(_s_b), ctypes.byref(_out_len), ctypes.byref(_err))
     if _err.code:
         raise _trap_from(*_read_error(_err))
@@ -1211,8 +1622,8 @@ _c_kitchen_echo_bytes = _bind("kitchen_sink_kitchen_echo_bytes", ctypes.c_void_p
 
 def echo_bytes(b: bytes) -> bytes:
     _b_b = bytes(b)
-    _err = _ErrorStruct()
     _out_len = ctypes.c_size_t()
+    _err = _ErrorStruct()
     _ret = _c_kitchen_echo_bytes(_b_b, len(_b_b), ctypes.byref(_out_len), ctypes.byref(_err))
     if _err.code:
         raise _trap_from(*_read_error(_err))
@@ -1235,7 +1646,7 @@ def subscribe(listener: ReadyListener) -> int:
 _c_kitchen_maybe_subscribe = _bind("kitchen_sink_kitchen_maybe_subscribe", ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(_ErrorStruct))
 
 
-def maybe_subscribe(listener: Optional[ReadyListener]) -> bool:
+def maybe_subscribe(listener: ReadyListener | None) -> bool:
     """Register a listener if one is given"""
     _err = _ErrorStruct()
     _listener_ctx = _callback_register_opt(listener, ReadyListener)
@@ -1248,7 +1659,7 @@ def maybe_subscribe(listener: Optional[ReadyListener]) -> bool:
 _c_kitchen_maybe_gadget = _bind("kitchen_sink_kitchen_maybe_gadget", ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(_ErrorStruct))
 
 
-def maybe_gadget(fallback: Optional[Gadget]) -> Optional[Gadget]:
+def maybe_gadget(fallback: Gadget | None) -> Gadget | None:
     """Optional object in both directions"""
     _err = _ErrorStruct()
     _fallback_p = _lend_opt(fallback, Gadget)
@@ -1264,10 +1675,10 @@ def maybe_gadget(fallback: Optional[Gadget]) -> Optional[Gadget]:
 _c_kitchen_gadgets = _bind("kitchen_sink_kitchen_gadgets", ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_ErrorStruct))
 
 
-def gadgets() -> List[Gadget]:
+def gadgets() -> list[Gadget]:
     """A list of objects"""
-    _err = _ErrorStruct()
     _out_len = ctypes.c_size_t()
+    _err = _ErrorStruct()
     _ret = _c_kitchen_gadgets(ctypes.byref(_out_len), ctypes.byref(_err))
     if _err.code:
         raise _trap_from(*_read_error(_err))
@@ -1279,68 +1690,58 @@ _c_kitchen_StreamGadgetsIterator_next = _bind("kitchen_sink_kitchen_StreamGadget
 _c_kitchen_StreamGadgetsIterator_destroy = _bind("kitchen_sink_kitchen_StreamGadgetsIterator_destroy", None, ctypes.c_void_p)
 
 
-class _kitchen_StreamGadgetsIterator(_Iterator):
-    """The lazy iterator `stream_gadgets` returns: each step pulls one element
-    from the producer."""
-
-    _destroy = staticmethod(_c_kitchen_StreamGadgetsIterator_destroy)
-
-    def __next__(self) -> Gadget:
-        _item = ctypes.c_void_p()
-        _err = _ErrorStruct()
-        _p = self._step()
-        try:
-            _more = _c_kitchen_StreamGadgetsIterator_next(_p, ctypes.byref(_item), ctypes.byref(_err))
-        finally:
-            self._release()
-        if _err.code:
-            raise _trap_from(*_read_error(_err))
-        if not _more:
-            self.close()
-            raise StopIteration
-        return Gadget._adopt(_required(_item.value))
+def _pull_kitchen_StreamGadgetsIterator(_p: int) -> Gadget:
+    _out_item = ctypes.c_void_p()
+    _err = _ErrorStruct()
+    _more = _c_kitchen_StreamGadgetsIterator_next(_p, ctypes.byref(_out_item), ctypes.byref(_err))
+    if _err.code:
+        raise _trap_from(*_read_error(_err))
+    if not _more:
+        raise StopIteration
+    return Gadget._adopt(_required(_out_item.value))
 
 
-def stream_gadgets() -> Iterator[Gadget]:
+def stream_gadgets() -> NativeIterator[Gadget]:
     """An iterator over objects
 
-    Returns a lazy iterator: each step pulls one element from the
-    producer. Exhaust or close() the iterator to release its native
-    handle (garbage collection also releases it).
+    Returns a lazy `NativeIterator`: each step pulls one element from
+    the producer. Exhaust it, `close()` it, or use it in a `with`
+    statement to release its native handle (garbage collection also
+    releases it).
     """
     _err = _ErrorStruct()
     _ret = _c_kitchen_stream_gadgets(ctypes.byref(_err))
     if _err.code:
         raise _trap_from(*_read_error(_err))
-    return _kitchen_StreamGadgetsIterator._adopt(_ret)
+    return _iterate(_required(_ret), _pull_kitchen_StreamGadgetsIterator, _c_kitchen_StreamGadgetsIterator_destroy)
 
 
 _c_kitchen_maybe_item = _bind("kitchen_sink_kitchen_maybe_item", ctypes.c_void_p, ctypes.c_int64, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_ErrorStruct))
 
 
-def maybe_item(id: int) -> Optional[Item]:
+def maybe_item(id: int) -> Item | None:
     """Optional struct return
 
     Raises
     ------
-    KitchenErrorsError
-        If the call reports one of the domain's error codes.
+    KitchenError
+        If the call fails with one of the domain's codes.
     """
-    _err = _ErrorStruct()
     _out_len = ctypes.c_size_t()
-    _ret = _c_kitchen_maybe_item(id, ctypes.byref(_out_len), ctypes.byref(_err))
+    _err = _ErrorStruct()
+    _ret = _c_kitchen_maybe_item(_i64(id, "id"), ctypes.byref(_out_len), ctypes.byref(_err))
     if _err.code:
-        raise _kitchen_errors_error_from(*_read_error(_err))
+        raise _kitchen_error_from(*_read_error(_err))
     return _decode(_take_bytes(_ret, _out_len.value), _read_opt_Item)
 
 
 _c_kitchen_list_items = _bind("kitchen_sink_kitchen_list_items", ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_ErrorStruct))
 
 
-def list_items() -> List[Item]:
+def list_items() -> list[Item]:
     """List of structs"""
-    _err = _ErrorStruct()
     _out_len = ctypes.c_size_t()
+    _err = _ErrorStruct()
     _ret = _c_kitchen_list_items(ctypes.byref(_out_len), ctypes.byref(_err))
     if _err.code:
         raise _trap_from(*_read_error(_err))
@@ -1350,10 +1751,10 @@ def list_items() -> List[Item]:
 _c_kitchen_get_attrs = _bind("kitchen_sink_kitchen_get_attrs", ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_ErrorStruct))
 
 
-def get_attrs() -> Dict[str, int]:
+def get_attrs() -> dict[str, int]:
     """Map return type"""
-    _err = _ErrorStruct()
     _out_len = ctypes.c_size_t()
+    _err = _ErrorStruct()
     _ret = _c_kitchen_get_attrs(ctypes.byref(_out_len), ctypes.byref(_err))
     if _err.code:
         raise _trap_from(*_read_error(_err))
@@ -1365,41 +1766,31 @@ _c_kitchen_StreamItemsIterator_next = _bind("kitchen_sink_kitchen_StreamItemsIte
 _c_kitchen_StreamItemsIterator_destroy = _bind("kitchen_sink_kitchen_StreamItemsIterator_destroy", None, ctypes.c_void_p)
 
 
-class _kitchen_StreamItemsIterator(_Iterator):
-    """The lazy iterator `stream_items` returns: each step pulls one element
-    from the producer."""
-
-    _destroy = staticmethod(_c_kitchen_StreamItemsIterator_destroy)
-
-    def __next__(self) -> Item:
-        _item = ctypes.c_void_p()
-        _len = ctypes.c_size_t()
-        _err = _ErrorStruct()
-        _p = self._step()
-        try:
-            _more = _c_kitchen_StreamItemsIterator_next(_p, ctypes.byref(_item), ctypes.byref(_len), ctypes.byref(_err))
-        finally:
-            self._release()
-        if _err.code:
-            raise _trap_from(*_read_error(_err))
-        if not _more:
-            self.close()
-            raise StopIteration
-        return _decode(_take_bytes(_item.value, _len.value), _read_Item)
+def _pull_kitchen_StreamItemsIterator(_p: int) -> Item:
+    _out_item = ctypes.c_void_p()
+    _out_len = ctypes.c_size_t()
+    _err = _ErrorStruct()
+    _more = _c_kitchen_StreamItemsIterator_next(_p, ctypes.byref(_out_item), ctypes.byref(_out_len), ctypes.byref(_err))
+    if _err.code:
+        raise _trap_from(*_read_error(_err))
+    if not _more:
+        raise StopIteration
+    return _decode(_take_bytes(_out_item.value, _out_len.value), _read_Item)
 
 
-def stream_items() -> Iterator[Item]:
+def stream_items() -> NativeIterator[Item]:
     """Iterator return type
 
-    Returns a lazy iterator: each step pulls one element from the
-    producer. Exhaust or close() the iterator to release its native
-    handle (garbage collection also releases it).
+    Returns a lazy `NativeIterator`: each step pulls one element from
+    the producer. Exhaust it, `close()` it, or use it in a `with`
+    statement to release its native handle (garbage collection also
+    releases it).
     """
     _err = _ErrorStruct()
     _ret = _c_kitchen_stream_items(ctypes.byref(_err))
     if _err.code:
         raise _trap_from(*_read_error(_err))
-    return _kitchen_StreamItemsIterator._adopt(_ret)
+    return _iterate(_required(_ret), _pull_kitchen_StreamItemsIterator, _c_kitchen_StreamItemsIterator_destroy)
 
 
 _c_kitchen_cross_module_token = _bind("kitchen_sink_kitchen_cross_module_token", ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_ErrorStruct))
@@ -1407,8 +1798,8 @@ _c_kitchen_cross_module_token = _bind("kitchen_sink_kitchen_cross_module_token",
 
 def cross_module_token() -> Token:
     """Returns the shared Token type from another module"""
-    _err = _ErrorStruct()
     _out_len = ctypes.c_size_t()
+    _err = _ErrorStruct()
     _ret = _c_kitchen_cross_module_token(ctypes.byref(_out_len), ctypes.byref(_err))
     if _err.code:
         raise _trap_from(*_read_error(_err))
@@ -1419,7 +1810,7 @@ _c_kitchen_do_async_callback = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.PO
 _c_kitchen_do_async = _bind("kitchen_sink_kitchen_do_async", None, ctypes.c_char_p, ctypes.c_size_t, _c_kitchen_do_async_callback, ctypes.c_void_p)
 
 
-def _kitchen_do_async_complete(context: Optional[int], err: Any, result_ptr: Optional[int], result_len: int) -> None:
+def _kitchen_do_async_complete(context: int | None, err: Any, result_ptr: int | None, result_len: int) -> None:
     # Runs once, on a producer thread: take ownership of the result
     # here, then hand it to the awaiting event loop.
     try:
@@ -1451,7 +1842,7 @@ _c_kitchen_do_cancellable_callback = ctypes.CFUNCTYPE(None, ctypes.c_void_p, cty
 _c_kitchen_do_cancellable = _bind("kitchen_sink_kitchen_do_cancellable", None, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p, _c_kitchen_do_cancellable_callback, ctypes.c_void_p)
 
 
-def _kitchen_do_cancellable_complete(context: Optional[int], err: Any, result_ptr: Optional[int], result_len: int) -> None:
+def _kitchen_do_cancellable_complete(context: int | None, err: Any, result_ptr: int | None, result_len: int) -> None:
     # Runs once, on a producer thread: take ownership of the result
     # here, then hand it to the awaiting event loop.
     try:
@@ -1487,9 +1878,9 @@ _c_kitchen_legacy_op = _bind("kitchen_sink_kitchen_legacy_op", ctypes.c_int32, c
 def legacy_op() -> int:
     """Legacy operation kept for compatibility
 
-    Deprecated: Use new_op instead
+    Deprecated: Use `new_op` instead
     """
-    warnings.warn("Use new_op instead", DeprecationWarning, stacklevel=2)
+    warnings.warn("Use `new_op` instead", DeprecationWarning, stacklevel=2)
     _err = _ErrorStruct()
     _ret: int = _c_kitchen_legacy_op(ctypes.byref(_err))
     if _err.code:
@@ -1501,11 +1892,313 @@ _c_kitchen_new_op = _bind("kitchen_sink_kitchen_new_op", ctypes.c_int32, ctypes.
 
 
 def new_op() -> int:
-    """Replacement for legacy_op"""
+    """Replacement for `legacy_op`"""
     _err = _ErrorStruct()
     _ret: int = _c_kitchen_new_op(ctypes.byref(_err))
     if _err.code:
         raise _trap_from(*_read_error(_err))
+    return _ret
+
+
+_c_kitchen_opt_i32_id = _bind("kitchen_sink_kitchen_opt_i32_id", ctypes.c_bool, ctypes.c_bool, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(_ErrorStruct))
+
+
+def opt_i32_id(x: int | None) -> int | None:
+    """Optional scalar in both directions"""
+    _out_value = ctypes.c_int32()
+    _err = _ErrorStruct()
+    _ret = _c_kitchen_opt_i32_id(x is not None, _i32(x, "x") if x is not None else 0, ctypes.byref(_out_value), ctypes.byref(_err))
+    if _err.code:
+        raise _trap_from(*_read_error(_err))
+    return _out_value.value if _ret else None
+
+
+_c_kitchen_opt_bool_id = _bind("kitchen_sink_kitchen_opt_bool_id", ctypes.c_bool, ctypes.c_bool, ctypes.c_bool, ctypes.POINTER(ctypes.c_bool), ctypes.POINTER(_ErrorStruct))
+
+
+def opt_bool_id(x: bool | None) -> bool | None:
+    _out_value = ctypes.c_bool()
+    _err = _ErrorStruct()
+    _ret = _c_kitchen_opt_bool_id(x is not None, x if x is not None else False, ctypes.byref(_out_value), ctypes.byref(_err))
+    if _err.code:
+        raise _trap_from(*_read_error(_err))
+    return _out_value.value if _ret else None
+
+
+_c_kitchen_opt_priority = _bind("kitchen_sink_kitchen_opt_priority", ctypes.c_bool, ctypes.c_bool, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(_ErrorStruct))
+
+
+def opt_priority(p: Priority | None) -> Priority | None:
+    """Optional C-style enum in both directions"""
+    _out_value = ctypes.c_int32()
+    _err = _ErrorStruct()
+    _ret = _c_kitchen_opt_priority(p is not None, _i32(p, "p") if p is not None else 0, ctypes.byref(_out_value), ctypes.byref(_err))
+    if _err.code:
+        raise _trap_from(*_read_error(_err))
+    return Priority(_out_value.value) if _ret else None
+
+
+_c_kitchen_opt_mixed = _bind("kitchen_sink_kitchen_opt_mixed", ctypes.c_bool, ctypes.c_double, ctypes.c_bool, ctypes.c_float, ctypes.c_bool, ctypes.c_int64, ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint16), ctypes.POINTER(_ErrorStruct))
+
+
+def opt_mixed(base: float, scale: float | None, offset: int | None, label: str | None) -> int | None:
+    """Optional scalars next to ordinary parameters"""
+    _scale_v = scale if scale is not None else 0.0
+    _offset_v = _i64(offset, "offset") if offset is not None else 0
+    _label_w = _Writer()
+    _write_opt_string(_label_w, label)
+    _out_value = ctypes.c_uint16()
+    _err = _ErrorStruct()
+    _label_b = _label_w.finish()
+    _ret = _c_kitchen_opt_mixed(base, scale is not None, _scale_v, offset is not None, _offset_v, _label_b, len(_label_b), ctypes.byref(_out_value), ctypes.byref(_err))
+    if _err.code:
+        raise _trap_from(*_read_error(_err))
+    return _out_value.value if _ret else None
+
+
+_c_kitchen_sum_f64 = _bind("kitchen_sink_kitchen_sum_f64", ctypes.c_double, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(_ErrorStruct))
+
+
+def sum_f64(xs: Sequence[float]) -> float:
+    """A typed-array parameter"""
+    _xs_a = _array(xs, "f64", "xs")
+    _err = _ErrorStruct()
+    _ret: float = _c_kitchen_sum_f64(_xs_a.buffer_info()[0], len(_xs_a), ctypes.byref(_err))
+    if _err.code:
+        raise _trap_from(*_read_error(_err))
+    return _ret
+
+
+_c_kitchen_scale_i32 = _bind("kitchen_sink_kitchen_scale_i32", ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int32, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_ErrorStruct))
+
+
+def scale_i32(xs: Sequence[int], factor: int) -> list[int]:
+    """Typed arrays in both directions"""
+    _xs_a = _array(xs, "i32", "xs")
+    _out_len = ctypes.c_size_t()
+    _err = _ErrorStruct()
+    _ret = _c_kitchen_scale_i32(_xs_a.buffer_info()[0], len(_xs_a), _i32(factor, "factor"), ctypes.byref(_out_len), ctypes.byref(_err))
+    if _err.code:
+        raise _trap_from(*_read_error(_err))
+    return _take_array(_ret, _out_len.value, "i32")
+
+
+_c_kitchen_ids_u64 = _bind("kitchen_sink_kitchen_ids_u64", ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_ErrorStruct))
+
+
+def ids_u64(ids: Sequence[int]) -> list[int]:
+    _ids_a = _array(ids, "u64", "ids")
+    _out_len = ctypes.c_size_t()
+    _err = _ErrorStruct()
+    _ret = _c_kitchen_ids_u64(_ids_a.buffer_info()[0], len(_ids_a), ctypes.byref(_out_len), ctypes.byref(_err))
+    if _err.code:
+        raise _trap_from(*_read_error(_err))
+    return _take_array(_ret, _out_len.value, "u64")
+
+
+_c_kitchen_mixed_slices = _bind("kitchen_sink_kitchen_mixed_slices", ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_ErrorStruct))
+
+
+def mixed_slices(a: Sequence[int], b: Sequence[int], c: Sequence[int], d: Sequence[int], e: Sequence[int], f: Sequence[float]) -> list[int]:
+    """Every slice element type"""
+    _a_a = _array(a, "i8", "a")
+    _b_a = _array(b, "i16", "b")
+    _c_a = _array(c, "u16", "c")
+    _d_a = _array(d, "u32", "d")
+    _e_a = _array(e, "i64", "e")
+    _f_a = _array(f, "f32", "f")
+    _out_len = ctypes.c_size_t()
+    _err = _ErrorStruct()
+    _ret = _c_kitchen_mixed_slices(_a_a.buffer_info()[0], len(_a_a), _b_a.buffer_info()[0], len(_b_a), _c_a.buffer_info()[0], len(_c_a), _d_a.buffer_info()[0], len(_d_a), _e_a.buffer_info()[0], len(_e_a), _f_a.buffer_info()[0], len(_f_a), ctypes.byref(_out_len), ctypes.byref(_err))
+    if _err.code:
+        raise _trap_from(*_read_error(_err))
+    return _take_array(_ret, _out_len.value, "u32")
+
+
+_c_kitchen_async_maybe_count_callback = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_ErrorStruct), ctypes.c_bool, ctypes.c_int64)
+_c_kitchen_async_maybe_count = _bind("kitchen_sink_kitchen_async_maybe_count", None, _c_kitchen_async_maybe_count_callback, ctypes.c_void_p)
+
+
+def _kitchen_async_maybe_count_complete(context: int | None, err: Any, has_result: bool, result: int) -> None:
+    # Runs once, on a producer thread: take ownership of the result
+    # here, then hand it to the awaiting event loop.
+    try:
+        if err:
+            _async_settle(context, _async_error(err, _trap_from), None)
+        else:
+            _async_settle(context, None, result if has_result else None)
+    except BaseException as exc:
+        _async_settle(context, exc, None)
+
+
+_kitchen_async_maybe_count_completion = _c_kitchen_async_maybe_count_callback(_kitchen_async_maybe_count_complete)
+
+
+async def async_maybe_count() -> int | None:
+    """Async returning an optional scalar"""
+    _call, _future = _async_begin()
+    try:
+        _c_kitchen_async_maybe_count(_kitchen_async_maybe_count_completion, _call)
+    except BaseException:
+        _async_abandon(_call)
+        raise
+    _result: int | None = await _future
+    return _result
+
+
+_c_kitchen_async_samples_callback = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_ErrorStruct), ctypes.c_void_p, ctypes.c_size_t)
+_c_kitchen_async_samples = _bind("kitchen_sink_kitchen_async_samples", None, ctypes.c_uint32, ctypes.c_void_p, _c_kitchen_async_samples_callback, ctypes.c_void_p)
+
+
+def _kitchen_async_samples_complete(context: int | None, err: Any, result_ptr: int | None, result_len: int) -> None:
+    # Runs once, on a producer thread: take ownership of the result
+    # here, then hand it to the awaiting event loop.
+    try:
+        if err:
+            _async_settle(context, _async_error(err, _trap_from), None)
+        else:
+            _async_settle(context, None, _take_array(result_ptr, result_len, "f32"))
+    except BaseException as exc:
+        _async_settle(context, exc, None)
+
+
+_kitchen_async_samples_completion = _c_kitchen_async_samples_callback(_kitchen_async_samples_complete)
+
+
+async def async_samples(n: int) -> list[float]:
+    """Async returning a typed array"""
+    _call, _future = _async_begin()
+    _token = _cancel_token_create()
+    try:
+        _c_kitchen_async_samples(_u32(n, "n"), _token, _kitchen_async_samples_completion, _call)
+    except BaseException:
+        _async_abandon(_call)
+        _cancel_token_destroy(_token)
+        raise
+    _result: list[float] = await _async_wait_cancellable(_future, _token)
+    return _result
+
+
+_c_kitchen_stream_maybe = _bind("kitchen_sink_kitchen_stream_maybe", ctypes.c_void_p, ctypes.POINTER(_ErrorStruct))
+_c_kitchen_StreamMaybeIterator_next = _bind("kitchen_sink_kitchen_StreamMaybeIterator_next", ctypes.c_int32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_bool), ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(_ErrorStruct))
+_c_kitchen_StreamMaybeIterator_destroy = _bind("kitchen_sink_kitchen_StreamMaybeIterator_destroy", None, ctypes.c_void_p)
+
+
+def _pull_kitchen_StreamMaybeIterator(_p: int) -> int | None:
+    _out_has_item = ctypes.c_bool()
+    _out_item = ctypes.c_int32()
+    _err = _ErrorStruct()
+    _more = _c_kitchen_StreamMaybeIterator_next(_p, ctypes.byref(_out_has_item), ctypes.byref(_out_item), ctypes.byref(_err))
+    if _err.code:
+        raise _trap_from(*_read_error(_err))
+    if not _more:
+        raise StopIteration
+    return _out_item.value if _out_has_item.value else None
+
+
+def stream_maybe() -> NativeIterator[int | None]:
+    """Iterator of optional scalars
+
+    Returns a lazy `NativeIterator`: each step pulls one element from
+    the producer. Exhaust it, `close()` it, or use it in a `with`
+    statement to release its native handle (garbage collection also
+    releases it).
+    """
+    _err = _ErrorStruct()
+    _ret = _c_kitchen_stream_maybe(ctypes.byref(_err))
+    if _err.code:
+        raise _trap_from(*_read_error(_err))
+    return _iterate(_required(_ret), _pull_kitchen_StreamMaybeIterator, _c_kitchen_StreamMaybeIterator_destroy)
+
+
+_c_kitchen_stream_chunks = _bind("kitchen_sink_kitchen_stream_chunks", ctypes.c_void_p, ctypes.POINTER(_ErrorStruct))
+_c_kitchen_StreamChunksIterator_next = _bind("kitchen_sink_kitchen_StreamChunksIterator_next", ctypes.c_int32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_ErrorStruct))
+_c_kitchen_StreamChunksIterator_destroy = _bind("kitchen_sink_kitchen_StreamChunksIterator_destroy", None, ctypes.c_void_p)
+
+
+def _pull_kitchen_StreamChunksIterator(_p: int) -> list[int]:
+    _out_item = ctypes.c_void_p()
+    _out_len = ctypes.c_size_t()
+    _err = _ErrorStruct()
+    _more = _c_kitchen_StreamChunksIterator_next(_p, ctypes.byref(_out_item), ctypes.byref(_out_len), ctypes.byref(_err))
+    if _err.code:
+        raise _trap_from(*_read_error(_err))
+    if not _more:
+        raise StopIteration
+    return _take_array(_out_item.value, _out_len.value, "i32")
+
+
+def stream_chunks() -> NativeIterator[list[int]]:
+    """Iterator of typed arrays
+
+    Returns a lazy `NativeIterator`: each step pulls one element from
+    the producer. Exhaust it, `close()` it, or use it in a `with`
+    statement to release its native handle (garbage collection also
+    releases it).
+    """
+    _err = _ErrorStruct()
+    _ret = _c_kitchen_stream_chunks(ctypes.byref(_err))
+    if _err.code:
+        raise _trap_from(*_read_error(_err))
+    return _iterate(_required(_ret), _pull_kitchen_StreamChunksIterator, _c_kitchen_StreamChunksIterator_destroy)
+
+
+_c_kitchen_sample_with = _bind("kitchen_sink_kitchen_sample_with", ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool, ctypes.c_uint32, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_ErrorStruct))
+
+
+def sample_with(sampler: Sampler, level: int | None) -> list[int]:
+    """Drive a consumer-implemented sampler
+
+    Raises
+    ------
+    PantryError
+        If the call fails with one of the domain's codes.
+    """
+    _level_v = _u32(level, "level") if level is not None else 0
+    _out_len = ctypes.c_size_t()
+    _err = _ErrorStruct()
+    _sampler_ctx = _callback_register(sampler, Sampler)
+    _ret = _c_kitchen_sample_with(_sampler_ctx, _Sampler_vtable_ptr, level is not None, _level_v, ctypes.byref(_out_len), ctypes.byref(_err))
+    if _err.code:
+        raise _pantry_error_from(*_read_error(_err))
+    return _take_array(_ret, _out_len.value, "i16")
+
+
+_c_kitchen_take_from_pantry = _bind("kitchen_sink_kitchen_take_from_pantry", ctypes.c_int32, ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(_ErrorStruct))
+
+
+def take_from_pantry(item: str) -> int:
+    """Fails with the second domain
+
+    Raises
+    ------
+    PantryError
+        If the call fails with one of the domain's codes.
+    """
+    _item_b = item.encode("utf-8")
+    _err = _ErrorStruct()
+    _ret: int = _c_kitchen_take_from_pantry(_item_b, len(_item_b), ctypes.byref(_err))
+    if _err.code:
+        raise _pantry_error_from(*_read_error(_err))
+    return _ret
+
+
+_c_kitchen_parse_any = _bind("kitchen_sink_kitchen_parse_any", ctypes.c_int64, ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(_ErrorStruct))
+
+
+def parse_any(text: str) -> int:
+    """Fails with an untyped error
+
+    Raises
+    ------
+    Error
+        If the call fails.
+    """
+    _text_b = text.encode("utf-8")
+    _err = _ErrorStruct()
+    _ret: int = _c_kitchen_parse_any(_text_b, len(_text_b), ctypes.byref(_err))
+    if _err.code:
+        raise _error_from(*_read_error(_err))
     return _ret
 
 
@@ -1517,8 +2210,8 @@ _c_kitchen_nested_hello = _bind("kitchen_sink_kitchen_nested_hello", ctypes.c_vo
 
 def hello() -> str:
     """Trivial nested-module function"""
-    _err = _ErrorStruct()
     _out_len = ctypes.c_size_t()
+    _err = _ErrorStruct()
     _ret = _c_kitchen_nested_hello(ctypes.byref(_out_len), ctypes.byref(_err))
     if _err.code:
         raise _trap_from(*_read_error(_err))
@@ -1528,24 +2221,24 @@ def hello() -> str:
 # === Value-buffer codecs of composite types ===
 
 
-def _write_list_string(_w: _Writer, value: List[str]) -> None:
+def _write_list_string(_w: _Writer, value: Sequence[str]) -> None:
     _w.write_count(len(value))
     for item in value:
         _w.write_string(item)
 
 
-def _read_list_string(_r: _Reader) -> List[str]:
+def _read_list_string(_r: _Reader) -> list[str]:
     return [_r.read_string() for _ in range(_r.read_count())]
 
 
-def _write_map_string_string(_w: _Writer, value: Dict[str, str]) -> None:
+def _write_map_string_string(_w: _Writer, value: Mapping[str, str]) -> None:
     _w.write_count(len(value))
     for key, item in value.items():
         _w.write_string(key)
         _w.write_string(item)
 
 
-def _read_map_string_string(_r: _Reader) -> Dict[str, str]:
+def _read_map_string_string(_r: _Reader) -> dict[str, str]:
     n = _r.read_count()
     value = {_r.read_string(): _r.read_string() for _ in range(n)}
     if len(value) != n:
@@ -1553,64 +2246,64 @@ def _read_map_string_string(_r: _Reader) -> Dict[str, str]:
     return value
 
 
-def _write_opt_i64(_w: _Writer, value: Optional[int]) -> None:
+def _write_opt_i64(_w: _Writer, value: int | None) -> None:
     _w.write_flag(value is not None)
     if value is not None:
         _w.write_i64(value)
 
 
-def _read_opt_i64(_r: _Reader) -> Optional[int]:
+def _read_opt_i64(_r: _Reader) -> int | None:
     return _r.read_i64() if _r.read_flag() else None
 
 
-def _write_opt_Gadget(_w: _Writer, value: Optional[Gadget]) -> None:
+def _write_opt_Gadget(_w: _Writer, value: Gadget | None) -> None:
     _w.write_flag(value is not None)
     if value is not None:
         _w.write_object(value, Gadget)
 
 
-def _read_opt_Gadget(_r: _Reader) -> Optional[Gadget]:
+def _read_opt_Gadget(_r: _Reader) -> Gadget | None:
     return Gadget._adopt(_r.read_object()) if _r.read_flag() else None
 
 
-def _write_list_Gadget(_w: _Writer, value: List[Gadget]) -> None:
+def _write_list_Gadget(_w: _Writer, value: Sequence[Gadget]) -> None:
     _w.write_count(len(value))
     for item in value:
         _w.write_object(item, Gadget)
 
 
-def _read_list_Gadget(_r: _Reader) -> List[Gadget]:
+def _read_list_Gadget(_r: _Reader) -> list[Gadget]:
     return [Gadget._adopt(_r.read_object()) for _ in range(_r.read_count())]
 
 
-def _write_opt_Item(_w: _Writer, value: Optional[Item]) -> None:
+def _write_opt_Item(_w: _Writer, value: Item | None) -> None:
     _w.write_flag(value is not None)
     if value is not None:
         _write_Item(_w, value)
 
 
-def _read_opt_Item(_r: _Reader) -> Optional[Item]:
+def _read_opt_Item(_r: _Reader) -> Item | None:
     return _read_Item(_r) if _r.read_flag() else None
 
 
-def _write_list_Item(_w: _Writer, value: List[Item]) -> None:
+def _write_list_Item(_w: _Writer, value: Sequence[Item]) -> None:
     _w.write_count(len(value))
     for item in value:
         _write_Item(_w, item)
 
 
-def _read_list_Item(_r: _Reader) -> List[Item]:
+def _read_list_Item(_r: _Reader) -> list[Item]:
     return [_read_Item(_r) for _ in range(_r.read_count())]
 
 
-def _write_map_string_i32(_w: _Writer, value: Dict[str, int]) -> None:
+def _write_map_string_i32(_w: _Writer, value: Mapping[str, int]) -> None:
     _w.write_count(len(value))
     for key, item in value.items():
         _w.write_string(key)
         _w.write_i32(item)
 
 
-def _read_map_string_i32(_r: _Reader) -> Dict[str, int]:
+def _read_map_string_i32(_r: _Reader) -> dict[str, int]:
     n = _r.read_count()
     value = {_r.read_string(): _r.read_i32() for _ in range(n)}
     if len(value) != n:
@@ -1618,17 +2311,33 @@ def _read_map_string_i32(_r: _Reader) -> Dict[str, int]:
     return value
 
 
+def _write_opt_string(_w: _Writer, value: str | None) -> None:
+    _w.write_flag(value is not None)
+    if value is not None:
+        _w.write_string(value)
+
+
+def _read_opt_string(_r: _Reader) -> str | None:
+    return _r.read_string() if _r.read_flag() else None
+
+
 __all__ = [
     "Error",
     "InternalError",
+    "LibraryLoadError",
+    "NativeIterator",
     "Token",
     "ping",
-    "KitchenErrorsError",
-    "NotFound",
-    "InvalidInput",
+    "KitchenError",
+    "NotFoundError",
+    "InvalidInputError",
+    "PantryError",
+    "OutOfStockError",
+    "SpoiledError",
     "Priority",
     "Item",
     "ReadyListener",
+    "Sampler",
     "Gadget",
     "bool_id",
     "i32_id",
@@ -1651,6 +2360,21 @@ __all__ = [
     "do_cancellable",
     "legacy_op",
     "new_op",
+    "opt_i32_id",
+    "opt_bool_id",
+    "opt_priority",
+    "opt_mixed",
+    "sum_f64",
+    "scale_i32",
+    "ids_u64",
+    "mixed_slices",
+    "async_maybe_count",
+    "async_samples",
+    "stream_maybe",
+    "stream_chunks",
+    "sample_with",
+    "take_from_pantry",
+    "parse_any",
     "hello",
 ]
 

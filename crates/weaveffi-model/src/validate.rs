@@ -9,11 +9,11 @@
 //! invocation.
 
 use crate::ir::{Api, SUPPORTED_VERSIONS};
-use crate::model::{Model, RESERVED_SYMBOL_FAMILIES, RUNTIME_SYMBOLS};
+use crate::model::{Model, SymbolOwner, RESERVED_SYMBOL_FAMILIES};
 use crate::pkg::Identity;
 #[cfg(feature = "idl")]
 use miette::Diagnostic;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 mod diagnostic;
 mod rules;
@@ -210,6 +210,29 @@ pub enum ValidationError {
         /// The declaration that collided with it.
         second: String,
     },
+    /// Two C slots of one lowered signature share a name: a parameter's
+    /// slot collides with another parameter's (a `string` parameter `name`
+    /// lowers to `name_ptr`, which collides with a parameter `name_ptr`; an
+    /// optional `x` adds `has_x`) or with a slot the ABI adds (`self`,
+    /// `ctx`, `out_err`, `out_len`, `out_value`, `callback`, `context`,
+    /// `cancel_token`).
+    #[error("C slot collision in '{function}': two slots are named '{slot}'")]
+    #[cfg_attr(
+        feature = "idl",
+        diagnostic(help(
+            "a parameter lowers to C slots named after it (`x`, `has_x`, `x_ptr`, `x_len`, \
+         `x_ctx`, `x_vtable`) next to the slots the ABI adds (`self`, `ctx`, `out_err`, \
+         `out_len`, `out_value`, `out_ptr`, `callback`, `context`, `cancel_token`); rename the \
+         parameter"
+        ))
+    )]
+    SlotCollision {
+        /// The callable's dotted path (`m.f`, `m.Store.get`,
+        /// `m.Listener.on_event`).
+        function: String,
+        /// The colliding slot name.
+        slot: String,
+    },
     /// Two parameters of one function share a name.
     #[error("duplicate param name in function '{function}' of module '{module}': {param}")]
     #[cfg_attr(
@@ -241,22 +264,23 @@ pub enum ValidationError {
         /// The offending function.
         function: String,
     },
-    /// A function or callback-interface method declares `throws: true` but
-    /// no error domain is in scope.
-    #[error("function '{module}::{function}' declares throws but no error domain is in scope")]
+    /// A callable's `throws` names an error domain that doesn't exist.
+    #[error("'{module}::{function}' throws '{domain}', which is not an error domain")]
     #[cfg_attr(
         feature = "idl",
         diagnostic(help(
-            "a throwing function (or callback-interface method) reports codes from its \
-         module's error domain; declare an `errors:` block on this module (or an ancestor \
-         module), or remove `throws: true`"
+            "`throws` names an error domain declared in any module's `errors:` list (domain \
+         names are global), or is `any` for an untyped error; declare the domain or fix the \
+         name"
         ))
     )]
-    ThrowsWithoutErrorDomain {
-        /// Module that contains the function.
+    UnknownErrorDomain {
+        /// Module that contains the callable.
         module: String,
-        /// Function marked `throws` with no domain in scope.
+        /// The callable (`f`, `Store.get`, or `Listener.on_event`).
         function: String,
+        /// The name `throws` gave.
+        domain: String,
     },
     /// An async function tries to return an iterator, which has no async ABI.
     #[error("async function '{module}::{function}' cannot return an iterator")]
@@ -284,7 +308,7 @@ pub enum ValidationError {
         module: String,
     },
     /// Two error codes in one domain share a numeric value.
-    #[error("duplicate error numeric code in module '{module}': {value}")]
+    #[error("duplicate error numeric code in error domain '{module}.{domain}': {value}")]
     #[cfg_attr(
         feature = "idl",
         diagnostic(help(
@@ -294,6 +318,8 @@ pub enum ValidationError {
     DuplicateErrorCode {
         /// Module that declares the error domain.
         module: String,
+        /// The error domain.
+        domain: String,
         /// Conflicting numeric error code.
         value: i32,
     },
@@ -518,6 +544,19 @@ pub enum ValidationError {
         /// Unresolved type name.
         name: String,
     },
+    /// A type reference names an error domain, which isn't a value type.
+    #[error("error domain '{name}' is not a value type")]
+    #[cfg_attr(
+        feature = "idl",
+        diagnostic(help(
+            "an error domain is what a callable's `throws` names; it can't be a parameter, \
+         return, or field type. Declare a record or enum for the value instead"
+        ))
+    )]
+    ErrorDomainAsType {
+        /// The error domain's name.
+        name: String,
+    },
     /// A type reference is module-qualified (`a.b.T`).
     #[error("qualified type reference '{name}': type names are global, so refer to a type by its bare name")]
     #[cfg_attr(
@@ -669,14 +708,14 @@ impl Diagnostic for ValidationDiagnostics {
 /// Returns [`ValidationDiagnostics`] carrying one [`ValidationDiagnostic`]
 /// per violation: an unsupported schema version, a duplicate or invalid name,
 /// an unknown, qualified, or misplaced type, an empty struct or enum, a
-/// `throws` without an error domain, a C symbol collision, or any other rule
-/// violation in the catalog above.
+/// `throws` naming no error domain, a C symbol or slot collision, or any
+/// other rule violation in the catalog above.
 pub fn validate(
     api: &Api,
     identity: &Identity,
     source: Option<(&str, &str)>,
 ) -> Result<Model, ValidationDiagnostics> {
-    validate_scoped(api, identity, Options::default()).map_err(|errors| ValidationDiagnostics {
+    validate_scoped(api, identity, &Options::default()).map_err(|errors| ValidationDiagnostics {
         diagnostics: errors
             .into_iter()
             .map(|(error, scope)| ValidationDiagnostic::new(error, &scope, source))
@@ -685,14 +724,21 @@ pub fn validate(
 }
 
 /// Options for [`validate_scoped`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Options {
-    /// Accept a type name that no declaration in the document provides,
-    /// assuming it's a record or rich enum declared elsewhere, and resolve
-    /// it to [`Ty::Record`](crate::ty::Ty::Record). The `#[weaveffi::module]`
-    /// macro sets this: it validates one module tree at a time, and asserts
-    /// at compile time that each such name really crosses as a value buffer.
-    pub foreign_names: bool,
+    /// Type names declared outside the validated document that it may
+    /// reference: records or rich enums from another module tree, which
+    /// cross as value buffers. Each resolves to
+    /// [`Ty::Record`](crate::ty::Ty::Record) and is recorded in the model's
+    /// [`TypeIndex`](crate::ty::TypeIndex) as foreign
+    /// ([`TypeIndex::is_foreign`](crate::ty::TypeIndex::is_foreign)). A
+    /// name the document declares itself is its own declaration.
+    ///
+    /// The `#[weaveffi::module]` macro validates one module tree at a time:
+    /// it passes [`Api::undeclared_type_names`] here and asserts at compile
+    /// time that each such name really crosses as a value buffer. Any other
+    /// undeclared name is an [`UnknownTypeRef`](ValidationError::UnknownTypeRef).
+    pub foreign: BTreeSet<String>,
 }
 
 /// A rule violation paired with the declaration path that encloses it
@@ -712,7 +758,7 @@ pub type Found = (ValidationError, Vec<String>);
 pub fn validate_scoped(
     api: &Api,
     identity: &Identity,
-    options: Options,
+    options: &Options,
 ) -> Result<Model, Vec<Found>> {
     if !SUPPORTED_VERSIONS.contains(&api.version.as_str()) {
         // A wrong-schema document is checked no further: the rules below
@@ -725,16 +771,21 @@ pub fn validate_scoped(
             vec![],
         )]);
     }
-    let types = crate::model::index(api);
+    let mut types = crate::model::index(api);
+    types.set_foreign(&options.foreign);
     let mut found = Vec::new();
-    rules::check(api, &types, options, &mut found);
+    rules::check(api, &types, &mut found);
     if !found.is_empty() {
         // The model's lowering assumes every rule holds, so the symbol
         // table is only built for an otherwise valid document.
         return Err(found);
     }
-    let model = crate::model::build_indexed(api, identity.clone(), types);
+    let model = match crate::model::build(api, identity.clone(), types) {
+        Ok(model) => model,
+        Err(error) => return Err(vec![(error, vec![])]),
+    };
     check_symbol_collisions(&model, &mut found);
+    check_slot_collisions(&model, &mut found);
     if found.is_empty() {
         Ok(model)
     } else {
@@ -746,34 +797,82 @@ pub fn validate_scoped(
 /// family the generated C value-buffer helpers reserve.
 fn check_symbol_collisions(model: &Model, found: &mut Vec<Found>) {
     let prefix = model.prefix();
-    let mut seen: BTreeMap<String, String> = BTreeMap::new();
-    for (i, (symbol, origin)) in model.c_symbols().into_iter().enumerate() {
-        let family = symbol.strip_prefix(&format!("{prefix}_")).and_then(|rest| {
-            RESERVED_SYMBOL_FAMILIES
-                .iter()
-                .find(|f| rest.starts_with(*f))
-        });
-        if let (Some(family), true) = (family, i >= RUNTIME_SYMBOLS.len()) {
-            found.push((
-                ValidationError::SymbolCollision {
-                    symbol: symbol.clone(),
-                    first: format!("the C value-buffer helpers ('{prefix}_{family}*')"),
-                    second: origin.clone(),
-                },
-                vec![],
-            ));
+    let mut seen: BTreeMap<String, SymbolOwner> = BTreeMap::new();
+    for symbol in model.c_symbols() {
+        if symbol.owner != SymbolOwner::Runtime {
+            let family = symbol
+                .name
+                .strip_prefix(&format!("{prefix}_"))
+                .and_then(|rest| {
+                    RESERVED_SYMBOL_FAMILIES
+                        .iter()
+                        .find(|f| rest.starts_with(*f))
+                });
+            if let Some(family) = family {
+                found.push((
+                    ValidationError::SymbolCollision {
+                        symbol: symbol.name.clone(),
+                        first: format!("the C value-buffer helpers ('{prefix}_{family}*')"),
+                        second: symbol.owner.to_string(),
+                    },
+                    vec![],
+                ));
+            }
         }
-        match seen.get(&symbol) {
+        match seen.get(&symbol.name) {
             Some(first) => found.push((
                 ValidationError::SymbolCollision {
-                    symbol,
-                    first: first.clone(),
-                    second: origin,
+                    first: first.to_string(),
+                    second: symbol.owner.to_string(),
+                    symbol: symbol.name,
                 },
                 vec![],
             )),
             None => {
-                seen.insert(symbol, origin);
+                seen.insert(symbol.name, symbol.owner);
+            }
+        }
+    }
+}
+
+/// Reject any lowered signature with two slots of one name.
+fn check_slot_collisions(model: &Model, found: &mut Vec<Found>) {
+    let mut check = |scope: Vec<String>, slots: &[crate::abi::AbiParam]| {
+        let mut seen = BTreeSet::new();
+        let mut reported = BTreeSet::new();
+        for slot in slots {
+            if !seen.insert(slot.name.as_str()) && reported.insert(slot.name.as_str()) {
+                found.push((
+                    ValidationError::SlotCollision {
+                        function: scope.join("."),
+                        slot: slot.name.clone(),
+                    },
+                    scope.clone(),
+                ));
+            }
+        }
+    };
+    for m in &model.modules {
+        let callable = |owner: &[&str], f: &crate::model::FnBinding| {
+            let mut scope = m.segments.clone();
+            scope.extend(owner.iter().map(|s| (*s).to_string()));
+            scope.push(f.name.clone());
+            scope
+        };
+        for f in &m.functions {
+            check(callable(&[], f), &f.abi.params);
+        }
+        for i in &m.interfaces {
+            for f in i.members() {
+                check(callable(&[&i.name], f), &f.abi.params);
+            }
+        }
+        for c in &m.callback_interfaces {
+            for method in &c.methods {
+                let mut scope = m.segments.clone();
+                scope.push(c.name.clone());
+                scope.push(method.name.clone());
+                check(scope, &method.abi.params);
             }
         }
     }

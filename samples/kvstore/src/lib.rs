@@ -6,22 +6,30 @@
 //!
 //! * a reference-counted `Store` interface with fallible and infallible
 //!   constructors, methods, statics, and a deprecated method;
-//! * the `KvError` domain, whose codes carry payload fields;
+//! * the `KvError` domain, whose codes carry payload fields, with its
+//!   `Display` generated from message templates;
 //! * records (`Entry`, `StoreInfo`), a C-style enum (`EntryKind`), and a rich
 //!   enum (`Change`), with optionals, lists, and maps (including maps keyed by
 //!   the C-style enum);
 //! * `Store` objects in every position: parameters, returns, optionals,
 //!   lists, map values, record fields, iterator elements, an async result,
 //!   and both a parameter and the return of a callback method;
-//! * three callback interfaces the consumer implements: `Listener` (retained,
+//! * four callback interfaces the consumer implements: `Listener` (retained,
 //!   and notified from a producer thread during compaction), `Policy`
-//!   (rich returns and a throwing method whose typed error, payload
-//!   included, reaches the original caller), and `Loader` (string, bytes, and
-//!   optional-object returns, passed as an optional parameter);
-//! * lazy iterators of strings, records, and objects;
+//!   (rich returns, an optional-scalar parameter and return, and methods
+//!   that throw `KvError`, whose typed errors, payload included, reach the
+//!   original caller typed), `Loader` (string, bytes, and optional-object
+//!   returns, passed as an optional parameter), and `Scorer` (a typed array
+//!   in and out);
+//! * optional scalars and numeric lists crossing directly (an optional TTL
+//!   parameter, an optional expiry return, a `[u64]` return), `usize`
+//!   counts, and a `throws any` method (`import_lines`, failing with a
+//!   `String`);
+//! * lazy iterators of strings, records, objects, and optional scalars;
 //! * async methods and functions, including a cancellable one that stops its
 //!   background work cooperatively, with a test hook (`Store::active_jobs`)
-//!   that shows it did;
+//!   that shows it did, and ones completing with an optional scalar and a
+//!   typed array;
 //! * a nested `kv.stats` module that uses the parent's `Store` and inherits
 //!   the parent's error domain, and a sibling `report` root that shares the
 //!   `Entry` record.
@@ -45,20 +53,23 @@ pub mod kv {
     use std::sync::{Arc, Mutex, PoisonError};
     use std::task::{Context, Poll};
 
-    use weaveffi::{CancelToken, ErrorReport, ForeignError};
+    use weaveffi::{CancelToken, ForeignError};
 
     /// The store's error domain. Each code's fields travel as the error's
-    /// payload, so every binding raises a typed error carrying them.
+    /// payload, so every binding raises a typed error carrying them. The
+    /// message of each is its template, filled from the fields.
     #[weaveffi::error]
     #[derive(Debug, Clone, PartialEq, Eq)]
     #[repr(i32)]
     pub enum KvError {
         /// key not found
+        #[weaveffi(message = "key not found: {key}")]
         KeyNotFound {
             /// The key that was looked up.
             key: String,
         } = 1001,
         /// entry expired
+        #[weaveffi(message = "entry {key} expired at {expired_at}")]
         Expired {
             /// The expired entry's key.
             key: String,
@@ -66,6 +77,7 @@ pub mod kv {
             expired_at: i64,
         } = 1002,
         /// store is full
+        #[weaveffi(message = "store is full ({capacity} entries)")]
         StoreFull {
             /// The store's capacity.
             capacity: u32,
@@ -73,69 +85,27 @@ pub mod kv {
         /// invalid path
         InvalidPath = 1004,
         /// write rejected by policy
+        #[weaveffi(message = "write to {key} rejected: {reason}")]
         Rejected {
             /// The rejected key.
             key: String,
             /// Why the policy rejected it.
             reason: String,
         } = 1005,
+        /// a consumer callback failed
+        #[weaveffi(message = "{message}")]
+        CallbackFailed {
+            /// The consumer's message.
+            message: String,
+        } = 1006,
     }
 
-    impl std::fmt::Display for KvError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::KeyNotFound { key } => write!(f, "key not found: {key}"),
-                Self::Expired { key, expired_at } => {
-                    write!(f, "entry {key} expired at {expired_at}")
-                }
-                Self::StoreFull { capacity } => write!(f, "store is full ({capacity} entries)"),
-                Self::InvalidPath => f.write_str("invalid path"),
-                Self::Rejected { key, reason } => write!(f, "write to {key} rejected: {reason}"),
-            }
-        }
-    }
-
-    /// A store operation's failure: a `KvError`, or a consumer callback's
-    /// failure passed through unchanged (its code, message, and payload), so
-    /// a typed error a callback raised reaches the original caller typed.
-    #[derive(Debug)]
-    pub enum StoreError {
-        /// A failure of the store itself.
-        Kv(KvError),
-        /// A callback's failure.
-        Callback(ForeignError),
-    }
-
-    impl From<KvError> for StoreError {
-        fn from(e: KvError) -> Self {
-            Self::Kv(e)
-        }
-    }
-
-    impl From<ForeignError> for StoreError {
+    /// A consumer callback that fails with anything but a `KvError` code
+    /// (or is called off its thread) fails the store operation with
+    /// `CallbackFailed`, carrying its message.
+    impl From<ForeignError> for KvError {
         fn from(e: ForeignError) -> Self {
-            Self::Callback(e)
-        }
-    }
-
-    impl ErrorReport for StoreError {
-        fn code(&self) -> i32 {
-            match self {
-                Self::Kv(e) => e.code(),
-                Self::Callback(e) => e.code(),
-            }
-        }
-        fn message(&self) -> String {
-            match self {
-                Self::Kv(e) => e.message(),
-                Self::Callback(e) => e.message(),
-            }
-        }
-        fn payload(&self) -> Vec<u8> {
-            match self {
-                Self::Kv(e) => e.payload(),
-                Self::Callback(e) => e.payload(),
-            }
+            Self::CallbackFailed { message: e.message }
         }
     }
 
@@ -238,17 +208,30 @@ pub mod kv {
     /// with `set_policy`.
     #[weaveffi::callback_interface]
     pub trait Policy: Send + Sync {
+        /// The TTL a write of `key` gets, given the TTL the caller
+        /// `requested` (absent for none): return it unchanged to keep it,
+        /// another value to override it, or none to store without one.
+        /// Consulted before `admit`.
+        fn ttl_for(&self, key: &str, requested: Option<i64>) -> Result<Option<i64>, KvError>;
+
         /// Admit an entry about to be stored, returning it as it should be
         /// stored. The policy may change its value, kind, TTL, tags, and
         /// metadata (its key and version are kept). Fail with
         /// `Rejected` to veto the write: `put` then fails with that same
         /// error.
-        #[weaveffi::throws]
-        fn admit(&self, entry: &Entry) -> Result<Entry, ForeignError>;
+        fn admit(&self, entry: &Entry) -> Result<Entry, KvError>;
 
         /// The store `key` belongs in: return `home` (the store `put` was
         /// called on) to keep it there, or another store to redirect it.
         fn route(&self, key: &str, home: Arc<Store>) -> Result<Arc<Store>, ForeignError>;
+    }
+
+    /// Scores entries for `Store::rank`.
+    #[weaveffi::callback_interface]
+    pub trait Scorer: Send + Sync {
+        /// One score per entry, given each entry's value size in bytes (in
+        /// key order). Higher scores rank first.
+        fn scores(&self, sizes: &[u64]) -> Result<Vec<f64>, ForeignError>;
     }
 
     /// A read-through source that `get_or_load` consults on a miss.
@@ -263,8 +246,7 @@ pub mod kv {
 
         /// The value for `key`. Fail with `KeyNotFound` naming
         /// `key` when there's none.
-        #[weaveffi::throws]
-        fn load(&self, key: &str) -> Result<Vec<u8>, ForeignError>;
+        fn load(&self, key: &str) -> Result<Vec<u8>, KvError>;
     }
 
     /// The default capacity of a new store.
@@ -437,7 +419,7 @@ pub mod kv {
                 .iter()
                 .chain(named.values())
                 .chain(extra.as_ref().map(|i| &i.store))
-                .map(|s| s.count())
+                .map(|s| s.count() as u32)
                 .sum()
         }
 
@@ -481,17 +463,23 @@ pub mod kv {
         }
 
         /// Store `value` under `key`, returning the stored entry. The
-        /// installed policy (if any) admits the entry first and may route it
-        /// to another store, where it's stored instead. Fails with
-        /// `StoreFull`, or with the policy's failure unchanged (such as
-        /// `Rejected`).
+        /// installed policy (if any) picks the TTL (`ttl_for`), admits the
+        /// entry, and may route it to another store, where it's stored
+        /// instead. Fails with `StoreFull`, or with the policy's failure
+        /// (its own `KvError`, such as `Rejected`, unchanged, and any other
+        /// as `CallbackFailed`).
         pub fn put(
             self: Arc<Self>,
             key: String,
             value: Vec<u8>,
             kind: EntryKind,
             ttl_seconds: Option<i64>,
-        ) -> Result<Entry, StoreError> {
+        ) -> Result<Entry, KvError> {
+            let policy = lock(&self.policy).clone();
+            let ttl_seconds = match &policy {
+                Some(policy) => policy.ttl_for(&key, ttl_seconds)?,
+                None => ttl_seconds,
+            };
             let mut entry = Entry {
                 key: key.clone(),
                 value,
@@ -501,7 +489,6 @@ pub mod kv {
                 tags: Vec::new(),
                 metadata: BTreeMap::new(),
             };
-            let policy = lock(&self.policy).clone();
             let target = match policy {
                 Some(policy) => {
                     entry = policy.admit(&entry)?;
@@ -509,7 +496,7 @@ pub mod kv {
                 }
                 None => self,
             };
-            Ok(target.insert(entry, key)?)
+            target.insert(entry, key)
         }
 
         /// The live entry for `key`. Fails with `KeyNotFound`, or with
@@ -551,12 +538,13 @@ pub mod kv {
         /// holding what `load` returns, with metadata `source` set to the
         /// loader's name (either way it's stored here). Returns no entry
         /// with no loader, or when `load` fails with `KeyNotFound` for
-        /// this same key; any other loader failure fails the call unchanged.
+        /// this same key; any other loader failure fails the call (a
+        /// `KvError` unchanged, anything else as `CallbackFailed`).
         pub fn get_or_load(
             &self,
             key: String,
             loader: Option<Arc<dyn Loader>>,
-        ) -> Result<Option<Entry>, StoreError> {
+        ) -> Result<Option<Entry>, KvError> {
             if let Some(entry) = self.find(key.clone()) {
                 return Ok(Some(entry));
             }
@@ -568,12 +556,8 @@ pub mod kv {
             }
             let value = match loader.load(&key) {
                 Ok(value) => value,
-                Err(e) => {
-                    return match e.domain::<KvError>() {
-                        Some(KvError::KeyNotFound { key: missing }) if missing == key => Ok(None),
-                        _ => Err(e.into()),
-                    }
-                }
+                Err(KvError::KeyNotFound { key: missing }) if missing == key => return Ok(None),
+                Err(e) => return Err(e),
             };
             let entry = Entry {
                 key: key.clone(),
@@ -613,14 +597,75 @@ pub mod kv {
         }
 
         /// The number of live (unexpired) entries.
-        pub fn count(&self) -> u32 {
-            self.live(None).len() as u32
+        pub fn count(&self) -> usize {
+            self.live(None).len()
         }
 
         /// The number of live entries.
         #[deprecated(note = "use count()")]
         pub fn size(&self) -> u32 {
-            self.count()
+            self.count() as u32
+        }
+
+        /// The logical time at which `key`'s live entry expires: none when
+        /// there's no live entry or it has no TTL.
+        pub fn expires_at(&self, key: String) -> Option<i64> {
+            self.find(key).and_then(|e| e.expires_at)
+        }
+
+        /// The value size in bytes of every live entry, in key order.
+        pub fn value_sizes(&self) -> Vec<u64> {
+            self.live(None)
+                .iter()
+                .map(|e| e.value.len() as u64)
+                .collect()
+        }
+
+        /// The live keys ordered by `scorer`'s scores, highest first (ties
+        /// keep key order). Fails with `CallbackFailed` when the scorer
+        /// fails or returns a score count that doesn't match the entries.
+        pub fn rank(&self, scorer: Arc<dyn Scorer>) -> Result<Vec<String>, KvError> {
+            let entries = self.live(None);
+            let sizes: Vec<u64> = entries.iter().map(|e| e.value.len() as u64).collect();
+            let scores = scorer.scores(&sizes)?;
+            if scores.len() != entries.len() {
+                return Err(KvError::CallbackFailed {
+                    message: format!("expected {} scores, got {}", entries.len(), scores.len()),
+                });
+            }
+            let mut ranked: Vec<(f64, String)> = scores
+                .into_iter()
+                .zip(entries.into_iter().map(|e| e.key))
+                .collect();
+            ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+            Ok(ranked.into_iter().map(|(_, k)| k).collect())
+        }
+
+        /// Store one `Volatile` entry per line of `text`, each written
+        /// `key=value` (blank lines are skipped), returning how many were
+        /// stored. Fails, as an untyped error, with `line {n}: expected
+        /// key=value` (`n` counts from 1) at the first malformed line, after
+        /// storing the lines before it.
+        pub fn import_lines(self: Arc<Self>, text: &str) -> Result<usize, String> {
+            let mut stored = 0;
+            for (i, line) in text.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Some((key, value)) = line.split_once('=') else {
+                    return Err(format!("line {}: expected key=value", i + 1));
+                };
+                Arc::clone(&self)
+                    .put(
+                        key.to_string(),
+                        value.as_bytes().to_vec(),
+                        EntryKind::Volatile,
+                        None,
+                    )
+                    .map_err(|e| e.to_string())?;
+                stored += 1;
+            }
+            Ok(stored)
         }
 
         /// The live keys in order, optionally only those starting with
@@ -643,6 +688,12 @@ pub mod kv {
         /// start with `prefix`.
         pub fn entries(&self, prefix: Option<String>) -> weaveffi::Iter<Entry> {
             weaveffi::Iter::new(self.live(prefix.as_deref()))
+        }
+
+        /// Each live entry's expiry time (none for an entry without a TTL),
+        /// in key order, pulled lazily from a snapshot.
+        pub fn expirations(&self) -> weaveffi::Iter<Option<i64>> {
+            weaveffi::Iter::new(self.live(None).into_iter().map(|e| e.expires_at))
         }
 
         /// One new store per prefix, created lazily as the iterator is
@@ -675,8 +726,8 @@ pub mod kv {
         }
 
         /// The number of subscribed listeners.
-        pub fn listener_count(&self) -> u32 {
-            lock(&self.listeners).len() as u32
+        pub fn listener_count(&self) -> usize {
+            lock(&self.listeners).len()
         }
 
         /// Install a write policy, replacing (and releasing) any previous
@@ -716,7 +767,7 @@ pub mod kv {
 
         /// Snapshot this store into a record that carries the store itself.
         pub fn describe(self: Arc<Self>, label: String, mirror: Option<Arc<Store>>) -> StoreInfo {
-            let count = self.count();
+            let count = self.count() as u32;
             StoreInfo {
                 label,
                 store: self,
@@ -741,6 +792,20 @@ pub mod kv {
         /// none), resolved on a producer thread.
         pub async fn get_many(&self, keys: Vec<String>) -> Vec<Option<Entry>> {
             keys.into_iter().map(|k| self.find(k)).collect()
+        }
+
+        /// The version of `key`'s live entry, if any, resolved on a producer
+        /// thread.
+        pub async fn version_of(&self, key: String) -> Option<u32> {
+            self.find(key).map(|e| e.version)
+        }
+
+        /// The version of each key's live entry, in order (`0` where
+        /// there's none), resolved on a producer thread.
+        pub async fn versions(&self, keys: Vec<String>) -> Vec<u32> {
+            keys.into_iter()
+                .map(|k| self.find(k).map_or(0, |e| e.version))
+                .collect()
         }
     }
 
@@ -888,12 +953,6 @@ pub mod report {
     pub enum ReportError {
         /// nothing to report
         NothingToReport = 2001,
-    }
-
-    impl std::fmt::Display for ReportError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("nothing to report")
-        }
     }
 
     /// One line per entry, sorted by key: `"{key}: {n} bytes, {kind}"`, with

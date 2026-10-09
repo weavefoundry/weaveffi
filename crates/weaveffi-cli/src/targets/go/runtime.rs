@@ -3,14 +3,16 @@
 //! The sources live in `runtime/` as ordinary Go files and are spliced into
 //! the output with `{{PLACEHOLDER}}` substitution:
 //!
-//! * `runtime.go`: the load-time ABI and contract checks, the generic
-//!   `Error` type, error-slot, callback, string, and byte-run helpers, the
-//!   object reference guard (`wvRef`), the async completion bridge, and
-//!   `DebugLive`.
+//! * `runtime.go`: `Check` and the load-time ABI and contract checks, the
+//!   generic `Error` type, error-slot, callback, string, byte-run,
+//!   optional-scalar, and typed-array helpers, the object wrapper core
+//!   (`wvObject`), the generic iterator sequences, the async completion
+//!   bridge, and `DebugLive`.
 //! * `codec.go`: the value-buffer writer and reader and the generic list,
 //!   map, and optional codecs the generated pairs are built from.
 
-use crate::utils::{render_prelude, render_trailer, CommentStyle};
+use crate::targets::go::go_prelude;
+use crate::utils::{render_trailer, CommentStyle};
 use weaveffi_model::model::ABI_VERSION;
 
 const RUNTIME_GO: &str = include_str!("runtime/runtime.go");
@@ -34,7 +36,7 @@ fn splice(template: &str, names: &RuntimeNames, file: &str) -> String {
         .replace("{{ABI_VERSION}}", &ABI_VERSION.to_string());
     format!(
         "{}{body}\n{}",
-        render_prelude(CommentStyle::DoubleSlash),
+        go_prelude(),
         render_trailer(CommentStyle::DoubleSlash, file)
     )
 }

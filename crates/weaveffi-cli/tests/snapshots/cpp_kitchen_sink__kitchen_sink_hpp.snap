@@ -21,6 +21,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -28,23 +29,26 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 namespace kitchen_sink {
 
 /**
- * An error a call that declares errors reports.
+ * The base of every exception this library throws.
  *
- * A positive code is a declared code of the module's error domain, thrown as
- * that domain's typed subclass. A negative code is a runtime failure: -1 a
- * generic producer error, -2 a producer panic, -3 a marshalling failure, and
- * -4 a callback-interface implementation that failed. A cancelled async call
- * (-5) throws Cancelled.
+ * `code()` is the failure's error code. A positive code belongs to an error
+ * domain and is thrown as that domain's class (or the class of the code).
+ * A negative code is a runtime failure: -1 an untyped error (a call declared
+ * `throws: any`), -2 a producer panic, -3 a marshalling failure, -4 a
+ * callback-interface implementation that failed, and -5 a cancelled async
+ * call (thrown as Cancelled). Code 0 is a failure these bindings detected
+ * without calling the producer (LoadError).
  */
 class Error : public std::runtime_error {
-    int32_t code_;
-
 public:
     /** Builds an error carrying `code` and `message`. */
     Error(int32_t code, const std::string& message) : std::runtime_error(message), code_(code) {}
 
     /** The numeric error code. */
     int32_t code() const noexcept { return code_; }
+
+private:
+    int32_t code_;
 };
 
 /** Thrown by an async call that was cancelled through its CancelToken (code -5). */
@@ -55,39 +59,27 @@ public:
 };
 
 /**
- * Thrown by a call that declares no errors when it fails anyway: a producer
- * panic (-2), a marshalling failure (-3), a callback-interface failure the
- * producer let through (-4), or another runtime failure (-1). These are bugs,
- * so no signature declares them; `what()` names the code and the producer's
- * message.
+ * Thrown when a call that declares no errors fails anyway: a producer panic
+ * (-2), a marshalling failure (-3), a callback-interface failure the producer
+ * let through (-4), or another runtime failure. These are bugs, so no
+ * signature declares them. A value buffer these bindings can't decode is
+ * also an InternalError with code -3.
  */
-class InternalError : public std::runtime_error {
-    int32_t code_;
-    std::string message_;
-
+class InternalError : public Error {
 public:
-    /** Builds an internal error carrying `code` and the producer's `message`. */
-    InternalError(int32_t code, const std::string& message)
-        : std::runtime_error("kitchen_sink: runtime error " + std::to_string(code) + ": " + message),
-          code_(code),
-          message_(message) {}
-
-    /** The runtime error code (negative). */
-    int32_t code() const noexcept { return code_; }
-
-    /** The producer's message. */
-    const std::string& message() const noexcept { return message_; }
+    /** Builds an internal error carrying the runtime `code` and the producer's `message`. */
+    InternalError(int32_t code, const std::string& message) : Error(code, message) {}
 };
 
 /**
  * Thrown on first use when the linked kitchen_sink library implements a
  * different C ABI revision than this header, or lacks or changed a
- * declaration this header was generated with.
+ * declaration this header was generated with. Its code is 0.
  */
-class LoadError : public std::runtime_error {
+class LoadError : public Error {
 public:
     /** Builds a load error describing the mismatch. */
-    explicit LoadError(const std::string& message) : std::runtime_error(message) {}
+    explicit LoadError(const std::string& message) : Error(0, message) {}
 };
 
 /**
@@ -101,120 +93,179 @@ struct adopt_t {
 /** The adopt_t tag value: `Store s(adopt, raw)`. */
 inline constexpr adopt_t adopt{};
 
-/**
- * A cancellation token for cancellable async functions.
- *
- * Create one, pass it to any number of cancellable calls, and call cancel()
- * from any thread. A cancelled call settles its future with Cancelled. Each
- * call takes its own reference to the native token, so the token can be
- * destroyed at any time; the destructor releases this wrapper's reference.
- */
-class CancelToken {
-    kitchen_sink_cancel_token* handle_;
-
-    struct none_t {};
-    explicit CancelToken(none_t) noexcept : handle_(nullptr) {}
-
-public:
-    /** Creates a new, uncancelled token. */
-    CancelToken() : handle_(kitchen_sink_cancel_token_create()) {
-        if (handle_ == nullptr) throw std::bad_alloc();
-    }
-
-    /** Releases this wrapper's reference to the native token. */
-    ~CancelToken() {
-        if (handle_ != nullptr) kitchen_sink_cancel_token_destroy(handle_);
-    }
-
-    CancelToken(const CancelToken&) = delete;
-    CancelToken& operator=(const CancelToken&) = delete;
-
-    /** Transfers the native token; `other` becomes empty. */
-    CancelToken(CancelToken&& other) noexcept : handle_(other.handle_) { other.handle_ = nullptr; }
-
-    /** Releases the current token and takes over `other`'s. */
-    CancelToken& operator=(CancelToken&& other) noexcept {
-        if (this != &other) {
-            if (handle_ != nullptr) kitchen_sink_cancel_token_destroy(handle_);
-            handle_ = other.handle_;
-            other.handle_ = nullptr;
-        }
-        return *this;
-    }
-
-    /** The empty token a cancellable call uses when none is passed. */
-    static const CancelToken& none() noexcept {
-        static const CancelToken token{none_t{}};
-        return token;
-    }
-
-    /** Requests cancellation of every call this token was passed to. Idempotent and thread-safe. */
-    void cancel() const noexcept {
-        if (handle_ != nullptr) kitchen_sink_cancel_token_cancel(handle_);
-    }
-
-    /** Whether cancel() has been called. */
-    bool is_cancelled() const noexcept {
-        return handle_ != nullptr && kitchen_sink_cancel_token_is_cancelled(handle_);
-    }
-
-    /** The native token, borrowed (null for an empty token). */
-    kitchen_sink_cancel_token* handle() const noexcept { return handle_; }
-};
-
 namespace detail {
 
-/** The exception for a failed call that declares no errors: Cancelled for -5, else InternalError. */
-inline std::exception_ptr make_internal_error(int32_t code, const std::string& message) {
-    if (code == -5) return std::make_exception_ptr(Cancelled(message));
-    return std::make_exception_ptr(InternalError(code, message));
+/** The C error slot every fallible call fills. */
+using error = kitchen_sink_error;
+
+/** The message of a failed call's error slot (empty when the producer sent none). */
+inline std::string message(const error& err) {
+    if (err.message_ptr == nullptr || err.message_len == 0) return std::string();
+    return std::string(reinterpret_cast<const char*>(err.message_ptr), err.message_len);
 }
 
-/** The message of a nonzero error slot. */
-inline std::string error_message(const kitchen_sink_error& err) {
-    return std::string(err.message != nullptr ? err.message : "unknown error");
+/** Fills a callback's error slot with `code` and a copy of `message`. */
+inline void set_error(error* out_err, int32_t code, std::string_view message) noexcept {
+    kitchen_sink_error_set(out_err, code, reinterpret_cast<const uint8_t*>(message.data()), message.size());
 }
 
-/** Throws InternalError if `err` carries a nonzero code (a call that declares no errors). */
-inline void check(kitchen_sink_error& err) {
+/**
+ * Reports the exception being handled through a callback's error slot as
+ * `code` with its `what()`. Call it only from inside a catch handler.
+ */
+inline void report_current(error* out_err, int32_t code) noexcept {
+    try {
+        throw;
+    } catch (const std::exception& e) {
+        set_error(out_err, code, e.what());
+    } catch (...) {
+        set_error(out_err, code, "a callback implementation threw an exception not derived from std::exception");
+    }
+}
+
+/**
+ * How a call that throws `E` turns a failed error slot into an exception
+ * (`raise`), and how a callback method that may throw `E` reports the
+ * exception being handled to the producer (`report`). Specialized for
+ * InternalError (calls that declare no errors), Error (`throws: any`), and
+ * each error domain.
+ */
+template <typename E>
+struct Errors;
+
+/** Throws Cancelled for -5 and `E` for every other code. */
+template <typename E>
+[[noreturn]] void raise_runtime(const error& err) {
+    if (err.code == -5) throw Cancelled(message(err));
+    throw E(err.code, message(err));
+}
+
+/** A call that declares no errors: any failure is an InternalError. A callback method reports -4. */
+template <>
+struct Errors<InternalError> {
+    [[noreturn]] static void raise(const error& err) { raise_runtime<InternalError>(err); }
+    static void report(error* out_err) noexcept { report_current(out_err, -4); }
+};
+
+/** A call declared `throws: any`: any failure is an Error. A callback method reports -1. */
+template <>
+struct Errors<Error> {
+    [[noreturn]] static void raise(const error& err) { raise_runtime<Error>(err); }
+    static void report(error* out_err) noexcept { report_current(out_err, -1); }
+};
+
+/** Releases an error slot's message and payload on scope exit. */
+struct ErrorClear {
+    error* err;
+    ~ErrorClear() { kitchen_sink_error_clear(err); }
+};
+
+/** Throws the `E` exception for a failed call's error slot, which it then clears. */
+template <typename E>
+void check(error& err) {
     if (err.code == 0) return;
-    std::exception_ptr ex = make_internal_error(err.code, error_message(err));
-    kitchen_sink_error_clear(&err);
-    std::rethrow_exception(ex);
+    ErrorClear clear{&err};
+    Errors<E>::raise(err);
+}
+
+/** Releases an async completion's heap-boxed error. */
+struct ErrorFree {
+    void operator()(error* err) const noexcept { kitchen_sink_error_free(err); }
+};
+
+/**
+ * Settles the `std::promise<T>` an async call passed as `context`, exactly
+ * once: with the `E` exception for a failure, else with `value()` (which
+ * takes ownership of the result slots). Releases the boxed error. Runs on
+ * a producer thread inside a C frame, so nothing unwinds out of it.
+ */
+template <typename E, typename T, typename F>
+void settle(void* context, error* err, F&& value) noexcept {
+    std::unique_ptr<std::promise<T>> promise(static_cast<std::promise<T>*>(context));
+    std::unique_ptr<error, ErrorFree> owned(err);
+    try {
+        if (err != nullptr && err->code != 0) Errors<E>::raise(*err);
+        if constexpr (std::is_void_v<T>) {
+            value();
+            promise->set_value();
+        } else {
+            promise->set_value(value());
+        }
+    } catch (...) {
+        promise->set_exception(std::current_exception());
+    }
+}
+
+/**
+ * Runs a callback method's `body` for a trampoline, reporting any exception
+ * through `out_err` as a method that throws `E` does. Returns the body's
+ * value, or a zero value after a failure.
+ */
+template <typename E, typename F>
+auto callback(error* out_err, F&& body) noexcept -> decltype(body()) {
+    try {
+        return body();
+    } catch (...) {
+        Errors<E>::report(out_err);
+    }
+    if constexpr (!std::is_void_v<decltype(body())>) return decltype(body()){};
+}
+
+/** Releases a producer run (a string, bytes, value buffer, or typed array) on scope exit. */
+struct Run {
+    const void* ptr;
+    size_t len;
+    ~Run() {
+        if (ptr != nullptr) kitchen_sink_free_bytes(static_cast<uint8_t*>(const_cast<void*>(ptr)), len);
+    }
+};
+
+/** The byte size of `count` elements of `T`, failing with -3 when it overflows. */
+template <typename T>
+size_t byte_size(size_t count) {
+    if (count > SIZE_MAX / sizeof(T)) throw Error(-3, "array is too large");
+    return count * sizeof(T);
 }
 
 /** Copies a producer-returned UTF-8 run into a string, then releases it. */
 inline std::string take_string(const uint8_t* ptr, size_t len) {
+    Run run{ptr, len};
     if (ptr == nullptr) return std::string();
-    struct Release {
-        const uint8_t* ptr;
-        size_t len;
-        ~Release() { kitchen_sink_free_bytes(const_cast<uint8_t*>(ptr), len); }
-    } release{ptr, len};
     return std::string(reinterpret_cast<const char*>(ptr), len);
 }
 
 /** Copies a producer-returned byte run into a vector, then releases it. */
 inline std::vector<uint8_t> take_bytes(const uint8_t* ptr, size_t len) {
+    Run run{ptr, len};
     if (ptr == nullptr) return std::vector<uint8_t>();
-    struct Release {
-        const uint8_t* ptr;
-        size_t len;
-        ~Release() { kitchen_sink_free_bytes(const_cast<uint8_t*>(ptr), len); }
-    } release{ptr, len};
     return std::vector<uint8_t>(ptr, ptr + len);
 }
 
-/** Views a borrowed UTF-8 run (null when empty) as a string_view. */
+/** Copies a producer-returned typed array of `len` elements into a vector, then releases it. */
+template <typename T>
+std::vector<T> take_slice(const T* ptr, size_t len) {
+    Run run{ptr, len * sizeof(T)};
+    if (ptr == nullptr) return std::vector<T>();
+    return std::vector<T>(ptr, ptr + len);
+}
+
+/** Views a borrowed UTF-8 run as a string_view (a zero-length run may be dangling). */
 inline std::string_view borrow_string(const uint8_t* ptr, size_t len) noexcept {
-    if (ptr == nullptr || len == 0) return std::string_view();
+    if (len == 0) return std::string_view();
     return std::string_view(reinterpret_cast<const char*>(ptr), len);
 }
 
-/** Copies a borrowed byte run (null when empty) into a vector. */
+/** Copies a borrowed byte run into a vector. */
 inline std::vector<uint8_t> borrow_bytes(const uint8_t* ptr, size_t len) {
-    if (ptr == nullptr || len == 0) return std::vector<uint8_t>();
+    if (len == 0) return std::vector<uint8_t>();
     return std::vector<uint8_t>(ptr, ptr + len);
+}
+
+/** Copies a borrowed typed array of `len` elements into a vector. */
+template <typename T>
+std::vector<T> borrow_slice(const T* ptr, size_t len) {
+    if (len == 0) return std::vector<T>();
+    return std::vector<T>(ptr, ptr + len);
 }
 
 /** The data pointer of a string argument, as the C ABI expects it. */
@@ -222,21 +273,318 @@ inline const uint8_t* utf8(std::string_view s) noexcept {
     return reinterpret_cast<const uint8_t*>(s.data());
 }
 
+/** The C value of a scalar or C-style enum: an enum crosses as its `int32_t` discriminant. */
+template <typename T>
+constexpr auto to_c(T value) noexcept {
+    if constexpr (std::is_enum_v<T>) {
+        return static_cast<std::underlying_type_t<T>>(value);
+    } else {
+        return value;
+    }
+}
+
+/** The C value slot of an optional scalar or enum argument: its value, or zero when absent. */
+template <typename T>
+constexpr auto value_or_zero(const std::optional<T>& value) noexcept {
+    return to_c(value.has_value() ? *value : T{});
+}
+
+/** An optional scalar or enum from its C presence flag and value. */
+template <typename T, typename C>
+std::optional<T> lift_optional(bool present, C value) noexcept {
+    if (!present) return std::nullopt;
+    return std::optional<T>(static_cast<T>(value));
+}
+
+/** A wrapper adopting a returned object reference, or none for null. */
+template <typename T>
+std::optional<T> adopt_optional(typename T::raw_type* raw) noexcept {
+    if (raw == nullptr) return std::nullopt;
+    return std::optional<T>(std::in_place, adopt, raw);
+}
+
+/** The borrowed C pointer of an optional object argument (null for none). */
+template <typename T>
+const typename T::raw_type* handle_of(const std::optional<T>& object) noexcept {
+    return object.has_value() ? object->handle() : nullptr;
+}
+
+/** A new strong reference to an optional object a callback returns (null for none). */
+template <typename T>
+typename T::raw_type* clone_of(const std::optional<T>& object) noexcept {
+    return object.has_value() ? object->clone_handle() : nullptr;
+}
+
+/** Hands a callback's optional scalar or enum return to the producer: writes the value, returns presence. */
+template <typename T, typename C>
+bool give_optional(const std::optional<T>& value, C* out_value) noexcept {
+    if (!value.has_value()) return false;
+    *out_value = static_cast<C>(*value);
+    return true;
+}
+
 /**
  * Hands `len` bytes from `data` to the producer through a callback method's
  * out slots: copies them into a run from kitchen_sink_alloc, which the
  * producer adopts and frees.
  */
-inline void hand_over(const void* data, size_t len, uint8_t** out_ptr, size_t* out_len) {
+template <typename T>
+void give_run(const void* data, size_t len, T** out_ptr, size_t* out_len) {
     uint8_t* run = nullptr;
     if (len > 0) {
         run = kitchen_sink_alloc(len);
         if (run == nullptr) throw std::bad_alloc();
         std::memcpy(run, data, len);
     }
-    *out_ptr = run;
+    *out_ptr = reinterpret_cast<T*>(run);
     *out_len = len;
 }
+
+/** Hands a callback's string return to the producer. */
+inline void give(std::string_view value, uint8_t** out_ptr, size_t* out_len) {
+    give_run(value.data(), value.size(), out_ptr, out_len);
+}
+
+/** Hands a callback's bytes return to the producer. */
+inline void give(const std::vector<uint8_t>& value, uint8_t** out_ptr, size_t* out_len) {
+    give_run(value.data(), value.size(), out_ptr, out_len);
+}
+
+/** Hands a callback's typed-array return to the producer; `out_len` receives the element count. */
+template <typename T>
+void give_slice(const std::vector<T>& value, T** out_ptr, size_t* out_len) {
+    give_run(value.data(), byte_size<T>(value.size()), out_ptr, out_len);
+    *out_len = value.size();
+}
+
+/** The implementation a callback interface's `ctx` boxes. */
+template <typename I>
+I& implementation(void* ctx) noexcept {
+    return **static_cast<std::shared_ptr<I>*>(ctx);
+}
+
+/** Deletes a callback interface's `ctx` box once the producer releases it. */
+template <typename I>
+void release(void* ctx) noexcept {
+    delete static_cast<std::shared_ptr<I>*>(ctx);
+}
+
+/**
+ * Boxes an implementation as a callback interface's `ctx` (null for an
+ * empty pointer). The caller releases the box into the call, after which
+ * the producer owns it and deletes it through the vtable's `free`.
+ */
+template <typename I>
+std::unique_ptr<std::shared_ptr<I>> lend(std::shared_ptr<I> impl) {
+    if (!impl) return nullptr;
+    return std::make_unique<std::shared_ptr<I>>(std::move(impl));
+}
+
+/** Boxes a required implementation, failing with -3 (naming `param`) when it's empty. */
+template <typename I>
+std::unique_ptr<std::shared_ptr<I>> lend_required(std::shared_ptr<I> impl, const char* param) {
+    if (!impl) throw Error(-3, std::string(param) + ": null callback interface");
+    return lend(std::move(impl));
+}
+
+/**
+ * The trampolines and static vtable that adapt implementations of the
+ * callback interface `I` to its C vtable; specialized per callback
+ * interface.
+ */
+template <typename I>
+struct Callbacks;
+
+/**
+ * Owns one strong reference to a reference-counted producer object, the
+ * Rule-of-Zero core of every interface wrapper: copying takes a new
+ * reference through `Traits::clone`, moving transfers it (leaving null), and
+ * destruction releases it through `Traits::destroy`.
+ */
+template <typename Traits>
+class Handle {
+public:
+    /** The C type of the object. */
+    using raw_type = typename Traits::raw_type;
+
+    /** An empty handle. */
+    Handle() noexcept = default;
+
+    /** Adopts one strong reference (or null). */
+    explicit Handle(raw_type* raw) noexcept : raw_(raw) {}
+
+    /** Takes a new strong reference to `other`'s object. */
+    Handle(const Handle& other) noexcept : raw_(other.clone()) {}
+
+    /** Transfers `other`'s reference; `other` becomes empty. */
+    Handle(Handle&& other) noexcept : raw_(std::exchange(other.raw_, nullptr)) {}
+
+    /** Copy-and-swap assignment from a copy or a moved-from handle. */
+    Handle& operator=(Handle other) noexcept {
+        std::swap(raw_, other.raw_);
+        return *this;
+    }
+
+    /** Releases the reference. */
+    ~Handle() {
+        if (raw_ != nullptr) Traits::destroy(raw_);
+    }
+
+    /** The object, borrowed (null when empty). */
+    raw_type* get() const noexcept { return raw_; }
+
+    /** A new strong reference to the object, which the caller owns (null when empty). */
+    raw_type* clone() const noexcept { return raw_ != nullptr ? Traits::clone(raw_) : nullptr; }
+
+    /** Releases the current reference and adopts `raw`. */
+    void reset(raw_type* raw) noexcept { *this = Handle(raw); }
+
+private:
+    raw_type* raw_ = nullptr;
+};
+
+} // namespace detail
+
+/**
+ * A cancellation token for cancellable async functions.
+ *
+ * Create one, pass it to any number of cancellable calls, and call cancel()
+ * from any thread. A cancelled call settles its future with Cancelled. Each
+ * call takes its own reference to the native token, so the token can be
+ * destroyed at any time. Move-only.
+ */
+class CancelToken {
+public:
+    /** Creates a new, uncancelled token. */
+    CancelToken() : handle_(kitchen_sink_cancel_token_create()) {
+        if (!handle_) throw std::bad_alloc();
+    }
+
+    /** The empty token a cancellable call uses when none is passed; it never cancels. */
+    static const CancelToken& none() noexcept {
+        static const CancelToken token{nullptr};
+        return token;
+    }
+
+    /** Requests cancellation of every call this token was passed to. Idempotent and thread-safe. */
+    void cancel() const noexcept {
+        if (handle_) kitchen_sink_cancel_token_cancel(handle_.get());
+    }
+
+    /** Whether cancel() has been called. */
+    bool is_cancelled() const noexcept { return handle_ && kitchen_sink_cancel_token_is_cancelled(handle_.get()); }
+
+    /** The native token, borrowed (null for an empty token). */
+    kitchen_sink_cancel_token* handle() const noexcept { return handle_.get(); }
+
+private:
+    struct Destroy {
+        void operator()(kitchen_sink_cancel_token* token) const noexcept { kitchen_sink_cancel_token_destroy(token); }
+    };
+
+    explicit CancelToken(std::nullptr_t) noexcept {}
+
+    std::unique_ptr<kitchen_sink_cancel_token, Destroy> handle_;
+};
+
+/**
+ * A lazy, single-pass, move-only range over the elements a producer
+ * iterator yields: what every `iter<T>` callable returns.
+ *
+ * Each step makes one producer call, so results stream in constant memory:
+ *
+ *     for (const std::string& key : store.keys(std::nullopt)) { ... }
+ *
+ * The range releases the producer iterator exactly once: when it's
+ * exhausted, when a step fails (rethrowing the call's exception), on
+ * close(), or from the destructor when iteration stops early. Moving a range
+ * invalidates its iterators.
+ */
+template <typename T>
+class Range {
+public:
+    /** The element type. */
+    using value_type = T;
+
+    /** Pulls one element into `item`; returns false once exhausted, throws on a producer error. */
+    using Next = bool (*)(void* iter, std::optional<T>& item);
+
+    /** Releases the producer iterator. */
+    using Destroy = void (*)(void* iter);
+
+    /** Adopts a producer iterator, driven by `next` and released by `destroy`. */
+    Range(adopt_t, void* iter, Next next, Destroy destroy) noexcept : iter_(iter, destroy), next_(next) {}
+
+    /** Pulls the next element, or `std::nullopt` once the range is exhausted. */
+    std::optional<T> next() {
+        std::optional<T> item;
+        if (!iter_) return item;
+        bool more = false;
+        try {
+            more = next_(iter_.get(), item);
+        } catch (...) {
+            iter_.reset();
+            throw;
+        }
+        if (!more) iter_.reset();
+        return item;
+    }
+
+    /** Releases the producer iterator now; the range is then exhausted. */
+    void close() noexcept { iter_.reset(); }
+
+    /** Marks the end of the range. */
+    struct sentinel {};
+
+    /** A single-pass input iterator; each increment pulls one element. */
+    class iterator {
+    public:
+        using iterator_category = std::input_iterator_tag;
+        using value_type = T;
+        using difference_type = std::ptrdiff_t;
+        using pointer = T*;
+        using reference = T&;
+
+        iterator() noexcept = default;
+
+        reference operator*() const { return *range_->current_; }
+        pointer operator->() const { return &*range_->current_; }
+
+        iterator& operator++() {
+            range_->current_ = range_->next();
+            return *this;
+        }
+
+        void operator++(int) { ++*this; }
+
+        friend bool operator==(const iterator& it, sentinel) noexcept { return it.done(); }
+        friend bool operator==(sentinel end, const iterator& it) noexcept { return it == end; }
+        friend bool operator!=(const iterator& it, sentinel end) noexcept { return !(it == end); }
+        friend bool operator!=(sentinel end, const iterator& it) noexcept { return !(it == end); }
+
+    private:
+        friend class Range;
+        explicit iterator(Range* range) noexcept : range_(range) {}
+        bool done() const noexcept { return !range_->current_.has_value(); }
+        Range* range_ = nullptr;
+    };
+
+    /** Begins iteration by pulling the first element. */
+    iterator begin() {
+        current_ = next();
+        return iterator(this);
+    }
+
+    /** The end sentinel. */
+    sentinel end() const noexcept { return sentinel{}; }
+
+private:
+    std::unique_ptr<void, Destroy> iter_;
+    Next next_;
+    std::optional<T> current_;
+};
+
+namespace detail {
 
 /** One declaration this header was generated with: its contract id and hash, and its dotted path. */
 struct ContractEntry {
@@ -283,50 +631,80 @@ std::string contract_mismatch(const kitchen_sink_contract_entry* (*contract)(siz
 
 /** The declarations of module `shared` this header was generated with. */
 inline constexpr ContractEntry shared_contract[] = {
-    {0x709e234caa962446ull, 0x3894f2ca452e9f98ull, "shared.ping"},
-    {0xcfb306fa5801ee5bull, 0x1cbd9e10983cac2cull, "shared.Token"},
+    {0x709e234caa962446ull, 0x3894f2ca452e9f98ull, "shared.ping"}, // function ping() -> string
+    {0xcfb306fa5801ee5bull, 0x18e9fc204a13df6full, "shared.Token"}, // record Token {i64, string}
 };
 
 /** The declarations of module `kitchen` this header was generated with. */
 inline constexpr ContractEntry kitchen_contract[] = {
-    {0x01d4f09bbddc986full, 0x29eb88fecc66544dull, "kitchen.Gadget.new"},
-    {0x10472d8fe748c2eeull, 0xb265832b6a759fc4ull, "kitchen.maybe_gadget"},
-    {0x11368eec07a74078ull, 0xfa049f78b77e146aull, "kitchen.gadgets"},
-    {0x137f08a29cde6021ull, 0xda8de7aeb2dbb8a3ull, "kitchen.stream_gadgets"},
-    {0x2111b54980826dd7ull, 0x452783f3e6ca6e1dull, "kitchen.do_cancellable"},
-    {0x29dddbc60bf8d7dbull, 0x452a3e573d57f6dbull, "kitchen.Priority"},
-    {0x2b227003b74a0d16ull, 0x12332957470e9782ull, "kitchen.maybe_subscribe"},
-    {0x2dd66cb0064f0494ull, 0x60197363fefd92ddull, "kitchen.Item"},
-    {0x33c265bbf079b0e9ull, 0xc3dcd0927e6c1debull, "kitchen.u32_id"},
-    {0x33e6381d01660dfeull, 0x077c63c31fd7f90aull, "kitchen.KitchenErrors"},
-    {0x3f5fc99d73504b76ull, 0x2df88d710f1ea10eull, "kitchen.Gadget.poke"},
-    {0x4c5764cf109528d1ull, 0x2a65529af4338a58ull, "kitchen.maybe_item"},
-    {0x4de17dfb93fd494dull, 0xba0ad0dd52ed74afull, "kitchen.i32_id"},
-    {0x504e95b7f7e65570ull, 0x01b3e8e0c9a10e23ull, "kitchen.stream_items"},
-    {0x68cdb9a4bd3e3dd5ull, 0xc678b9164348d497ull, "kitchen.bool_id"},
-    {0x69e7cd703d16eb85ull, 0xf3b28dd22ae9e689ull, "kitchen.do_async"},
-    {0x70865079ce41be82ull, 0xbe3b69464672af46ull, "kitchen.Gadget.describe"},
-    {0x71c5a1116cb7c49aull, 0xcba1837108a89b84ull, "kitchen.echo_bytes"},
-    {0x735ee1e0049ee91aull, 0xca74320bc53eddabull, "kitchen.echo_string"},
-    {0x76d7fc58f4e41d84ull, 0x7373a0e47d30e690ull, "kitchen.i64_id"},
-    {0x79abfe1aa960fd6aull, 0xbca7a9e5eb26f3a6ull, "kitchen.nested.hello"},
-    {0x7d3dd7d5cf6749e3ull, 0xa192f5a7298adb39ull, "kitchen.new_op"},
-    {0x89a5e664bc25c67bull, 0x5764a95e81ecfd31ull, "kitchen.f64_id"},
-    {0x8cfdbdcecac5f7f1ull, 0x07e272f09c41fffcull, "kitchen.Gadget.version"},
-    {0x974b9f3e823c1738ull, 0xb81b91e975695f27ull, "kitchen.cross_module_token"},
-    {0xaca0655fac15d230ull, 0x11c4d2b28abe07bbull, "kitchen.list_items"},
-    {0xc883b4afae20543eull, 0xc40560e5411ff392ull, "kitchen.legacy_op"},
-    {0xf2f7753e6e1dffc2ull, 0xc9047a95bdf49e93ull, "kitchen.get_attrs"},
-    {0xfae25d3391922eadull, 0x1c7f95739f3210b8ull, "kitchen.subscribe"},
-    {0xfd0059b05cb2fcfbull, 0x248bf8404a5823b4ull, "kitchen.Gadget"},
-    {0xfed9c551fb9fd2d6ull, 0x59aec980ef3f3291ull, "kitchen.ReadyListener"},
+    {0x01d4f09bbddc986full, 0xffcf2bd3b04aa002ull, "kitchen.Gadget.new"}, // constructor new(i64) -> Gadget
+    {0x02bbd5f31c953704ull, 0xaca75656ad13d661ull, "kitchen.Sampler.samples"}, // callback_method samples(u32?, [f64]) -> [i16] throws PantryError
+    {0x10472d8fe748c2eeull, 0xcc570a2649bbf7dcull, "kitchen.maybe_gadget"}, // function maybe_gadget(Gadget?) -> Gadget?
+    {0x11368eec07a74078ull, 0xfa049f78b77e146aull, "kitchen.gadgets"}, // function gadgets() -> [Gadget]
+    {0x137f08a29cde6021ull, 0xda8de7aeb2dbb8a3ull, "kitchen.stream_gadgets"}, // function stream_gadgets() -> iter<Gadget>
+    {0x184bfc4ab0e3fe45ull, 0xb64587477022696bull, "kitchen.ids_u64"}, // function ids_u64([u64]) -> [u64]
+    {0x2111b54980826dd7ull, 0x627bf01ab365b209ull, "kitchen.do_cancellable"}, // function do_cancellable(string) -> string async cancellable
+    {0x21c70f9371374d74ull, 0xc582d6ad2392c36cull, "kitchen.ReadyListener.favorite"}, // callback_method favorite() -> Gadget
+    {0x23de5bd597372f46ull, 0xcf1bc6bb37872798ull, "kitchen.stream_chunks"}, // function stream_chunks() -> iter<[i32]>
+    {0x249f1ddaec6a6cbeull, 0x0710d6c9a4de93daull, "kitchen.take_from_pantry"}, // function take_from_pantry(string) -> i32 throws PantryError
+    {0x29dddbc60bf8d7dbull, 0x452a3e573d57f6dbull, "kitchen.Priority"}, // enum Priority {Low = 0, Normal = 1, High = 2}
+    {0x2b227003b74a0d16ull, 0x5dae036b8a6aed30ull, "kitchen.maybe_subscribe"}, // function maybe_subscribe(ReadyListener?) -> bool
+    {0x2dd66cb0064f0494ull, 0x74b131724dd0d867ull, "kitchen.Item"}, // record Item {i64, string, i32, bool, f64, u32, bytes, [string], {string:string}, i64?, Token, Priority, Gadget?}
+    {0x33c265bbf079b0e9ull, 0x97c32b764693f2cbull, "kitchen.u32_id"}, // function u32_id(u32) -> u32
+    {0x33e6381d01660dfeull, 0x05e35a563089bf7dull, "kitchen.KitchenErrors"}, // errors KitchenErrors
+    {0x3d969ae76db6cb23ull, 0x38ac642c196512a5ull, "kitchen.ReadyListener.latest"}, // callback_method latest() -> Item?
+    {0x3f5fc99d73504b76ull, 0x417e4a2acd3210b3ull, "kitchen.Gadget.poke"}, // method poke(i32) -> i32 throws KitchenErrors
+    {0x4082f0085db28781ull, 0x18848e701962912eull, "kitchen.Sampler"}, // callback Sampler
+    {0x4340a6b1e7ec8c50ull, 0xf5b4f10f61862b33ull, "kitchen.Sampler.describe"}, // callback_method describe() -> string throws any
+    {0x4c5764cf109528d1ull, 0xb374accf14676d90ull, "kitchen.maybe_item"}, // function maybe_item(i64) -> Item? throws KitchenErrors
+    {0x4de17dfb93fd494dull, 0x78be3203bcd10727ull, "kitchen.i32_id"}, // function i32_id(i32) -> i32
+    {0x504e95b7f7e65570ull, 0x01b3e8e0c9a10e23ull, "kitchen.stream_items"}, // function stream_items() -> iter<Item>
+    {0x5dafabb7775fcb2dull, 0x6c4b78c7d3f858c1ull, "kitchen.PantryError.Spoiled"}, // code Spoiled = 2
+    {0x5e0a8f6be4b00600ull, 0x3d0dcaec54133637ull, "kitchen.Sampler.threshold"}, // callback_method threshold(u32?) -> f64?
+    {0x5ec0af1d4ecc6fedull, 0x6540bdb74246420cull, "kitchen.async_samples"}, // function async_samples(u32) -> [f32] async cancellable
+    {0x61a358b0571e0a4eull, 0x11a24c4b50d11996ull, "kitchen.async_maybe_count"}, // function async_maybe_count() -> i64? async
+    {0x68cdb9a4bd3e3dd5ull, 0xcde022fe6bc3b1bfull, "kitchen.bool_id"}, // function bool_id(bool) -> bool
+    {0x69e7cd703d16eb85ull, 0xb13cb8d39e702c79ull, "kitchen.do_async"}, // function do_async(string) -> string async
+    {0x70865079ce41be82ull, 0xbe3b69464672af46ull, "kitchen.Gadget.describe"}, // method describe() -> string
+    {0x71c5a1116cb7c49aull, 0x1506cfe6f548fac4ull, "kitchen.echo_bytes"}, // function echo_bytes(bytes) -> bytes
+    {0x735ee1e0049ee91aull, 0xa713dbd1be707752ull, "kitchen.echo_string"}, // function echo_string(string) -> string
+    {0x76d7fc58f4e41d84ull, 0x6bdb4ccea2841d5eull, "kitchen.i64_id"}, // function i64_id(i64) -> i64
+    {0x78d91fd617e162b8ull, 0xd88e2753503b36dfull, "kitchen.stream_maybe"}, // function stream_maybe() -> iter<i32?>
+    {0x79abfe1aa960fd6aull, 0xbca7a9e5eb26f3a6ull, "kitchen.nested.hello"}, // function hello() -> string
+    {0x7b3865b536da998cull, 0x1c4e79d60a20e74full, "kitchen.mixed_slices"}, // function mixed_slices([i8], [i16], [u16], [u32], [i64], [f32]) -> [u32]
+    {0x7ba266dc26a58989ull, 0x0f86001cac0c21e8ull, "kitchen.KitchenErrors.InvalidInput"}, // code InvalidInput = 2
+    {0x7d3dd7d5cf6749e3ull, 0xa192f5a7298adb39ull, "kitchen.new_op"}, // function new_op() -> i32
+    {0x81ded69adee0abf2ull, 0x8c71141a931906f6ull, "kitchen.scale_i32"}, // function scale_i32([i32], i32) -> [i32]
+    {0x81fa72769330fed6ull, 0x2096511ca5c9d8d3ull, "kitchen.ReadyListener.label"}, // callback_method label() -> string throws KitchenErrors
+    {0x89a5e664bc25c67bull, 0x357fd9b65ad879a9ull, "kitchen.f64_id"}, // function f64_id(f64) -> f64
+    {0x8cfdbdcecac5f7f1ull, 0x07e272f09c41fffcull, "kitchen.Gadget.version"}, // static version() -> string
+    {0x8dc42397e47614b9ull, 0xcddf6fede09b2e7full, "kitchen.opt_priority"}, // function opt_priority(Priority?) -> Priority?
+    {0x92f060ef68961fc1ull, 0xd948f51645dc11a0ull, "kitchen.ReadyListener.on_item"}, // callback_method on_item(Item, Gadget) -> bool
+    {0x974b9f3e823c1738ull, 0xb81b91e975695f27ull, "kitchen.cross_module_token"}, // function cross_module_token() -> Token
+    {0x9f0f001aa85f97d5ull, 0x55815247f895bd45ull, "kitchen.sum_f64"}, // function sum_f64([f64]) -> f64
+    {0xab2a29fd1ef5458bull, 0x471a34aa4c09ae2bull, "kitchen.KitchenErrors.NotFound"}, // code NotFound = 1
+    {0xaca0655fac15d230ull, 0x11c4d2b28abe07bbull, "kitchen.list_items"}, // function list_items() -> [Item]
+    {0xb57c8e6ae3fb4383ull, 0x3f857851ab75366cull, "kitchen.PantryError"}, // errors PantryError
+    {0xbdc795b195edd428ull, 0x36127462f8b0969full, "kitchen.opt_mixed"}, // function opt_mixed(f64, f32?, i64?, string?) -> u16?
+    {0xbe4821ab3c340e71ull, 0x17fad5418abe0f50ull, "kitchen.ReadyListener.on_ready"}, // callback_method on_ready(i32, string) -> void
+    {0xc2ad53f2a6a36323ull, 0x071e29abee823f17ull, "kitchen.opt_i32_id"}, // function opt_i32_id(i32?) -> i32?
+    {0xc7ab409554fd3d7bull, 0xfea12b6bc219fc46ull, "kitchen.parse_any"}, // function parse_any(string) -> i64 throws any
+    {0xc82a7f2d85f99f4eull, 0xa9bcb8bacedb036cull, "kitchen.sample_with"}, // function sample_with(Sampler, u32?) -> [i16] throws PantryError
+    {0xc883b4afae20543eull, 0xc40560e5411ff392ull, "kitchen.legacy_op"}, // function legacy_op() -> i32
+    {0xd180bf646bff59e2ull, 0xa4515a6d00d7c600ull, "kitchen.PantryError.OutOfStock"}, // code OutOfStock = 1 {string}
+    {0xe6778df0f5c1b82bull, 0x38eaafdb350559e1ull, "kitchen.opt_bool_id"}, // function opt_bool_id(bool?) -> bool?
+    {0xf2f7753e6e1dffc2ull, 0xc9047a95bdf49e93ull, "kitchen.get_attrs"}, // function get_attrs() -> {string:i32}
+    {0xfae25d3391922eadull, 0xcc034cf506cae182ull, "kitchen.subscribe"}, // function subscribe(ReadyListener) -> i32
+    {0xfd0059b05cb2fcfbull, 0x248bf8404a5823b4ull, "kitchen.Gadget"}, // interface Gadget
+    {0xfed9c551fb9fd2d6ull, 0xe1020573f084dc1dull, "kitchen.ReadyListener"}, // callback ReadyListener
+    {0xff3a99b52597dee2ull, 0x14c4ecac97bdfc9bull, "kitchen.Gadget.readings"}, // method readings(u32?) -> [f64] throws any
 };
 
 } // namespace detail
 
 /**
  * Verifies that the linked kitchen_sink library implements C ABI revision
- * 4 and every declaration this header was generated with, throwing
+ * 5 and every declaration this header was generated with, throwing
  * LoadError naming the first mismatch. The check runs once; every free
  * function, constructor, and static member calls this before its first
  * native call, so calling it at startup is optional.
@@ -353,18 +731,10 @@ namespace detail {
 
 /**
  * Serializes values into the value-buffer wire format: little-endian, packed
- * with no alignment, lengths and element counts as u32.
+ * with no alignment, lengths and element counts as u32. The `write`
+ * overloads below encode one value of each type.
  */
 class BufferWriter {
-    std::vector<uint8_t> buf_;
-
-    template <typename T>
-    void append_le(T v) {
-        for (size_t i = 0; i < sizeof(T); ++i) {
-            buf_.push_back(static_cast<uint8_t>(v >> (8 * i)));
-        }
-    }
-
 public:
     /** Pointer to the encoded bytes. */
     const uint8_t* data() const noexcept { return buf_.data(); }
@@ -372,206 +742,317 @@ public:
     /** Number of encoded bytes. */
     size_t size() const noexcept { return buf_.size(); }
 
-    void write_bool(bool v) { buf_.push_back(v ? 1 : 0); }
-    void write_i8(int8_t v) { buf_.push_back(static_cast<uint8_t>(v)); }
-    void write_u8(uint8_t v) { buf_.push_back(v); }
-    void write_i16(int16_t v) { append_le(static_cast<uint16_t>(v)); }
-    void write_u16(uint16_t v) { append_le(v); }
-    void write_i32(int32_t v) { append_le(static_cast<uint32_t>(v)); }
-    void write_u32(uint32_t v) { append_le(v); }
-    void write_i64(int64_t v) { append_le(static_cast<uint64_t>(v)); }
-    void write_u64(uint64_t v) { append_le(v); }
+    /** Appends one byte. */
+    void byte(uint8_t v) { buf_.push_back(v); }
 
-    void write_f32(float v) {
-        uint32_t bits = 0;
-        std::memcpy(&bits, &v, sizeof(bits));
-        append_le(bits);
+    /** Appends an unsigned integer, little-endian. */
+    template <typename U>
+    void le(U v) {
+        for (size_t i = 0; i < sizeof(U); ++i) buf_.push_back(static_cast<uint8_t>(v >> (8 * i)));
     }
 
-    void write_f64(double v) {
-        uint64_t bits = 0;
-        std::memcpy(&bits, &v, sizeof(bits));
-        append_le(bits);
+    /** Appends a byte length or an element count as a u32, failing with -3 past u32. */
+    void len(size_t n) {
+        if (static_cast<uint64_t>(n) > UINT32_MAX) throw Error(-3, "value buffer length exceeds u32");
+        le(static_cast<uint32_t>(n));
     }
 
-    /** Writes a byte length or an element count as a u32. */
-    void write_len(size_t n) {
-        if (static_cast<uint64_t>(n) > UINT32_MAX) throw std::length_error("value buffer length exceeds u32");
-        append_le(static_cast<uint32_t>(n));
+    /** Appends `n` raw bytes. */
+    void bytes(const void* data, size_t n) {
+        const uint8_t* p = static_cast<const uint8_t*>(data);
+        buf_.insert(buf_.end(), p, p + n);
     }
 
-    void write_string(std::string_view v) {
-        write_len(v.size());
-        buf_.insert(buf_.end(), v.begin(), v.end());
-    }
-
-    void write_bytes(const std::vector<uint8_t>& v) {
-        write_len(v.size());
-        buf_.insert(buf_.end(), v.begin(), v.end());
-    }
-
-    /** Writes an optional's presence flag: 0 absent, 1 present. */
-    void write_option_flag(bool present) { buf_.push_back(present ? 1 : 0); }
-
-    /**
-     * Writes an object token: a fresh strong reference from the wrapper's
-     * `_clone`, which the reader adopts while `v` keeps its own.
-     */
-    template <typename T>
-    void write_object(const T& v) {
-        write_u64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(v.clone_handle())));
-    }
+private:
+    std::vector<uint8_t> buf_;
 };
 
 /**
  * Decodes values from the value-buffer wire format. A malformed buffer is a
  * producer bug (both sides are generated from one API), so every decode
  * failure throws InternalError with the marshalling code -3. Object tokens
- * adopted before a failure live in RAII wrappers that release them on
- * unwind.
+ * adopted before a failure live in wrappers that release them on unwind.
  */
 class BufferReader {
-    const uint8_t* data_;
-    size_t len_;
-    size_t pos_;
-
-    void require(size_t n, const char* what) const {
-        if (len_ - pos_ < n) fail(what);
-    }
-
-    template <typename T>
-    T read_le(const char* what) {
-        require(sizeof(T), what);
-        uint64_t v = 0;
-        for (size_t i = 0; i < sizeof(T); ++i) {
-            v |= static_cast<uint64_t>(data_[pos_ + i]) << (8 * i);
-        }
-        pos_ += sizeof(T);
-        return static_cast<T>(v);
-    }
-
 public:
+    /** Reads from the `len` bytes at `data` (null when empty). */
+    BufferReader(const uint8_t* data, size_t len) noexcept : data_(data), len_(data != nullptr ? len : 0) {}
+
     /** Throws the marshalling failure (-3) for a malformed buffer. */
     [[noreturn]] static void fail(const char* what) {
         throw InternalError(-3, std::string("malformed value buffer: ") + what);
     }
 
-    /** Reads from the `len` bytes at `data` (null when empty). */
-    BufferReader(const uint8_t* data, size_t len) noexcept : data_(data), len_(data != nullptr ? len : 0), pos_(0) {}
-
     /** Bytes not yet consumed. */
     size_t remaining() const noexcept { return len_ - pos_; }
 
-    bool read_bool() {
-        uint8_t b = read_le<uint8_t>("bool");
-        if (b > 1) fail("bool byte out of range");
+    /** Consumes `n` bytes, returning where they start. */
+    const uint8_t* take(size_t n, const char* what) {
+        if (remaining() < n) fail(what);
+        const uint8_t* p = data_ + pos_;
+        pos_ += n;
+        return p;
+    }
+
+    /** Reads an unsigned integer, little-endian. */
+    template <typename U>
+    U le(const char* what) {
+        const uint8_t* p = take(sizeof(U), what);
+        U v = 0;
+        for (size_t i = 0; i < sizeof(U); ++i) v = static_cast<U>(v | static_cast<U>(static_cast<U>(p[i]) << (8 * i)));
+        return v;
+    }
+
+    /** Reads a 0/1 byte (a bool or an optional's presence flag). */
+    bool flag(const char* what) {
+        uint8_t b = le<uint8_t>(what);
+        if (b > 1) fail(what);
         return b != 0;
     }
 
-    int8_t read_i8() { return read_le<int8_t>("i8"); }
-    uint8_t read_u8() { return read_le<uint8_t>("u8"); }
-    int16_t read_i16() { return read_le<int16_t>("i16"); }
-    uint16_t read_u16() { return read_le<uint16_t>("u16"); }
-    int32_t read_i32() { return read_le<int32_t>("i32"); }
-    uint32_t read_u32() { return read_le<uint32_t>("u32"); }
-    int64_t read_i64() { return read_le<int64_t>("i64"); }
-    uint64_t read_u64() { return read_le<uint64_t>("u64"); }
-
-    float read_f32() {
-        uint32_t bits = read_le<uint32_t>("f32");
-        float v = 0;
-        std::memcpy(&v, &bits, sizeof(v));
-        return v;
-    }
-
-    double read_f64() {
-        uint64_t bits = read_le<uint64_t>("f64");
-        double v = 0;
-        std::memcpy(&v, &bits, sizeof(v));
-        return v;
-    }
-
     /** Reads a byte length, rejecting one larger than the bytes remaining. */
-    size_t read_len() {
-        uint32_t n = read_le<uint32_t>("length");
-        if (static_cast<size_t>(n) > remaining()) fail("length prefix exceeds remaining buffer");
-        return static_cast<size_t>(n);
+    size_t len() {
+        size_t n = le<uint32_t>("length");
+        if (n > remaining()) fail("length prefix exceeds remaining buffer");
+        return n;
     }
 
     /**
      * Reads an element count. Elements may encode to zero bytes, so a count
-     * larger than the bytes remaining is legal; callers cap preallocation
-     * with reserve_hint().
+     * larger than the bytes remaining is legal; preallocate with reserve_hint().
      */
-    size_t read_count() { return static_cast<size_t>(read_le<uint32_t>("count")); }
+    size_t count() { return le<uint32_t>("count"); }
 
     /** A preallocation size for `n` elements that a malformed count can't inflate. */
     size_t reserve_hint(size_t n) const noexcept { return n < remaining() ? n : remaining(); }
-
-    std::string read_string() {
-        size_t n = read_len();
-        std::string v(reinterpret_cast<const char*>(data_) + pos_, n);
-        pos_ += n;
-        return v;
-    }
-
-    std::vector<uint8_t> read_bytes() {
-        size_t n = read_len();
-        std::vector<uint8_t> v(data_ + pos_, data_ + pos_ + n);
-        pos_ += n;
-        return v;
-    }
-
-    bool read_option_flag() {
-        uint8_t b = read_le<uint8_t>("option flag");
-        if (b > 1) fail("option flag byte out of range");
-        return b != 0;
-    }
-
-    /** Reads an object token, adopting the strong reference it carries into a `T` wrapper. */
-    template <typename T>
-    T read_object() {
-        auto* raw = reinterpret_cast<typename T::raw_type*>(static_cast<uintptr_t>(read_u64()));
-        if (raw == nullptr) fail("null object token");
-        return T(adopt, raw);
-    }
 
     /** Rejects unconsumed bytes after decoding a complete value. */
     void expect_end() const {
         if (pos_ != len_) fail("trailing bytes after value");
     }
+
+private:
+    const uint8_t* data_;
+    size_t len_;
+    size_t pos_ = 0;
 };
 
-/** Releases a producer-allocated buffer with kitchen_sink_free_bytes on scope exit. */
-struct BufferGuard {
-    /** The producer-allocated buffer, or null when the call reported an error. */
-    const uint8_t* ptr;
-    /** The buffer length in bytes. */
-    size_t len;
-
-    BufferGuard(const uint8_t* p, size_t n) noexcept : ptr(p), len(n) {}
-    BufferGuard(const BufferGuard&) = delete;
-    BufferGuard& operator=(const BufferGuard&) = delete;
-
-    ~BufferGuard() {
-        if (ptr != nullptr) kitchen_sink_free_bytes(const_cast<uint8_t*>(ptr), len);
-    }
-};
-
-/** Decodes one complete `T` from a borrowed buffer with `read`, rejecting trailing bytes. */
+/** Selects a `read` overload by the type it decodes. */
 template <typename T>
-T decode(const uint8_t* ptr, size_t len, T (*read)(BufferReader&)) {
+struct type_tag {};
+
+/** Reads one `T` (declared below and per value type). */
+template <typename T>
+T read(BufferReader& r) {
+    return read(r, type_tag<T>{});
+}
+
+inline void write(BufferWriter& w, bool v) { w.byte(v ? 1 : 0); }
+inline void write(BufferWriter& w, int8_t v) { w.byte(static_cast<uint8_t>(v)); }
+inline void write(BufferWriter& w, uint8_t v) { w.byte(v); }
+inline void write(BufferWriter& w, int16_t v) { w.le(static_cast<uint16_t>(v)); }
+inline void write(BufferWriter& w, uint16_t v) { w.le(v); }
+inline void write(BufferWriter& w, int32_t v) { w.le(static_cast<uint32_t>(v)); }
+inline void write(BufferWriter& w, uint32_t v) { w.le(v); }
+inline void write(BufferWriter& w, int64_t v) { w.le(static_cast<uint64_t>(v)); }
+inline void write(BufferWriter& w, uint64_t v) { w.le(v); }
+
+inline void write(BufferWriter& w, float v) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &v, sizeof bits);
+    w.le(bits);
+}
+
+inline void write(BufferWriter& w, double v) {
+    uint64_t bits = 0;
+    std::memcpy(&bits, &v, sizeof bits);
+    w.le(bits);
+}
+
+inline void write(BufferWriter& w, std::string_view v) {
+    w.len(v.size());
+    w.bytes(v.data(), v.size());
+}
+
+inline void write(BufferWriter& w, const std::vector<uint8_t>& v) {
+    w.len(v.size());
+    w.bytes(v.data(), v.size());
+}
+
+inline bool read(BufferReader& r, type_tag<bool>) { return r.flag("bool"); }
+inline int8_t read(BufferReader& r, type_tag<int8_t>) { return static_cast<int8_t>(r.le<uint8_t>("i8")); }
+inline uint8_t read(BufferReader& r, type_tag<uint8_t>) { return r.le<uint8_t>("u8"); }
+inline int16_t read(BufferReader& r, type_tag<int16_t>) { return static_cast<int16_t>(r.le<uint16_t>("i16")); }
+inline uint16_t read(BufferReader& r, type_tag<uint16_t>) { return r.le<uint16_t>("u16"); }
+inline int32_t read(BufferReader& r, type_tag<int32_t>) { return static_cast<int32_t>(r.le<uint32_t>("i32")); }
+inline uint32_t read(BufferReader& r, type_tag<uint32_t>) { return r.le<uint32_t>("u32"); }
+inline int64_t read(BufferReader& r, type_tag<int64_t>) { return static_cast<int64_t>(r.le<uint64_t>("i64")); }
+inline uint64_t read(BufferReader& r, type_tag<uint64_t>) { return r.le<uint64_t>("u64"); }
+
+inline float read(BufferReader& r, type_tag<float>) {
+    uint32_t bits = r.le<uint32_t>("f32");
+    float v = 0;
+    std::memcpy(&v, &bits, sizeof v);
+    return v;
+}
+
+inline double read(BufferReader& r, type_tag<double>) {
+    uint64_t bits = r.le<uint64_t>("f64");
+    double v = 0;
+    std::memcpy(&v, &bits, sizeof v);
+    return v;
+}
+
+inline std::string read(BufferReader& r, type_tag<std::string>) {
+    size_t n = r.len();
+    return std::string(reinterpret_cast<const char*>(r.take(n, "string")), n);
+}
+
+inline std::vector<uint8_t> read(BufferReader& r, type_tag<std::vector<uint8_t>>) {
+    size_t n = r.len();
+    const uint8_t* p = r.take(n, "bytes");
+    return std::vector<uint8_t>(p, p + n);
+}
+
+/** A C-style enum crosses as its `int32_t` discriminant. */
+template <typename E, std::enable_if_t<std::is_enum_v<E>, int> = 0>
+void write(BufferWriter& w, E v) {
+    write(w, static_cast<int32_t>(v));
+}
+
+template <typename E, std::enable_if_t<std::is_enum_v<E>, int> = 0>
+E read(BufferReader& r, type_tag<E>) {
+    return static_cast<E>(read<int32_t>(r));
+}
+
+/** Whether `T` is an interface wrapper (it names the C type it wraps). */
+template <typename T, typename = void>
+struct is_object : std::false_type {};
+
+template <typename T>
+struct is_object<T, std::void_t<typename T::raw_type>> : std::true_type {};
+
+/**
+ * An object crosses as a token: a fresh strong reference from the wrapper's
+ * `_clone`, which the reader adopts while the writer's wrapper keeps its own.
+ */
+template <typename T, std::enable_if_t<is_object<T>::value, int> = 0>
+void write(BufferWriter& w, const T& v) {
+    write(w, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(v.clone_handle())));
+}
+
+template <typename T, std::enable_if_t<is_object<T>::value, int> = 0>
+T read(BufferReader& r, type_tag<T>) {
+    auto* raw = reinterpret_cast<typename T::raw_type*>(static_cast<uintptr_t>(read<uint64_t>(r)));
+    if (raw == nullptr) BufferReader::fail("null object token");
+    return T(adopt, raw);
+}
+
+/** `T?`: a presence flag, then the value when present. */
+template <typename T>
+void write(BufferWriter& w, const std::optional<T>& v) {
+    w.byte(v.has_value() ? 1 : 0);
+    if (v.has_value()) write(w, *v);
+}
+
+template <typename T>
+std::optional<T> read(BufferReader& r, type_tag<std::optional<T>>) {
+    if (!r.flag("option flag")) return std::nullopt;
+    return std::optional<T>(read<T>(r));
+}
+
+/** `[T]`: a u32 count, then the elements. */
+template <typename T>
+void write(BufferWriter& w, const std::vector<T>& v) {
+    w.len(v.size());
+    for (const auto& item : v) write(w, item);
+}
+
+template <typename T>
+std::vector<T> read(BufferReader& r, type_tag<std::vector<T>>) {
+    size_t n = r.count();
+    std::vector<T> v;
+    v.reserve(r.reserve_hint(n));
+    for (size_t i = 0; i < n; ++i) v.push_back(read<T>(r));
+    return v;
+}
+
+/** `{K: V}`: a u32 count, then each key and value. A repeated key is malformed. */
+template <typename K, typename V>
+void write(BufferWriter& w, const std::unordered_map<K, V>& v) {
+    w.len(v.size());
+    for (const auto& entry : v) {
+        write(w, entry.first);
+        write(w, entry.second);
+    }
+}
+
+template <typename K, typename V>
+std::unordered_map<K, V> read(BufferReader& r, type_tag<std::unordered_map<K, V>>) {
+    size_t n = r.count();
+    std::unordered_map<K, V> v;
+    v.reserve(r.reserve_hint(n));
+    for (size_t i = 0; i < n; ++i) {
+        K key = read<K>(r);
+        V value = read<V>(r);
+        if (!v.emplace(std::move(key), std::move(value)).second) BufferReader::fail("repeated map key");
+    }
+    return v;
+}
+
+/** Encodes one value into a fresh buffer. */
+template <typename T>
+BufferWriter encode(const T& value) {
+    BufferWriter w;
+    write(w, value);
+    return w;
+}
+
+/** Decodes one complete `T` from a borrowed buffer, rejecting trailing bytes. */
+template <typename T>
+T decode(const uint8_t* ptr, size_t len) {
     BufferReader r(ptr, len);
-    T value = read(r);
+    T value = read<T>(r);
     r.expect_end();
     return value;
 }
 
-/** Decodes one complete `T` from a producer-returned buffer with `read`, then releases the buffer. */
+/** Decodes one complete `T` from a producer-returned buffer, then releases the buffer. */
 template <typename T>
-T take(const uint8_t* ptr, size_t len, T (*read)(BufferReader&)) {
-    BufferGuard guard(ptr, len);
-    return decode(ptr, len, read);
+T take(const uint8_t* ptr, size_t len) {
+    Run run{ptr, len};
+    return decode<T>(ptr, len);
+}
+
+/** Hands a callback's buffered return to the producer as a kitchen_sink_alloc run. */
+inline void give(const BufferWriter& value, uint8_t** out_ptr, size_t* out_len) {
+    give_run(value.data(), value.size(), out_ptr, out_len);
+}
+
+/** Throws the error class `E` of a domain code with fields, decoding them from the error's payload. */
+template <typename E, typename... Fields>
+[[noreturn]] void raise_with_fields(const error& err) {
+    BufferReader r(err.payload_ptr, err.payload_len);
+    E e{message(err), read<Fields>(r)...};
+    r.expect_end();
+    throw e;
+}
+
+/**
+ * Reports a domain exception from a callback: its code and message, and its
+ * `fields` encoded as the payload. A field that can't be encoded reports a
+ * plain failure (-1) instead.
+ */
+template <typename... Fields>
+void report_with_fields(error* out_err, const Error& e, const Fields&... fields) noexcept {
+    try {
+        BufferWriter payload;
+        (write(payload, fields), ...);
+        set_error(out_err, e.code(), e.what());
+        kitchen_sink_error_set_payload(out_err, payload.data(), payload.size());
+    } catch (...) {
+        set_error(out_err, -1, e.what());
+    }
 }
 
 } // namespace detail
@@ -590,54 +1071,16 @@ struct Token;
 struct Item;
 class Gadget;
 class ReadyListener;
+class Sampler;
 
 /** A pocket-sized interface exercising the object surface */
 class Gadget {
-    kitchen_sink_kitchen_Gadget* raw_;
-
 public:
     /** The C type this class wraps. */
     using raw_type = kitchen_sink_kitchen_Gadget;
 
     /** Adopts one strong reference to a producer object: `Gadget(adopt, raw)`. */
-    explicit Gadget(adopt_t, kitchen_sink_kitchen_Gadget* h) noexcept : raw_(h) {}
-
-    /** Releases this wrapper's reference; the object is dropped with its last one. */
-    ~Gadget() {
-        if (raw_ != nullptr) kitchen_sink_kitchen_Gadget_destroy(raw_);
-    }
-
-    /** Copies share the object: the copy takes a new strong reference. */
-    Gadget(const Gadget& other) : raw_(kitchen_sink_kitchen_Gadget_clone(other.raw_)) {}
-
-    /** Takes a new reference to `other`'s object and releases the current one. */
-    Gadget& operator=(const Gadget& other) {
-        if (this != &other) {
-            kitchen_sink_kitchen_Gadget* h = kitchen_sink_kitchen_Gadget_clone(other.raw_);
-            if (raw_ != nullptr) kitchen_sink_kitchen_Gadget_destroy(raw_);
-            raw_ = h;
-        }
-        return *this;
-    }
-
-    /** Transfers `other`'s reference; `other` becomes empty. */
-    Gadget(Gadget&& other) noexcept : raw_(other.raw_) { other.raw_ = nullptr; }
-
-    /** Releases the current reference and takes over `other`'s. */
-    Gadget& operator=(Gadget&& other) noexcept {
-        if (this != &other) {
-            if (raw_ != nullptr) kitchen_sink_kitchen_Gadget_destroy(raw_);
-            raw_ = other.raw_;
-            other.raw_ = nullptr;
-        }
-        return *this;
-    }
-
-    /** The wrapped pointer, borrowed (null after a move): this wrapper keeps its reference. */
-    const kitchen_sink_kitchen_Gadget* handle() const noexcept { return raw_; }
-
-    /** A new strong reference to the object, which the caller owns. */
-    kitchen_sink_kitchen_Gadget* clone_handle() const { return kitchen_sink_kitchen_Gadget_clone(raw_); }
+    explicit Gadget(adopt_t, raw_type* raw) noexcept : raw_(raw) {}
 
     /** Create a gadget with the given id */
     explicit Gadget(int64_t id);
@@ -648,250 +1091,149 @@ public:
     /**
      * Poke the gadget a number of times, failing on a negative count
      *
-     * @throws KitchenErrorsError when the call fails with one of the domain's codes.
+     * @throws KitchenError (or one of its codes' classes) when the call fails with one of the domain's codes.
      */
     int32_t poke(int32_t times) const;
+
+    /**
+     * The gadget's sensor readings, optionally limited
+     *
+     * @throws Error with code -1 and the producer's message when the call fails.
+     */
+    std::vector<double> readings(std::optional<uint32_t> limit) const;
 
     /** The gadget subsystem version string */
     static std::string version();
 
+    /** The wrapped pointer, borrowed (null after a move): this wrapper keeps its reference. */
+    const raw_type* handle() const noexcept { return raw_.get(); }
+
+    /** A new strong reference to the object, which the caller owns. */
+    raw_type* clone_handle() const noexcept { return raw_.clone(); }
+
+    /** Whether both wrap the same producer object. */
+    friend bool operator==(const Gadget& a, const Gadget& b) noexcept { return a.raw_.get() == b.raw_.get(); }
+    friend bool operator!=(const Gadget& a, const Gadget& b) noexcept { return !(a == b); }
+
+private:
+    struct traits {
+        using raw_type = kitchen_sink_kitchen_Gadget;
+        static raw_type* clone(const raw_type* raw) noexcept { return kitchen_sink_kitchen_Gadget_clone(raw); }
+        static void destroy(raw_type* raw) noexcept { kitchen_sink_kitchen_Gadget_destroy(raw); }
+    };
+
+    detail::Handle<traits> raw_;
 };
 
 /** A reusable token referenced across modules */
 struct Token {
-    int64_t id;
-    std::string label;
+    int64_t id{};
+    std::string label{};
+
+    /** Memberwise equality; interface members compare by identity. */
+    friend bool operator==(const Token& a, const Token& b) { return a.id == b.id && a.label == b.label; }
+    friend bool operator!=(const Token& a, const Token& b) { return !(a == b); }
 };
 
 /** Kitchen sink struct exercising every field feature */
 struct Item {
     /** Stable identifier */
-    int64_t id;
+    int64_t id{};
     /** Display name */
-    std::string name;
+    std::string name{};
     /** Initial count */
-    int32_t count;
+    int32_t count{};
     /** Whether the item is enabled */
-    bool enabled;
+    bool enabled{};
     /** Scaling ratio */
-    double ratio;
-    uint32_t nick;
-    std::vector<uint8_t> payload;
-    std::vector<std::string> tags;
-    std::unordered_map<std::string, std::string> attrs;
-    std::optional<int64_t> parent;
+    double ratio{};
+    uint32_t nick{};
+    std::vector<uint8_t> payload{};
+    std::vector<std::string> tags{};
+    std::unordered_map<std::string, std::string> attrs{};
+    std::optional<int64_t> parent{};
     /** Cross-module struct reference */
-    Token token;
-    Priority priority;
+    Token token{};
+    Priority priority{};
     /** An optional object inside a record */
-    std::optional<Gadget> gadget;
+    std::optional<Gadget> gadget{};
+
+    /** Memberwise equality; interface members compare by identity. */
+    friend bool operator==(const Item& a, const Item& b) {
+        return a.id == b.id
+            && a.name == b.name
+            && a.count == b.count
+            && a.enabled == b.enabled
+            && a.ratio == b.ratio
+            && a.nick == b.nick
+            && a.payload == b.payload
+            && a.tags == b.tags
+            && a.attrs == b.attrs
+            && a.parent == b.parent
+            && a.token == b.token
+            && a.priority == b.priority
+            && a.gadget == b.gadget;
+    }
+    friend bool operator!=(const Item& a, const Item& b) { return !(a == b); }
 };
 
 namespace detail {
 
-inline void write_Token(BufferWriter& w, const Token& v);
-inline Token read_Token(BufferReader& r);
-inline void write_Item(BufferWriter& w, const Item& v);
-inline Item read_Item(BufferReader& r);
-inline void write_list_string(BufferWriter& w, const std::vector<std::string>& v);
-inline std::vector<std::string> read_list_string(BufferReader& r);
-inline void write_map_string_string(BufferWriter& w, const std::unordered_map<std::string, std::string>& v);
-inline std::unordered_map<std::string, std::string> read_map_string_string(BufferReader& r);
-inline void write_opt_i64(BufferWriter& w, const std::optional<int64_t>& v);
-inline std::optional<int64_t> read_opt_i64(BufferReader& r);
-inline void write_opt_Gadget(BufferWriter& w, const std::optional<Gadget>& v);
-inline std::optional<Gadget> read_opt_Gadget(BufferReader& r);
-inline void write_list_Gadget(BufferWriter& w, const std::vector<Gadget>& v);
-inline std::vector<Gadget> read_list_Gadget(BufferReader& r);
-inline void write_opt_Item(BufferWriter& w, const std::optional<Item>& v);
-inline std::optional<Item> read_opt_Item(BufferReader& r);
-inline void write_list_Item(BufferWriter& w, const std::vector<Item>& v);
-inline std::vector<Item> read_list_Item(BufferReader& r);
-inline void write_map_string_i32(BufferWriter& w, const std::unordered_map<std::string, int32_t>& v);
-inline std::unordered_map<std::string, int32_t> read_map_string_i32(BufferReader& r);
+inline void write(BufferWriter& w, const Token& v);
+inline Token read(BufferReader& r, type_tag<Token>);
+inline void write(BufferWriter& w, const Item& v);
+inline Item read(BufferReader& r, type_tag<Item>);
 
-/** Writes one `Token` to a value buffer. */
-inline void write_Token(BufferWriter& w, const Token& v) {
-    w.write_i64(v.id);
-    w.write_string(v.label);
+inline void write(BufferWriter& w, const Token& v) {
+    write(w, v.id);
+    write(w, v.label);
 }
 
-/** Reads one `Token` from a value buffer. */
-inline Token read_Token(BufferReader& r) {
-    return Token{
-        r.read_i64(),
-        r.read_string(),
-    };
+inline Token read(BufferReader& r, type_tag<Token>) {
+    return Token{read<int64_t>(r), read<std::string>(r)};
 }
 
-/** Writes one `Item` to a value buffer. */
-inline void write_Item(BufferWriter& w, const Item& v) {
-    w.write_i64(v.id);
-    w.write_string(v.name);
-    w.write_i32(v.count);
-    w.write_bool(v.enabled);
-    w.write_f64(v.ratio);
-    w.write_u32(v.nick);
-    w.write_bytes(v.payload);
-    detail::write_list_string(w, v.tags);
-    detail::write_map_string_string(w, v.attrs);
-    detail::write_opt_i64(w, v.parent);
-    detail::write_Token(w, v.token);
-    w.write_i32(static_cast<int32_t>(v.priority));
-    detail::write_opt_Gadget(w, v.gadget);
+inline void write(BufferWriter& w, const Item& v) {
+    write(w, v.id);
+    write(w, v.name);
+    write(w, v.count);
+    write(w, v.enabled);
+    write(w, v.ratio);
+    write(w, v.nick);
+    write(w, v.payload);
+    write(w, v.tags);
+    write(w, v.attrs);
+    write(w, v.parent);
+    write(w, v.token);
+    write(w, v.priority);
+    write(w, v.gadget);
 }
 
-/** Reads one `Item` from a value buffer. */
-inline Item read_Item(BufferReader& r) {
+inline Item read(BufferReader& r, type_tag<Item>) {
     return Item{
-        r.read_i64(),
-        r.read_string(),
-        r.read_i32(),
-        r.read_bool(),
-        r.read_f64(),
-        r.read_u32(),
-        r.read_bytes(),
-        detail::read_list_string(r),
-        detail::read_map_string_string(r),
-        detail::read_opt_i64(r),
-        detail::read_Token(r),
-        static_cast<Priority>(r.read_i32()),
-        detail::read_opt_Gadget(r),
+        read<int64_t>(r),
+        read<std::string>(r),
+        read<int32_t>(r),
+        read<bool>(r),
+        read<double>(r),
+        read<uint32_t>(r),
+        read<std::vector<uint8_t>>(r),
+        read<std::vector<std::string>>(r),
+        read<std::unordered_map<std::string, std::string>>(r),
+        read<std::optional<int64_t>>(r),
+        read<Token>(r),
+        read<Priority>(r),
+        read<std::optional<Gadget>>(r)
     };
-}
-
-/** Writes one `[string]` to a value buffer. */
-inline void write_list_string(BufferWriter& w, const std::vector<std::string>& v) {
-    w.write_len(v.size());
-    for (const auto& item : v) w.write_string(item);
-}
-
-/** Reads one `[string]` from a value buffer. */
-inline std::vector<std::string> read_list_string(BufferReader& r) {
-    size_t n = r.read_count();
-    std::vector<std::string> v;
-    v.reserve(r.reserve_hint(n));
-    for (size_t i = 0; i < n; ++i) v.push_back(r.read_string());
-    return v;
-}
-
-/** Writes one `{string:string}` to a value buffer. */
-inline void write_map_string_string(BufferWriter& w, const std::unordered_map<std::string, std::string>& v) {
-    w.write_len(v.size());
-    for (const auto& entry : v) {
-        w.write_string(entry.first);
-        w.write_string(entry.second);
-    }
-}
-
-/** Reads one `{string:string}` from a value buffer. */
-inline std::unordered_map<std::string, std::string> read_map_string_string(BufferReader& r) {
-    size_t n = r.read_count();
-    std::unordered_map<std::string, std::string> v;
-    v.reserve(r.reserve_hint(n));
-    for (size_t i = 0; i < n; ++i) {
-        std::string key = r.read_string();
-        std::string value = r.read_string();
-        if (!v.emplace(std::move(key), std::move(value)).second) BufferReader::fail("repeated map key");
-    }
-    return v;
-}
-
-/** Writes one `i64?` to a value buffer. */
-inline void write_opt_i64(BufferWriter& w, const std::optional<int64_t>& v) {
-    w.write_option_flag(v.has_value());
-    if (v.has_value()) w.write_i64(*v);
-}
-
-/** Reads one `i64?` from a value buffer. */
-inline std::optional<int64_t> read_opt_i64(BufferReader& r) {
-    if (!r.read_option_flag()) return std::nullopt;
-    return std::optional<int64_t>(r.read_i64());
-}
-
-/** Writes one `Gadget?` to a value buffer. */
-inline void write_opt_Gadget(BufferWriter& w, const std::optional<Gadget>& v) {
-    w.write_option_flag(v.has_value());
-    if (v.has_value()) w.write_object(*v);
-}
-
-/** Reads one `Gadget?` from a value buffer. */
-inline std::optional<Gadget> read_opt_Gadget(BufferReader& r) {
-    if (!r.read_option_flag()) return std::nullopt;
-    return std::optional<Gadget>(r.read_object<Gadget>());
-}
-
-/** Writes one `[Gadget]` to a value buffer. */
-inline void write_list_Gadget(BufferWriter& w, const std::vector<Gadget>& v) {
-    w.write_len(v.size());
-    for (const auto& item : v) w.write_object(item);
-}
-
-/** Reads one `[Gadget]` from a value buffer. */
-inline std::vector<Gadget> read_list_Gadget(BufferReader& r) {
-    size_t n = r.read_count();
-    std::vector<Gadget> v;
-    v.reserve(r.reserve_hint(n));
-    for (size_t i = 0; i < n; ++i) v.push_back(r.read_object<Gadget>());
-    return v;
-}
-
-/** Writes one `Item?` to a value buffer. */
-inline void write_opt_Item(BufferWriter& w, const std::optional<Item>& v) {
-    w.write_option_flag(v.has_value());
-    if (v.has_value()) detail::write_Item(w, *v);
-}
-
-/** Reads one `Item?` from a value buffer. */
-inline std::optional<Item> read_opt_Item(BufferReader& r) {
-    if (!r.read_option_flag()) return std::nullopt;
-    return std::optional<Item>(detail::read_Item(r));
-}
-
-/** Writes one `[Item]` to a value buffer. */
-inline void write_list_Item(BufferWriter& w, const std::vector<Item>& v) {
-    w.write_len(v.size());
-    for (const auto& item : v) detail::write_Item(w, item);
-}
-
-/** Reads one `[Item]` from a value buffer. */
-inline std::vector<Item> read_list_Item(BufferReader& r) {
-    size_t n = r.read_count();
-    std::vector<Item> v;
-    v.reserve(r.reserve_hint(n));
-    for (size_t i = 0; i < n; ++i) v.push_back(detail::read_Item(r));
-    return v;
-}
-
-/** Writes one `{string:i32}` to a value buffer. */
-inline void write_map_string_i32(BufferWriter& w, const std::unordered_map<std::string, int32_t>& v) {
-    w.write_len(v.size());
-    for (const auto& entry : v) {
-        w.write_string(entry.first);
-        w.write_i32(entry.second);
-    }
-}
-
-/** Reads one `{string:i32}` from a value buffer. */
-inline std::unordered_map<std::string, int32_t> read_map_string_i32(BufferReader& r) {
-    size_t n = r.read_count();
-    std::unordered_map<std::string, int32_t> v;
-    v.reserve(r.reserve_hint(n));
-    for (size_t i = 0; i < n; ++i) {
-        std::string key = r.read_string();
-        int32_t value = r.read_i32();
-        if (!v.emplace(std::move(key), std::move(value)).second) BufferReader::fail("repeated map key");
-    }
-    return v;
 }
 
 } // namespace detail
 
-/** The errors the `kitchen` module's throwing calls report; catch a code's subclass or this. */
-class KitchenErrorsError : public Error {
+/** The `KitchenErrors` error domain of module `kitchen`: catch a code's class or this. */
+class KitchenError : public Error {
 public:
-    /** Builds an error carrying a domain `code` and `message`. */
-    KitchenErrorsError(int32_t code, const std::string& message) : Error(code, message) {}
+    /** Builds an error carrying one of the domain's `code`s and its `message`. */
+    KitchenError(int32_t code, const std::string& message) : Error(code, message) {}
 };
 
 /**
@@ -899,10 +1241,10 @@ public:
  *
  * Code 1.
  */
-class NotFoundError : public KitchenErrorsError {
+class NotFoundError : public KitchenError {
 public:
     /** Builds the error with the producer's `message` and the code's fields. */
-    explicit NotFoundError(const std::string& message) : KitchenErrorsError(1, message) {}
+    explicit NotFoundError(const std::string& message) : KitchenError(1, message) {}
 };
 
 /**
@@ -910,51 +1252,103 @@ public:
  *
  * Code 2.
  */
-class InvalidInputError : public KitchenErrorsError {
+class InvalidInputError : public KitchenError {
 public:
     /** Builds the error with the producer's `message` and the code's fields. */
-    explicit InvalidInputError(const std::string& message) : KitchenErrorsError(2, message) {}
+    explicit InvalidInputError(const std::string& message) : KitchenError(2, message) {}
 };
 
 namespace detail {
 
-/** The exception for a failed `KitchenErrorsError` call: its code's subclass, Cancelled, or the root Error. */
-inline std::exception_ptr make_kitchen_error(int32_t code, const std::string& message, const uint8_t* payload_ptr, size_t payload_len) {
-    if (code == -5) return std::make_exception_ptr(Cancelled(message));
-    if (code < 0) return std::make_exception_ptr(Error(code, message));
-    (void)payload_ptr;
-    (void)payload_len;
-    switch (code) {
-        case 1: return std::make_exception_ptr(NotFoundError(message));
-        case 2: return std::make_exception_ptr(InvalidInputError(message));
-        default: return std::make_exception_ptr(KitchenErrorsError(code, message));
+/** Raises and reports `KitchenError` and its codes' classes. */
+template <>
+struct Errors<KitchenError> {
+    [[noreturn]] static void raise(const kitchen_sink_error& err) {
+        if (err.code < 0) raise_runtime<Error>(err);
+        switch (err.code) {
+            case 1: throw NotFoundError(message(err));
+            case 2: throw InvalidInputError(message(err));
+            default: throw KitchenError(err.code, message(err));
+        }
     }
-}
 
-/** Throws the typed `KitchenErrorsError` exception if `err` carries a nonzero code. */
-inline void check_kitchen(kitchen_sink_error& err) {
-    if (err.code == 0) return;
-    std::exception_ptr ex = make_kitchen_error(err.code, error_message(err), err.payload_ptr, err.payload_len);
-    kitchen_sink_error_clear(&err);
-    std::rethrow_exception(ex);
-}
-
-/** Reports a `KitchenErrorsError` a callback implementation threw through the vtable entry's `out_err`. */
-inline void report_kitchen_error(const KitchenErrorsError& e, kitchen_sink_error* out_err) {
-    switch (e.code()) {
-        case 1: kitchen_sink_error_set(out_err, 1, e.what()); return;
-        case 2: kitchen_sink_error_set(out_err, 2, e.what()); return;
-        default: break;
+    static void report(kitchen_sink_error* out_err) noexcept {
+        try {
+            throw;
+        } catch (const KitchenError& e) {
+            set_error(out_err, e.code(), e.what());
+        } catch (...) {
+            report_current(out_err, -1);
+        }
     }
-    kitchen_sink_error_set(out_err, -4, e.what());
-}
+};
+
+} // namespace detail
+
+/** The `PantryError` error domain of module `kitchen`: catch a code's class or this. */
+class PantryError : public Error {
+public:
+    /** Builds an error carrying one of the domain's `code`s and its `message`. */
+    PantryError(int32_t code, const std::string& message) : Error(code, message) {}
+};
+
+/**
+ * Out of stock
+ *
+ * Code 1.
+ */
+class OutOfStockError : public PantryError {
+public:
+    std::string item;
+
+    /** Builds the error with the producer's `message` and the code's fields. */
+    OutOfStockError(const std::string& message, std::string item) : PantryError(1, message), item(std::move(item)) {}
+};
+
+/**
+ * Spoiled
+ *
+ * Code 2.
+ */
+class SpoiledError : public PantryError {
+public:
+    /** Builds the error with the producer's `message` and the code's fields. */
+    explicit SpoiledError(const std::string& message) : PantryError(2, message) {}
+};
+
+namespace detail {
+
+/** Raises and reports `PantryError` and its codes' classes. */
+template <>
+struct Errors<PantryError> {
+    [[noreturn]] static void raise(const kitchen_sink_error& err) {
+        if (err.code < 0) raise_runtime<Error>(err);
+        switch (err.code) {
+            case 1: raise_with_fields<OutOfStockError, std::string>(err);
+            case 2: throw SpoiledError(message(err));
+            default: throw PantryError(err.code, message(err));
+        }
+    }
+
+    static void report(kitchen_sink_error* out_err) noexcept {
+        try {
+            throw;
+        } catch (const OutOfStockError& e) {
+            report_with_fields(out_err, e, e.item);
+        } catch (const PantryError& e) {
+            set_error(out_err, e.code(), e.what());
+        } catch (...) {
+            report_current(out_err, -1);
+        }
+    }
+};
 
 } // namespace detail
 
 /**
  * Consumer-implemented observer of ready items
  *
- * Subclass it and pass a `std::shared_ptr<ReadyListener>` where the API takes a `ReadyListener`. The producer may call the methods from any thread, so they must be thread-safe, until it releases the implementation (also from any thread). A method that declares errors may throw a `KitchenErrorsError` code's exception, which reaches the producer with its fields; any other exception reaches it as a callback failure (code -4).
+ * Subclass it and pass a `std::shared_ptr<ReadyListener>` where the API takes a `ReadyListener`. The producer may call the methods from any thread, so they must be thread-safe, and releases the implementation (also from any thread) once it's done with it. An exception a method throws never unwinds into the producer: a method that declares errors reports it as described on the method, and any other method reports a callback failure (-4).
  */
 class ReadyListener {
 public:
@@ -969,7 +1363,7 @@ public:
     /**
      * A display label, failing with a kitchen error
      *
-     * @throws KitchenErrorsError to report one of the domain's codes to the producer.
+     * @throws KitchenError (or one of its codes' classes) to report one of the domain's codes, fields included; any other exception reports a plain failure.
      */
     virtual std::string label() = 0;
 
@@ -982,125 +1376,162 @@ public:
 
 namespace detail {
 
-/** Trampolines adapting a `ReadyListener` implementation to `kitchen_sink_kitchen_ReadyListener_vtable`. */
-struct ReadyListener_trampolines {
+/** Adapts a `ReadyListener` implementation to `kitchen_sink_kitchen_ReadyListener_vtable`. */
+template <>
+struct Callbacks<ReadyListener> {
     static void on_ready(void* ctx, int32_t code, const uint8_t* msg_ptr, size_t msg_len, kitchen_sink_error* out_err) {
-        try {
-            ReadyListener& impl = **static_cast<std::shared_ptr<ReadyListener>*>(ctx);
-            impl.on_ready(code, detail::borrow_string(msg_ptr, msg_len));
-        } catch (const std::exception& e) {
-            kitchen_sink_error_set(out_err, -4, e.what());
-        } catch (...) {
-            kitchen_sink_error_set(out_err, -4, "ReadyListener::on_ready threw a non-standard exception");
-        }
+        callback<InternalError>(out_err, [&] {
+            implementation<ReadyListener>(ctx).on_ready(code, borrow_string(msg_ptr, msg_len));
+        });
     }
 
     static bool on_item(void* ctx, const uint8_t* item_ptr, size_t item_len, kitchen_sink_kitchen_Gadget* gadget, kitchen_sink_error* out_err) {
         Gadget gadget_arg(adopt, gadget);
-        try {
-            ReadyListener& impl = **static_cast<std::shared_ptr<ReadyListener>*>(ctx);
-            Item item_arg = detail::decode(item_ptr, item_len, &detail::read_Item);
-            return impl.on_item(std::move(item_arg), std::move(gadget_arg));
-        } catch (const std::exception& e) {
-            kitchen_sink_error_set(out_err, -4, e.what());
-        } catch (...) {
-            kitchen_sink_error_set(out_err, -4, "ReadyListener::on_item threw a non-standard exception");
-        }
-        return bool{};
+        return callback<InternalError>(out_err, [&] {
+            auto item_arg = decode<Item>(item_ptr, item_len);
+            return implementation<ReadyListener>(ctx).on_item(std::move(item_arg), std::move(gadget_arg));
+        });
     }
 
     static void label(void* ctx, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err) {
-        try {
-            ReadyListener& impl = **static_cast<std::shared_ptr<ReadyListener>*>(ctx);
-            std::string ret = impl.label();
-            detail::hand_over(ret.data(), ret.size(), out_ptr, out_len);
-        } catch (const KitchenErrorsError& e) {
-            detail::report_kitchen_error(e, out_err);
-        } catch (const std::exception& e) {
-            kitchen_sink_error_set(out_err, -4, e.what());
-        } catch (...) {
-            kitchen_sink_error_set(out_err, -4, "ReadyListener::label threw a non-standard exception");
-        }
+        callback<KitchenError>(out_err, [&] {
+            give(implementation<ReadyListener>(ctx).label(), out_ptr, out_len);
+        });
     }
 
     static void latest(void* ctx, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err) {
-        try {
-            ReadyListener& impl = **static_cast<std::shared_ptr<ReadyListener>*>(ctx);
-            std::optional<Item> ret = impl.latest();
-            detail::BufferWriter ret_buf;
-            detail::write_opt_Item(ret_buf, ret);
-            detail::hand_over(ret_buf.data(), ret_buf.size(), out_ptr, out_len);
-        } catch (const std::exception& e) {
-            kitchen_sink_error_set(out_err, -4, e.what());
-        } catch (...) {
-            kitchen_sink_error_set(out_err, -4, "ReadyListener::latest threw a non-standard exception");
-        }
+        callback<InternalError>(out_err, [&] {
+            give(encode(implementation<ReadyListener>(ctx).latest()), out_ptr, out_len);
+        });
     }
 
     static kitchen_sink_kitchen_Gadget* favorite(void* ctx, kitchen_sink_error* out_err) {
-        try {
-            ReadyListener& impl = **static_cast<std::shared_ptr<ReadyListener>*>(ctx);
-            return impl.favorite().clone_handle();
-        } catch (const std::exception& e) {
-            kitchen_sink_error_set(out_err, -4, e.what());
-        } catch (...) {
-            kitchen_sink_error_set(out_err, -4, "ReadyListener::favorite threw a non-standard exception");
-        }
-        return nullptr;
+        return callback<InternalError>(out_err, [&] {
+            return implementation<ReadyListener>(ctx).favorite().clone_handle();
+        });
     }
 
-    /** Deletes the implementation box once the producer releases it. */
-    static void free_ctx(void* ctx) {
-        delete static_cast<std::shared_ptr<ReadyListener>*>(ctx);
+    /** The vtable every `ReadyListener` implementation is passed with. */
+    static const kitchen_sink_kitchen_ReadyListener_vtable& vtable() noexcept {
+        static const kitchen_sink_kitchen_ReadyListener_vtable table = {
+            sizeof(kitchen_sink_kitchen_ReadyListener_vtable),
+            0,
+            &release<ReadyListener>,
+            &on_ready,
+            &on_item,
+            &label,
+            &latest,
+            &favorite,
+        };
+        return table;
     }
 };
 
-/** The vtable every `ReadyListener` implementation is passed with. */
-inline const kitchen_sink_kitchen_ReadyListener_vtable& ReadyListener_vtable() {
-    static const kitchen_sink_kitchen_ReadyListener_vtable vtable = {
-        static_cast<uint32_t>(sizeof(kitchen_sink_kitchen_ReadyListener_vtable)),
-        0,
-        &ReadyListener_trampolines::free_ctx,
-        &ReadyListener_trampolines::on_ready,
-        &ReadyListener_trampolines::on_item,
-        &ReadyListener_trampolines::label,
-        &ReadyListener_trampolines::latest,
-        &ReadyListener_trampolines::favorite,
-    };
-    return vtable;
-}
+} // namespace detail
+
+/**
+ * Consumer-implemented source of scalar samples
+ *
+ * Subclass it and pass a `std::shared_ptr<Sampler>` where the API takes a `Sampler`. The producer may call the methods from any thread, so they must be thread-safe, and releases the implementation (also from any thread) once it's done with it. An exception a method throws never unwinds into the producer: a method that declares errors reports it as described on the method, and any other method reports a callback failure (-4).
+ */
+class Sampler {
+public:
+    virtual ~Sampler() = default;
+
+    /** The cutoff for a level, if the sampler has one */
+    virtual std::optional<double> threshold(std::optional<uint32_t> level) = 0;
+
+    /**
+     * Up to `limit` samples, failing when the pantry is empty
+     *
+     * @throws PantryError (or one of its codes' classes) to report one of the domain's codes, fields included; any other exception reports a plain failure.
+     */
+    virtual std::vector<int16_t> samples(std::optional<uint32_t> limit, const std::vector<double>& weights) = 0;
+
+    /**
+     * A free-form description, failing with an untyped error
+     *
+     * @throws std::exception to report a failure, with `what()` as its message.
+     */
+    virtual std::string describe() = 0;
+};
+
+namespace detail {
+
+/** Adapts a `Sampler` implementation to `kitchen_sink_kitchen_Sampler_vtable`. */
+template <>
+struct Callbacks<Sampler> {
+    static bool threshold(void* ctx, bool has_level, uint32_t level, double* out_value, kitchen_sink_error* out_err) {
+        return callback<InternalError>(out_err, [&] {
+            return give_optional(implementation<Sampler>(ctx).threshold(lift_optional<uint32_t>(has_level, level)), out_value);
+        });
+    }
+
+    static void samples(void* ctx, bool has_limit, uint32_t limit, const double* weights_ptr, size_t weights_len, int16_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err) {
+        callback<PantryError>(out_err, [&] {
+            give_slice(implementation<Sampler>(ctx).samples(lift_optional<uint32_t>(has_limit, limit), borrow_slice(weights_ptr, weights_len)), out_ptr, out_len);
+        });
+    }
+
+    static void describe(void* ctx, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err) {
+        callback<Error>(out_err, [&] {
+            give(implementation<Sampler>(ctx).describe(), out_ptr, out_len);
+        });
+    }
+
+    /** The vtable every `Sampler` implementation is passed with. */
+    static const kitchen_sink_kitchen_Sampler_vtable& vtable() noexcept {
+        static const kitchen_sink_kitchen_Sampler_vtable table = {
+            sizeof(kitchen_sink_kitchen_Sampler_vtable),
+            0,
+            &release<Sampler>,
+            &threshold,
+            &samples,
+            &describe,
+        };
+        return table;
+    }
+};
 
 } // namespace detail
 
-inline Gadget::Gadget(int64_t id) : raw_(nullptr) {
+inline Gadget::Gadget(int64_t id) {
     check_library();
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_Gadget_new(id, &err);
-    detail::check(err);
-    raw_ = result;
+    auto* result = kitchen_sink_kitchen_Gadget_new(id, &err);
+    detail::check<InternalError>(err);
+    raw_.reset(result);
 }
 
 inline std::string Gadget::describe() const {
-    size_t out_len = 0;
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_Gadget_describe(raw_, &out_len, &err);
-    detail::check(err);
+    size_t out_len{};
+    auto result = kitchen_sink_kitchen_Gadget_describe(raw_.get(), &out_len, &err);
+    detail::check<InternalError>(err);
     return detail::take_string(result, out_len);
 }
 
 inline int32_t Gadget::poke(int32_t times) const {
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_Gadget_poke(raw_, times, &err);
-    detail::check_kitchen(err);
+    auto result = kitchen_sink_kitchen_Gadget_poke(raw_.get(), times, &err);
+    detail::check<KitchenError>(err);
     return result;
+}
+
+inline std::vector<double> Gadget::readings(std::optional<uint32_t> limit) const {
+    kitchen_sink_error err{};
+    size_t out_len{};
+    auto result = kitchen_sink_kitchen_Gadget_readings(raw_.get(), limit.has_value(), detail::value_or_zero(limit), &out_len, &err);
+    detail::check<Error>(err);
+    return detail::take_slice(result, out_len);
 }
 
 inline std::string Gadget::version() {
     check_library();
-    size_t out_len = 0;
     kitchen_sink_error err{};
+    size_t out_len{};
     auto result = kitchen_sink_kitchen_Gadget_version(&out_len, &err);
-    detail::check(err);
+    detail::check<InternalError>(err);
     return detail::take_string(result, out_len);
 }
 
@@ -1109,10 +1540,10 @@ namespace shared {
 /** Trivial cross-module helper */
 inline std::string ping() {
     check_library();
-    size_t out_len = 0;
     kitchen_sink_error err{};
+    size_t out_len{};
     auto result = kitchen_sink_shared_ping(&out_len, &err);
-    detail::check(err);
+    detail::check<InternalError>(err);
     return detail::take_string(result, out_len);
 }
 
@@ -1125,7 +1556,7 @@ inline bool bool_id(bool x) {
     check_library();
     kitchen_sink_error err{};
     auto result = kitchen_sink_kitchen_bool_id(x, &err);
-    detail::check(err);
+    detail::check<InternalError>(err);
     return result;
 }
 
@@ -1133,7 +1564,7 @@ inline int32_t i32_id(int32_t x) {
     check_library();
     kitchen_sink_error err{};
     auto result = kitchen_sink_kitchen_i32_id(x, &err);
-    detail::check(err);
+    detail::check<InternalError>(err);
     return result;
 }
 
@@ -1141,7 +1572,7 @@ inline uint32_t u32_id(uint32_t x) {
     check_library();
     kitchen_sink_error err{};
     auto result = kitchen_sink_kitchen_u32_id(x, &err);
-    detail::check(err);
+    detail::check<InternalError>(err);
     return result;
 }
 
@@ -1149,7 +1580,7 @@ inline int64_t i64_id(int64_t x) {
     check_library();
     kitchen_sink_error err{};
     auto result = kitchen_sink_kitchen_i64_id(x, &err);
-    detail::check(err);
+    detail::check<InternalError>(err);
     return result;
 }
 
@@ -1157,47 +1588,46 @@ inline double f64_id(double x) {
     check_library();
     kitchen_sink_error err{};
     auto result = kitchen_sink_kitchen_f64_id(x, &err);
-    detail::check(err);
+    detail::check<InternalError>(err);
     return result;
 }
 
 inline std::string echo_string(std::string_view s) {
     check_library();
-    size_t out_len = 0;
     kitchen_sink_error err{};
+    size_t out_len{};
     auto result = kitchen_sink_kitchen_echo_string(detail::utf8(s), s.size(), &out_len, &err);
-    detail::check(err);
+    detail::check<InternalError>(err);
     return detail::take_string(result, out_len);
 }
 
 inline std::vector<uint8_t> echo_bytes(const std::vector<uint8_t>& b) {
     check_library();
-    size_t out_len = 0;
     kitchen_sink_error err{};
+    size_t out_len{};
     auto result = kitchen_sink_kitchen_echo_bytes(b.data(), b.size(), &out_len, &err);
-    detail::check(err);
+    detail::check<InternalError>(err);
     return detail::take_bytes(result, out_len);
 }
 
 /** Register a listener, returning how many are attached */
 inline int32_t subscribe(std::shared_ptr<ReadyListener> listener) {
     check_library();
-    if (!listener) throw std::invalid_argument("listener: null callback interface");
-    auto listener_ctx = std::make_unique<std::shared_ptr<ReadyListener>>(std::move(listener));
+    auto listener_ctx = detail::lend_required(std::move(listener), "listener");
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_subscribe(static_cast<void*>(listener_ctx.release()), &detail::ReadyListener_vtable(), &err);
-    detail::check(err);
+    auto result = kitchen_sink_kitchen_subscribe(listener_ctx.release(), &detail::Callbacks<ReadyListener>::vtable(), &err);
+    detail::check<InternalError>(err);
     return result;
 }
 
 /** Register a listener if one is given */
 inline bool maybe_subscribe(std::shared_ptr<ReadyListener> listener) {
     check_library();
-    const auto* listener_vtable = listener ? &detail::ReadyListener_vtable() : nullptr;
-    std::unique_ptr<std::shared_ptr<ReadyListener>> listener_ctx(listener ? new std::shared_ptr<ReadyListener>(std::move(listener)) : nullptr);
+    auto listener_ctx = detail::lend(std::move(listener));
+    const auto* listener_vtable = listener_ctx ? &detail::Callbacks<ReadyListener>::vtable() : nullptr;
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_maybe_subscribe(static_cast<void*>(listener_ctx.release()), listener_vtable, &err);
-    detail::check(err);
+    auto result = kitchen_sink_kitchen_maybe_subscribe(listener_ctx.release(), listener_vtable, &err);
+    detail::check<InternalError>(err);
     return result;
 }
 
@@ -1205,250 +1635,108 @@ inline bool maybe_subscribe(std::shared_ptr<ReadyListener> listener) {
 inline std::optional<Gadget> maybe_gadget(const std::optional<Gadget>& fallback) {
     check_library();
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_maybe_gadget(fallback.has_value() ? fallback->handle() : nullptr, &err);
-    detail::check(err);
-    return result != nullptr ? std::optional<Gadget>(std::in_place, adopt, result) : std::nullopt;
+    auto result = kitchen_sink_kitchen_maybe_gadget(detail::handle_of(fallback), &err);
+    detail::check<InternalError>(err);
+    return detail::adopt_optional<Gadget>(result);
 }
 
 /** A list of objects */
 inline std::vector<Gadget> gadgets() {
     check_library();
-    size_t out_len = 0;
     kitchen_sink_error err{};
+    size_t out_len{};
     auto result = kitchen_sink_kitchen_gadgets(&out_len, &err);
-    detail::check(err);
-    return detail::take(result, out_len, &detail::read_list_Gadget);
+    detail::check<InternalError>(err);
+    return detail::take<std::vector<Gadget>>(result, out_len);
 }
-
-/**
- * A lazy, move-only range over the `Gadget` elements `stream_gadgets()` produces.
- *
- * Each step pulls one element from the producer, so results stream in constant memory. The range releases the producer iterator exactly once: when it's exhausted, or from the destructor when iteration stops early.
- */
-class StreamGadgetsIterator {
-    kitchen_sink_kitchen_StreamGadgetsIterator* handle_;
-
-public:
-    /** Adopts a producer iterator. */
-    explicit StreamGadgetsIterator(adopt_t, kitchen_sink_kitchen_StreamGadgetsIterator* h) noexcept : handle_(h) {}
-
-    /** Releases the producer iterator if it's still held. */
-    ~StreamGadgetsIterator() {
-        if (handle_ != nullptr) kitchen_sink_kitchen_StreamGadgetsIterator_destroy(handle_);
-    }
-
-    StreamGadgetsIterator(const StreamGadgetsIterator&) = delete;
-    StreamGadgetsIterator& operator=(const StreamGadgetsIterator&) = delete;
-
-    /** Transfers `other`'s iterator; `other` becomes empty. */
-    StreamGadgetsIterator(StreamGadgetsIterator&& other) noexcept : handle_(other.handle_) { other.handle_ = nullptr; }
-
-    /** Releases the current iterator and takes over `other`'s. */
-    StreamGadgetsIterator& operator=(StreamGadgetsIterator&& other) noexcept {
-        if (this != &other) {
-            if (handle_ != nullptr) kitchen_sink_kitchen_StreamGadgetsIterator_destroy(handle_);
-            handle_ = other.handle_;
-            other.handle_ = nullptr;
-        }
-        return *this;
-    }
-
-    /** Pulls the next element, or `std::nullopt` once exhausted (which releases the producer iterator). A producer error releases the iterator and throws InternalError. */
-    std::optional<Gadget> next() {
-        if (handle_ == nullptr) return std::nullopt;
-        kitchen_sink_error err{};
-        kitchen_sink_kitchen_Gadget* item{};
-        int32_t has_item = kitchen_sink_kitchen_StreamGadgetsIterator_next(handle_, &item, &err);
-        if (err.code != 0 || has_item == 0) {
-            kitchen_sink_kitchen_StreamGadgetsIterator_destroy(handle_);
-            handle_ = nullptr;
-            detail::check(err);
-            return std::nullopt;
-        }
-        return std::optional<Gadget>(std::in_place, Gadget(adopt, item));
-    }
-
-    /** Sentinel type marking the end of the range. */
-    struct sentinel {};
-
-    /** Single-pass input iterator; each increment pulls one element. */
-    class iterator {
-        StreamGadgetsIterator* range_;
-        std::optional<Gadget> current_;
-
-    public:
-        using iterator_category = std::input_iterator_tag;
-        using value_type = Gadget;
-        using difference_type = std::ptrdiff_t;
-        using pointer = Gadget*;
-        using reference = Gadget&;
-
-        /** Binds to `range` and pulls the first element. */
-        explicit iterator(StreamGadgetsIterator* range) : range_(range), current_(range->next()) {}
-        reference operator*() { return *current_; }
-        pointer operator->() { return &*current_; }
-        iterator& operator++() { current_ = range_->next(); return *this; }
-        void operator++(int) { current_ = range_->next(); }
-        bool operator==(sentinel) const { return !current_.has_value(); }
-        bool operator!=(sentinel) const { return current_.has_value(); }
-    };
-
-    /** Begins iteration by pulling the first element. */
-    iterator begin() { return iterator(this); }
-
-    /** The past-the-end sentinel. */
-    sentinel end() const { return sentinel{}; }
-};
 
 /**
  * An iterator over objects
  *
- * @return A lazy `StreamGadgetsIterator` range that pulls one element per step and releases the producer iterator when exhausted or destroyed.
+ * @return A lazy, single-pass range; each step makes one producer call.
  */
-inline StreamGadgetsIterator stream_gadgets() {
+inline Range<Gadget> stream_gadgets() {
     check_library();
     kitchen_sink_error err{};
     kitchen_sink_kitchen_StreamGadgetsIterator* iter = kitchen_sink_kitchen_stream_gadgets(&err);
-    detail::check(err);
-    return StreamGadgetsIterator(adopt, iter);
+    detail::check<InternalError>(err);
+    return Range<Gadget>(adopt, iter, [](void* raw, std::optional<Gadget>& item) {
+        kitchen_sink_error next_err{};
+        kitchen_sink_kitchen_Gadget* out_item{};
+        if (kitchen_sink_kitchen_StreamGadgetsIterator_next(static_cast<kitchen_sink_kitchen_StreamGadgetsIterator*>(raw), &out_item, &next_err) == 0) {
+            detail::check<InternalError>(next_err);
+            return false;
+        }
+        item.emplace(Gadget(adopt, out_item));
+        return true;
+    }, [](void* raw) { kitchen_sink_kitchen_StreamGadgetsIterator_destroy(static_cast<kitchen_sink_kitchen_StreamGadgetsIterator*>(raw)); });
 }
 
 /**
  * Optional struct return
  *
- * @throws KitchenErrorsError when the call fails with one of the domain's codes.
+ * @throws KitchenError (or one of its codes' classes) when the call fails with one of the domain's codes.
  */
 inline std::optional<Item> maybe_item(int64_t id) {
     check_library();
-    size_t out_len = 0;
     kitchen_sink_error err{};
+    size_t out_len{};
     auto result = kitchen_sink_kitchen_maybe_item(id, &out_len, &err);
-    detail::check_kitchen(err);
-    return detail::take(result, out_len, &detail::read_opt_Item);
+    detail::check<KitchenError>(err);
+    return detail::take<std::optional<Item>>(result, out_len);
 }
 
 /** List of structs */
 inline std::vector<Item> list_items() {
     check_library();
-    size_t out_len = 0;
     kitchen_sink_error err{};
+    size_t out_len{};
     auto result = kitchen_sink_kitchen_list_items(&out_len, &err);
-    detail::check(err);
-    return detail::take(result, out_len, &detail::read_list_Item);
+    detail::check<InternalError>(err);
+    return detail::take<std::vector<Item>>(result, out_len);
 }
 
 /** Map return type */
 inline std::unordered_map<std::string, int32_t> get_attrs() {
     check_library();
-    size_t out_len = 0;
     kitchen_sink_error err{};
+    size_t out_len{};
     auto result = kitchen_sink_kitchen_get_attrs(&out_len, &err);
-    detail::check(err);
-    return detail::take(result, out_len, &detail::read_map_string_i32);
+    detail::check<InternalError>(err);
+    return detail::take<std::unordered_map<std::string, int32_t>>(result, out_len);
 }
-
-/**
- * A lazy, move-only range over the `Item` elements `stream_items()` produces.
- *
- * Each step pulls one element from the producer, so results stream in constant memory. The range releases the producer iterator exactly once: when it's exhausted, or from the destructor when iteration stops early.
- */
-class StreamItemsIterator {
-    kitchen_sink_kitchen_StreamItemsIterator* handle_;
-
-public:
-    /** Adopts a producer iterator. */
-    explicit StreamItemsIterator(adopt_t, kitchen_sink_kitchen_StreamItemsIterator* h) noexcept : handle_(h) {}
-
-    /** Releases the producer iterator if it's still held. */
-    ~StreamItemsIterator() {
-        if (handle_ != nullptr) kitchen_sink_kitchen_StreamItemsIterator_destroy(handle_);
-    }
-
-    StreamItemsIterator(const StreamItemsIterator&) = delete;
-    StreamItemsIterator& operator=(const StreamItemsIterator&) = delete;
-
-    /** Transfers `other`'s iterator; `other` becomes empty. */
-    StreamItemsIterator(StreamItemsIterator&& other) noexcept : handle_(other.handle_) { other.handle_ = nullptr; }
-
-    /** Releases the current iterator and takes over `other`'s. */
-    StreamItemsIterator& operator=(StreamItemsIterator&& other) noexcept {
-        if (this != &other) {
-            if (handle_ != nullptr) kitchen_sink_kitchen_StreamItemsIterator_destroy(handle_);
-            handle_ = other.handle_;
-            other.handle_ = nullptr;
-        }
-        return *this;
-    }
-
-    /** Pulls the next element, or `std::nullopt` once exhausted (which releases the producer iterator). A producer error releases the iterator and throws InternalError. */
-    std::optional<Item> next() {
-        if (handle_ == nullptr) return std::nullopt;
-        kitchen_sink_error err{};
-        const uint8_t* item{};
-        size_t item_len = 0;
-        int32_t has_item = kitchen_sink_kitchen_StreamItemsIterator_next(handle_, &item, &item_len, &err);
-        if (err.code != 0 || has_item == 0) {
-            kitchen_sink_kitchen_StreamItemsIterator_destroy(handle_);
-            handle_ = nullptr;
-            detail::check(err);
-            return std::nullopt;
-        }
-        return std::optional<Item>(std::in_place, detail::take(item, item_len, &detail::read_Item));
-    }
-
-    /** Sentinel type marking the end of the range. */
-    struct sentinel {};
-
-    /** Single-pass input iterator; each increment pulls one element. */
-    class iterator {
-        StreamItemsIterator* range_;
-        std::optional<Item> current_;
-
-    public:
-        using iterator_category = std::input_iterator_tag;
-        using value_type = Item;
-        using difference_type = std::ptrdiff_t;
-        using pointer = Item*;
-        using reference = Item&;
-
-        /** Binds to `range` and pulls the first element. */
-        explicit iterator(StreamItemsIterator* range) : range_(range), current_(range->next()) {}
-        reference operator*() { return *current_; }
-        pointer operator->() { return &*current_; }
-        iterator& operator++() { current_ = range_->next(); return *this; }
-        void operator++(int) { current_ = range_->next(); }
-        bool operator==(sentinel) const { return !current_.has_value(); }
-        bool operator!=(sentinel) const { return current_.has_value(); }
-    };
-
-    /** Begins iteration by pulling the first element. */
-    iterator begin() { return iterator(this); }
-
-    /** The past-the-end sentinel. */
-    sentinel end() const { return sentinel{}; }
-};
 
 /**
  * Iterator return type
  *
- * @return A lazy `StreamItemsIterator` range that pulls one element per step and releases the producer iterator when exhausted or destroyed.
+ * @return A lazy, single-pass range; each step makes one producer call.
  */
-inline StreamItemsIterator stream_items() {
+inline Range<Item> stream_items() {
     check_library();
     kitchen_sink_error err{};
     kitchen_sink_kitchen_StreamItemsIterator* iter = kitchen_sink_kitchen_stream_items(&err);
-    detail::check(err);
-    return StreamItemsIterator(adopt, iter);
+    detail::check<InternalError>(err);
+    return Range<Item>(adopt, iter, [](void* raw, std::optional<Item>& item) {
+        kitchen_sink_error next_err{};
+        const uint8_t* out_item{};
+        size_t out_len{};
+        if (kitchen_sink_kitchen_StreamItemsIterator_next(static_cast<kitchen_sink_kitchen_StreamItemsIterator*>(raw), &out_item, &out_len, &next_err) == 0) {
+            detail::check<InternalError>(next_err);
+            return false;
+        }
+        item.emplace(detail::take<Item>(out_item, out_len));
+        return true;
+    }, [](void* raw) { kitchen_sink_kitchen_StreamItemsIterator_destroy(static_cast<kitchen_sink_kitchen_StreamItemsIterator*>(raw)); });
 }
 
 /** Returns the shared Token type from another module */
 inline Token cross_module_token() {
     check_library();
-    size_t out_len = 0;
     kitchen_sink_error err{};
+    size_t out_len{};
     auto result = kitchen_sink_kitchen_cross_module_token(&out_len, &err);
-    detail::check(err);
-    return detail::take(result, out_len, &detail::read_Token);
+    detail::check<InternalError>(err);
+    return detail::take<Token>(result, out_len);
 }
 
 /**
@@ -1461,19 +1749,8 @@ inline std::future<std::string> do_async(std::string_view input) {
     auto promise = std::make_unique<std::promise<std::string>>();
     auto future = promise->get_future();
     kitchen_sink_kitchen_do_async(detail::utf8(input), input.size(), [](void* context, kitchen_sink_error* err, const uint8_t* result_ptr, size_t result_len) {
-        std::unique_ptr<std::promise<std::string>> p(static_cast<std::promise<std::string>*>(context));
-        try {
-            if (err != nullptr && err->code != 0) {
-                std::string message = detail::error_message(*err);
-                p->set_exception(detail::make_internal_error(err->code, message));
-            } else {
-                p->set_value(detail::take_string(result_ptr, result_len));
-            }
-        } catch (...) {
-            p->set_exception(std::current_exception());
-        }
-        kitchen_sink_error_free(err);
-    }, static_cast<void*>(promise.release()));
+        detail::settle<InternalError, std::string>(context, err, [&] { return detail::take_string(result_ptr, result_len); });
+    }, promise.release());
     return future;
 }
 
@@ -1488,38 +1765,223 @@ inline std::future<std::string> do_cancellable(std::string_view input, const Can
     auto promise = std::make_unique<std::promise<std::string>>();
     auto future = promise->get_future();
     kitchen_sink_kitchen_do_cancellable(detail::utf8(input), input.size(), cancel_token.handle(), [](void* context, kitchen_sink_error* err, const uint8_t* result_ptr, size_t result_len) {
-        std::unique_ptr<std::promise<std::string>> p(static_cast<std::promise<std::string>*>(context));
-        try {
-            if (err != nullptr && err->code != 0) {
-                std::string message = detail::error_message(*err);
-                p->set_exception(detail::make_internal_error(err->code, message));
-            } else {
-                p->set_value(detail::take_string(result_ptr, result_len));
-            }
-        } catch (...) {
-            p->set_exception(std::current_exception());
-        }
-        kitchen_sink_error_free(err);
-    }, static_cast<void*>(promise.release()));
+        detail::settle<InternalError, std::string>(context, err, [&] { return detail::take_string(result_ptr, result_len); });
+    }, promise.release());
     return future;
 }
 
 /** Legacy operation kept for compatibility */
-[[deprecated("Use new_op instead")]]
+[[deprecated("Use `new_op` instead")]]
 inline int32_t legacy_op() {
     check_library();
     kitchen_sink_error err{};
     auto result = kitchen_sink_kitchen_legacy_op(&err);
-    detail::check(err);
+    detail::check<InternalError>(err);
     return result;
 }
 
-/** Replacement for legacy_op */
+/** Replacement for `legacy_op` */
 inline int32_t new_op() {
     check_library();
     kitchen_sink_error err{};
     auto result = kitchen_sink_kitchen_new_op(&err);
-    detail::check(err);
+    detail::check<InternalError>(err);
+    return result;
+}
+
+/** Optional scalar in both directions */
+inline std::optional<int32_t> opt_i32_id(std::optional<int32_t> x) {
+    check_library();
+    kitchen_sink_error err{};
+    int32_t out_value{};
+    auto result = kitchen_sink_kitchen_opt_i32_id(x.has_value(), detail::value_or_zero(x), &out_value, &err);
+    detail::check<InternalError>(err);
+    return detail::lift_optional<int32_t>(result, out_value);
+}
+
+inline std::optional<bool> opt_bool_id(std::optional<bool> x) {
+    check_library();
+    kitchen_sink_error err{};
+    bool out_value{};
+    auto result = kitchen_sink_kitchen_opt_bool_id(x.has_value(), detail::value_or_zero(x), &out_value, &err);
+    detail::check<InternalError>(err);
+    return detail::lift_optional<bool>(result, out_value);
+}
+
+/** Optional C-style enum in both directions */
+inline std::optional<Priority> opt_priority(std::optional<Priority> p) {
+    check_library();
+    kitchen_sink_error err{};
+    kitchen_sink_kitchen_Priority out_value{};
+    auto result = kitchen_sink_kitchen_opt_priority(p.has_value(), detail::value_or_zero(p), &out_value, &err);
+    detail::check<InternalError>(err);
+    return detail::lift_optional<Priority>(result, out_value);
+}
+
+/** Optional scalars next to ordinary parameters */
+inline std::optional<uint16_t> opt_mixed(double base, std::optional<float> scale, std::optional<int64_t> offset, const std::optional<std::string>& label) {
+    check_library();
+    const auto label_buf = detail::encode(label);
+    kitchen_sink_error err{};
+    uint16_t out_value{};
+    auto result = kitchen_sink_kitchen_opt_mixed(base, scale.has_value(), detail::value_or_zero(scale), offset.has_value(), detail::value_or_zero(offset), label_buf.data(), label_buf.size(), &out_value, &err);
+    detail::check<InternalError>(err);
+    return detail::lift_optional<uint16_t>(result, out_value);
+}
+
+/** A typed-array parameter */
+inline double sum_f64(const std::vector<double>& xs) {
+    check_library();
+    kitchen_sink_error err{};
+    auto result = kitchen_sink_kitchen_sum_f64(xs.data(), xs.size(), &err);
+    detail::check<InternalError>(err);
+    return result;
+}
+
+/** Typed arrays in both directions */
+inline std::vector<int32_t> scale_i32(const std::vector<int32_t>& xs, int32_t factor) {
+    check_library();
+    kitchen_sink_error err{};
+    size_t out_len{};
+    auto result = kitchen_sink_kitchen_scale_i32(xs.data(), xs.size(), factor, &out_len, &err);
+    detail::check<InternalError>(err);
+    return detail::take_slice(result, out_len);
+}
+
+inline std::vector<uint64_t> ids_u64(const std::vector<uint64_t>& ids) {
+    check_library();
+    kitchen_sink_error err{};
+    size_t out_len{};
+    auto result = kitchen_sink_kitchen_ids_u64(ids.data(), ids.size(), &out_len, &err);
+    detail::check<InternalError>(err);
+    return detail::take_slice(result, out_len);
+}
+
+/** Every slice element type */
+inline std::vector<uint32_t> mixed_slices(const std::vector<int8_t>& a, const std::vector<int16_t>& b, const std::vector<uint16_t>& c, const std::vector<uint32_t>& d, const std::vector<int64_t>& e, const std::vector<float>& f) {
+    check_library();
+    kitchen_sink_error err{};
+    size_t out_len{};
+    auto result = kitchen_sink_kitchen_mixed_slices(a.data(), a.size(), b.data(), b.size(), c.data(), c.size(), d.data(), d.size(), e.data(), e.size(), f.data(), f.size(), &out_len, &err);
+    detail::check<InternalError>(err);
+    return detail::take_slice(result, out_len);
+}
+
+/**
+ * Async returning an optional scalar
+ *
+ * @return A future settled from a producer thread; get() rethrows the call's error.
+ */
+inline std::future<std::optional<int64_t>> async_maybe_count() {
+    check_library();
+    auto promise = std::make_unique<std::promise<std::optional<int64_t>>>();
+    auto future = promise->get_future();
+    kitchen_sink_kitchen_async_maybe_count([](void* context, kitchen_sink_error* err, bool has_result, int64_t result) {
+        detail::settle<InternalError, std::optional<int64_t>>(context, err, [&] { return detail::lift_optional<int64_t>(has_result, result); });
+    }, promise.release());
+    return future;
+}
+
+/**
+ * Async returning a typed array
+ *
+ * @param cancel_token Cancels the call; the future then throws Cancelled.
+ * @return A future settled from a producer thread; get() rethrows the call's error.
+ */
+inline std::future<std::vector<float>> async_samples(uint32_t n, const CancelToken& cancel_token = CancelToken::none()) {
+    check_library();
+    auto promise = std::make_unique<std::promise<std::vector<float>>>();
+    auto future = promise->get_future();
+    kitchen_sink_kitchen_async_samples(n, cancel_token.handle(), [](void* context, kitchen_sink_error* err, const float* result_ptr, size_t result_len) {
+        detail::settle<InternalError, std::vector<float>>(context, err, [&] { return detail::take_slice(result_ptr, result_len); });
+    }, promise.release());
+    return future;
+}
+
+/**
+ * Iterator of optional scalars
+ *
+ * @return A lazy, single-pass range; each step makes one producer call.
+ */
+inline Range<std::optional<int32_t>> stream_maybe() {
+    check_library();
+    kitchen_sink_error err{};
+    kitchen_sink_kitchen_StreamMaybeIterator* iter = kitchen_sink_kitchen_stream_maybe(&err);
+    detail::check<InternalError>(err);
+    return Range<std::optional<int32_t>>(adopt, iter, [](void* raw, std::optional<std::optional<int32_t>>& item) {
+        kitchen_sink_error next_err{};
+        bool out_has_item{};
+        int32_t out_item{};
+        if (kitchen_sink_kitchen_StreamMaybeIterator_next(static_cast<kitchen_sink_kitchen_StreamMaybeIterator*>(raw), &out_has_item, &out_item, &next_err) == 0) {
+            detail::check<InternalError>(next_err);
+            return false;
+        }
+        item.emplace(detail::lift_optional<int32_t>(out_has_item, out_item));
+        return true;
+    }, [](void* raw) { kitchen_sink_kitchen_StreamMaybeIterator_destroy(static_cast<kitchen_sink_kitchen_StreamMaybeIterator*>(raw)); });
+}
+
+/**
+ * Iterator of typed arrays
+ *
+ * @return A lazy, single-pass range; each step makes one producer call.
+ */
+inline Range<std::vector<int32_t>> stream_chunks() {
+    check_library();
+    kitchen_sink_error err{};
+    kitchen_sink_kitchen_StreamChunksIterator* iter = kitchen_sink_kitchen_stream_chunks(&err);
+    detail::check<InternalError>(err);
+    return Range<std::vector<int32_t>>(adopt, iter, [](void* raw, std::optional<std::vector<int32_t>>& item) {
+        kitchen_sink_error next_err{};
+        int32_t* out_item{};
+        size_t out_len{};
+        if (kitchen_sink_kitchen_StreamChunksIterator_next(static_cast<kitchen_sink_kitchen_StreamChunksIterator*>(raw), &out_item, &out_len, &next_err) == 0) {
+            detail::check<InternalError>(next_err);
+            return false;
+        }
+        item.emplace(detail::take_slice(out_item, out_len));
+        return true;
+    }, [](void* raw) { kitchen_sink_kitchen_StreamChunksIterator_destroy(static_cast<kitchen_sink_kitchen_StreamChunksIterator*>(raw)); });
+}
+
+/**
+ * Drive a consumer-implemented sampler
+ *
+ * @throws PantryError (or one of its codes' classes) when the call fails with one of the domain's codes.
+ */
+inline std::vector<int16_t> sample_with(std::shared_ptr<Sampler> sampler, std::optional<uint32_t> level) {
+    check_library();
+    auto sampler_ctx = detail::lend_required(std::move(sampler), "sampler");
+    kitchen_sink_error err{};
+    size_t out_len{};
+    auto result = kitchen_sink_kitchen_sample_with(sampler_ctx.release(), &detail::Callbacks<Sampler>::vtable(), level.has_value(), detail::value_or_zero(level), &out_len, &err);
+    detail::check<PantryError>(err);
+    return detail::take_slice(result, out_len);
+}
+
+/**
+ * Fails with the second domain
+ *
+ * @throws PantryError (or one of its codes' classes) when the call fails with one of the domain's codes.
+ */
+inline int32_t take_from_pantry(std::string_view item) {
+    check_library();
+    kitchen_sink_error err{};
+    auto result = kitchen_sink_kitchen_take_from_pantry(detail::utf8(item), item.size(), &err);
+    detail::check<PantryError>(err);
+    return result;
+}
+
+/**
+ * Fails with an untyped error
+ *
+ * @throws Error with code -1 and the producer's message when the call fails.
+ */
+inline int64_t parse_any(std::string_view text) {
+    check_library();
+    kitchen_sink_error err{};
+    auto result = kitchen_sink_kitchen_parse_any(detail::utf8(text), text.size(), &err);
+    detail::check<Error>(err);
     return result;
 }
 
@@ -1530,10 +1992,10 @@ namespace kitchen::nested {
 /** Trivial nested-module function */
 inline std::string hello() {
     check_library();
-    size_t out_len = 0;
     kitchen_sink_error err{};
+    size_t out_len{};
     auto result = kitchen_sink_kitchen_nested_hello(&out_len, &err);
-    detail::check(err);
+    detail::check<InternalError>(err);
     return detail::take_string(result, out_len);
 }
 

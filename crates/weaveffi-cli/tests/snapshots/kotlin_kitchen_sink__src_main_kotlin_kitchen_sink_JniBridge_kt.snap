@@ -14,33 +14,39 @@ package kitchen_sink
  */
 internal object JniBridge {
     init {
-        NativeLibrary.ensureLoaded()
+        NativeLibrary.load()
     }
 
     /**
-     * The exception for a native failure: through error domain [domain] for a
-     * throwing call, or a [NativeBugException] (domain 0) for one that can't fail.
+     * The exception for a native failure of a call whose errors map through
+     * [domain]: 0 for a call that can't fail ([NativeBugException]), 1 for
+     * `throws: any` ([FfiException]), or an error domain, whose unknown codes
+     * map to the domain's base exception. Runtime (negative) codes are
+     * [FfiException]s.
      */
     @JvmStatic
     fun error(domain: Int, code: Int, message: ByteArray, payload: ByteArray?): Throwable {
         val text = decodeUtf8(message)
-        return when (domain) {
-            1 -> KitchenErrorsException.fromCode(code, text, payload)
-            else -> NativeBugException(code, text)
+        return when {
+            domain == 0 -> NativeBugException(code, text)
+            code < 0 -> FfiException(code, text)
+            domain == 2 -> KitchenException.fromCode(code, text, payload)
+            domain == 3 -> PantryException.fromCode(code, text, payload)
+            else -> FfiException(code, text)
         }
     }
 
     /**
      * Reports a failed callback through its vtable entry's `out_err` ([err]):
-     * [typed], a domain error the method is declared to throw, with its code and
-     * payload fields, and anything else as code -4 with its message.
+     * [typed], an exception of the domain the method throws, with its code and
+     * payload fields, and anything else with code [fallback] and its message.
      */
-    private fun fail(err: Long, error: Throwable, typed: FfiException?) {
+    private fun fail(err: Long, error: Throwable, typed: FfiException?, fallback: Int) {
         if (typed != null) {
             error_set(err, typed.code, encodeUtf8(typed.message ?: ""))
             typed.encodePayload()?.let { error_set_payload(err, it) }
         } else {
-            error_set(err, -4, encodeUtf8(error.message ?: error.toString()))
+            error_set(err, fallback, encodeUtf8(error.message ?: error.toString()))
         }
     }
 
@@ -66,22 +72,42 @@ internal object JniBridge {
     @JvmStatic external fun kitchen_maybe_gadget(fallback: Long): Long
     @JvmStatic external fun kitchen_gadgets(): ByteArray
     @JvmStatic external fun kitchen_stream_gadgets(): Long
-    @JvmStatic external fun kitchen_StreamGadgetsIterator_next(_iter: Long, _out: LongArray): Boolean
+    @JvmStatic external fun kitchen_StreamGadgetsIterator_next(_iter: Long, _out: Array<Any?>): Boolean
     @JvmStatic external fun kitchen_StreamGadgetsIterator_destroy(_iter: Long)
     @JvmStatic external fun kitchen_maybe_item(id: Long): ByteArray
     @JvmStatic external fun kitchen_list_items(): ByteArray
     @JvmStatic external fun kitchen_get_attrs(): ByteArray
     @JvmStatic external fun kitchen_stream_items(): Long
-    @JvmStatic external fun kitchen_StreamItemsIterator_next(_iter: Long): ByteArray?
+    @JvmStatic external fun kitchen_StreamItemsIterator_next(_iter: Long, _out: Array<Any?>): Boolean
     @JvmStatic external fun kitchen_StreamItemsIterator_destroy(_iter: Long)
     @JvmStatic external fun kitchen_cross_module_token(): ByteArray
     @JvmStatic external fun kitchen_do_async(input: ByteArray, _done: NativeCompletion<*>)
     @JvmStatic external fun kitchen_do_cancellable(input: ByteArray, _token: Long, _done: NativeCompletion<*>)
     @JvmStatic external fun kitchen_legacy_op(): Int
     @JvmStatic external fun kitchen_new_op(): Int
+    @JvmStatic external fun kitchen_opt_i32_id(has_x: Boolean, x: Int): Int?
+    @JvmStatic external fun kitchen_opt_bool_id(has_x: Boolean, x: Boolean): Boolean?
+    @JvmStatic external fun kitchen_opt_priority(has_p: Boolean, p: Int): Int?
+    @JvmStatic external fun kitchen_opt_mixed(base: Double, has_scale: Boolean, scale: Float, has_offset: Boolean, offset: Long, label: ByteArray): Short?
+    @JvmStatic external fun kitchen_sum_f64(xs: DoubleArray): Double
+    @JvmStatic external fun kitchen_scale_i32(xs: IntArray, factor: Int): IntArray
+    @JvmStatic external fun kitchen_ids_u64(ids: LongArray): LongArray
+    @JvmStatic external fun kitchen_mixed_slices(a: ByteArray, b: ShortArray, c: ShortArray, d: IntArray, e: LongArray, f: FloatArray): IntArray
+    @JvmStatic external fun kitchen_async_maybe_count(_done: NativeCompletion<*>)
+    @JvmStatic external fun kitchen_async_samples(n: Int, _token: Long, _done: NativeCompletion<*>)
+    @JvmStatic external fun kitchen_stream_maybe(): Long
+    @JvmStatic external fun kitchen_StreamMaybeIterator_next(_iter: Long, _out: Array<Any?>): Boolean
+    @JvmStatic external fun kitchen_StreamMaybeIterator_destroy(_iter: Long)
+    @JvmStatic external fun kitchen_stream_chunks(): Long
+    @JvmStatic external fun kitchen_StreamChunksIterator_next(_iter: Long, _out: Array<Any?>): Boolean
+    @JvmStatic external fun kitchen_StreamChunksIterator_destroy(_iter: Long)
+    @JvmStatic external fun kitchen_sample_with(sampler: Sampler, has_level: Boolean, level: Int): ShortArray
+    @JvmStatic external fun kitchen_take_from_pantry(item: ByteArray): Int
+    @JvmStatic external fun kitchen_parse_any(text: ByteArray): Long
     @JvmStatic external fun kitchen_Gadget_new(id: Long): Long
     @JvmStatic external fun kitchen_Gadget_describe(_self: Long): ByteArray
     @JvmStatic external fun kitchen_Gadget_poke(_self: Long, times: Int): Int
+    @JvmStatic external fun kitchen_Gadget_readings(_self: Long, has_limit: Boolean, limit: Int): DoubleArray
     @JvmStatic external fun kitchen_Gadget_version(): ByteArray
     @JvmStatic external fun kitchen_nested_hello(): ByteArray
 
@@ -90,7 +116,7 @@ internal object JniBridge {
         try {
             _impl.onReady(code, decodeUtf8(msg))
         } catch (_e: Throwable) {
-            fail(_err, _e, null)
+            fail(_err, _e, null, -4)
         }
     }
 
@@ -98,9 +124,9 @@ internal object JniBridge {
     fun kitchen_ReadyListener_on_item(_impl: ReadyListener, _err: Long, item: ByteArray, gadget: Long): Boolean {
         val _gadget = Gadget.fromHandle(gadget)
         return try {
-            _impl.onItem(decodeBuffer(item) { _r -> unpackItem(_r) }, _gadget)
+            _impl.onItem(decodeBuffer(item) { _r -> unpack_Item(_r) }, _gadget)
         } catch (_e: Throwable) {
-            fail(_err, _e, null)
+            fail(_err, _e, null, -4)
             false
         }
     }
@@ -109,15 +135,15 @@ internal object JniBridge {
     fun kitchen_ReadyListener_label(_impl: ReadyListener, _err: Long): ByteArray? = try {
         encodeUtf8(_impl.label())
     } catch (_e: Throwable) {
-        fail(_err, _e, _e as? KitchenErrorsException)
+        fail(_err, _e, _e as? KitchenException, -1)
         null
     }
 
     @JvmStatic
     fun kitchen_ReadyListener_latest(_impl: ReadyListener, _err: Long): ByteArray? = try {
-        encodeBuffer { _w -> packOptionalOfItem(_w, _impl.latest()) }
+        encodeBuffer { _w -> pack_opt_Item(_w, _impl.latest()) }
     } catch (_e: Throwable) {
-        fail(_err, _e, null)
+        fail(_err, _e, null, -4)
         null
     }
 
@@ -125,8 +151,32 @@ internal object JniBridge {
     fun kitchen_ReadyListener_favorite(_impl: ReadyListener, _err: Long): Long = try {
         _impl.favorite().cloneHandle()
     } catch (_e: Throwable) {
-        fail(_err, _e, null)
+        fail(_err, _e, null, -4)
         0L
+    }
+
+    @JvmStatic
+    fun kitchen_Sampler_threshold(_impl: Sampler, _err: Long, has_level: Boolean, level: Int): Double? = try {
+        _impl.threshold(if (has_level) level.toUInt() else null)
+    } catch (_e: Throwable) {
+        fail(_err, _e, null, -4)
+        null
+    }
+
+    @JvmStatic
+    fun kitchen_Sampler_samples(_impl: Sampler, _err: Long, has_limit: Boolean, limit: Int, weights: DoubleArray): ShortArray? = try {
+        _impl.samples(if (has_limit) limit.toUInt() else null, weights.asList()).toShortArray()
+    } catch (_e: Throwable) {
+        fail(_err, _e, _e as? PantryException, -1)
+        null
+    }
+
+    @JvmStatic
+    fun kitchen_Sampler_describe(_impl: Sampler, _err: Long): ByteArray? = try {
+        encodeUtf8(_impl.describe())
+    } catch (_e: Throwable) {
+        fail(_err, _e, null, -1)
+        null
     }
 }
 

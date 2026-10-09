@@ -17,8 +17,8 @@
 //! self-delimiting, so a section holding several frames back to back
 //! [decodes](decode) into all of them.
 //!
-//! One frame describes one declaration: a module (its name and doc), its
-//! error domain, a free function, an interface (without its members), one
+//! One frame describes one declaration: a module (its name and doc), one of
+//! its error domains, a free function, an interface (without its members), one
 //! interface member, a record, an enum, or a callback interface. Each frame
 //! records the path of the module it belongs to and its position among its
 //! siblings of the same kind, so [`assemble`] restores declaration order.
@@ -67,7 +67,7 @@ pub enum Item {
     /// A module's own name and doc; its declarations have frames of their
     /// own.
     Module(ModuleHeader),
-    /// A module's error domain.
+    /// One of a module's error domains.
     Error(ErrorDomain),
     /// A free function.
     Function(Function),
@@ -314,8 +314,8 @@ pub fn module_frames(module: &Module, parent: &[String], index: u32, prefix: &st
             doc: module.doc.clone(),
         }),
     )];
-    if let Some(errors) = &module.errors {
-        out.push(frame(&path, 0, Item::Error(errors.clone())));
+    for (i, e) in module.errors.iter().enumerate() {
+        out.push(frame(&path, i, Item::Error(e.clone())));
     }
     for (i, f) in module.functions.iter().enumerate() {
         out.push(frame(&path, i, Item::Function(f.clone())));
@@ -388,7 +388,7 @@ pub fn frames(api: &Api, prefix: &str) -> Vec<Frame> {
 #[derive(Default)]
 struct Node {
     header: Option<(u32, ModuleHeader)>,
-    errors: Option<ErrorDomain>,
+    errors: Vec<(u32, ErrorDomain)>,
     functions: Vec<(u32, Function)>,
     interfaces: Vec<(u32, InterfaceDef)>,
     members: Vec<(u32, Member)>,
@@ -439,9 +439,11 @@ pub fn assemble(frames: &[Frame], prefix: &str) -> Result<Api, MetaError> {
                 full.push(h.name.clone());
                 nodes.entry(full).or_default().header = Some((i, h.clone()));
             }
-            Item::Error(e) => {
-                nodes.entry(frame.module.clone()).or_default().errors = Some(e.clone());
-            }
+            Item::Error(e) => nodes
+                .entry(frame.module.clone())
+                .or_default()
+                .errors
+                .push((i, e.clone())),
             Item::Function(f) => nodes
                 .entry(frame.module.clone())
                 .or_default()
@@ -515,7 +517,7 @@ fn orphan_of(path: &[String], node: &Node) -> (String, String) {
         .or_else(|| node.structs.first().map(|(_, d)| d.name.clone()))
         .or_else(|| node.enums.first().map(|(_, d)| d.name.clone()))
         .or_else(|| node.callbacks.first().map(|(_, d)| d.name.clone()))
-        .or_else(|| node.errors.as_ref().map(|e| e.name.clone()))
+        .or_else(|| node.errors.first().map(|(_, e)| e.name.clone()))
         .unwrap_or_default();
     (format!("{module}.{name}"), module)
 }
@@ -571,7 +573,7 @@ fn build(
             callback_interfaces: ordered(node.callbacks, |d| &d.name),
             structs: ordered(node.structs, |d| &d.name),
             enums: ordered(node.enums, |d| &d.name),
-            errors: node.errors,
+            errors: ordered(node.errors, |d| &d.name),
             modules: Vec::new(),
         };
         module.modules = build(nodes, &path)?;
@@ -586,22 +588,26 @@ mod tests {
     use crate::parse::parse_api_str;
 
     const API: &str = r#"
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: kv
     doc: The store.
     errors:
-      name: KvError
-      codes:
-        - { name: Missing, code: 1, message: missing, fields: [{ name: key, type: string }] }
+      - name: KvError
+        codes:
+          - { name: Missing, code: 1, message: missing, fields: [{ name: key, type: string }] }
+      - name: IoError
+        codes:
+          - { name: Disk, code: 1, message: disk }
     functions:
-      - { name: open_store, params: [{ name: path, type: string }], return: Store, throws: true }
+      - { name: open_store, params: [{ name: path, type: string }], return: Store, throws: KvError }
+      - { name: sync, params: [{ name: ids, type: "[u64]" }], return: "i32?", throws: any }
       - { name: version, return: u32 }
     interfaces:
       - name: Store
         constructors:
           - { name: new }
-          - { name: open, params: [{ name: path, type: string }], throws: true }
+          - { name: open, params: [{ name: path, type: string }], throws: IoError }
         methods:
           - { name: put, params: [{ name: key, type: string }] }
           - { name: count, return: u32 }

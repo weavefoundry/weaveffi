@@ -1,0 +1,16 @@
+error[E0277]: `Oops` doesn't implement `std::fmt::Display`
+ --> tests/ui/fail_no_display_without_impl.rs:7:14
+  |
+7 |     pub enum Oops {
+  |              ^^^^ unsatisfied trait bound
+  |
+help: the trait `std::fmt::Display` is not implemented for `Oops`
+ --> tests/ui/fail_no_display_without_impl.rs:7:5
+  |
+7 |     pub enum Oops {
+  |     ^^^^^^^^^^^^^
+note: required by a bound in `ErrorDomain`
+ --> $WORKSPACE/crates/weaveffi/src/abi/error.rs
+  |
+  | pub trait ErrorDomain: std::fmt::Display + Sized {
+  |                        ^^^^^^^^^^^^^^^^^ required by this bound in `ErrorDomain`

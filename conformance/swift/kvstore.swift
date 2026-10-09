@@ -1,24 +1,27 @@
-// Conformance consumer: kvstore sample, Swift target (ABI revision 4).
+// Conformance consumer: kvstore sample, Swift target (ABI revision 5).
 //
 // Drives the feature-complete producer through the generated `Kvstore`
 // module:
 //
-//   * the load-time checks (ABI revision, the `kv` and `report` contract
-//     tables), run by the bindings before the first call;
+//   * the load check (ABI revision, the `kv` and `report` contract tables),
+//     through `KvstoreLibrary.check()`;
 //   * the `Store` class: a throwing static factory and an `init`, methods,
 //     statics, the deprecated `size()`, records (`Entry`, `StoreInfo`), the
 //     C-style `EntryKind`, maps and optionals, and the logical clock;
 //   * `KvError` cases with their payload fields (`keyNotFound`, `expired`,
 //     `storeFull`, `rejected`, `invalidPath`);
 //   * lazy sequences of strings (throwing), records, and objects;
-//   * three callback protocols implemented in Swift: a `Listener` (retained,
+//   * four callback protocols implemented in Swift: a `Listener` (retained,
 //     filtered by `accepts`, told about every `Change`, detached when it
 //     throws, and notified from a producer thread during compaction), a
-//     `Policy` (a record return, a throwing method whose `KvError` and fields
-//     reach the `put` caller, an object parameter and object return), and a
-//     `Loader` passed as an optional callback (string, bytes, and
-//     optional-object returns; `KvError`s decoded by the producer or passed
-//     through);
+//     `Policy` (an optional-scalar parameter and return in `ttlFor`, a record
+//     return, a throwing method whose `KvError` and fields reach the `put`
+//     caller with the domain's message, any other error, including a code
+//     `KvError` doesn't declare, arriving as `callbackFailed`, an object
+//     parameter and object return), a `Loader` passed as an optional
+//     callback (string, bytes, and optional-object returns; `KvError`s
+//     decoded by the producer or passed through), and a `Scorer` (typed
+//     arrays in and out);
 //   * `Store` objects in every position: parameter, return, optional, list,
 //     map value, record field, iterator element, async result, and callback
 //     parameter and return;
@@ -27,7 +30,13 @@
 //     `CancellationError` while its background work stops, shown by
 //     `activeJobs()`), an async list, an async function in the nested
 //     `kv.stats` module, and concurrent calls;
-//   * the nested `kv.stats` module and the sibling `report` root.
+//   * the nested `kv.stats` module and the sibling `report` root;
+//   * the ABI 5 shapes: an optional scalar return (`expiresAt`), iterator
+//     item (`expirations`), and async result (`versionOf`); typed arrays as
+//     a return (`valueSizes`) and an async result (`versions`); a `usize`
+//     return and `throws: any` (`importLines`);
+//   * object identity: wrappers of one native object are `==` and hash
+//     alike, so records carrying objects are `Hashable` too.
 //
 // Ends by asserting the producer's leak counters are zero and that the
 // library released every callback implementation. Exits non-zero on any
@@ -187,7 +196,7 @@ final class RecordingListener: Listener, @unchecked Sendable {
         return key != skip
     }
 
-    func onChange(change: Change) throws {
+    func onChange(change: Change) {
         if pthread_equal(pthread_self(), tally.origin) == 0 { tally.add("offMain") }
         switch change {
         case let .put(entry, replaced):
@@ -220,6 +229,17 @@ final class TestPolicy: Policy, @unchecked Sendable {
         Released.tally.add("policy")
     }
 
+    /// "short" lives one tick, "forever" never expires, "ttl-fail" fails
+    /// with a typed error, and every other key keeps the requested TTL.
+    func ttlFor(key: String, requested: Int64?) throws -> Int64? {
+        switch key {
+        case "short": return 1
+        case "forever": return nil
+        case "ttl-fail": throw KvError.invalidPath(message: "no ttl for you")
+        default: return requested
+        }
+    }
+
     func admit(entry: Entry) throws -> Entry {
         tally.add("admitted")
         expect(entry.version == 0, "admit sees version 0")
@@ -228,6 +248,10 @@ final class TestPolicy: Policy, @unchecked Sendable {
         }
         if entry.key.hasPrefix("boom") {
             throw Refused("policy exploded")
+        }
+        if entry.key.hasPrefix("unknown") {
+            // A code the domain doesn't declare is a plain callback failure.
+            throw KvError.unknown(code: 4242, message: "no such code")
         }
         var admitted = entry
         admitted.tags = ["admitted"]
@@ -269,6 +293,40 @@ final class TestLoader: Loader, @unchecked Sendable {
         case "broken": throw Refused("loader is broken")
         default: return Data("loaded:\(key)".utf8)
         }
+    }
+}
+
+/// Scores each value size as itself, or fails, or returns too few scores.
+final class TestScorer: Scorer, @unchecked Sendable {
+    enum Mode { case sizes, fail, short }
+    let mode: Mode
+
+    init(_ mode: Mode) {
+        self.mode = mode
+    }
+
+    deinit {
+        Released.tally.add("scorer")
+    }
+
+    func scores(sizes: [UInt64]) throws -> [Double] {
+        switch mode {
+        case .sizes:
+            expect(sizes == [1, 3, 2], "scores receives the sizes in key order (got \(sizes))")
+            return sizes.map(Double.init)
+        case .fail:
+            throw Refused("scorer is out of order")
+        case .short:
+            return [Double(sizes[0])]
+        }
+    }
+}
+
+/// `true` when `error` is `KvError.callbackFailed` with `message`.
+func isCallbackFailed(_ message: String) -> (KvError) -> Bool {
+    { error in
+        guard case let .callbackFailed(rendered, field) = error else { return false }
+        return field == message && rendered == message && error.errorCode == 1006
     }
 }
 
@@ -343,7 +401,7 @@ func basics() {
 
     put(s, "beta", "b")
     expect(s.delete(key: "beta") && !s.delete(key: "beta"), "delete")
-    expect((s as Sized).size() == s.count() && s.count() == 1, "deprecated size")
+    expect(UInt64((s as Sized).size()) == s.count() && s.count() == 1, "deprecated size")
     expect(s.clear() == 1 && s.count() == 0, "clear")
 }
 
@@ -452,17 +510,25 @@ func policies() {
     expect(s.count() == 1 && other.count() == 1, "route redirected b/x")
 
     // A typed error from the throwing callback reaches the caller with its
-    // code, message, and fields.
+    // code and fields, and the domain's own message for them.
     expectKvError("put(secret)", { try s.put(key: "secret", value: Data(), kind: .volatile, ttlSeconds: nil) }) { error in
-        guard case let .rejected(message, key, reason) = error else { return false }
-        return message == "secrets are not stored" && key == "secret" && reason == "no secrets" && error.errorCode == 1005
+        error == .rejected(message: "write to secret rejected: no secrets", key: "secret", reason: "no secrets") && error.errorCode == 1005
     }
-    // Any other error arrives as -4 with the consumer's message.
-    expectRuntimeError("put(boom)", code: -4, message: "policy exploded") {
-        try s.put(key: "boom", value: Data(), kind: .volatile, ttlSeconds: nil)
-    }
+    // Any other error, and a code the domain doesn't declare, arrive as
+    // `callbackFailed` with the consumer's message.
+    expectKvError("put(boom)", { try s.put(key: "boom", value: Data(), kind: .volatile, ttlSeconds: nil) }, isCallbackFailed("policy exploded"))
+    expectKvError("put(unknown)", { try s.put(key: "unknown", value: Data(), kind: .volatile, ttlSeconds: nil) }, isCallbackFailed("no such code"))
     expect(s.count() == 1 && other.count() == 1, "failed puts stored nothing")
-    expect(tally["admitted"] == 4, "admit calls")
+    expect(tally["admitted"] == 5, "admit calls")
+
+    // ttlFor: an optional scalar in and out, consulted before admit.
+    expect(put(s, "short", "x", .volatile).expiresAt == 1, "ttlFor(short)")
+    expect(put(s, "forever", "x", .volatile, ttl: 5).expiresAt == nil, "ttlFor(forever)")
+    expect(put(s, "kept", "x", .volatile, ttl: 5).expiresAt == 5, "ttlFor keeps the requested TTL")
+    expectKvError("put(ttl-fail)", { try s.put(key: "ttl-fail", value: Data(), kind: .volatile, ttlSeconds: nil) }) { error in
+        error == .invalidPath(message: "invalid path")
+    }
+    expect(s.count() == 4 && tally["admitted"] == 8, "ttlFor puts")
 
     // Replacing the policy releases the old one; nil removes it.
     s.setPolicy(policy: TestPolicy(tally, other: other))
@@ -470,7 +536,7 @@ func policies() {
     s.setPolicy(policy: nil)
     expect(Released.tally["policy"] == 2 && !s.hasPolicy(), "removed policy released")
     put(s, "secret", "now allowed")
-    expect(s.count() == 2, "no policy, no veto")
+    expect(s.count() == 5, "no policy, no veto")
 }
 
 func loaders() {
@@ -507,14 +573,13 @@ func loaders() {
     // KeyNotFound for this key: the producer decoded the payload and
     // answers nil.
     expect(loadOK("missing", TestLoader()) == nil, "missing")
-    // KeyNotFound for another key: passed through, payload intact.
+    // KeyNotFound for another key: passed through, payload intact, with the
+    // domain's message.
     expectKvError("getOrLoad(elsewhere)", { try load("elsewhere", TestLoader()) }) { error in
-        error.localizedDescription == "not in the loader" && isKeyNotFound("other")(error)
+        error.localizedDescription == "key not found: other" && isKeyNotFound("other")(error)
     }
-    // Any other failure is -4.
-    expectRuntimeError("getOrLoad(broken)", code: -4, message: "loader is broken") {
-        try load("broken", TestLoader())
-    }
+    // Any other failure is `callbackFailed` with the loader's message.
+    expectKvError("getOrLoad(broken)", { try load("broken", TestLoader()) }, isCallbackFailed("loader is broken"))
     expect(Released.tally["loader"] == 6, "every loader released (got \(Released.tally["loader"]))")
 }
 
@@ -585,29 +650,33 @@ func objectGraph() {
     var original: Store? = open("/graph")
     put(original!, "k", "v")
 
-    // share(): the same object; the original reference can go.
+    // share(): the same object (so `==`); the original reference can go.
     let s = original!.share()
-    expect(isSame(s, original!), "share is the same store")
+    expect(isSame(s, original!) && s == original! && s.hashValue == original!.hashValue, "share is the same store")
     original = nil
     _ = original
     expect(s.count() == 1, "alive through the shared reference")
 
     // fork(): a distinct object with a copy of the entries.
     let fork = s.fork()
-    expect(!isSame(fork, s) && fork.count() == 1 && fork.path() == "/graph", "fork")
+    expect(!isSame(fork, s) && fork != s && fork.count() == 1 && fork.path() == "/graph", "fork")
     put(fork, "k2", "v")
     expect(fork.count() == 2 && s.count() == 1, "fork is independent")
 
     // larger(): `Store?` in and out.
     let empty = open("/empty")
     expect(empty.larger(other: nil) == nil, "larger(nil) on an empty store")
-    expect(empty.larger(other: fork).map { isSame($0, fork) } == true, "larger(fork)")
-    expect(s.larger(other: nil).map { isSame($0, s) } == true, "larger(nil) is self")
+    expect(empty.larger(other: fork) == fork, "larger(fork)")
+    expect(s.larger(other: nil) == s, "larger(nil) is self")
+    expect(Set([s, s.share(), fork, s.larger(other: nil)!]).count == 2, "stores hash by identity")
 
     // describe(): a record whose fields carry objects.
     let info = s.describe(label: "main", mirror: fork)
-    expect(info.label == "main" && isSame(info.store, s) && info.count == 1, "describe")
-    expect(info.mirror.map { isSame($0, fork) } == true && info.mirror?.count() == 2, "describe mirror")
+    expect(info.label == "main" && info.store == s && info.count == 1, "describe")
+    expect(info.mirror == fork && info.mirror?.count() == 2, "describe mirror")
+    // A record carrying objects compares by their identity.
+    expect(info == StoreInfo(label: "main", store: s.share(), mirror: fork, count: 1), "StoreInfo ==")
+    expect(info != StoreInfo(label: "main", store: s.fork(), mirror: fork, count: 1), "StoreInfo != for another store")
 
     // openMany(): a list of objects; one bad path fails the whole call.
     guard let many = try? Store.openMany(paths: ["/a", "/b"]) else { fail("openMany") }
@@ -620,8 +689,8 @@ func objectGraph() {
     // byLabel(): records with objects in, a map with object values out.
     let named = Store.byLabel(infos: [info, StoreInfo(label: "first", store: many[0], mirror: nil, count: 0)])
     expect(named.count == 2, "byLabel count")
-    expect(named["main"].map { isSame($0, s) } == true, "byLabel main")
-    expect(named["first"].map { isSame($0, many[0]) } == true, "byLabel first")
+    expect(named["main"] == s, "byLabel main")
+    expect(named["first"] == many[0], "byLabel first")
 
     // totalCount(): a list, a map, and an optional record, all carrying
     // objects (each encoded as a fresh reference the producer adopts).
@@ -669,6 +738,66 @@ func statsAndReport() {
     }
 }
 
+@MainActor
+func abi5Shapes() async {
+    let s = open("/abi5")
+    put(s, "b", "12")
+    _ = try! s.put(key: "a", value: Data([1, 2, 3]), kind: .volatile, ttlSeconds: 7)
+    expect(s.count() == 2, "count")
+
+    // An optional scalar return.
+    expect(s.expiresAt(key: "a") == 7, "expiresAt(a)")
+    expect(s.expiresAt(key: "b") == nil && s.expiresAt(key: "zzz") == nil, "expiresAt absent")
+
+    // A typed-array return, in key order.
+    expect(s.valueSizes() == [3, 2], "valueSizes")
+
+    // Optional scalar iterator items.
+    let expirations = s.expirations()
+    expect(Array(expirations) == [7, nil], "expirations")
+    expect(expirations.error == nil && expirations.next() == nil, "expirations ended")
+
+    // An optional scalar and a typed-array async result.
+    let a = await s.versionOf(key: "a")
+    let q = await s.versionOf(key: "q")
+    expect(a == 1 && q == nil, "versionOf (got \(String(describing: a)), \(String(describing: q)))")
+    put(s, "b", "x")
+    let versions = await s.versions(keys: ["b", "q", "a"])
+    expect(versions == [2, 0, 1], "versions (got \(versions))")
+
+    // A callback taking and returning typed arrays.
+    let r = open("/rank")
+    put(r, "a", "1")
+    put(r, "b", "333")
+    put(r, "c", "22")
+    do {
+        expect(try r.rank(scorer: TestScorer(.sizes)) == ["b", "c", "a"], "rank")
+    } catch {
+        fail("rank threw \(error)")
+    }
+    expectKvError("rank(fail)", { try r.rank(scorer: TestScorer(.fail)) }, isCallbackFailed("scorer is out of order"))
+    expectKvError("rank(short)", { try r.rank(scorer: TestScorer(.short)) }, isCallbackFailed("expected 3 scores, got 1"))
+    expect(Released.tally["scorer"] == 3, "every scorer released")
+
+    // `throws: any` and a `usize` return: the runtime error, code -1.
+    let i = open("/import")
+    do {
+        expect(try i.importLines(text: "a=1\n\nb=two\n") == 2, "importLines")
+        expect(try i.get(key: "b").value == Data("two".utf8), "imported b")
+    } catch {
+        fail("importLines threw \(error)")
+    }
+    expectRuntimeError("importLines(broken)", code: KvstoreRuntimeError.untypedCode, message: "line 2: expected key=value") {
+        try i.importLines(text: "c=3\nbroken\nd=4")
+    }
+    expect(i.count() == 3, "c was stored, d wasn't")
+}
+
+do {
+    try KvstoreLibrary.check()
+} catch {
+    fail("check() threw \(error)")
+}
 await constructors()
 basics()
 iterators()
@@ -678,8 +807,9 @@ loaders()
 await asyncCalls()
 objectGraph()
 statsAndReport()
+await abi5Shapes()
 
-expect(kvstore_abi_version() == 4, "ABI revision 4")
+expect(kvstore_abi_version() == 5, "ABI revision 5")
 expect(kvstore_debug_live(-1) == 1, "the sample counts live resources")
 assertNoLeaks()
 expect(Released.tally["listener"] == 5, "every listener released (got \(Released.tally["listener"]))")

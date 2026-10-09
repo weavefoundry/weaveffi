@@ -1,0 +1,5 @@
+error[E0432]: unresolved import `crate`
+ --> tests/ui/fail_missing_export_runtime.rs:5:9
+  |
+5 | pub mod api {
+  |         ^^^ no `__weaveffi_runtime` in the root

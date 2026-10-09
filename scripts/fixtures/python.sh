@@ -7,16 +7,17 @@
 # byte-compile has run.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
-require python3
+. "$(dirname "$0")/../toolchains.sh"
+python=$(find_python) || missing "Python 3.10 or newer not found"
 dir=$1
-find "$dir/python" -name '*.py' -print0 | xargs -0 python3 -m py_compile
-if command -v mypy >/dev/null 2>&1; then
+find "$dir/python" -name '*.py' -print0 | xargs -0 "$python" -m py_compile
+if "$python" -c "import mypy" >/dev/null 2>&1; then
+    mypy=("$python" -m mypy)
+elif command -v mypy >/dev/null 2>&1; then
     mypy=(mypy)
-elif python3 -c "import mypy" >/dev/null 2>&1; then
-    mypy=(python3 -m mypy)
 else
     missing "mypy not found; type checks not run (pip install 'mypy<2')"
 fi
 for pkg in "$dir"/python/*/; do
-    "${mypy[@]}" --strict --python-version 3.9 --no-incremental "$pkg"
+    "${mypy[@]}" --strict --python-version 3.10 --no-incremental "$pkg"
 done

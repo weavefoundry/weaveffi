@@ -1,4 +1,4 @@
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: shared
     structs:
@@ -56,7 +56,7 @@ modules:
             doc: A display label, failing with a kitchen error
             params: []
             return: string
-            throws: true
+            throws: KitchenErrors
           - name: latest
             doc: The most recent item the listener kept, if any
             params: []
@@ -65,11 +65,35 @@ modules:
             doc: The listener's favorite gadget
             params: []
             return: Gadget
+      - name: Sampler
+        doc: Consumer-implemented source of scalar samples
+        methods:
+          - name: threshold
+            doc: The cutoff for a level, if the sampler has one
+            params:
+              - { name: level, type: "u32?" }
+            return: "f64?"
+          - name: samples
+            doc: Up to `limit` samples, failing when the pantry is empty
+            params:
+              - { name: limit, type: "u32?" }
+              - { name: weights, type: "[f64]" }
+            return: "[i16]"
+            throws: PantryError
+          - name: describe
+            doc: A free-form description, failing with an untyped error
+            params: []
+            return: string
+            throws: any
     errors:
-      name: KitchenErrors
-      codes:
-        - { name: NotFound, code: 1, message: "Item not found" }
-        - { name: InvalidInput, code: 2, message: "Invalid input" }
+      - name: KitchenErrors
+        codes:
+          - { name: NotFound, code: 1, message: "Item not found" }
+          - { name: InvalidInput, code: 2, message: "Invalid input" }
+      - name: PantryError
+        codes:
+          - { name: OutOfStock, code: 1, message: "Out of stock", fields: [{ name: item, type: string }] }
+          - { name: Spoiled, code: 2, message: "Spoiled" }
     interfaces:
       - name: Gadget
         doc: A pocket-sized interface exercising the object surface
@@ -88,7 +112,13 @@ modules:
             params:
               - { name: times, type: i32 }
             return: i32
-            throws: true
+            throws: KitchenErrors
+          - name: readings
+            doc: The gadget's sensor readings, optionally limited
+            params:
+              - { name: limit, type: "u32?" }
+            return: "[f64]"
+            throws: any
         statics:
           - name: version
             doc: The gadget subsystem version string
@@ -152,7 +182,7 @@ modules:
         params:
           - { name: id, type: i64 }
         return: "Item?"
-        throws: true
+        throws: KitchenErrors
       - name: list_items
         doc: List of structs
         params: []
@@ -186,11 +216,97 @@ modules:
         doc: Legacy operation kept for compatibility
         params: []
         return: i32
-        deprecated: "Use new_op instead"
+        deprecated: "Use `new_op` instead"
       - name: new_op
-        doc: Replacement for legacy_op
+        doc: Replacement for `legacy_op`
         params: []
         return: i32
+      - name: opt_i32_id
+        doc: Optional scalar in both directions
+        params:
+          - { name: x, type: "i32?" }
+        return: "i32?"
+      - name: opt_bool_id
+        params:
+          - { name: x, type: "bool?" }
+        return: "bool?"
+      - name: opt_priority
+        doc: Optional C-style enum in both directions
+        params:
+          - { name: p, type: "Priority?" }
+        return: "Priority?"
+      - name: opt_mixed
+        doc: Optional scalars next to ordinary parameters
+        params:
+          - { name: base, type: f64 }
+          - { name: scale, type: "f32?" }
+          - { name: offset, type: "i64?" }
+          - { name: label, type: "string?" }
+        return: "u16?"
+      - name: sum_f64
+        doc: A typed-array parameter
+        params:
+          - { name: xs, type: "[f64]" }
+        return: f64
+      - name: scale_i32
+        doc: Typed arrays in both directions
+        params:
+          - { name: xs, type: "[i32]" }
+          - { name: factor, type: i32 }
+        return: "[i32]"
+      - name: ids_u64
+        params:
+          - { name: ids, type: "[u64]" }
+        return: "[u64]"
+      - name: mixed_slices
+        doc: Every slice element type
+        params:
+          - { name: a, type: "[i8]" }
+          - { name: b, type: "[i16]" }
+          - { name: c, type: "[u16]" }
+          - { name: d, type: "[u32]" }
+          - { name: e, type: "[i64]" }
+          - { name: f, type: "[f32]" }
+        return: "[u32]"
+      - name: async_maybe_count
+        doc: Async returning an optional scalar
+        params: []
+        return: "i64?"
+        async: true
+      - name: async_samples
+        doc: Async returning a typed array
+        params:
+          - { name: n, type: u32 }
+        return: "[f32]"
+        async: true
+        cancellable: true
+      - name: stream_maybe
+        doc: Iterator of optional scalars
+        params: []
+        return: "iter<i32?>"
+      - name: stream_chunks
+        doc: Iterator of typed arrays
+        params: []
+        return: "iter<[i32]>"
+      - name: sample_with
+        doc: Drive a consumer-implemented sampler
+        params:
+          - { name: sampler, type: Sampler }
+          - { name: level, type: "u32?" }
+        return: "[i16]"
+        throws: PantryError
+      - name: take_from_pantry
+        doc: Fails with the second domain
+        params:
+          - { name: item, type: string }
+        return: i32
+        throws: PantryError
+      - name: parse_any
+        doc: Fails with an untyped error
+        params:
+          - { name: text, type: string }
+        return: i64
+        throws: any
     modules:
       - name: nested
         functions:

@@ -1,85 +1,33 @@
 //! Call-path renderers: the wrapper methods for every call shape (sync,
 //! async, iterator), argument marshalling driven by [`ArgPass`], result
-//! receiving driven by [`Family`], and the per-module static classes.
+//! receiving driven by [`RetPass`], [`ResultPass`], and [`ItemPass`], and
+//! the per-module static classes.
 //!
-//! Every wrapper follows one frame: encode arguments (UTF-8 strings, value
-//! buffers, callback registrations), pin them with one `fixed` statement,
-//! call the import with a stack `FfiError`, check it, and receive the result.
+//! Every wrapper follows one frame: encode arguments (pooled UTF-8, pooled
+//! value buffers, callback registrations), pin them with `fixed`, call the
+//! import with a stack `FfiError` and out slots, check the error, and
+//! receive the result.
 
-use crate::codegen::CodeWriter;
-use heck::ToUpperCamelCase;
+use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_model::abi::{AbiParam, CType};
 use weaveffi_model::model::{
-    AsyncBinding, CallShape, ErrorBinding, FnBinding, IteratorBinding, ModuleBinding, ParamBinding,
+    AsyncBinding, FnBinding, IteratorBinding, Model, ModuleBinding, ParamBinding,
 };
-use weaveffi_model::plan::{ArgPass, ErrorStrategy};
-use weaveffi_model::ty::{Family, Prim, Ty};
+use weaveffi_model::plan::{ArgPass, ItemPass, ResultPass, RetPass};
+use weaveffi_model::ty::Ty;
 
-use crate::targets::dotnet::codec::{decode_expr, write_stmt};
-use crate::targets::dotnet::docs::{write_doc, write_fn_doc};
-use crate::targets::dotnet::runtime::dotnet_exception_name;
+use crate::codegen::CodeWriter;
+use crate::targets::dotnet::codec::{read_lambda, write_call};
+use crate::targets::dotnet::docs::Docs;
+use crate::targets::dotnet::errors::ErrCtx;
 use crate::targets::dotnet::types::{
-    camel_fn, cs_ctype, cs_type, safe_cs_name, vtable_class_cs, Cx,
+    camel, cs_ctype, item_cs, param_cs, prim_cs, result_cs, ret_cs, safe_cs_name, vtable_class_cs,
+    Cx,
 };
 
 /// The `[UnmanagedCallersOnly]` attribute every native entry point carries.
 pub(crate) const UNMANAGED_CALLERS_ONLY: &str =
     "[UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]";
-
-/// How a wrapper maps a non-zero error slot to an exception, rendering
-/// [`ErrorStrategy`]: a throwing function uses its domain's typed
-/// `FromError` (or the root exception's, without a domain in scope); a
-/// non-throwing one traps through the bug exception's.
-#[derive(Clone)]
-pub(crate) struct ErrCtx<'a> {
-    cx: Cx<'a>,
-    map: String,
-    domain: Option<(String, String)>,
-}
-
-impl<'a> ErrCtx<'a> {
-    /// The error context for one function.
-    pub(crate) fn for_fn(f: &FnBinding, error: Option<&ErrorBinding>, cx: Cx<'a>) -> Self {
-        match (f.error_strategy(), error) {
-            (ErrorStrategy::Throws, Some(eb)) => {
-                let exc = dotnet_exception_name(eb);
-                ErrCtx {
-                    cx,
-                    map: format!("{}.FromError", cx.ty(&exc)),
-                    domain: Some((exc, eb.name.clone())),
-                }
-            }
-            (ErrorStrategy::Throws, None) => ErrCtx {
-                cx,
-                map: format!("{}.FromError", cx.ty(cx.base)),
-                domain: None,
-            },
-            (ErrorStrategy::Trap, _) => ErrCtx {
-                cx,
-                map: format!("{}.FromError", cx.ty(cx.bug)),
-                domain: None,
-            },
-        }
-    }
-
-    /// The statement throwing when the local `FfiError` named `var` holds a
-    /// failure.
-    fn check(&self, var: &str) -> String {
-        format!(
-            "if ({var}.Code != 0) throw Ffi.TakeError(&{var}, {});",
-            self.map
-        )
-    }
-
-    /// Emit the `<exception>` doc line of a throwing wrapper.
-    fn write_doc(&self, w: &mut CodeWriter) {
-        if let Some((exc, ty)) = &self.domain {
-            w.line(format!(
-                "/// <exception cref=\"{exc}\">The call reported a {ty} code.</exception>"
-            ));
-        }
-    }
-}
 
 /// The receiver of a wrapper: what the method is a member of.
 #[derive(Clone, Copy)]
@@ -93,16 +41,10 @@ pub(crate) enum Receiver<'a> {
     Constructor(&'a str),
 }
 
-/// The `[Obsolete]` attribute line for a deprecated item.
-pub(crate) fn write_obsolete(w: &mut CodeWriter, deprecated: &Option<String>) {
-    if let Some(msg) = deprecated {
-        w.line(format!("[Obsolete(\"{}\")]", msg.replace('"', "\\\"")));
-    }
-}
-
 /// The argument marshalling for one parameter list: statements run before
-/// the call, the buffers pinned for it, one expression per ABI slot, and the
-/// callback registrations to release if the call never reaches the producer.
+/// the call, the `fixed` pins it needs, one expression per ABI slot, and
+/// the callback registrations to release if the call never reaches the
+/// producer.
 struct Marshal {
     setup: Vec<String>,
     pins: Vec<String>,
@@ -111,75 +53,91 @@ struct Marshal {
 }
 
 impl Marshal {
-    /// Plan the marshalling of `params` (already camelCased).
+    /// Plan the marshalling of `params`.
     fn new(cx: Cx<'_>, params: &[ParamBinding]) -> Self {
-        let mut pins = Vec::new();
-        let mut args = Vec::new();
-        let mut callbacks = Vec::new();
-        let mut setup = Vec::new();
+        let mut m = Marshal {
+            setup: Vec::new(),
+            pins: Vec::new(),
+            args: Vec::new(),
+            callbacks: Vec::new(),
+        };
         let mut registrations = Vec::new();
         for p in params {
-            let n = safe_cs_name(&p.name);
-            let local = p.name.as_str();
-            match p.arg_pass() {
-                ArgPass::Direct { .. } => args.push(direct_to_slot(&p.ty, &n)),
+            let n = camel(&p.name);
+            let local = p.name.to_lower_camel_case();
+            match &p.pass {
+                ArgPass::Direct { .. } => m.args.push(n),
+                ArgPass::OptDirect { .. } => {
+                    m.args.push(format!("{n}.HasValue"));
+                    m.args.push(format!("{n}.GetValueOrDefault()"));
+                }
+                ArgPass::Slice { elem, .. } => {
+                    m.pins.push(format!("{}* {local}Ptr = {n}", prim_cs(*elem)));
+                    m.args.push(format!("{local}Ptr"));
+                    m.args.push(format!("(nuint){n}.Length"));
+                }
                 ArgPass::String { .. } => {
-                    setup.push(format!("var {local}Bytes = Ffi.Utf8({n});"));
-                    pins.push(format!("{local}Ptr = {local}Bytes"));
-                    args.push(format!("{local}Ptr"));
-                    args.push(format!("(nuint){local}Bytes.Length"));
+                    m.setup
+                        .push(format!("using var {local}Utf8 = new FfiUtf8({n});"));
+                    m.pins.push(format!("byte* {local}Ptr = {local}Utf8"));
+                    m.args.push(format!("{local}Ptr"));
+                    m.args.push(format!("{local}Utf8.Length"));
                 }
                 ArgPass::Bytes { .. } => {
-                    pins.push(format!("{local}Ptr = {n}"));
-                    args.push(format!("{local}Ptr"));
-                    args.push(format!("(nuint){n}.Length"));
+                    m.pins.push(format!("byte* {local}Ptr = {n}"));
+                    m.args.push(format!("{local}Ptr"));
+                    m.args.push(format!("(nuint){n}.Length"));
                 }
                 ArgPass::Buffer { .. } => {
                     let writer = format!("{local}Writer");
-                    setup.push(format!("var {writer} = new FfiBufferWriter();"));
-                    setup.push(write_stmt(&p.ty, &writer, &n));
-                    pins.push(format!("{local}Ptr = {writer}.Written"));
-                    args.push(format!("{local}Ptr"));
-                    args.push(format!("(nuint){writer}.Length"));
+                    let ty = p.ty.value().expect("a buffered parameter has a value type");
+                    m.setup
+                        .push(format!("using var {writer} = new FfiBufferWriter();"));
+                    m.setup.push(format!("{};", write_call(ty, &writer, &n, 0)));
+                    m.pins.push(format!("byte* {local}Ptr = {writer}.Written"));
+                    m.args.push(format!("{local}Ptr"));
+                    m.args.push(format!("(nuint){writer}.Length"));
                 }
-                ArgPass::Object { nullable, .. } => {
-                    if nullable {
-                        let iface =
-                            p.ty.interface_name()
-                                .expect("object types name an interface");
-                        args.push(format!("{n}?.Handle ?? {}.NativeHandle.Null", cx.ty(iface)));
+                ArgPass::Object {
+                    nullable,
+                    interface,
+                    ..
+                } => {
+                    if *nullable {
+                        m.args.push(format!(
+                            "{n}?.Handle ?? {}.NativeHandle.Null",
+                            cx.ty(interface)
+                        ));
                     } else {
-                        args.push(format!("{n}.Handle"));
+                        m.args.push(format!("{n}.Handle"));
                     }
                 }
                 // The producer owns the registration once the call reaches
                 // it: its vtable `free(ctx)` releases it. An absent optional
                 // implementation passes a null vtable.
                 ArgPass::Callback {
-                    vtable, nullable, ..
+                    nullable,
+                    interface,
+                    ..
                 } => {
                     let ctx = format!("{local}Ctx");
-                    let pointer = format!("{}.Pointer", vtable_class_for_slot(&vtable.ty));
-                    args.push(ctx.clone());
-                    if nullable {
-                        args.push(format!("{n} == null ? IntPtr.Zero : {pointer}"));
+                    let pointer = format!("{}.Pointer", vtable_class_cs(interface));
+                    m.args.push(ctx.clone());
+                    if *nullable {
+                        m.args
+                            .push(format!("{n} == null ? IntPtr.Zero : {pointer}"));
                     } else {
-                        args.push(pointer);
+                        m.args.push(pointer);
                     }
                     registrations.push(format!("var {ctx} = Ffi.Register({n});"));
-                    callbacks.push(ctx);
+                    m.callbacks.push(ctx);
                 }
             }
         }
         // Register last, so a failing encode above can't strand a
         // registration.
-        setup.extend(registrations);
-        Marshal {
-            setup,
-            pins,
-            args,
-            callbacks,
-        }
+        m.setup.extend(registrations);
+        m
     }
 
     /// Emit the setup statements.
@@ -189,17 +147,44 @@ impl Marshal {
         }
     }
 
-    /// Emit `body` inside one `fixed` statement pinning every buffer, or bare
+    /// Emit `body` inside one stacked `fixed` statement per pin, or bare
     /// when nothing needs pinning.
     fn pinned(&self, w: &mut CodeWriter, body: impl FnOnce(&mut CodeWriter)) {
         if self.pins.is_empty() {
             body(w);
             return;
         }
-        w.line(format!("fixed (byte* {})", self.pins.join(", ")));
+        for pin in &self.pins {
+            w.line(format!("fixed ({pin})"));
+        }
         w.line("{");
         w.scope(body);
         w.line("}");
+    }
+
+    /// Emit `call` (a statement), releasing every callback registration if
+    /// it throws before reaching the producer. `declare` is the declaration
+    /// of the variable the statement assigns, when it assigns one.
+    fn guarded(&self, w: &mut CodeWriter, declare: Option<String>, call: &str) {
+        if self.callbacks.is_empty() {
+            match declare {
+                Some(_) => w.line(format!("var {call}")),
+                None => w.line(call),
+            };
+            return;
+        }
+        if let Some(decl) = declare {
+            w.line(decl);
+        }
+        w.line("try");
+        w.block("{", "}", |w| {
+            w.line(call);
+        });
+        w.line("catch");
+        w.block("{", "}", |w| {
+            self.unregister(w);
+            w.line("throw;");
+        });
     }
 
     /// The statements releasing every callback registration.
@@ -210,102 +195,12 @@ impl Marshal {
     }
 }
 
-/// The C# class hosting the static vtable a callback slot points at, named
-/// from the slot's vtable C type.
-fn vtable_class_for_slot(vtable: &CType) -> String {
-    let CType::Ptr { pointee, .. } = vtable else {
-        unreachable!("a callback vtable slot is a pointer")
-    };
-    let CType::VtableTag { module, name } = pointee.as_ref() else {
-        unreachable!("a callback vtable slot points at a vtable tag")
-    };
-    vtable_class_cs(module, name)
-}
-
-/// The expression converting a surface value into its by-value slot: `bool`
-/// as a byte, a C-style enum as its `int`, every other scalar as is.
-pub(crate) fn direct_to_slot(ty: &Ty, expr: &str) -> String {
-    match ty {
-        Ty::Prim(Prim::Bool) => format!("(byte)({expr} ? 1 : 0)"),
-        Ty::Enum(_) => format!("(int){expr}"),
-        _ => expr.to_string(),
-    }
-}
-
-/// The expression converting a by-value slot into its surface type.
-pub(crate) fn direct_from_slot(cx: Cx<'_>, ty: &Ty, slot: &str) -> String {
-    match ty {
-        Ty::Prim(Prim::Bool) => format!("{slot} != 0"),
-        Ty::Enum(name) => format!("({}){slot}", cx.ty(name)),
-        _ => slot.to_string(),
-    }
-}
-
-/// Who owns a received `(ptr, len)` run.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Own {
-    /// The consumer: copy or decode it, then release it with `free_bytes`
-    /// (returns, async results, iterator items).
-    Take,
-    /// The producer, for the duration of a callback: copy or decode only.
-    Borrow,
-}
-
-/// The expression receiving a value of `ty` from its slots (`ptr`, plus
-/// `len` for the `(ptr, len)` families). Objects always transfer one strong
-/// reference, which the new wrapper adopts.
-pub(crate) fn receive(cx: Cx<'_>, ty: &Ty, ptr: &str, len: &str, own: Own) -> String {
-    let verb = match own {
-        Own::Take => "Take",
-        Own::Borrow => "Read",
-    };
-    match ty.family() {
-        Family::Direct => direct_from_slot(cx, ty, ptr),
-        Family::String => format!("Ffi.{verb}String({ptr}, {len})"),
-        Family::Bytes => format!("Ffi.{verb}Bytes({ptr}, {len})"),
-        Family::Buffer => decode_expr(cx, ty, &format!("Ffi.{verb}Buffer({ptr}, {len})")),
-        Family::Object { nullable } => {
-            let class = cx.ty(ty.interface_name().expect("object types name an interface"));
-            if nullable {
-                format!("{ptr} == IntPtr.Zero ? null : {class}.Adopt({ptr})")
-            } else {
-                format!("{class}.Adopt({ptr})")
-            }
-        }
-        Family::Callback { .. } | Family::Iterator => unreachable!("{ty} is never received"),
-    }
-}
-
-/// The public signature's parameter list. With `span`, bytes parameters are
-/// `ReadOnlySpan<byte>`.
-fn params_sig(params: &[ParamBinding], span: bool) -> Vec<String> {
+/// The public signature's parameter list.
+fn params_sig(params: &[ParamBinding]) -> Vec<String> {
     params
         .iter()
-        .map(|p| {
-            let ty = if span && p.ty == Ty::Prim(Prim::Bytes) {
-                "ReadOnlySpan<byte>".to_string()
-            } else {
-                cs_type(&p.ty)
-            };
-            format!("{ty} {}", safe_cs_name(&p.name))
-        })
+        .map(|p| format!("{} {}", param_cs(&p.pass, p.ty.value()), camel(&p.name)))
         .collect()
-}
-
-/// The argument list forwarding a `byte[]` overload to its span overload.
-fn forward_args(params: &[ParamBinding]) -> String {
-    params
-        .iter()
-        .map(|p| {
-            let n = safe_cs_name(&p.name);
-            if p.ty == Ty::Prim(Prim::Bytes) {
-                format!("(ReadOnlySpan<byte>){n}")
-            } else {
-                n
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// The slot arguments of a call: the receiver (when any), every marshalled
@@ -320,8 +215,8 @@ fn call_args(receiver: Receiver<'_>, m: &Marshal, extra: &[String]) -> String {
     args.join(", ")
 }
 
-/// The signature line opener for a wrapper: modifiers, return type, and
-/// name (or the bare class name for a constructor).
+/// The modifiers, return type, and name opening a method (or the bare class
+/// name of a constructor).
 fn opener(receiver: Receiver<'_>, ret: &str, name: &str) -> String {
     match receiver {
         Receiver::Static => format!("public static {ret} {name}"),
@@ -330,113 +225,150 @@ fn opener(receiver: Receiver<'_>, ret: &str, name: &str) -> String {
     }
 }
 
+/// The element type of a pointer slot.
+fn pointee(slot: &AbiParam) -> &CType {
+    match &slot.ty {
+        CType::Ptr { pointee, .. } => pointee,
+        other => other,
+    }
+}
+
+/// The expression adopting an object pointer into a wrapper (`null` for a
+/// null pointer of a nullable object).
+fn adopt(cx: Cx<'_>, ptr: &str, nullable: bool, interface: &str) -> String {
+    let class = cx.ty(interface);
+    if nullable {
+        format!("{ptr} == IntPtr.Zero ? null : {class}.Adopt({ptr})")
+    } else {
+        format!("{class}.Adopt({ptr})")
+    }
+}
+
 /// Render one wrapper (any shape) named `name`.
 pub(crate) fn render_callable(
     w: &mut CodeWriter,
+    docs: &Docs,
     f: &FnBinding,
     name: &str,
     receiver: Receiver<'_>,
-    err: &ErrCtx<'_>,
+    err: &ErrCtx,
+    cx: Cx<'_>,
 ) {
-    let f = camel_fn(f);
-    match &f.shape {
-        CallShape::Sync(abi) => {
-            let span = f.params.iter().any(|p| p.ty == Ty::Prim(Prim::Bytes));
-            render_sync(w, &f, &abi.params, &abi.ret, name, receiver, err, span);
-            if span {
-                render_array_overload(w, &f, name, receiver, err);
-            }
-        }
-        CallShape::Async(a) => render_async(w, &f, a, name, receiver, err),
-        CallShape::Iterator(it) => render_iterator(w, &f, it, name, receiver, err),
+    if let Some(a) = f.async_binding() {
+        render_async(w, docs, f, a, name, receiver, err, cx);
+    } else if let Some(it) = f.iterator() {
+        render_iterator(w, docs, f, it, name, receiver, err, cx);
+    } else {
+        render_sync(w, docs, f, name, receiver, err, cx);
     }
 }
 
 /// The documentation, `<exception>`, and `[Obsolete]` lines of a wrapper.
-fn write_header(w: &mut CodeWriter, f: &FnBinding, err: &ErrCtx<'_>) {
-    write_fn_doc(w, &f.doc, &f.params);
+fn write_header(w: &mut CodeWriter, docs: &Docs, f: &FnBinding, err: &ErrCtx) {
+    docs.summary(w, &f.doc);
+    for p in &f.params {
+        docs.param(w, &camel(&p.name), &p.doc);
+    }
     err.write_doc(w);
-    write_obsolete(w, &f.deprecated);
+    docs.obsolete(w, &f.deprecated);
+}
+
+/// The out-slot locals of a sync call and the `&local` arguments passing
+/// them, per its [`RetPass`].
+fn ret_outs(cx: Cx<'_>, pass: &RetPass) -> (Vec<String>, Vec<String>) {
+    match pass {
+        RetPass::OptDirect { out_value } => (
+            vec![format!(
+                "{} ffiValue = default;",
+                cs_ctype(cx.ns, pointee(out_value))
+            )],
+            vec!["&ffiValue".into()],
+        ),
+        RetPass::Slice { .. }
+        | RetPass::String { .. }
+        | RetPass::Bytes { .. }
+        | RetPass::Buffer { .. } => (
+            vec!["nuint ffiOutLen = 0;".into()],
+            vec!["&ffiOutLen".into()],
+        ),
+        _ => (Vec::new(), Vec::new()),
+    }
+}
+
+/// The expression receiving a sync call's result `ffiResult`.
+fn receive_ret(cx: Cx<'_>, pass: &RetPass, ty: &Ty) -> String {
+    match pass {
+        RetPass::Void | RetPass::Iterator(_) => unreachable!("no value to receive"),
+        RetPass::Direct => "ffiResult".into(),
+        RetPass::OptDirect { .. } => "ffiResult ? ffiValue : null".into(),
+        RetPass::Slice { .. } => "Ffi.TakeArray(ffiResult, ffiOutLen)".into(),
+        RetPass::String { .. } => "Ffi.TakeString(ffiResult, ffiOutLen)".into(),
+        RetPass::Bytes { .. } => "Ffi.TakeBytes(ffiResult, ffiOutLen)".into(),
+        RetPass::Buffer { .. } => format!(
+            "Ffi.TakeBuffer(ffiResult, ffiOutLen, {})",
+            read_lambda(cx, ty, 0)
+        ),
+        RetPass::Object {
+            nullable,
+            interface,
+            ..
+        } => adopt(cx, "ffiResult", *nullable, interface),
+    }
 }
 
 /// A synchronous wrapper: one call, one check, one received result. A
 /// constructor stores the adopted pointer as its handle instead of
 /// returning it.
-#[allow(clippy::too_many_arguments)]
 fn render_sync(
     w: &mut CodeWriter,
+    docs: &Docs,
     f: &FnBinding,
-    slots: &[AbiParam],
-    ret: &CType,
     name: &str,
     receiver: Receiver<'_>,
-    err: &ErrCtx<'_>,
-    span: bool,
+    err: &ErrCtx,
+    cx: Cx<'_>,
 ) {
-    let ret_cs = match receiver {
-        Receiver::Constructor(_) => String::new(),
-        _ => f.ret.as_ref().map(cs_type).unwrap_or_else(|| "void".into()),
+    let value = f.ret.as_ref().and_then(|r| r.value());
+    let ret = match (receiver, value) {
+        (Receiver::Constructor(_), _) => String::new(),
+        (_, Some(ty)) => ret_cs(&f.ret_pass, ty),
+        (_, None) => "void".into(),
     };
-    let cx = err.cx;
     let m = Marshal::new(cx, &f.params);
-    let has_out_len = slots.iter().any(|s| s.name == "out_len");
-    let mut extra = Vec::new();
-    if has_out_len {
-        extra.push("&ffiOutLen".to_string());
-    }
+    let (locals, mut extra) = ret_outs(cx, &f.ret_pass);
     extra.push("&ffiErr".to_string());
     let call = format!(
         "NativeMethods.{}({})",
-        f.c_base,
+        f.abi.symbol,
         call_args(receiver, &m, &extra)
     );
 
-    write_header(w, f, err);
+    write_header(w, docs, f, err);
     w.line(format!(
         "{}({})",
-        opener(receiver, &ret_cs, name),
-        params_sig(&f.params, span).join(", ")
+        opener(receiver, &ret, name),
+        params_sig(&f.params).join(", ")
     ));
     w.block("{", "}", |w| {
         m.write_setup(w);
         w.line("var ffiErr = default(FfiError);");
-        if has_out_len {
-            w.line("nuint ffiOutLen = 0;");
+        for l in &locals {
+            w.line(l);
         }
         m.pinned(w, |w| {
-            let returns = f.ret.is_some();
-            if m.callbacks.is_empty() {
-                if returns {
-                    w.line(format!("var ffiResult = {call};"));
-                } else {
-                    w.line(format!("{call};"));
-                }
+            if value.is_some() {
+                let decl = format!("{} ffiResult;", cs_ctype(cx.ns, &f.abi.ret));
+                m.guarded(w, Some(decl), &format!("ffiResult = {call};"));
             } else {
-                if returns {
-                    w.line(format!("{} ffiResult;", cs_ctype(ret)));
-                }
-                w.line("try");
-                w.block("{", "}", |w| {
-                    if returns {
-                        w.line(format!("ffiResult = {call};"));
-                    } else {
-                        w.line(format!("{call};"));
-                    }
-                });
-                w.line("catch");
-                w.block("{", "}", |w| {
-                    m.unregister(w);
-                    w.line("throw;");
-                });
+                m.guarded(w, None, &format!("{call};"));
             }
             w.line(err.check("ffiErr"));
-            match (&f.ret, receiver) {
+            match (value, receiver) {
                 (Some(_), Receiver::Constructor(_)) => {
                     w.line("Handle = new NativeHandle(ffiResult);");
                 }
                 (Some(ty), _) => {
-                    let expr = receive(cx, ty, "ffiResult", "ffiOutLen", Own::Take);
-                    w.line(format!("return {expr};"));
+                    w.line(format!("return {};", receive_ret(cx, &f.ret_pass, ty)));
                 }
                 (None, _) => {}
             }
@@ -445,101 +377,97 @@ fn render_sync(
     w.blank();
 }
 
-/// The `byte[]` overload of a wrapper whose bytes parameters are
-/// `ReadOnlySpan<byte>`, forwarding to it.
-fn render_array_overload(
-    w: &mut CodeWriter,
-    f: &FnBinding,
-    name: &str,
-    receiver: Receiver<'_>,
-    err: &ErrCtx<'_>,
-) {
-    let ret_cs = f.ret.as_ref().map(cs_type).unwrap_or_else(|| "void".into());
-    let args = forward_args(&f.params);
-    write_header(w, f, err);
-    let sig = format!(
-        "{}({})",
-        opener(receiver, &ret_cs, name),
-        params_sig(&f.params, false).join(", ")
-    );
-    match receiver {
-        Receiver::Constructor(_) => {
-            w.line(format!("{sig} : this({args})"));
-            w.line("{");
-            w.line("}");
-        }
-        _ => {
-            w.line(format!("{sig} => {name}({args});"));
-        }
+/// The expression receiving an async result from the completion's slots.
+fn receive_result(cx: Cx<'_>, pass: &ResultPass, ty: Option<&Ty>) -> String {
+    let n = |slot: &AbiParam| safe_cs_name(&slot.name);
+    match pass {
+        ResultPass::Void => "default".into(),
+        ResultPass::Direct { result } => n(result),
+        ResultPass::OptDirect { has, value } => format!("{} ? {} : null", n(has), n(value)),
+        ResultPass::Slice { ptr, len, .. } => format!("Ffi.TakeArray({}, {})", n(ptr), n(len)),
+        ResultPass::String { ptr, len } => format!("Ffi.TakeString({}, {})", n(ptr), n(len)),
+        ResultPass::Bytes { ptr, len } => format!("Ffi.TakeBytes({}, {})", n(ptr), n(len)),
+        ResultPass::Buffer { ptr, len } => format!(
+            "Ffi.TakeBuffer({}, {}, {})",
+            n(ptr),
+            n(len),
+            read_lambda(cx, ty.expect("a buffered result has a type"), 0)
+        ),
+        ResultPass::Object {
+            result,
+            nullable,
+            interface,
+            ..
+        } => adopt(cx, &n(result), *nullable, interface),
     }
-    w.blank();
 }
 
 /// An async wrapper: a `Task`-returning method launching the call with a
 /// pending `FfiCall` as `context`, plus the `[UnmanagedCallersOnly]`
-/// completion that resolves it. A cancellable function takes a
-/// `CancellationToken` linked to the native cancel token.
+/// completion that resolves it. Every async method takes a
+/// `CancellationToken`: a cancellable function links it to the native
+/// cancel token; any other stops waiting when it fires.
+#[allow(clippy::too_many_arguments)]
 fn render_async(
     w: &mut CodeWriter,
+    docs: &Docs,
     f: &FnBinding,
     a: &AsyncBinding,
     name: &str,
     receiver: Receiver<'_>,
-    err: &ErrCtx<'_>,
+    err: &ErrCtx,
+    cx: Cx<'_>,
 ) {
-    let result_cs = f.ret.as_ref().map(cs_type);
-    let task = match &result_cs {
+    let value = f.ret.as_ref().and_then(|r| r.value());
+    let result = value.map(|ty| result_cs(&a.result, ty));
+    let task = match &result {
         Some(t) => format!("Task<{t}>"),
         None => "Task".into(),
     };
-    let call_ty = result_cs.clone().unwrap_or_else(|| "bool".into());
+    let call_ty = result.clone().unwrap_or_else(|| "FfiVoid".into());
     let complete = format!("Complete{name}");
-    let cx = err.cx;
     let m = Marshal::new(cx, &f.params);
     let mut extra = Vec::new();
-    if f.cancellable {
+    if a.cancellable() {
         extra.push("ffiCall.CancelToken()".to_string());
     }
     extra.push(format!("&{complete}"));
     extra.push("ffiCall.Context".to_string());
     let call = format!(
         "NativeMethods.{}({});",
-        a.launch.symbol,
+        f.abi.symbol,
         call_args(receiver, &m, &extra)
     );
 
-    write_header(w, f, err);
-    if f.cancellable {
-        w.line("/// <param name=\"cancellationToken\">Cancels the native call; the task");
-        w.line("/// then completes as canceled.</param>");
+    write_header(w, docs, f, err);
+    if a.cancellable() {
+        w.line("/// <param name=\"cancellationToken\">Cancels the native call; the task then");
+        w.line("/// completes as canceled.</param>");
+    } else {
+        w.line("/// <param name=\"cancellationToken\">Stops waiting: the task completes as");
+        w.line("/// canceled at once, and the native call, which can't be cancelled, finishes");
+        w.line("/// in the background and releases its result.</param>");
     }
-    let mut sig = params_sig(&f.params, false);
-    if f.cancellable {
-        sig.push("CancellationToken cancellationToken = default".into());
-    }
+    let mut sig = params_sig(&f.params);
+    sig.push("CancellationToken cancellationToken = default".into());
     let opener = match receiver {
         Receiver::Instance => format!("public {task} {name}"),
         _ => format!("public static {task} {name}"),
     };
     w.line(format!("{opener}({})", sig.join(", ")));
     w.block("{", "}", |w| {
-        if f.cancellable {
-            w.line("if (cancellationToken.IsCancellationRequested)");
-            w.block("{", "}", |w| {
-                let from = match &result_cs {
-                    Some(t) => format!("Task.FromCanceled<{t}>(cancellationToken)"),
-                    None => "Task.FromCanceled(cancellationToken)".into(),
-                };
-                w.line(format!("return {from};"));
-            });
-        }
+        w.line("if (cancellationToken.IsCancellationRequested)");
+        w.block("{", "}", |w| {
+            let from = match &result {
+                Some(t) => format!("Task.FromCanceled<{t}>(cancellationToken)"),
+                None => "Task.FromCanceled(cancellationToken)".into(),
+            };
+            w.line(format!("return {from};"));
+        });
         m.write_setup(w);
-        let token = if f.cancellable {
-            "cancellationToken"
-        } else {
-            ""
-        };
-        w.line(format!("var ffiCall = new FfiCall<{call_ty}>({token});"));
+        w.line(format!(
+            "var ffiCall = new FfiCall<{call_ty}>(cancellationToken);"
+        ));
         w.line("try");
         w.block("{", "}", |w| {
             m.pinned(w, |w| {
@@ -552,7 +480,7 @@ fn render_async(
             m.unregister(w);
             w.line("throw;");
         });
-        w.line("return ffiCall.Task;");
+        w.line("return ffiCall.Launched();");
     });
     w.blank();
 
@@ -560,7 +488,7 @@ fn render_async(
     let slots: Vec<String> = a
         .callback_params
         .iter()
-        .map(|s| format!("{} {}", cs_ctype(&s.ty), safe_cs_name(&s.name)))
+        .map(|s| format!("{} {}", cs_ctype(cx.ns, &s.ty), safe_cs_name(&s.name)))
         .collect();
     w.line(UNMANAGED_CALLERS_ONLY);
     w.line(format!(
@@ -578,21 +506,10 @@ fn render_async(
                 w.line(format!("ffiCall.SetError(err, {});", err.map));
                 w.line("return;");
             });
-            match &f.ret {
-                None => {
-                    w.line("ffiCall.SetResult(true);");
-                }
-                Some(ty) => {
-                    let pair = a.callback_params.iter().any(|s| s.name == "result_len");
-                    let (ptr, len) = if pair {
-                        ("result_ptr", "result_len")
-                    } else {
-                        ("result", "")
-                    };
-                    let expr = receive(cx, ty, ptr, len, Own::Take);
-                    w.line(format!("ffiCall.SetResult({expr});"));
-                }
-            }
+            w.line(format!(
+                "ffiCall.SetResult({});",
+                receive_result(cx, &a.result, value)
+            ));
         });
         w.line("catch (Exception e)");
         w.block("{", "}", |w| {
@@ -602,92 +519,154 @@ fn render_async(
     w.blank();
 }
 
-/// An iterator wrapper: the launcher runs eagerly (so launch errors throw
-/// at the call), and the returned single-use sequence pulls one item per
-/// `MoveNext` through a static `Next{Name}` helper. The native iterator is a
-/// `SafeHandle`, destroyed exactly once on exhaustion, disposal, or
-/// finalization.
+/// The locals `_next` writes an item into, the `&local` arguments passing
+/// them (in slot order), and the expression receiving the item.
+fn item_outs(cx: Cx<'_>, pass: &ItemPass, elem: &Ty) -> (Vec<String>, Vec<String>, String) {
+    let local = |slot: &AbiParam, name: &str| {
+        format!("{} {name} = default;", cs_ctype(cx.ns, pointee(slot)))
+    };
+    match pass {
+        ItemPass::Direct { out_item } => (
+            vec![local(out_item, "ffiItem")],
+            vec!["&ffiItem".into()],
+            "ffiItem".into(),
+        ),
+        ItemPass::OptDirect { out_has, out_item } => (
+            vec![local(out_has, "ffiHas"), local(out_item, "ffiItem")],
+            vec!["&ffiHas".into(), "&ffiItem".into()],
+            "ffiHas ? ffiItem : null".into(),
+        ),
+        ItemPass::Slice {
+            out_item, out_len, ..
+        } => (
+            vec![local(out_item, "ffiItem"), local(out_len, "ffiLen")],
+            vec!["&ffiItem".into(), "&ffiLen".into()],
+            "Ffi.TakeArray(ffiItem, ffiLen)".into(),
+        ),
+        ItemPass::String { out_item, out_len } => (
+            vec![local(out_item, "ffiItem"), local(out_len, "ffiLen")],
+            vec!["&ffiItem".into(), "&ffiLen".into()],
+            "Ffi.TakeString(ffiItem, ffiLen)".into(),
+        ),
+        ItemPass::Bytes { out_item, out_len } => (
+            vec![local(out_item, "ffiItem"), local(out_len, "ffiLen")],
+            vec!["&ffiItem".into(), "&ffiLen".into()],
+            "Ffi.TakeBytes(ffiItem, ffiLen)".into(),
+        ),
+        ItemPass::Buffer { out_item, out_len } => (
+            vec![local(out_item, "ffiItem"), local(out_len, "ffiLen")],
+            vec!["&ffiItem".into(), "&ffiLen".into()],
+            format!(
+                "Ffi.TakeBuffer(ffiItem, ffiLen, {})",
+                read_lambda(cx, elem, 0)
+            ),
+        ),
+        ItemPass::Object {
+            out_item,
+            nullable,
+            interface,
+            ..
+        } => (
+            vec![local(out_item, "ffiItem")],
+            vec!["&ffiItem".into()],
+            adopt(cx, "ffiItem", *nullable, interface),
+        ),
+    }
+}
+
+/// An iterator wrapper: a re-enumerable `IEnumerable<T>` whose every
+/// enumeration launches a new native iterator through a `Launch{Name}`
+/// helper and pulls one item per `MoveNext` through a static `Next{Name}`.
+/// Span parameters are copied once, since the sequence outlives the call.
+#[allow(clippy::too_many_arguments)]
 fn render_iterator(
     w: &mut CodeWriter,
+    docs: &Docs,
     f: &FnBinding,
     it: &IteratorBinding,
     name: &str,
     receiver: Receiver<'_>,
-    err: &ErrCtx<'_>,
+    err: &ErrCtx,
+    cx: Cx<'_>,
 ) {
-    let elem = cs_type(&it.elem);
+    let elem = item_cs(&it.item, &it.elem);
+    let launch = format!("Launch{name}");
     let next = format!("Next{name}");
-    let cx = err.cx;
     let m = Marshal::new(cx, &f.params);
-    let call = format!(
-        "NativeMethods.{}({})",
-        it.launch.symbol,
-        call_args(receiver, &m, &["&ffiErr".to_string()])
-    );
 
-    write_header(w, f, err);
-    w.line("/// <remarks>Streams lazily, one native call per item. The sequence can be");
-    w.line("/// enumerated once; disposing its enumerator (as <c>foreach</c> does)");
-    w.line("/// releases the native iterator.</remarks>");
+    write_header(w, docs, f, err);
+    w.line("/// <remarks>Streams lazily, one native call per item. Each enumeration launches a");
+    w.line("/// new native iterator, so a failure to start throws from");
+    w.line("/// <c>GetEnumerator</c> (the start of a <c>foreach</c>); disposing the enumerator");
+    w.line("/// (as <c>foreach</c> does) releases it.</remarks>");
     let ret = format!("IEnumerable<{elem}>");
     w.line(format!(
         "{}({})",
         opener(receiver, &ret, name),
-        params_sig(&f.params, false).join(", ")
+        params_sig(&f.params).join(", ")
+    ));
+    w.block("{", "}", |w| {
+        let mut args = Vec::new();
+        for p in &f.params {
+            let n = camel(&p.name);
+            if matches!(p.pass, ArgPass::Slice { .. } | ArgPass::Bytes { .. }) {
+                let copy = format!("{}Copy", p.name.to_lower_camel_case());
+                w.line(format!("var {copy} = {n}.ToArray();"));
+                args.push(copy);
+            } else {
+                args.push(n);
+            }
+        }
+        w.line(format!(
+            "return new FfiSequence<{elem}>(() => {launch}({}), &{next});",
+            args.join(", ")
+        ));
+    });
+    w.blank();
+
+    // The launcher: a sync call returning the native iterator.
+    let call = format!(
+        "NativeMethods.{}({})",
+        f.abi.symbol,
+        call_args(receiver, &m, &["&ffiErr".to_string()])
+    );
+    let modifier = match receiver {
+        Receiver::Instance => "private",
+        _ => "private static",
+    };
+    w.line(format!(
+        "{modifier} FfiIteratorHandle {launch}({})",
+        params_sig(&f.params).join(", ")
     ));
     w.block("{", "}", |w| {
         m.write_setup(w);
         w.line("var ffiErr = default(FfiError);");
         m.pinned(w, |w| {
-            if m.callbacks.is_empty() {
-                w.line(format!("var ffiResult = {call};"));
-            } else {
-                w.line("IntPtr ffiResult;");
-                w.line("try");
-                w.block("{", "}", |w| {
-                    w.line(format!("ffiResult = {call};"));
-                });
-                w.line("catch");
-                w.block("{", "}", |w| {
-                    m.unregister(w);
-                    w.line("throw;");
-                });
-            }
+            m.guarded(
+                w,
+                Some("IntPtr ffiResult;".into()),
+                &format!("ffiResult = {call};"),
+            );
             w.line(err.check("ffiErr"));
             w.line(format!(
-                "return new FfiSequence<{elem}>(new FfiIteratorHandle(ffiResult, &NativeMethods.{}), &{next});",
+                "return new FfiIteratorHandle(ffiResult, &NativeMethods.{});",
                 it.destroy_symbol
             ));
         });
     });
     w.blank();
 
-    // `_next` out-slots after the iterator handle, excluding `out_err`.
-    let outs: Vec<&AbiParam> = it
-        .next
-        .params
-        .iter()
-        .skip(1)
-        .filter(|s| s.name != "out_err")
-        .collect();
+    // `_next`: one item per call; 0 means exhausted.
+    let (locals, mut args, item) = item_outs(cx, &it.item, &it.elem);
+    args.insert(0, "iter".into());
+    args.push("&ffiErr".into());
     w.line(format!(
         "private static bool {next}(FfiIteratorHandle iter, out {elem} item)"
     ));
     w.block("{", "}", |w| {
-        let mut args = vec!["iter".to_string()];
-        for s in &outs {
-            let CType::Ptr { pointee, .. } = &s.ty else {
-                unreachable!("iterator out-slots are pointers")
-            };
-            let local = if s.name == "out_item" {
-                "ffiItem"
-            } else {
-                "ffiLen"
-            };
-            w.line(format!("{} {local} = default;", cs_ctype(pointee)));
-            args.push(format!("&{local}"));
+        for l in &locals {
+            w.line(l);
         }
-        args.push("&ffiErr".to_string());
         w.line("var ffiErr = default(FfiError);");
         w.line(format!(
             "var ffiMore = NativeMethods.{}({});",
@@ -700,32 +679,36 @@ fn render_iterator(
             w.line("item = default!;");
             w.line("return false;");
         });
-        let expr = receive(cx, &it.elem, "ffiItem", "ffiLen", Own::Take);
-        w.line(format!("item = {expr};"));
+        w.line(format!("item = {item};"));
         w.line("return true;");
     });
     w.blank();
 }
 
-/// Render one module's static class. Submodules become sibling classes named
-/// by their full path (`KvStats`), so a module class never shadows a type.
+/// The C# class of a module's free functions: its full path in PascalCase
+/// (`KvStats` for `kv.stats`), so a module class never shadows a type.
+pub(crate) fn module_class(m: &ModuleBinding) -> String {
+    m.segments.iter().map(|s| s.to_upper_camel_case()).collect()
+}
+
+/// Render one module's static class.
 pub(crate) fn render_module_class(
     w: &mut CodeWriter,
+    model: &Model,
+    docs: &Docs,
     m: &ModuleBinding,
-    error: Option<&ErrorBinding>,
     cx: Cx<'_>,
 ) {
     if m.functions.is_empty() {
         return;
     }
-    let class: String = m.segments.iter().map(|s| s.to_upper_camel_case()).collect();
-    write_doc(w, &m.doc);
-    w.line(format!("public static unsafe class {class}"));
+    docs.summary(w, &m.doc);
+    w.line(format!("public static unsafe class {}", module_class(m)));
     w.block("{", "}", |w| {
         for f in &m.functions {
             let name = f.name.to_upper_camel_case();
-            let err = ErrCtx::for_fn(f, error, cx);
-            render_callable(w, f, &name, Receiver::Static, &err);
+            let err = ErrCtx::new(model, &f.error, cx);
+            render_callable(w, docs, f, &name, Receiver::Static, &err, cx);
         }
     });
     w.blank();
