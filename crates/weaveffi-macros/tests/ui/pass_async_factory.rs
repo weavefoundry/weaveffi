@@ -8,15 +8,11 @@ mod store {
 
     #[weaveffi::error]
     #[repr(i32)]
+    #[derive(Debug)]
     pub enum StoreError {
         /// Empty path
+        #[weaveffi(message = "invalid path")]
         InvalidPath = 1,
-    }
-
-    impl std::fmt::Display for StoreError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("invalid path")
-        }
     }
 
     #[weaveffi::interface]
@@ -52,6 +48,8 @@ mod store {
         }
     }
 }
+
+weaveffi::export_runtime!();
 
 fn main() {
     let _ = store::Store::new("x".into()).path();

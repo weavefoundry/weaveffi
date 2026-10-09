@@ -5,6 +5,8 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::weaveffi;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -14,9 +16,25 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// A 64-bit little-endian ELF shared-object header with no sections: a
+/// Linux library that needs no glibc version beyond the 2.17 floor, which
+/// is what the wheel's manylinux tag is read from.
+fn minimal_elf() -> Vec<u8> {
+    let mut elf = vec![0u8; 64];
+    elf[..4].copy_from_slice(b"\x7fELF");
+    elf[4] = 2; // ELFCLASS64
+    elf[5] = 1; // ELFDATA2LSB
+    elf[6] = 1; // EV_CURRENT
+    elf[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    elf[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+    elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+    elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    elf
+}
+
 /// Lay out a fake `--binaries` tree (`<dir>/<platform>/<lib>`) covering the
 /// desktop matrix, with placeholder library bytes so packaging has something
-/// to copy.
+/// to copy (a bare ELF header on Linux).
 fn write_prebuilt(root: &Path, lib_base: &str) {
     let entries = [
         ("darwin-arm64", format!("lib{lib_base}.dylib")),
@@ -28,7 +46,12 @@ fn write_prebuilt(root: &Path, lib_base: &str) {
     for (platform, lib) in entries {
         let dir = root.join(platform);
         std::fs::create_dir_all(&dir).expect("create platform dir");
-        std::fs::write(dir.join(&lib), b"\x00fake-native\x01").expect("write fake lib");
+        let bytes = if platform.starts_with("linux") {
+            minimal_elf()
+        } else {
+            b"\x00fake-native\x01".to_vec()
+        };
+        std::fs::write(dir.join(&lib), bytes).expect("write fake lib");
     }
     std::fs::write(
         root.join("darwin-arm64")
@@ -45,7 +68,7 @@ fn calculator_idl(dir: &Path) -> PathBuf {
     std::fs::write(
         &idl,
         concat!(
-            "version: \"0.11.0\"\n",
+            "version: \"0.12.0\"\n",
             "modules:\n",
             "  - name: calculator\n",
             "    functions:\n",
@@ -59,10 +82,6 @@ fn calculator_idl(dir: &Path) -> PathBuf {
     )
     .unwrap();
     idl
-}
-
-fn weaveffi() -> assert_cmd::Command {
-    assert_cmd::Command::cargo_bin("weaveffi").expect("binary not found")
 }
 
 /// The `(path, bytes)` entries of a gzipped tarball.
@@ -91,15 +110,36 @@ fn package_writes_installable_artifacts_from_binaries() {
     let out = tempfile::tempdir().expect("temp out dir");
     let dist = out.path();
 
+    let targets = ["python", "node", "ruby", "c", "go"];
     weaveffi()
         .args(["package", input.to_str().unwrap(), "--binaries"])
         .arg(bins.path())
-        .args(["--target", "python,node,ruby,c,go", "-o"])
+        .args(["--target", &targets.join(","), "-o"])
         .arg(dist)
         .assert()
         .success();
 
-    // Python: one platform-tagged wheel per desktop platform.
+    python_wheels(dist);
+    node_tarballs(dist);
+    ruby_gems(dist);
+
+    // C: headers and every platform's library in one tarball.
+    let c = untar_gz(&dist.join("c/calculator-1.0.0-c.tar.gz"));
+    let names: Vec<&str> = c.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"calculator-1.0.0/include/calculator.h"),
+        "{names:?}"
+    );
+    assert!(
+        names.contains(&"calculator-1.0.0/lib/windows-x64/calculator.dll"),
+        "{names:?}"
+    );
+
+    go_module(dist);
+}
+
+/// Python: one platform-tagged wheel per desktop platform.
+fn python_wheels(dist: &Path) {
     for wheel in [
         "calculator-1.0.0-py3-none-macosx_11_0_arm64.whl",
         "calculator-1.0.0-py3-none-macosx_11_0_x86_64.whl",
@@ -109,9 +149,11 @@ fn package_writes_installable_artifacts_from_binaries() {
     ] {
         assert!(dist.join("python").join(wheel).is_file(), "missing {wheel}");
     }
+}
 
-    // Node: per-platform tarballs with the library (and the prebuilt addon
-    // where one was built), plus the main package.
+/// Node: per-platform tarballs with the library (and the prebuilt addon
+/// where one was built), plus the main package.
+fn node_tarballs(dist: &Path) {
     let mac = untar_gz(&dist.join("node/calculator-darwin-arm64-1.0.0.tgz"));
     let names: Vec<&str> = mac.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(
@@ -134,8 +176,10 @@ fn package_writes_installable_artifacts_from_binaries() {
         package_json.contains("\"calculator-darwin-arm64\": \"1.0.0\""),
         "{package_json}"
     );
+}
 
-    // Ruby: one precompiled gem per desktop platform.
+/// Ruby: one precompiled gem per desktop platform.
+fn ruby_gems(dist: &Path) {
     for gem in [
         "calculator-1.0.0-arm64-darwin.gem",
         "calculator-1.0.0-x86_64-linux.gem",
@@ -143,20 +187,10 @@ fn package_writes_installable_artifacts_from_binaries() {
     ] {
         assert!(dist.join("ruby").join(gem).is_file(), "missing {gem}");
     }
+}
 
-    // C: headers and every platform's library in one tarball.
-    let c = untar_gz(&dist.join("c/calculator-1.0.0-c.tar.gz"));
-    let names: Vec<&str> = c.iter().map(|(n, _)| n.as_str()).collect();
-    assert!(
-        names.contains(&"calculator-1.0.0/include/calculator.h"),
-        "{names:?}"
-    );
-    assert!(
-        names.contains(&"calculator-1.0.0/lib/windows-x64/calculator.dll"),
-        "{names:?}"
-    );
-
-    // Go: the module directory with per-platform libraries and cgo flags.
+/// Go: the module directory with per-platform libraries and cgo flags.
+fn go_module(dist: &Path) {
     let bindings = std::fs::read_to_string(dist.join("go/calculator/bindings.go")).unwrap();
     assert!(
         bindings.contains("#cgo linux,amd64 LDFLAGS: -L${SRCDIR}/lib/linux-x64"),
@@ -201,7 +235,7 @@ fn package_names_the_missing_platform_library() {
     let output = weaveffi()
         .args(["package", input.to_str().unwrap(), "--binaries"])
         .arg(bins.path())
-        .args(["--platforms", "android-arm64", "--target", "kotlin"])
+        .args(["--platforms", "android-arm64", "--target", "c"])
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -219,7 +253,7 @@ fn build_without_a_cargo_toml_explains_the_alternatives() {
     let idl = dir.path().join("greeter.yml");
     std::fs::write(
         &idl,
-        "version: \"0.11.0\"\nmodules:\n  - name: greeter\n    functions:\n      - { name: hi, params: [], return: i32 }\n",
+        "version: \"0.12.0\"\nmodules:\n  - name: greeter\n    functions:\n      - { name: hi, params: [], return: i32 }\n",
     )
     .unwrap();
     for command in ["build", "package"] {
@@ -263,5 +297,9 @@ fn build_rejects_unknown_and_foreign_platforms_before_compiling() {
     assert!(!output.status.success());
     let err = crate::stderr(&output);
     assert!(err.contains("can only be built on a"), "{err}");
+    assert!(
+        err.contains("none of the requested platforms can be built"),
+        "{err}"
+    );
     assert!(!err.contains("Compiling"), "checks run before cargo: {err}");
 }

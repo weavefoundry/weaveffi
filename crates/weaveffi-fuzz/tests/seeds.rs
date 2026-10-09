@@ -52,13 +52,6 @@ fn parse_json_seed_is_well_formed() {
 }
 
 #[test]
-fn parse_toml_seed_is_well_formed() {
-    let s = seed("fuzz_parse_toml", "minimal.toml");
-    let api = parse_api_str(&s, "toml").expect("seed must parse as TOML");
-    assert_eq!(api.modules.len(), 1);
-}
-
-#[test]
 fn parse_type_ref_seed_is_well_formed() {
     let s = seed("fuzz_parse_type_ref", "minimal.txt");
     parse_type_ref(s.trim()).expect("seed must parse as a TypeRef");
@@ -87,15 +80,6 @@ fn parse_json_target_does_not_panic_on_garbage() {
     for data in [&b""[..], b"\xff", b"{", b"{\"version\":}"] {
         if let Ok(s) = std::str::from_utf8(data) {
             let _ = parse_api_str(s, "json");
-        }
-    }
-}
-
-#[test]
-fn parse_toml_target_does_not_panic_on_garbage() {
-    for data in [&b""[..], b"\xff", b"=", b"version = ["] {
-        if let Ok(s) = std::str::from_utf8(data) {
-            let _ = parse_api_str(s, "toml");
         }
     }
 }

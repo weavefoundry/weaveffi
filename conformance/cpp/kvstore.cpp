@@ -1,4 +1,4 @@
-// Conformance consumer: kvstore sample, C++ target (ABI revision 4).
+// Conformance consumer: kvstore sample, C++ target (ABI revision 5).
 //
 // Drives the feature-complete producer through the generated header:
 //
@@ -8,22 +8,29 @@
 //     statics, the deprecated `size`, records (`Entry`, `StoreInfo`), the
 //     `EntryKind` enum, maps and optionals, and the logical clock;
 //   * the `KvError` hierarchy with payload fields (`KeyNotFoundError`,
-//     `ExpiredError`, `StoreFullError`, `RejectedError`) and runtime codes on
-//     throwing calls (the root `Error`);
-//   * lazy ranges of strings (throwing), records, and objects;
-//   * three callback interfaces implemented as subclasses: a `Listener`
+//     `ExpiredError`, `StoreFullError`, `RejectedError`,
+//     `CallbackFailedError`) and runtime codes on throwing calls (the root
+//     `Error`);
+//   * lazy `Range`s of strings (throwing), records, objects, and optional
+//     scalars;
+//   * four callback interfaces implemented as subclasses: a `Listener`
 //     (retained, filtered by `accepts`, told about every `Change`, detached
 //     when it throws, and notified from a producer thread during
-//     compaction), a `Policy` (a record return, a typed `RejectedError`
-//     thrown back through `put` with its fields, an object parameter and
-//     object return, and returns the producer rejects), and a `Loader` passed
-//     as an optional callback (string, bytes, and optional-object returns;
-//     typed errors decoded by the producer or passed through);
-//   * `Store` objects in every position, compared by native identity;
+//     compaction), a `Policy` (an optional scalar parameter and return in
+//     `ttl_for`, a record return, a typed `RejectedError` thrown back through
+//     `put` with its fields, an object parameter and object return, and
+//     failures the sample turns into `CallbackFailedError`), a `Loader`
+//     passed as an optional callback (string, bytes, and optional-object
+//     returns; typed errors decoded by the producer or passed through), and
+//     a `Scorer` taking and returning typed arrays;
+//   * `Store` objects in every position, compared by identity (`==`);
 //   * futures: an async free function returning an object, a cancellable
 //     method cancelled mid-pause, an async list, an async function in the
 //     nested `kv.stats` module, and concurrent calls;
-//   * the nested `kv.stats` module and the sibling `report` root.
+//   * the nested `kv.stats` module and the sibling `report` root;
+//   * the ABI 5 shapes: an optional scalar return, iterator item, and async
+//     result; typed arrays as a return and an async result; a `usize`
+//     return; and a `throws: any` method failing with the root `Error` (-1).
 //
 // Ends by asserting every callback implementation was released and the
 // producer's leak counters are all zero.
@@ -55,6 +62,7 @@ static const std::thread::id g_main_thread = std::this_thread::get_id();
 static std::atomic<int> g_listeners_freed{0};
 static std::atomic<int> g_policies_freed{0};
 static std::atomic<int> g_loaders_freed{0};
+static std::atomic<int> g_scorers_freed{0};
 
 static std::vector<uint8_t> bytes(std::string_view s) { return std::vector<uint8_t>(s.begin(), s.end()); }
 
@@ -190,8 +198,8 @@ static void iterators() {
     CHECK(parts.size() == 3);
     const uint32_t counts[] = {2, 1, 0};
     for (size_t i = 0; i < parts.size(); ++i) {
-        CHECK(parts[i].handle() != s.handle());
-        for (size_t j = 0; j < i; ++j) CHECK(parts[i].handle() != parts[j].handle());
+        CHECK(parts[i] != s);
+        for (size_t j = 0; j < i; ++j) CHECK(parts[i] != parts[j]);
         CHECK(parts[i].count() == counts[i] && parts[i].path() == prefixes[i]);
     }
 }
@@ -296,8 +304,9 @@ static void listeners() {
     put(s, "boom", "1");
     CHECK(s.count() == 2 && s.listener_count() == 0 && failing.use_count() == 1);
 
-    // A null listener is refused before the call.
-    expect_throw<std::invalid_argument>([&] { s.subscribe(nullptr); }, "subscribe(nullptr)");
+    // A null listener is refused before the call, as a marshalling failure.
+    Error null_listener = expect_throw<Error>([&] { s.subscribe(nullptr); }, "subscribe(nullptr)");
+    CHECK(null_listener.code() == -3);
 
     // Destroying the store releases the listeners it still holds.
     freed = g_listeners_freed;
@@ -321,6 +330,15 @@ public:
 
     explicit TestPolicy(Store other) : other_(std::move(other)) {}
     ~TestPolicy() override { ++g_policies_freed; }
+
+    // "short" lives one tick, "forever" never expires, "ttl-fail" fails with
+    // a typed error, and every other key keeps the requested TTL.
+    std::optional<int64_t> ttl_for(std::string_view key, std::optional<int64_t> requested) override {
+        if (key == "short") return 1;
+        if (key == "forever") return std::nullopt;
+        if (key == "ttl-fail") throw InvalidPathError("no ttl for you");
+        return requested;
+    }
 
     Entry admit(const Entry& entry) override {
         ++admitted;
@@ -367,24 +385,32 @@ static void policies() {
     CHECK(s.count() == 1 && other.count() == 1);
 
     // A typed error thrown by the throwing callback reaches the caller with
-    // its code, message, and fields.
+    // its code and fields, and the domain's own message for them.
     RejectedError rej = expect_throw<RejectedError>([&] { put(s, "secret", "3"); }, "Rejected");
     CHECK(rej.code() == 1005 && rej.key == "secret" && rej.reason == "no secrets");
-    CHECK(std::string(rej.what()) == "secrets are not stored");
+    CHECK(std::string(rej.what()) == "write to secret rejected: no secrets");
 
-    // Any other exception arrives as -4 with its message.
-    Error boom = expect_throw<Error>([&] { put(s, "boom", "4"); }, "non-domain failure");
-    CHECK(boom.code() == -4 && std::string(boom.what()) == "policy exploded");
-    CHECK(dynamic_cast<const KvError*>(&boom) == nullptr);
+    // Any other exception reaches the producer as a callback failure, which
+    // the sample turns into CallbackFailed with the exception's message.
+    CallbackFailedError boom =
+        expect_throw<CallbackFailedError>([&] { put(s, "boom", "4"); }, "non-domain failure");
+    CHECK(boom.code() == 1006 && boom.message == "policy exploded");
+    CHECK(std::string(boom.what()) == "policy exploded");
 
-    // A return the producer can't accept is -3: a malformed record, or a
+    // So is a return the producer can't accept: a malformed record, or a
     // null required object.
-    Error garbage = expect_throw<Error>([&] { put(s, "garbage", "5"); }, "malformed admit");
-    CHECK(garbage.code() == -3);
-    Error null_route = expect_throw<Error>([&] { put(s, "null/x", "6"); }, "null route");
-    CHECK(null_route.code() == -3);
+    expect_throw<CallbackFailedError>([&] { put(s, "garbage", "5"); }, "malformed admit");
+    expect_throw<CallbackFailedError>([&] { put(s, "null/x", "6"); }, "null route");
     CHECK(s.count() == 1 && other.count() == 1);
     CHECK(policy->admitted == 6 && policy->saw_version_zero);
+
+    // ttl_for: an optional scalar in and out, consulted before admit.
+    CHECK(put(s, "short", "x", EntryKind::Volatile).expires_at == 1);
+    CHECK(!put(s, "forever", "x", EntryKind::Volatile, 5).expires_at.has_value());
+    CHECK(put(s, "kept", "x", EntryKind::Volatile, 5).expires_at == 5);
+    InvalidPathError ttl = expect_throw<InvalidPathError>([&] { put(s, "ttl-fail", "x"); }, "ttl_for fails");
+    CHECK(ttl.code() == 1004 && std::string(ttl.what()) == "invalid path");
+    CHECK(s.count() == 4 && policy->admitted == 9);
 
     // Replacing the policy releases the old one; an empty pointer removes it.
     s.set_policy(std::make_shared<TestPolicy>(other));
@@ -393,7 +419,7 @@ static void policies() {
     s.set_policy(nullptr);
     CHECK(g_policies_freed == freed + 1 && !s.has_policy());
     put(s, "secret", "now allowed");
-    CHECK(s.count() == 2);
+    CHECK(s.count() == 5);
 }
 
 // ── loader ──────────────────────────────────────────────────────────────────
@@ -442,9 +468,10 @@ static void loaders() {
     CHECK(!s.get_or_load("missing", loader).has_value());
     KeyNotFoundError nf =
         expect_key_not_found([&] { s.get_or_load("elsewhere", loader); }, "other", "elsewhere");
-    CHECK(std::string(nf.what()) == "not in the loader");
-    Error broken = expect_throw<Error>([&] { s.get_or_load("broken", loader); }, "broken loader");
-    CHECK(broken.code() == -4 && std::string(broken.what()) == "loader is broken");
+    CHECK(std::string(nf.what()) == "key not found: other");
+    CallbackFailedError broken =
+        expect_throw<CallbackFailedError>([&] { s.get_or_load("broken", loader); }, "broken loader");
+    CHECK(broken.message == "loader is broken");
     CHECK(loader.use_count() == 1);
     int freed = g_loaders_freed;
     loader.reset();
@@ -537,8 +564,9 @@ static void object_graph() {
     CHECK(larger.has_value() && larger->handle() == s.handle());
 
     StoreInfo info = s.describe("main", fork);
-    CHECK(info.label == "main" && info.store.handle() == s.handle() && info.count == 1);
-    CHECK(info.mirror.has_value() && info.mirror->handle() == fork.handle());
+    CHECK(info.label == "main" && info.store == s && info.count == 1);
+    CHECK(info.mirror == fork);
+    CHECK(info == s.describe("main", fork) && info != s.describe("other", fork));
     CHECK(info.mirror->count() == 2);
 
     std::vector<Store> many = Store::open_many({"/a", "/b"});
@@ -582,6 +610,78 @@ static void stats_and_report() {
     CHECK(dynamic_cast<const KvError*>(&none) == nullptr);
 }
 
+// ── scorer and the ABI 5 shapes ─────────────────────────────────────────────
+
+enum class ScoreMode { Sizes, Fail, Short };
+
+// Scores each value size as itself; fails, or returns too few scores, on
+// request.
+class TestScorer : public Scorer {
+    ScoreMode mode_;
+
+public:
+    explicit TestScorer(ScoreMode mode) : mode_(mode) {}
+    ~TestScorer() override { ++g_scorers_freed; }
+
+    std::vector<double> scores(const std::vector<uint64_t>& sizes) override {
+        if (mode_ == ScoreMode::Sizes) CHECK((sizes == std::vector<uint64_t>{1, 3, 2}));
+        if (mode_ == ScoreMode::Fail) throw std::runtime_error("scorer is out of order");
+        std::vector<double> out;
+        for (uint64_t size : sizes) out.push_back(static_cast<double>(size));
+        if (mode_ == ScoreMode::Short) out.resize(1);
+        return out;
+    }
+};
+
+static void abi5_shapes() {
+    Store s = Store::open("/abi5");
+    put(s, "b", "12");
+    put(s, "a", "\x01\x02\x03", EntryKind::Volatile, 7);
+    CHECK(s.count() == 2);
+
+    // An optional scalar return.
+    CHECK(s.expires_at("a") == 7);
+    CHECK(!s.expires_at("b").has_value());
+    CHECK(!s.expires_at("zzz").has_value());
+
+    // A typed-array return, in key order.
+    CHECK((s.value_sizes() == std::vector<uint64_t>{3, 2}));
+
+    // Optional scalar iterator items: an absent item isn't the end.
+    std::vector<std::optional<int64_t>> expirations;
+    for (const std::optional<int64_t>& at : s.expirations()) expirations.push_back(at);
+    CHECK((expirations == std::vector<std::optional<int64_t>>{7, std::nullopt}));
+
+    // An optional scalar async result and a typed-array async result.
+    CHECK(s.version_of("a").get() == 1u);
+    CHECK(!s.version_of("q").get().has_value());
+    put(s, "b", "x");
+    CHECK((s.versions({"b", "q", "a"}).get() == std::vector<uint32_t>{2, 0, 1}));
+
+    // A callback taking and returning typed arrays.
+    Store r = Store::open("/rank");
+    put(r, "a", "1");
+    put(r, "b", "333");
+    put(r, "c", "22");
+    CHECK((r.rank(std::make_shared<TestScorer>(ScoreMode::Sizes)) == std::vector<std::string>{"b", "c", "a"}));
+    CallbackFailedError failed = expect_throw<CallbackFailedError>(
+        [&] { r.rank(std::make_shared<TestScorer>(ScoreMode::Fail)); }, "failing scorer");
+    CHECK(failed.message == "scorer is out of order");
+    failed = expect_throw<CallbackFailedError>(
+        [&] { r.rank(std::make_shared<TestScorer>(ScoreMode::Short)); }, "short scorer");
+    CHECK(failed.message == "expected 3 scores, got 1");
+    CHECK(g_scorers_freed == 3);
+
+    // `throws: any` and a `usize` return: the root Error with code -1.
+    Store imp = Store::open("/import");
+    CHECK(imp.import_lines("a=1\n\nb=two\n") == 2u);
+    CHECK(imp.get("b").value == bytes("two"));
+    Error e = expect_throw<Error>([&] { imp.import_lines("c=3\nbroken\nd=4"); }, "import_lines");
+    CHECK(e.code() == -1 && std::string(e.what()) == "line 2: expected key=value");
+    CHECK(dynamic_cast<const KvError*>(&e) == nullptr);
+    CHECK(imp.count() == 3);
+}
+
 int main() {
     load_checks();
     constructors();
@@ -593,10 +693,12 @@ int main() {
     async_calls();
     object_graph();
     stats_and_report();
+    abi5_shapes();
 
     CHECK(kvstore_debug_live(1) == 0);
     check_no_leaks(kvstore_debug_live, "kvstore");
-    std::printf("cpp/kvstore: OK (%d listeners, %d policies, %d loaders released)\n",
-                g_listeners_freed.load(), g_policies_freed.load(), g_loaders_freed.load());
+    std::printf("cpp/kvstore: OK (%d listeners, %d policies, %d loaders, %d scorers released)\n",
+                g_listeners_freed.load(), g_policies_freed.load(), g_loaders_freed.load(),
+                g_scorers_freed.load());
     return 0;
 }

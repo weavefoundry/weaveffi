@@ -1,112 +1,146 @@
-//! Godoc comments: a declaration's doc starts with its name ("Path returns
-//! the path the store was opened with."), followed by any further
-//! paragraphs and a final `Deprecated:` paragraph.
+//! Go doc comments, rendered from the shared [`Doc`] text.
+//!
+//! IDL docs are copied as written, with backticked API identifiers turned
+//! into Go doc links (`` `new_op` `` is `[NewOp]`, a method `[Store.Get]`)
+//! or their Go spelling (a field `ExpiresAt`, a parameter `ttlSeconds`).
+//! Go convention starts the doc of an exported package-level declaration
+//! with its name, so a summary that doesn't is prefixed with `Name: `;
+//! fields, constants, and interface methods keep their text as is. A
+//! deprecation becomes the final `Deprecated:` paragraph that Go tools
+//! recognize.
 
+use std::collections::BTreeMap;
+
+use crate::codegen::common::wrap;
+use crate::codegen::docs::{map_code_spans, ApiNames, Doc, IdentKind};
 use crate::codegen::CodeWriter;
-use weaveffi_model::model::ParamBinding;
+use weaveffi_model::model::Model;
+
+use crate::targets::go::names::{method_param, pascal, GoNames};
 
 /// The width generated comment text wraps at (IDL docs keep their own line
 /// breaks).
 const WRAP: usize = 76;
 
-/// What a doc comment describes, which decides how a summary that doesn't
-/// start with the name is joined to it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Kind {
-    /// A function or method with a result: "The path ..." reads "Path
-    /// returns the path ...".
-    Func,
-    /// A function or method without one: only a third-person verb or
-    /// "Whether" joins the name directly.
-    Proc,
-    /// A type or field: "The store's clock" reads "Clock is the store's
-    /// clock".
-    Value,
-    /// A variant, constant, or error code, whose IDL doc is often a clause
-    /// ("An entry was stored."): only a third-person verb joins the name
-    /// directly.
-    Clause,
+/// Every API identifier a doc may name in backticks, with its Go spelling.
+pub(crate) struct DocNames<'a> {
+    api: ApiNames,
+    go: &'a GoNames,
+    /// Enum variants (C-style constants and rich-enum structs) by C
+    /// constant.
+    variants: BTreeMap<String, String>,
 }
 
-impl Kind {
-    /// [`Kind::Func`] for a callable with a result, else [`Kind::Proc`].
-    pub(crate) fn callable(returns: bool) -> Self {
-        if returns {
-            Kind::Func
-        } else {
-            Kind::Proc
+impl<'a> DocNames<'a> {
+    /// Index the identifiers of `model`, spelled per `go`.
+    pub(crate) fn new(model: &Model, go: &'a GoNames) -> Self {
+        let variants = model
+            .modules
+            .iter()
+            .flat_map(|m| &m.enums)
+            .flat_map(|e| {
+                e.variants.iter().map(move |v| {
+                    (
+                        v.c_const.clone(),
+                        format!("{}{}", pascal(&e.name), pascal(&v.name)),
+                    )
+                })
+            })
+            .collect();
+        Self {
+            api: ApiNames::new(model),
+            go,
+            variants,
         }
+    }
+
+    /// The Go replacement for a backticked identifier, backticks included:
+    /// a doc link for a package-level name or method, the plain Go spelling
+    /// for a field or parameter, and `None` (kept as written) for a module
+    /// or an identifier that names declarations of different kinds.
+    fn replace(&self, ident: &str) -> Option<String> {
+        let link = |s: &str| Some(format!("[{s}]"));
+        match self.api.kind(ident)? {
+            IdentKind::Function | IdentKind::Member => {
+                link(self.go.callable(self.api.c_name(ident)?)?)
+            }
+            IdentKind::Type => link(&pascal(ident)),
+            IdentKind::ErrorDomain => link(&self.go.domain(ident).iface),
+            IdentKind::ErrorCode => link(self.go.code_by_const(self.api.c_name(ident)?)?),
+            IdentKind::Variant => link(self.variants.get(self.api.c_name(ident)?)?),
+            IdentKind::Field | IdentKind::CallbackMethod => Some(pascal(ident)),
+            IdentKind::Param => Some(method_param(ident)),
+            IdentKind::Module => None,
+        }
+    }
+
+    /// `text` with its backticked identifiers in Go spelling.
+    pub(crate) fn render(&self, text: &str) -> String {
+        map_code_spans(text, |ident| self.replace(ident))
+    }
+
+    /// The doc text and deprecation message of a declaration, rendered.
+    pub(crate) fn of(
+        &self,
+        doc: &Option<String>,
+        deprecated: &Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        let d = Doc::new(doc, deprecated);
+        let keep = |_: &str| None;
+        (
+            d.text(keep).map(|t| self.render(&t)),
+            d.deprecation(keep).map(|t| self.render(&t)),
+        )
     }
 }
 
-/// A godoc comment under construction: the summary paragraph naming the
-/// declaration, then further paragraphs, then `Deprecated:`.
+/// A Go doc comment under construction: paragraphs, then `Deprecated:`.
+#[derive(Default)]
 pub(crate) struct GoDoc {
-    name: String,
-    paragraphs: Vec<Vec<String>>,
+    paragraphs: Vec<String>,
     deprecated: Option<String>,
 }
 
 impl GoDoc {
-    /// A doc for `name` whose summary is the IDL doc `doc`, joined to the
-    /// name per `kind`, or `fallback` (which must start with the name)
-    /// when there's no IDL doc.
-    pub(crate) fn new(name: &str, doc: Option<&str>, kind: Kind, fallback: Option<String>) -> Self {
-        let mut paragraphs = Vec::new();
-        match doc.map(str::trim).filter(|d| !d.is_empty()) {
-            Some(d) => {
-                // Blank lines separate paragraphs.
-                let mut current = Vec::new();
-                for (i, line) in d.lines().enumerate() {
-                    let line = line.trim_end();
-                    if line.is_empty() {
-                        if !current.is_empty() {
-                            paragraphs.push(std::mem::take(&mut current));
-                        }
-                    } else if i == 0 {
-                        current.push(lead(name, line, kind));
-                    } else {
-                        current.push(line.to_string());
-                    }
-                }
-                if !current.is_empty() {
-                    paragraphs.push(current);
-                }
+    /// The doc of the exported package-level declaration `name`: `text`,
+    /// prefixed with `Name: ` unless its first word is already the name.
+    pub(crate) fn decl(name: &str, text: Option<String>) -> Self {
+        let mut doc = Self::default();
+        if let Some(text) = text {
+            let first = text.split_whitespace().next().unwrap_or_default();
+            if first.trim_end_matches(['.', ',', ':', ';', '\'']) == name {
+                doc.paragraphs.push(text);
+            } else {
+                doc.paragraphs.push(format!("{name}: {text}"));
             }
-            None => paragraphs.extend(fallback.map(|f| wrap(&f))),
         }
+        doc
+    }
+
+    /// A doc whose text needs no name (a field, constant, or interface
+    /// method).
+    pub(crate) fn plain(text: Option<String>) -> Self {
         Self {
-            name: name.to_string(),
-            paragraphs,
+            paragraphs: text.into_iter().collect(),
             deprecated: None,
         }
     }
 
-    /// Append a paragraph of generated text, rewrapped. When it's the
-    /// first, it's joined to the name ("Wait blocks until ...").
+    /// Append a paragraph of generated text, rewrapped.
     pub(crate) fn para(mut self, text: &str) -> Self {
-        let text = if self.paragraphs.is_empty() {
-            format!("{} {}", self.name, lower_first(text))
-        } else {
-            text.to_string()
-        };
-        self.paragraphs.push(wrap(&text));
+        self.paragraphs.push(wrap(text, WRAP));
         self
     }
 
-    /// Append a "Parameters:" list for the documented parameters, labelled
-    /// with their Go spellings (`name`).
-    pub(crate) fn params(mut self, params: &[ParamBinding], name: impl Fn(&str) -> String) -> Self {
+    /// Append a list of the documented parameters, labelled with their Go
+    /// spellings: `(name, doc)` pairs.
+    pub(crate) fn params(mut self, params: impl IntoIterator<Item = (String, String)>) -> Self {
         let mut list = Vec::new();
-        for p in params {
-            let Some(doc) = p.doc.as_deref().map(str::trim).filter(|d| !d.is_empty()) else {
-                continue;
-            };
+        for (name, doc) in params {
             let mut lines = doc.lines();
-            let first = lines.next().unwrap_or_default();
-            list.push(format!("  - {}: {first}", name(&p.name)));
+            list.push(format!("  - {name}: {}", lines.next().unwrap_or_default()));
             list.extend(lines.map(|l| {
-                if l.is_empty() {
+                if l.trim().is_empty() {
                     String::new()
                 } else {
                     format!("    {l}")
@@ -114,39 +148,30 @@ impl GoDoc {
             }));
         }
         if !list.is_empty() {
-            if self.paragraphs.is_empty() {
-                self.paragraphs
-                    .push(vec![format!("{} takes these parameters:", self.name)]);
-            } else {
-                self.paragraphs.push(vec!["Parameters:".into()]);
-            }
-            self.paragraphs.push(list);
+            self.paragraphs.push("Parameters:".into());
+            self.paragraphs.push(list.join("\n"));
         }
         self
     }
 
     /// Set the `Deprecated:` paragraph.
-    pub(crate) fn deprecated(mut self, msg: Option<&str>) -> Self {
-        self.deprecated = msg.map(str::to_string);
+    pub(crate) fn deprecated(mut self, msg: Option<String>) -> Self {
+        self.deprecated = msg;
         self
-    }
-
-    /// `true` when the comment has no paragraph yet.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.paragraphs.is_empty()
     }
 
     /// Write the comment at the writer's indentation.
     pub(crate) fn emit(self, w: &mut CodeWriter) {
         let mut paragraphs = self.paragraphs;
         if let Some(msg) = self.deprecated {
-            paragraphs.push(vec![format!("Deprecated: {msg}")]);
+            paragraphs.push(wrap(&format!("Deprecated: {msg}"), WRAP));
         }
         for (i, p) in paragraphs.iter().enumerate() {
             if i > 0 {
                 w.line("//");
             }
-            for line in p {
+            for line in p.lines() {
+                let line = line.trim_end();
                 if line.is_empty() {
                     w.line("//");
                 } else {
@@ -157,145 +182,10 @@ impl GoDoc {
     }
 }
 
-/// The first line of an IDL summary, made to start with `name`: kept when
-/// it already does; a third-person verb ("Returns ...") follows the name in
-/// lowercase; "Whether ..." becomes "reports whether ..." for a callable or
-/// field; "The ...", "A ...", or a wh-word becomes "returns ..." for a
-/// callable with a result and "is ..." for a type or field; anything else
-/// follows the name after a colon.
-fn lead(name: &str, first: &str, kind: Kind) -> String {
-    let word = first.split_whitespace().next().unwrap_or_default();
-    if word.trim_end_matches(['.', ',', ':', '\'']) == name {
-        return first.to_string();
-    }
-    let lowered = lower_first(first);
-    let noun = matches!(
-        word,
-        "The" | "A" | "An" | "How" | "What" | "When" | "Where" | "Which" | "Who" | "Why"
-    );
-    match kind {
-        _ if third_person(word) => format!("{name} {lowered}"),
-        Kind::Func | Kind::Proc | Kind::Value if word == "Whether" => {
-            format!("{name} reports {lowered}")
-        }
-        Kind::Func if noun => format!("{name} returns {lowered}"),
-        Kind::Value if noun => format!("{name} is {lowered}"),
-        _ => format!("{name}: {first}"),
-    }
-}
-
-/// `true` for a capitalized third-person verb that opens doc summaries
-/// ("Returns", "Creates", "Reports"). A word that can also be a plural
-/// noun ("Stores", "Lists", "Statistics") isn't one.
-fn third_person(word: &str) -> bool {
-    const VERBS: &[&str] = &[
-        "Accepts",
-        "Adds",
-        "Advances",
-        "Allocates",
-        "Applies",
-        "Builds",
-        "Checks",
-        "Clears",
-        "Closes",
-        "Computes",
-        "Converts",
-        "Copies",
-        "Creates",
-        "Decodes",
-        "Deletes",
-        "Describes",
-        "Determines",
-        "Divides",
-        "Echoes",
-        "Emits",
-        "Encodes",
-        "Fetches",
-        "Finds",
-        "Fires",
-        "Formats",
-        "Frees",
-        "Gets",
-        "Gives",
-        "Greets",
-        "Identifies",
-        "Indicates",
-        "Installs",
-        "Loads",
-        "Makes",
-        "Merges",
-        "Notifies",
-        "Opens",
-        "Parses",
-        "Produces",
-        "Raises",
-        "Reads",
-        "Receives",
-        "Registers",
-        "Releases",
-        "Removes",
-        "Renders",
-        "Replaces",
-        "Reports",
-        "Represents",
-        "Resets",
-        "Resolves",
-        "Returns",
-        "Runs",
-        "Sends",
-        "Sets",
-        "Starts",
-        "Stops",
-        "Subscribes",
-        "Takes",
-        "Tells",
-        "Unsubscribes",
-        "Updates",
-        "Validates",
-        "Waits",
-        "Wraps",
-        "Writes",
-        "Yields",
-    ];
-    VERBS.contains(&word)
-}
-
-/// `s` with its first character lowercased, unless the first word is an
-/// acronym or initialism (all capitals).
-fn lower_first(s: &str) -> String {
-    let word = s.split_whitespace().next().unwrap_or_default();
-    if word.len() > 1 && word.chars().all(|c| !c.is_lowercase()) {
-        return s.to_string();
-    }
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(first) => first.to_lowercase().chain(chars).collect(),
-        None => String::new(),
-    }
-}
-
-/// Generated text wrapped at [`WRAP`] columns.
-fn wrap(text: &str) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        if !line.is_empty() && line.len() + 1 + word.len() > WRAP {
-            lines.push(std::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    lines
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codegen::test_model;
 
     fn render(doc: GoDoc) -> String {
         let mut w = CodeWriter::tabs();
@@ -304,58 +194,68 @@ mod tests {
     }
 
     #[test]
-    fn summaries_start_with_the_name() {
+    fn package_level_docs_start_with_the_name() {
+        let doc = |name: &str, text: &str| render(GoDoc::decl(name, Some(text.into())));
         assert_eq!(
-            lead("Add", "Add two numbers.", Kind::Func),
-            "Add two numbers."
+            doc("Sum", "Sum returns the sum."),
+            "// Sum returns the sum.\n"
         );
+        assert_eq!(doc("Ping", "Trivial helper"), "// Ping: Trivial helper\n");
+        assert_eq!(doc("Open", "Open a store."), "// Open a store.\n");
         assert_eq!(
-            lead("Sum", "Returns the sum.", Kind::Func),
-            "Sum returns the sum."
+            render(GoDoc::plain(Some("A field.\n\nMore.".into()))),
+            "// A field.\n//\n// More.\n"
         );
-        assert_eq!(
-            lead("Path", "The path it was opened with.", Kind::Func),
-            "Path returns the path it was opened with."
-        );
-        assert_eq!(
-            lead("Entry", "A stored value.", Kind::Value),
-            "Entry is a stored value."
-        );
-        assert_eq!(
-            lead("Reason", "Why it failed.", Kind::Value),
-            "Reason is why it failed."
-        );
-        assert_eq!(
-            lead("Accepts", "Whether to accept.", Kind::Func),
-            "Accepts reports whether to accept."
-        );
-        assert_eq!(
-            lead("OnChange", "A change it accepted.", Kind::Proc),
-            "OnChange: A change it accepted."
-        );
-        assert_eq!(
-            lead("ChangePut", "An entry was stored.", Kind::Clause),
-            "ChangePut: An entry was stored."
-        );
-        assert_eq!(lead("Open", "Open a store.", Kind::Func), "Open a store.");
-        assert_eq!(
-            lead("Connect", "Open a store.", Kind::Func),
-            "Connect: Open a store."
-        );
+        assert_eq!(render(GoDoc::decl("X", None)), "");
     }
 
     #[test]
-    fn paragraphs_wrap_and_deprecation_comes_last() {
-        let doc = GoDoc::new("Old", Some("Returns it.\n\nMore."), Kind::Func, None)
+    fn deprecation_comes_last_and_long_text_wraps() {
+        let doc = GoDoc::decl("Old", Some("Old returns it.".into()))
             .para("Extra.")
-            .deprecated(Some("use New"));
+            .deprecated(Some("Use [New] instead.".into()));
         assert_eq!(
             render(doc),
-            "// Old returns it.\n//\n// More.\n//\n// Extra.\n//\n// Deprecated: use New\n"
+            "// Old returns it.\n//\n// Extra.\n//\n// Deprecated: Use [New] instead.\n"
         );
-        let bare = GoDoc::new("Wait", None, Kind::Func, None).para("Blocks until done.");
-        assert_eq!(render(bare), "// Wait blocks until done.\n");
-        let long = "word ".repeat(30);
-        assert!(wrap(&long).iter().all(|l| l.len() <= WRAP));
+        let long = render(GoDoc::plain(None).para(&"word ".repeat(30)));
+        assert!(long.lines().all(|l| l.len() <= WRAP + 3), "{long}");
+    }
+
+    #[test]
+    fn backticked_identifiers_become_links_or_go_spellings() {
+        let model = test_model(
+            r#"
+version: "0.12.0"
+modules:
+  - name: kv
+    errors:
+      - name: KvErrors
+        codes: [{ name: not_found, code: 1, message: missing }]
+    enums:
+      - name: Mode
+        variants: [{ name: fast, value: 0 }]
+    structs:
+      - name: Entry
+        fields: [{ name: expires_at, type: i64 }]
+    interfaces:
+      - name: Store
+        constructors: [{ name: open, params: [] }]
+        methods:
+          - { name: get_all, params: [{ name: ttl_seconds, type: i64 }] }
+    functions:
+      - { name: new_op, params: [] }
+"#,
+        );
+        let go = GoNames::new(&model);
+        let names = DocNames::new(&model, &go);
+        assert_eq!(
+            names.render(
+                "Use `new_op`, `open`, `get_all`, `Entry`, `KvErrors`, `not_found`, \
+                 `fast`, `expires_at`, `ttl_seconds`, `kv`, or `x + 1`."
+            ),
+            "Use [NewOp], [OpenStore], [Store.GetAll], [Entry], [KvError], \
+             [NotFoundError], [ModeFast], ExpiresAt, ttlSeconds, `kv`, or `x + 1`."
+        );
     }
 }

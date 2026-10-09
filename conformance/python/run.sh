@@ -5,7 +5,9 @@
 # against one sample and must exit 0.
 set -uo pipefail
 . "$(dirname "$0")/../lib.sh"
-require_tools python python3
+. "$ROOT/scripts/toolchains.sh"
+PYTHON=$(find_python) || require_tools python python3.10
+export PYTHON
 
 # Run a Python consumer against the generated package as-is: its directory
 # goes on PYTHONPATH, and the producer cdylib is selected through the
@@ -15,7 +17,7 @@ py_consumer() {
     local sample="$1" script="$2"
     env PYTHONPATH="$GENROOT/$sample/python" \
         "$(library_env "$sample")=$(sample_lib "$sample")" \
-        python3 -X dev "$ROOT/conformance/python/$script"
+        "$PYTHON" -X dev "$ROOT/conformance/python/$script"
 }
 
 python_calculator() { py_consumer calculator calculator_consumer.py; }

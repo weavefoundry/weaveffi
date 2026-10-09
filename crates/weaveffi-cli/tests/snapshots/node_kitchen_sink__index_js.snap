@@ -10,9 +10,13 @@ import {
   $fault,
   $domain,
   $raise,
+  $untyped,
   $W,
   $WK,
   $R,
+  $check,
+  $opt,
+  $slice,
   $encode,
   $decode,
   $Object,
@@ -27,8 +31,8 @@ import {
   $Iterator,
   $cancellable,
   $impl,
-  $ret,
   $verify,
+  $setLive,
   KitchenSinkError as $Error,
 } from './runtime.js';
 export { KitchenSinkError, CancelledError } from './runtime.js';
@@ -69,48 +73,78 @@ $raw.$setup($Fault);
 const $token = (t) => t;
 
 // The declarations these bindings were generated with, per top-level
-// module, as [id, hash, path]: the library's contract tables must hold
-// each one (see $verify).
+// module's table function, as [id, hash, path]: the library's tables must
+// hold each one (see $verify).
 const $contract = [
-  ['shared', [
-    [0x709e234caa962446n, 0x3894f2ca452e9f98n, 'shared.ping'],
-    [0xcfb306fa5801ee5bn, 0x1cbd9e10983cac2cn, 'shared.Token'],
+  ['kitchen_sink_shared_contract', [
+    [0x709e234caa962446n, 0x3894f2ca452e9f98n, 'shared.ping'], // function ping() -> string
+    [0xcfb306fa5801ee5bn, 0x18e9fc204a13df6fn, 'shared.Token'], // record Token {i64, string}
   ]],
-  ['kitchen', [
-    [0x01d4f09bbddc986fn, 0x29eb88fecc66544dn, 'kitchen.Gadget.new'],
-    [0x10472d8fe748c2een, 0xb265832b6a759fc4n, 'kitchen.maybe_gadget'],
-    [0x11368eec07a74078n, 0xfa049f78b77e146an, 'kitchen.gadgets'],
-    [0x137f08a29cde6021n, 0xda8de7aeb2dbb8a3n, 'kitchen.stream_gadgets'],
-    [0x2111b54980826dd7n, 0x452783f3e6ca6e1dn, 'kitchen.do_cancellable'],
-    [0x29dddbc60bf8d7dbn, 0x452a3e573d57f6dbn, 'kitchen.Priority'],
-    [0x2b227003b74a0d16n, 0x12332957470e9782n, 'kitchen.maybe_subscribe'],
-    [0x2dd66cb0064f0494n, 0x60197363fefd92ddn, 'kitchen.Item'],
-    [0x33c265bbf079b0e9n, 0xc3dcd0927e6c1debn, 'kitchen.u32_id'],
-    [0x33e6381d01660dfen, 0x077c63c31fd7f90an, 'kitchen.KitchenErrors'],
-    [0x3f5fc99d73504b76n, 0x2df88d710f1ea10en, 'kitchen.Gadget.poke'],
-    [0x4c5764cf109528d1n, 0x2a65529af4338a58n, 'kitchen.maybe_item'],
-    [0x4de17dfb93fd494dn, 0xba0ad0dd52ed74afn, 'kitchen.i32_id'],
-    [0x504e95b7f7e65570n, 0x01b3e8e0c9a10e23n, 'kitchen.stream_items'],
-    [0x68cdb9a4bd3e3dd5n, 0xc678b9164348d497n, 'kitchen.bool_id'],
-    [0x69e7cd703d16eb85n, 0xf3b28dd22ae9e689n, 'kitchen.do_async'],
-    [0x70865079ce41be82n, 0xbe3b69464672af46n, 'kitchen.Gadget.describe'],
-    [0x71c5a1116cb7c49an, 0xcba1837108a89b84n, 'kitchen.echo_bytes'],
-    [0x735ee1e0049ee91an, 0xca74320bc53eddabn, 'kitchen.echo_string'],
-    [0x76d7fc58f4e41d84n, 0x7373a0e47d30e690n, 'kitchen.i64_id'],
-    [0x79abfe1aa960fd6an, 0xbca7a9e5eb26f3a6n, 'kitchen.nested.hello'],
-    [0x7d3dd7d5cf6749e3n, 0xa192f5a7298adb39n, 'kitchen.new_op'],
-    [0x89a5e664bc25c67bn, 0x5764a95e81ecfd31n, 'kitchen.f64_id'],
-    [0x8cfdbdcecac5f7f1n, 0x07e272f09c41fffcn, 'kitchen.Gadget.version'],
-    [0x974b9f3e823c1738n, 0xb81b91e975695f27n, 'kitchen.cross_module_token'],
-    [0xaca0655fac15d230n, 0x11c4d2b28abe07bbn, 'kitchen.list_items'],
-    [0xc883b4afae20543en, 0xc40560e5411ff392n, 'kitchen.legacy_op'],
-    [0xf2f7753e6e1dffc2n, 0xc9047a95bdf49e93n, 'kitchen.get_attrs'],
-    [0xfae25d3391922eadn, 0x1c7f95739f3210b8n, 'kitchen.subscribe'],
-    [0xfd0059b05cb2fcfbn, 0x248bf8404a5823b4n, 'kitchen.Gadget'],
-    [0xfed9c551fb9fd2d6n, 0x59aec980ef3f3291n, 'kitchen.ReadyListener'],
+  ['kitchen_sink_kitchen_contract', [
+    [0x01d4f09bbddc986fn, 0xffcf2bd3b04aa002n, 'kitchen.Gadget.new'], // constructor new(i64) -> Gadget
+    [0x02bbd5f31c953704n, 0xaca75656ad13d661n, 'kitchen.Sampler.samples'], // callback_method samples(u32?, [f64]) -> [i16] throws PantryError
+    [0x10472d8fe748c2een, 0xcc570a2649bbf7dcn, 'kitchen.maybe_gadget'], // function maybe_gadget(Gadget?) -> Gadget?
+    [0x11368eec07a74078n, 0xfa049f78b77e146an, 'kitchen.gadgets'], // function gadgets() -> [Gadget]
+    [0x137f08a29cde6021n, 0xda8de7aeb2dbb8a3n, 'kitchen.stream_gadgets'], // function stream_gadgets() -> iter<Gadget>
+    [0x184bfc4ab0e3fe45n, 0xb64587477022696bn, 'kitchen.ids_u64'], // function ids_u64([u64]) -> [u64]
+    [0x2111b54980826dd7n, 0x627bf01ab365b209n, 'kitchen.do_cancellable'], // function do_cancellable(string) -> string async cancellable
+    [0x21c70f9371374d74n, 0xc582d6ad2392c36cn, 'kitchen.ReadyListener.favorite'], // callback_method favorite() -> Gadget
+    [0x23de5bd597372f46n, 0xcf1bc6bb37872798n, 'kitchen.stream_chunks'], // function stream_chunks() -> iter<[i32]>
+    [0x249f1ddaec6a6cben, 0x0710d6c9a4de93dan, 'kitchen.take_from_pantry'], // function take_from_pantry(string) -> i32 throws PantryError
+    [0x29dddbc60bf8d7dbn, 0x452a3e573d57f6dbn, 'kitchen.Priority'], // enum Priority {Low = 0, Normal = 1, High = 2}
+    [0x2b227003b74a0d16n, 0x5dae036b8a6aed30n, 'kitchen.maybe_subscribe'], // function maybe_subscribe(ReadyListener?) -> bool
+    [0x2dd66cb0064f0494n, 0x74b131724dd0d867n, 'kitchen.Item'], // record Item {i64, string, i32, bool, f64, u32, bytes, [string], {string:string}, i64?, Token, Priority, Gadget?}
+    [0x33c265bbf079b0e9n, 0x97c32b764693f2cbn, 'kitchen.u32_id'], // function u32_id(u32) -> u32
+    [0x33e6381d01660dfen, 0x05e35a563089bf7dn, 'kitchen.KitchenErrors'], // errors KitchenErrors
+    [0x3d969ae76db6cb23n, 0x38ac642c196512a5n, 'kitchen.ReadyListener.latest'], // callback_method latest() -> Item?
+    [0x3f5fc99d73504b76n, 0x417e4a2acd3210b3n, 'kitchen.Gadget.poke'], // method poke(i32) -> i32 throws KitchenErrors
+    [0x4082f0085db28781n, 0x18848e701962912en, 'kitchen.Sampler'], // callback Sampler
+    [0x4340a6b1e7ec8c50n, 0xf5b4f10f61862b33n, 'kitchen.Sampler.describe'], // callback_method describe() -> string throws any
+    [0x4c5764cf109528d1n, 0xb374accf14676d90n, 'kitchen.maybe_item'], // function maybe_item(i64) -> Item? throws KitchenErrors
+    [0x4de17dfb93fd494dn, 0x78be3203bcd10727n, 'kitchen.i32_id'], // function i32_id(i32) -> i32
+    [0x504e95b7f7e65570n, 0x01b3e8e0c9a10e23n, 'kitchen.stream_items'], // function stream_items() -> iter<Item>
+    [0x5dafabb7775fcb2dn, 0x6c4b78c7d3f858c1n, 'kitchen.PantryError.Spoiled'], // code Spoiled = 2
+    [0x5e0a8f6be4b00600n, 0x3d0dcaec54133637n, 'kitchen.Sampler.threshold'], // callback_method threshold(u32?) -> f64?
+    [0x5ec0af1d4ecc6fedn, 0x6540bdb74246420cn, 'kitchen.async_samples'], // function async_samples(u32) -> [f32] async cancellable
+    [0x61a358b0571e0a4en, 0x11a24c4b50d11996n, 'kitchen.async_maybe_count'], // function async_maybe_count() -> i64? async
+    [0x68cdb9a4bd3e3dd5n, 0xcde022fe6bc3b1bfn, 'kitchen.bool_id'], // function bool_id(bool) -> bool
+    [0x69e7cd703d16eb85n, 0xb13cb8d39e702c79n, 'kitchen.do_async'], // function do_async(string) -> string async
+    [0x70865079ce41be82n, 0xbe3b69464672af46n, 'kitchen.Gadget.describe'], // method describe() -> string
+    [0x71c5a1116cb7c49an, 0x1506cfe6f548fac4n, 'kitchen.echo_bytes'], // function echo_bytes(bytes) -> bytes
+    [0x735ee1e0049ee91an, 0xa713dbd1be707752n, 'kitchen.echo_string'], // function echo_string(string) -> string
+    [0x76d7fc58f4e41d84n, 0x6bdb4ccea2841d5en, 'kitchen.i64_id'], // function i64_id(i64) -> i64
+    [0x78d91fd617e162b8n, 0xd88e2753503b36dfn, 'kitchen.stream_maybe'], // function stream_maybe() -> iter<i32?>
+    [0x79abfe1aa960fd6an, 0xbca7a9e5eb26f3a6n, 'kitchen.nested.hello'], // function hello() -> string
+    [0x7b3865b536da998cn, 0x1c4e79d60a20e74fn, 'kitchen.mixed_slices'], // function mixed_slices([i8], [i16], [u16], [u32], [i64], [f32]) -> [u32]
+    [0x7ba266dc26a58989n, 0x0f86001cac0c21e8n, 'kitchen.KitchenErrors.InvalidInput'], // code InvalidInput = 2
+    [0x7d3dd7d5cf6749e3n, 0xa192f5a7298adb39n, 'kitchen.new_op'], // function new_op() -> i32
+    [0x81ded69adee0abf2n, 0x8c71141a931906f6n, 'kitchen.scale_i32'], // function scale_i32([i32], i32) -> [i32]
+    [0x81fa72769330fed6n, 0x2096511ca5c9d8d3n, 'kitchen.ReadyListener.label'], // callback_method label() -> string throws KitchenErrors
+    [0x89a5e664bc25c67bn, 0x357fd9b65ad879a9n, 'kitchen.f64_id'], // function f64_id(f64) -> f64
+    [0x8cfdbdcecac5f7f1n, 0x07e272f09c41fffcn, 'kitchen.Gadget.version'], // static version() -> string
+    [0x8dc42397e47614b9n, 0xcddf6fede09b2e7fn, 'kitchen.opt_priority'], // function opt_priority(Priority?) -> Priority?
+    [0x92f060ef68961fc1n, 0xd948f51645dc11a0n, 'kitchen.ReadyListener.on_item'], // callback_method on_item(Item, Gadget) -> bool
+    [0x974b9f3e823c1738n, 0xb81b91e975695f27n, 'kitchen.cross_module_token'], // function cross_module_token() -> Token
+    [0x9f0f001aa85f97d5n, 0x55815247f895bd45n, 'kitchen.sum_f64'], // function sum_f64([f64]) -> f64
+    [0xab2a29fd1ef5458bn, 0x471a34aa4c09ae2bn, 'kitchen.KitchenErrors.NotFound'], // code NotFound = 1
+    [0xaca0655fac15d230n, 0x11c4d2b28abe07bbn, 'kitchen.list_items'], // function list_items() -> [Item]
+    [0xb57c8e6ae3fb4383n, 0x3f857851ab75366cn, 'kitchen.PantryError'], // errors PantryError
+    [0xbdc795b195edd428n, 0x36127462f8b0969fn, 'kitchen.opt_mixed'], // function opt_mixed(f64, f32?, i64?, string?) -> u16?
+    [0xbe4821ab3c340e71n, 0x17fad5418abe0f50n, 'kitchen.ReadyListener.on_ready'], // callback_method on_ready(i32, string) -> void
+    [0xc2ad53f2a6a36323n, 0x071e29abee823f17n, 'kitchen.opt_i32_id'], // function opt_i32_id(i32?) -> i32?
+    [0xc7ab409554fd3d7bn, 0xfea12b6bc219fc46n, 'kitchen.parse_any'], // function parse_any(string) -> i64 throws any
+    [0xc82a7f2d85f99f4en, 0xa9bcb8bacedb036cn, 'kitchen.sample_with'], // function sample_with(Sampler, u32?) -> [i16] throws PantryError
+    [0xc883b4afae20543en, 0xc40560e5411ff392n, 'kitchen.legacy_op'], // function legacy_op() -> i32
+    [0xd180bf646bff59e2n, 0xa4515a6d00d7c600n, 'kitchen.PantryError.OutOfStock'], // code OutOfStock = 1 {string}
+    [0xe6778df0f5c1b82bn, 0x38eaafdb350559e1n, 'kitchen.opt_bool_id'], // function opt_bool_id(bool?) -> bool?
+    [0xf2f7753e6e1dffc2n, 0xc9047a95bdf49e93n, 'kitchen.get_attrs'], // function get_attrs() -> {string:i32}
+    [0xfae25d3391922eadn, 0xcc034cf506cae182n, 'kitchen.subscribe'], // function subscribe(ReadyListener) -> i32
+    [0xfd0059b05cb2fcfbn, 0x248bf8404a5823b4n, 'kitchen.Gadget'], // interface Gadget
+    [0xfed9c551fb9fd2d6n, 0xe1020573f084dc1dn, 'kitchen.ReadyListener'], // callback ReadyListener
+    [0xff3a99b52597dee2n, 0x14c4ecac97bdfc9bn, 'kitchen.Gadget.readings'], // method readings(u32?) -> [f64] throws any
   ]],
 ];
-$verify($raw, 'kitchen_sink', 'kitchen_sink', 4, $contract);
+$verify($raw, 'kitchen_sink', 'kitchen_sink', 5, $contract);
 
 // The native cancel tokens behind `AbortSignal`s.
 const $tokens = {
@@ -119,24 +153,17 @@ const $tokens = {
   destroy: (t) => $raw.kitchen_sink_cancel_token_destroy(t),
 };
 
-/**
- * The native library's live-resource counters (0 objects, 1 callbacks,
- * 2 iterators, 3 cancel tokens, 4 byte runs), for leak tests. Kind -1 is
- * `1n` when the library counts at all (its `leak-check` feature), else
- * every kind is `0n`.
- */
-export function __debugLive(kind) {
-  return $raw.kitchen_sink_debug_live(kind);
-}
+// The leak counters behind the package's `./debug` export.
+$setLive((kind) => $raw.kitchen_sink_debug_live(kind));
 
-const kitchen$KitchenErrorsError = class KitchenErrorsError extends $Error {};
-const kitchen$NotFoundError = class NotFoundError extends kitchen$KitchenErrorsError {
+const kitchen$KitchenError = class KitchenError extends $Error {};
+const kitchen$NotFoundError = class NotFoundError extends kitchen$KitchenError {
   static CODE = 1;
   constructor(message = 'Item not found') {
     super(1, message);
   }
 };
-const kitchen$InvalidInputError = class InvalidInputError extends kitchen$KitchenErrorsError {
+const kitchen$InvalidInputError = class InvalidInputError extends kitchen$KitchenError {
   static CODE = 2;
   constructor(message = 'Invalid input') {
     super(2, message);
@@ -148,11 +175,42 @@ const $codes$kitchen$KitchenErrors = new Map([
 ]);
 const $payloads$kitchen$KitchenErrors = new Map();
 function $from$kitchen$KitchenErrors(e) {
-  return $domain(e, $codes$kitchen$KitchenErrors, $payloads$kitchen$KitchenErrors);
+  return $domain(e, kitchen$KitchenError, $codes$kitchen$KitchenErrors, $payloads$kitchen$KitchenErrors);
 }
 const $fields$kitchen$KitchenErrors = new Map();
 function $raise$kitchen$KitchenErrors(e) {
-  return $raise(e, kitchen$KitchenErrorsError, $codes$kitchen$KitchenErrors, $fields$kitchen$KitchenErrors);
+  return $raise(e, kitchen$KitchenError, $codes$kitchen$KitchenErrors, $fields$kitchen$KitchenErrors);
+}
+
+const kitchen$PantryError = class PantryError extends $Error {};
+const kitchen$OutOfStockError = class OutOfStockError extends kitchen$PantryError {
+  static CODE = 1;
+  constructor(fields, message = 'Out of stock') {
+    super(1, message);
+    this.item = fields.item;
+  }
+};
+const kitchen$SpoiledError = class SpoiledError extends kitchen$PantryError {
+  static CODE = 2;
+  constructor(message = 'Spoiled') {
+    super(2, message);
+  }
+};
+const $codes$kitchen$PantryError = new Map([
+  [1, kitchen$OutOfStockError],
+  [2, kitchen$SpoiledError],
+]);
+const $payloads$kitchen$PantryError = new Map([
+  [1, (r) => ({ item: r.readString() })],
+]);
+function $from$kitchen$PantryError(e) {
+  return $domain(e, kitchen$PantryError, $codes$kitchen$PantryError, $payloads$kitchen$PantryError);
+}
+const $fields$kitchen$PantryError = new Map([
+  [1, (w, e) => { w.writeString(e.item); }],
+]);
+function $raise$kitchen$PantryError(e) {
+  return $raise(e, kitchen$PantryError, $codes$kitchen$PantryError, $fields$kitchen$PantryError);
 }
 
 const kitchen$Priority = Object.freeze({
@@ -212,33 +270,12 @@ function $w$kitchen$Gadget(w, v) {
 function $r$kitchen$Gadget(r) {
   return $adopt(kitchen$Gadget, $token(r.readU64()));
 }
-/** `[Gadget]` */
-function $w_list_Gadget(w, v) {
-  w.writeList(v, $w$kitchen$Gadget);
-}
-function $r_list_Gadget(r) {
-  return r.readList($r$kitchen$Gadget);
-}
-/** `[Item]` */
-function $w_list_Item(w, v) {
-  w.writeList(v, $w$kitchen$Item);
-}
-function $r_list_Item(r) {
-  return r.readList($r$kitchen$Item);
-}
 /** `[string]` */
 function $w_list_string(w, v) {
   w.writeList(v, $W.String);
 }
 function $r_list_string(r) {
   return r.readList($R.String);
-}
-/** `{string:i32}` */
-function $w_map_string_i32(w, v) {
-  w.writeMap(v, $WK.String, $W.I32);
-}
-function $r_map_string_i32(r) {
-  return r.readMap($R.String, $R.I32);
 }
 /** `{string:string}` */
 function $w_map_string_string(w, v) {
@@ -247,12 +284,26 @@ function $w_map_string_string(w, v) {
 function $r_map_string_string(r) {
   return r.readMap($R.String, $R.String);
 }
+/** `i64?` */
+function $w_opt_i64(w, v) {
+  w.writeOpt(v, $W.I64);
+}
+function $r_opt_i64(r) {
+  return r.readOpt($R.I64);
+}
 /** `Gadget?` */
 function $w_opt_Gadget(w, v) {
   w.writeOpt(v, $w$kitchen$Gadget);
 }
 function $r_opt_Gadget(r) {
   return r.readOpt($r$kitchen$Gadget);
+}
+/** `[Gadget]` */
+function $w_list_Gadget(w, v) {
+  w.writeList(v, $w$kitchen$Gadget);
+}
+function $r_list_Gadget(r) {
+  return r.readList($r$kitchen$Gadget);
 }
 /** `Item?` */
 function $w_opt_Item(w, v) {
@@ -261,12 +312,26 @@ function $w_opt_Item(w, v) {
 function $r_opt_Item(r) {
   return r.readOpt($r$kitchen$Item);
 }
-/** `i64?` */
-function $w_opt_i64(w, v) {
-  w.writeOpt(v, $W.I64);
+/** `[Item]` */
+function $w_list_Item(w, v) {
+  w.writeList(v, $w$kitchen$Item);
 }
-function $r_opt_i64(r) {
-  return r.readOpt($R.I64);
+function $r_list_Item(r) {
+  return r.readList($r$kitchen$Item);
+}
+/** `{string:i32}` */
+function $w_map_string_i32(w, v) {
+  w.writeMap(v, $WK.String, $W.I32);
+}
+function $r_map_string_i32(r) {
+  return r.readMap($R.String, $R.I32);
+}
+/** `string?` */
+function $w_opt_string(w, v) {
+  w.writeOpt(v, $W.String);
+}
+function $r_opt_string(r) {
+  return r.readOpt($R.String);
 }
 
 const shared$ping = function ping() {
@@ -284,11 +349,11 @@ function $adapt$kitchen$ReadyListener(impl) {
       impl.onReady($a0, $a1);
     },
     on_item($a0, $a1) {
-      return $ret.Bool(impl.onItem($decode($a0, $r$kitchen$Item), $adopt(kitchen$Gadget, $a1)), 'ReadyListener.onItem');
+      return $check.Bool(impl.onItem($decode($a0, $r$kitchen$Item), $adopt(kitchen$Gadget, $a1)), 'the return value of ReadyListener.onItem');
     },
     label() {
       try {
-        return $ret.String(impl.label(), 'ReadyListener.label');
+        return $check.String(impl.label(), 'the return value of ReadyListener.label');
       } catch ($e) {
         throw $raise$kitchen$KitchenErrors($e);
       }
@@ -298,6 +363,29 @@ function $adapt$kitchen$ReadyListener(impl) {
     },
     favorite() {
       return $clone(impl.favorite(), kitchen$Gadget);
+    },
+  };
+}
+
+function $adapt$kitchen$Sampler(impl) {
+  $impl(impl, 'Sampler');
+  return {
+    threshold($a0) {
+      return $opt(impl.threshold($a0), $check.F64, 'the return value of Sampler.threshold');
+    },
+    samples($a0, $a1) {
+      try {
+        return $slice.I16(impl.samples($a0, Array.from($a1)), 'the return value of Sampler.samples');
+      } catch ($e) {
+        throw $raise$kitchen$PantryError($e);
+      }
+    },
+    describe() {
+      try {
+        return $check.String(impl.describe(), 'the return value of Sampler.describe');
+      } catch ($e) {
+        throw $untyped($e);
+      }
     },
   };
 }
@@ -333,6 +421,16 @@ const kitchen$Gadget = class Gadget extends $Object {
       return $raw.kitchen_sink_kitchen_Gadget_poke($self, times);
     } catch ($e) {
       throw $from$kitchen$KitchenErrors($e);
+    } finally {
+      $unlend(this);
+    }
+  }
+  readings(limit) {
+    const $self = $lend(this, kitchen$Gadget);
+    try {
+      return Array.from($raw.kitchen_sink_kitchen_Gadget_readings($self, limit));
+    } catch ($e) {
+      throw $fault($e);
     } finally {
       $unlend(this);
     }
@@ -529,6 +627,138 @@ const kitchen$newOp = function newOp() {
   }
 };
 
+const kitchen$optI32Id = function optI32Id(x) {
+  try {
+    return $raw.kitchen_sink_kitchen_opt_i32_id(x);
+  } catch ($e) {
+    throw $fault($e);
+  }
+};
+
+const kitchen$optBoolId = function optBoolId(x) {
+  try {
+    return $raw.kitchen_sink_kitchen_opt_bool_id(x);
+  } catch ($e) {
+    throw $fault($e);
+  }
+};
+
+const kitchen$optPriority = function optPriority(p) {
+  try {
+    return $raw.kitchen_sink_kitchen_opt_priority(p);
+  } catch ($e) {
+    throw $fault($e);
+  }
+};
+
+const kitchen$optMixed = function optMixed(base, scale, offset, label) {
+  try {
+    return $raw.kitchen_sink_kitchen_opt_mixed(base, scale, offset, $encode(label, $w_opt_string));
+  } catch ($e) {
+    throw $fault($e);
+  }
+};
+
+const kitchen$sumF64 = function sumF64(xs) {
+  try {
+    return $raw.kitchen_sink_kitchen_sum_f64($slice.F64(xs, 'xs'));
+  } catch ($e) {
+    throw $fault($e);
+  }
+};
+
+const kitchen$scaleI32 = function scaleI32(xs, factor) {
+  try {
+    return Array.from($raw.kitchen_sink_kitchen_scale_i32($slice.I32(xs, 'xs'), factor));
+  } catch ($e) {
+    throw $fault($e);
+  }
+};
+
+const kitchen$idsU64 = function idsU64(ids) {
+  try {
+    return Array.from($raw.kitchen_sink_kitchen_ids_u64($slice.U64(ids, 'ids')));
+  } catch ($e) {
+    throw $fault($e);
+  }
+};
+
+const kitchen$mixedSlices = function mixedSlices(a, b, c, d, e, f) {
+  try {
+    return Array.from($raw.kitchen_sink_kitchen_mixed_slices($slice.I8(a, 'a'), $slice.I16(b, 'b'), $slice.U16(c, 'c'), $slice.U32(d, 'd'), $slice.I64(e, 'e'), $slice.F32(f, 'f')));
+  } catch ($e) {
+    throw $fault($e);
+  }
+};
+
+const kitchen$asyncMaybeCount = async function asyncMaybeCount() {
+  try {
+    return await $raw.kitchen_sink_kitchen_async_maybe_count();
+  } catch ($e) {
+    throw $fault($e);
+  }
+};
+
+const kitchen$asyncSamples = async function asyncSamples(n, $options) {
+  try {
+    return Array.from(await $cancellable($options?.signal, $tokens, ($t) => $raw.kitchen_sink_kitchen_async_samples(n, $t)));
+  } catch ($e) {
+    throw $fault($e);
+  }
+};
+
+const $it$kitchen$stream_maybe = {
+  next: (h) => $raw.kitchen_sink_kitchen_StreamMaybeIterator_next(h),
+  destroy: (h) => $raw.kitchen_sink_kitchen_StreamMaybeIterator_destroy(h),
+  map: $fault,
+  convert: null,
+};
+const kitchen$streamMaybe = function streamMaybe() {
+  try {
+    return new $Iterator($raw.kitchen_sink_kitchen_stream_maybe(), $it$kitchen$stream_maybe);
+  } catch ($e) {
+    throw $fault($e);
+  }
+};
+
+const $it$kitchen$stream_chunks = {
+  next: (h) => $raw.kitchen_sink_kitchen_StreamChunksIterator_next(h),
+  destroy: (h) => $raw.kitchen_sink_kitchen_StreamChunksIterator_destroy(h),
+  map: $fault,
+  convert: (v) => Array.from(v),
+};
+const kitchen$streamChunks = function streamChunks() {
+  try {
+    return new $Iterator($raw.kitchen_sink_kitchen_stream_chunks(), $it$kitchen$stream_chunks);
+  } catch ($e) {
+    throw $fault($e);
+  }
+};
+
+const kitchen$sampleWith = function sampleWith(sampler, level) {
+  try {
+    return Array.from($raw.kitchen_sink_kitchen_sample_with($adapt$kitchen$Sampler(sampler), level));
+  } catch ($e) {
+    throw $from$kitchen$PantryError($e);
+  }
+};
+
+const kitchen$takeFromPantry = function takeFromPantry(item) {
+  try {
+    return $raw.kitchen_sink_kitchen_take_from_pantry(item);
+  } catch ($e) {
+    throw $from$kitchen$PantryError($e);
+  }
+};
+
+const kitchen$parseAny = function parseAny(text) {
+  try {
+    return $raw.kitchen_sink_kitchen_parse_any(text);
+  } catch ($e) {
+    throw $fault($e);
+  }
+};
+
 const kitchen$nested$hello = function hello() {
   try {
     return $raw.kitchen_sink_kitchen_nested_hello();
@@ -542,9 +772,12 @@ export const shared = Object.freeze({
 });
 
 export const kitchen = Object.freeze({
-  KitchenErrorsError: kitchen$KitchenErrorsError,
+  KitchenError: kitchen$KitchenError,
   NotFoundError: kitchen$NotFoundError,
   InvalidInputError: kitchen$InvalidInputError,
+  PantryError: kitchen$PantryError,
+  OutOfStockError: kitchen$OutOfStockError,
+  SpoiledError: kitchen$SpoiledError,
   Priority: kitchen$Priority,
   Gadget: kitchen$Gadget,
   boolId: kitchen$boolId,
@@ -568,6 +801,21 @@ export const kitchen = Object.freeze({
   doCancellable: kitchen$doCancellable,
   legacyOp: kitchen$legacyOp,
   newOp: kitchen$newOp,
+  optI32Id: kitchen$optI32Id,
+  optBoolId: kitchen$optBoolId,
+  optPriority: kitchen$optPriority,
+  optMixed: kitchen$optMixed,
+  sumF64: kitchen$sumF64,
+  scaleI32: kitchen$scaleI32,
+  idsU64: kitchen$idsU64,
+  mixedSlices: kitchen$mixedSlices,
+  asyncMaybeCount: kitchen$asyncMaybeCount,
+  asyncSamples: kitchen$asyncSamples,
+  streamMaybe: kitchen$streamMaybe,
+  streamChunks: kitchen$streamChunks,
+  sampleWith: kitchen$sampleWith,
+  takeFromPantry: kitchen$takeFromPantry,
+  parseAny: kitchen$parseAny,
   nested: Object.freeze({
     hello: kitchen$nested$hello,
   }),

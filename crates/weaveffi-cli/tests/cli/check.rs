@@ -1,5 +1,5 @@
-//! Integration tests for the CI-oriented flags: `weaveffi diff --check` and
-//! `weaveffi validate [--warn] --format json`. Each test runs the binary as a
+//! Integration tests for the CI-oriented flags: `weaveffi generate --check`
+//! and `weaveffi validate [--warn] --format json`. Each test runs the binary as a
 //! subprocess and either asserts on the structured stdout or on the process
 //! exit code.
 
@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::Path;
 
 fn cargo_bin() -> assert_cmd::Command {
-    assert_cmd::Command::cargo_bin("weaveffi").expect("binary not found")
+    crate::weaveffi()
 }
 
 fn write_file(path: &Path, contents: &str) {
@@ -26,7 +26,7 @@ fn calculator_crate() -> std::path::PathBuf {
 }
 
 #[test]
-fn diff_check_passes_when_output_matches() {
+fn check_passes_when_output_matches() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("generated");
     let input = calculator_crate();
@@ -43,40 +43,34 @@ fn diff_check_passes_when_output_matches() {
 
     let output = cargo_bin()
         .args([
-            "diff",
+            "generate",
             input.to_str().unwrap(),
             "--out",
             out.to_str().unwrap(),
             "--check",
         ])
         .output()
-        .expect("failed to run weaveffi diff --check");
+        .expect("failed to run weaveffi generate --check");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "diff --check should exit 0 when output matches; stdout={stdout}, stderr={stderr}"
+        "generate --check should exit 0 when output matches; stdout={stdout}, stderr={stderr}"
     );
-    assert!(
-        stdout.contains("+ 0 added, - 0 removed, ~ 0 modified"),
-        "expected zeroed summary, got: {stdout}"
-    );
-    assert!(
-        !stdout.contains("---") && !stdout.contains("+++"),
-        "diff --check must not print per-file diff content, got: {stdout}"
-    );
+    assert!(stdout.is_empty(), "nothing would change, got: {stdout}");
+    assert!(stderr.contains("is up to date"), "{stderr}");
 }
 
 #[test]
-fn diff_check_fails_when_idl_changed() {
+fn check_fails_when_idl_changed() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("generated");
     let idl = tmp.path().join("api.yml");
     write_file(
         &idl,
         concat!(
-            "version: \"0.11.0\"\n",
+            "version: \"0.12.0\"\n",
             "modules:\n",
             "  - name: calc\n",
             "    functions:\n",
@@ -102,7 +96,7 @@ fn diff_check_fails_when_idl_changed() {
     write_file(
         &idl,
         concat!(
-            "version: \"0.11.0\"\n",
+            "version: \"0.12.0\"\n",
             "modules:\n",
             "  - name: calc\n",
             "    functions:\n",
@@ -123,34 +117,30 @@ fn diff_check_fails_when_idl_changed() {
 
     let output = cargo_bin()
         .args([
-            "diff",
+            "generate",
             idl.to_str().unwrap(),
             "--out",
             out.to_str().unwrap(),
             "--check",
+            "--quiet",
         ])
         .output()
-        .expect("failed to run weaveffi diff --check");
+        .expect("failed to run weaveffi generate --check");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        !output.status.success(),
-        "diff --check should fail when IDL drifted; stdout={stdout}"
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "generate --check should exit 1 when the IDL drifted; stdout={stdout}"
     );
-    let code = output.status.code().expect("expected an exit code");
-    assert!(
-        code == 2 || code == 3,
-        "expected exit code 2 (modified) or 3 (added/removed), got {code}; stdout={stdout}"
-    );
-    assert!(
-        stdout.contains(" added, ")
-            && stdout.contains(" removed, ")
-            && stdout.contains(" modified"),
-        "expected diff summary line, got: {stdout}"
-    );
+    assert!(stdout.lines().any(|l| l == "~ c/api.h"), "{stdout}");
     assert!(
         !stdout.contains("---") && !stdout.contains("+++"),
-        "diff --check must not print per-file diff content, got: {stdout}"
+        "generate --check must not print per-file diff content, got: {stdout}"
+    );
+    assert!(
+        std::fs::read_to_string(out.join("c/api.h")).is_ok_and(|h| !h.contains("api_calc_sub")),
+        "generate --check must not write"
     );
 }
 
@@ -189,7 +179,7 @@ fn validate_warn_json_format_outputs_warnings_array() {
     write_file(
         &path,
         concat!(
-            "version: \"0.11.0\"\n",
+            "version: \"0.12.0\"\n",
             "modules:\n",
             "  - name: nodocs\n",
             "    functions:\n",
@@ -244,7 +234,7 @@ fn validate_json_failures_carry_the_code_and_fields() {
     write_file(
         &path,
         concat!(
-            "version: \"0.11.0\"\n",
+            "version: \"0.12.0\"\n",
             "modules:\n",
             "  - name: a\n",
             "    structs: [{ name: Item, fields: [{ name: n, type: usize }] }]\n",

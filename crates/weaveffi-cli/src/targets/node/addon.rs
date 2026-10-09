@@ -1,86 +1,118 @@
 //! The N-API addon (`{library}_node.c`): the Node.js transport.
 //!
-//! The fixed part (value conversions, error reporting, the async and
-//! callback-interface machinery, the JavaScript-thread bookkeeping, and the
-//! runtime symbols) is `runtime/addon.c`. This module appends one exported
-//! entry point per C symbol (callables, async launchers, iterator
+//! The fixed part (value conversions and checks, error reporting, the async
+//! and callback-interface machinery, the JavaScript-thread bookkeeping, and
+//! the runtime symbols) is `runtime/addon.c`. This module appends one
+//! exported entry point per C symbol (callables, async launchers, iterator
 //! `next`/`destroy`, interface `clone`/`destroy`, and module contract
 //! tables), each following the raw calling convention of the shared
 //! JavaScript layer, plus a static vtable with thread-hopping trampolines per
 //! callback interface.
+//!
+//! Every C call is built from the model's lowered signature ([`AbiFn`]):
+//! each slot's argument is looked up by the slot's name, so the argument
+//! order is the model's by construction.
 
-use weaveffi_model::abi::AbiParam;
+use std::collections::HashMap;
+
+use weaveffi_model::abi::{AbiParam, CType};
 use weaveffi_model::model::{
-    contract_symbol, CallShape, CallbackInterfaceBinding, CallbackMethodBinding, FnBinding, Model,
+    contract_symbol, AbiFn, CallbackInterfaceBinding, CallbackMethodBinding, FnBinding, Model,
 };
-use weaveffi_model::plan::{ArgPass, RetPass};
-use weaveffi_model::ty::{Prim, Ty};
+use weaveffi_model::plan::{ArgPass, CallbackRetPass, ItemPass, ResultPass, RetPass};
+use weaveffi_model::ty::Prim;
 
 use crate::codegen::CodeWriter;
-use crate::targets::js::names::{callback_method_name, direct_prim};
+use crate::targets::js::names::callback_method_name;
 use crate::utils::{render_prelude, render_trailer, CommentStyle};
 
 /// The fixed addon runtime, with `{{PREFIX}}` (the C prefix), `{{MACRO}}`
 /// (its uppercase form), and `{{HEADER}}` (the header file) placeholders.
 const ADDON_C: &str = include_str!("runtime/addon.c");
 
-/// The `js_arg_*` reader and C type of a direct primitive's temporary.
-fn arg_reader(p: Prim) -> (&'static str, &'static str) {
-    match p {
-        Prim::Bool => ("js_arg_bool", "bool"),
-        Prim::I8 => ("js_arg_i8", "int8_t"),
-        Prim::I16 => ("js_arg_i16", "int16_t"),
-        Prim::I32 => ("js_arg_i32", "int32_t"),
-        Prim::I64 => ("js_arg_i64", "int64_t"),
-        Prim::U8 => ("js_arg_u8", "uint8_t"),
-        Prim::U16 => ("js_arg_u16", "uint16_t"),
-        Prim::U32 => ("js_arg_u32", "uint32_t"),
-        Prim::U64 => ("js_arg_u64", "uint64_t"),
-        Prim::F32 => ("js_arg_f32", "float"),
-        Prim::F64 => ("js_arg_f64", "double"),
-        Prim::String | Prim::Bytes => unreachable!("not a direct primitive"),
+/// The `js_arg_*` reader of a scalar C slot type (C-style enums are
+/// `int32_t` typedefs).
+fn arg_reader(ty: &CType) -> &'static str {
+    match ty {
+        CType::Bool => "js_arg_bool",
+        CType::Int8 => "js_arg_i8",
+        CType::Int16 => "js_arg_i16",
+        CType::Int32 | CType::Enum { .. } => "js_arg_i32",
+        CType::Int64 => "js_arg_i64",
+        CType::Uint8 => "js_arg_u8",
+        CType::Uint16 => "js_arg_u16",
+        CType::Uint32 => "js_arg_u32",
+        CType::Uint64 => "js_arg_u64",
+        CType::Float => "js_arg_f32",
+        CType::Double => "js_arg_f64",
+        other => unreachable!("{other:?} is not a scalar slot"),
     }
 }
 
-/// The expression creating a JavaScript value from the direct C value
-/// `expr`.
-fn new_direct(p: Prim, expr: &str) -> String {
-    match p {
-        Prim::Bool => format!("js_new_bool(env, {expr})"),
-        Prim::I8 | Prim::I16 | Prim::I32 => format!("js_new_i32(env, (int32_t){expr})"),
-        Prim::U8 | Prim::U16 | Prim::U32 => format!("js_new_u32(env, (uint32_t){expr})"),
-        Prim::I64 => format!("js_new_i64(env, {expr})"),
-        Prim::U64 => format!("js_new_u64(env, {expr})"),
-        Prim::F32 | Prim::F64 => format!("js_new_f64(env, (double){expr})"),
-        Prim::String | Prim::Bytes => unreachable!("not a direct primitive"),
+/// The expression creating a JavaScript value from the scalar C value
+/// `expr` of slot type `ty`.
+fn new_scalar(ty: &CType, expr: &str) -> String {
+    match ty {
+        CType::Bool => format!("js_new_bool(env, {expr})"),
+        CType::Int8 | CType::Int16 | CType::Int32 | CType::Enum { .. } => {
+            format!("js_new_i32(env, (int32_t){expr})")
+        }
+        CType::Uint8 | CType::Uint16 | CType::Uint32 => {
+            format!("js_new_u32(env, (uint32_t){expr})")
+        }
+        CType::Int64 => format!("js_new_i64(env, {expr})"),
+        CType::Uint64 => format!("js_new_u64(env, {expr})"),
+        CType::Float | CType::Double => format!("js_new_f64(env, (double){expr})"),
+        other => unreachable!("{other:?} is not a scalar slot"),
     }
 }
 
-/// The expression converting a value received from the producer: `slots`
-/// are the C expressions of its ABI slots (one, or a pointer and a length).
-/// `owned` values (returns, async results, iterator elements) are released
-/// after conversion; borrowed ones (callback arguments) are copied.
-fn receive(ty: &Ty, pass: &RetPass, slots: &[String], owned: bool) -> String {
-    match pass {
-        RetPass::Void => "js_undefined(env)".into(),
-        RetPass::Direct => new_direct(direct_prim(ty), &slots[0]),
-        RetPass::String => format!(
-            "{}(env, {}, {})",
-            if owned { "js_take_str" } else { "js_new_str" },
-            slots[0],
-            slots[1]
-        ),
-        RetPass::Bytes | RetPass::Buffer => format!(
-            "{}(env, {}, {})",
-            if owned {
-                "js_take_bytes"
-            } else {
-                "js_new_bytes"
-            },
-            slots[0],
-            slots[1]
-        ),
-        RetPass::Object { .. } => format!("js_new_handle(env, {})", slots[0]),
+/// The N-API typed array type and C element type of a typed-array (Slice)
+/// element.
+fn typed_array(elem: Prim) -> (&'static str, &'static str) {
+    match elem {
+        Prim::I8 => ("napi_int8_array", "int8_t"),
+        Prim::I16 => ("napi_int16_array", "int16_t"),
+        Prim::I32 => ("napi_int32_array", "int32_t"),
+        Prim::I64 => ("napi_bigint64_array", "int64_t"),
+        Prim::U16 => ("napi_uint16_array", "uint16_t"),
+        Prim::U32 => ("napi_uint32_array", "uint32_t"),
+        Prim::U64 => ("napi_biguint64_array", "uint64_t"),
+        Prim::F32 => ("napi_float32_array", "float"),
+        Prim::F64 => ("napi_float64_array", "double"),
+        Prim::Bool | Prim::U8 | Prim::String | Prim::Bytes => {
+            unreachable!("{elem} never crosses as a typed array")
+        }
+    }
+}
+
+/// `js_new_slice(...)` (borrowed) or `js_take_slice(...)` (owned) of a
+/// typed array of `elem` at `ptr` with `count` elements.
+fn new_slice(elem: Prim, ptr: &str, count: &str, owned: bool) -> String {
+    let (napi, c) = typed_array(elem);
+    let f = if owned {
+        "js_take_slice"
+    } else {
+        "js_new_slice"
+    };
+    format!("{f}(env, {napi}, {ptr}, {count}, sizeof({c}))")
+}
+
+/// The type an out slot (`T* out_x`) points to.
+fn pointee(ty: &CType) -> &CType {
+    match ty {
+        CType::Ptr { pointee, .. } => pointee,
+        other => unreachable!("{other:?} is not an out slot"),
+    }
+}
+
+/// The local zero of a C type: `NULL` for a pointer, `false` for a bool,
+/// `0` otherwise.
+fn zero(ty: &CType) -> &'static str {
+    match ty {
+        _ if ty.is_pointer() => "NULL",
+        CType::Bool => "false",
+        _ => "0",
     }
 }
 
@@ -196,8 +228,8 @@ struct Args {
     decls: Vec<String>,
     /// Argument reads (each jumps to `done` on failure).
     reads: Vec<String>,
-    /// The C argument expressions, in slot order.
-    call: Vec<String>,
+    /// The C argument expression of each slot, by slot name.
+    slots: HashMap<String, String>,
     /// Statements run after the call (callback registrations the producer
     /// now owns).
     transfer: Vec<String>,
@@ -205,74 +237,119 @@ struct Args {
     cleanup: Vec<String>,
 }
 
+impl Args {
+    fn slot(&mut self, slot: &AbiParam, expr: impl Into<String>) {
+        self.slots.insert(slot.name.clone(), expr.into());
+    }
+
+    /// The argument list of a call to `abi`, every slot in the model's
+    /// order.
+    fn call(&self, abi: &AbiFn) -> String {
+        let args: Vec<&str> = abi
+            .params
+            .iter()
+            .map(|p| {
+                self.slots
+                    .get(&p.name)
+                    .unwrap_or_else(|| {
+                        panic!("no argument for slot `{}` of {}", p.name, abi.symbol)
+                    })
+                    .as_str()
+            })
+            .collect();
+        format!("{}({})", abi.symbol, args.join(", "))
+    }
+}
+
 /// Marshal the receiver, parameters, and cancel token of `f` from `argv`.
-fn marshal(model: &Model, f: &FnBinding, launch: &[AbiParam]) -> Args {
+fn marshal(model: &Model, f: &FnBinding) -> Args {
     let prefix = model.prefix();
     let mut a = Args::default();
     let mut idx = 0usize;
-    if f.has_self {
-        let ty = launch[0].ty.render_c(prefix);
+    if let Some(recv) = &f.receiver {
         a.decls.push("void* self_h = NULL;".into());
         a.reads.push(format!(
             "if (!js_arg_handle(env, argv[{idx}], &self_h, false)) goto done;"
         ));
-        a.call.push(format!("({ty})self_h"));
+        a.slot(recv, format!("({})self_h", recv.ty.render_c(prefix)));
         idx += 1;
     }
     for (n, p) in f.params.iter().enumerate() {
         let v = format!("a{n}");
-        match p.arg_pass() {
+        let arg = format!("argv[{idx}]");
+        match &p.pass {
             ArgPass::Direct { slot } => {
-                let (reader, tmp) = arg_reader(direct_prim(&p.ty));
-                a.decls.push(format!("{tmp} {v} = 0;"));
-                a.reads
-                    .push(format!("if (!{reader}(env, argv[{idx}], &{v})) goto done;"));
-                if matches!(p.ty, Ty::Enum(_)) {
-                    a.call.push(format!("({}){v}", slot.ty.render_c(prefix)));
-                } else {
-                    a.call.push(v);
-                }
-            }
-            ArgPass::String { .. } => {
-                a.decls.push(format!("js_str {v} = JS_STR_INIT;"));
+                a.decls
+                    .push(format!("{} {v} = 0;", slot.ty.render_c(prefix)));
                 a.reads.push(format!(
-                    "if (!js_arg_str(env, argv[{idx}], &{v})) goto done;"
+                    "if (!{}(env, {arg}, &{v})) goto done;",
+                    arg_reader(&slot.ty)
                 ));
-                a.call.push(format!("JS_STR_PTR({v})"));
-                a.call.push(format!("{v}.len"));
+                a.slot(slot, v);
+            }
+            ArgPass::OptDirect { has, value, .. } => {
+                a.decls.push(format!("bool {v}_has = false;"));
+                a.decls
+                    .push(format!("{} {v} = 0;", value.ty.render_c(prefix)));
+                a.reads.push(format!(
+                    "if (js_present(env, {arg}, &{v}_has) && !{}(env, {arg}, &{v})) goto done;",
+                    arg_reader(&value.ty)
+                ));
+                a.slot(has, format!("{v}_has"));
+                a.slot(value, v);
+            }
+            ArgPass::Slice { ptr, len, elem } => {
+                let (napi, c) = typed_array(*elem);
+                a.decls.push(format!("const void* {v} = NULL;"));
+                a.decls.push(format!("size_t {v}_len = 0;"));
+                a.reads.push(format!(
+                    "if (!js_arg_slice(env, {arg}, {napi}, &{v}, &{v}_len)) goto done;"
+                ));
+                a.slot(ptr, format!("(const {c}*){v}"));
+                a.slot(len, format!("{v}_len"));
+            }
+            ArgPass::String { ptr, len } => {
+                a.decls.push(format!("js_str {v} = JS_STR_INIT;"));
+                a.reads
+                    .push(format!("if (!js_arg_str(env, {arg}, &{v})) goto done;"));
+                a.slot(ptr, format!("JS_STR_PTR({v})"));
+                a.slot(len, format!("{v}.len"));
                 a.cleanup.push(format!("js_str_free(&{v});"));
             }
-            ArgPass::Bytes { .. } | ArgPass::Buffer { .. } => {
+            ArgPass::Bytes { ptr, len } | ArgPass::Buffer { ptr, len } => {
                 a.decls.push(format!("const uint8_t* {v} = NULL;"));
                 a.decls.push(format!("size_t {v}_len = 0;"));
                 a.reads.push(format!(
-                    "if (!js_arg_bytes(env, argv[{idx}], &{v}, &{v}_len)) goto done;"
+                    "if (!js_arg_bytes(env, {arg}, &{v}, &{v}_len)) goto done;"
                 ));
-                a.call.push(v.clone());
-                a.call.push(format!("{v}_len"));
+                a.slot(ptr, v.clone());
+                a.slot(len, format!("{v}_len"));
             }
-            ArgPass::Object { slot, nullable } => {
+            ArgPass::Object { slot, nullable, .. } => {
                 a.decls.push(format!("void* {v} = NULL;"));
                 a.reads.push(format!(
-                    "if (!js_arg_handle(env, argv[{idx}], &{v}, {nullable})) goto done;"
+                    "if (!js_arg_handle(env, {arg}, &{v}, {nullable})) goto done;"
                 ));
-                a.call.push(format!("({}){v}", slot.ty.render_c(prefix)));
+                a.slot(slot, format!("({}){v}", slot.ty.render_c(prefix)));
             }
-            ArgPass::Callback { nullable, .. } => {
-                let cb = model.callback_interface(
-                    p.ty.callback_interface_name().expect("callback parameter"),
-                );
-                let (dispatch, vtable) = cb_names(&cb.c_tag);
+            ArgPass::Callback {
+                ctx,
+                vtable,
+                nullable,
+                interface,
+            } => {
+                let cb = model.callback_interface(interface);
+                let (dispatch, table) = cb_names(&cb.c_tag);
                 a.decls.push(format!("js_cb* {v} = NULL;"));
                 a.reads.push(format!(
-                    "if (!js_arg_cb(env, argv[{idx}], \"{}\", {dispatch}, {nullable}, &{v})) goto done;",
+                    "if (!js_arg_cb(env, {arg}, \"{}\", {dispatch}, {nullable}, &{v})) goto done;",
                     cb.c_tag
                 ));
-                a.call.push(format!("(void*){v}"));
-                if nullable {
-                    a.call.push(format!("{v} != NULL ? &{vtable} : NULL"));
+                a.slot(ctx, format!("(void*){v}"));
+                if *nullable {
+                    a.slot(vtable, format!("{v} != NULL ? &{table} : NULL"));
                 } else {
-                    a.call.push(format!("&{vtable}"));
+                    a.slot(vtable, format!("&{table}"));
                 }
                 a.transfer.push(format!("{v} = NULL;"));
                 a.cleanup
@@ -281,190 +358,164 @@ fn marshal(model: &Model, f: &FnBinding, launch: &[AbiParam]) -> Args {
         }
         idx += 1;
     }
-    if f.cancellable {
+    if let Some(token) = f.async_binding().and_then(|ab| ab.cancel_token.as_ref()) {
         a.decls.push("void* token = NULL;".into());
         a.reads.push(format!(
             "if (!js_arg_handle(env, argv[{idx}], &token, true)) goto done;"
         ));
-        a.call.push(format!("({prefix}_cancel_token*)token"));
+        a.slot(token, format!("({})token", token.ty.render_c(prefix)));
         idx += 1;
     }
     a.argc = idx;
     a
 }
 
+/// The async result kind of a scalar slot type and the `js_async` field
+/// its value is stored in.
+fn async_scalar(ty: &CType) -> (&'static str, &'static str) {
+    match ty {
+        CType::Bool => ("JS_R_BOOL", "b"),
+        CType::Int8 | CType::Int16 | CType::Int32 | CType::Enum { .. } => ("JS_R_I32", "i"),
+        CType::Int64 => ("JS_R_I64", "i"),
+        CType::Uint8 | CType::Uint16 | CType::Uint32 => ("JS_R_U32", "u"),
+        CType::Uint64 => ("JS_R_U64", "u"),
+        CType::Float | CType::Double => ("JS_R_F64", "f"),
+        other => unreachable!("{other:?} is not a scalar slot"),
+    }
+}
+
 /// The async result kind and the statements storing the completion's
 /// result slots into `a`.
-fn async_result(f: &FnBinding) -> (&'static str, Vec<String>) {
-    let pass = RetPass::of(f.ret.as_ref());
-    match pass {
-        RetPass::Void => ("JS_R_VOID", vec![]),
-        RetPass::Direct => {
-            let ty = f.ret.as_ref().expect("direct result");
-            let (kind, field) = match direct_prim(ty) {
-                Prim::Bool => ("JS_R_BOOL", "b"),
-                Prim::I8 | Prim::I16 | Prim::I32 => ("JS_R_I32", "i"),
-                Prim::I64 => ("JS_R_I64", "i"),
-                Prim::U8 | Prim::U16 | Prim::U32 => ("JS_R_U32", "u"),
-                Prim::U64 => ("JS_R_U64", "u"),
-                Prim::F32 | Prim::F64 => ("JS_R_F64", "f"),
-                Prim::String | Prim::Bytes => unreachable!("not direct"),
-            };
-            (kind, vec![format!("a->v.{field} = result;")])
+fn async_result(result: &ResultPass) -> (&'static str, Vec<String>) {
+    match result {
+        ResultPass::Void => ("JS_R_VOID", vec![]),
+        ResultPass::Direct { result } => {
+            let (kind, field) = async_scalar(&result.ty);
+            (kind, vec![format!("a->v.{field} = {};", result.name)])
         }
-        RetPass::String | RetPass::Bytes | RetPass::Buffer => (
-            if pass == RetPass::String {
-                "JS_R_STR"
-            } else {
-                "JS_R_BYTES"
-            },
-            vec!["a->v.p = result_ptr;".into(), "a->len = result_len;".into()],
+        ResultPass::OptDirect { has, value } => {
+            let (kind, field) = async_scalar(&value.ty);
+            (
+                kind,
+                vec![
+                    "a->opt = true;".into(),
+                    format!("a->has = {};", has.name),
+                    format!("a->v.{field} = {};", value.name),
+                ],
+            )
+        }
+        ResultPass::Slice { ptr, len, elem } => {
+            let (napi, c) = typed_array(*elem);
+            (
+                "JS_R_SLICE",
+                vec![
+                    format!("a->v.p = {};", ptr.name),
+                    format!("a->len = {};", len.name),
+                    format!("a->slice_type = {napi};"),
+                    format!("a->slice_size = sizeof({c});"),
+                ],
+            )
+        }
+        ResultPass::String { ptr, len } => (
+            "JS_R_STR",
+            vec![
+                format!("a->v.p = {};", ptr.name),
+                format!("a->len = {};", len.name),
+            ],
         ),
-        RetPass::Object { .. } => ("JS_R_HANDLE", vec!["a->v.p = result;".into()]),
+        ResultPass::Bytes { ptr, len } | ResultPass::Buffer { ptr, len } => (
+            "JS_R_BYTES",
+            vec![
+                format!("a->v.p = {};", ptr.name),
+                format!("a->len = {};", len.name),
+            ],
+        ),
+        ResultPass::Object { result, .. } => {
+            ("JS_R_HANDLE", vec![format!("a->v.p = {};", result.name)])
+        }
     }
 }
 
 /// Emit one callable's entry point(s).
 fn emit_callable(w: &mut CodeWriter, model: &Model, f: &FnBinding, exports: &mut Vec<String>) {
     let prefix = model.prefix();
-    match &f.shape {
-        CallShape::Async(ab) => {
-            let symbol = &ab.launch.symbol;
-            let (kind, store) = async_result(f);
-            let params: Vec<String> = ab
-                .callback_params
-                .iter()
-                .map(|p| format!("{} {}", p.ty.render_c(prefix), p.name))
-                .collect();
-            w.block(
-                format!("static void done_{symbol}({}) {{", params.join(", ")),
-                "}",
-                |w| {
-                    w.line("js_async* a = (js_async*)context;");
-                    for s in &store {
-                        w.line(s);
-                    }
-                    w.line("js_async_done(a, err);");
-                },
-            );
-            w.blank();
-            let mut args = marshal(model, f, &ab.launch.params);
-            args.call.push(format!("done_{symbol}"));
-            args.call.push("a".into());
-            emit_entry(w, symbol, &args, |w| {
-                w.line(format!(
-                    "js_async* a = js_async_begin(env, {kind}, \"{symbol}\", &ret);"
-                ));
-                w.line("js_sync_begin();");
-                w.line(format!("{symbol}({});", args.call.join(", ")));
-                w.line("js_sync_end();");
-                for t in &args.transfer {
-                    w.line(t);
+    let symbol = &f.abi.symbol;
+    let mut args = marshal(model, f);
+    if let Some(ab) = f.async_binding() {
+        let (kind, store) = async_result(&ab.result);
+        let params: Vec<String> = ab
+            .callback_params
+            .iter()
+            .map(|p| format!("{} {}", p.ty.render_c(prefix), p.name))
+            .collect();
+        w.block(
+            format!("static void done_{symbol}({}) {{", params.join(", ")),
+            "}",
+            |w| {
+                w.line("js_async* a = (js_async*)context;");
+                for s in &store {
+                    w.line(s);
                 }
-            });
-            exports.push(symbol.clone());
-        }
-        CallShape::Sync(abi) => {
-            let args = marshal(model, f, &abi.params);
-            let pass = RetPass::of(f.ret.as_ref());
-            let result = f.ret.as_ref().map(|ty| SyncResult {
-                c_type: abi.ret.render_c(prefix),
-                out_len: matches!(pass, RetPass::String | RetPass::Bytes | RetPass::Buffer),
-                value: receive(ty, &pass, &["r".into(), "out_len".into()], true),
-            });
-            emit_sync(w, &abi.symbol, &args, result.as_ref());
-            exports.push(abi.symbol.clone());
-        }
-        CallShape::Iterator(it) => {
-            let args = marshal(model, f, &it.launch.params);
-            let handle = SyncResult {
-                c_type: it.launch.ret.render_c(prefix),
-                out_len: false,
-                value: "js_new_handle(env, r)".into(),
-            };
-            emit_sync(w, &it.launch.symbol, &args, Some(&handle));
-            exports.push(it.launch.symbol.clone());
-
-            let item = it.item_ctype().render_c(prefix);
-            let protocol = it.protocol(f);
-            let pair = matches!(
-                protocol.elem,
-                RetPass::String | RetPass::Bytes | RetPass::Buffer
-            );
-            let symbol = &it.next.symbol;
-            w.block(
-                format!("static napi_value nx_{symbol}(napi_env env, napi_callback_info info) {{"),
-                "}",
-                |w| {
-                    w.line("JS_ARGS(1);");
-                    w.line("void* h = NULL;");
-                    w.line("if (!js_arg_handle(env, argv[0], &h, false)) return NULL;");
-                    w.line(format!("{item} item;"));
-                    w.line("memset(&item, 0, sizeof item);");
-                    w.line("size_t item_len = 0;");
-                    w.line("js_error err = {0};");
-                    let len = if pair { "&item_len, " } else { "" };
-                    w.line("js_sync_begin();");
-                    w.line(format!(
-                        "int32_t has = {symbol}(({}*)h, &item, {len}&err);",
-                        it.iter_tag
-                    ));
-                    w.line("js_sync_end();");
-                    if !pair {
-                        w.line("(void)item_len;");
-                    }
-                    w.line("if (err.code != 0) return js_throw(env, &err);");
-                    w.line("if (has == 0) return js_undefined(env);");
-                    w.line(format!(
-                        "return {};",
-                        receive(
-                            &it.elem,
-                            &protocol.elem,
-                            &["item".into(), "item_len".into()],
-                            true
-                        )
-                    ));
-                },
-            );
-            w.blank();
-            exports.push(symbol.clone());
-            emit_handle_fn(
-                w,
-                &it.destroy_symbol,
-                &format!(
-                    "js_sync_begin();\n{}(({}*)h);\njs_sync_end();\nreturn js_undefined(env);",
-                    it.destroy_symbol, it.iter_tag
-                ),
-            );
-            exports.push(it.destroy_symbol.clone());
-        }
+                w.line("js_async_done(a, err);");
+            },
+        );
+        w.blank();
+        args.slots
+            .insert("callback".into(), format!("done_{symbol}"));
+        args.slots.insert("context".into(), "a".into());
+        let call = args.call(&f.abi);
+        emit_entry(w, symbol, &args, |w| {
+            w.line(format!(
+                "js_async* a = js_async_begin(env, {kind}, \"{symbol}\", &ret);"
+            ));
+            w.line("js_sync_begin();");
+            w.line(format!("{call};"));
+            w.line("js_sync_end();");
+            for t in &args.transfer {
+                w.line(t);
+            }
+        });
+        exports.push(symbol.clone());
+        return;
     }
-}
 
-/// The result of a synchronous entry point: the C type of `r`, whether an
-/// `out_len` slot follows the inputs, and the JavaScript value made from `r`
-/// (and `out_len`).
-struct SyncResult {
-    c_type: String,
-    out_len: bool,
-    value: String,
-}
-
-/// Emit a synchronous entry point: marshal, call, check the error slot, and
-/// convert the result (`None` for a void call).
-fn emit_sync(w: &mut CodeWriter, symbol: &str, args: &Args, result: Option<&SyncResult>) {
-    emit_entry(w, symbol, args, |w| {
-        w.line("js_error err = {0};");
-        let mut call = args.call.clone();
-        if result.is_some_and(|r| r.out_len) {
-            w.line("size_t out_len = 0;");
-            call.push("&out_len".into());
+    // A synchronous call (or an iterator launcher): the out slots its
+    // return needs, then the call, the error check, and the conversion.
+    let mut outs: Vec<String> = Vec::new();
+    for slot in f.ret_pass.out_slots() {
+        let ty = pointee(&slot.ty);
+        outs.push(format!(
+            "{} {} = {};",
+            ty.render_c(prefix),
+            slot.name,
+            zero(ty)
+        ));
+        args.slot(slot, format!("&{}", slot.name));
+    }
+    args.slots.insert("out_err".into(), "&err".into());
+    let value = match &f.ret_pass {
+        RetPass::Void => None,
+        RetPass::Direct => Some(new_scalar(&f.abi.ret, "r")),
+        RetPass::OptDirect { out_value } => Some(format!(
+            "r ? {} : js_null(env)",
+            new_scalar(pointee(&out_value.ty), &out_value.name)
+        )),
+        RetPass::Slice { out_len, elem } => Some(new_slice(*elem, "r", &out_len.name, true)),
+        RetPass::String { out_len } => Some(format!("js_take_str(env, r, {})", out_len.name)),
+        RetPass::Bytes { out_len } | RetPass::Buffer { out_len } => {
+            Some(format!("js_take_bytes(env, r, {})", out_len.name))
         }
-        call.push("&err".into());
-        let call = format!("{symbol}({})", call.join(", "));
+        RetPass::Object { .. } | RetPass::Iterator(_) => Some("js_new_handle(env, r)".into()),
+    };
+    let call = args.call(&f.abi);
+    emit_entry(w, symbol, &args, |w| {
+        w.line("js_error err = {0};");
+        for o in &outs {
+            w.line(o);
+        }
         w.line("js_sync_begin();");
-        match result {
-            Some(r) => w.line(format!("{} r = {call};", r.c_type)),
+        match &value {
+            Some(_) => w.line(format!("{} r = {call};", f.abi.ret.render_c(prefix))),
             None => w.line(format!("{call};")),
         };
         w.line("js_sync_end();");
@@ -475,9 +526,96 @@ fn emit_sync(w: &mut CodeWriter, symbol: &str, args: &Args, result: Option<&Sync
         w.line("  js_throw(env, &err);");
         w.line("  goto done;");
         w.line("}");
-        let value = result.map_or("js_undefined(env)", |r| r.value.as_str());
-        w.line(format!("ret = {value};"));
+        w.line(format!(
+            "ret = {};",
+            value.as_deref().unwrap_or("js_undefined(env)")
+        ));
     });
+    exports.push(symbol.clone());
+
+    if let Some(it) = f.iterator() {
+        emit_iterator_next(w, prefix, it);
+        exports.push(it.next.symbol.clone());
+        emit_handle_fn(
+            w,
+            &it.destroy_symbol,
+            &format!(
+                "js_sync_begin();\n{}(({}*)h);\njs_sync_end();\nreturn js_undefined(env);",
+                it.destroy_symbol, it.iter_tag
+            ),
+        );
+        exports.push(it.destroy_symbol.clone());
+    }
+}
+
+/// Emit an iterator's `next` entry point: `undefined` once exhausted, else
+/// the element (`null` for an absent optional one).
+fn emit_iterator_next(
+    w: &mut CodeWriter,
+    prefix: &str,
+    it: &weaveffi_model::model::IteratorBinding,
+) {
+    let symbol = &it.next.symbol;
+    let mut slots: HashMap<String, String> = HashMap::new();
+    let mut decls = Vec::new();
+    for slot in it.item.slots() {
+        let ty = pointee(&slot.ty);
+        decls.push(format!(
+            "{} {} = {};",
+            ty.render_c(prefix),
+            slot.name,
+            zero(ty)
+        ));
+        slots.insert(slot.name.clone(), format!("&{}", slot.name));
+    }
+    let iter = &it.next.params[0];
+    slots.insert(iter.name.clone(), format!("({}*)h", it.iter_tag));
+    slots.insert("out_err".into(), "&err".into());
+    let call = Args {
+        slots,
+        ..Args::default()
+    }
+    .call(&it.next);
+    let value = match &it.item {
+        ItemPass::Direct { out_item } => new_scalar(pointee(&out_item.ty), &out_item.name),
+        ItemPass::OptDirect { out_has, out_item } => format!(
+            "{} ? {} : js_null(env)",
+            out_has.name,
+            new_scalar(pointee(&out_item.ty), &out_item.name)
+        ),
+        ItemPass::Slice {
+            out_item,
+            out_len,
+            elem,
+        } => new_slice(*elem, &out_item.name, &out_len.name, true),
+        ItemPass::String { out_item, out_len } => {
+            format!("js_take_str(env, {}, {})", out_item.name, out_len.name)
+        }
+        ItemPass::Bytes { out_item, out_len } | ItemPass::Buffer { out_item, out_len } => {
+            format!("js_take_bytes(env, {}, {})", out_item.name, out_len.name)
+        }
+        ItemPass::Object { out_item, .. } => format!("js_new_handle(env, {})", out_item.name),
+    };
+    w.block(
+        format!("static napi_value nx_{symbol}(napi_env env, napi_callback_info info) {{"),
+        "}",
+        |w| {
+            w.line("JS_ARGS(1);");
+            w.line("void* h = NULL;");
+            w.line("if (!js_arg_handle(env, argv[0], &h, false)) return NULL;");
+            for d in &decls {
+                w.line(d);
+            }
+            w.line("js_error err = {0};");
+            w.line("js_sync_begin();");
+            w.line(format!("int32_t has = {call};"));
+            w.line("js_sync_end();");
+            w.line("if (err.code != 0) return js_throw(env, &err);");
+            w.line("if (has == 0) return js_undefined(env);");
+            w.line(format!("return {value};"));
+        },
+    );
+    w.blank();
 }
 
 /// Emit an entry point's frame: the argument reads, `body` in its own
@@ -504,139 +642,21 @@ fn emit_entry(w: &mut CodeWriter, symbol: &str, args: &Args, body: impl FnOnce(&
     w.blank();
 }
 
-/// The parts of one callback method's vtable entry: its C return type, the
-/// parameter slots (declarations `p0`, `p1`, ...), and whether the return
-/// travels through the `out_ptr`/`out_len` slots.
-struct Entry<'a> {
-    ret_c: String,
-    slots: &'a [AbiParam],
-    run: bool,
-}
-
-impl<'a> Entry<'a> {
-    fn of(method: &'a CallbackMethodBinding, pass: &RetPass, prefix: &str) -> Self {
-        let run = matches!(pass, RetPass::String | RetPass::Bytes | RetPass::Buffer);
-        let inputs: usize = method.params.iter().map(|p| p.abi.len()).sum();
-        Entry {
-            ret_c: method.abi_ret.render_c(prefix),
-            slots: &method.abi_params[1..1 + inputs],
-            run,
-        }
-    }
+/// The frame field (and trampoline parameter) of a callback method slot.
+fn field(slot: &AbiParam) -> String {
+    format!("p_{}", slot.name)
 }
 
 /// Emit one callback interface: per method a frame, an invoker that runs on
 /// the JavaScript thread, and a trampoline (the vtable entry) that calls the
 /// invoker directly or hops to the JavaScript thread and waits; then the
-/// dispatcher of hopped calls and the static vtable.
+/// dispatcher of hopped calls and the static vtable (flags 0: methods may
+/// be called from any thread).
 fn emit_callback_interface(w: &mut CodeWriter, cb: &CallbackInterfaceBinding, prefix: &str) {
     let tag = &cb.c_tag;
-    let protocol = cb.protocol();
     let (dispatch, vtable) = cb_names(tag);
-    for (idx, ((method, passes), ret)) in cb
-        .methods
-        .iter()
-        .zip(&protocol.method_args)
-        .zip(&protocol.method_returns)
-        .enumerate()
-    {
-        let entry = Entry::of(method, ret, prefix);
-        let frame = format!("frame_{tag}_{}", method.name);
-        w.block("typedef struct {", format!("}} {frame};"), |w| {
-            w.line("js_error* out_err;");
-            for (i, s) in entry.slots.iter().enumerate() {
-                w.line(format!("{} p{i};", s.ty.render_c(prefix)));
-            }
-            if entry.run {
-                w.line("uint8_t** out_ptr;");
-                w.line("size_t* out_len;");
-            } else if method.ret.is_some() {
-                w.line(format!("{} result;", entry.ret_c));
-            }
-        });
-        w.blank();
-
-        let what = format!("{}.{}", cb.name, callback_method_name(&method.name));
-        w.block(
-            format!(
-                "static void invoke_{tag}_{}(napi_env env, js_cb* cb, {frame}* f) {{",
-                method.name
-            ),
-            "}",
-            |w| {
-                w.line("napi_handle_scope scope;");
-                w.line("napi_open_handle_scope(env, &scope);");
-                let n = method.params.len();
-                w.line(format!("napi_value argv[{}];", n + 1));
-                let mut slot = 0usize;
-                for (i, (p, pass)) in method.params.iter().zip(passes).enumerate() {
-                    let names: Vec<String> = (slot..slot + p.abi.len())
-                        .map(|k| format!("f->p{k}"))
-                        .collect();
-                    slot += p.abi.len();
-                    w.line(format!(
-                        "argv[{i}] = {};",
-                        receive(&p.ty, pass, &names, false)
-                    ));
-                }
-                w.line("napi_value result;");
-                w.line(format!(
-                    "if (!js_cb_call(env, cb, \"{}\", {n}, argv, &result)) {{",
-                    method.name
-                ));
-                w.line(format!(
-                    "  js_cb_report(env, f->out_err, \"{what} failed\");"
-                ));
-                if let Some(ty) = &method.ret {
-                    w.line("} else {");
-                    w.scope(|w| emit_callback_return(w, ty, ret, &entry, &what));
-                }
-                w.line("}");
-                w.line("napi_close_handle_scope(env, scope);");
-            },
-        );
-        w.blank();
-
-        let mut decls = vec!["void* ctx".to_string()];
-        for (i, s) in entry.slots.iter().enumerate() {
-            decls.push(format!("{} p{i}", s.ty.render_c(prefix)));
-        }
-        if entry.run {
-            decls.push("uint8_t** out_ptr".into());
-            decls.push("size_t* out_len".into());
-        }
-        decls.push(format!("{prefix}_error* out_err"));
-        w.block(
-            format!(
-                "static {} tramp_{tag}_{}({}) {{",
-                entry.ret_c,
-                method.name,
-                decls.join(", ")
-            ),
-            "}",
-            |w| {
-                w.line(format!("{frame} f;"));
-                w.line("memset(&f, 0, sizeof f);");
-                w.line("f.out_err = out_err;");
-                for i in 0..entry.slots.len() {
-                    w.line(format!("f.p{i} = p{i};"));
-                }
-                if entry.run {
-                    w.line("f.out_ptr = out_ptr;");
-                    w.line("f.out_len = out_len;");
-                }
-                w.line("js_cb* cb = (js_cb*)ctx;");
-                w.line("if (js_cb_on_js_thread(cb)) {");
-                w.line(format!("  invoke_{tag}_{}(cb->env, cb, &f);", method.name));
-                w.line("} else {");
-                w.line(format!("  js_cb_hop(cb, {idx}, &f, out_err, \"{what}\");"));
-                w.line("}");
-                if method.ret.is_some() && !entry.run {
-                    w.line("return f.result;");
-                }
-            },
-        );
-        w.blank();
+    for (idx, method) in cb.methods.iter().enumerate() {
+        emit_callback_method(w, cb, method, idx, prefix);
     }
 
     w.block(
@@ -653,9 +673,7 @@ fn emit_callback_interface(w: &mut CodeWriter, cb: &CallbackInterfaceBinding, pr
             w.line("}");
             w.line("if (!js_cb_take(req)) return;");
             w.line("if (env == NULL) {");
-            w.line(format!(
-                "  {prefix}_error_set(req->out_err, -4, \"the JavaScript environment is shutting down\");"
-            ));
+            w.line("  js_error_set(req->out_err, -4, \"the JavaScript environment is shutting down\");");
             w.line("} else {");
             w.line("  switch (req->method) {");
             for (i, method) in cb.methods.iter().enumerate() {
@@ -683,39 +701,201 @@ fn emit_callback_interface(w: &mut CodeWriter, cb: &CallbackInterfaceBinding, pr
     w.blank();
 }
 
+/// Emit one callback method's frame, invoker, and trampoline.
+fn emit_callback_method(
+    w: &mut CodeWriter,
+    cb: &CallbackInterfaceBinding,
+    method: &CallbackMethodBinding,
+    idx: usize,
+    prefix: &str,
+) {
+    let tag = &cb.c_tag;
+    let frame = format!("frame_{tag}_{}", method.name);
+    // Every slot but the context: the inputs, the return's out slots, and
+    // `out_err`.
+    let slots = &method.abi.params[1..];
+    let ret_c = method.abi.ret.render_c(prefix);
+    let returns = method.abi.ret != CType::Void;
+    w.block("typedef struct {", format!("}} {frame};"), |w| {
+        for s in slots {
+            w.line(format!("{} {};", s.ty.render_c(prefix), field(s)));
+        }
+        if returns {
+            w.line(format!("{ret_c} result;"));
+        }
+    });
+    w.blank();
+
+    let what = format!("{}.{}", cb.name, callback_method_name(&method.name));
+    w.block(
+        format!(
+            "static void invoke_{tag}_{}(napi_env env, js_cb* cb, {frame}* f) {{",
+            method.name
+        ),
+        "}",
+        |w| {
+            w.line("napi_handle_scope scope;");
+            w.line("napi_open_handle_scope(env, &scope);");
+            let n = method.params.len();
+            w.line(format!("napi_value argv[{}];", n + 1));
+            for (i, p) in method.params.iter().enumerate() {
+                let f = |s: &AbiParam| format!("f->{}", field(s));
+                let value = match &p.pass {
+                    ArgPass::Direct { slot } => new_scalar(&slot.ty, &f(slot)),
+                    ArgPass::OptDirect { has, value, .. } => format!(
+                        "{} ? {} : js_null(env)",
+                        f(has),
+                        new_scalar(&value.ty, &f(value))
+                    ),
+                    ArgPass::Slice { ptr, len, elem } => new_slice(*elem, &f(ptr), &f(len), false),
+                    ArgPass::String { ptr, len } => {
+                        format!("js_new_str(env, {}, {})", f(ptr), f(len))
+                    }
+                    ArgPass::Bytes { ptr, len } | ArgPass::Buffer { ptr, len } => {
+                        format!("js_new_bytes(env, {}, {})", f(ptr), f(len))
+                    }
+                    ArgPass::Object { slot, .. } => format!("js_new_handle(env, {})", f(slot)),
+                    ArgPass::Callback { .. } => {
+                        unreachable!("callback methods take value types only")
+                    }
+                };
+                w.line(format!("argv[{i}] = {value};"));
+            }
+            w.line("napi_value result;");
+            w.line(format!(
+                "if (!js_cb_call(env, cb, \"{}\", {n}, argv, &result)) {{",
+                method.name
+            ));
+            w.line(format!(
+                "  js_cb_report(env, f->p_out_err, \"{what} failed\");"
+            ));
+            if method.ret.is_some() {
+                w.line("} else {");
+                w.scope(|w| emit_callback_return(w, method, &ret_c, &what, prefix));
+            }
+            w.line("}");
+            w.line("napi_close_handle_scope(env, scope);");
+        },
+    );
+    w.blank();
+
+    let mut decls = vec!["void* ctx".to_string()];
+    decls.extend(
+        slots
+            .iter()
+            .map(|s| format!("{} {}", s.ty.render_c(prefix), field(s))),
+    );
+    w.block(
+        format!(
+            "static {ret_c} tramp_{tag}_{}({}) {{",
+            method.name,
+            decls.join(", ")
+        ),
+        "}",
+        |w| {
+            w.line(format!("{frame} f;"));
+            w.line("memset(&f, 0, sizeof f);");
+            for s in slots {
+                w.line(format!("f.{0} = {0};", field(s)));
+            }
+            w.line("js_cb* cb = (js_cb*)ctx;");
+            w.line("if (js_cb_on_js_thread(cb)) {");
+            w.line(format!("  invoke_{tag}_{}(cb->env, cb, &f);", method.name));
+            w.line("} else {");
+            w.line(format!(
+                "  js_cb_hop(cb, {idx}, &f, f.p_out_err, \"{what}\");"
+            ));
+            w.line("}");
+            if returns {
+                w.line("return f.result;");
+            }
+        },
+    );
+    w.blank();
+}
+
 /// Emit the conversion of a callback method's JavaScript `result` into its
-/// vtable return: the frame's `result`, or a run in the out slots. A value
-/// of the wrong type is reported as a failure.
-fn emit_callback_return(w: &mut CodeWriter, ty: &Ty, pass: &RetPass, entry: &Entry, what: &str) {
+/// vtable return: the frame's `result`, a value behind `out_value`, or a run
+/// in the `out_ptr`/`out_len` slots. A value of the wrong type is reported
+/// as a failure.
+fn emit_callback_return(
+    w: &mut CodeWriter,
+    method: &CallbackMethodBinding,
+    ret_c: &str,
+    what: &str,
+    prefix: &str,
+) {
     let wrong =
-        format!("js_cb_report(env, f->out_err, \"{what} returned a value of the wrong type\");");
-    match pass {
-        RetPass::Void => {}
-        RetPass::Direct => {
-            let (reader, tmp) = arg_reader(direct_prim(ty));
-            w.line(format!("{tmp} v = 0;"));
-            w.line(format!("if ({reader}(env, result, &v)) {{"));
-            w.line(format!("  f->result = ({})v;", entry.ret_c));
+        format!("js_cb_report(env, f->p_out_err, \"{what} returned a value of the wrong type\");");
+    match &method.ret_pass {
+        CallbackRetPass::Void => {}
+        CallbackRetPass::Direct => {
+            w.line(format!("{ret_c} v = 0;"));
+            w.line(format!(
+                "if ({}(env, result, &v)) {{",
+                arg_reader(&method.abi.ret)
+            ));
+            w.line("  f->result = v;");
             w.line("} else {");
             w.line(format!("  {wrong}"));
             w.line("}");
         }
-        RetPass::String => {
-            w.line("if (!js_ret_str(env, result, f->out_ptr, f->out_len)) {");
+        CallbackRetPass::OptDirect { out_value } => {
+            let ty = pointee(&out_value.ty);
+            w.line("bool has = false;");
+            w.line(format!("{} v = 0;", ty.render_c(prefix)));
+            w.line(format!(
+                "if (js_present(env, result, &has) && !{}(env, result, &v)) {{",
+                arg_reader(ty)
+            ));
+            w.line(format!("  {wrong}"));
+            w.line("} else if (has) {");
+            w.line(format!("  *f->{} = v;", field(out_value)));
+            w.line("  f->result = true;");
+            w.line("}");
+        }
+        CallbackRetPass::Slice {
+            out_ptr,
+            out_len,
+            elem,
+        } => {
+            let (napi, c) = typed_array(*elem);
+            w.line("void* run = NULL;");
+            w.line("size_t n = 0;");
+            w.line(format!(
+                "if (js_ret_slice(env, result, {napi}, sizeof({c}), &run, &n)) {{"
+            ));
+            w.line(format!("  *f->{} = ({c}*)run;", field(out_ptr)));
+            w.line(format!("  *f->{} = n;", field(out_len)));
+            w.line("} else {");
             w.line(format!("  {wrong}"));
             w.line("}");
         }
-        RetPass::Bytes | RetPass::Buffer => {
-            w.line("if (!js_ret_bytes(env, result, f->out_ptr, f->out_len)) {");
+        CallbackRetPass::String { out_ptr, out_len } => {
+            w.line(format!(
+                "if (!js_ret_str(env, result, f->{}, f->{})) {{",
+                field(out_ptr),
+                field(out_len)
+            ));
             w.line(format!("  {wrong}"));
             w.line("}");
         }
-        RetPass::Object { nullable } => {
+        CallbackRetPass::Bytes { out_ptr, out_len }
+        | CallbackRetPass::Buffer { out_ptr, out_len } => {
+            w.line(format!(
+                "if (!js_ret_bytes(env, result, f->{}, f->{})) {{",
+                field(out_ptr),
+                field(out_len)
+            ));
+            w.line(format!("  {wrong}"));
+            w.line("}");
+        }
+        CallbackRetPass::Object { nullable, .. } => {
             w.line("void* h = NULL;");
             w.line(format!(
                 "if (js_arg_handle(env, result, &h, {nullable})) {{"
             ));
-            w.line(format!("  f->result = ({})h;", entry.ret_c));
+            w.line(format!("  f->result = ({ret_c})h;"));
             w.line("} else {");
             w.line(format!("  {wrong}"));
             w.line("}");

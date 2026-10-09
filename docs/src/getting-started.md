@@ -17,19 +17,14 @@ weaveffi --version
 
 ## Write the producer
 
-Create a library crate, add the `weaveffi` crate, and build it as a C
-dynamic library:
+Create a library crate and add the `weaveffi` crate. It needs no
+`crate-type`: WeaveFFI builds the C dynamic library itself (with `cargo
+rustc --crate-type cdylib`).
 
 ```bash
 cargo new --lib mathlib
 cd mathlib
 cargo add weaveffi
-```
-
-```toml
-# Cargo.toml
-[lib]
-crate-type = ["cdylib"]
 ```
 
 Replace `src/lib.rs` with an annotated module. Everything here is safe Rust;
@@ -43,14 +38,8 @@ pub mod math {
     #[weaveffi::error]
     #[derive(Debug)]
     pub enum MathError {
-        /// Division by zero.
+        /// division by zero
         DivisionByZero = 1,
-    }
-
-    impl std::fmt::Display for MathError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("division by zero")
-        }
     }
 
     /// Add two integers.
@@ -81,9 +70,13 @@ A few things to notice:
 - Every C symbol starts with the crate's library name, so this crate exports
   `mathlib_math_add`, `mathlib_math_div`, and `mathlib_math_greet`, plus the
   runtime (`mathlib_error_clear`, `mathlib_free_bytes`, and so on).
-- `Result<i32, MathError>` makes `div` a throwing function. The enum's
-  discriminants are the stable error codes, and its `Display` output is the
-  message consumers see.
+- `Result<i32, MathError>` makes `div` throw the `MathError` domain. The
+  enum's discriminants are the stable error codes, and the macro generates
+  its `Display` from each variant's doc comment (or a
+  `#[weaveffi(message = "...")]` template), which is the message consumers
+  see. A `Result` whose error type isn't a declared domain (a `String`, a
+  `std::io::Error`) works too: it throws an untyped error carrying its
+  `Display` text.
 - `weaveffi::export_runtime!()` appears exactly once, at the crate root.
 
 The [producer macro guide](guides/producer-macro.md) covers records, enums,
@@ -93,15 +86,16 @@ objects, callbacks, iterators, and async functions.
 
 Run `weaveffi init` in the crate. It writes a `weaveffi.toml` whose
 `[project]` table points at the crate itself, then lists anything the crate
-still needs (a `cdylib` crate type, the `export_runtime!` call, a
+still needs (the `weaveffi` dependency, the `export_runtime!` call, a
 `#[weaveffi::module]`):
 
 ```bash
 weaveffi init
 ```
 
-The file it writes generates all eleven targets; uncomment `targets` to pick
-a subset:
+The file it writes generates the C header and the Python package; edit
+`targets` to pick the languages you ship (without it, every target is
+generated):
 
 ```toml
 # weaveffi.toml
@@ -118,8 +112,9 @@ no arguments and works from any directory in the project:
 weaveffi generate
 ```
 
-`weaveffi generate` runs `cargo build`, then reads the API from the library
-it built: the macro embeds a description of every exported declaration in
+`weaveffi generate` builds the library with Cargo's `dev` profile (pass
+`--profile <name>` for another), then reads the API from the library it
+built: the macro embeds a description of every exported declaration in
 the library, so the bindings match the compiled code exactly, `#[cfg]`
 included. `weaveffi extract` prints that description as an IDL.
 
@@ -132,7 +127,7 @@ that are no longer produced.
 ## Call it from Python
 
 Run `weaveffi dev` instead of `weaveffi generate` while you iterate: it
-builds the debug library, generates, and copies the library into the
+builds the library (the `dev` profile), generates, and copies the library into the
 generated Python package, which loads a bundled copy first. Then install the
 package:
 
@@ -167,8 +162,9 @@ to load with an error naming the declaration that's missing or changed. The
 ## Call it from C
 
 The header is the contract every other binding is built on. Strings cross as
-UTF-8 `(ptr, len)` runs, the caller owns a zeroed `mathlib_error`, and
-returned strings are released with `mathlib_free_bytes`:
+UTF-8 `(ptr, len)` runs, the caller owns a zeroed `mathlib_error` (whose
+message is a length-delimited run, not a C string), and returned strings are
+released with `mathlib_free_bytes`:
 
 ```c
 #include <stdio.h>
@@ -187,7 +183,8 @@ int main(void) {
 
     mathlib_math_div(1, 0, &err);
     if (err.code == mathlib_math_MathError_DivisionByZero) {
-        printf("error %d: %s\n", err.code, err.message);
+        printf("error %d: %.*s\n", err.code,
+               (int)err.message_len, (const char*)err.message_ptr);
         mathlib_error_clear(&err);
     }
 
@@ -243,7 +240,7 @@ Edit `greeter.yml` to declare the API (the [IDL reference](reference/idl.md)
 has the full schema):
 
 ```yaml
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: greeter
     functions:
@@ -271,70 +268,93 @@ weaveffi generate --target c     # writes bindings/c/greeter.h
 
 uint32_t greeter_abi_version(void) { return GREETER_ABI_VERSION; }
 
-/* The contract table the header was generated with. */
+/* The contract table the header was generated with, sorted by id. */
 const greeter_contract_entry* greeter_greeter_contract(size_t* out_len) {
     static const greeter_contract_entry table[] = GREETER_GREETER_CONTRACT;
-    *out_len = GREETER_GREETER_CONTRACT_LEN;
+    if (out_len != NULL) *out_len = GREETER_GREETER_CONTRACT_LEN;
     return table;
 }
 
 int32_t greeter_greeter_add(int32_t a, int32_t b, greeter_error* out_err) {
     (void)out_err;   /* written only on failure */
-    return a + b;
+    return (int32_t)((uint32_t)a + (uint32_t)b);
 }
 
-void greeter_error_set(greeter_error* err, int32_t code, const char* message) {
+/* One allocator for every byte run: returned strings and buffers, error
+   messages and payloads, and runs a consumer allocates with greeter_alloc.
+   Every run must be 8-aligned; malloc's alignment is at least 8. */
+uint8_t* greeter_alloc(size_t len) { return len ? calloc(len, 1) : NULL; }
+void greeter_free_bytes(uint8_t* ptr, size_t len) { if (len) free(ptr); }
+
+static const uint8_t* run_copy(const uint8_t* ptr, size_t len) {
+    uint8_t* run = greeter_alloc(len);
+    if (run != NULL) memcpy(run, ptr, len);
+    return run;
+}
+
+/* The message is `message_len` bytes of UTF-8, not NUL-terminated; NULL is
+   the empty message. Both setters copy. */
+void greeter_error_set(greeter_error* err, int32_t code,
+                       const uint8_t* message_ptr, size_t message_len) {
+    if (err == NULL) return;
     greeter_error_clear(err);
     err->code = code;
-    err->message = message ? strdup(message) : NULL;
+    if (message_ptr != NULL && message_len != 0) {
+        err->message_ptr = run_copy(message_ptr, message_len);
+        err->message_len = err->message_ptr != NULL ? message_len : 0;
+    }
+}
+
+void greeter_error_set_payload(greeter_error* err, const uint8_t* ptr, size_t len) {
+    if (err == NULL) return;
+    free((void*)err->payload_ptr);
+    err->payload_ptr = NULL;
+    err->payload_len = 0;
+    if (ptr != NULL && len != 0) {
+        err->payload_ptr = run_copy(ptr, len);
+        err->payload_len = err->payload_ptr != NULL ? len : 0;
+    }
 }
 
 void greeter_error_clear(greeter_error* err) {
-    free((void*)err->message);
+    if (err == NULL) return;
+    free((void*)err->message_ptr);
     free((void*)err->payload_ptr);
     memset(err, 0, sizeof *err);
 }
 
-void greeter_error_set_payload(greeter_error* err, const uint8_t* ptr, size_t len) {
-    free((void*)err->payload_ptr);
-    err->payload_ptr = NULL;
-    err->payload_len = 0;
-    if (ptr && len) {
-        uint8_t* copy = malloc(len);
-        memcpy(copy, ptr, len);
-        err->payload_ptr = copy;
-        err->payload_len = len;
-    }
-}
-
 void greeter_error_free(greeter_error* err) {
-    if (err) { greeter_error_clear(err); free(err); }
+    greeter_error_clear(err);
+    free(err);
 }
-
-/* One allocator for every byte run, returned or consumer-allocated. */
-uint8_t* greeter_alloc(size_t len) { return len ? calloc(len, 1) : NULL; }
-void greeter_free_bytes(uint8_t* ptr, size_t len) { (void)len; free(ptr); }
 
 /* Cancel tokens (used by async functions; this API has none, but the runtime
    surface is the same for every library). */
-struct greeter_cancel_token { atomic_bool cancelled; };
+struct greeter_cancel_token { atomic_int refs; atomic_bool cancelled; };
 greeter_cancel_token* greeter_cancel_token_create(void) {
-    return calloc(1, sizeof(greeter_cancel_token));
+    greeter_cancel_token* t = malloc(sizeof *t);
+    if (t != NULL) { atomic_init(&t->refs, 1); atomic_init(&t->cancelled, false); }
+    return t;
 }
 void greeter_cancel_token_cancel(greeter_cancel_token* token) {
-    if (token) atomic_store(&token->cancelled, true);
+    if (token != NULL) atomic_store(&token->cancelled, true);
 }
 bool greeter_cancel_token_is_cancelled(const greeter_cancel_token* token) {
-    return token && atomic_load(&((greeter_cancel_token*)token)->cancelled);
+    return token != NULL && atomic_load(&((greeter_cancel_token*)token)->cancelled);
 }
-void greeter_cancel_token_destroy(greeter_cancel_token* token) { free(token); }
+void greeter_cancel_token_destroy(greeter_cancel_token* token) {
+    if (token != NULL && atomic_fetch_sub(&token->refs, 1) == 1) free(token);
+}
 
 /* Leak counters: a producer that doesn't count returns 0 for every kind. */
 uint64_t greeter_debug_live(int32_t kind) { (void)kind; return 0; }
 ```
 
 The library must export every runtime symbol the header declares, each
-top-level module's contract function, and the API itself; the
+top-level module's contract function, and the API itself. Every run it hands
+out is 8-aligned and released by its own `greeter_free_bytes`, and a
+callback vtable it's given may carry the `GREETER_VTABLE_THREAD_AFFINE`
+flag, which it must honor. The
 [C ABI contract](reference/abi.md#runtime-surface) lists them, and
 [`conformance/c/producer.c`](https://github.com/weavefoundry/weaveffi/blob/main/conformance/c/producer.c)
 is a complete hand-written producer to copy from. Build it as
@@ -362,5 +382,5 @@ GREETER_LIBRARY=$PWD/libgreeter.so python3 -c "import greeter; print(greeter.add
 - [Samples](samples.md): three complete producers, from the minimal
   `calculator` to the feature-complete `kvstore`.
 - [Generators](generators/README.md): what each language gets.
-- Gate CI on `weaveffi diff --check` so committed bindings can't drift; see
+- Gate CI on `weaveffi generate --check` so committed bindings can't drift; see
   [Stability and Versioning](stability.md#ci-workflow).

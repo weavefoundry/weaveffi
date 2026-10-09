@@ -1,6 +1,7 @@
-// Shared helpers for the C conformance consumers: always-on assertions,
-// string-slot shorthands for the ABI's (ptr, len) strings, and the leak
-// check every consumer runs before exiting.
+// Shared helpers for the C conformance consumers (C ABI revision 5):
+// always-on assertions, string-slot shorthands for the ABI's (ptr, len)
+// strings and error messages, and the leak check every consumer runs before
+// exiting.
 #ifndef CONFORMANCE_HARNESS_H
 #define CONFORMANCE_HARNESS_H
 
@@ -32,6 +33,10 @@ static inline int bytes_eq(const uint8_t* ptr, size_t len, const char* s) {
     size_t n = strlen(s);
     return len == n && (n == 0 || memcmp(ptr, s, n) == 0);
 }
+
+// `true` when an error struct's length-delimited UTF-8 message (ABI 5: not
+// NUL-terminated; NULL with length 0 is the empty message) spells `s`.
+#define MSG_EQ(err, s) bytes_eq((err).message_ptr, (err).message_len, (s))
 
 // Assert that every leak counter of a producer built with `leak-check` is
 // zero: 0 objects, 1 callbacks, 2 iterators, 3 cancel tokens, 4 returned

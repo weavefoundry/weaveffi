@@ -32,20 +32,20 @@ In an IDL, set `async: true` and optionally `cancellable: true` on a
 function, method, or static:
 
 ```yaml
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: kv
     errors:
-      name: KvError
-      codes:
-        - { name: InvalidPath, code: 1004, message: "invalid path" }
+      - name: KvError
+        codes:
+          - { name: InvalidPath, code: 1004, message: "invalid path" }
     interfaces:
       - name: Store
         constructors:
           - name: open
             params:
               - { name: path, type: string }
-            throws: true
+            throws: KvError
         methods:
           - name: compact
             params:
@@ -53,6 +53,11 @@ modules:
             return: u32
             async: true
             cancellable: true
+          - name: version_of
+            params:
+              - { name: key, type: string }
+            return: u32?
+            async: true
 ```
 
 `async` composes with `throws`, with object and buffered results, and with
@@ -80,11 +85,22 @@ void kvstore_kv_Store_compact(
     void* context);
 ```
 
-The result slots are nothing (a `void` function), one direct value or object
-pointer named `result`, or `const uint8_t* result_ptr, size_t result_len` for
-strings, bytes, and value buffers. The launcher has no `out_err`: every
-failure, including a marshalling failure of an input, arrives through the
-callback.
+The result slots follow the value's family:
+
+| Result | Completion slots after `context, err` |
+|--------|----------------------------------------|
+| none (`void`) | none |
+| Direct (scalar, `bool`, C-style enum) | `T result` |
+| OptDirect (`u32?`, `bool?`, `Color?`) | `bool has_result, T result` |
+| Slice (`[i32]`, `[f64]`, ...) | `const T* result_ptr, size_t result_len` (element count) |
+| string, bytes, value buffer | `const uint8_t* result_ptr, size_t result_len` |
+| object | `{tag}* result` (one strong reference) |
+
+`version_of` above completes through
+`void (*)(void* context, kvstore_error* err, bool has_result, uint32_t
+result)`. On failure every result slot is zero (`false`, `0`, `NULL`). The
+launcher has no `out_err`: every failure, including a marshalling failure of
+an input, arrives through the callback.
 
 ## The completion contract
 
@@ -101,7 +117,9 @@ The runtime guarantees these for every launch:
 3. **Owned results.** `err` is `NULL` on success; otherwise it's heap-boxed,
    owned by the consumer, and released with `{prefix}_error_free`. A string,
    bytes, or buffered result is owned by the consumer and released with
-   `{prefix}_free_bytes(result_ptr, result_len)` after decoding. An object
+   `{prefix}_free_bytes(result_ptr, result_len)` after decoding; a typed
+   array with `{prefix}_free_bytes((uint8_t*)result_ptr, result_len *
+   sizeof(T))`. An OptDirect or Direct result is copied, and an object
    result transfers one strong reference.
 4. **Dropped futures complete.** If the executor drops a future before it
    finishes (a runtime shutting down, say), the drop guard completes the call
@@ -163,28 +181,33 @@ language page.
 Something has to drive each future between launch and completion. The
 runtime routes every future to the process-wide executor:
 
-- **Default.** A fixed pool of worker threads, one per available core and
-  at least two, started lazily on the first launch. The workers share one
-  run queue, and a future's waker puts it back on the queue, so a launch
-  never costs a thread and a future woken from any thread resumes on the
-  pool. The pool has no reactor, so a future that awaits Tokio's I/O or
-  timers never wakes, and because its workers are few, a future that blocks
-  one for a long time (synchronous I/O, a long computation) holds up every
-  other async call. Run such work on a runtime of its own: enable the
-  `tokio` feature or install a spawner.
-- **The `tokio` feature.** With the `weaveffi` crate's `tokio` feature on,
-  the default executor is Tokio: the current runtime when the launcher is
-  called from inside one, otherwise a multi-thread runtime the library
-  creates on first use (its threads are named `weaveffi-async`). That
-  runtime enables every Tokio driver the build compiles in, so turn on the
-  Tokio features your futures need (`time`, `net`, and so on) in your own
-  dependency on `tokio`. Use `tokio::task::spawn_blocking` for synchronous
-  work inside a future.
+- **Tokio (the default).** The `weaveffi` crate's `tokio` feature is on by
+  default, and with it the executor is Tokio: the current runtime when the
+  launcher is called from inside one, otherwise a multi-thread runtime the
+  library creates on first use (its threads are named `weaveffi-async`).
+  That runtime enables every Tokio driver the build compiles in, so turn on
+  the Tokio features your futures need (`time`, `net`, and so on) in your
+  own dependency on `tokio`. Use `tokio::task::spawn_blocking` for
+  synchronous work inside a future.
 
   ```toml
   [dependencies]
-  weaveffi = { version = "0.24", features = ["tokio"] }
+  weaveffi = "0.25"
   tokio = { version = "1", features = ["time"] }
+  ```
+
+- **A thread per call.** With `default-features = false`, there's no Tokio
+  dependency, and each async call runs on a thread of its own (also named
+  `weaveffi-async`), which drives the future with a minimal blocking
+  executor and exits when the call completes. A future woken from another
+  thread resumes on its own thread. There's no reactor, so a future that
+  awaits Tokio's I/O or timers never wakes; use this for futures that wait
+  only on channels, other threads, or nothing at all. A thread that can't
+  start completes the call with `-1`.
+
+  ```toml
+  [dependencies]
+  weaveffi = { version = "0.25", default-features = false }
   ```
 
 - **Custom.** Call `weaveffi::set_spawner` once at startup, before the first
@@ -204,30 +227,31 @@ runtime routes every future to the process-wide executor:
   thread. Every future it receives is already wrapped so a panic becomes a
   `-2` completion, a spawner that drops a future still produces a `-5`
   completion, and a spawner that panics completes the call with `-1`.
-- **`wasm32`.** There are no threads, so the default polls the future
-  inline before the launcher returns. A future that finishes after bounded
-  work is fine. A future that's still pending once nothing can wake it (it
-  awaits a timer or I/O) is dropped, and the call completes with `-1` and
-  the message "async function suspended with no executor on wasm32" rather
-  than hanging the module. A call usually completes before an `AbortSignal`
-  can fire, so on this target cancellation mostly matters for a signal
-  that's already aborted when the call starts.
+- **`wasm32`.** There are no threads (Tokio is never compiled in there, so
+  the `tokio` feature has no effect), and the future is polled inline before
+  the launcher returns. A future that finishes after bounded work is fine. A
+  future that's still pending once nothing can wake it (it awaits a timer or
+  I/O) is dropped, and the call completes with `-1` and the message "async
+  function suspended with no executor on wasm32" rather than hanging the
+  module. A call usually completes before an `AbortSignal` can fire, so on
+  this target cancellation mostly matters for a signal that's already
+  aborted when the call starts.
 
 ## Pitfalls
 
-- **Awaiting Tokio under the default executor.** The pool has no reactor,
-  so the future never wakes and the callback never fires; enable the `tokio`
-  feature or install a Tokio spawner.
-- **Blocking a pool worker.** A future that blocks (synchronous I/O, a long
-  computation) stalls every other call queued behind it on the default
-  pool; move the work to a runtime of its own.
+- **Awaiting Tokio without the `tokio` feature.** The thread-per-call
+  executor has no reactor, so the future never wakes and the callback never
+  fires; keep the default feature or install a Tokio spawner.
+- **Blocking a Tokio worker.** A future that blocks (synchronous I/O, a
+  long computation) holds a runtime thread; wrap the work in
+  `tokio::task::spawn_blocking`.
 - **Expecting the token to stop CPU-bound work.** Cancellation drops the
   future at a suspension point. Long synchronous loops should yield or check
   `is_cancelled()`.
 - **Clearing an async error.** `err` is boxed; release it with
   `{prefix}_error_free`, not `error_clear`.
 - **Leaking a result buffer.** A raw C callback that only copies the result
-  must still free it.
+  must still free it (a typed array's length times `sizeof(T)`).
 - **Async functions with no return value.** Valid, but `weaveffi validate
   --warn` flags an async free function that returns nothing
   (`AsyncVoidFunction`), since it's usually a missing return type.

@@ -7,6 +7,10 @@ that stages values in the module's linear memory. The JavaScript API is the
 errors, callbacks, and iterators apply here unchanged; this page covers what
 differs.
 
+WebAssembly is a [Tier 2](../stability.md#target-tiers) target: it may lag
+behind a new ABI revision, but it passes the same conformance suite before a
+release.
+
 ## What gets generated
 
 For a library named `kvstore` (the snapshot fixtures use `kitchen_sink`):
@@ -16,7 +20,9 @@ wasm/
 ├── package.json   ES module manifest
 ├── index.js       `init()`, the raw entry points, and the API
 ├── index.d.ts     TypeScript declarations
-├── runtime.js     the shared runtime (codec, errors, wrappers)
+├── runtime.js     the shared runtime (codec, checks, errors, wrappers)
+├── debug.js       the `./debug` export: leak counters for tests
+├── debug.d.ts
 ├── linear.js      the transport: loading, staging, table functions
 └── README.md
 ```
@@ -43,9 +49,9 @@ module to `target/weaveffi/wasm32/{library}.wasm`.
 ## Load
 
 `init()` loads the module and checks the contract before any other export
-works: the module must implement ABI revision 4, and each top-level module's
-contract table must hold every declaration the bindings were generated with
-(see the [Node.js page](node.md#load-time-checks)). A failed check rejects
+works: the module must implement ABI revision 5, and each top-level module's
+contract table must hold every row the bindings were generated with (see
+the [Node.js page](node.md#load-time-checks)). A failed check rejects
 with an `Error` naming the declaration (`kvstore: kv.Store.put changed
 since these bindings were generated`). Until the promise resolves, every
 other call throws.
@@ -75,9 +81,11 @@ and a failed load can be retried.
 
 ## Transport
 
-Each C symbol gets one entry point in `index.js` that checks its arguments,
-copies strings and byte runs into linear memory for the call, and copies
-returned strings and buffers out before releasing them:
+Each C symbol gets one entry point in `index.js` that checks its arguments
+(range-checking integers), splits an optional scalar into its flag and
+value, copies strings, byte runs, and typed arrays into linear memory for
+the call, and copies returned strings, buffers, and typed arrays out before
+releasing them:
 
 ```js
     kitchen_sink_kitchen_echo_string: (a0) => {
@@ -93,14 +101,15 @@ returned strings and buffers out before releasing them:
     },
 ```
 
-Staged arguments are runs from `{prefix}_alloc`, released with
-`{prefix}_free_bytes` once the call returns. Runs have alignment 1, so the
-glue reads and writes multi-byte values through a `DataView`. One error
-slot, one `out_len` slot, and one iterator item slot are reused by every
-call; they and the callback vtables live in 8-byte-aligned blocks carved
-from arenas the glue allocates once and never frees. `__debugLive(4)`
-leaves those arenas out of its count of byte runs. Object handles are
-linear-memory addresses.
+Staged arguments are runs from `{prefix}_alloc` (8-aligned, so a typed
+array's elements are aligned for their type), released with
+`{prefix}_free_bytes` once the call returns. The glue reads and writes
+multi-byte values through a `DataView`. One error slot and one each of the
+`out_len`, `out_value`, and iterator item slots are reused by every call;
+they and the callback vtables live in 8-byte-aligned blocks carved from
+arenas the glue allocates once and never frees. The `./debug` export's
+`debugLive(4)` leaves those arenas out of its count of byte runs. Object
+handles are linear-memory addresses.
 
 Async completions and callback-interface methods are JavaScript functions
 installed in the module's function table. The glue uses
@@ -113,9 +122,12 @@ re-exports it, so no experimental flag is needed.
 The mapping is the Node.js target's: 64-bit integers are `bigint`, `bytes` is
 `Uint8Array`, records are plain objects, rich enums are tagged unions,
 C-style enums are frozen objects, interfaces are classes with `close()` and
-`[Symbol.dispose]()`, optionals are `T | null`, lists are arrays, maps are
-`Record` objects (a `Map` is accepted as an argument), and `iter<T>` is a
-lazy `IterableIterator<T>`.
+`[Symbol.dispose]()`, optionals are `T | null`, lists are arrays (a numeric
+list argument may also be the matching typed array), maps are `Record`
+objects (a `Map` is accepted as an argument), and `iter<T>` is a lazy
+`NativeIterator<T>` with `close()`. Integer arguments are range-checked the
+same way, so a value that throws a `RangeError` on one target throws it on
+the other.
 
 ## Async and cancellation
 
@@ -132,34 +144,30 @@ wasm32`). A cancelled call rejects with `CancelledError` (code -5).
 ## Callbacks and errors
 
 Callback interfaces work as on Node.js: returns of every family (a
-string, bytes, or buffer return is copied into a run from `{prefix}_alloc`
-that the producer adopts, and an object return is a new reference), domain
-errors from methods declared `throws` with their fields, and `null` for an
-optional callback (`Cb?`), which passes a null vtable. The vtable starts
-with its `size`, `flags`, and `free` entries, like any consumer's.
+string, bytes, buffer, or typed-array return is copied into a run from
+`{prefix}_alloc` that the producer adopts, an optional scalar is the
+method's `bool` result plus the value behind its `out_value` slot, and an
+object return is a new reference), errors reported by each method's
+`throws` (a domain's codes with their fields, -1 for `throws: any`, -4 for
+a method that doesn't throw), and `null` for an optional callback (`Cb?`),
+which passes a null vtable. The vtable starts with its `size`, `flags` (0),
+and `free` entries, like any consumer's.
 
 There are no threads, so a callback runs only while a call into the module
 is on the stack, on the calling thread, and the Node.js addon's threading
-rules don't arise. An implementation that throws fails the call with code
--4, as on Node.js. Because `wasm32-unknown-unknown` aborts on a panic, a
-producer panic traps the module; the trap surfaces as the package's root
-error with code -2, and the module may be unusable afterward.
+rules don't arise.
 
-## Emscripten
+## Traps
 
-With `emscripten = true` under `[generators.wasm]`, `init` instead takes an
-initialized Emscripten module (or the promise its `MODULARIZE` factory
-returns), binds its underscore-prefixed exports, reads memory through
-`HEAPU8`, and installs table functions with `addFunction`. Link the module
-with `-sALLOW_TABLE_GROWTH`, `-sWASM_BIGINT`, and
-`-sEXPORTED_RUNTIME_METHODS=addFunction,HEAPU8`, and export the library's C
-symbols, including the runtime surface (`{prefix}_alloc`,
-`{prefix}_free_bytes`, `{prefix}_error_set_payload`, and the rest) and each
-`{prefix}_{module}_contract`. The packaged layout then ships glue only.
-
-```ts
-export declare function init(module: object | Promise<object>): Promise<void>;
-```
+Because `wasm32-unknown-unknown` aborts on a panic, a producer panic traps
+the module. The call that trapped fails with the package's root error, code
+-2 (`the native library trapped: unreachable`). A trap can leave the
+module's memory inconsistent, so it also poisons the instance: every later
+call fails with code -2 (`kvstore: the WebAssembly instance trapped earlier
+(...) and can't be used anymore`) without running, while releases (closing
+a wrapper or an iterator, a garbage-collected wrapper, a cancel token) do
+nothing, so no finalizer throws. Load the module again in a new process or
+page to recover.
 
 ## Known limitations
 
@@ -167,6 +175,6 @@ export declare function init(module: object | Promise<object>): Promise<void>;
 - An async call can't be cancelled once launched, since it completes before
   its launcher returns, and a future that waits on another thread or an
   external event fails with code -1.
-- A producer panic traps rather than unwinding, which can leave the module's
-  state inconsistent.
-- Emscripten mode isn't covered by the conformance suite.
+- A producer panic traps rather than unwinding, and the instance is
+  unusable afterward (see [Traps](#traps)).
+- Only `wasm32-unknown-unknown` builds are supported.

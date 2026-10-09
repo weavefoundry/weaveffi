@@ -5,16 +5,15 @@
 //! completion callback that fires when the future resolves. Something has to
 //! drive the future in between:
 //!
-//! * By default, a fixed pool of worker threads (one per available core, at
-//!   least two) started lazily on the first launch. Workers share one run
-//!   queue, and a future's waker puts it back on the queue, so a launch
-//!   never costs a thread. The pool has no reactor, and its workers are few:
-//!   a future that blocks a worker for a long time (synchronous I/O, a long
-//!   computation) holds up every other call, so such work belongs on a
-//!   runtime of its own (the `tokio` feature, or [`set_spawner`]).
-//! * With the `tokio` feature, a Tokio runtime: the current one when the
-//!   launcher is called from inside a runtime, otherwise a multi-thread
-//!   runtime the library creates on first use.
+//! * By default (the `tokio` feature, on by default), a Tokio runtime: the
+//!   current one when the launcher is called from inside a runtime,
+//!   otherwise a multi-thread runtime the library creates on first use
+//!   (its threads are named `weaveffi-async`).
+//! * Without the `tokio` feature (`default-features = false`), each call
+//!   runs on a thread of its own, named `weaveffi-async`, which drives the
+//!   future with [`block_on`] and exits when it completes. There's no
+//!   reactor, so a future that awaits Tokio's I/O or timers never wakes;
+//!   a future woken from another thread resumes on its own thread.
 //! * On `wasm32`, which has no threads, the future is polled inline before
 //!   the launcher returns. A future still pending once nothing wakes it
 //!   completes with [`GENERIC_ERROR_CODE`]
@@ -148,7 +147,11 @@ pub fn spawn(fut: impl Future<Output = ()> + Send + 'static) -> Result<(), Spawn
 
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "tokio")))]
 fn default_spawn(fut: BoxFuture) -> Result<(), SpawnError> {
-    pool::spawn(fut)
+    std::thread::Builder::new()
+        .name("weaveffi-async".to_string())
+        .spawn(move || block_on(fut))
+        .map(drop)
+        .map_err(|e| SpawnError::Failed(format!("could not start a thread: {e}")))
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "tokio"))]
@@ -203,148 +206,6 @@ fn default_spawn(mut fut: BoxFuture) -> Result<(), SpawnError> {
             drop(fut);
             return Err(SpawnError::Suspended);
         }
-    }
-}
-
-/// The default native executor: a fixed pool of worker threads sharing one
-/// run queue, started on the first launch.
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "tokio")))]
-mod pool {
-    use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
-    use std::task::{Context, Wake, Waker};
-
-    use super::{BoxFuture, SpawnError};
-
-    struct Pool {
-        queue: Mutex<VecDeque<Arc<Task>>>,
-        ready: Condvar,
-    }
-
-    struct Task {
-        future: Mutex<Option<BoxFuture>>,
-        /// Set while the task sits on the queue, so a burst of wakes queues
-        /// it once.
-        queued: AtomicBool,
-        pool: &'static Pool,
-    }
-
-    impl Task {
-        fn schedule(self: Arc<Self>) {
-            if !self.queued.swap(true, Ordering::AcqRel) {
-                let pool = self.pool;
-                pool.queue
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push_back(self);
-                pool.ready.notify_one();
-            }
-        }
-    }
-
-    impl Wake for Task {
-        fn wake(self: Arc<Self>) {
-            self.schedule();
-        }
-        fn wake_by_ref(self: &Arc<Self>) {
-            Arc::clone(self).schedule();
-        }
-    }
-
-    impl Pool {
-        fn work(&'static self) {
-            loop {
-                let task = {
-                    let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
-                    loop {
-                        match queue.pop_front() {
-                            Some(task) => break task,
-                            None => {
-                                queue = self
-                                    .ready
-                                    .wait(queue)
-                                    .unwrap_or_else(PoisonError::into_inner);
-                            }
-                        }
-                    }
-                };
-                // Clear the flag before polling, so a wake during the poll
-                // queues the task again.
-                task.queued.store(false, Ordering::Release);
-                let mut slot = task.future.lock().unwrap_or_else(PoisonError::into_inner);
-                if let Some(fut) = slot.as_mut() {
-                    let waker = Waker::from(Arc::clone(&task));
-                    // The launcher wraps every future in `CatchUnwind`, so
-                    // polling never unwinds into the worker.
-                    if fut
-                        .as_mut()
-                        .poll(&mut Context::from_waker(&waker))
-                        .is_ready()
-                    {
-                        *slot = None;
-                    }
-                }
-            }
-        }
-    }
-
-    /// The number of workers the pool starts.
-    pub(super) fn size() -> usize {
-        std::thread::available_parallelism()
-            .map_or(2, std::num::NonZero::get)
-            .max(2)
-    }
-
-    fn pool() -> Result<&'static Pool, SpawnError> {
-        static POOL: OnceLock<Result<&'static Pool, String>> = OnceLock::new();
-        POOL.get_or_init(|| {
-            let pool: &'static Pool = Box::leak(Box::new(Pool {
-                queue: Mutex::new(VecDeque::new()),
-                ready: Condvar::new(),
-            }));
-            let started = (0..size())
-                .filter(|i| {
-                    std::thread::Builder::new()
-                        .name(format!("weaveffi-async-{i}"))
-                        .spawn(move || pool.work())
-                        .is_ok()
-                })
-                .count();
-            if started == 0 {
-                Err("no executor thread could be started".to_string())
-            } else {
-                Ok(pool)
-            }
-        })
-        .clone()
-        .map_err(SpawnError::Failed)
-    }
-
-    pub(super) fn spawn(fut: BoxFuture) -> Result<(), SpawnError> {
-        let pool = pool()?;
-        Arc::new(Task {
-            future: Mutex::new(Some(fut)),
-            queued: AtomicBool::new(false),
-            pool,
-        })
-        .schedule();
-        Ok(())
-    }
-}
-
-/// The number of worker threads the default executor runs: one per
-/// available core, at least two. (With the `tokio` feature or on `wasm32`
-/// the default executor is something else, and this is `0`.)
-#[must_use]
-pub fn default_pool_size() -> usize {
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "tokio")))]
-    {
-        pool::size()
-    }
-    #[cfg(any(target_arch = "wasm32", feature = "tokio"))]
-    {
-        0
     }
 }
 

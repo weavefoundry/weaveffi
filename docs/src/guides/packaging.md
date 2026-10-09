@@ -21,7 +21,8 @@ identity's `library` field.
 `weaveffi build` finds the producer crate with `cargo metadata` (the
 project's crate, `[build] manifest`, or `--manifest-path`) and runs
 `cargo rustc --lib` once per platform with the artifact kinds that platform
-needs, so the crate's own `crate-type` doesn't matter. A Rust producer's API
+needs, so the crate's own `crate-type` doesn't matter. It builds with the
+`release` profile unless `--profile` (or `[build] profile`) names another. A Rust producer's API
 is then read from the first library it built (see [Library
 Mode](extract.md)), so nothing is compiled twice:
 
@@ -62,10 +63,17 @@ library so packages ship it prebuilt:
   `windows-x64`, where the generated CMake project builds it.
 
 Glue a host can't compile is skipped with a warning, and the package falls
-back to compiling it. Every platform is checked before anything compiles, so
-a missing rustup target (`rustup target add ...`), a missing NDK, or a
-platform this host can't build (Apple platforms need macOS, Windows needs
-Windows) fails at once with every problem listed.
+back to compiling it. Every platform is checked before anything compiles; a
+platform this machine can't build (a missing rustup target, a missing NDK,
+or a host that can't build it: Apple platforms need macOS, Windows needs
+Windows) is skipped with a warning naming the fix, and the run fails only
+when no requested platform can be built.
+
+`build` and `package` follow one policy for a missing external tool (a C
+compiler, Node.js headers, a JDK, the NDK, Xcode, the .NET SDK): they warn,
+skip the artifact that needs it, finish everything else, and list every
+skipped artifact at the end. The run still exits `0`; pass `--strict` to
+exit `1` when anything was skipped (as CI should).
 
 ## Package
 
@@ -140,14 +148,15 @@ To publish, upload the archive to that URL and commit `swift/{Module}/` to
 the repository consumers depend on. For local use, unzip the archive next to
 the packaged `Package.swift`; the manifest prefers a local
 `C{Module}.xcframework` over the URL. This step runs `xcodebuild`, so it
-needs macOS.
+needs macOS with Xcode; elsewhere the Swift package is skipped.
 
 ## What still needs the ecosystem's tools
 
 - **Publishing.** There's no `weaveffi publish`; run each ecosystem's own
   upload command on the artifacts.
 - **NuGet.** `package` runs `dotnet pack`, so the .NET SDK must be
-  installed; without it the run fails after writing everything else.
+  installed; without it the `.nupkg` is skipped (and `--strict` fails the
+  run) after everything else is written.
 - **Kotlin.** The output is a Gradle project, not an `.aar` or `.jar`:
   building one needs the Kotlin compiler, so run `gradle assembleRelease`
   (Android) or `gradle jar` (JVM) on it. With prebuilt shims present, Gradle
@@ -190,7 +199,7 @@ jobs:
           targets: ${{ matrix.targets }}
       - uses: actions/setup-node@v4   # for the prebuilt Node.js addon
       - run: cargo install weaveffi-cli
-      - run: weaveffi build --platforms ${{ matrix.platforms }}
+      - run: weaveffi build --platforms ${{ matrix.platforms }} --strict
       - uses: actions/upload-artifact@v4
         with:
           name: weaveffi-${{ matrix.runner }}
@@ -207,7 +216,7 @@ jobs:
           path: prebuilt
           merge-multiple: true
       - run: cargo install weaveffi-cli
-      - run: weaveffi package --binaries prebuilt
+      - run: weaveffi package --binaries prebuilt --strict
 ```
 
 The Linux runner finds the NDK through `ANDROID_NDK_HOME` (or the SDK

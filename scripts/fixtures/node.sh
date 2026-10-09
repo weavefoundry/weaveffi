@@ -10,7 +10,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/js.sh"
 require node cc
 
-js_check "$dir" index.js runtime.js
+js_check "$dir" index.js runtime.js debug.js
 
 # The headers node-gyp caches, or the ones an official Node.js distribution
 # (nvm, actions/setup-node) ships next to its binary.

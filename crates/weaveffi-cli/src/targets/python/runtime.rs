@@ -10,9 +10,10 @@
 //! uses the feature. The contract table's entries are written into the
 //! writer where `core.py` says `{{CONTRACTS}}`.
 
+use crate::codegen::contract;
 use crate::codegen::CodeWriter;
-use weaveffi_model::contract;
-use weaveffi_model::model::{contract_symbol, ABI_VERSION};
+use heck::ToSnakeCase;
+use weaveffi_model::model::ABI_VERSION;
 
 use crate::targets::python::types::py_str_literal;
 use crate::targets::python::Gen;
@@ -23,19 +24,20 @@ const CANCEL: &str = include_str!("runtime/cancel.py");
 const CALLBACKS: &str = include_str!("runtime/callbacks.py");
 
 /// Write the body of the `_CONTRACTS` table: per top-level module, its
-/// contract symbol and the `(id, hash, path)` entries these bindings rely
-/// on, sorted by id.
+/// contract symbol and the `(id, hash, path)` rows these bindings rely on,
+/// sorted by id, each with its canonical signature as a comment.
 fn render_contracts(w: &mut CodeWriter, g: &Gen<'_>) {
     w.scope(|w| {
-        for root in g.model.roots() {
-            w.line(format!("\"{}\": [", contract_symbol(g.prefix, &root.name)));
+        for table in contract::tables(g.model) {
+            w.line(format!("\"{}\": [", table.symbol));
             w.scope(|w| {
-                for e in contract::entries(g.model, root) {
+                for row in &table.rows {
                     w.line(format!(
-                        "({:#018x}, {:#018x}, \"{}\"),",
-                        e.id,
-                        e.hash,
-                        py_str_literal(&e.path)
+                        "({}, {}, \"{}\"),  # {}",
+                        contract::hex(row.id),
+                        contract::hex(row.hash),
+                        py_str_literal(&row.path),
+                        row.signature
                     ));
                 }
             });
@@ -52,6 +54,10 @@ fn fill(template: &str, g: &Gen<'_>) -> String {
         .replace("{{NAME}}", &id.name)
         .replace("{{ERROR}}", &g.root_error)
         .replace("{{TRAP}}", &g.trap_error)
+        .replace(
+            "{{ERROR_FROM}}",
+            &format!("_{}_from", g.root_error.to_snake_case()),
+        )
         .replace("{{PREFIX}}", g.prefix)
         .replace("{{LIBRARY_ENV}}", &id.library_env_var())
         .replace("{{LIB_DARWIN}}", &darwin)
@@ -64,7 +70,7 @@ fn fill(template: &str, g: &Gen<'_>) -> String {
 pub(crate) fn render_runtime(w: &mut CodeWriter, g: &Gen<'_>) {
     let callbacks = g.model.has_callback_interfaces();
     let is_async = g.model.has_async();
-    let cancellable = g.model.callables().any(|(_, f)| f.cancellable);
+    let cancellable = g.model.callables().any(|(_, f)| f.cancellable());
     let mut imports = String::new();
     if callbacks {
         imports.push_str("import abc\n");

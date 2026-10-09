@@ -19,11 +19,12 @@
 //! `XCFramework` needs). The [`crate::package`] driver and every packaging
 //! backend consume it.
 
-use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
+use miette::{bail, IntoDiagnostic, Result, WrapErr};
 
 /// The operating-system family of a [`Platform`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[allow(clippy::enum_variant_names, reason = "`MacOs` is the OS's name")]
 pub enum Os {
     /// Apple platforms (macOS); shared libraries are `.dylib`.
     MacOs,
@@ -441,29 +442,61 @@ pub fn jni_shim_name(library: &str) -> String {
     format!("{library}_jni")
 }
 
-/// The newest glibc version a Linux shared library links against, read from
-/// the `GLIBC_2.x` symbol-version names in its bytes, and never older than
-/// 2.17 (the oldest glibc Rust supports).
+/// The newest glibc version the Linux shared library at `path` needs, read
+/// from the `GLIBC_2.x` version needs in its `.gnu.version_r` section, and
+/// never older than 2.17 (the oldest glibc Rust supports).
 ///
 /// This picks the `manylinux_2_N` tag of a wheel: a library built on a
 /// recent distribution needs that distribution's glibc, whatever the target
 /// triple's minimum.
-#[must_use]
-pub fn glibc_requirement(library: &[u8]) -> (u32, u32) {
-    const NEEDLE: &[u8] = b"GLIBC_2.";
-    let mut best = (2, 17);
-    let mut rest = library;
-    while let Some(at) = rest.windows(NEEDLE.len()).position(|w| w == NEEDLE) {
-        rest = &rest[at + NEEDLE.len()..];
-        let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
-        if let Some(minor) = std::str::from_utf8(&rest[..digits])
-            .ok()
-            .and_then(|d| d.parse::<u32>().ok())
-        {
-            best = best.max((2, minor));
+pub(crate) fn glibc_requirement(path: &Utf8Path) -> Result<(u32, u32)> {
+    use object::read::elf::{ElfFile32, ElfFile64, FileHeader};
+
+    fn needs<Elf: FileHeader>(
+        file: &object::read::elf::ElfFile<'_, Elf>,
+    ) -> object::Result<Vec<String>> {
+        let endian = file.endian();
+        let data = file.data();
+        let sections = file.elf_section_table();
+        let mut names = Vec::new();
+        if let Some((mut verneeds, link)) = sections.gnu_verneed(endian, data)? {
+            let strings = sections.strings(endian, data, link)?;
+            while let Some((_, mut vernauxs)) = verneeds.next()? {
+                while let Some(vernaux) = vernauxs.next()? {
+                    names
+                        .push(String::from_utf8_lossy(vernaux.name(endian, strings)?).into_owned());
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    let data = read_file(path)?;
+    let names = match object::FileKind::parse(&*data) {
+        Ok(object::FileKind::Elf64) => {
+            ElfFile64::<object::Endianness>::parse(&*data).and_then(|f| needs(&f))
+        }
+        Ok(object::FileKind::Elf32) => {
+            ElfFile32::<object::Endianness>::parse(&*data).and_then(|f| needs(&f))
+        }
+        _ => {
+            return Err(miette::miette!(
+                "{path} isn't an ELF shared library, so its glibc requirement can't be read"
+            ))
         }
     }
-    best
+    .into_diagnostic()
+    .wrap_err_with(|| format!("failed to read the glibc version needs of {path}"))?;
+    Ok(newest_glibc(names.iter().map(String::as_str)))
+}
+
+/// The newest `GLIBC_2.x` among version-need `names`, at least 2.17.
+fn newest_glibc<'a>(names: impl Iterator<Item = &'a str>) -> (u32, u32) {
+    names
+        .filter_map(|name| name.strip_prefix("GLIBC_2."))
+        .filter_map(|rest| rest.split('.').next()?.parse::<u32>().ok())
+        .map(|minor| (2, minor))
+        .fold((2, 17), std::cmp::max)
 }
 
 /// The files `weaveffi build` laid out for one platform in
@@ -577,12 +610,14 @@ impl BinarySet {
             let platform_dir = dir.join(platform.id());
             match NativeBinary::read_dir(&platform_dir, *platform, lib_name) {
                 Some(binary) => set.insert(binary),
-                None if platforms.is_some() => bail!(
-                    "no {} in {platform_dir}; build {} first (`weaveffi build --platforms {}`)",
-                    platform.lib_filename(lib_name),
-                    platform.id(),
-                    platform.id()
-                ),
+                None if platforms.is_some() => {
+                    return Err(miette::miette!(
+                        "no {} in {platform_dir}; build {} first (`weaveffi build --platforms {}`)",
+                        platform.lib_filename(lib_name),
+                        platform.id(),
+                        platform.id()
+                    ))
+                }
                 None => {}
             }
         }
@@ -639,7 +674,9 @@ impl BinarySet {
 ///
 /// Returns an error when the file can't be read.
 pub fn read_file(path: &Utf8Path) -> Result<Vec<u8>> {
-    std::fs::read(path.as_std_path()).with_context(|| format!("failed to read {path}"))
+    std::fs::read(path.as_std_path())
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read {path}"))
 }
 
 #[cfg(test)]
@@ -815,11 +852,26 @@ mod tests {
     }
 
     #[test]
-    fn glibc_requirement_takes_the_newest_version_named() {
-        assert_eq!(glibc_requirement(b"nothing here"), (2, 17));
+    fn glibc_requirement_takes_the_newest_version_needed() {
+        assert_eq!(newest_glibc(["GCC_3.0"].into_iter()), (2, 17));
         assert_eq!(
-            glibc_requirement(b"\0GLIBC_2.2.5\0GLIBC_2.28\0GLIBC_2.3.4\0"),
+            newest_glibc(["GLIBC_2.2.5", "GLIBC_2.28", "GLIBC_2.3.4", "GCC_4.2"].into_iter()),
             (2, 28)
         );
+    }
+
+    #[test]
+    fn glibc_requirement_reads_elf_version_needs_and_rejects_other_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let junk = Utf8Path::from_path(dir.path()).unwrap().join("libjunk.so");
+        std::fs::write(&junk, b"\x00GLIBC_2.99\x00").unwrap();
+        assert!(glibc_requirement(&junk).is_err());
+        assert!(glibc_requirement(&junk.with_file_name("missing.so")).is_err());
+        // This test binary links glibc on Linux.
+        if cfg!(all(target_os = "linux", target_env = "gnu")) {
+            let me = std::env::current_exe().unwrap();
+            let me = Utf8Path::from_path(&me).unwrap();
+            assert!(glibc_requirement(me).unwrap() >= (2, 17));
+        }
     }
 }

@@ -4,55 +4,88 @@
 
 use crate::lang;
 use heck::ToSnakeCase;
-use weaveffi_model::abi::CType;
+use weaveffi_model::abi::{CType, ConstPos};
 use weaveffi_model::model::FieldBinding;
-use weaveffi_model::ty::{Prim, Ty};
+use weaveffi_model::ty::{ParamTy, Prim, RetTy, Ty};
 
-/// The Python typing hint for `ty` as it appears in annotations. The module
+/// Which way a value travels, which decides how its containers are
+/// annotated: what the bindings accept is abstract (any `Sequence` or
+/// `Mapping`), and what they hand out is concrete (`list`, `dict`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dir {
+    /// Into the native library: function parameters, callback returns, and
+    /// value-buffer writers.
+    In,
+    /// Out of the native library: function returns, callback parameters,
+    /// record and error fields, and value-buffer readers.
+    Out,
+}
+
+/// The Python typing hint for `ty` travelling in direction `dir`. The module
 /// starts with `from __future__ import annotations`, so user types are
 /// written bare even when declared later in the file; type names are
 /// global, and every module's declarations share one Python namespace.
-pub(crate) fn py_type_hint(ty: &Ty) -> String {
+pub(crate) fn py_type_hint(ty: &Ty, dir: Dir) -> String {
     match ty {
-        Ty::Prim(
-            Prim::I8
-            | Prim::I16
-            | Prim::I32
-            | Prim::I64
-            | Prim::U8
-            | Prim::U16
-            | Prim::U32
-            | Prim::U64,
-        ) => "int".into(),
         Ty::Prim(Prim::F32 | Prim::F64) => "float".into(),
         Ty::Prim(Prim::Bool) => "bool".into(),
         Ty::Prim(Prim::String) => "str".into(),
         Ty::Prim(Prim::Bytes) => "bytes".into(),
-        Ty::Enum(name)
-        | Ty::Record(name)
-        | Ty::RichEnum(name)
-        | Ty::Interface(name)
-        | Ty::CallbackInterface(name) => name.clone(),
-        Ty::Optional(inner) => format!("Optional[{}]", py_type_hint(inner)),
-        Ty::List(inner) => format!("List[{}]", py_type_hint(inner)),
-        Ty::Map(k, v) => format!("Dict[{}, {}]", py_type_hint(k), py_type_hint(v)),
-        Ty::Iterator(inner) => format!("Iterator[{}]", py_type_hint(inner)),
+        Ty::Prim(_) => "int".into(),
+        Ty::Enum(name) | Ty::Record(name) | Ty::RichEnum(name) | Ty::Interface(name) => {
+            name.clone()
+        }
+        Ty::Optional(inner) => format!("{} | None", py_type_hint(inner, dir)),
+        Ty::List(inner) => match dir {
+            Dir::In => format!("Sequence[{}]", py_type_hint(inner, dir)),
+            Dir::Out => format!("list[{}]", py_type_hint(inner, dir)),
+        },
+        Ty::Map(k, v) => match dir {
+            Dir::In => format!(
+                "Mapping[{}, {}]",
+                py_type_hint(k, dir),
+                py_type_hint(v, dir)
+            ),
+            Dir::Out => format!("dict[{}, {}]", py_type_hint(k, dir), py_type_hint(v, dir)),
+        },
     }
 }
 
-/// The hint for an optional return or `None`: `None` for a void callable.
-pub(crate) fn py_return_hint(ty: Option<&Ty>) -> String {
-    ty.map_or_else(|| "None".to_string(), py_type_hint)
+/// The hint for a parameter: its value type (accepted abstractly), or a
+/// callback interface's class (`| None` when nullable).
+pub(crate) fn py_param_hint(ty: &ParamTy) -> String {
+    match ty {
+        ParamTy::Value(ty) => py_type_hint(ty, Dir::In),
+        ParamTy::Callback { name, nullable } => {
+            if *nullable {
+                format!("{name} | None")
+            } else {
+                name.clone()
+            }
+        }
+    }
+}
+
+/// The hint for a callable's return: `None` for a void callable, the
+/// iterator's `NativeIterator[T]`, or the value type.
+pub(crate) fn py_return_hint(ret: Option<&RetTy>) -> String {
+    match ret {
+        None => "None".into(),
+        Some(RetTy::Value(ty)) => py_type_hint(ty, Dir::Out),
+        Some(RetTy::Iterator(elem)) => format!("NativeIterator[{}]", py_type_hint(elem, Dir::Out)),
+    }
 }
 
 /// The builtin types an annotation names.
-const BUILTIN_HINTS: &[&str] = &["bool", "bytes", "float", "int", "str"];
+const BUILTIN_HINTS: &[&str] = &[
+    "bool", "bytes", "dict", "float", "int", "list", "str", "type",
+];
 
 /// The annotation for `ty` inside a class declaring `fields`. A field named
 /// like a builtin type (`int: int`) shadows it for every later annotation in
 /// the class body, so such classes spell the builtins `builtins.int`.
 pub(crate) fn py_field_hint(fields: &[FieldBinding], ty: &Ty) -> String {
-    let hint = py_type_hint(ty);
+    let hint = py_type_hint(ty, Dir::Out);
     if !fields
         .iter()
         .any(|f| BUILTIN_HINTS.contains(&f.name.as_str()))
@@ -80,25 +113,58 @@ pub(crate) fn py_field_hint(fields: &[FieldBinding], ty: &Ty) -> String {
     out
 }
 
-/// Which side of the boundary a `ctypes` slot type describes.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Slot {
-    /// An argument the wrapper passes in (`argtypes`). A `const uint8_t*`
-    /// is `c_char_p`, which accepts a Python `bytes` object directly
-    /// (interior NUL bytes included, since the length travels separately).
-    Arg,
-    /// A value the wrapper receives (`restype`, or a parameter of a
-    /// `CFUNCTYPE` the producer calls). A `uint8_t*` stays a raw `c_void_p`
-    /// address so the wrapper can copy exactly `len` bytes and free them.
-    Recv,
+/// The IDL spelling of a slice element or range-checked integer kind, which
+/// names the runtime's per-kind helpers (`_i32`, `_take_array(.., "f64")`).
+pub(crate) fn prim_kind(p: Prim) -> &'static str {
+    p.snake()
 }
 
-/// Maps a shared ABI [`CType`] onto its `ctypes` spelling. The structural
-/// lowering (which slots exist, in what order) comes from the model; this is
-/// only the Python vocabulary applied to each slot. Opaque object, iterator,
-/// vtable, and cancel-token pointers are `c_void_p`; `bool` is `c_bool`;
-/// enums are `c_int32`; the error struct is the runtime's `_ErrorStruct`.
-pub(crate) fn py_ctype(ty: &CType, slot: Slot) -> String {
+/// The runtime checker a direct integer slot of C type `ty` goes through
+/// before `ctypes` sees it (`ctypes` truncates an out-of-range integer
+/// silently): `_i32` for `int32_t` and every C-style enum, `_u64` for
+/// `uint64_t`, and so on. `None` for floats and `bool`, which need no check.
+pub(crate) fn int_checker(ty: &CType) -> Option<&'static str> {
+    Some(match ty {
+        CType::Int8 => "_i8",
+        CType::Int16 => "_i16",
+        CType::Int32 | CType::Enum { .. } => "_i32",
+        CType::Int64 => "_i64",
+        CType::Uint8 => "_u8",
+        CType::Uint16 => "_u16",
+        CType::Uint32 => "_u32",
+        CType::Uint64 | CType::Size => "_u64",
+        _ => return None,
+    })
+}
+
+/// The C-style enum a direct slot of C type `ty` carries, whose class
+/// re-wraps a received integer (`Priority(x)`).
+pub(crate) fn enum_class(ty: &CType) -> Option<&str> {
+    match ty {
+        CType::Enum { name, .. } => Some(name),
+        _ => None,
+    }
+}
+
+/// Maps a shared ABI [`CType`] onto the `ctypes` spelling of a parameter
+/// slot (an `argtypes` entry, or a parameter of a `CFUNCTYPE` the producer
+/// calls). The structural lowering (which slots exist, in what order) comes
+/// from the model; this is only the Python vocabulary applied to each slot.
+///
+/// - A borrowed `const uint8_t*` run the wrapper passes is `c_char_p`,
+///   which accepts a Python `bytes` object directly (interior NUL bytes
+///   included, since the length travels separately); one the producer
+///   passes to a trampoline is a raw `c_void_p` address, so exactly `len`
+///   bytes are copied.
+/// - A borrowed typed array (`const T*`) is a `c_void_p` address: the
+///   wrapper passes an `array.array`'s buffer, and a trampoline reads `len`
+///   elements from it.
+/// - An out slot (`T*`) is `POINTER(T)`, and an out slot for a run or an
+///   object (`T**`) is `POINTER(c_void_p)`.
+/// - Opaque object, iterator, vtable, and cancel-token pointers are
+///   `c_void_p`; `bool` is `c_bool`; enums are `c_int32`; the error struct
+///   is the runtime's `_ErrorStruct`.
+pub(crate) fn py_ctype(ty: &CType, outbound: bool) -> String {
     match ty {
         CType::Int8 => "ctypes.c_int8".into(),
         CType::Int16 => "ctypes.c_int16".into(),
@@ -119,25 +185,66 @@ pub(crate) fn py_ctype(ty: &CType, slot: Slot) -> String {
         | CType::StructTag { .. }
         | CType::VtableTag { .. }
         | CType::Named(_) => "ctypes.c_void_p".into(),
-        CType::Ptr { pointee, .. } => match pointee.as_ref() {
-            CType::Uint8 if slot == Slot::Arg => "ctypes.c_char_p".into(),
-            CType::Char => "ctypes.c_char_p".into(),
-            CType::Ptr { .. } => "ctypes.POINTER(ctypes.c_void_p)".into(),
-            CType::Uint8
-            | CType::StructTag { .. }
-            | CType::VtableTag { .. }
-            | CType::CancelToken
-            | CType::Void
-            | CType::Named(_) => "ctypes.c_void_p".into(),
-            other => format!("ctypes.POINTER({})", py_ctype(other, slot)),
+        CType::Ptr { konst, pointee } => match (konst, pointee.as_ref()) {
+            (ConstPos::West, CType::Uint8) if outbound => "ctypes.c_char_p".into(),
+            (_, CType::Error) => "ctypes.POINTER(_ErrorStruct)".into(),
+            (_, CType::Ptr { .. }) => "ctypes.POINTER(ctypes.c_void_p)".into(),
+            (ConstPos::None, scalar) if is_scalar(scalar) => {
+                format!("ctypes.POINTER({})", py_ctype(scalar, outbound))
+            }
+            _ => "ctypes.c_void_p".into(),
         },
+    }
+}
+
+/// Whether `ty` is a by-value number, `bool`, `size_t`, or enum.
+fn is_scalar(ty: &CType) -> bool {
+    matches!(
+        ty,
+        CType::Int8
+            | CType::Int16
+            | CType::Int32
+            | CType::Int64
+            | CType::Uint8
+            | CType::Uint16
+            | CType::Uint32
+            | CType::Uint64
+            | CType::Float
+            | CType::Double
+            | CType::Bool
+            | CType::Size
+            | CType::Enum { .. }
+    )
+}
+
+/// The `ctypes` spelling of a C return type (a `restype`). Every pointer
+/// return (a string, bytes, buffer, or typed-array run, an object, or an
+/// iterator handle) is a raw `c_void_p` address, so the wrapper can copy
+/// exactly what it owes and release it.
+pub(crate) fn py_restype(ty: &CType) -> String {
+    match ty {
+        CType::Ptr { .. } => "ctypes.c_void_p".into(),
+        other => py_ctype(other, false),
+    }
+}
+
+/// The `ctypes` type of the local a wrapper allocates for the out slot
+/// `slot` (a `T*` or `T**`) and passes by reference: the pointee, with a
+/// pointer pointee received as a raw `c_void_p` address.
+pub(crate) fn py_out_local(slot: &CType) -> String {
+    match slot {
+        CType::Ptr { pointee, .. } => match pointee.as_ref() {
+            CType::Ptr { .. } => "ctypes.c_void_p".into(),
+            scalar => py_ctype(scalar, true),
+        },
+        other => unreachable!("an out slot is a pointer, not {other:?}"),
     }
 }
 
 /// The Python type a `ctypes` callback receives for one C slot (a
 /// trampoline or completion parameter), as an annotation: integers and
-/// sizes are `int`, floats `float`, `bool` `bool`, an address
-/// `Optional[int]` (`None` for null), and a typed pointer `Any`.
+/// sizes are `int`, floats `float`, `bool` `bool`, an address `int | None`
+/// (`None` for null), and a typed pointer `Any`.
 pub(crate) fn py_slot_hint(ty: &CType) -> &'static str {
     match ty {
         CType::Float | CType::Double => "float",
@@ -146,18 +253,15 @@ pub(crate) fn py_slot_hint(ty: &CType) -> &'static str {
         CType::CancelToken
         | CType::StructTag { .. }
         | CType::VtableTag { .. }
-        | CType::Named(_) => "Optional[int]",
+        | CType::Named(_) => "int | None",
         CType::Error => "Any",
-        CType::Ptr { pointee, .. } => match pointee.as_ref() {
-            CType::Uint8
-            | CType::Char
-            | CType::StructTag { .. }
-            | CType::VtableTag { .. }
-            | CType::CancelToken
-            | CType::Void
-            | CType::Named(_) => "Optional[int]",
-            _ => "Any",
-        },
+        CType::Ptr { .. } => {
+            if py_ctype(ty, false) == "ctypes.c_void_p" {
+                "int | None"
+            } else {
+                "Any"
+            }
+        }
         _ => "int",
     }
 }
@@ -175,13 +279,14 @@ const PY_BODY_NAMES: &[&str] = &[
     "int",
     "isinstance",
     "len",
+    "list",
     "range",
     "self",
     "warnings",
 ];
 
 /// The Python spelling of an IDL value identifier (parameter name):
-/// snake_case via heck, then escaped with a trailing `_` when it is a
+/// snake_case via heck, then escaped with a trailing `_` when it's a
 /// keyword (`class`) or a name the generated body relies on (`self`,
 /// `len`). IDL names are usually already snake, so the case conversion is a
 /// safety net for camelCase inputs.

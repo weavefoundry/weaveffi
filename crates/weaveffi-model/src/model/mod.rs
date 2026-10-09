@@ -1,38 +1,54 @@
 //! The **model**: the one validated, fully lowered view of an API that every
 //! language backend consumes.
 //!
-//! [`validate`](crate::validate::validate) checks an [`Api`] and builds the
-//! [`Model`] exactly once per run. The model owns everything a generator
-//! reads:
+//! [`validate`](crate::validate::validate) checks an [`Api`](crate::ir::Api)
+//! and builds the [`Model`] exactly once per run. The model owns everything
+//! a generator reads:
 //!
 //! * the library's [`Identity`] (C symbol prefix, library name, package
 //!   metadata) and the schema version;
-//! * a flat list of [`ModuleBinding`]s in which every **type** is a resolved
-//!   [`Ty`] (no unresolved names), so a backend dispatches on [`Ty::family`]
-//!   and [`Ty::wire`] instead of re-deriving what a name means;
+//! * a flat list of [`ModuleBinding`]s, linked by [`parent`] and
+//!   [`children`] indices, in which every **type** is resolved
+//!   ([`Ty`], [`ParamTy`], [`RetTy`]; no unresolved names);
 //! * every emitted **C symbol name**, precomputed once, so all backends agree
-//!   by construction;
-//! * every function, interface member, and callback-interface method paired
-//!   with its lowered [`AbiFn`] signature (built from [`crate::abi`]), so no
-//!   backend re-derives parameter arity, ordering, or `out_*`/`out_err`
-//!   placement; and
+//!   by construction, plus the typed [symbol table](Model::c_symbols);
+//! * every function, interface member, and callback-interface method with
+//!   its lowered [`AbiFn`] signature and its **passing contracts**
+//!   ([`ArgPass`] on each parameter, [`RetPass`], [`ResultPass`],
+//!   [`ItemPass`], or [`CallbackRetPass`] for what comes back, and the
+//!   [`ErrorStrategy`]), with every obligation resolved (release symbols,
+//!   element types, error domain names), so no backend re-derives arity,
+//!   slot order, `out_*`/`out_err` placement, or ownership; and
 //! * the [`TypeIndex`], which maps each (global) type name to its
 //!   declaration and owning module, behind typed lookups such as
-//!   [`Model::interface`] and [`Model::owner`].
+//!   [`Model::interface`], [`Model::error_domain`], and [`Model::owner`].
 //!
-//! A backend reads the *idiomatic* shape from the retained [`Ty`]s
-//! (`param.ty`, `field.ty`, ...) and the *native* shape from the [`AbiFn`]s,
-//! then writes only the marshalling that bridges the two (see
-//! [`crate::plan`]) in its own idioms. Generators never see the [`Api`].
+//! A backend reads the *idiomatic* shape from the resolved types and the
+//! *native* shape from the passing contracts and [`AbiFn`]s, then writes
+//! only the marshalling that bridges the two in its own idioms. Generators
+//! never see the [`Api`](crate::ir::Api).
+//!
+//! [`parent`]: ModuleBinding::parent
+//! [`children`]: ModuleBinding::children
+//! [`ArgPass`]: crate::plan::ArgPass
+//! [`RetPass`]: crate::plan::RetPass
+//! [`ResultPass`]: crate::plan::ResultPass
+//! [`ItemPass`]: crate::plan::ItemPass
+//! [`CallbackRetPass`]: crate::plan::CallbackRetPass
+//! [`ErrorStrategy`]: crate::plan::ErrorStrategy
 
 mod build;
+mod symbols;
+#[cfg(all(test, feature = "idl"))]
+mod tests;
 
-pub(crate) use build::{build_indexed, index};
+pub(crate) use build::{build, index};
+pub use symbols::{Symbol, SymbolOwner};
 
 use crate::abi::{AbiParam, CType};
-use crate::ir::{Api, TypeRef};
 use crate::pkg::Identity;
-use crate::ty::{Ty, TypeDecl, TypeIndex, TypeKind};
+use crate::plan::{ArgPass, CallbackRetPass, ErrorStrategy, ItemPass, ResultPass, RetPass};
+use crate::ty::{ParamTy, RetTy, Ty, TypeDecl, TypeIndex, TypeKind};
 
 /// The runtime symbols every producer exports (and every C header declares),
 /// without the `{prefix}_` that begins each one. See the C ABI contract for
@@ -74,7 +90,7 @@ pub const VALUE_CODECS: &[&str] = &["write", "read", "decode", "free"];
 
 /// The C ABI revision this model lowers to. Producers export it from
 /// `{prefix}_abi_version()` and every generated consumer checks it at load.
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 /// The symbol of a top-level module's contract table function,
 /// `{prefix}_{module}_contract` (see [`crate::contract`]).
@@ -90,143 +106,190 @@ pub fn contract_check_symbol(prefix: &str, module: &str) -> String {
     format!("{prefix}_{module}_contract_check")
 }
 
-/// A single lowered C symbol: its name, ordered ABI parameter slots, and C
-/// return type. This is what a backend declares to its FFI layer and calls.
+/// `{prefix}_{path}_{name}`: the C tag (type name stem) of a declaration
+/// named `name` in the module whose underscore-joined path is `path`.
+pub(crate) fn c_tag(prefix: &str, path: &str, name: &str) -> String {
+    format!("{prefix}_{path}_{name}")
+}
+
+/// `{tag}_{member}`: a symbol hanging off a C tag (`_clone`, `_destroy`,
+/// an interface member, an iterator's `_next`).
+pub(crate) fn member_symbol(tag: &str, member: &str) -> String {
+    format!("{tag}_{member}")
+}
+
+/// A single lowered C signature: its name, ordered ABI parameter slots, and
+/// C return type. This is what a backend declares to its FFI layer and
+/// calls (or, for a callback method, implements).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbiFn {
-    /// The fully-qualified, prefixed C symbol (e.g. `weaveffi_math_add`).
+    /// The fully qualified, prefixed C symbol (for example
+    /// `weaveffi_math_add`); for a callback method, the vtable field name.
     pub symbol: String,
-    /// Ordered parameter slots, including any trailing `out_*` and `out_err`.
+    /// Ordered parameter slots, including any leading `self` or `ctx` and
+    /// any trailing `out_*` and `out_err`.
     pub params: Vec<AbiParam>,
     /// The C return type.
     pub ret: CType,
 }
 
-/// How a function crosses the boundary. Exactly one shape applies to any given
-/// function: synchronous, asynchronous (callback-completed), or iterator-returning.
+/// How a callable crosses the boundary: a blocking call or an async launch.
+///
+/// An iterator-returning function is a [`Sync`](Self::Sync) call whose
+/// [`FnBinding::ret_pass`] is [`RetPass::Iterator`].
+// A model holds a few of these per callable and never moves them in bulk,
+// so boxing the large variant would only cost consumers a deref.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallShape {
-    /// A plain blocking call: [`AbiFn`] is the symbol to invoke.
-    Sync(AbiFn),
-    /// An async launcher plus its completion-callback typedef.
+    /// A blocking call: invoke [`FnBinding::abi`], then receive its return
+    /// as [`FnBinding::ret_pass`] says.
+    Sync,
+    /// An async launch: invoke [`FnBinding::abi`] (the launcher, which
+    /// returns `void`) and receive the result in the completion callback.
     Async(AsyncBinding),
-    /// An iterator-returning function: an opaque handle plus `next`/`destroy`.
-    Iterator(IteratorBinding),
 }
 
-/// The lowered surface of an `async` function.
+/// The lowered completion side of an `async` callable.
+///
+/// The launcher is [`FnBinding::abi`]: the receiver (if any), the input
+/// slots, the `cancel_token` slot when cancellable, then
+/// `{callback_type} callback` and `void* context`. It returns `void` and has
+/// no `out_err`; every failure arrives through the completion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsyncBinding {
-    /// The launcher: input slots, optional `cancel_token`, then `callback` and
-    /// `context`. Returns `void`.
-    pub launch: AbiFn,
-    /// The completion-callback function-pointer typedef name
+    /// The completion-callback function-pointer typedef
     /// (`{symbol}_callback`).
     pub callback_type: String,
-    /// The callback's parameter slots: `(void* context, {prefix}_error* err,
-    /// <result fields>)`.
+    /// The completion callback's parameter slots, in order:
+    /// `void* context`, `{prefix}_error* err`, then the result slots
+    /// ([`result`](Self::result)).
     pub callback_params: Vec<AbiParam>,
+    /// How the result arrives in the callback, with the release it owes.
+    pub result: ResultPass,
+    /// The launcher's `{prefix}_cancel_token* cancel_token` slot for a
+    /// `cancellable` callable, else `None`.
+    pub cancel_token: Option<AbiParam>,
 }
 
-/// The lowered surface of an `iter<T>`-returning function.
+impl AsyncBinding {
+    /// `true` when the launcher takes a cancel token.
+    #[must_use]
+    pub fn cancellable(&self) -> bool {
+        self.cancel_token.is_some()
+    }
+}
+
+/// The lowered surface of an `iter<T>`-returning callable.
+///
+/// The launcher is [`FnBinding::abi`], which returns `{iter_tag}*`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IteratorBinding {
     /// The element type `T` of `iter<T>`.
     pub elem: Ty,
-    /// The opaque iterator tag (`{prefix}_{path}_{Pascal}Iterator`).
+    /// The opaque iterator tag (`{prefix}_{owner}_{Pascal}Iterator`).
     pub iter_tag: String,
-    /// The launcher returning `{iter_tag}*`.
-    pub launch: AbiFn,
-    /// `int32_t {iter_tag}_next({iter_tag}* iter, T* out_item, ..., error* out_err)`.
+    /// `int32_t {iter_tag}_next({iter_tag}* iter, <item slots>,
+    /// {prefix}_error* out_err)`: returns `1` with an element, `0` when
+    /// done.
     pub next: AbiFn,
+    /// How each element arrives through `next`'s out slots.
+    pub item: ItemPass,
     /// `void {iter_tag}_destroy({iter_tag}* iter)`.
     pub destroy_symbol: String,
 }
 
-impl IteratorBinding {
-    /// The C type of one element: the pointee of `next`'s `T* out_item`
-    /// slot.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the model built `next` without its `out_item` pointer slot,
-    /// which would be a bug in the model construction.
-    pub fn item_ctype(&self) -> &CType {
-        match &self.next.params[1].ty {
-            CType::Ptr { pointee, .. } => pointee,
-            other => panic!("iterator `out_item` slot is {other:?}, not a pointer"),
-        }
-    }
-}
-
-/// One IR parameter, retained with its lowered ABI slots.
+/// One parameter of a callable, with its lowered passing contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamBinding {
     /// The parameter name as written in the IDL.
     pub name: String,
     /// The resolved type a backend renders the parameter as.
-    pub ty: Ty,
+    pub ty: ParamTy,
     /// Optional doc comment carried from the IDL.
     pub doc: Option<String>,
-    /// The ordered C ABI slots this single parameter expands into.
-    pub abi: Vec<AbiParam>,
+    /// The C slots the parameter occupies and how they're filled.
+    pub pass: ArgPass,
 }
 
-/// A function, fully lowered.
+/// A callable (free function or interface member), fully lowered.
 ///
-/// Free functions and interface members share this shape. For an instance
-/// method, [`has_self`](Self::has_self) is `true` and every [`AbiFn`] in
-/// [`shape`](Self::shape) carries an implicit leading `const {c_tag}* self`
-/// slot that does **not** appear in [`params`](Self::params); a wrapper
-/// passes its own native handle there.
+/// For an instance method, [`receiver`](Self::receiver) is the implicit
+/// leading `const {c_tag}* self` slot of [`abi`](Self::abi), which does
+/// **not** appear in [`params`](Self::params); a wrapper passes its own
+/// native handle there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FnBinding {
-    /// The function name as written in the IDL.
+    /// The callable's name as written in the IDL.
     pub name: String,
     /// Optional doc comment carried from the IDL.
     pub doc: Option<String>,
-    /// Deprecation message when the function is marked deprecated, else `None`.
+    /// Deprecation message when the callable is marked deprecated, else
+    /// `None`.
     pub deprecated: Option<String>,
-    /// Whether an async function accepts a trailing `cancel_token` slot.
-    pub cancellable: bool,
-    /// Whether the function reports typed domain errors. A throwing function
-    /// surfaces as `throws`/`raises` in idiomatic wrappers using the error
-    /// domain in scope ([`Model::error_domain`]); a non-throwing function
-    /// has a plain signature, and a
-    /// reported error (only ever a producer panic) surfaces as the target's
-    /// unrecoverable-error idiom instead.
-    pub throws: bool,
-    /// `true` for an instance method: the ABI signatures carry an implicit
-    /// leading `self` slot not present in [`params`](Self::params).
-    pub has_self: bool,
-    /// Input parameters with their lowered slots.
+    /// The `const {c_tag}* self` slot of an instance method, else `None`.
+    pub receiver: Option<AbiParam>,
+    /// Input parameters with their passing contracts.
     pub params: Vec<ParamBinding>,
-    /// The resolved return type (`None` = void). For an iterator function this
-    /// is the `iter<T>` type itself; the element `T` also lives in
-    /// [`IteratorBinding`]. For an interface constructor this is the
-    /// constructed interface type.
-    pub ret: Option<Ty>,
-    /// Base C symbol (`{prefix}_{module_path}_{name}` for a free function,
-    /// `{c_tag}_{name}` for an interface member) before any `_async`/iterator
-    /// suffixing.
-    pub c_base: String,
-    /// The call shape (sync / async / iterator).
+    /// The resolved return type (`None` = void). For an interface
+    /// constructor this is the constructed interface type.
+    pub ret: Option<RetTy>,
+    /// How [`abi`](Self::abi)'s C return and trailing out slots carry the
+    /// return back: the value for a sync call, [`RetPass::Iterator`] for an
+    /// iterator launcher, and [`RetPass::Void`] for an async launcher.
+    pub ret_pass: RetPass,
+    /// How a reported error is interpreted.
+    pub error: ErrorStrategy,
+    /// The symbol to call: the sync entry point, the async launcher, or the
+    /// iterator launcher, with its full ordered slot list.
+    pub abi: AbiFn,
+    /// Whether the call blocks or completes asynchronously.
     pub shape: CallShape,
 }
 
 impl FnBinding {
-    /// `true` when the function is `async` (lowered as a callback-completed
-    /// launcher).
+    /// `true` for an instance method (one with a [`receiver`](Self::receiver)).
+    #[must_use]
+    pub fn has_self(&self) -> bool {
+        self.receiver.is_some()
+    }
+
+    /// `true` when the callable is `async`.
+    #[must_use]
     pub fn is_async(&self) -> bool {
         matches!(self.shape, CallShape::Async(_))
+    }
+
+    /// The completion side of an async callable, else `None`.
+    #[must_use]
+    pub fn async_binding(&self) -> Option<&AsyncBinding> {
+        match &self.shape {
+            CallShape::Async(a) => Some(a),
+            CallShape::Sync => None,
+        }
+    }
+
+    /// The iterator surface of an iterator-returning callable, else `None`.
+    #[must_use]
+    pub fn iterator(&self) -> Option<&IteratorBinding> {
+        match &self.ret_pass {
+            RetPass::Iterator(it) => Some(it),
+            _ => None,
+        }
+    }
+
+    /// `true` when the callable is async and takes a cancel token.
+    #[must_use]
+    pub fn cancellable(&self) -> bool {
+        self.async_binding().is_some_and(AsyncBinding::cancellable)
     }
 }
 
 /// A field of a record, a rich-enum variant, or an error code's payload.
 ///
-/// Records and rich enums are value types: they declare no C symbols of their
-/// own and cross the ABI serialized inside a value buffer, so a field is just
-/// its name and type. Field declaration order **is** the wire order.
+/// Records and rich enums are value types: they declare no C functions of
+/// their own and cross the ABI serialized inside a value buffer, so a field
+/// is just its name and type. Field declaration order **is** the wire order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldBinding {
     /// The field name as written in the IDL.
@@ -238,8 +301,8 @@ pub struct FieldBinding {
 }
 
 /// A struct (record), fully lowered: a plain value type generators emit as a
-/// native data class plus buffer read/write functions. No C symbols exist for
-/// a record; instances cross the ABI serialized in value buffers.
+/// native data class plus buffer read/write functions. Instances cross the
+/// ABI serialized in value buffers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructBinding {
     /// The struct name as written in the IDL.
@@ -248,6 +311,9 @@ pub struct StructBinding {
     pub doc: Option<String>,
     /// Deprecation message when the struct is marked deprecated, else `None`.
     pub deprecated: Option<String>,
+    /// `{prefix}_{module_path}_{name}`: the struct the C value-buffer
+    /// helper header declares, and the stem of its codecs.
+    pub c_tag: String,
     /// The fields in declaration (and wire) order.
     pub fields: Vec<FieldBinding>,
 }
@@ -255,12 +321,13 @@ pub struct StructBinding {
 /// An enum, fully lowered.
 ///
 /// A *C-style* enum (every variant a bare discriminant) crosses the ABI by
-/// value as an integer. An *algebraic* (rich) enum, at least one variant with
-/// associated data, is a value type exactly like a struct: it crosses the ABI
-/// serialized in a value buffer as an `i32` tag followed by the active
-/// variant's fields in declaration order. Either way, the C header still
-/// emits the discriminant constants ([`EnumVariantBinding::c_const`]) so C
-/// consumers can switch on the value or tag.
+/// value as an `int32_t`. An *algebraic* (rich) enum, at least one variant
+/// with associated data, is a value type exactly like a struct: it crosses
+/// the ABI serialized in a value buffer as an `i32` tag followed by the
+/// active variant's fields in declaration order. Either way, the C header
+/// still emits the discriminant constants
+/// ([`EnumVariantBinding::c_const`]) so C consumers can switch on the value
+/// or tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumBinding {
     /// The enum name as written in the IDL.
@@ -280,6 +347,7 @@ pub struct EnumBinding {
 
 impl EnumBinding {
     /// `true` when this is a rich (algebraic) sum-type enum.
+    #[must_use]
     pub fn is_rich(&self) -> bool {
         self.rich
     }
@@ -307,16 +375,17 @@ pub struct EnumVariantBinding {
 ///
 /// Constructors, methods, and statics are all [`FnBinding`]s sharing the
 /// member symbol scheme `{c_tag}_{name}`. Methods additionally carry an
-/// implicit leading `const {c_tag}* self` ABI slot ([`FnBinding::has_self`]).
-/// A constructor's [`FnBinding::ret`] is synthesized as the interface type
-/// itself, so wrappers can reuse their ordinary return-marshalling path.
+/// implicit leading `const {c_tag}* self` slot ([`FnBinding::receiver`]).
+/// A constructor's [`FnBinding::ret`] is the interface type itself, so
+/// wrappers can reuse their ordinary return-marshalling path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceBinding {
     /// The interface name as written in the IDL.
     pub name: String,
     /// Optional doc comment carried from the IDL.
     pub doc: Option<String>,
-    /// Deprecation message when the interface is marked deprecated, else `None`.
+    /// Deprecation message when the interface is marked deprecated, else
+    /// `None`.
     pub deprecated: Option<String>,
     /// `{prefix}_{module_path}_{name}`, the opaque tag.
     pub c_tag: String,
@@ -333,13 +402,35 @@ pub struct InterfaceBinding {
     pub destroy_symbol: String,
 }
 
+impl InterfaceBinding {
+    /// Every member: constructors, then methods, then statics.
+    pub fn members(&self) -> impl Iterator<Item = &FnBinding> {
+        self.constructors
+            .iter()
+            .chain(&self.methods)
+            .chain(&self.statics)
+    }
+}
+
+/// One parameter of a callback-interface method: always a value type, with
+/// the slots the producer fills and the consumer's trampoline receives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallbackParamBinding {
+    /// The parameter name as written in the IDL.
+    pub name: String,
+    /// The resolved type.
+    pub ty: Ty,
+    /// Optional doc comment carried from the IDL.
+    pub doc: Option<String>,
+    /// The C slots the parameter occupies. Never [`ArgPass::Callback`]; an
+    /// [`ArgPass::Object`] here transfers one strong reference to the
+    /// consumer.
+    pub pass: ArgPass,
+}
+
 /// One method of a callback interface, lowered to its vtable entry.
 ///
 /// The consumer implements this; the producer calls it through the vtable.
-/// [`abi_params`](Self::abi_params) is the full C slot list of the vtable
-/// entry (`void* ctx`, the parameter slots, the return's out slots, then
-/// `{prefix}_error* out_err`) and [`abi_ret`](Self::abi_ret) its C return
-/// type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallbackMethodBinding {
     /// The method name as written in the IDL; also the vtable field name.
@@ -348,31 +439,29 @@ pub struct CallbackMethodBinding {
     pub doc: Option<String>,
     /// Deprecation message when the method is marked deprecated, else `None`.
     pub deprecated: Option<String>,
-    /// Whether the method may report a positive code of the error domain in
-    /// scope ([`Model::error_domain`]) through its `out_err`.
-    pub throws: bool,
-    /// Input parameters with their lowered slots.
-    pub params: Vec<ParamBinding>,
-    /// The resolved return type (`None` = void). Any family but iterators
-    /// and callback interfaces; see
-    /// [`lower_callback_return`](crate::abi::lower_callback_return).
+    /// Input parameters with their passing contracts.
+    pub params: Vec<CallbackParamBinding>,
+    /// The resolved return type (`None` = void).
     pub ret: Option<Ty>,
-    /// The vtable entry's C parameter slots: `ctx`, then every parameter's
-    /// slots, then the return's out slots (`out_ptr` and `out_len` for a
-    /// string, bytes, or buffer return), then `out_err`.
-    pub abi_params: Vec<AbiParam>,
-    /// The vtable entry's C return type.
-    pub abi_ret: CType,
+    /// How the return crosses back to the producer.
+    pub ret_pass: CallbackRetPass,
+    /// Which failures the method may report.
+    pub error: ErrorStrategy,
+    /// The vtable entry's signature: [`symbol`](AbiFn::symbol) is the
+    /// method's field name, and the slots are `void* ctx` first, then every
+    /// parameter's slots, then the return's out slots, then
+    /// `{prefix}_error* out_err` last.
+    pub abi: AbiFn,
 }
 
 /// A callback interface, fully lowered.
 ///
 /// The C ABI sees a vtable struct ([`vtable_tag`](Self::vtable_tag)) that
 /// starts with a fixed header, `uint32_t size` (the vtable's size as the
-/// consumer compiled it), `uint32_t flags` (reserved, `0`), and
-/// `void (*free)(void* ctx)`, followed by one function-pointer field per
-/// method in declaration order. A parameter of this type lowers to two
-/// slots, `void* {name}_ctx` and `const {vtable_tag}* {name}_vtable`.
+/// consumer compiled it), `uint32_t flags`, and `void (*free)(void* ctx)`,
+/// followed by one function-pointer field per method in declaration order. A
+/// parameter of this type lowers to two slots, `void* {name}_ctx` and
+/// `const {vtable_tag}* {name}_vtable`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallbackInterfaceBinding {
     /// The callback interface name as written in the IDL.
@@ -390,10 +479,11 @@ pub struct CallbackInterfaceBinding {
     pub methods: Vec<CallbackMethodBinding>,
 }
 
-/// One error code of a module's error domain, with its C constant name.
+/// One error code of an error domain, with its C constant name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorCodeBinding {
-    /// The code name exactly as written in the IDL (e.g. `KEY_NOT_FOUND`).
+    /// The code name exactly as written in the IDL (for example
+    /// `KEY_NOT_FOUND`).
     pub name: String,
     /// The numeric ABI code carried in `{prefix}_error.code`.
     pub value: i32,
@@ -413,6 +503,7 @@ pub struct ErrorCodeBinding {
 impl ErrorCodeBinding {
     /// `{c_const}_payload`, the struct the C value-buffer header declares
     /// for the code's [`fields`](Self::fields) (only when there are any).
+    #[must_use]
     pub fn payload_tag(&self) -> String {
         format!("{}_payload", self.c_const)
     }
@@ -420,44 +511,56 @@ impl ErrorCodeBinding {
 
 /// An error domain, lowered on the module that declares it.
 ///
-/// Every throwing function reports codes from the domain in scope for its
-/// module: the module's own, or the nearest ancestor's
-/// ([`Model::error_domain`]). Backends emit one error type per declaring
-/// module and reference it from inheriting submodules.
+/// A callable reports a domain's codes when its
+/// [`ErrorStrategy`] is [`Domain`](ErrorStrategy::Domain) naming it;
+/// [`Model::error_domain`] resolves the name. Domains are open: a consumer
+/// maps a positive code it doesn't know to the domain's base error type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorBinding {
-    /// The domain name as written in the IDL (e.g. `KvError`).
+    /// The domain name as written in the IDL (for example `KvError`).
     pub name: String,
-    /// PascalCase type name with exactly one `Error` suffix (e.g. `KvError`);
-    /// backends that brand exceptions swap the suffix via
-    /// [`crate::errors::type_name`].
+    /// The domain's error type name with exactly one `Error` suffix (for
+    /// example `KvError`, and `KitchenError` for `KitchenErrors`), from
+    /// [`crate::errors::type_name`]. Backends that brand exceptions use
+    /// [`crate::errors::exception_type_name`] on [`name`](Self::name).
     pub type_name: String,
-    /// Underscore-joined path of the module that declares the domain.
+    /// Dot-joined path of the declaring module (for example `kv.stats`).
+    pub module: String,
+    /// Underscore-joined path of the declaring module.
     pub owner_path: String,
-    /// `{prefix}_{owner_path}_{name}`, the C tag naming the domain's code
-    /// constants.
+    /// `{prefix}_{owner_path}_{name}`, the C type (`typedef int32_t`) naming
+    /// the domain's code constants.
     pub c_tag: String,
     /// The domain's codes in declaration order.
     pub codes: Vec<ErrorCodeBinding>,
 }
 
-/// One module, flattened with its underscore-joined symbol path.
+/// One module, flattened with its underscore-joined symbol path and linked
+/// to its parent and children by index into [`Model::modules`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleBinding {
+    /// The module's position in [`Model::modules`].
+    pub index: usize,
     /// The module name (its final path segment).
     pub name: String,
-    /// Path segments from the root (e.g. `["outer", "inner"]`).
+    /// Path segments from the root (for example `["outer", "inner"]`).
     pub segments: Vec<String>,
-    /// Underscore-joined path used as the C symbol segment (e.g. `outer_inner`).
+    /// Underscore-joined path used as the C symbol segment (for example
+    /// `outer_inner`).
     pub path: String,
-    /// Dot-joined path (e.g. `outer.inner`), the declaration path diagnostics
-    /// and generated comments quote.
+    /// Dot-joined path (for example `outer.inner`), the declaration path
+    /// diagnostics and generated comments quote.
     pub dot_path: String,
+    /// The parent module's position in [`Model::modules`], or `None` for a
+    /// top-level module.
+    pub parent: Option<usize>,
+    /// The direct submodules' positions in [`Model::modules`], in
+    /// declaration order.
+    pub children: Vec<usize>,
     /// The module's doc comment, if the IDL records one.
     pub doc: Option<String>,
-    /// The error domain this module declares, if any. A module without one
-    /// inherits the nearest ancestor's ([`Model::error_domain`]).
-    pub errors: Option<ErrorBinding>,
+    /// The error domains this module declares, in declaration order.
+    pub errors: Vec<ErrorBinding>,
     /// Enums declared in this module, fully lowered.
     pub enums: Vec<EnumBinding>,
     /// Structs declared in this module, fully lowered.
@@ -476,23 +579,19 @@ impl ModuleBinding {
     pub fn callables(&self) -> impl Iterator<Item = &FnBinding> {
         self.functions
             .iter()
-            .chain(self.interfaces.iter().flat_map(|i| {
-                i.constructors
-                    .iter()
-                    .chain(i.methods.iter())
-                    .chain(i.statics.iter())
-            }))
+            .chain(self.interfaces.iter().flat_map(InterfaceBinding::members))
     }
 
     /// `true` when any callable in this module is `async`.
+    #[must_use]
     pub fn has_async(&self) -> bool {
         self.callables().any(FnBinding::is_async)
     }
 
     /// `true` when any callable in this module returns an iterator.
+    #[must_use]
     pub fn has_iterators(&self) -> bool {
-        self.callables()
-            .any(|f| matches!(f.shape, CallShape::Iterator(_)))
+        self.callables().any(|f| f.iterator().is_some())
     }
 }
 
@@ -507,56 +606,40 @@ pub struct Model {
     pub identity: Identity,
     /// The IR schema version of the source document.
     pub version: String,
-    /// Modules in depth-first pre-order, each carrying its joined symbol path.
+    /// Modules in depth-first pre-order (a parent before its children).
     pub modules: Vec<ModuleBinding>,
     /// Every user type name, mapped to its declaration.
     pub types: TypeIndex,
 }
 
 impl Model {
-    /// Build the model without validating the document.
-    ///
-    /// Type names that resolve to no declaration become [`Ty::Record`]
-    /// references named exactly as written. Tests use it for hand-built
-    /// trees; everything else goes through
-    /// [`validate`](crate::validate::validate).
-    #[doc(hidden)]
-    #[must_use]
-    pub fn assume_valid(api: &Api, identity: Identity) -> Self {
-        build::build(api, identity)
-    }
-
-    /// Resolve a written type reference against this model's declarations.
-    /// A name no declaration provides resolves to a [`Ty::Record`] (see
-    /// [`assume_valid`](Self::assume_valid)).
-    pub fn resolve(&self, ty: &TypeRef) -> Ty {
-        build::resolve(&self.types, ty)
-    }
-
     /// The C symbol prefix every emitted name starts with.
+    #[must_use]
     pub fn prefix(&self) -> &str {
         &self.identity.prefix
     }
 
-    /// The top-level modules (those with a single path segment), in order.
+    /// The top-level modules, in declaration order.
     pub fn roots(&self) -> impl Iterator<Item = &ModuleBinding> {
-        self.modules.iter().filter(|m| m.segments.len() == 1)
+        self.modules.iter().filter(|m| m.parent.is_none())
     }
 
-    /// The direct submodules of `parent`, in declaration order. Backends that
-    /// render nested namespaces recurse with this instead of re-walking the
-    /// IR tree.
+    /// The direct submodules of `parent`, in declaration order.
     pub fn children<'a>(
         &'a self,
         parent: &'a ModuleBinding,
     ) -> impl Iterator<Item = &'a ModuleBinding> + 'a {
-        self.modules.iter().filter(move |m| {
-            m.segments.len() == parent.segments.len() + 1
-                && m.segments[..parent.segments.len()] == parent.segments[..]
-        })
+        parent.children.iter().filter_map(|&i| self.modules.get(i))
     }
 
-    /// Iterate every function across all modules, paired with its module.
+    /// The parent of `module`, or `None` for a top-level module.
+    #[must_use]
+    pub fn parent(&self, module: &ModuleBinding) -> Option<&ModuleBinding> {
+        module.parent.and_then(|i| self.modules.get(i))
+    }
+
+    /// Iterate every free function across all modules, paired with its
+    /// module.
     pub fn functions(&self) -> impl Iterator<Item = (&ModuleBinding, &FnBinding)> {
         self.modules
             .iter()
@@ -581,12 +664,21 @@ impl Model {
             .flat_map(|m| m.callback_interfaces.iter().map(move |c| (m, c)))
     }
 
-    /// The declaration of the user type `name`.
+    /// Iterate every error domain across all modules, paired with its
+    /// module.
+    pub fn error_domains(&self) -> impl Iterator<Item = (&ModuleBinding, &ErrorBinding)> {
+        self.modules
+            .iter()
+            .flat_map(|m| m.errors.iter().map(move |e| (m, e)))
+    }
+
+    /// The declaration of the user type `name`, which must be one of
+    /// `kinds`.
     ///
     /// # Panics
     ///
-    /// Panics when `name` isn't declared, which validation rules out for
-    /// every name a [`Ty`] carries.
+    /// Panics when `name` isn't declared as one of `kinds`, which
+    /// validation rules out for every name the model carries.
     fn decl(&self, name: &str, kinds: &[TypeKind]) -> &TypeDecl {
         match self.types.get(name) {
             Some(d) if kinds.contains(&d.kind) => d,
@@ -595,12 +687,13 @@ impl Model {
         }
     }
 
-    /// The module declaring the user type `name`.
+    /// The module declaring the user type or error domain `name`.
     ///
     /// # Panics
     ///
-    /// Panics when `name` isn't declared, which validation rules out for
-    /// every name a [`Ty`] carries.
+    /// Panics when `name` isn't declared in this model (a name the model
+    /// itself carries always is; a foreign record has no owner).
+    #[must_use]
     pub fn owner(&self, name: &str) -> &ModuleBinding {
         let decl = self.types.get(name);
         let decl = decl.unwrap_or_else(|| panic!("type '{name}' is not declared"));
@@ -612,17 +705,19 @@ impl Model {
     /// # Panics
     ///
     /// Panics when no interface has that name.
+    #[must_use]
     pub fn interface(&self, name: &str) -> &InterfaceBinding {
         let d = self.decl(name, &[TypeKind::Interface]);
         &self.modules[d.module].interfaces[d.index]
     }
 
     /// The callback interface named `name`, as carried by
-    /// [`Ty::CallbackInterface`].
+    /// [`ParamTy::Callback`].
     ///
     /// # Panics
     ///
     /// Panics when no callback interface has that name.
+    #[must_use]
     pub fn callback_interface(&self, name: &str) -> &CallbackInterfaceBinding {
         let d = self.decl(name, &[TypeKind::CallbackInterface]);
         &self.modules[d.module].callback_interfaces[d.index]
@@ -634,162 +729,72 @@ impl Model {
     /// # Panics
     ///
     /// Panics when no enum has that name.
+    #[must_use]
     pub fn enumeration(&self, name: &str) -> &EnumBinding {
         let d = self.decl(name, &[TypeKind::Enum, TypeKind::RichEnum]);
         &self.modules[d.module].enums[d.index]
     }
 
-    /// The error domain in scope for `module`'s throwing functions: its own,
-    /// else the nearest ancestor's, else `None` (in which case validation
-    /// has rejected any `throws` there).
-    pub fn error_domain(&self, module: &ModuleBinding) -> Option<&ErrorBinding> {
-        (1..=module.segments.len()).rev().find_map(|n| {
-            let scope = &module.segments[..n];
-            self.modules
-                .iter()
-                .find(|m| m.segments == scope)
-                .and_then(|m| m.errors.as_ref())
-        })
+    /// The record named `name`, as carried by [`Ty::Record`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when no record in this model has that name (including a
+    /// foreign record, which [`TypeIndex::is_foreign`] identifies).
+    #[must_use]
+    pub fn record(&self, name: &str) -> &StructBinding {
+        let d = self.decl(name, &[TypeKind::Record]);
+        &self.modules[d.module].structs[d.index]
     }
 
-    /// Every C identifier the library's ABI declares, paired with a
-    /// human-readable description of the declaration that owns it, in
-    /// declaration order. Validation rejects an API in which two entries share
-    /// an identifier.
+    /// The error domain named `name`, as carried by
+    /// [`ErrorStrategy::Domain`]. Domain names are global, so the domain may
+    /// be declared in any module.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no error domain has that name; validation guarantees one
+    /// for every name an [`ErrorStrategy`] in the model carries.
+    #[must_use]
+    pub fn error_domain(&self, name: &str) -> &ErrorBinding {
+        let d = self.decl(name, &[TypeKind::ErrorDomain]);
+        &self.modules[d.module].errors[d.index]
+    }
+
+    /// Every C identifier the library's ABI declares, with the declaration
+    /// that owns it, in declaration order. Validation rejects an API in
+    /// which two entries share an identifier.
     ///
     /// Covers the runtime surface ([`RUNTIME_SYMBOLS`]), each top-level
     /// module's contract table function and the C header's checker for it,
-    /// every callable's symbols (sync entry point, async launcher and
-    /// completion type, iterator launcher, type, `_next`, and `_destroy`),
-    /// interface types with their `_clone` and `_destroy`, enum types and
-    /// constants (and a rich enum's tag type), error-domain types and code
-    /// constants, callback-interface vtable types, and what the C
-    /// value-buffer helper header declares per user type: the struct of
-    /// every record, rich enum, and error code with fields
-    /// ([`ErrorCodeBinding::payload_tag`]), each with its
-    /// [`VALUE_CODECS`]. (The header's list, map, and optional shapes fall
-    /// in [`RESERVED_SYMBOL_FAMILIES`].)
-    pub fn c_symbols(&self) -> Vec<(String, String)> {
-        let p = self.prefix();
-        let mut out: Vec<(String, String)> = RUNTIME_SYMBOLS
-            .iter()
-            .map(|s| (format!("{p}_{s}"), format!("the runtime symbol '{p}_{s}'")))
-            .collect();
-        for m in self.roots() {
-            out.push((
-                contract_symbol(p, &m.name),
-                format!("the contract table of module '{}'", m.name),
-            ));
-            out.push((
-                contract_check_symbol(p, &m.name),
-                format!("the contract check of module '{}'", m.name),
-            ));
-        }
-        let callable = |out: &mut Vec<(String, String)>, f: &FnBinding, owner: &str| {
-            let what = format!("'{owner}.{}'", f.name);
-            match &f.shape {
-                CallShape::Sync(abi) => out.push((abi.symbol.clone(), format!("function {what}"))),
-                CallShape::Async(a) => {
-                    out.push((a.launch.symbol.clone(), format!("async function {what}")));
-                    out.push((
-                        a.callback_type.clone(),
-                        format!("the completion type of {what}"),
-                    ));
-                }
-                CallShape::Iterator(it) => {
-                    out.push((it.launch.symbol.clone(), format!("function {what}")));
-                    out.push((it.iter_tag.clone(), format!("the iterator type of {what}")));
-                    out.push((
-                        it.next.symbol.clone(),
-                        format!("the iterator step of {what}"),
-                    ));
-                    out.push((
-                        it.destroy_symbol.clone(),
-                        format!("the iterator destructor of {what}"),
-                    ));
-                }
-            }
-        };
-        let codecs = |out: &mut Vec<(String, String)>, tag: &str, what: &str| {
-            for codec in VALUE_CODECS {
-                out.push((
-                    format!("{tag}_{codec}"),
-                    format!("the value-buffer codec '{tag}_{codec}' of {what}"),
-                ));
-            }
-        };
-        for m in &self.modules {
-            let dot = &m.dot_path;
-            if let Some(e) = &m.errors {
-                out.push((e.c_tag.clone(), format!("error domain '{dot}.{}'", e.name)));
-                for c in &e.codes {
-                    let what = format!("error code '{dot}.{}.{}'", e.name, c.name);
-                    out.push((c.c_const.clone(), what.clone()));
-                    if !c.fields.is_empty() {
-                        let payload = c.payload_tag();
-                        codecs(&mut out, &payload, &format!("the payload of {what}"));
-                        out.push((payload, format!("the payload struct of {what}")));
-                    }
-                }
-            }
-            for e in &m.enums {
-                out.push((e.c_tag.clone(), format!("enum '{dot}.{}'", e.name)));
-                if e.rich {
-                    out.push((
-                        format!("{}_Tag", e.c_tag),
-                        format!("the tag type of enum '{dot}.{}'", e.name),
-                    ));
-                    codecs(&mut out, &e.c_tag, &format!("enum '{dot}.{}'", e.name));
-                }
-                for v in &e.variants {
-                    out.push((
-                        v.c_const.clone(),
-                        format!("enum variant '{dot}.{}.{}'", e.name, v.name),
-                    ));
-                }
-            }
-            for s in &m.structs {
-                let tag = format!("{p}_{}_{}", m.path, s.name);
-                let what = format!("record '{dot}.{}'", s.name);
-                codecs(&mut out, &tag, &what);
-                out.push((tag, what));
-            }
-            for c in &m.callback_interfaces {
-                out.push((
-                    c.vtable_tag.clone(),
-                    format!("the vtable of callback interface '{dot}.{}'", c.name),
-                ));
-            }
-            for i in &m.interfaces {
-                let owner = format!("{dot}.{}", i.name);
-                out.push((i.c_tag.clone(), format!("interface '{owner}'")));
-                out.push((i.clone_symbol.clone(), format!("the clone of '{owner}'")));
-                out.push((
-                    i.destroy_symbol.clone(),
-                    format!("the destructor of '{owner}'"),
-                ));
-                for f in i.constructors.iter().chain(&i.methods).chain(&i.statics) {
-                    callable(&mut out, f, &owner);
-                }
-            }
-            for f in &m.functions {
-                callable(&mut out, f, dot);
-            }
-        }
-        out
+    /// every callable's symbols (entry point or launcher, async completion
+    /// type, iterator type, `_next`, and `_destroy`), interface types with
+    /// their `_clone` and `_destroy`, enum types and constants (and a rich
+    /// enum's tag type), error-domain types and code constants,
+    /// callback-interface vtable types, and what the C value-buffer helper
+    /// header declares per user type: the struct of every record, rich enum,
+    /// and error code with fields ([`ErrorCodeBinding::payload_tag`]), each
+    /// with its [`VALUE_CODECS`]. (The header's list, map, and optional
+    /// shapes fall in [`RESERVED_SYMBOL_FAMILIES`].)
+    #[must_use]
+    pub fn c_symbols(&self) -> Vec<Symbol> {
+        symbols::collect(self)
     }
 
     /// `true` when any callable anywhere in the API is `async`.
+    #[must_use]
     pub fn has_async(&self) -> bool {
         self.modules.iter().any(ModuleBinding::has_async)
     }
 
     /// `true` when any callable anywhere in the API returns an iterator.
+    #[must_use]
     pub fn has_iterators(&self) -> bool {
         self.modules.iter().any(ModuleBinding::has_iterators)
     }
 
     /// `true` when the API declares any callback interface.
+    #[must_use]
     pub fn has_callback_interfaces(&self) -> bool {
         self.modules
             .iter()
@@ -797,418 +802,34 @@ impl Model {
     }
 
     /// `true` when the API declares any interface.
+    #[must_use]
     pub fn has_interfaces(&self) -> bool {
         self.modules.iter().any(|m| !m.interfaces.is_empty())
     }
 
-    /// `true` when any type anywhere in the API crosses the ABI as a value
-    /// buffer (records, rich enums, optionals, lists, maps, error payloads).
+    /// `true` when any value anywhere in the API crosses the ABI as a value
+    /// buffer (records, rich enums, error payloads, and optionals, lists,
+    /// and maps outside the OptDirect and Slice families).
+    #[must_use]
     pub fn has_buffers(&self) -> bool {
         let buffered = |ty: &Ty| ty.any(&Ty::is_buffered);
-        let signature = |params: &[ParamBinding], ret: &Option<Ty>| {
-            params.iter().any(|p| buffered(&p.ty)) || ret.as_ref().is_some_and(buffered)
+        let callable = |f: &FnBinding| {
+            f.params.iter().any(|p| p.ty.value().is_some_and(buffered))
+                || f.ret.as_ref().is_some_and(|r| buffered(r.elem()))
+        };
+        let method = |m: &CallbackMethodBinding| {
+            m.params.iter().any(|p| buffered(&p.ty)) || m.ret.as_ref().is_some_and(buffered)
         };
         self.modules.iter().any(|m| {
             !m.structs.is_empty()
                 || m.enums.iter().any(|e| e.rich)
                 || m.errors
-                    .as_ref()
-                    .is_some_and(|e| e.codes.iter().any(|c| !c.fields.is_empty()))
-                || m.callables().any(|f| signature(&f.params, &f.ret))
+                    .iter()
+                    .any(|e| e.codes.iter().any(|c| !c.fields.is_empty()))
+                || m.callables().any(callable)
                 || m.callback_interfaces
                     .iter()
-                    .any(|c| c.methods.iter().any(|f| signature(&f.params, &f.ret)))
+                    .any(|c| c.methods.iter().any(method))
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ir::{
-        CallbackInterfaceDef, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, InterfaceDef,
-        Module, Param, StructDef, StructField, TypeRef,
-    };
-    use crate::ty::Prim;
-
-    fn param(name: &str, ty: TypeRef) -> Param {
-        Param {
-            name: name.into(),
-            ty,
-            doc: None,
-        }
-    }
-
-    fn func(name: &str, params: Vec<Param>, returns: Option<TypeRef>) -> Function {
-        Function {
-            name: name.into(),
-            params,
-            returns,
-            doc: None,
-            throws: false,
-            r#async: false,
-            cancellable: false,
-            deprecated: None,
-        }
-    }
-
-    fn module(name: &str) -> Module {
-        Module {
-            name: name.into(),
-            doc: None,
-            functions: vec![],
-            interfaces: vec![],
-            callback_interfaces: vec![],
-            structs: vec![],
-            enums: vec![],
-            errors: None,
-            modules: vec![],
-        }
-    }
-
-    fn build(modules: Vec<Module>, prefix: &str) -> Model {
-        let api = Api {
-            version: crate::ir::CURRENT_SCHEMA_VERSION.into(),
-            modules,
-        };
-        Model::assume_valid(&api, Identity::named(prefix))
-    }
-
-    fn rendered(abi: &AbiFn) -> Vec<String> {
-        abi.params
-            .iter()
-            .map(|p| format!("{} {}", p.ty.render_c("weaveffi"), p.name))
-            .collect()
-    }
-
-    #[test]
-    fn sync_function_symbol_and_sig() {
-        let m = Module {
-            functions: vec![func(
-                "add",
-                vec![
-                    param("a", TypeRef::Prim(Prim::I32)),
-                    param("b", TypeRef::Prim(Prim::I32)),
-                ],
-                Some(TypeRef::Prim(Prim::I32)),
-            )],
-            ..module("math")
-        };
-        let model = build(vec![m], "weaveffi");
-        let f = &model.modules[0].functions[0];
-        assert_eq!(f.c_base, "weaveffi_math_add");
-        let CallShape::Sync(abi) = &f.shape else {
-            panic!("expected sync")
-        };
-        assert_eq!(abi.symbol, "weaveffi_math_add");
-        assert_eq!(abi.ret, CType::Int32);
-        assert_eq!(
-            rendered(abi),
-            ["int32_t a", "int32_t b", "weaveffi_error* out_err"]
-        );
-
-        let model = build(vec![module("net")], "acme");
-        assert_eq!(model.prefix(), "acme");
-    }
-
-    #[test]
-    fn async_function_has_launch_and_callback() {
-        let m = Module {
-            functions: vec![Function {
-                cancellable: true,
-                r#async: true,
-                ..func(
-                    "fetch",
-                    vec![param("id", TypeRef::Prim(Prim::I64))],
-                    Some(TypeRef::Prim(Prim::String)),
-                )
-            }],
-            ..module("net")
-        };
-        let model = build(vec![m], "weaveffi");
-        let CallShape::Async(a) = &model.modules[0].functions[0].shape else {
-            panic!("expected async")
-        };
-        assert_eq!(a.launch.symbol, "weaveffi_net_fetch");
-        assert_eq!(a.callback_type, "weaveffi_net_fetch_callback");
-        let names: Vec<&str> = a.launch.params.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["id", "cancel_token", "callback", "context"]);
-        assert_eq!(a.callback_params[0].name, "context");
-        assert_eq!(a.callback_params[1].name, "err");
-        assert_eq!(a.callback_params[2].name, "result_ptr");
-        assert!(model.has_async());
-    }
-
-    #[test]
-    fn iterator_function_has_next_and_destroy() {
-        let m = Module {
-            functions: vec![func(
-                "get_messages",
-                vec![],
-                Some(TypeRef::Iterator(Box::new(TypeRef::Prim(Prim::String)))),
-            )],
-            ..module("events")
-        };
-        let model = build(vec![m], "weaveffi");
-        let CallShape::Iterator(it) = &model.modules[0].functions[0].shape else {
-            panic!("expected iterator")
-        };
-        assert_eq!(it.iter_tag, "weaveffi_events_GetMessagesIterator");
-        assert_eq!(it.launch.symbol, "weaveffi_events_get_messages");
-        assert_eq!(it.next.symbol, "weaveffi_events_GetMessagesIterator_next");
-        assert_eq!(
-            it.destroy_symbol,
-            "weaveffi_events_GetMessagesIterator_destroy"
-        );
-        assert_eq!(it.elem, Ty::Prim(Prim::String));
-        assert_eq!(it.next.ret, CType::Int32);
-        assert_eq!(it.next.params[1].ty.render_c("weaveffi"), "const uint8_t**");
-        assert_eq!(it.item_ctype().render_c("weaveffi"), "const uint8_t*");
-        assert!(model.has_iterators());
-    }
-
-    #[test]
-    fn user_types_resolve_to_kinds_and_buffers() {
-        let shared = Module {
-            structs: vec![StructDef {
-                name: "Contact".into(),
-                doc: None,
-                deprecated: Some("use Person".into()),
-                fields: vec![
-                    StructField {
-                        name: "name".into(),
-                        ty: TypeRef::Prim(Prim::String),
-                        doc: None,
-                    },
-                    StructField {
-                        name: "status".into(),
-                        ty: TypeRef::Named("Status".into()),
-                        doc: None,
-                    },
-                    StructField {
-                        name: "store".into(),
-                        ty: TypeRef::Optional(Box::new(TypeRef::Named("Store".into()))),
-                        doc: None,
-                    },
-                ],
-            }],
-            enums: vec![EnumDef {
-                name: "Status".into(),
-                doc: None,
-                deprecated: None,
-                variants: vec![EnumVariant {
-                    name: "Ok".into(),
-                    value: 0,
-                    doc: None,
-                    fields: vec![],
-                }],
-            }],
-            interfaces: vec![InterfaceDef {
-                name: "Store".into(),
-                doc: None,
-                deprecated: None,
-                constructors: vec![func("open", vec![], None)],
-                methods: vec![func(
-                    "save",
-                    vec![param("contact", TypeRef::Named("Contact".into()))],
-                    Some(TypeRef::List(Box::new(TypeRef::Named("Contact".into())))),
-                )],
-                statics: vec![],
-            }],
-            ..module("contacts")
-        };
-        let other = Module {
-            functions: vec![func(
-                "status_of",
-                vec![param("store", TypeRef::Named("Store".into()))],
-                Some(TypeRef::Named("Status".into())),
-            )],
-            ..module("ops")
-        };
-        let model = build(vec![shared, other], "weaveffi");
-        let contacts = &model.modules[0];
-        let s = &contacts.structs[0];
-        assert_eq!(s.deprecated.as_deref(), Some("use Person"));
-        assert_eq!(s.fields[1].ty, Ty::Enum("Status".into()));
-        assert_eq!(
-            s.fields[2].ty,
-            Ty::Optional(Box::new(Ty::Interface("Store".into())))
-        );
-        assert_eq!(contacts.enums[0].c_tag, "weaveffi_contacts_Status");
-        assert_eq!(
-            contacts.enums[0].variants[0].c_const,
-            "weaveffi_contacts_Status_Ok"
-        );
-
-        let iface = &contacts.interfaces[0];
-        assert_eq!(iface.c_tag, "weaveffi_contacts_Store");
-        assert_eq!(iface.clone_symbol, "weaveffi_contacts_Store_clone");
-        assert_eq!(iface.destroy_symbol, "weaveffi_contacts_Store_destroy");
-        assert_eq!(
-            iface.constructors[0].ret,
-            Some(Ty::Interface("Store".into()))
-        );
-        let save = &iface.methods[0];
-        assert!(save.has_self);
-        assert_eq!(save.params[0].ty, Ty::Record("Contact".into()));
-        let CallShape::Sync(abi) = &save.shape else {
-            panic!("expected sync")
-        };
-        assert_eq!(
-            rendered(abi),
-            [
-                "const weaveffi_contacts_Store* self",
-                "const uint8_t* contact_ptr",
-                "size_t contact_len",
-                "size_t* out_len",
-                "weaveffi_error* out_err"
-            ]
-        );
-        assert_eq!(abi.ret.render_c("weaveffi"), "const uint8_t*");
-
-        let ops = &model.modules[1];
-        let f = &ops.functions[0];
-        assert_eq!(f.params[0].ty, Ty::Interface("Store".into()));
-        assert_eq!(f.ret, Some(Ty::Enum("Status".into())));
-        let CallShape::Sync(abi) = &f.shape else {
-            panic!("expected sync")
-        };
-        assert_eq!(
-            rendered(abi),
-            [
-                "const weaveffi_contacts_Store* store",
-                "weaveffi_error* out_err"
-            ]
-        );
-        assert_eq!(abi.ret.render_c("weaveffi"), "weaveffi_contacts_Status");
-        assert!(model.has_buffers());
-        assert!(model.has_interfaces());
-        assert_eq!(model.interface("Store").c_tag, "weaveffi_contacts_Store");
-        assert_eq!(model.owner("Status").path, "contacts");
-        assert_eq!(
-            model.enumeration("Status").c_tag,
-            "weaveffi_contacts_Status"
-        );
-    }
-
-    #[test]
-    fn callback_interfaces_lower_to_vtables() {
-        let m = Module {
-            callback_interfaces: vec![CallbackInterfaceDef {
-                name: "Listener".into(),
-                doc: Some("Receives messages.".into()),
-                deprecated: None,
-                methods: vec![
-                    func(
-                        "on_message",
-                        vec![param("text", TypeRef::Prim(Prim::String))],
-                        None,
-                    ),
-                    func("should_stop", vec![], Some(TypeRef::Prim(Prim::Bool))),
-                ],
-            }],
-            functions: vec![func(
-                "subscribe",
-                vec![param("listener", TypeRef::Named("Listener".into()))],
-                None,
-            )],
-            ..module("events")
-        };
-        let model = build(vec![m], "weaveffi");
-        let mb = &model.modules[0];
-        let cb = &mb.callback_interfaces[0];
-        assert_eq!(cb.c_tag, "weaveffi_events_Listener");
-        assert_eq!(cb.vtable_tag, "weaveffi_events_Listener_vtable");
-        let on_message = &cb.methods[0];
-        let slots: Vec<String> = on_message
-            .abi_params
-            .iter()
-            .map(|p| format!("{} {}", p.ty.render_c("weaveffi"), p.name))
-            .collect();
-        assert_eq!(
-            slots,
-            [
-                "void* ctx",
-                "const uint8_t* text_ptr",
-                "size_t text_len",
-                "weaveffi_error* out_err"
-            ]
-        );
-        assert_eq!(on_message.abi_ret, CType::Void);
-        assert_eq!(cb.methods[1].abi_ret, CType::Bool);
-        assert_eq!(model.callback_interface("Listener").c_tag, cb.c_tag);
-        assert!(model.has_callback_interfaces());
-
-        let f = &mb.functions[0];
-        assert_eq!(f.params[0].ty, Ty::CallbackInterface("Listener".into()));
-        let CallShape::Sync(abi) = &f.shape else {
-            panic!("expected sync")
-        };
-        assert_eq!(
-            rendered(abi),
-            [
-                "void* listener_ctx",
-                "const weaveffi_events_Listener_vtable* listener_vtable",
-                "weaveffi_error* out_err"
-            ]
-        );
-        assert!(!model.has_buffers());
-    }
-
-    #[test]
-    fn nested_modules_flatten_pre_order_with_paths_and_docs() {
-        let inner = Module {
-            functions: vec![Function {
-                doc: Some("Leaf.".into()),
-                ..func("leaf_fn", vec![], None)
-            }],
-            ..module("inner")
-        };
-        let outer = Module {
-            doc: Some("Outer module.".into()),
-            functions: vec![func("outer_fn", vec![], None)],
-            modules: vec![inner],
-            ..module("outer")
-        };
-        let model = build(vec![outer], "weaveffi");
-        let paths: Vec<&str> = model.modules.iter().map(|m| m.path.as_str()).collect();
-        assert_eq!(paths, ["outer", "outer_inner"]);
-        assert_eq!(model.modules[1].dot_path, "outer.inner");
-        assert_eq!(
-            model.modules[1].functions[0].c_base,
-            "weaveffi_outer_inner_leaf_fn"
-        );
-        assert_eq!(model.modules[0].doc.as_deref(), Some("Outer module."));
-        assert_eq!(model.modules[1].doc, None);
-    }
-
-    #[test]
-    fn error_domains_are_declared_once_and_inherited_by_lookup() {
-        let domain = ErrorDomain {
-            name: "OuterError".into(),
-            codes: vec![ErrorCode {
-                name: "Bad".into(),
-                code: 1,
-                message: "bad".into(),
-                doc: None,
-                fields: vec![],
-            }],
-        };
-        let outer = Module {
-            errors: Some(domain),
-            modules: vec![module("inner")],
-            ..module("outer")
-        };
-        let model = build(vec![outer, module("other")], "weaveffi");
-        let [outer, inner, other] = &model.modules[..] else {
-            panic!("three modules");
-        };
-        assert!(outer.errors.is_some() && inner.errors.is_none());
-        assert_eq!(
-            model.error_domain(inner).map(|e| e.c_tag.as_str()),
-            Some("weaveffi_outer_OuterError")
-        );
-        assert_eq!(model.error_domain(outer), outer.errors.as_ref());
-        assert!(model.error_domain(other).is_none());
     }
 }

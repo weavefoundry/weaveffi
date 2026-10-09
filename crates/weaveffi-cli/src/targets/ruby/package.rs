@@ -34,10 +34,10 @@ impl GemNames<'_> {
 }
 
 /// The `required_ruby_version` every gem declares.
-pub(crate) const REQUIRED_RUBY_VERSION: &str = ">= 2.7";
+pub(crate) const REQUIRED_RUBY_VERSION: &str = ">= 3.2";
 
 /// The `ffi` gem requirement every gem declares.
-pub(crate) const FFI_REQUIREMENT: &str = "~> 1.15";
+pub(crate) const FFI_REQUIREMENT: &str = "~> 1.16";
 
 /// The gem's authors. RubyGems requires a non-empty list, so an identity
 /// without authors falls back to the gem name.
@@ -118,7 +118,7 @@ Ruby bindings for `{gem}` using the [ffi](https://github.com/ffi/ffi) gem.
 
 ## Prerequisites
 
-- Ruby 2.7 or newer
+- Ruby 3.2 or newer
 - The native library (`{linux}`, `{macos}`, or `{windows}`) on the library
   search path, or its path in the `{env}` environment variable.
 

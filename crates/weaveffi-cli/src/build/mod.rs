@@ -13,14 +13,14 @@
 //! Node.js addon and JNI shim and `weaveffi package` reads them back as a
 //! [`BinarySet`](crate::platform::BinarySet).
 
-pub mod glue;
-pub mod ndk;
+pub(crate) mod glue;
+pub(crate) mod ndk;
 
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-use anyhow::{bail, Context, Result};
 use camino::Utf8PathBuf;
+use miette::{bail, IntoDiagnostic, Result, WrapErr};
 
 use crate::cargo::{cargo_bin, CargoCrate};
 use crate::platform::{NativeBinary, Os, Platform};
@@ -29,22 +29,22 @@ use self::ndk::Ndk;
 
 /// Build settings shared by every platform (the `[build]` table).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuildSettings {
-    /// Build with the release profile (`--release`).
-    pub release: bool,
+pub(crate) struct BuildSettings {
+    /// The Cargo profile to build with (`--profile`).
+    pub(crate) profile: String,
     /// The minimum macOS version (`MACOSX_DEPLOYMENT_TARGET`).
-    pub macos_deployment_target: String,
+    pub(crate) macos_deployment_target: String,
     /// The minimum iOS version (`IPHONEOS_DEPLOYMENT_TARGET`).
-    pub ios_deployment_target: String,
+    pub(crate) ios_deployment_target: String,
     /// The minimum Android API level, which selects the NDK compiler.
-    pub android_api: u32,
+    pub(crate) android_api: u32,
 }
 
 impl Default for BuildSettings {
     /// Release builds for macOS 11.0, iOS 13.0, and Android API 21.
     fn default() -> Self {
         Self {
-            release: true,
+            profile: "release".into(),
             macos_deployment_target: "11.0".into(),
             ios_deployment_target: "13.0".into(),
             android_api: 21,
@@ -53,7 +53,7 @@ impl Default for BuildSettings {
 }
 
 /// Cross-compiles one producer crate into `{target_dir}/weaveffi/<platform>/`.
-pub struct Builder<'a> {
+pub(crate) struct Builder<'a> {
     krate: &'a CargoCrate,
     library: &'a str,
     settings: &'a BuildSettings,
@@ -65,7 +65,11 @@ pub struct Builder<'a> {
 impl<'a> Builder<'a> {
     /// A builder for `krate` whose outputs are named after `library` (the
     /// identity's library, which the generated bindings load).
-    pub fn new(krate: &'a CargoCrate, library: &'a str, settings: &'a BuildSettings) -> Self {
+    pub(crate) fn new(
+        krate: &'a CargoCrate,
+        library: &'a str,
+        settings: &'a BuildSettings,
+    ) -> Self {
         Self {
             krate,
             library,
@@ -78,7 +82,7 @@ impl<'a> Builder<'a> {
 
     /// Pass `--quiet` to Cargo.
     #[must_use]
-    pub fn quiet(mut self, quiet: bool) -> Self {
+    pub(crate) fn quiet(mut self, quiet: bool) -> Self {
         self.quiet = quiet;
         self
     }
@@ -86,7 +90,7 @@ impl<'a> Builder<'a> {
     /// The directory a platform's outputs are laid out in:
     /// `{target_dir}/weaveffi/<platform-id>`.
     #[must_use]
-    pub fn output_dir(&self, platform: Platform) -> Utf8PathBuf {
+    pub(crate) fn output_dir(&self, platform: Platform) -> Utf8PathBuf {
         self.krate.weaveffi_dir().join(platform.id())
     }
 
@@ -95,11 +99,11 @@ impl<'a> Builder<'a> {
     /// # Errors
     ///
     /// Returns an error when no NDK is found.
-    pub fn ndk(&self) -> Result<&Ndk> {
+    pub(crate) fn ndk(&self) -> Result<&Ndk> {
         self.ndk
             .get_or_init(|| Ndk::locate().map_err(|e| e.to_string()))
             .as_ref()
-            .map_err(|e| anyhow::anyhow!("{e}"))
+            .map_err(|e| miette::miette!("{e}"))
     }
 
     /// Check, before compiling anything, that `platform` can be built here:
@@ -109,7 +113,7 @@ impl<'a> Builder<'a> {
     /// # Errors
     ///
     /// Returns an error naming the missing piece and how to add it.
-    pub fn check(&self, platform: Platform) -> Result<()> {
+    pub(crate) fn check(&self, platform: Platform) -> Result<()> {
         platform.check_host()?;
         let triple = platform.rust_target();
         if let Some(installed) = self.installed_targets() {
@@ -155,7 +159,7 @@ impl<'a> Builder<'a> {
     ///
     /// Returns an error when [`check`](Self::check) fails, Cargo fails, or
     /// Cargo produces none of the expected libraries.
-    pub fn build(&self, platform: Platform) -> Result<NativeBinary> {
+    pub(crate) fn build(&self, platform: Platform) -> Result<NativeBinary> {
         self.check(platform)?;
         let triple = platform.rust_target();
         let library = self.library;
@@ -186,9 +190,7 @@ impl<'a> Builder<'a> {
             .arg("--manifest-path")
             .arg(self.krate.manifest_path.as_str())
             .args(["--target", triple, "--crate-type", crate_types]);
-        if self.settings.release {
-            cmd.arg("--release");
-        }
+        cmd.args(["--profile", &self.settings.profile]);
         if self.quiet {
             cmd.arg("--quiet");
         }
@@ -228,7 +230,8 @@ impl<'a> Builder<'a> {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .output()
-            .context("failed to run cargo")?;
+            .into_diagnostic()
+            .wrap_err("failed to run cargo")?;
         if !output.status.success() {
             bail!(
                 "cargo failed to build `{}` for {} ({triple}); see its errors above",
@@ -241,17 +244,20 @@ impl<'a> Builder<'a> {
         let dir = self.output_dir(platform);
         if dir.exists() {
             std::fs::remove_dir_all(dir.as_std_path())
-                .with_context(|| format!("failed to clear {dir}"))?;
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to clear {dir}"))?;
         }
         std::fs::create_dir_all(dir.as_std_path())
-            .with_context(|| format!("failed to create {dir}"))?;
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create {dir}"))?;
         let place = |suffix: &str, name: String| -> Result<Option<Utf8PathBuf>> {
             let Some(source) = produced.iter().find(|p| p.as_str().ends_with(suffix)) else {
                 return Ok(None);
             };
             let dest = dir.join(name);
             std::fs::copy(source.as_std_path(), dest.as_std_path())
-                .with_context(|| format!("failed to copy {source} to {dest}"))?;
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to copy {source} to {dest}"))?;
             Ok(Some(dest))
         };
         let primary = platform.lib_filename(library);

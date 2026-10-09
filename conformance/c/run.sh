@@ -37,13 +37,15 @@ c_producer_exports() {
     local incdir="$GENROOT/calculator/c"
     local lib="$OUT/libcalc_producer.$EXT"
     clang -std=c11 -Wall -Wextra -Werror -shared -fPIC -fvisibility=hidden \
-        -I "$incdir" "$ROOT/conformance/c/producer.c" -o "$lib" \
+        -I "$incdir" "$ROOT/conformance/c/producer.c" -lm -o "$lib" \
         || { echo "producer compile failed" >&2; return 1; }
     local syms
     syms=$(nm -g --defined-only "$lib" 2>/dev/null) || syms=$(nm -gU "$lib" 2>/dev/null)
     local sym
     for sym in calculator_calculator_add calculator_calculator_divide \
-        calculator_calculator_greet \
+        calculator_calculator_greet calculator_calculator_parse \
+        calculator_calculator_sqrt calculator_calculator_mean \
+        calculator_calculator_running_total \
         calculator_abi_version calculator_calculator_contract \
         calculator_error_set calculator_error_set_payload calculator_error_clear \
         calculator_error_free calculator_alloc calculator_free_bytes \

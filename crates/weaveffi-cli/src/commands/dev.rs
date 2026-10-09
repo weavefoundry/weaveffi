@@ -1,27 +1,34 @@
 //! `weaveffi dev`: the inner loop for a Rust producer.
 //!
-//! It builds the crate's debug library, generates the bindings from it, and
-//! then makes the generated packages find that library without any setup
-//! where a package looks for a bundled copy: the library is copied into the
-//! Python package, next to the Node.js package's `binding.gyp` (which links
-//! and loads it from there), and into the Ruby gem's `lib/native/`. For the
+//! It builds the crate's library (the `dev` profile unless `--profile` says
+//! otherwise), generates the bindings from it, and then makes the generated
+//! packages find that library without any setup where a package looks for a
+//! bundled copy (each target's
+//! [`dev_bundle_dir`](crate::targets::Target::dev_bundle_dir)). For the
 //! other targets it prints the one environment variable to set (or, for
 //! targets that link at build time, the directory to link from).
+
+use std::process::ExitCode;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use miette::{bail, IntoDiagnostic, Result, WrapErr};
 
-use super::generate::{generate, report_summary};
 use super::Locate;
+use crate::codegen::Orchestrator;
+use crate::targets::Linkage;
 
 /// Options for [`cmd_dev`].
-pub(crate) struct DevArgs<'a> {
-    pub(crate) locate: Locate<'a>,
-    pub(crate) out: Option<&'a str>,
-    pub(crate) targets: Option<&'a str>,
+pub struct DevArgs<'a> {
+    /// Where the project is.
+    pub locate: Locate<'a>,
+    /// `--out`.
+    pub out: Option<&'a str>,
+    /// `--target`.
+    pub targets: Option<&'a [String]>,
 }
 
-pub(crate) fn cmd_dev(args: &DevArgs<'_>) -> Result<()> {
+/// Run `weaveffi dev`.
+pub fn cmd_dev(args: &DevArgs<'_>) -> Result<ExitCode> {
     let project = args.locate.project()?;
     let Some(krate) = project.krate() else {
         bail!(
@@ -39,53 +46,35 @@ pub(crate) fn cmd_dev(args: &DevArgs<'_>) -> Result<()> {
     let model = super::load_model(&project, false)?;
     let out_dir = project.config.out_dir(args.out);
     let quiet = args.locate.quiet;
-    if let Some(report) = generate(&project, &model, &out_dir, args.targets, false)? {
-        if !quiet {
-            println!("{}", report_summary(&report, &out_dir));
-        }
+    let targets = project.config.targets(args.targets)?;
+    let report = Orchestrator::new()
+        .with_targets(targets.iter().map(AsRef::as_ref))
+        .run(&model, &out_dir)?;
+    if !quiet {
+        println!("{}", report.summary(&out_dir));
     }
 
     let shared = matches!(library.extension(), Some("so" | "dylib" | "dll"));
     let mut placed = Vec::new();
     let mut by_env = Vec::new();
     let mut by_link = Vec::new();
-    for target in project.config.select_targets(args.targets)? {
-        let files = target.render(&model, &out_dir);
-        let file_dir = |suffix: &str| {
-            files
-                .iter()
-                .find(|f| f.path.as_str().ends_with(suffix))
-                .and_then(|f| f.path.parent().map(Utf8Path::to_path_buf))
-        };
-        let dest = match target.name() {
-            "python" => file_dir("/__init__.py"),
-            "node" => file_dir("/binding.gyp"),
-            "ruby" => file_dir("runtime.rb").and_then(|d| d.parent().map(|p| p.join("native"))),
-            "c" | "cpp" | "swift" | "go" => {
-                by_link.push(target.name());
-                None
-            }
-            "wasm" => None,
-            other => {
-                by_env.push(other);
-                None
-            }
-        };
-        match dest {
-            Some(dir) if shared => {
-                copy_into(&library, &dir)?;
-                placed.push(dir);
-            }
-            Some(_) | None => {
-                if matches!(target.name(), "python" | "node" | "ruby") {
-                    by_env.push(target.name());
-                }
-            }
+    let mut wasm = false;
+    for target in &targets {
+        if let Some(dir) = target.dev_bundle_dir(&model).filter(|_| shared) {
+            let dir = out_dir.join(target.name()).join(dir);
+            copy_into(&library, &dir)?;
+            placed.push(dir);
+            continue;
+        }
+        match target.linkage() {
+            Linkage::Runtime => by_env.push(target.name()),
+            Linkage::Link => by_link.push(target.name()),
+            Linkage::Wasm => wasm = true,
         }
     }
 
     if quiet {
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     println!("Built `{name}`: {library}");
     for dir in &placed {
@@ -108,15 +97,10 @@ pub(crate) fn cmd_dev(args: &DevArgs<'_>) -> Result<()> {
             model.identity.library
         );
     }
-    if project
-        .config
-        .select_targets(args.targets)?
-        .iter()
-        .any(|t| t.name() == "wasm")
-    {
+    if wasm {
         println!("  wasm: needs a wasm32 build: `weaveffi build --platforms wasm32`");
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Copy `library` into `dir`, replacing an older copy.

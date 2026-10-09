@@ -13,7 +13,6 @@ locally and in CI.
 | --- | --- |
 | `fuzz_parse_yaml` | `weaveffi_model::parse::parse_api_str(..., "yaml")` |
 | `fuzz_parse_json` | `weaveffi_model::parse::parse_api_str(..., "json")` |
-| `fuzz_parse_toml` | `weaveffi_model::parse::parse_api_str(..., "toml")` |
 | `fuzz_parse_type_ref` | `weaveffi_model::ir::parse_type_ref` |
 | `fuzz_validate` | parses YAML, then runs `weaveffi_model::validate::validate` on success |
 | `fuzz_value_buffer` | `weaveffi::abi::decode_value` over several value-buffer shapes; a successful decode must re-encode to the same bytes |
@@ -21,8 +20,8 @@ locally and in CI.
 Seed inputs for each target live in `fuzz/seeds/<target>/` and are committed
 to git. `seed_corpus.py <target> <dir>` copies them into a corpus directory
 and adds inputs derived from the snapshot fixtures in
-`crates/weaveffi-cli/tests/fixtures/` (as YAML, JSON, and TOML documents,
-and every type string they use); it needs `pip install pyyaml tomli-w`. The
+`crates/weaveffi-cli/tests/fixtures/` (as YAML and JSON documents, and
+every type string they use); it needs `pip install pyyaml`. The
 nightly CI run starts from that corpus. `corpus/`, `artifacts/`, and
 `coverage/` are generated at runtime and gitignored.
 

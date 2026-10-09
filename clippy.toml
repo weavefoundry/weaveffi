@@ -27,5 +27,8 @@ doc-valid-idents = [
     "lowerCamelCase",
     "SCREAMING_SNAKE",
     "SCREAMING_SNAKE_CASE",
+    # The C ABI family of optional scalars, named like its siblings
+    # (Direct, Slice, Buffer) in prose.
+    "OptDirect",
     "..",
 ]

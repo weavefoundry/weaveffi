@@ -8,8 +8,8 @@ maximum maturity, it's the safer pick. WeaveFFI exists for a different set of
 needs: eleven first-party targets from one definition, a producer that can be
 written in any language with a C ABI (the generated header is a public
 contract, not private scaffolding), a standalone CLI built for CI, and a
-schema-checked YAML, JSON, or TOML IDL. UniFFI is still ahead on async
-callback methods, custom types, and cross-crate type imports. See the
+schema-checked YAML or JSON IDL. UniFFI is still ahead on async callback
+methods, consumer-side custom types, and cross-crate type imports. See the
 [comparison](comparison.md) for the full table.
 
 ## Can I use it with a C++ codebase?
@@ -35,9 +35,10 @@ trait-object interfaces are on the [roadmap](roadmap.md).
 A call costs the marshalling of its arguments, one `extern "C"` call, and the
 marshalling of its result. Scalars pass by value. Strings and bytes pass as
 borrowed `(ptr, len)` views, so the producer copies only what it keeps.
-Objects pass as one pointer. Records and collections are encoded into one
-value buffer per value, with single-copy fast paths for byte and numeric
-lists. Async calls add a completion callback and whatever executor drives
+Objects pass as one pointer. Optional scalars pass as a flag plus the
+value, and numeric lists as typed arrays the producer reads in place (a
+`&[f64]` parameter borrows the caller's array without copying). Records and
+other collections are encoded into one value buffer per value. Async calls add a completion callback and whatever executor drives
 the future. The runtime itself is the small `weaveffi::abi` module; the
 `leak-check` counters cost an atomic update per counted operation and are off
 by default.
@@ -45,12 +46,16 @@ by default.
 ## How are errors propagated?
 
 Every fallible C call takes a `{prefix}_error*` out-parameter; async calls
-receive one in their completion. Positive codes are your declared error
-domain, negative codes are the runtime's (generic, panic, marshalling,
-callback failure, cancelled). A function marked `throws: true` (a `Result` in
-Rust) surfaces domain codes as typed errors in every language; a function
-without it traps on failure, since a failure there is a bug. See
-[Errors and Memory](guides/errors-and-memory.md#the-trap-policy).
+receive one in their completion. Positive codes belong to the error domain
+the callable throws, negative codes are the runtime's (untyped, panic,
+marshalling, callback failure, cancelled). A function declared `throws:
+KvError` (a `Result<T, KvError>` in Rust) surfaces the domain's codes as
+typed errors in every language, and an unknown code added later as the
+domain's base error. A function declared `throws: any` (a `Result` with any
+other error type, such as `anyhow::Error`) surfaces its failure as the
+library's base error with a message. A function without `throws` traps on
+failure, since a failure there is a bug. See
+[Errors and Memory](guides/errors-and-memory.md#domain-errors-and-the-trap-channel).
 
 ## Can two WeaveFFI libraries live in one process?
 
@@ -65,12 +70,13 @@ own copy of the small runtime.
 They refuse to load. Every generated consumer compares the library's ABI
 revision with the one it was generated against, and checks that every
 declaration it uses is in the library's contract table with the same
-signature hash. On a mismatch it raises the language's load error naming the
-declaration that's missing or changed. The hashes cover names, types, and
-flags, but not documentation or declaration order, so editing doc comments
-never breaks a deployed binding, and neither does adding a function, method,
-or type.
-In CI, `weaveffi diff --check` catches stale committed bindings before they
+signature hash. On a mismatch it raises the language's load error (a
+catchable one, in every language) naming the declaration that's missing or
+changed. The hashes cover declaration names, types, and flags, but not
+parameter or field names, documentation, or declaration order, so editing doc
+comments or renaming a parameter never breaks a deployed binding, and neither
+does adding a function, method, type, error code, or callback method.
+In CI, `weaveffi generate --check` catches stale committed bindings before they
 ship.
 
 ## Does the CLI parse my Rust source?
@@ -129,11 +135,11 @@ objects passed to the producer are borrowed. See
 
 ## Which executor runs my async functions, and how does cancellation work?
 
-By default, a small pool of worker threads (one per core, at least two)
-started on the first call. With the `weaveffi` crate's `tokio` feature it's
-Tokio: the current runtime when the call is made from inside one, otherwise
-one the library creates. `weaveffi::set_spawner` installs any other executor
-and overrides both. Consumers see their native async idiom, and cancelling it (a Swift `Task`, a Kotlin coroutine, an
+By default, Tokio (the `weaveffi` crate's default `tokio` feature): the
+current runtime when the call is made from inside one, otherwise one the
+library creates. With `default-features = false`, each call runs on a thread
+of its own. `weaveffi::set_spawner` installs any other executor and
+overrides both. Consumers see their native async idiom, and cancelling it (a Swift `Task`, a Kotlin coroutine, an
 `AbortSignal`, a `CancellationToken`, a Go `context`) cancels the native
 call: the runtime drops the future and completes with the cancelled code,
 which surfaces as the language's cancellation error. See

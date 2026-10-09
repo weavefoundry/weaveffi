@@ -12,154 +12,259 @@ require_relative 'kitchen_sink/runtime'
 # Ruby bindings for kitchen_sink.
 module KitchenSink
   # The declarations these bindings were generated with, per top-level
-  # module, as [id, hash, path]. Loading fails, naming the path, unless
-  # the library's contract table holds each one with an equal hash.
-  _wv_check_contract!(
+  # module, as [id, hash, path]. Loading raises LoadError, naming the path,
+  # unless the library's contract table holds each one with an equal hash.
+  Bridge.check_contract!(
     kitchen_sink_shared_contract: [
+      # function ping() -> string
       [0x709e234caa962446, 0x3894f2ca452e9f98, 'shared.ping'],
-      [0xcfb306fa5801ee5b, 0x1cbd9e10983cac2c, 'shared.Token'],
+      # record Token {i64, string}
+      [0xcfb306fa5801ee5b, 0x18e9fc204a13df6f, 'shared.Token'],
     ],
     kitchen_sink_kitchen_contract: [
-      [0x01d4f09bbddc986f, 0x29eb88fecc66544d, 'kitchen.Gadget.new'],
-      [0x10472d8fe748c2ee, 0xb265832b6a759fc4, 'kitchen.maybe_gadget'],
+      # constructor new(i64) -> Gadget
+      [0x01d4f09bbddc986f, 0xffcf2bd3b04aa002, 'kitchen.Gadget.new'],
+      # callback_method samples(u32?, [f64]) -> [i16] throws PantryError
+      [0x02bbd5f31c953704, 0xaca75656ad13d661, 'kitchen.Sampler.samples'],
+      # function maybe_gadget(Gadget?) -> Gadget?
+      [0x10472d8fe748c2ee, 0xcc570a2649bbf7dc, 'kitchen.maybe_gadget'],
+      # function gadgets() -> [Gadget]
       [0x11368eec07a74078, 0xfa049f78b77e146a, 'kitchen.gadgets'],
+      # function stream_gadgets() -> iter<Gadget>
       [0x137f08a29cde6021, 0xda8de7aeb2dbb8a3, 'kitchen.stream_gadgets'],
-      [0x2111b54980826dd7, 0x452783f3e6ca6e1d, 'kitchen.do_cancellable'],
+      # function ids_u64([u64]) -> [u64]
+      [0x184bfc4ab0e3fe45, 0xb64587477022696b, 'kitchen.ids_u64'],
+      # function do_cancellable(string) -> string async cancellable
+      [0x2111b54980826dd7, 0x627bf01ab365b209, 'kitchen.do_cancellable'],
+      # callback_method favorite() -> Gadget
+      [0x21c70f9371374d74, 0xc582d6ad2392c36c, 'kitchen.ReadyListener.favorite'],
+      # function stream_chunks() -> iter<[i32]>
+      [0x23de5bd597372f46, 0xcf1bc6bb37872798, 'kitchen.stream_chunks'],
+      # function take_from_pantry(string) -> i32 throws PantryError
+      [0x249f1ddaec6a6cbe, 0x0710d6c9a4de93da, 'kitchen.take_from_pantry'],
+      # enum Priority {Low = 0, Normal = 1, High = 2}
       [0x29dddbc60bf8d7db, 0x452a3e573d57f6db, 'kitchen.Priority'],
-      [0x2b227003b74a0d16, 0x12332957470e9782, 'kitchen.maybe_subscribe'],
-      [0x2dd66cb0064f0494, 0x60197363fefd92dd, 'kitchen.Item'],
-      [0x33c265bbf079b0e9, 0xc3dcd0927e6c1deb, 'kitchen.u32_id'],
-      [0x33e6381d01660dfe, 0x077c63c31fd7f90a, 'kitchen.KitchenErrors'],
-      [0x3f5fc99d73504b76, 0x2df88d710f1ea10e, 'kitchen.Gadget.poke'],
-      [0x4c5764cf109528d1, 0x2a65529af4338a58, 'kitchen.maybe_item'],
-      [0x4de17dfb93fd494d, 0xba0ad0dd52ed74af, 'kitchen.i32_id'],
+      # function maybe_subscribe(ReadyListener?) -> bool
+      [0x2b227003b74a0d16, 0x5dae036b8a6aed30, 'kitchen.maybe_subscribe'],
+      # record Item {i64, string, i32, bool, f64, u32, bytes, [string], {string:string}, i64?, Token, Priority, Gadget?}
+      [0x2dd66cb0064f0494, 0x74b131724dd0d867, 'kitchen.Item'],
+      # function u32_id(u32) -> u32
+      [0x33c265bbf079b0e9, 0x97c32b764693f2cb, 'kitchen.u32_id'],
+      # errors KitchenErrors
+      [0x33e6381d01660dfe, 0x05e35a563089bf7d, 'kitchen.KitchenErrors'],
+      # callback_method latest() -> Item?
+      [0x3d969ae76db6cb23, 0x38ac642c196512a5, 'kitchen.ReadyListener.latest'],
+      # method poke(i32) -> i32 throws KitchenErrors
+      [0x3f5fc99d73504b76, 0x417e4a2acd3210b3, 'kitchen.Gadget.poke'],
+      # callback Sampler
+      [0x4082f0085db28781, 0x18848e701962912e, 'kitchen.Sampler'],
+      # callback_method describe() -> string throws any
+      [0x4340a6b1e7ec8c50, 0xf5b4f10f61862b33, 'kitchen.Sampler.describe'],
+      # function maybe_item(i64) -> Item? throws KitchenErrors
+      [0x4c5764cf109528d1, 0xb374accf14676d90, 'kitchen.maybe_item'],
+      # function i32_id(i32) -> i32
+      [0x4de17dfb93fd494d, 0x78be3203bcd10727, 'kitchen.i32_id'],
+      # function stream_items() -> iter<Item>
       [0x504e95b7f7e65570, 0x01b3e8e0c9a10e23, 'kitchen.stream_items'],
-      [0x68cdb9a4bd3e3dd5, 0xc678b9164348d497, 'kitchen.bool_id'],
-      [0x69e7cd703d16eb85, 0xf3b28dd22ae9e689, 'kitchen.do_async'],
+      # code Spoiled = 2
+      [0x5dafabb7775fcb2d, 0x6c4b78c7d3f858c1, 'kitchen.PantryError.Spoiled'],
+      # callback_method threshold(u32?) -> f64?
+      [0x5e0a8f6be4b00600, 0x3d0dcaec54133637, 'kitchen.Sampler.threshold'],
+      # function async_samples(u32) -> [f32] async cancellable
+      [0x5ec0af1d4ecc6fed, 0x6540bdb74246420c, 'kitchen.async_samples'],
+      # function async_maybe_count() -> i64? async
+      [0x61a358b0571e0a4e, 0x11a24c4b50d11996, 'kitchen.async_maybe_count'],
+      # function bool_id(bool) -> bool
+      [0x68cdb9a4bd3e3dd5, 0xcde022fe6bc3b1bf, 'kitchen.bool_id'],
+      # function do_async(string) -> string async
+      [0x69e7cd703d16eb85, 0xb13cb8d39e702c79, 'kitchen.do_async'],
+      # method describe() -> string
       [0x70865079ce41be82, 0xbe3b69464672af46, 'kitchen.Gadget.describe'],
-      [0x71c5a1116cb7c49a, 0xcba1837108a89b84, 'kitchen.echo_bytes'],
-      [0x735ee1e0049ee91a, 0xca74320bc53eddab, 'kitchen.echo_string'],
-      [0x76d7fc58f4e41d84, 0x7373a0e47d30e690, 'kitchen.i64_id'],
+      # function echo_bytes(bytes) -> bytes
+      [0x71c5a1116cb7c49a, 0x1506cfe6f548fac4, 'kitchen.echo_bytes'],
+      # function echo_string(string) -> string
+      [0x735ee1e0049ee91a, 0xa713dbd1be707752, 'kitchen.echo_string'],
+      # function i64_id(i64) -> i64
+      [0x76d7fc58f4e41d84, 0x6bdb4ccea2841d5e, 'kitchen.i64_id'],
+      # function stream_maybe() -> iter<i32?>
+      [0x78d91fd617e162b8, 0xd88e2753503b36df, 'kitchen.stream_maybe'],
+      # function hello() -> string
       [0x79abfe1aa960fd6a, 0xbca7a9e5eb26f3a6, 'kitchen.nested.hello'],
+      # function mixed_slices([i8], [i16], [u16], [u32], [i64], [f32]) -> [u32]
+      [0x7b3865b536da998c, 0x1c4e79d60a20e74f, 'kitchen.mixed_slices'],
+      # code InvalidInput = 2
+      [0x7ba266dc26a58989, 0x0f86001cac0c21e8, 'kitchen.KitchenErrors.InvalidInput'],
+      # function new_op() -> i32
       [0x7d3dd7d5cf6749e3, 0xa192f5a7298adb39, 'kitchen.new_op'],
-      [0x89a5e664bc25c67b, 0x5764a95e81ecfd31, 'kitchen.f64_id'],
+      # function scale_i32([i32], i32) -> [i32]
+      [0x81ded69adee0abf2, 0x8c71141a931906f6, 'kitchen.scale_i32'],
+      # callback_method label() -> string throws KitchenErrors
+      [0x81fa72769330fed6, 0x2096511ca5c9d8d3, 'kitchen.ReadyListener.label'],
+      # function f64_id(f64) -> f64
+      [0x89a5e664bc25c67b, 0x357fd9b65ad879a9, 'kitchen.f64_id'],
+      # static version() -> string
       [0x8cfdbdcecac5f7f1, 0x07e272f09c41fffc, 'kitchen.Gadget.version'],
+      # function opt_priority(Priority?) -> Priority?
+      [0x8dc42397e47614b9, 0xcddf6fede09b2e7f, 'kitchen.opt_priority'],
+      # callback_method on_item(Item, Gadget) -> bool
+      [0x92f060ef68961fc1, 0xd948f51645dc11a0, 'kitchen.ReadyListener.on_item'],
+      # function cross_module_token() -> Token
       [0x974b9f3e823c1738, 0xb81b91e975695f27, 'kitchen.cross_module_token'],
+      # function sum_f64([f64]) -> f64
+      [0x9f0f001aa85f97d5, 0x55815247f895bd45, 'kitchen.sum_f64'],
+      # code NotFound = 1
+      [0xab2a29fd1ef5458b, 0x471a34aa4c09ae2b, 'kitchen.KitchenErrors.NotFound'],
+      # function list_items() -> [Item]
       [0xaca0655fac15d230, 0x11c4d2b28abe07bb, 'kitchen.list_items'],
+      # errors PantryError
+      [0xb57c8e6ae3fb4383, 0x3f857851ab75366c, 'kitchen.PantryError'],
+      # function opt_mixed(f64, f32?, i64?, string?) -> u16?
+      [0xbdc795b195edd428, 0x36127462f8b0969f, 'kitchen.opt_mixed'],
+      # callback_method on_ready(i32, string) -> void
+      [0xbe4821ab3c340e71, 0x17fad5418abe0f50, 'kitchen.ReadyListener.on_ready'],
+      # function opt_i32_id(i32?) -> i32?
+      [0xc2ad53f2a6a36323, 0x071e29abee823f17, 'kitchen.opt_i32_id'],
+      # function parse_any(string) -> i64 throws any
+      [0xc7ab409554fd3d7b, 0xfea12b6bc219fc46, 'kitchen.parse_any'],
+      # function sample_with(Sampler, u32?) -> [i16] throws PantryError
+      [0xc82a7f2d85f99f4e, 0xa9bcb8bacedb036c, 'kitchen.sample_with'],
+      # function legacy_op() -> i32
       [0xc883b4afae20543e, 0xc40560e5411ff392, 'kitchen.legacy_op'],
+      # code OutOfStock = 1 {string}
+      [0xd180bf646bff59e2, 0xa4515a6d00d7c600, 'kitchen.PantryError.OutOfStock'],
+      # function opt_bool_id(bool?) -> bool?
+      [0xe6778df0f5c1b82b, 0x38eaafdb350559e1, 'kitchen.opt_bool_id'],
+      # function get_attrs() -> {string:i32}
       [0xf2f7753e6e1dffc2, 0xc9047a95bdf49e93, 'kitchen.get_attrs'],
-      [0xfae25d3391922ead, 0x1c7f95739f3210b8, 'kitchen.subscribe'],
+      # function subscribe(ReadyListener) -> i32
+      [0xfae25d3391922ead, 0xcc034cf506cae182, 'kitchen.subscribe'],
+      # interface Gadget
       [0xfd0059b05cb2fcfb, 0x248bf8404a5823b4, 'kitchen.Gadget'],
-      [0xfed9c551fb9fd2d6, 0x59aec980ef3f3291, 'kitchen.ReadyListener'],
+      # callback ReadyListener
+      [0xfed9c551fb9fd2d6, 0xe1020573f084dc1d, 'kitchen.ReadyListener'],
+      # method readings(u32?) -> [f64] throws any
+      [0xff3a99b52597dee2, 0x14c4ecac97bdfc9b, 'kitchen.Gadget.readings'],
     ],
   )
+
+  # The C functions the wrappers below call (private).
+  module Native
+    # shared
+    attach_function :kitchen_sink_shared_ping, [:pointer, :pointer], :pointer, blocking: true
+
+    # kitchen
+    attach_function :kitchen_sink_kitchen_Gadget_clone, [:pointer], :pointer
+    attach_function :kitchen_sink_kitchen_Gadget_destroy, [:pointer], :void
+    attach_function :kitchen_sink_kitchen_Gadget_new, [:int64, :pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_Gadget_describe, [:pointer, :pointer, :pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_Gadget_poke, [:pointer, :int32, :pointer], :int32, blocking: true
+    attach_function :kitchen_sink_kitchen_Gadget_readings, [:pointer, :bool, :uint32, :pointer, :pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_Gadget_version, [:pointer, :pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_bool_id, [:bool, :pointer], :bool, blocking: true
+    attach_function :kitchen_sink_kitchen_i32_id, [:int32, :pointer], :int32, blocking: true
+    attach_function :kitchen_sink_kitchen_u32_id, [:uint32, :pointer], :uint32, blocking: true
+    attach_function :kitchen_sink_kitchen_i64_id, [:int64, :pointer], :int64, blocking: true
+    attach_function :kitchen_sink_kitchen_f64_id, [:double, :pointer], :double, blocking: true
+    attach_function :kitchen_sink_kitchen_echo_string, [:pointer, :size_t, :pointer, :pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_echo_bytes, [:pointer, :size_t, :pointer, :pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_subscribe, [:pointer, :pointer, :pointer], :int32, blocking: true
+    attach_function :kitchen_sink_kitchen_maybe_subscribe, [:pointer, :pointer, :pointer], :bool, blocking: true
+    attach_function :kitchen_sink_kitchen_maybe_gadget, [:pointer, :pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_gadgets, [:pointer, :pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_stream_gadgets, [:pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_StreamGadgetsIterator_next, [:pointer, :pointer, :pointer], :int32, blocking: true
+    attach_function :kitchen_sink_kitchen_StreamGadgetsIterator_destroy, [:pointer], :void
+    attach_function :kitchen_sink_kitchen_maybe_item, [:int64, :pointer, :pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_list_items, [:pointer, :pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_get_attrs, [:pointer, :pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_stream_items, [:pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_StreamItemsIterator_next, [:pointer, :pointer, :pointer, :pointer], :int32, blocking: true
+    attach_function :kitchen_sink_kitchen_StreamItemsIterator_destroy, [:pointer], :void
+    attach_function :kitchen_sink_kitchen_cross_module_token, [:pointer, :pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_do_async, [:pointer, :size_t, :pointer, :pointer], :void, blocking: true
+    attach_function :kitchen_sink_kitchen_do_cancellable, [:pointer, :size_t, :pointer, :pointer, :pointer], :void, blocking: true
+    attach_function :kitchen_sink_kitchen_legacy_op, [:pointer], :int32, blocking: true
+    attach_function :kitchen_sink_kitchen_new_op, [:pointer], :int32, blocking: true
+    attach_function :kitchen_sink_kitchen_opt_i32_id, [:bool, :int32, :pointer, :pointer], :bool, blocking: true
+    attach_function :kitchen_sink_kitchen_opt_bool_id, [:bool, :bool, :pointer, :pointer], :bool, blocking: true
+    attach_function :kitchen_sink_kitchen_opt_priority, [:bool, :int32, :pointer, :pointer], :bool, blocking: true
+    attach_function :kitchen_sink_kitchen_opt_mixed, [:double, :bool, :float, :bool, :int64, :pointer, :size_t, :pointer, :pointer], :bool, blocking: true
+    attach_function :kitchen_sink_kitchen_sum_f64, [:pointer, :size_t, :pointer], :double, blocking: true
+    attach_function :kitchen_sink_kitchen_scale_i32, [:pointer, :size_t, :int32, :pointer, :pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_ids_u64, [:pointer, :size_t, :pointer, :pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_mixed_slices, [:pointer, :size_t, :pointer, :size_t, :pointer, :size_t, :pointer, :size_t, :pointer, :size_t, :pointer, :size_t, :pointer, :pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_async_maybe_count, [:pointer, :pointer], :void, blocking: true
+    attach_function :kitchen_sink_kitchen_async_samples, [:uint32, :pointer, :pointer, :pointer], :void, blocking: true
+    attach_function :kitchen_sink_kitchen_stream_maybe, [:pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_StreamMaybeIterator_next, [:pointer, :pointer, :pointer, :pointer], :int32, blocking: true
+    attach_function :kitchen_sink_kitchen_StreamMaybeIterator_destroy, [:pointer], :void
+    attach_function :kitchen_sink_kitchen_stream_chunks, [:pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_StreamChunksIterator_next, [:pointer, :pointer, :pointer, :pointer], :int32, blocking: true
+    attach_function :kitchen_sink_kitchen_StreamChunksIterator_destroy, [:pointer], :void
+    attach_function :kitchen_sink_kitchen_sample_with, [:pointer, :pointer, :bool, :uint32, :pointer, :pointer], :pointer, blocking: true
+    attach_function :kitchen_sink_kitchen_take_from_pantry, [:pointer, :size_t, :pointer], :int32, blocking: true
+    attach_function :kitchen_sink_kitchen_parse_any, [:pointer, :size_t, :pointer], :int64, blocking: true
+
+    # kitchen.nested
+    attach_function :kitchen_sink_kitchen_nested_hello, [:pointer, :pointer], :pointer, blocking: true
+  end
 
   # === Module: shared ===
 
   # A reusable token referenced across modules
-  class Token
-    attr_reader :id
-
-    attr_reader :label
-
-    def initialize(id:, label:)
-      @id = id
-      @label = label
-    end
-
-    # Structural equality over every field.
-    def ==(other)
-      other.is_a?(Token) &&
-        id == other.id &&
-        label == other.label
-    end
-  end
-
-  # @api private
-  # Packs a Token into the value-buffer wire format.
-  def self._wv_write_token(w, v)
-    w.write_i64(v.id)
-    w.write_string(v.label)
-  end
-
-  # @api private
-  # Unpacks a Token from the value-buffer wire format.
-  def self._wv_read_token(r)
-    Token.new(id: r.read_i64, label: r.read_string)
-  end
-
-  attach_function :kitchen_sink_shared_ping, [:pointer, :pointer], :pointer, blocking: true
+  #
+  # @!attribute [r] id
+  #   @return [Integer]
+  # @!attribute [r] label
+  #   @return [String]
+  Token = Data.define(:id, :label)
 
   # Trivial cross-module helper
+  #
   # @return [String]
   def self.ping
-    err = ErrorStruct.new
-    out_len = FFI::MemoryPointer.new(:size_t)
-    result = kitchen_sink_shared_ping(out_len, err)
-    _wv_check!(err)
-    _wv_take_string(result, out_len.read(:size_t))
+    Bridge.call(nil, :string) do |out_len, out_err|
+      Native.kitchen_sink_shared_ping(out_len, out_err)
+    end
   end
 
   # === Module: kitchen ===
 
-  # Base error for the `kitchen` module's error domain.
-  class KitchenErrorsError < Error
+  # The `KitchenErrors` error domain of the `kitchen` module. A code these
+  # bindings don't know (from a newer library) raises this class itself, with
+  # its code and message.
+  class KitchenError < Error
     # Item not found
-    class NotFound < KitchenErrorsError
+    class NotFound < KitchenError
       CODE = 1
-
-      def initialize(message = nil)
-        super(CODE, message || 'Item not found')
-      end
+      MESSAGE = 'Item not found'
     end
 
     # Invalid input
-    class InvalidInput < KitchenErrorsError
+    class InvalidInput < KitchenError
       CODE = 2
-
-      def initialize(message = nil)
-        super(CODE, message || 'Invalid input')
-      end
+      MESSAGE = 'Invalid input'
     end
   end
 
-  # @api private
-  # The KitchenErrorsError for a domain `code`, with its payload fields decoded;
-  # the root Error (or Cancelled) for any other code.
-  def self._wv_kitchen_errors_error_from(code, message, payload = nil)
-    message = nil if message.empty?
-    r = WvBufferReader.new(payload)
-    error =
-      case code
-      when 1
-        KitchenErrorsError::NotFound.new(message)
-      when 2
-        KitchenErrorsError::InvalidInput.new(message)
-      else
-        return _wv_error(code, message.to_s)
-      end
-    r.expect_end!
-    error
-  end
+  # The `PantryError` error domain of the `kitchen` module. A code these
+  # bindings don't know (from a newer library) raises this class itself, with
+  # its code and message.
+  class PantryError < Error
+    # Out of stock
+    class OutOfStock < PantryError
+      CODE = 1
+      MESSAGE = 'Out of stock'
 
-  # @api private
-  # Raises the KitchenErrorsError for a non-zero error slot.
-  def self._wv_check_kitchen_errors_error!(err)
-    taken = _wv_take_error(err)
-    raise _wv_kitchen_errors_error_from(*taken) unless taken.nil?
-  end
+      # @return [String]
+      attr_reader :item
+    end
 
-  # @api private
-  # The code and value-buffer payload of a KitchenErrorsError a callback
-  # implementation raised, or nil for an error of no declared code.
-  def self._wv_kitchen_errors_error_payload(error)
-    w = WvBufferWriter.new
-    code =
-      case error
-      when KitchenErrorsError::NotFound then 1
-      when KitchenErrorsError::InvalidInput then 2
-      end
-    code && [code, w.bytes]
+    # Spoiled
+    class Spoiled < PantryError
+      CODE = 2
+      MESSAGE = 'Spoiled'
+    end
   end
 
   # Task priority levels
@@ -173,757 +278,763 @@ module KitchenSink
   end
 
   # Kitchen sink struct exercising every field feature
-  class Item
-    # Stable identifier
-    attr_reader :id
-
-    # Display name
-    attr_reader :name
-
-    # Initial count
-    attr_reader :count
-
-    # Whether the item is enabled
-    attr_reader :enabled
-
-    # Scaling ratio
-    attr_reader :ratio
-
-    attr_reader :nick
-
-    attr_reader :payload
-
-    attr_reader :tags
-
-    attr_reader :attrs
-
-    attr_reader :parent
-
-    # Cross-module struct reference
-    attr_reader :token
-
-    attr_reader :priority
-
-    # An optional object inside a record
-    attr_reader :gadget
-
-    def initialize(
-      id:,
-      name:,
-      count:,
-      enabled:,
-      ratio:,
-      nick:,
-      payload:,
-      tags:,
-      attrs:,
-      parent:,
-      token:,
-      priority:,
-      gadget:
-    )
-      @id = id
-      @name = name
-      @count = count
-      @enabled = enabled
-      @ratio = ratio
-      @nick = nick
-      @payload = payload
-      @tags = tags
-      @attrs = attrs
-      @parent = parent
-      @token = token
-      @priority = priority
-      @gadget = gadget
-    end
-
-    # Structural equality over every field.
-    def ==(other)
-      other.is_a?(Item) &&
-        id == other.id &&
-        name == other.name &&
-        count == other.count &&
-        enabled == other.enabled &&
-        ratio == other.ratio &&
-        nick == other.nick &&
-        payload == other.payload &&
-        tags == other.tags &&
-        attrs == other.attrs &&
-        parent == other.parent &&
-        token == other.token &&
-        priority == other.priority &&
-        gadget == other.gadget
-    end
-  end
-
-  # @api private
-  # Packs an Item into the value-buffer wire format.
-  def self._wv_write_item(w, v)
-    w.write_i64(v.id)
-    w.write_string(v.name)
-    w.write_i32(v.count)
-    w.write_bool(v.enabled)
-    w.write_f64(v.ratio)
-    w.write_u32(v.nick)
-    w.write_bytes(v.payload)
-    _wv_write_list_string(w, v.tags)
-    _wv_write_map_string_string(w, v.attrs)
-    _wv_write_opt_i64(w, v.parent)
-    _wv_write_token(w, v.token)
-    w.write_i32(v.priority)
-    _wv_write_opt_gadget(w, v.gadget)
-  end
-
-  # @api private
-  # Unpacks an Item from the value-buffer wire format.
-  def self._wv_read_item(r)
-    Item.new(
-      id: r.read_i64,
-      name: r.read_string,
-      count: r.read_i32,
-      enabled: r.read_bool,
-      ratio: r.read_f64,
-      nick: r.read_u32,
-      payload: r.read_bytes,
-      tags: _wv_read_list_string(r),
-      attrs: _wv_read_map_string_string(r),
-      parent: _wv_read_opt_i64(r),
-      token: _wv_read_token(r),
-      priority: r.read_i32,
-      gadget: _wv_read_opt_gadget(r),
-    )
-  end
-
-  attach_function :kitchen_sink_kitchen_Gadget_clone, [:pointer], :pointer
-  attach_function :kitchen_sink_kitchen_Gadget_destroy, [:pointer], :void
-  attach_function :kitchen_sink_kitchen_Gadget_new, [:int64, :pointer], :pointer, blocking: true
-  attach_function :kitchen_sink_kitchen_Gadget_describe, [:pointer, :pointer, :pointer], :pointer, blocking: true
-  attach_function :kitchen_sink_kitchen_Gadget_poke, [:pointer, :int32, :pointer], :int32, blocking: true
-  attach_function :kitchen_sink_kitchen_Gadget_version, [:pointer, :pointer], :pointer, blocking: true
-  attach_function :kitchen_sink_kitchen_bool_id, [:bool, :pointer], :bool, blocking: true
-  attach_function :kitchen_sink_kitchen_i32_id, [:int32, :pointer], :int32, blocking: true
-  attach_function :kitchen_sink_kitchen_u32_id, [:uint32, :pointer], :uint32, blocking: true
-  attach_function :kitchen_sink_kitchen_i64_id, [:int64, :pointer], :int64, blocking: true
-  attach_function :kitchen_sink_kitchen_f64_id, [:double, :pointer], :double, blocking: true
-  attach_function :kitchen_sink_kitchen_echo_string, [:pointer, :size_t, :pointer, :pointer], :pointer, blocking: true
-  attach_function :kitchen_sink_kitchen_echo_bytes, [:pointer, :size_t, :pointer, :pointer], :pointer, blocking: true
-  attach_function :kitchen_sink_kitchen_subscribe, [:pointer, :pointer, :pointer], :int32, blocking: true
-  attach_function :kitchen_sink_kitchen_maybe_subscribe, [:pointer, :pointer, :pointer], :bool, blocking: true
-  attach_function :kitchen_sink_kitchen_maybe_gadget, [:pointer, :pointer], :pointer, blocking: true
-  attach_function :kitchen_sink_kitchen_gadgets, [:pointer, :pointer], :pointer, blocking: true
-  attach_function :kitchen_sink_kitchen_stream_gadgets, [:pointer], :pointer, blocking: true
-  attach_function :kitchen_sink_kitchen_StreamGadgetsIterator_next, [:pointer, :pointer, :pointer], :int32, blocking: true
-  attach_function :kitchen_sink_kitchen_StreamGadgetsIterator_destroy, [:pointer], :void
-  attach_function :kitchen_sink_kitchen_maybe_item, [:int64, :pointer, :pointer], :pointer, blocking: true
-  attach_function :kitchen_sink_kitchen_list_items, [:pointer, :pointer], :pointer, blocking: true
-  attach_function :kitchen_sink_kitchen_get_attrs, [:pointer, :pointer], :pointer, blocking: true
-  attach_function :kitchen_sink_kitchen_stream_items, [:pointer], :pointer, blocking: true
-  attach_function :kitchen_sink_kitchen_StreamItemsIterator_next, [:pointer, :pointer, :pointer, :pointer], :int32, blocking: true
-  attach_function :kitchen_sink_kitchen_StreamItemsIterator_destroy, [:pointer], :void
-  attach_function :kitchen_sink_kitchen_cross_module_token, [:pointer, :pointer], :pointer, blocking: true
-  attach_function :kitchen_sink_kitchen_do_async, [:pointer, :size_t, :pointer, :pointer], :void, blocking: true
-  attach_function :kitchen_sink_kitchen_do_cancellable, [:pointer, :size_t, :pointer, :pointer, :pointer], :void, blocking: true
-  attach_function :kitchen_sink_kitchen_legacy_op, [:pointer], :int32, blocking: true
-  attach_function :kitchen_sink_kitchen_new_op, [:pointer], :int32, blocking: true
-
-  # @api private
-  # Completion trampoline for do_async.
-  KITCHEN_SINK_KITCHEN_DO_ASYNC_CALLBACK = FFI::Function.new(:void, [:pointer, :pointer, :pointer, :size_t]) do |ctx, err, result_ptr, result_len|
-    queue = _wv_async_finish(ctx)
-    begin
-      taken = _wv_take_boxed_error(err)
-      if taken
-        queue << _wv_trap(*taken)
-      else
-        value = _wv_take_string(result_ptr, result_len)
-        queue << value
-      end
-    rescue Exception => e # rubocop:disable Lint/RescueException
-      queue << e
-    end
-  end
-
-  # @api private
-  # Completion trampoline for do_cancellable.
-  KITCHEN_SINK_KITCHEN_DO_CANCELLABLE_CALLBACK = FFI::Function.new(:void, [:pointer, :pointer, :pointer, :size_t]) do |ctx, err, result_ptr, result_len|
-    queue = _wv_async_finish(ctx)
-    begin
-      taken = _wv_take_boxed_error(err)
-      if taken
-        queue << _wv_trap(*taken)
-      else
-        value = _wv_take_string(result_ptr, result_len)
-        queue << value
-      end
-    rescue Exception => e # rubocop:disable Lint/RescueException
-      queue << e
-    end
-  end
+  #
+  # @!attribute [r] id
+  #   @return [Integer] Stable identifier
+  # @!attribute [r] name
+  #   @return [String] Display name
+  # @!attribute [r] count
+  #   @return [Integer] Initial count
+  # @!attribute [r] enabled
+  #   @return [Boolean] Whether the item is enabled
+  # @!attribute [r] ratio
+  #   @return [Float] Scaling ratio
+  # @!attribute [r] nick
+  #   @return [Integer]
+  # @!attribute [r] payload
+  #   @return [String]
+  # @!attribute [r] tags
+  #   @return [Array<String>]
+  # @!attribute [r] attrs
+  #   @return [Hash{String => String}]
+  # @!attribute [r] parent
+  #   @return [Integer, nil]
+  # @!attribute [r] token
+  #   @return [Token] Cross-module struct reference
+  # @!attribute [r] priority
+  #   @return [Integer]
+  # @!attribute [r] gadget
+  #   @return [Gadget, nil] An optional object inside a record
+  Item = Data.define(
+    :id,
+    :name,
+    :count,
+    :enabled,
+    :ratio,
+    :nick,
+    :payload,
+    :tags,
+    :attrs,
+    :parent,
+    :token,
+    :priority,
+    :gadget,
+  )
 
   # Consumer-implemented observer of ready items
   #
-  # Consumer-implemented callback interface. Any object responding to the
-  # methods below is accepted wherever a ReadyListener is expected; include
-  # this module to inherit NotImplementedError defaults. The library
-  # may call the methods from any thread until it releases the
-  # implementation.
+  # A callback interface: pass any object that responds to the methods below
+  # wherever a ReadyListener is expected. Including this module documents the
+  # intent and supplies NotImplementedError defaults. The library may call the
+  # methods from any thread until it releases the implementation.
   module ReadyListener
     # Fires when an item is ready
+    #
+    # @param code [Integer]
+    # @param msg [String]
+    # @return [void]
     def on_ready(code, msg)
       raise NotImplementedError, "#{self.class}#on_ready is not implemented"
     end
 
     # Receives the item itself and says whether to keep listening
+    #
+    # @param item [Item]
+    # @param gadget [Gadget]
     # @return [Boolean]
     def on_item(item, gadget)
       raise NotImplementedError, "#{self.class}#on_item is not implemented"
     end
 
     # A display label, failing with a kitchen error
+    #
     # @return [String]
-    # @raise [KitchenErrorsError] reported to the library with its code and fields
+    # @raise [KitchenError] reported to the library with its code and fields
     def label
       raise NotImplementedError, "#{self.class}#label is not implemented"
     end
 
     # The most recent item the listener kept, if any
+    #
     # @return [Item, nil]
     def latest
       raise NotImplementedError, "#{self.class}#latest is not implemented"
     end
 
     # The listener's favorite gadget
+    #
     # @return [Gadget]
     def favorite
       raise NotImplementedError, "#{self.class}#favorite is not implemented"
     end
   end
 
-  # @api private
-  # The C vtable layout the library calls a ReadyListener through.
-  class WvReadyListenerVtable < FFI::Struct
-    layout :wv_size, :uint32,
-           :wv_flags, :uint32,
-           :wv_free, :pointer,
-           :on_ready, :pointer,
-           :on_item, :pointer,
-           :label, :pointer,
-           :latest, :pointer,
-           :favorite, :pointer
-  end
+  # Consumer-implemented source of scalar samples
+  #
+  # A callback interface: pass any object that responds to the methods below
+  # wherever a Sampler is expected. Including this module documents the intent
+  # and supplies NotImplementedError defaults. The library may call the
+  # methods from any thread until it releases the implementation.
+  module Sampler
+    # The cutoff for a level, if the sampler has one
+    #
+    # @param level [Integer, nil]
+    # @return [Float, nil]
+    def threshold(level)
+      raise NotImplementedError, "#{self.class}#threshold is not implemented"
+    end
 
-  # @api private
-  # Releases a ReadyListener implementation when the library drops its last
-  # reference. May run on any library thread.
-  WV_READY_LISTENER_FREE = FFI::Function.new(:void, [:pointer]) do |ctx|
-    _wv_cb_free(ctx)
-  end
+    # Up to `limit` samples, failing when the pantry is empty
+    #
+    # @param limit [Integer, nil]
+    # @param weights [Array<Float>]
+    # @return [Array<Integer>]
+    # @raise [PantryError] reported to the library with its code and fields
+    def samples(limit, weights)
+      raise NotImplementedError, "#{self.class}#samples is not implemented"
+    end
 
-  # @api private
-  # Trampoline for ReadyListener#on_ready.
-  WV_READY_LISTENER_ON_READY = FFI::Function.new(:void, [:pointer, :int32, :pointer, :size_t, :pointer]) do |wv_ctx, code, msg_ptr, msg_len, wv_err|
-    msg = _wv_borrow_string(msg_ptr, msg_len)
-    _wv_cb_lookup(wv_ctx).on_ready(code, msg)
-    nil
-  rescue Exception => e # rubocop:disable Lint/RescueException
-    _wv_cb_fail(wv_err, e)
-    nil
-  end
-
-  # @api private
-  # Trampoline for ReadyListener#on_item.
-  WV_READY_LISTENER_ON_ITEM = FFI::Function.new(:bool, [:pointer, :pointer, :size_t, :pointer, :pointer]) do |wv_ctx, item_ptr, item_len, gadget_ptr, wv_err|
-    gadget = Gadget._from_ptr(gadget_ptr)
-    item = _wv_decode_borrowed(item_ptr, item_len) { |r| _wv_read_item(r) }
-    _wv_cb_lookup(wv_ctx).on_item(item, gadget) ? true : false
-  rescue Exception => e # rubocop:disable Lint/RescueException
-    _wv_cb_fail(wv_err, e)
-    false
-  end
-
-  # @api private
-  # Trampoline for ReadyListener#label.
-  WV_READY_LISTENER_LABEL = FFI::Function.new(:void, [:pointer, :pointer, :pointer, :pointer]) do |wv_ctx, wv_out_ptr, wv_out_len, wv_err|
-    _wv_cb_return_bytes(wv_out_ptr, wv_out_len, _wv_str(_wv_cb_lookup(wv_ctx).label))
-  rescue KitchenErrorsError => e
-    _wv_cb_throw(wv_err, e) { _wv_kitchen_errors_error_payload(e) }
-    nil
-  rescue Exception => e # rubocop:disable Lint/RescueException
-    _wv_cb_fail(wv_err, e)
-    nil
-  end
-
-  # @api private
-  # Trampoline for ReadyListener#latest.
-  WV_READY_LISTENER_LATEST = FFI::Function.new(:void, [:pointer, :pointer, :pointer, :pointer]) do |wv_ctx, wv_out_ptr, wv_out_len, wv_err|
-    result = _wv_cb_lookup(wv_ctx).latest
-    writer = WvBufferWriter.new
-    _wv_write_opt_item(writer, result)
-    _wv_cb_return_bytes(wv_out_ptr, wv_out_len, _wv_seal(writer).first)
-  rescue Exception => e # rubocop:disable Lint/RescueException
-    _wv_cb_fail(wv_err, e)
-    nil
-  end
-
-  # @api private
-  # Trampoline for ReadyListener#favorite.
-  WV_READY_LISTENER_FAVORITE = FFI::Function.new(:pointer, [:pointer, :pointer]) do |wv_ctx, wv_err|
-    _wv_cb_return_object(_wv_cb_lookup(wv_ctx).favorite, Gadget)
-  rescue Exception => e # rubocop:disable Lint/RescueException
-    _wv_cb_fail(wv_err, e)
-    FFI::Pointer::NULL
-  end
-
-  # The one process-wide ReadyListener vtable every registration hands the
-  # library; its entries live for the process lifetime.
-  WV_READY_LISTENER_VTABLE = WvReadyListenerVtable.new
-  WV_READY_LISTENER_VTABLE[:wv_size] = WvReadyListenerVtable.size
-  WV_READY_LISTENER_VTABLE[:wv_flags] = 0
-  WV_READY_LISTENER_VTABLE[:wv_free] = WV_READY_LISTENER_FREE
-  WV_READY_LISTENER_VTABLE[:on_ready] = WV_READY_LISTENER_ON_READY
-  WV_READY_LISTENER_VTABLE[:on_item] = WV_READY_LISTENER_ON_ITEM
-  WV_READY_LISTENER_VTABLE[:label] = WV_READY_LISTENER_LABEL
-  WV_READY_LISTENER_VTABLE[:latest] = WV_READY_LISTENER_LATEST
-  WV_READY_LISTENER_VTABLE[:favorite] = WV_READY_LISTENER_FAVORITE
-
-  # @api private
-  # Owns one strong reference to a Gadget; releases it exactly once.
-  class GadgetPtr < FFI::AutoPointer
-    def self.release(ptr)
-      KitchenSink.kitchen_sink_kitchen_Gadget_destroy(ptr)
+    # A free-form description, failing with an untyped error
+    #
+    # @return [String]
+    # @raise [StandardError] reported to the library with its message
+    def describe
+      raise NotImplementedError, "#{self.class}#describe is not implemented"
     end
   end
 
   # A pocket-sized interface exercising the object surface
-  class Gadget < WvObject
-    WV_PTR = GadgetPtr
-
-    # @api private
-    def self._wv_clone(ptr)
-      KitchenSink.kitchen_sink_kitchen_Gadget_clone(ptr)
-    end
-
+  class Gadget < Bridge::Handle
     # Create a gadget with the given id
+    #
+    # @param id [Integer]
     def initialize(id)
-      err = ErrorStruct.new
-      result = KitchenSink.kitchen_sink_kitchen_Gadget_new(id, err)
-      KitchenSink._wv_check!(err)
-      _wv_init(KitchenSink._wv_nonnull(result))
+      id = Bridge.scalar(id, :i64)
+      ptr = Bridge.call(nil, :pointer) do |out_err|
+        Native.kitchen_sink_kitchen_Gadget_new(id, out_err)
+      end
+      _wv_init(ptr)
     end
 
     # Render the gadget as a human-readable string
+    #
     # @return [String]
     def describe
-      KitchenSink._wv_pin(self) do |_wv_self|
-        err = ErrorStruct.new
-        out_len = FFI::MemoryPointer.new(:size_t)
-        result = KitchenSink.kitchen_sink_kitchen_Gadget_describe(_wv_self, out_len, err)
-        KitchenSink._wv_check!(err)
-        KitchenSink._wv_take_string(result, out_len.read(:size_t))
+      Bridge.pin(self) do |self_|
+        Bridge.call(nil, :string) do |out_len, out_err|
+          Native.kitchen_sink_kitchen_Gadget_describe(self_, out_len, out_err)
+        end
       end
     end
 
     # Poke the gadget a number of times, failing on a negative count
+    #
+    # @param times [Integer]
     # @return [Integer]
+    # @raise [KitchenError] for a domain error
     def poke(times)
-      KitchenSink._wv_pin(self) do |_wv_self|
-        err = ErrorStruct.new
-        result = KitchenSink.kitchen_sink_kitchen_Gadget_poke(_wv_self, times, err)
-        KitchenSink._wv_check_kitchen_errors_error!(err)
-        result
+      times = Bridge.scalar(times, :i32)
+      Bridge.pin(self) do |self_|
+        Bridge.call(KitchenError, :i32) do |out_err|
+          Native.kitchen_sink_kitchen_Gadget_poke(self_, times, out_err)
+        end
+      end
+    end
+
+    # The gadget's sensor readings, optionally limited
+    #
+    # @param limit [Integer, nil]
+    # @return [Array<Float>]
+    # @raise [Error] when the call fails
+    def readings(limit = nil)
+      has_limit, limit = Bridge.opt_arg(limit, :u32)
+      Bridge.pin(self) do |self_|
+        Bridge.call(Error, [:slice, :f64]) do |out_len, out_err|
+          Native.kitchen_sink_kitchen_Gadget_readings(self_, has_limit, limit, out_len, out_err)
+        end
       end
     end
 
     # The gadget subsystem version string
+    #
     # @return [String]
     def self.version
-      err = ErrorStruct.new
-      out_len = FFI::MemoryPointer.new(:size_t)
-      result = KitchenSink.kitchen_sink_kitchen_Gadget_version(out_len, err)
-      KitchenSink._wv_check!(err)
-      KitchenSink._wv_take_string(result, out_len.read(:size_t))
+      Bridge.call(nil, :string) do |out_len, out_err|
+        Native.kitchen_sink_kitchen_Gadget_version(out_len, out_err)
+      end
     end
   end
 
   # Identity for bool
+  #
+  # @param x [Boolean]
   # @return [Boolean]
   def self.bool_id(x)
-    err = ErrorStruct.new
-    result = kitchen_sink_kitchen_bool_id((x ? true : false), err)
-    _wv_check!(err)
-    result
+    Bridge.call(nil, :bool) do |out_err|
+      Native.kitchen_sink_kitchen_bool_id((x ? true : false), out_err)
+    end
   end
 
+  # @param x [Integer]
   # @return [Integer]
   def self.i32_id(x)
-    err = ErrorStruct.new
-    result = kitchen_sink_kitchen_i32_id(x, err)
-    _wv_check!(err)
-    result
+    x = Bridge.scalar(x, :i32)
+    Bridge.call(nil, :i32) do |out_err|
+      Native.kitchen_sink_kitchen_i32_id(x, out_err)
+    end
   end
 
+  # @param x [Integer]
   # @return [Integer]
   def self.u32_id(x)
-    err = ErrorStruct.new
-    result = kitchen_sink_kitchen_u32_id(x, err)
-    _wv_check!(err)
-    result
+    x = Bridge.scalar(x, :u32)
+    Bridge.call(nil, :u32) do |out_err|
+      Native.kitchen_sink_kitchen_u32_id(x, out_err)
+    end
   end
 
+  # @param x [Integer]
   # @return [Integer]
   def self.i64_id(x)
-    err = ErrorStruct.new
-    result = kitchen_sink_kitchen_i64_id(x, err)
-    _wv_check!(err)
-    result
+    x = Bridge.scalar(x, :i64)
+    Bridge.call(nil, :i64) do |out_err|
+      Native.kitchen_sink_kitchen_i64_id(x, out_err)
+    end
   end
 
+  # @param x [Float]
   # @return [Float]
   def self.f64_id(x)
-    err = ErrorStruct.new
-    result = kitchen_sink_kitchen_f64_id(x, err)
-    _wv_check!(err)
-    result
+    Bridge.call(nil, :f64) do |out_err|
+      Native.kitchen_sink_kitchen_f64_id(x, out_err)
+    end
   end
 
+  # @param s [String]
   # @return [String]
   def self.echo_string(s)
-    s_s = _wv_str(s)
-    err = ErrorStruct.new
-    out_len = FFI::MemoryPointer.new(:size_t)
-    result = kitchen_sink_kitchen_echo_string(s_s, s_s.bytesize, out_len, err)
-    _wv_check!(err)
-    _wv_take_string(result, out_len.read(:size_t))
+    s_ptr = Bridge.string_arg(s)
+    Bridge.call(nil, :string) do |out_len, out_err|
+      Native.kitchen_sink_kitchen_echo_string(s_ptr, s_ptr.bytesize, out_len, out_err)
+    end
   end
 
+  # @param b [String]
   # @return [String]
   def self.echo_bytes(b)
-    b_s = _wv_bytes(b)
-    err = ErrorStruct.new
-    out_len = FFI::MemoryPointer.new(:size_t)
-    result = kitchen_sink_kitchen_echo_bytes(b_s, b_s.bytesize, out_len, err)
-    _wv_check!(err)
-    _wv_take_bytes(result, out_len.read(:size_t))
+    b_ptr = Bridge.bytes_arg(b)
+    Bridge.call(nil, :bytes) do |out_len, out_err|
+      Native.kitchen_sink_kitchen_echo_bytes(b_ptr, b_ptr.bytesize, out_len, out_err)
+    end
   end
 
   # Register a listener, returning how many are attached
+  #
+  # @param listener [ReadyListener]
   # @return [Integer]
   def self.subscribe(listener)
-    _wv_present!(listener, 'listener')
-    err = ErrorStruct.new
-    listener_ctx, listener_vtable = _wv_cb_register(listener, WV_READY_LISTENER_VTABLE)
-    result = kitchen_sink_kitchen_subscribe(listener_ctx, listener_vtable, err)
-    _wv_check!(err)
-    result
+    Bridge.present!(listener, 'listener')
+    Bridge.call(nil, :i32) do |out_err|
+      listener_ctx, listener_vtable = Bridge.register(listener, ReadyListener)
+      Native.kitchen_sink_kitchen_subscribe(listener_ctx, listener_vtable, out_err)
+    end
   end
 
   # Register a listener if one is given
+  #
+  # @param listener [ReadyListener, nil]
   # @return [Boolean]
   def self.maybe_subscribe(listener = nil)
-    err = ErrorStruct.new
-    listener_ctx, listener_vtable = _wv_cb_register(listener, WV_READY_LISTENER_VTABLE)
-    result = kitchen_sink_kitchen_maybe_subscribe(listener_ctx, listener_vtable, err)
-    _wv_check!(err)
-    result
+    Bridge.call(nil, :bool) do |out_err|
+      listener_ctx, listener_vtable = Bridge.register(listener, ReadyListener)
+      Native.kitchen_sink_kitchen_maybe_subscribe(listener_ctx, listener_vtable, out_err)
+    end
   end
 
   # Optional object in both directions
+  #
+  # @param fallback [Gadget, nil]
   # @return [Gadget, nil]
   def self.maybe_gadget(fallback = nil)
-    _wv_object!(fallback, Gadget, 'fallback', true)
-    _wv_pin(fallback) do |_wv_fallback|
-      err = ErrorStruct.new
-      result = kitchen_sink_kitchen_maybe_gadget(_wv_fallback, err)
-      _wv_check!(err)
-      result.null? ? nil : Gadget._from_ptr(result)
+    Bridge.check_object(fallback, Gadget, 'fallback', nullable: true)
+    Bridge.pin(fallback) do |fallback|
+      Bridge.call(nil, [:object?, Gadget]) do |out_err|
+        Native.kitchen_sink_kitchen_maybe_gadget(fallback, out_err)
+      end
     end
   end
 
   # A list of objects
+  #
   # @return [Array<Gadget>]
   def self.gadgets
-    err = ErrorStruct.new
-    out_len = FFI::MemoryPointer.new(:size_t)
-    result = kitchen_sink_kitchen_gadgets(out_len, err)
-    _wv_check!(err)
-    _wv_decode(result, out_len.read(:size_t)) { |r| _wv_read_list_gadget(r) }
+    Bridge.call(nil, [:buffer, [:list, Gadget]]) do |out_len, out_err|
+      Native.kitchen_sink_kitchen_gadgets(out_len, out_err)
+    end
   end
 
   # An iterator over objects
-  # Returns a lazy Enumerator that pulls one element per step. The
-  # producer iterator starts on the first pull and is released when
-  # iteration finishes or is abandoned early.
+  #
+  # Returns a lazy Enumerator: each enumeration starts its own native iterator
+  # on the first pull and releases it when iteration finishes or stops early.
+  #
   # @return [Enumerator<Gadget>]
   def self.stream_gadgets
-    Enumerator.new do |y|
-      err = ErrorStruct.new
-      iter = kitchen_sink_kitchen_stream_gadgets(err)
-      begin
-        _wv_check!(err)
-        out_item = FFI::MemoryPointer.new(:pointer)
-        loop do
-          has_item = kitchen_sink_kitchen_StreamGadgetsIterator_next(iter, out_item, err)
-          _wv_check!(err)
-          break if has_item.zero?
-          item = out_item.read_pointer
-          value = Gadget._from_ptr(_wv_nonnull(item))
-          y << value
-        end
-      ensure
-        kitchen_sink_kitchen_StreamGadgetsIterator_destroy(iter) unless iter.null?
-      end
+    Bridge.iterate(
+      nil,
+      [:object, Gadget],
+      :kitchen_sink_kitchen_StreamGadgetsIterator_next,
+      :kitchen_sink_kitchen_StreamGadgetsIterator_destroy,
+    ) do |out_err|
+      Native.kitchen_sink_kitchen_stream_gadgets(out_err)
     end
   end
 
   # Optional struct return
+  #
+  # @param id [Integer]
   # @return [Item, nil]
+  # @raise [KitchenError] for a domain error
   def self.maybe_item(id)
-    err = ErrorStruct.new
-    out_len = FFI::MemoryPointer.new(:size_t)
-    result = kitchen_sink_kitchen_maybe_item(id, out_len, err)
-    _wv_check_kitchen_errors_error!(err)
-    _wv_decode(result, out_len.read(:size_t)) { |r| _wv_read_opt_item(r) }
+    id = Bridge.scalar(id, :i64)
+    Bridge.call(KitchenError, [:buffer, [:opt, Item]]) do |out_len, out_err|
+      Native.kitchen_sink_kitchen_maybe_item(id, out_len, out_err)
+    end
   end
 
   # List of structs
+  #
   # @return [Array<Item>]
   def self.list_items
-    err = ErrorStruct.new
-    out_len = FFI::MemoryPointer.new(:size_t)
-    result = kitchen_sink_kitchen_list_items(out_len, err)
-    _wv_check!(err)
-    _wv_decode(result, out_len.read(:size_t)) { |r| _wv_read_list_item(r) }
+    Bridge.call(nil, [:buffer, [:list, Item]]) do |out_len, out_err|
+      Native.kitchen_sink_kitchen_list_items(out_len, out_err)
+    end
   end
 
   # Map return type
+  #
   # @return [Hash{String => Integer}]
   def self.get_attrs
-    err = ErrorStruct.new
-    out_len = FFI::MemoryPointer.new(:size_t)
-    result = kitchen_sink_kitchen_get_attrs(out_len, err)
-    _wv_check!(err)
-    _wv_decode(result, out_len.read(:size_t)) { |r| _wv_read_map_string_i32(r) }
+    Bridge.call(nil, [:buffer, [:map, :string, :i32]]) do |out_len, out_err|
+      Native.kitchen_sink_kitchen_get_attrs(out_len, out_err)
+    end
   end
 
   # Iterator return type
-  # Returns a lazy Enumerator that pulls one element per step. The
-  # producer iterator starts on the first pull and is released when
-  # iteration finishes or is abandoned early.
+  #
+  # Returns a lazy Enumerator: each enumeration starts its own native iterator
+  # on the first pull and releases it when iteration finishes or stops early.
+  #
   # @return [Enumerator<Item>]
   def self.stream_items
-    Enumerator.new do |y|
-      err = ErrorStruct.new
-      iter = kitchen_sink_kitchen_stream_items(err)
-      begin
-        _wv_check!(err)
-        out_item = FFI::MemoryPointer.new(:pointer)
-        out_len = FFI::MemoryPointer.new(:size_t)
-        loop do
-          has_item = kitchen_sink_kitchen_StreamItemsIterator_next(iter, out_item, out_len, err)
-          _wv_check!(err)
-          break if has_item.zero?
-          item = out_item.read_pointer
-          value = _wv_decode(item, out_len.read(:size_t)) { |r| _wv_read_item(r) }
-          y << value
-        end
-      ensure
-        kitchen_sink_kitchen_StreamItemsIterator_destroy(iter) unless iter.null?
-      end
+    Bridge.iterate(
+      nil,
+      [:buffer, Item],
+      :kitchen_sink_kitchen_StreamItemsIterator_next,
+      :kitchen_sink_kitchen_StreamItemsIterator_destroy,
+    ) do |out_err|
+      Native.kitchen_sink_kitchen_stream_items(out_err)
     end
   end
 
   # Returns the shared Token type from another module
+  #
   # @return [Token]
   def self.cross_module_token
-    err = ErrorStruct.new
-    out_len = FFI::MemoryPointer.new(:size_t)
-    result = kitchen_sink_kitchen_cross_module_token(out_len, err)
-    _wv_check!(err)
-    _wv_decode(result, out_len.read(:size_t)) { |r| _wv_read_token(r) }
+    Bridge.call(nil, [:buffer, Token]) do |out_len, out_err|
+      Native.kitchen_sink_kitchen_cross_module_token(out_len, out_err)
+    end
   end
 
   # Async operation
-  # Blocks until the call completes on a producer thread.
+  #
+  # Blocks until the call completes on a library thread (under a Fiber
+  # scheduler, only the calling Fiber waits).
+  #
+  # @param input [String]
   # @return [String]
   def self.do_async(input)
-    input_s = _wv_str(input)
-    ctx, queue = _wv_async_begin
-    kitchen_sink_kitchen_do_async(input_s, input_s.bytesize, KITCHEN_SINK_KITCHEN_DO_ASYNC_CALLBACK, ctx)
-    _wv_async_wait(queue)
+    input_ptr = Bridge.string_arg(input)
+    Bridge.await(nil, :string) do |callback, context|
+      Native.kitchen_sink_kitchen_do_async(input_ptr, input_ptr.bytesize, callback, context)
+    end
   end
 
   # Cancellable async operation
-  # Blocks until the call completes on a producer thread.
-  # @param cancel [CancelToken, nil] cancels the call; it then raises Cancelled
+  #
+  # Blocks until the call completes on a library thread (under a Fiber
+  # scheduler, only the calling Fiber waits).
+  #
+  # @param input [String]
+  # @param cancel [CancelToken, nil] cancels the call, which then raises Cancelled
   # @return [String]
+  # @raise [Cancelled] when `cancel` fires first
   def self.do_cancellable(input, cancel: nil)
-    input_s = _wv_str(input)
-    own_token = CancelToken.new if cancel.nil?
-    token = cancel || own_token
-    ctx, queue = _wv_async_begin
-    kitchen_sink_kitchen_do_cancellable(input_s, input_s.bytesize, token._wv_ptr, KITCHEN_SINK_KITCHEN_DO_CANCELLABLE_CALLBACK, ctx)
-    _wv_async_wait(queue, token)
-  ensure
-    own_token&.close
+    input_ptr = Bridge.string_arg(input)
+    Bridge.await_cancellable(nil, :string, cancel) do |cancel_token, callback, context|
+      Native.kitchen_sink_kitchen_do_cancellable(
+        input_ptr,
+        input_ptr.bytesize,
+        cancel_token,
+        callback,
+        context,
+      )
+    end
   end
 
   # Legacy operation kept for compatibility
+  #
   # @return [Integer]
-  # @deprecated Use new_op instead
+  # @deprecated Use `new_op` instead
   def self.legacy_op
-    warn('KitchenSink.legacy_op is deprecated: Use new_op instead', uplevel: 1)
-    err = ErrorStruct.new
-    result = kitchen_sink_kitchen_legacy_op(err)
-    _wv_check!(err)
-    result
+    warn('KitchenSink.legacy_op is deprecated: Use `new_op` instead', uplevel: 1, category: :deprecated)
+    Bridge.call(nil, :i32) do |out_err|
+      Native.kitchen_sink_kitchen_legacy_op(out_err)
+    end
   end
 
-  # Replacement for legacy_op
+  # Replacement for `legacy_op`
+  #
   # @return [Integer]
   def self.new_op
-    err = ErrorStruct.new
-    result = kitchen_sink_kitchen_new_op(err)
-    _wv_check!(err)
-    result
+    Bridge.call(nil, :i32) do |out_err|
+      Native.kitchen_sink_kitchen_new_op(out_err)
+    end
+  end
+
+  # Optional scalar in both directions
+  #
+  # @param x [Integer, nil]
+  # @return [Integer, nil]
+  def self.opt_i32_id(x = nil)
+    has_x, x = Bridge.opt_arg(x, :i32)
+    Bridge.call(nil, [:opt, :i32]) do |out_value, out_err|
+      Native.kitchen_sink_kitchen_opt_i32_id(has_x, x, out_value, out_err)
+    end
+  end
+
+  # @param x [Boolean, nil]
+  # @return [Boolean, nil]
+  def self.opt_bool_id(x = nil)
+    has_x, x = Bridge.opt_arg(x, :bool)
+    Bridge.call(nil, [:opt, :bool]) do |out_value, out_err|
+      Native.kitchen_sink_kitchen_opt_bool_id(has_x, x, out_value, out_err)
+    end
+  end
+
+  # Optional C-style enum in both directions
+  #
+  # @param p [Integer, nil]
+  # @return [Integer, nil]
+  def self.opt_priority(p = nil)
+    has_p, p = Bridge.opt_arg(p, :i32)
+    Bridge.call(nil, [:opt, :i32]) do |out_value, out_err|
+      Native.kitchen_sink_kitchen_opt_priority(has_p, p, out_value, out_err)
+    end
+  end
+
+  # Optional scalars next to ordinary parameters
+  #
+  # @param base [Float]
+  # @param scale [Float, nil]
+  # @param offset [Integer, nil]
+  # @param label [String, nil]
+  # @return [Integer, nil]
+  def self.opt_mixed(base, scale = nil, offset = nil, label = nil)
+    has_scale, scale = Bridge.opt_arg(scale, :f32)
+    has_offset, offset = Bridge.opt_arg(offset, :i64)
+    label_ptr = Bridge.encode([:opt, :string], label)
+    Bridge.call(nil, [:opt, :u16], label_ptr) do |label_ptr, out_value, out_err|
+      Native.kitchen_sink_kitchen_opt_mixed(
+        base,
+        has_scale,
+        scale,
+        has_offset,
+        offset,
+        label_ptr,
+        label_ptr.bytesize,
+        out_value,
+        out_err,
+      )
+    end
+  end
+
+  # A typed-array parameter
+  #
+  # @param xs [Array<Float>]
+  # @return [Float]
+  def self.sum_f64(xs)
+    xs_ptr, xs_len = Bridge.slice_arg(xs, :f64)
+    Bridge.call(nil, :f64) do |out_err|
+      Native.kitchen_sink_kitchen_sum_f64(xs_ptr, xs_len, out_err)
+    end
+  end
+
+  # Typed arrays in both directions
+  #
+  # @param xs [Array<Integer>]
+  # @param factor [Integer]
+  # @return [Array<Integer>]
+  def self.scale_i32(xs, factor)
+    xs_ptr, xs_len = Bridge.slice_arg(xs, :i32)
+    factor = Bridge.scalar(factor, :i32)
+    Bridge.call(nil, [:slice, :i32]) do |out_len, out_err|
+      Native.kitchen_sink_kitchen_scale_i32(xs_ptr, xs_len, factor, out_len, out_err)
+    end
+  end
+
+  # @param ids [Array<Integer>]
+  # @return [Array<Integer>]
+  def self.ids_u64(ids)
+    ids_ptr, ids_len = Bridge.slice_arg(ids, :u64)
+    Bridge.call(nil, [:slice, :u64]) do |out_len, out_err|
+      Native.kitchen_sink_kitchen_ids_u64(ids_ptr, ids_len, out_len, out_err)
+    end
+  end
+
+  # Every slice element type
+  #
+  # @param a [Array<Integer>]
+  # @param b [Array<Integer>]
+  # @param c [Array<Integer>]
+  # @param d [Array<Integer>]
+  # @param e [Array<Integer>]
+  # @param f [Array<Float>]
+  # @return [Array<Integer>]
+  def self.mixed_slices(a, b, c, d, e, f)
+    a_ptr, a_len = Bridge.slice_arg(a, :i8)
+    b_ptr, b_len = Bridge.slice_arg(b, :i16)
+    c_ptr, c_len = Bridge.slice_arg(c, :u16)
+    d_ptr, d_len = Bridge.slice_arg(d, :u32)
+    e_ptr, e_len = Bridge.slice_arg(e, :i64)
+    f_ptr, f_len = Bridge.slice_arg(f, :f32)
+    Bridge.call(nil, [:slice, :u32]) do |out_len, out_err|
+      Native.kitchen_sink_kitchen_mixed_slices(
+        a_ptr,
+        a_len,
+        b_ptr,
+        b_len,
+        c_ptr,
+        c_len,
+        d_ptr,
+        d_len,
+        e_ptr,
+        e_len,
+        f_ptr,
+        f_len,
+        out_len,
+        out_err,
+      )
+    end
+  end
+
+  # Async returning an optional scalar
+  #
+  # Blocks until the call completes on a library thread (under a Fiber
+  # scheduler, only the calling Fiber waits).
+  #
+  # @return [Integer, nil]
+  def self.async_maybe_count
+    Bridge.await(nil, [:opt, :i64]) do |callback, context|
+      Native.kitchen_sink_kitchen_async_maybe_count(callback, context)
+    end
+  end
+
+  # Async returning a typed array
+  #
+  # Blocks until the call completes on a library thread (under a Fiber
+  # scheduler, only the calling Fiber waits).
+  #
+  # @param n [Integer]
+  # @param cancel [CancelToken, nil] cancels the call, which then raises Cancelled
+  # @return [Array<Float>]
+  # @raise [Cancelled] when `cancel` fires first
+  def self.async_samples(n, cancel: nil)
+    n = Bridge.scalar(n, :u32)
+    Bridge.await_cancellable(nil, [:slice, :f32], cancel) do |cancel_token, callback, context|
+      Native.kitchen_sink_kitchen_async_samples(n, cancel_token, callback, context)
+    end
+  end
+
+  # Iterator of optional scalars
+  #
+  # Returns a lazy Enumerator: each enumeration starts its own native iterator
+  # on the first pull and releases it when iteration finishes or stops early.
+  #
+  # @return [Enumerator<Integer, nil>]
+  def self.stream_maybe
+    Bridge.iterate(
+      nil,
+      [:opt, :i32],
+      :kitchen_sink_kitchen_StreamMaybeIterator_next,
+      :kitchen_sink_kitchen_StreamMaybeIterator_destroy,
+    ) do |out_err|
+      Native.kitchen_sink_kitchen_stream_maybe(out_err)
+    end
+  end
+
+  # Iterator of typed arrays
+  #
+  # Returns a lazy Enumerator: each enumeration starts its own native iterator
+  # on the first pull and releases it when iteration finishes or stops early.
+  #
+  # @return [Enumerator<Array<Integer>>]
+  def self.stream_chunks
+    Bridge.iterate(
+      nil,
+      [:slice, :i32],
+      :kitchen_sink_kitchen_StreamChunksIterator_next,
+      :kitchen_sink_kitchen_StreamChunksIterator_destroy,
+    ) do |out_err|
+      Native.kitchen_sink_kitchen_stream_chunks(out_err)
+    end
+  end
+
+  # Drive a consumer-implemented sampler
+  #
+  # @param sampler [Sampler]
+  # @param level [Integer, nil]
+  # @return [Array<Integer>]
+  # @raise [PantryError] for a domain error
+  def self.sample_with(sampler, level = nil)
+    Bridge.present!(sampler, 'sampler')
+    has_level, level = Bridge.opt_arg(level, :u32)
+    Bridge.call(PantryError, [:slice, :i16]) do |out_len, out_err|
+      sampler_ctx, sampler_vtable = Bridge.register(sampler, Sampler)
+      Native.kitchen_sink_kitchen_sample_with(
+        sampler_ctx,
+        sampler_vtable,
+        has_level,
+        level,
+        out_len,
+        out_err,
+      )
+    end
+  end
+
+  # Fails with the second domain
+  #
+  # @param item [String]
+  # @return [Integer]
+  # @raise [PantryError] for a domain error
+  def self.take_from_pantry(item)
+    item_ptr = Bridge.string_arg(item)
+    Bridge.call(PantryError, :i32) do |out_err|
+      Native.kitchen_sink_kitchen_take_from_pantry(item_ptr, item_ptr.bytesize, out_err)
+    end
+  end
+
+  # Fails with an untyped error
+  #
+  # @param text [String]
+  # @return [Integer]
+  # @raise [Error] when the call fails
+  def self.parse_any(text)
+    text_ptr = Bridge.string_arg(text)
+    Bridge.call(Error, :i64) do |out_err|
+      Native.kitchen_sink_kitchen_parse_any(text_ptr, text_ptr.bytesize, out_err)
+    end
   end
 
   # === Module: kitchen.nested ===
 
-  attach_function :kitchen_sink_kitchen_nested_hello, [:pointer, :pointer], :pointer, blocking: true
-
   # Trivial nested-module function
+  #
   # @return [String]
   def self.hello
-    err = ErrorStruct.new
-    out_len = FFI::MemoryPointer.new(:size_t)
-    result = kitchen_sink_kitchen_nested_hello(out_len, err)
-    _wv_check!(err)
-    _wv_take_string(result, out_len.read(:size_t))
-  end
-
-  # === Value-buffer codecs of the composite types ===
-
-  # @api private
-  # Packs `[Gadget]` into the value-buffer wire format.
-  def self._wv_write_list_gadget(w, v)
-    w.write_len(v.length)
-    v.each { |e| w.write_object(e, Gadget) }
-  end
-
-  # @api private
-  # Unpacks `[Gadget]` from the value-buffer wire format.
-  def self._wv_read_list_gadget(r)
-    Array.new(r.read_len) { r.read_object(Gadget) }
-  end
-
-  # @api private
-  # Packs `Item?` into the value-buffer wire format.
-  def self._wv_write_opt_item(w, v)
-    if v.nil?
-      w.write_flag(false)
-    else
-      w.write_flag(true)
-      _wv_write_item(w, v)
+    Bridge.call(nil, :string) do |out_len, out_err|
+      Native.kitchen_sink_kitchen_nested_hello(out_len, out_err)
     end
   end
 
-  # @api private
-  # Unpacks `Item?` from the value-buffer wire format.
-  def self._wv_read_opt_item(r)
-    r.read_flag ? _wv_read_item(r) : nil
-  end
+  # === Private registrations ===
 
-  # @api private
-  # Packs `[Item]` into the value-buffer wire format.
-  def self._wv_write_list_item(w, v)
-    w.write_len(v.length)
-    v.each { |e| _wv_write_item(w, e) }
-  end
+  # How the library clones and releases each interface's objects, and how
+  # each record, variant, and error payload is laid out in a value buffer.
+  Bridge.interface(Gadget, :kitchen_sink_kitchen_Gadget_clone, :kitchen_sink_kitchen_Gadget_destroy)
+  Bridge.record(Token, id: :i64, label: :string)
+  Bridge.record(
+    Item,
+    id: :i64,
+    name: :string,
+    count: :i32,
+    enabled: :bool,
+    ratio: :f64,
+    nick: :u32,
+    payload: :bytes,
+    tags: [:list, :string],
+    attrs: [:map, :string, :string],
+    parent: [:opt, :i64],
+    token: Token,
+    priority: :i32,
+    gadget: [:opt, Gadget],
+  )
+  Bridge.record(PantryError::OutOfStock, item: :string)
 
-  # @api private
-  # Unpacks `[Item]` from the value-buffer wire format.
-  def self._wv_read_list_item(r)
-    Array.new(r.read_len) { _wv_read_item(r) }
-  end
+  # The ReadyListener vtable.
+  Bridge.vtable(
+    ReadyListener,
+    # ReadyListener#on_ready
+    FFI::Function.new(:void, [:pointer, :int32, :pointer, :size_t, :pointer]) do |ctx, code, msg_ptr, msg_len, out_err|
+      Bridge.callback(out_err, nil) do
+        msg = Bridge.borrow_string(msg_ptr, msg_len)
+        Bridge.impl(ctx).on_ready(code, msg)
+        nil
+      end
+    end,
+    # ReadyListener#on_item
+    FFI::Function.new(:bool, [:pointer, :pointer, :size_t, :pointer, :pointer]) do |ctx, item_ptr, item_len, gadget, out_err|
+      Bridge.callback(out_err, nil, false) do
+        gadget = Bridge.adopt(Gadget, gadget)
+        item = Bridge.decode_borrowed(item_ptr, item_len, Item)
+        Bridge.impl(ctx).on_item(item, gadget) ? true : false
+      end
+    end,
+    # ReadyListener#label
+    FFI::Function.new(:void, [:pointer, :pointer, :pointer, :pointer]) do |ctx, out_ptr, out_len, out_err|
+      Bridge.callback(out_err, KitchenError) do
+        Bridge.string_return(Bridge.impl(ctx).label, out_ptr, out_len)
+      end
+    end,
+    # ReadyListener#latest
+    FFI::Function.new(:void, [:pointer, :pointer, :pointer, :pointer]) do |ctx, out_ptr, out_len, out_err|
+      Bridge.callback(out_err, nil) do
+        Bridge.buffer_return([:opt, Item], Bridge.impl(ctx).latest, out_ptr, out_len)
+      end
+    end,
+    # ReadyListener#favorite
+    FFI::Function.new(:pointer, [:pointer, :pointer]) do |ctx, out_err|
+      Bridge.callback(out_err, nil) do
+        Bridge.object_return(Bridge.impl(ctx).favorite, Gadget)
+      end
+    end,
+  )
 
-  # @api private
-  # Packs `{string:i32}` into the value-buffer wire format.
-  def self._wv_write_map_string_i32(w, v)
-    w.write_len(v.length)
-    v.each do |k, e|
-      w.write_string(k)
-      w.write_i32(e)
-    end
-  end
-
-  # @api private
-  # Unpacks `{string:i32}` from the value-buffer wire format.
-  def self._wv_read_map_string_i32(r)
-    Array.new(r.read_len) { [r.read_string, r.read_i32] }.to_h
-  end
-
-  # @api private
-  # Packs `[string]` into the value-buffer wire format.
-  def self._wv_write_list_string(w, v)
-    w.write_len(v.length)
-    v.each { |e| w.write_string(e) }
-  end
-
-  # @api private
-  # Unpacks `[string]` from the value-buffer wire format.
-  def self._wv_read_list_string(r)
-    Array.new(r.read_len) { r.read_string }
-  end
-
-  # @api private
-  # Packs `{string:string}` into the value-buffer wire format.
-  def self._wv_write_map_string_string(w, v)
-    w.write_len(v.length)
-    v.each do |k, e|
-      w.write_string(k)
-      w.write_string(e)
-    end
-  end
-
-  # @api private
-  # Unpacks `{string:string}` from the value-buffer wire format.
-  def self._wv_read_map_string_string(r)
-    Array.new(r.read_len) { [r.read_string, r.read_string] }.to_h
-  end
-
-  # @api private
-  # Packs `i64?` into the value-buffer wire format.
-  def self._wv_write_opt_i64(w, v)
-    if v.nil?
-      w.write_flag(false)
-    else
-      w.write_flag(true)
-      w.write_i64(v)
-    end
-  end
-
-  # @api private
-  # Unpacks `i64?` from the value-buffer wire format.
-  def self._wv_read_opt_i64(r)
-    r.read_flag ? r.read_i64 : nil
-  end
-
-  # @api private
-  # Packs `Gadget?` into the value-buffer wire format.
-  def self._wv_write_opt_gadget(w, v)
-    if v.nil?
-      w.write_flag(false)
-    else
-      w.write_flag(true)
-      w.write_object(v, Gadget)
-    end
-  end
-
-  # @api private
-  # Unpacks `Gadget?` from the value-buffer wire format.
-  def self._wv_read_opt_gadget(r)
-    r.read_flag ? r.read_object(Gadget) : nil
-  end
+  # The Sampler vtable.
+  Bridge.vtable(
+    Sampler,
+    # Sampler#threshold
+    FFI::Function.new(:bool, [:pointer, :bool, :uint32, :pointer, :pointer]) do |ctx, has_level, level, out_value, out_err|
+      Bridge.callback(out_err, nil, false) do
+        level = has_level ? level : nil
+        Bridge.opt_return(Bridge.impl(ctx).threshold(level), :f64, out_value)
+      end
+    end,
+    # Sampler#samples
+    FFI::Function.new(:void, [:pointer, :bool, :uint32, :pointer, :size_t, :pointer, :pointer, :pointer]) do |ctx, has_limit, limit, weights_ptr, weights_len, out_ptr, out_len, out_err|
+      Bridge.callback(out_err, PantryError) do
+        limit = has_limit ? limit : nil
+        weights = Bridge.borrow_slice(weights_ptr, weights_len, :f64)
+        Bridge.slice_return(Bridge.impl(ctx).samples(limit, weights), :i16, out_ptr, out_len)
+      end
+    end,
+    # Sampler#describe
+    FFI::Function.new(:void, [:pointer, :pointer, :pointer, :pointer]) do |ctx, out_ptr, out_len, out_err|
+      Bridge.callback(out_err, Error) do
+        Bridge.string_return(Bridge.impl(ctx).describe, out_ptr, out_len)
+      end
+    end,
+  )
 end
 
 # END kitchen_sink.rb

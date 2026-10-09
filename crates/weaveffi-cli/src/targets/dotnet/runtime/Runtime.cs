@@ -1,6 +1,8 @@
 #nullable enable
 
 using System;
+using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
@@ -9,6 +11,10 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+
+// Every native signature is blittable (`bool` slots are marshalled as one
+// byte by the source generator), so the runtime never marshals on its own.
+[assembly: DisableRuntimeMarshalling]
 
 namespace {{NAMESPACE}};
 
@@ -19,11 +25,13 @@ namespace {{NAMESPACE}};
 /// negative <see cref="Code"/>.</summary>
 public class {{EXCEPTION}} : Exception
 {
-    /// <summary>An untyped producer error.</summary>
+    /// <summary>An untyped producer error (a <c>throws: any</c> call's
+    /// failure).</summary>
     public const int GenericErrorCode = -1;
     /// <summary>The producer panicked; the message carries the panic text.</summary>
     public const int PanicErrorCode = -2;
-    /// <summary>An argument couldn't be lifted by the producer.</summary>
+    /// <summary>A value couldn't be converted at the boundary (an argument the
+    /// producer rejected, or a callback result it couldn't accept).</summary>
     public const int MarshalErrorCode = -3;
     /// <summary>A callback-interface implementation failed; the message carries
     /// the implementation's message.</summary>
@@ -37,15 +45,23 @@ public class {{EXCEPTION}} : Exception
     public int Code { get; }
 
     /// <summary>Creates an exception carrying a native error code.</summary>
+    /// <param name="code">The native error code.</param>
+    /// <param name="message">The error message.</param>
     public {{EXCEPTION}}(int code, string message) : base(message)
     {
         Code = code;
     }
 
+    /// <summary>Writes the fields of a domain error, the payload a callback
+    /// reports with its code. A code without fields writes nothing.</summary>
+    internal virtual void WritePayload(FfiBufferWriter writer)
+    {
+    }
+
     /// <summary>Maps a code outside every declared domain to its exception:
     /// cancellation to <see cref="OperationCanceledException"/>, anything else
     /// to this type.</summary>
-    internal static Exception FromError(int code, string message, byte[]? payload)
+    internal static Exception FromError(int code, string message, FfiBufferReader payload)
     {
         if (code == CancelledErrorCode)
         {
@@ -67,6 +83,8 @@ public sealed class {{BUG_EXCEPTION}} : InvalidOperationException
 
     /// <summary>Creates the exception for a failed call that can't
     /// fail.</summary>
+    /// <param name="code">The native error code.</param>
+    /// <param name="message">The producer's message.</param>
     public {{BUG_EXCEPTION}}(int code, string message)
         : base($"native call failed with code {code}: {message}")
     {
@@ -76,7 +94,7 @@ public sealed class {{BUG_EXCEPTION}} : InvalidOperationException
     /// <summary>Maps a failure of a call that isn't declared to throw:
     /// cancellation to <see cref="OperationCanceledException"/>, anything else
     /// to this type.</summary>
-    internal static Exception FromError(int code, string message, byte[]? payload)
+    internal static Exception FromError(int code, string message, FfiBufferReader payload)
     {
         if (code == {{EXCEPTION}}.CancelledErrorCode)
         {
@@ -86,16 +104,49 @@ public sealed class {{BUG_EXCEPTION}} : InvalidOperationException
     }
 }
 
-/// <summary>Maps a native error code, message, and serialized payload to the
-/// exception a call throws.</summary>
-internal delegate Exception FfiErrorMap(int code, string message, byte[]? payload);
+/// <summary>The native library couldn't be loaded, or the loaded library
+/// doesn't match these bindings (another ABI revision, or a declaration that
+/// is missing or changed). Every later call into the library throws the same
+/// exception.</summary>
+public sealed class {{LOAD_EXCEPTION}} : Exception
+{
+    /// <summary>Creates the exception with a message and the failure that
+    /// caused it, if any.</summary>
+    /// <param name="message">What went wrong.</param>
+    /// <param name="inner">The underlying failure, if any.</param>
+    public {{LOAD_EXCEPTION}}(string message, Exception? inner = null) : base(message, inner)
+    {
+    }
+}
+
+/// <summary>The native <c>{{LIBRARY}}</c> library behind these
+/// bindings.</summary>
+public static class {{LIBRARY_CLASS}}
+{
+    /// <summary>The C ABI revision these bindings were generated
+    /// against.</summary>
+    public const uint AbiVersion = {{ABI_VERSION}};
+
+    /// <summary>Loads the native library and checks that it matches these
+    /// bindings: its ABI revision and the contract entry of every declaration
+    /// they use. Calling it is optional: the first call into the library runs
+    /// the same check and throws the same exception. Calling it again after
+    /// a success does nothing.</summary>
+    /// <exception cref="{{LOAD_EXCEPTION}}">The library can't be found or
+    /// loaded, or it doesn't match these bindings.</exception>
+    public static void Check()
+    {
+        NativeMethods.Load(null);
+    }
+}
 
 /// <summary>The native <c>{{PREFIX}}_error</c> slot.</summary>
 [StructLayout(LayoutKind.Sequential)]
 internal unsafe struct FfiError
 {
     public int Code;
-    public byte* Message;
+    public byte* MessagePtr;
+    public nuint MessageLen;
     public byte* PayloadPtr;
     public nuint PayloadLen;
 }
@@ -109,16 +160,45 @@ internal struct FfiContractEntry
     public ulong Hash;
 }
 
+/// <summary>The result type of an async call that returns nothing.</summary>
+internal readonly struct FfiVoid
+{
+}
+
+/// <summary>The UTF-8 bytes of a string argument, in a pooled buffer the
+/// native side borrows for the call as a (pointer, length) pair, so interior
+/// NULs survive. Pin it with <c>fixed</c>; dispose it after the call.</summary>
+internal readonly ref struct FfiUtf8
+{
+    private readonly byte[] _bytes;
+
+    /// <summary>The number of bytes.</summary>
+    internal readonly nuint Length;
+
+    internal FfiUtf8(string value)
+    {
+        var count = Encoding.UTF8.GetByteCount(value);
+        _bytes = count == 0 ? Array.Empty<byte>() : ArrayPool<byte>.Shared.Rent(count);
+        Length = (nuint)Encoding.UTF8.GetBytes(value, _bytes);
+    }
+
+    public ref byte GetPinnableReference()
+    {
+        return ref MemoryMarshal.GetArrayDataReference(_bytes);
+    }
+
+    public void Dispose()
+    {
+        if (_bytes.Length > 0)
+        {
+            ArrayPool<byte>.Shared.Return(_bytes);
+        }
+    }
+}
+
 /// <summary>Marshalling helpers shared by every generated call.</summary>
 internal static unsafe class Ffi
 {
-    /// <summary>The UTF-8 bytes of a string argument. The native side borrows
-    /// them as a (pointer, length) pair, so interior NULs survive.</summary>
-    internal static byte[] Utf8(string value)
-    {
-        return Encoding.UTF8.GetBytes(value);
-    }
-
     /// <summary>Decodes a borrowed UTF-8 run; the native side keeps
     /// ownership.</summary>
     internal static string ReadString(byte* ptr, nuint len)
@@ -133,11 +213,22 @@ internal static unsafe class Ffi
         return ptr == null || len == 0 ? Array.Empty<byte>() : new ReadOnlySpan<byte>(ptr, checked((int)len)).ToArray();
     }
 
-    /// <summary>A reader over a copy of a borrowed value buffer; the native
-    /// side keeps ownership.</summary>
-    internal static FfiBufferReader ReadBuffer(byte* ptr, nuint len)
+    /// <summary>A borrowed typed array (or byte run) as a span, valid for the
+    /// duration of a callback. A zero-length run may have a dangling
+    /// pointer, which an empty span never reads.</summary>
+    internal static ReadOnlySpan<T> Borrow<T>(T* ptr, nuint len) where T : unmanaged
     {
-        return new FfiBufferReader(ReadBytes(ptr, len));
+        return len == 0 ? ReadOnlySpan<T>.Empty : new ReadOnlySpan<T>(ptr, checked((int)len));
+    }
+
+    /// <summary>Decodes a borrowed value buffer, which must hold exactly one
+    /// value; the native side keeps ownership.</summary>
+    internal static T ReadBuffer<T>(byte* ptr, nuint len, Func<FfiBufferReader, T> read)
+    {
+        var reader = new FfiBufferReader(ptr, len);
+        var value = read(reader);
+        reader.ExpectEnd();
+        return value;
     }
 
     /// <summary>Decodes a returned UTF-8 string and releases it.</summary>
@@ -166,52 +257,101 @@ internal static unsafe class Ffi
         }
     }
 
-    /// <summary>Copies a returned value buffer, releases it, and returns a
-    /// reader over the copy.</summary>
-    internal static FfiBufferReader TakeBuffer(byte* ptr, nuint len)
+    /// <summary>Copies a returned typed array of <paramref name="len"/>
+    /// elements and releases its <c>len * sizeof(T)</c> bytes.</summary>
+    internal static T[] TakeArray<T>(T* ptr, nuint len) where T : unmanaged
     {
-        return new FfiBufferReader(TakeBytes(ptr, len));
+        if (ptr == null || len == 0)
+        {
+            return Array.Empty<T>();
+        }
+        try
+        {
+            return new ReadOnlySpan<T>(ptr, checked((int)len)).ToArray();
+        }
+        finally
+        {
+            NativeMethods.FreeBytes((byte*)ptr, len * (nuint)sizeof(T));
+        }
+    }
+
+    /// <summary>Decodes a returned value buffer and releases it.</summary>
+    internal static T TakeBuffer<T>(byte* ptr, nuint len, Func<FfiBufferReader, T> read)
+    {
+        try
+        {
+            return ReadBuffer(ptr, len, read);
+        }
+        finally
+        {
+            NativeMethods.FreeBytes(ptr, len);
+        }
     }
 
     /// <summary>Releases a caller-owned error slot and returns the exception
-    /// it described.</summary>
-    internal static Exception TakeError(FfiError* err, FfiErrorMap map)
+    /// <paramref name="map"/> makes of it.</summary>
+    internal static Exception TakeError(FfiError* err, delegate*<int, string, FfiBufferReader, Exception> map)
     {
-        var code = err->Code;
-        var message = ErrorMessage(err);
-        var payload = ReadBytes(err->PayloadPtr, err->PayloadLen);
-        NativeMethods.ErrorClear(err);
-        return map(code, message, payload.Length == 0 ? null : payload);
+        try
+        {
+            return Describe(err, map);
+        }
+        finally
+        {
+            NativeMethods.ErrorClear(err);
+        }
     }
 
-    /// <summary>Releases a heap-boxed async error and returns the exception it
-    /// described.</summary>
-    internal static Exception TakeBoxedError(FfiError* err, FfiErrorMap map, out int code)
+    /// <summary>Releases a heap-boxed async error and returns the exception
+    /// <paramref name="map"/> makes of it.</summary>
+    internal static Exception TakeBoxedError(FfiError* err, delegate*<int, string, FfiBufferReader, Exception> map)
     {
-        code = err->Code;
-        var message = ErrorMessage(err);
-        var payload = ReadBytes(err->PayloadPtr, err->PayloadLen);
-        NativeMethods.ErrorFree(err);
-        return map(code, message, payload.Length == 0 ? null : payload);
+        try
+        {
+            return Describe(err, map);
+        }
+        finally
+        {
+            NativeMethods.ErrorFree(err);
+        }
     }
 
-    private static string ErrorMessage(FfiError* err)
+    private static Exception Describe(FfiError* err, delegate*<int, string, FfiBufferReader, Exception> map)
     {
-        return Marshal.PtrToStringUTF8((IntPtr)err->Message) ?? "";
+        var message = ReadString(err->MessagePtr, err->MessageLen);
+        return map(err->Code, message, new FfiBufferReader(err->PayloadPtr, err->PayloadLen));
     }
 
     /// <summary>Reports a failed callback-interface method to the producer
     /// through <c>out_err</c>: <paramref name="code"/> with the exception's
-    /// message and, for a domain error with fields, the encoded fields as
-    /// its payload. The producer copies both.</summary>
-    internal static void SetError(FfiError* err, int code, Exception e, FfiBufferWriter? payload = null)
+    /// message. The producer copies it.</summary>
+    internal static void Report(FfiError* err, Exception e, int code)
     {
-        var bytes = Encoding.UTF8.GetBytes(e.Message + "\0");
-        fixed (byte* message = bytes)
+        using var message = new FfiUtf8(e.Message);
+        fixed (byte* ptr = message)
         {
-            NativeMethods.ErrorSet(err, code, message);
+            NativeMethods.ErrorSet(err, code, ptr, message.Length);
         }
-        if (payload != null && payload.Length > 0)
+    }
+
+    /// <summary>Reports an exception of the method's own error domain: its
+    /// code, its message, and its fields as the payload, so the producer sees
+    /// exactly that domain error. A payload that can't be encoded is reported
+    /// as a generic failure instead.</summary>
+    internal static void ReportDomain(FfiError* err, {{EXCEPTION}} e)
+    {
+        using var payload = new FfiBufferWriter();
+        try
+        {
+            e.WritePayload(payload);
+        }
+        catch (Exception inner)
+        {
+            Report(err, inner, {{EXCEPTION}}.GenericErrorCode);
+            return;
+        }
+        Report(err, e, e.Code);
+        if (payload.Length > 0)
         {
             fixed (byte* ptr = payload.Written)
             {
@@ -220,39 +360,12 @@ internal static unsafe class Ffi
         }
     }
 
-    /// <summary>Reports a domain exception a throwing callback-interface
-    /// method raised: its positive <paramref name="code"/>, its message, and
-    /// the fields <paramref name="writePayload"/> encodes. A failure to
-    /// encode them is reported as a foreign error instead.</summary>
-    internal static void SetDomainError(FfiError* err, int code, Exception e, Action<FfiBufferWriter> writePayload)
-    {
-        var payload = new FfiBufferWriter();
-        try
-        {
-            writePayload(payload);
-        }
-        catch (Exception inner)
-        {
-            SetForeignError(err, inner);
-            return;
-        }
-        SetError(err, code, e, payload);
-    }
-
-    /// <summary>Reports a failed callback-interface method that isn't a
-    /// declared domain error: the producer receives the foreign error code
-    /// with the exception's message.</summary>
-    internal static void SetForeignError(FfiError* err, Exception e)
-    {
-        SetError(err, {{EXCEPTION}}.ForeignErrorCode, e);
-    }
-
     /// <summary>Hands <paramref name="bytes"/> to the producer through a
     /// callback method's out slots, as a run allocated with
     /// <c>{{PREFIX}}_alloc</c> that the producer adopts.</summary>
-    internal static void Return(ReadOnlySpan<byte> bytes, byte** outPtr, nuint* outLen)
+    private static void Return(ReadOnlySpan<byte> bytes, byte** outPtr, nuint* outLen)
     {
-        var run = NativeMethods.Alloc((nuint)bytes.Length);
+        var run = bytes.Length == 0 ? null : NativeMethods.Alloc((nuint)bytes.Length);
         if (run == null && bytes.Length > 0)
         {
             throw new OutOfMemoryException("the native allocator returned null");
@@ -265,7 +378,11 @@ internal static unsafe class Ffi
     /// <summary>Returns a string from a callback method.</summary>
     internal static void ReturnString(string value, byte** outPtr, nuint* outLen)
     {
-        Return(Encoding.UTF8.GetBytes(value), outPtr, outLen);
+        using var utf8 = new FfiUtf8(value);
+        fixed (byte* ptr = utf8)
+        {
+            Return(new ReadOnlySpan<byte>(ptr, (int)utf8.Length), outPtr, outLen);
+        }
     }
 
     /// <summary>Returns bytes from a callback method.</summary>
@@ -274,10 +391,34 @@ internal static unsafe class Ffi
         Return(value, outPtr, outLen);
     }
 
-    /// <summary>Returns an encoded value buffer from a callback method.</summary>
-    internal static void ReturnBuffer(FfiBufferWriter writer, byte** outPtr, nuint* outLen)
+    /// <summary>Returns a typed array from a callback method: a run of
+    /// <c>Length * sizeof(T)</c> bytes and the element count.</summary>
+    internal static void ReturnArray<T>(T[] value, T** outPtr, nuint* outLen) where T : unmanaged
     {
+        nuint count;
+        Return(MemoryMarshal.AsBytes(value.AsSpan()), (byte**)outPtr, &count);
+        *outLen = (nuint)value.Length;
+    }
+
+    /// <summary>Returns an encoded value from a callback method.</summary>
+    internal static void ReturnBuffer<T>(T value, Action<FfiBufferWriter, T> write, byte** outPtr, nuint* outLen)
+    {
+        using var writer = new FfiBufferWriter();
+        write(writer, value);
         Return(writer.Written, outPtr, outLen);
+    }
+
+    /// <summary>Returns an optional scalar from a callback method: the
+    /// presence as the C return, the value through
+    /// <paramref name="outValue"/>.</summary>
+    internal static bool ReturnOptional<T>(T? value, T* outValue) where T : unmanaged
+    {
+        if (value is { } present)
+        {
+            *outValue = present;
+            return true;
+        }
+        return false;
     }
 
     /// <summary>Pins a callback-interface implementation for the producer and
@@ -306,9 +447,121 @@ internal static unsafe class Ffi
     }
 }
 
-/// <summary>Imports of the native runtime surface plus the load-time checks.
-/// The generated API declares its own imports, and the contract it was
-/// generated with, in the other half of this partial class.</summary>
+/// <summary>Value equality for record fields whose C# type compares by
+/// reference: byte arrays, lists, and maps compare their contents.</summary>
+internal static class FfiEquality
+{
+    /// <summary>Default equality (what a record compares its fields
+    /// with).</summary>
+    internal static bool Equal<T>(T a, T b)
+    {
+        return EqualityComparer<T>.Default.Equals(a, b);
+    }
+
+    internal static bool Bytes(byte[]? a, byte[]? b)
+    {
+        return ReferenceEquals(a, b) || a is not null && b is not null && a.AsSpan().SequenceEqual(b);
+    }
+
+    internal static bool Lists<T>(IReadOnlyList<T>? a, IReadOnlyList<T>? b)
+    {
+        return Lists(a, b, EqualityComparer<T>.Default);
+    }
+
+    internal static bool Lists<T>(IReadOnlyList<T>? a, IReadOnlyList<T>? b, Func<T, T, bool> equal)
+    {
+        if (ReferenceEquals(a, b))
+        {
+            return true;
+        }
+        if (a is null || b is null || a.Count != b.Count)
+        {
+            return false;
+        }
+        for (var i = 0; i < a.Count; i++)
+        {
+            if (!equal(a[i], b[i]))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool Lists<T>(IReadOnlyList<T>? a, IReadOnlyList<T>? b, EqualityComparer<T> comparer)
+    {
+        if (ReferenceEquals(a, b))
+        {
+            return true;
+        }
+        if (a is null || b is null || a.Count != b.Count)
+        {
+            return false;
+        }
+        for (var i = 0; i < a.Count; i++)
+        {
+            if (!comparer.Equals(a[i], b[i]))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    internal static bool Maps<K, V>(IReadOnlyDictionary<K, V>? a, IReadOnlyDictionary<K, V>? b)
+    {
+        var comparer = EqualityComparer<V>.Default;
+        return Maps(a, b, comparer.Equals);
+    }
+
+    internal static bool Maps<K, V>(IReadOnlyDictionary<K, V>? a, IReadOnlyDictionary<K, V>? b, Func<V, V, bool> equal)
+    {
+        if (ReferenceEquals(a, b))
+        {
+            return true;
+        }
+        if (a is null || b is null || a.Count != b.Count)
+        {
+            return false;
+        }
+        foreach (var entry in a)
+        {
+            if (!b.TryGetValue(entry.Key, out var other) || !equal(entry.Value, other))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    internal static int BytesHash(byte[]? value)
+    {
+        if (value is null)
+        {
+            return 0;
+        }
+        var hash = new HashCode();
+        hash.AddBytes(value);
+        return hash.ToHashCode();
+    }
+
+    /// <summary>A list's hash: its count, which equal lists share.</summary>
+    internal static int ListHash<T>(IReadOnlyList<T>? value)
+    {
+        return value?.Count ?? -1;
+    }
+
+    /// <summary>A map's hash: its count, which equal maps share.</summary>
+    internal static int MapHash<K, V>(IReadOnlyDictionary<K, V>? value)
+    {
+        return value?.Count ?? -1;
+    }
+}
+
+/// <summary>The native library handle, the load-time checks, and the imports
+/// of the native runtime surface. The generated API declares its own
+/// imports, and the contract it was generated with, in the other half of this
+/// partial class.</summary>
 internal static unsafe partial class NativeMethods
 {
     /// <summary>The native library's base name.</summary>
@@ -318,13 +571,14 @@ internal static unsafe partial class NativeMethods
     /// path.</summary>
     internal const string LibraryEnvVar = "{{LIBRARY_ENV}}";
 
-    /// <summary>The C ABI revision these bindings were generated
-    /// against.</summary>
-    internal const uint AbiVersion = {{ABI_VERSION}};
+    private static readonly object Gate = new object();
+    private static IntPtr s_library;
+    private static {{LOAD_EXCEPTION}}? s_failure;
 
-    // Runs before the first native call through this class, so a library
-    // built for another ABI revision or missing a declaration these bindings
-    // use fails here instead of misreading memory later.
+    // Every import resolves through `Resolve`, which loads the library and
+    // checks it once, so a library built for another ABI revision or missing
+    // a declaration these bindings use fails before any call can misread
+    // memory, with an exception the caller can catch.
     static NativeMethods()
     {
         try
@@ -333,59 +587,103 @@ internal static unsafe partial class NativeMethods
         }
         catch (InvalidOperationException)
         {
-            // The assembly already has a resolver; default probing still applies.
+            // The assembly already has a resolver; only an explicit Check()
+            // runs the load-time checks then.
         }
-        uint found;
-        try
-        {
-            found = AbiVersionOf();
-        }
-        catch (EntryPointNotFoundException e)
-        {
-            throw new InvalidOperationException(
-                $"the loaded {LibName} library doesn't export {{PREFIX}}_abi_version; these bindings expect ABI revision {AbiVersion}", e);
-        }
-        if (found != AbiVersion)
-        {
-            throw new InvalidOperationException(
-                $"ABI mismatch: these bindings expect revision {AbiVersion} but the loaded {LibName} library reports revision {found}");
-        }
-        VerifyContracts();
     }
-
-    static partial void VerifyContracts();
 
     private static IntPtr Resolve(string name, Assembly assembly, DllImportSearchPath? searchPath)
     {
-        if (name != LibName)
-        {
-            return IntPtr.Zero;
-        }
-        var path = Environment.GetEnvironmentVariable(LibraryEnvVar);
-        return string.IsNullOrEmpty(path) ? IntPtr.Zero : NativeLibrary.Load(path);
+        return name == LibName ? Load(searchPath) : IntPtr.Zero;
     }
 
-    /// <summary>Fails the load unless the loaded library's contract table,
-    /// read through <paramref name="table"/> (the import of
-    /// <paramref name="symbol"/>), carries every <paramref name="expected"/>
-    /// declaration with an unchanged signature hash. Declarations the
-    /// library has and these bindings don't are fine.</summary>
-    private static void VerifyContract(
-        string symbol,
-        delegate*<nuint*, FfiContractEntry*> table,
-        (ulong Id, ulong Hash, string Path)[] expected)
+    /// <summary>The checked library handle, loading it on first use. A
+    /// failure is remembered and thrown again by every later call.</summary>
+    internal static IntPtr Load(DllImportSearchPath? searchPath)
     {
+        lock (Gate)
+        {
+            if (s_failure != null)
+            {
+                throw s_failure;
+            }
+            if (s_library != IntPtr.Zero)
+            {
+                return s_library;
+            }
+            var library = IntPtr.Zero;
+            try
+            {
+                library = Open(searchPath);
+                Verify(library);
+                s_library = library;
+                return library;
+            }
+            catch ({{LOAD_EXCEPTION}} e)
+            {
+                if (library != IntPtr.Zero)
+                {
+                    NativeLibrary.Free(library);
+                }
+                s_failure = e;
+                throw;
+            }
+        }
+    }
+
+    private static IntPtr Open(DllImportSearchPath? searchPath)
+    {
+        var path = Environment.GetEnvironmentVariable(LibraryEnvVar);
+        if (!string.IsNullOrEmpty(path))
+        {
+            try
+            {
+                return NativeLibrary.Load(path);
+            }
+            catch (Exception e) when (e is DllNotFoundException or BadImageFormatException)
+            {
+                throw new {{LOAD_EXCEPTION}}($"couldn't load {path} (named by {LibraryEnvVar}): {e.Message}", e);
+            }
+        }
+        if (NativeLibrary.TryLoad(LibName, typeof(NativeMethods).Assembly, searchPath, out var library))
+        {
+            return library;
+        }
+        throw new {{LOAD_EXCEPTION}}(
+            $"couldn't find the {LibName} native library; put it next to the app or on the library search path, or set {LibraryEnvVar} to its full path");
+    }
+
+    private static void Verify(IntPtr library)
+    {
+        if (!NativeLibrary.TryGetExport(library, "{{PREFIX}}_abi_version", out var abiVersion))
+        {
+            throw new {{LOAD_EXCEPTION}}(
+                $"the loaded {LibName} library doesn't export {{PREFIX}}_abi_version; these bindings expect ABI revision {{{LIBRARY_CLASS}}.AbiVersion}");
+        }
+        var found = ((delegate* unmanaged[Cdecl]<uint>)abiVersion)();
+        if (found != {{LIBRARY_CLASS}}.AbiVersion)
+        {
+            throw new {{LOAD_EXCEPTION}}(
+                $"ABI mismatch: these bindings expect revision {{{LIBRARY_CLASS}}.AbiVersion} but the loaded {LibName} library reports revision {found}");
+        }
+        VerifyContracts(library);
+    }
+
+    static partial void VerifyContracts(IntPtr library);
+
+    /// <summary>Fails the load unless the library's contract table
+    /// <paramref name="symbol"/> carries every <paramref name="expected"/>
+    /// declaration with an unchanged signature hash. Declarations the library
+    /// has and these bindings don't are fine.</summary>
+    private static void VerifyContract(IntPtr library, string symbol, (ulong Id, ulong Hash, string Path)[] expected)
+    {
+        if (!NativeLibrary.TryGetExport(library, symbol, out var table))
+        {
+            throw new {{LOAD_EXCEPTION}}(
+                $"the loaded {LibName} library doesn't export {symbol}; regenerate the bindings or rebuild the library");
+        }
         nuint len = 0;
-        FfiContractEntry* entries;
-        try
-        {
-            entries = table(&len);
-        }
-        catch (EntryPointNotFoundException e)
-        {
-            throw new InvalidOperationException(
-                $"the loaded {LibName} library doesn't export {symbol}; regenerate the bindings or rebuild the library", e);
-        }
+        var entries = ((delegate* unmanaged[Cdecl]<nuint*, FfiContractEntry*>)table)(&len);
         var hashes = new Dictionary<ulong, ulong>(checked((int)len));
         for (nuint i = 0; i < len; i++)
         {
@@ -395,24 +693,20 @@ internal static unsafe partial class NativeMethods
         {
             if (!hashes.TryGetValue(id, out var actual))
             {
-                throw new InvalidOperationException(
+                throw new {{LOAD_EXCEPTION}}(
                     $"{path} is missing from the library {LibName}; regenerate the bindings or rebuild the library");
             }
             if (actual != hash)
             {
-                throw new InvalidOperationException(
+                throw new {{LOAD_EXCEPTION}}(
                     $"{path} changed since these bindings were generated; regenerate the bindings or rebuild the library {LibName}");
             }
         }
     }
 
-    [LibraryImport(LibName, EntryPoint = "{{PREFIX}}_abi_version")]
-    [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial uint AbiVersionOf();
-
     [LibraryImport(LibName, EntryPoint = "{{PREFIX}}_error_set")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial void ErrorSet(FfiError* err, int code, byte* message);
+    internal static partial void ErrorSet(FfiError* err, int code, byte* messagePtr, nuint messageLen);
 
     [LibraryImport(LibName, EntryPoint = "{{PREFIX}}_error_set_payload")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -448,9 +742,11 @@ internal static unsafe partial class NativeMethods
 }
 
 /// <summary>One pending async call: the task it completes, the native
-/// <c>context</c> that finds it again, and, for a cancellable function, the
-/// native cancel token linked to the caller's
-/// <see cref="CancellationToken"/>.</summary>
+/// <c>context</c> that finds it again, and the caller's
+/// <see cref="CancellationToken"/>. A cancellable function links the token to
+/// a native cancel token; for any other function, cancelling abandons the
+/// wait (the task completes as canceled at once, and the native call
+/// finishes in the background and releases its result).</summary>
 internal sealed class FfiCall<T>
 {
     private readonly TaskCompletionSource<T> _tcs =
@@ -463,20 +759,18 @@ internal sealed class FfiCall<T>
     private bool _completed;
     private bool _cancelling;
 
-    internal FfiCall(CancellationToken cancellation = default)
+    internal FfiCall(CancellationToken cancellation)
     {
         _cancellation = cancellation;
         _self = GCHandle.Alloc(this);
     }
 
-    /// <summary>The task the completion resolves.</summary>
-    internal Task<T> Task => _tcs.Task;
-
     /// <summary>The <c>context</c> argument for the launcher.</summary>
     internal IntPtr Context => GCHandle.ToIntPtr(_self);
 
-    /// <summary>Creates the native cancel token for the launcher and cancels
-    /// it when the caller's <see cref="CancellationToken"/> fires.</summary>
+    /// <summary>Creates the native cancel token for a cancellable launcher
+    /// and cancels it when the caller's <see cref="CancellationToken"/>
+    /// fires.</summary>
     internal IntPtr CancelToken()
     {
         _token = NativeMethods.CancelTokenCreate();
@@ -485,6 +779,24 @@ internal sealed class FfiCall<T>
             _registration = _cancellation.Register(static state => ((FfiCall<T>)state!).Cancel(), this);
         }
         return _token;
+    }
+
+    /// <summary>The task, once the launcher returned. A call without a native
+    /// cancel token stops waiting when the caller's token fires.</summary>
+    internal Task<T> Launched()
+    {
+        if (_token == IntPtr.Zero && _cancellation.CanBeCanceled)
+        {
+            lock (_gate)
+            {
+                if (!_completed)
+                {
+                    _registration = _cancellation.Register(
+                        static state => ((FfiCall<T>)state!).StopWaiting(), this);
+                }
+            }
+        }
+        return _tcs.Task;
     }
 
     /// <summary>Recovers the call behind a completion's <c>context</c>. Runs
@@ -506,9 +818,14 @@ internal sealed class FfiCall<T>
         Release();
     }
 
+    /// <summary>Completes the task with the call's result. When the caller
+    /// stopped waiting, a disposable result is disposed instead.</summary>
     internal void SetResult(T value)
     {
-        _tcs.TrySetResult(value);
+        if (!_tcs.TrySetResult(value) && value is IDisposable disposable)
+        {
+            disposable.Dispose();
+        }
     }
 
     internal void SetException(Exception e)
@@ -518,10 +835,10 @@ internal sealed class FfiCall<T>
 
     /// <summary>Faults (or cancels, for the cancelled code) the task from a
     /// heap-boxed error, releasing the box.</summary>
-    internal unsafe void SetError(FfiError* err, FfiErrorMap map)
+    internal unsafe void SetError(FfiError* err, delegate*<int, string, FfiBufferReader, Exception> map)
     {
-        var e = Ffi.TakeBoxedError(err, map, out var code);
-        if (code == {{EXCEPTION}}.CancelledErrorCode)
+        var e = Ffi.TakeBoxedError(err, map);
+        if (e is OperationCanceledException)
         {
             _tcs.TrySetCanceled(_cancellation);
         }
@@ -529,6 +846,11 @@ internal sealed class FfiCall<T>
         {
             _tcs.TrySetException(e);
         }
+    }
+
+    private void StopWaiting()
+    {
+        _tcs.TrySetCanceled(_cancellation);
     }
 
     // The registration callback and the completion race: whichever runs
@@ -559,10 +881,6 @@ internal sealed class FfiCall<T>
 
     private void Release()
     {
-        if (_token == IntPtr.Zero)
-        {
-            return;
-        }
         bool destroy;
         lock (_gate)
         {
@@ -572,7 +890,10 @@ internal sealed class FfiCall<T>
         if (destroy)
         {
             _registration.Dispose();
-            NativeMethods.CancelTokenDestroy(_token);
+            if (_token != IntPtr.Zero)
+            {
+                NativeMethods.CancelTokenDestroy(_token);
+            }
         }
     }
 }
@@ -600,16 +921,41 @@ internal sealed unsafe class FfiIteratorHandle : SafeHandle
     }
 }
 
-/// <summary>A lazily streamed sequence backed by a native iterator. It can be
-/// enumerated once; each <c>MoveNext</c> pulls one item.</summary>
-internal sealed unsafe class FfiSequence<T> : IEnumerable<T>, IEnumerator<T>
+/// <summary>A lazily streamed sequence backed by native iterators. Each
+/// enumeration launches a new native iterator (so a launch failure throws
+/// from <c>GetEnumerator</c>), and each <c>MoveNext</c> pulls one
+/// item.</summary>
+internal sealed unsafe class FfiSequence<T> : IEnumerable<T>
+{
+    private readonly Func<FfiIteratorHandle> _launch;
+    private readonly delegate*<FfiIteratorHandle, out T, bool> _next;
+
+    internal FfiSequence(Func<FfiIteratorHandle> launch, delegate*<FfiIteratorHandle, out T, bool> next)
+    {
+        _launch = launch;
+        _next = next;
+    }
+
+    public IEnumerator<T> GetEnumerator()
+    {
+        return new FfiEnumerator<T>(_launch(), _next);
+    }
+
+    IEnumerator IEnumerable.GetEnumerator()
+    {
+        return GetEnumerator();
+    }
+}
+
+/// <summary>One enumeration of an <see cref="FfiSequence{T}"/>: owns its
+/// native iterator, released on exhaustion or disposal.</summary>
+internal sealed unsafe class FfiEnumerator<T> : IEnumerator<T>
 {
     private readonly FfiIteratorHandle _iterator;
     private readonly delegate*<FfiIteratorHandle, out T, bool> _next;
-    private int _started;
     private T _current = default!;
 
-    internal FfiSequence(FfiIteratorHandle iterator, delegate*<FfiIteratorHandle, out T, bool> next)
+    internal FfiEnumerator(FfiIteratorHandle iterator, delegate*<FfiIteratorHandle, out T, bool> next)
     {
         _iterator = iterator;
         _next = next;
@@ -618,20 +964,6 @@ internal sealed unsafe class FfiSequence<T> : IEnumerable<T>, IEnumerator<T>
     public T Current => _current;
 
     object? IEnumerator.Current => _current;
-
-    public IEnumerator<T> GetEnumerator()
-    {
-        if (Interlocked.Exchange(ref _started, 1) != 0)
-        {
-            throw new InvalidOperationException("this sequence can be enumerated only once");
-        }
-        return this;
-    }
-
-    IEnumerator IEnumerable.GetEnumerator()
-    {
-        return GetEnumerator();
-    }
 
     public bool MoveNext()
     {
@@ -643,13 +975,14 @@ internal sealed unsafe class FfiSequence<T> : IEnumerable<T>, IEnumerator<T>
         {
             return true;
         }
+        _current = default!;
         _iterator.Dispose();
         return false;
     }
 
     public void Reset()
     {
-        throw new NotSupportedException("a native iterator can't be reset");
+        throw new NotSupportedException("a native iterator can't be reset; enumerate the sequence again");
     }
 
     public void Dispose()
@@ -659,10 +992,11 @@ internal sealed unsafe class FfiSequence<T> : IEnumerable<T>, IEnumerator<T>
 }
 
 /// <summary>Serializes values into the value-buffer wire format
-/// (little-endian, packed).</summary>
-internal sealed class FfiBufferWriter
+/// (little-endian, packed) in a pooled buffer, returned on
+/// <see cref="Dispose"/>.</summary>
+internal sealed class FfiBufferWriter : IDisposable
 {
-    private byte[] _buf = new byte[64];
+    private byte[] _buf = ArrayPool<byte>.Shared.Rent(256);
     private int _len;
 
     /// <summary>The bytes written so far.</summary>
@@ -671,11 +1005,28 @@ internal sealed class FfiBufferWriter
     /// <summary>The number of bytes written so far.</summary>
     internal int Length => _len;
 
+    public void Dispose()
+    {
+        var buf = _buf;
+        _buf = Array.Empty<byte>();
+        _len = 0;
+        if (buf.Length > 0)
+        {
+            ArrayPool<byte>.Shared.Return(buf);
+        }
+    }
+
     private Span<byte> Grow(int extra)
     {
         if (_len + extra > _buf.Length)
         {
-            Array.Resize(ref _buf, Math.Max(_buf.Length * 2, _len + extra));
+            var grown = ArrayPool<byte>.Shared.Rent(Math.Max(_buf.Length * 2, _len + extra));
+            _buf.AsSpan(0, _len).CopyTo(grown);
+            if (_buf.Length > 0)
+            {
+                ArrayPool<byte>.Shared.Return(_buf);
+            }
+            _buf = grown;
         }
         var span = _buf.AsSpan(_len, extra);
         _len += extra;
@@ -688,23 +1039,23 @@ internal sealed class FfiBufferWriter
 
     internal void WriteU8(byte v) => Grow(1)[0] = v;
 
-    internal void WriteI16(short v) => System.Buffers.Binary.BinaryPrimitives.WriteInt16LittleEndian(Grow(2), v);
+    internal void WriteI16(short v) => BinaryPrimitives.WriteInt16LittleEndian(Grow(2), v);
 
-    internal void WriteU16(ushort v) => System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(Grow(2), v);
+    internal void WriteU16(ushort v) => BinaryPrimitives.WriteUInt16LittleEndian(Grow(2), v);
 
-    internal void WriteI32(int v) => System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(Grow(4), v);
+    internal void WriteI32(int v) => BinaryPrimitives.WriteInt32LittleEndian(Grow(4), v);
 
-    internal void WriteU32(uint v) => System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(Grow(4), v);
+    internal void WriteU32(uint v) => BinaryPrimitives.WriteUInt32LittleEndian(Grow(4), v);
 
-    internal void WriteI64(long v) => System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(Grow(8), v);
+    internal void WriteI64(long v) => BinaryPrimitives.WriteInt64LittleEndian(Grow(8), v);
 
-    internal void WriteU64(ulong v) => System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(Grow(8), v);
+    internal void WriteU64(ulong v) => BinaryPrimitives.WriteUInt64LittleEndian(Grow(8), v);
 
-    internal void WriteF32(float v) => System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(Grow(4), v);
+    internal void WriteF32(float v) => BinaryPrimitives.WriteSingleLittleEndian(Grow(4), v);
 
-    internal void WriteF64(double v) => System.Buffers.Binary.BinaryPrimitives.WriteDoubleLittleEndian(Grow(8), v);
+    internal void WriteF64(double v) => BinaryPrimitives.WriteDoubleLittleEndian(Grow(8), v);
 
-    internal void WriteLen(int len) => WriteU32((uint)len);
+    private void WriteLen(int len) => WriteU32((uint)len);
 
     internal void WriteString(string v)
     {
@@ -722,21 +1073,61 @@ internal sealed class FfiBufferWriter
     /// <summary>Writes an object token. The token must carry its own strong
     /// reference (a fresh clone), which the reader adopts.</summary>
     internal void WriteObject(IntPtr token) => WriteU64((ulong)(nuint)token);
+
+    internal void WriteList<T>(IReadOnlyList<T> value, Action<FfiBufferWriter, T> write)
+    {
+        WriteLen(value.Count);
+        for (var i = 0; i < value.Count; i++)
+        {
+            write(this, value[i]);
+        }
+    }
+
+    internal void WriteMap<K, V>(IReadOnlyDictionary<K, V> value, Action<FfiBufferWriter, K> writeKey, Action<FfiBufferWriter, V> writeValue)
+    {
+        WriteLen(value.Count);
+        foreach (var entry in value)
+        {
+            writeKey(this, entry.Key);
+            writeValue(this, entry.Value);
+        }
+    }
+
+    internal void WriteOptional<T>(T? value, Action<FfiBufferWriter, T> write) where T : class
+    {
+        WriteBool(value is not null);
+        if (value is not null)
+        {
+            write(this, value);
+        }
+    }
+
+    internal void WriteOptionalValue<T>(T? value, Action<FfiBufferWriter, T> write) where T : struct
+    {
+        WriteBool(value.HasValue);
+        if (value is { } present)
+        {
+            write(this, present);
+        }
+    }
 }
 
-/// <summary>Decodes values from the value-buffer wire format. A malformed
-/// buffer is a bug on the side that encoded it and throws
-/// <see cref="{{BUG_EXCEPTION}}"/> with the marshalling code.</summary>
-internal sealed class FfiBufferReader
+/// <summary>Decodes values from a native value buffer, in place. The buffer
+/// must stay alive while it's read. A malformed buffer is a bug on the side
+/// that encoded it and throws <see cref="{{BUG_EXCEPTION}}"/> with the
+/// marshalling code.</summary>
+internal sealed unsafe class FfiBufferReader
 {
     private static readonly Encoding Utf8Strict = new UTF8Encoding(false, true);
 
-    private readonly byte[] _data;
+    private readonly byte* _data;
+    private readonly int _len;
     private int _pos;
 
-    internal FfiBufferReader(byte[] data)
+    internal FfiBufferReader(byte* data, nuint len)
     {
-        _data = data;
+        _data = len == 0 ? null : data;
+        _len = checked((int)len);
     }
 
     /// <summary>The exception for a buffer that breaks the wire
@@ -748,11 +1139,11 @@ internal sealed class FfiBufferReader
 
     private ReadOnlySpan<byte> Take(int n)
     {
-        if (_data.Length - _pos < n)
+        if (_len - _pos < n)
         {
             throw Malformed("buffer exhausted");
         }
-        var span = _data.AsSpan(_pos, n);
+        var span = new ReadOnlySpan<byte>(_data + _pos, n);
         _pos += n;
         return span;
     }
@@ -771,26 +1162,26 @@ internal sealed class FfiBufferReader
 
     internal byte ReadU8() => Take(1)[0];
 
-    internal short ReadI16() => System.Buffers.Binary.BinaryPrimitives.ReadInt16LittleEndian(Take(2));
+    internal short ReadI16() => BinaryPrimitives.ReadInt16LittleEndian(Take(2));
 
-    internal ushort ReadU16() => System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(Take(2));
+    internal ushort ReadU16() => BinaryPrimitives.ReadUInt16LittleEndian(Take(2));
 
-    internal int ReadI32() => System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(Take(4));
+    internal int ReadI32() => BinaryPrimitives.ReadInt32LittleEndian(Take(4));
 
-    internal uint ReadU32() => System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(Take(4));
+    internal uint ReadU32() => BinaryPrimitives.ReadUInt32LittleEndian(Take(4));
 
-    internal long ReadI64() => System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(Take(8));
+    internal long ReadI64() => BinaryPrimitives.ReadInt64LittleEndian(Take(8));
 
-    internal ulong ReadU64() => System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(Take(8));
+    internal ulong ReadU64() => BinaryPrimitives.ReadUInt64LittleEndian(Take(8));
 
-    internal float ReadF32() => System.Buffers.Binary.BinaryPrimitives.ReadSingleLittleEndian(Take(4));
+    internal float ReadF32() => BinaryPrimitives.ReadSingleLittleEndian(Take(4));
 
-    internal double ReadF64() => System.Buffers.Binary.BinaryPrimitives.ReadDoubleLittleEndian(Take(8));
+    internal double ReadF64() => BinaryPrimitives.ReadDoubleLittleEndian(Take(8));
 
     /// <summary>A collection count. Elements can be zero-sized, so the count
-    /// isn't checked against the remaining bytes; callers cap their
-    /// preallocation with <see cref="Capacity"/>.</summary>
-    internal int ReadLen()
+    /// isn't checked against the remaining bytes; collections cap their
+    /// preallocation instead.</summary>
+    private int ReadLen()
     {
         var len = ReadU32();
         if (len > int.MaxValue)
@@ -800,10 +1191,6 @@ internal sealed class FfiBufferReader
         return (int)len;
     }
 
-    /// <summary>A preallocation size for <paramref name="count"/> elements
-    /// that a malformed count can't inflate.</summary>
-    internal int Capacity(int count) => Math.Min(count, _data.Length - _pos);
-
     internal string ReadString()
     {
         var bytes = Take(ReadLen());
@@ -811,7 +1198,7 @@ internal sealed class FfiBufferReader
         {
             return Utf8Strict.GetString(bytes);
         }
-        catch (ArgumentException)
+        catch (DecoderFallbackException)
         {
             throw Malformed("string is not valid UTF-8");
         }
@@ -830,11 +1217,60 @@ internal sealed class FfiBufferReader
         return (IntPtr)(nint)token;
     }
 
+    internal T[] ReadList<T>(Func<FfiBufferReader, T> read)
+    {
+        var count = ReadLen();
+        if (count == 0)
+        {
+            return Array.Empty<T>();
+        }
+        // A malformed count can't inflate the allocation past the input.
+        var items = new List<T>(Math.Min(count, _len - _pos));
+        for (var i = 0; i < count; i++)
+        {
+            items.Add(read(this));
+        }
+        return items.ToArray();
+    }
+
+    internal Dictionary<K, V> ReadMap<K, V>(Func<FfiBufferReader, K> readKey, Func<FfiBufferReader, V> readValue) where K : notnull
+    {
+        var count = ReadLen();
+        var map = new Dictionary<K, V>(Math.Min(count, _len - _pos));
+        for (var i = 0; i < count; i++)
+        {
+            var key = readKey(this);
+            if (!map.TryAdd(key, readValue(this)))
+            {
+                throw Malformed("repeated map key");
+            }
+        }
+        return map;
+    }
+
+    internal T? ReadOptional<T>(Func<FfiBufferReader, T> read) where T : class
+    {
+        return ReadBool() ? read(this) : null;
+    }
+
+    internal T? ReadOptionalValue<T>(Func<FfiBufferReader, T> read) where T : struct
+    {
+        return ReadBool() ? read(this) : null;
+    }
+
     internal void ExpectEnd()
     {
-        if (_pos != _data.Length)
+        if (_pos != _len)
         {
             throw Malformed("trailing bytes");
         }
+    }
+
+    /// <summary>Returns <paramref name="value"/>, read from this buffer,
+    /// after checking that nothing trails it.</summary>
+    internal T End<T>(T value)
+    {
+        ExpectEnd();
+        return value;
     }
 }

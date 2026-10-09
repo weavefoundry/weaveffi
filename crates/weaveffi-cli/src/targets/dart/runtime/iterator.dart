@@ -7,5 +7,3 @@
 /// eagerly instead, so the iterator is destroyed exactly once either way.
 final class _IteratorAnchor implements Finalizable {}
 
-/// The `out_item` slot iterator steps write, wide enough for any element.
-final Pointer<Int64> _outItem = calloc<Int64>();

@@ -12,23 +12,6 @@
 //! stays in full control of the exact text it emits while losing the manual
 //! `\n`/indent bookkeeping. Output is byte-deterministic: blank lines never
 //! carry trailing whitespace, and the indent unit is fixed per writer.
-//!
-//! ```
-//! use weaveffi_cli::codegen::writer::CodeWriter;
-//!
-//! let mut w = CodeWriter::new("    ");
-//! w.line("class Greeter:");
-//! w.scope(|w| {
-//!     w.line("def hello(self):");
-//!     w.scope(|w| {
-//!         w.line("return \"hi\"");
-//!     });
-//! });
-//! assert_eq!(
-//!     w.finish(),
-//!     "class Greeter:\n    def hello(self):\n        return \"hi\"\n",
-//! );
-//! ```
 
 use crate::codegen::common::{emit_doc, DocCommentStyle};
 
@@ -39,6 +22,23 @@ use crate::codegen::common::{emit_doc, DocCommentStyle};
 /// with [`scope`](Self::scope) / [`block`](Self::block), splice pre-rendered
 /// multi-line text with [`block_raw`](Self::block_raw), and finish with
 /// [`finish`](Self::finish).
+///
+/// ```
+/// use weaveffi_cli::codegen::CodeWriter;
+///
+/// let mut w = CodeWriter::new("    ");
+/// w.line("class Greeter:");
+/// w.scope(|w| {
+///     w.line("def hello(self):");
+///     w.scope(|w| {
+///         w.line("return \"hi\"");
+///     });
+/// });
+/// assert_eq!(
+///     w.finish(),
+///     "class Greeter:\n    def hello(self):\n        return \"hi\"\n",
+/// );
+/// ```
 #[derive(Debug, Clone)]
 pub struct CodeWriter {
     buf: String,
@@ -188,7 +188,7 @@ impl CodeWriter {
     /// block.
     ///
     /// ```
-    /// use weaveffi_cli::codegen::writer::CodeWriter;
+    /// use weaveffi_cli::codegen::CodeWriter;
     /// let mut w = CodeWriter::four_space();
     /// w.block("fn main() {", "}", |w| {
     ///     w.line("println!(\"hi\");");
@@ -211,7 +211,7 @@ impl CodeWriter {
     /// No-op when `doc` is `None` or trims to empty. Mirrors [`emit_doc`],
     /// but indents from the writer's current depth instead of an explicit
     /// prefix argument.
-    pub fn doc(&mut self, doc: &Option<String>, style: DocCommentStyle) -> &mut Self {
+    pub(crate) fn doc(&mut self, doc: &Option<String>, style: DocCommentStyle) -> &mut Self {
         let prefix = self.unit.repeat(self.depth);
         emit_doc(&mut self.buf, doc, &prefix, style);
         self

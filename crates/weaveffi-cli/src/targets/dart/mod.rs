@@ -1,23 +1,29 @@
 //! Dart (`dart:ffi`) binding generator.
 //!
-//! Emits a standalone Dart package (`pubspec.yaml`, `README.md`, and
-//! `lib/{package}.dart`) whose bindings call the C ABI through `dart:ffi`.
-//! The package is named after the identity's C prefix and loads the
-//! identity's library, honoring the `{PREFIX}_LIBRARY` override. On first use
-//! the library's ABI revision and every top-level module's contract table
-//! are verified.
+//! Emits a standalone Dart package: `pubspec.yaml`, `README.md`, and one
+//! library, `lib/{package}.dart`, whose parts live under `lib/src/`: the
+//! runtime sections under `lib/src/runtime/` and one file per module
+//! (`lib/src/kitchen.dart`, `lib/src/kitchen/nested.dart`). The package is
+//! named after the identity's C prefix and loads the identity's library,
+//! honoring the `{PREFIX}_LIBRARY` override. On first use the library's ABI
+//! revision and every top-level module's contract table are verified, and a
+//! mismatch throws a catchable `NativeLibraryException`.
 //!
 //! Records and rich enums are value types: plain Dart classes (a sealed
 //! hierarchy for a rich enum) with value equality that cross the ABI
-//! serialized in the value buffer format. Interfaces are wrapper classes
-//! owning one strong reference, released by `dispose()` or a
-//! `NativeFinalizer`, and guarded so a `dispose()` during an in-flight call
-//! defers the release until the call returns. Async functions return a
-//! `Future` completed by a `NativeCallable.listener`; cancellable ones take a
-//! `CancelToken`. Callback interfaces are abstract classes: value-returning
-//! methods are isolate-local trampolines (callable only on the isolate's
-//! thread), and void methods are isolate-group-bound forwarders that may run
-//! on any thread and deliver the call on the isolate's event loop.
+//! serialized in the value buffer format. Optional scalars cross as a
+//! presence flag and a value, and numeric lists as C arrays. Interfaces are
+//! wrapper classes owning one strong reference, released by `dispose()` or
+//! a `NativeFinalizer`, and guarded so a `dispose()` during an in-flight
+//! call defers the release until the call returns. Every call runs in its
+//! own pooled frame of native out slots, so calls nested in callbacks never
+//! share state. Async functions return a `Future` completed by a
+//! `NativeCallable.listener`; cancellable ones take a `CancelToken`.
+//! Callback interfaces are abstract classes: value-returning methods are
+//! isolate-local trampolines on a thread-affine vtable (the producer refuses
+//! to call them off the isolate's thread), and void methods are
+//! isolate-group-bound forwarders that may run on any thread and deliver the
+//! call on the isolate's event loop.
 
 mod callbacks;
 mod calls;
@@ -33,28 +39,36 @@ mod tests;
 
 use std::collections::BTreeSet;
 
-use crate::backend::{LanguageBackend, OutputFile};
+use crate::codegen::errors::{tables as error_tables, ErrorTable};
 use crate::codegen::CodeWriter;
+use crate::codegen::OutputFile;
 use crate::package::{per_platform_libraries, Artifact, PackageContext, PackagedFile};
+use crate::targets::Target;
 use crate::utils::{render_prelude, render_trailer, CommentStyle};
-use camino::Utf8Path;
+use camino::Utf8PathBuf;
+use miette::Result;
 use serde::{Deserialize, Serialize};
-use weaveffi_model::model::Model;
+use weaveffi_model::model::{Model, ModuleBinding};
 
-use crate::targets::dart::callbacks::render_callback_interface;
-use crate::targets::dart::calls::{emit_bindings, emit_wrapper, DartDecl, ErrCtx};
+use crate::targets::dart::callbacks::{render_callback_interface, reported_domains};
+use crate::targets::dart::calls::{emit_bindings, emit_wrapper, DartDecl};
 use crate::targets::dart::codec::render_codecs;
-use crate::targets::dart::entities::{
-    dart_exception_name, render_enum, render_error, render_interface, render_struct,
-};
+use crate::targets::dart::docs::Docs;
+use crate::targets::dart::entities::{render_enum, render_error, render_interface, render_struct};
 use crate::targets::dart::package::{render_packaged_readme, render_pubspec, render_readme};
-use crate::targets::dart::runtime::{bundles_platform, render_runtime, Bundle};
-use crate::targets::dart::types::dart_ident;
+use crate::targets::dart::runtime::{bundles_platform, runtime_parts, Bundle};
+use crate::targets::dart::types::{dart_ident, dart_str_literal};
 
 /// The lowest Dart SDK the generated bindings support:
 /// `NativeCallable.isolateGroupBound`, which delivers void callback methods
 /// from any thread, first shipped in Dart 3.10.
 pub const MIN_DART_SDK: &str = "3.10.0";
+
+/// The `ignore_for_file` line every part carries: private codec names use
+/// the shared composite stems (`_pack_list_i32`), and a runtime section an
+/// API doesn't fully use leaves private helpers unreferenced.
+const IGNORES: &str = "// ignore_for_file: camel_case_types, non_constant_identifier_names, \
+     unused_element, unused_field";
 
 /// Per-target configuration for [`DartGenerator`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,14 +102,189 @@ impl DartConfig {
 }
 
 /// The Dart backend.
-pub struct DartGenerator;
+pub struct DartGenerator {
+    config: DartConfig,
+}
 
-/// Render `lib/{package}.dart`: imports, the runtime sections the API uses,
-/// the composite codecs, then every module's declarations.
-fn render_library(model: &Model, package: &str, bundle: &Bundle, file_name: &str) -> String {
+impl From<DartConfig> for DartGenerator {
+    fn from(config: DartConfig) -> Self {
+        Self { config }
+    }
+}
+
+/// The part file of `module`, relative to `lib/`: one file per module,
+/// nested by module path (`src/kitchen.dart`, `src/kitchen/nested.dart`).
+/// A top-level module named `runtime` is `src/runtime_.dart`, so its
+/// submodules can't land among the runtime sections.
+fn module_part(module: &ModuleBinding) -> Utf8PathBuf {
+    let mut path = Utf8PathBuf::from("src");
+    for (i, segment) in module.segments.iter().enumerate() {
+        if i == 0 && segment == "runtime" {
+            path.push("runtime_");
+        } else {
+            path.push(segment);
+        }
+    }
+    path.set_extension("dart");
+    path
+}
+
+/// Wrap a part's body: the prelude, the analyzer ignores, the `part of`
+/// directive (relative to the part), and the trailer.
+fn part_file(package: &str, rel: &Utf8PathBuf, body: &str) -> String {
+    let depth = rel.components().count() - 1;
+    let file = rel.file_name().expect("a part file name");
+    let mut out = render_prelude(CommentStyle::DoubleSlash);
+    out.push_str(IGNORES);
+    out.push('\n');
+    out.push_str(&format!(
+        "part of '{}{package}.dart';\n\n",
+        "../".repeat(depth)
+    ));
+    out.push_str(body.trim_end());
+    out.push_str("\n\n");
+    out.push_str(&render_trailer(CommentStyle::DoubleSlash, file));
+    out
+}
+
+/// One module's declarations: its error domains, enums, records, callback
+/// interfaces, interfaces, and functions.
+fn render_module(
+    model: &Model,
+    docs: &Docs,
+    module: &ModuleBinding,
+    errors: &[&ErrorTable],
+    reported: &BTreeSet<String>,
+    leaf: bool,
+) -> String {
+    let mut w = CodeWriter::two_space();
+    w.line(format!("// ── Module `{}` ──", module.dot_path));
+    if let Some(doc) = module
+        .doc
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        w.line("//");
+        for line in doc.lines() {
+            w.line(format!("// {line}").trim_end());
+        }
+    }
+    for table in errors {
+        render_error(&mut w, docs, table, reported.contains(&table.domain.name));
+    }
+    for e in &module.enums {
+        render_enum(&mut w, docs, e);
+    }
+    for s in &module.structs {
+        render_struct(&mut w, docs, s);
+    }
+    for cb in &module.callback_interfaces {
+        render_callback_interface(&mut w, model, docs, cb);
+    }
+    for i in &module.interfaces {
+        render_interface(&mut w, model, docs, i, leaf);
+    }
+    for f in &module.functions {
+        emit_bindings(&mut w, f, leaf);
+        emit_wrapper(
+            &mut w,
+            model,
+            docs,
+            f,
+            &DartDecl::TopLevel,
+            &dart_ident(&f.name),
+        );
+    }
+    w.finish()
+}
+
+/// Whether a module declares anything (a module with only submodules has
+/// no part of its own).
+fn declares_anything(m: &ModuleBinding) -> bool {
+    !(m.errors.is_empty()
+        && m.enums.is_empty()
+        && m.structs.is_empty()
+        && m.callback_interfaces.is_empty()
+        && m.interfaces.is_empty()
+        && m.functions.is_empty())
+}
+
+/// Render the library: `lib/{package}.dart` and its parts, as paths
+/// relative to the package root.
+fn render_library(model: &Model, package: &str, bundle: &Bundle) -> Vec<(Utf8PathBuf, String)> {
+    let mut parts: Vec<(Utf8PathBuf, String)> = Vec::new();
+    for (file, body) in runtime_parts(model, package, bundle) {
+        parts.push((Utf8PathBuf::from("src/runtime").join(file), body));
+    }
+    let mut codecs = CodeWriter::two_space();
+    render_codecs(&mut codecs, model);
+    if !codecs.is_empty() {
+        let body = format!(
+            "// ── Composite codecs ──\n// One writer and reader per optional, list, or map type that crosses\n// inside a value buffer.\n{}",
+            codecs.finish()
+        );
+        parts.push(("src/runtime/composites.dart".into(), body));
+    }
+
+    // Synchronous calls are leaf calls only when no callback interface
+    // exists, so no call can re-enter Dart.
+    let leaf = !model.has_callback_interfaces();
+    let docs = Docs::new(model);
+    let reported = reported_domains(model);
+    let errors = error_tables(model, "Exception");
+    for module in model.modules.iter().filter(|m| declares_anything(m)) {
+        let mine: Vec<&ErrorTable> = errors
+            .iter()
+            .filter(|t| t.module.index == module.index)
+            .collect();
+        let body = render_module(model, &docs, module, &mine, &reported, leaf);
+        parts.push((module_part(module), body));
+    }
+
+    let mut files: Vec<(Utf8PathBuf, String)> = parts
+        .iter()
+        .map(|(rel, body)| {
+            (
+                Utf8PathBuf::from("lib").join(rel),
+                part_file(package, rel, body),
+            )
+        })
+        .collect();
+    let main = render_main(model, package, bundle, parts.iter().map(|(rel, _)| rel));
+    files.insert(0, (Utf8PathBuf::from(format!("lib/{package}.dart")), main));
+    files
+}
+
+/// `lib/{package}.dart`: the library's doc comment, its imports, and its
+/// parts.
+fn render_main<'a>(
+    model: &Model,
+    package: &str,
+    bundle: &Bundle,
+    parts: impl Iterator<Item = &'a Utf8PathBuf>,
+) -> String {
     let mut w = CodeWriter::two_space();
     w.raw(render_prelude(CommentStyle::DoubleSlash));
-    w.line("// ignore_for_file: camel_case_types, non_constant_identifier_names, unused_element");
+    let identity = &model.identity;
+    if let Some(description) = identity.description.as_deref().map(str::trim) {
+        for line in description.lines() {
+            w.line(format!("/// {line}").trim_end());
+        }
+        w.line("///");
+    }
+    w.line(format!(
+        "/// `dart:ffi` bindings for the `{}` native library.",
+        identity.name
+    ));
+    w.line("///");
+    w.line(format!(
+        "/// The library loads on first use (set `{}` to its path to pick a",
+        identity.library_env_var()
+    ));
+    w.line("/// build); a library that can't be loaded or doesn't match these");
+    w.line("/// bindings throws a [NativeLibraryException].");
+    w.line("library;");
     w.blank();
     let callbacks = model.has_callback_interfaces();
     let bundled = matches!(bundle, Bundle::Packaged { .. });
@@ -115,110 +304,68 @@ fn render_library(model: &Model, package: &str, bundle: &Bundle, file_name: &str
     w.line("import 'dart:typed_data';");
     w.blank();
     w.line("import 'package:ffi/ffi.dart';");
-
-    render_runtime(&mut w, model, package, bundle);
-    render_codecs(&mut w, model);
-
-    // Synchronous calls are leaf calls only when no callback interface
-    // exists, so no call can re-enter Dart.
-    let leaf = !callbacks;
-    let reported = reported_domains(model);
-    for module in &model.modules {
-        let exception = model
-            .error_domain(module)
-            .map(|e| dart_exception_name(&e.type_name));
-        let exception = exception.as_deref();
-        if let Some(e) = module.errors.as_ref() {
-            render_error(&mut w, module, e, reported.contains(&e.type_name));
-        }
-        for e in &module.enums {
-            render_enum(&mut w, e);
-        }
-        for s in &module.structs {
-            render_struct(&mut w, s);
-        }
-        for cb in &module.callback_interfaces {
-            render_callback_interface(&mut w, cb, exception);
-        }
-        for i in &module.interfaces {
-            render_interface(&mut w, exception, i, leaf);
-        }
-        for f in &module.functions {
-            emit_bindings(&mut w, f, leaf);
-            emit_wrapper(
-                &mut w,
-                f,
-                &DartDecl::TopLevel,
-                &dart_ident(&f.name),
-                ErrCtx::of(f, exception),
-            );
-        }
+    w.blank();
+    for rel in parts {
+        w.line(format!("part '{}';", dart_str_literal(rel.as_str())));
     }
     w.blank();
-    w.raw(render_trailer(CommentStyle::DoubleSlash, file_name));
+    w.raw(render_trailer(
+        CommentStyle::DoubleSlash,
+        &format!("{package}.dart"),
+    ));
     w.finish()
 }
 
-/// The error domains (by type name) that a value-returning callback method
-/// declared `throws` reports, which need an encoder for their fields.
-fn reported_domains(model: &Model) -> BTreeSet<String> {
-    model
-        .modules
-        .iter()
-        .filter(|m| {
-            m.callback_interfaces
-                .iter()
-                .flat_map(|cb| &cb.methods)
-                .any(|f| f.throws && f.ret.is_some())
-        })
-        .filter_map(|m| model.error_domain(m))
-        .map(|e| e.type_name.clone())
-        .collect()
-}
-
-impl LanguageBackend for DartGenerator {
-    type Config = DartConfig;
-
+impl Target for DartGenerator {
     fn name(&self) -> &'static str {
         "dart"
     }
 
-    fn files(&self, model: &Model, out_dir: &Utf8Path, config: &Self::Config) -> Vec<OutputFile> {
-        let package = config.package_name(model);
-        let dir = out_dir.join("dart");
-        let file = format!("{package}.dart");
-        vec![
-            OutputFile::new(
-                dir.join("lib").join(&file),
-                render_library(model, &package, &Bundle::None, &file),
-            ),
-            OutputFile::new(
-                dir.join("pubspec.yaml"),
-                render_pubspec(&model.identity, &package, &config.sdk),
-            ),
-            OutputFile::new(
-                dir.join("README.md"),
-                render_readme(&model.identity, &package, &config.sdk),
-            ),
+    fn fixed_files(&self) -> &'static [&'static str] {
+        &[
+            "README.md",
+            "pubspec.yaml",
+            "loader.dart",
+            "core.dart",
+            "object.dart",
+            "codec.dart",
+            "arrays.dart",
+            "async.dart",
+            "cancel.dart",
+            "callbacks.dart",
+            "iterator.dart",
         ]
+    }
+
+    fn render(&self, model: &Model) -> Vec<OutputFile> {
+        let config = &self.config;
+        let package = config.package_name(model);
+        let mut files: Vec<OutputFile> = render_library(model, &package, &Bundle::None)
+            .into_iter()
+            .map(|(path, contents)| OutputFile::new(path, contents))
+            .collect();
+        files.push(OutputFile::new(
+            "pubspec.yaml",
+            render_pubspec(&model.identity, &package, &config.sdk),
+        ));
+        files.push(OutputFile::new(
+            "README.md",
+            render_readme(&model.identity, &package, &config.sdk),
+        ));
+        files
     }
 
     /// A pub package directory at `dart/{package}/` with the desktop
     /// libraries under `native/<platform>/`, which the loader tries (relative
     /// to the package, then to the working directory) before the system
     /// search path.
-    fn package(
-        &self,
-        model: &Model,
-        ctx: &PackageContext,
-        config: &Self::Config,
-    ) -> Option<Vec<Artifact>> {
+    fn package(&self, model: &Model, ctx: &PackageContext<'_>) -> Result<Vec<Artifact>> {
+        let config = &self.config;
         let natives = per_platform_libraries(ctx.binaries, "native", bundles_platform);
         if natives.is_empty() {
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
         let package = config.package_name(model);
-        let file = format!("{package}.dart");
         let bundle = Bundle::Packaged {
             lib: &ctx.binaries.lib_name,
             platforms: ctx
@@ -227,18 +374,19 @@ impl LanguageBackend for DartGenerator {
                 .filter(|p| bundles_platform(*p))
                 .collect(),
         };
-        let mut files = vec![
-            PackagedFile::text(
-                format!("lib/{file}"),
-                render_library(model, &package, &bundle, &file),
-            ),
-            PackagedFile::text(
-                "pubspec.yaml",
-                render_pubspec(&model.identity, &package, &config.sdk),
-            ),
-            PackagedFile::text("README.md", render_packaged_readme(&model.identity, ctx)),
-        ];
+        let mut files: Vec<PackagedFile> = render_library(model, &package, &bundle)
+            .into_iter()
+            .map(|(path, contents)| PackagedFile::text(path, contents))
+            .collect();
+        files.push(PackagedFile::text(
+            "pubspec.yaml",
+            render_pubspec(&model.identity, &package, &config.sdk),
+        ));
+        files.push(PackagedFile::text(
+            "README.md",
+            render_packaged_readme(&model.identity, ctx),
+        ));
         files.extend(natives);
-        Some(vec![Artifact::directory(format!("dart/{package}"), files)])
+        Ok(vec![Artifact::directory(format!("dart/{package}"), files)])
     }
 }

@@ -30,7 +30,7 @@ weaveffi = { path = "crates/weaveffi", version = "0.25.0" }
 weaveffi-macros = { path = "crates/weaveffi-macros", version = "0.25.0" }
 weaveffi-model = { path = "crates/weaveffi-model", version = "0.25.0", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.9"
+serde_yaml_ng = "0.10"
 serde_json = "1.0"
 toml = "0.8"
 thiserror = "1.0"

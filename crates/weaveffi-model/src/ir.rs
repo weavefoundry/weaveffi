@@ -3,8 +3,8 @@
 //!
 //! This is the *document* model: [`Api`] is the root and owns a forest of
 //! [`Module`]s, each grouping [`Function`]s, [`InterfaceDef`]s,
-//! [`CallbackInterfaceDef`]s, [`StructDef`]s, [`EnumDef`]s, and an optional
-//! [`ErrorDomain`]. Types are referenced throughout by [`TypeRef`], which
+//! [`CallbackInterfaceDef`]s, [`StructDef`]s, [`EnumDef`]s, and
+//! [`ErrorDomain`]s. Types are referenced throughout by [`TypeRef`], which
 //! (de)serializes as a compact string (`i32`, `[string]`, `{string:i32}`,
 //! `Contact?`, and so on) rather than as a tagged object.
 //!
@@ -39,7 +39,7 @@ use crate::ty::Prim;
 ///
 /// See [`docs/src/stability.md`](https://github.com/weavefoundry/weaveffi/blob/main/docs/src/stability.md)
 /// for the full schema policy and the surfaces covered by SemVer.
-pub const CURRENT_SCHEMA_VERSION: &str = "0.11.0";
+pub const CURRENT_SCHEMA_VERSION: &str = "0.12.0";
 
 /// Every IR schema version the current tools accept.
 ///
@@ -50,7 +50,7 @@ pub const SUPPORTED_VERSIONS: &[&str] = &[CURRENT_SCHEMA_VERSION];
 
 /// `skip_serializing_if` predicate for `bool` fields that default to `false`.
 /// Keeps the canonical IDL emitted by `weaveffi extract` minimal by omitting
-/// flags the user never set (e.g. `async: false`, `throws: false`).
+/// flags the user never set (for example `async: false`).
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(b: &bool) -> bool {
     !*b
@@ -58,7 +58,7 @@ fn is_false(b: &bool) -> bool {
 
 /// Top-level WeaveFFI API definition: the root of a parsed IDL document.
 ///
-/// This is the value an entire `.yml`, `.json`, or `.toml` IDL file
+/// This is the value an entire `.yml` or `.json` IDL file
 /// deserializes into (see [`crate::parse`]) and the single input the validator
 /// consumes. It pairs the schema version with the module forest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,7 +69,7 @@ fn is_false(b: &bool) -> bool {
     schemars(description = "Top-level WeaveFFI API definition.")
 )]
 pub struct Api {
-    /// IR schema version this document targets (for example `0.11.0`).
+    /// IR schema version this document targets (for example `0.12.0`).
     /// Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].
     pub version: String,
     /// Top-level modules that make up the API surface. Each is an independent
@@ -124,10 +124,46 @@ impl Api {
         }
         modules(&self.modules, f);
     }
+
+    /// Every type name the document references but doesn't declare: the
+    /// names a written type uses (`Named` references, at any depth) that no
+    /// record, enum, interface, callback interface, or error domain anywhere
+    /// in the document provides.
+    ///
+    /// The `#[weaveffi::module]` macro validates one module tree at a time,
+    /// so a record from a sibling tree is undeclared there; it passes these
+    /// names to [`Options::foreign`](crate::validate::Options::foreign)
+    /// explicitly.
+    #[must_use]
+    pub fn undeclared_type_names(&self) -> std::collections::BTreeSet<String> {
+        fn declared<'a>(ms: &'a [Module], out: &mut std::collections::BTreeSet<&'a str>) {
+            for m in ms {
+                out.extend(m.structs.iter().map(|d| d.name.as_str()));
+                out.extend(m.enums.iter().map(|d| d.name.as_str()));
+                out.extend(m.interfaces.iter().map(|d| d.name.as_str()));
+                out.extend(m.callback_interfaces.iter().map(|d| d.name.as_str()));
+                out.extend(m.errors.iter().map(|d| d.name.as_str()));
+                declared(&m.modules, out);
+            }
+        }
+        let mut names = std::collections::BTreeSet::new();
+        declared(&self.modules, &mut names);
+        let mut out = std::collections::BTreeSet::new();
+        self.for_each_type_ref(&mut |ty| {
+            ty.walk(&mut |t| {
+                if let TypeRef::Named(n) = t {
+                    if !names.contains(n.as_str()) {
+                        out.insert(n.clone());
+                    }
+                }
+            });
+        });
+        out
+    }
 }
 
 /// A module: a named namespace grouping related functions, types, callback
-/// interfaces, and an error domain.
+/// interfaces, and error domains.
 ///
 /// Modules are the IDL's unit of organization and map onto each target
 /// language's natural grouping construct (a namespace, a submodule, a symbol
@@ -168,10 +204,11 @@ pub struct Module {
     /// Enum types, C-style or algebraic, declared in this module.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enums: Vec<EnumDef>,
-    /// Optional error domain: the named codes this module's fallible functions
-    /// report. `None` when the module declares no errors.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub errors: Option<ErrorDomain>,
+    /// The error domains this module declares: named sets of codes that
+    /// fallible callables anywhere in the API report by naming the domain in
+    /// their `throws`. Domain names share the global type namespace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<ErrorDomain>,
     /// Nested submodules, forming a tree that mirrors a package hierarchy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modules: Vec<Module>,
@@ -204,13 +241,14 @@ pub struct Function {
     /// comments. `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-    /// Whether the function can fail with a domain error. A throwing function
-    /// surfaces as `throws`/`raises` in the idiomatic bindings, reporting the
-    /// owning module's error domain; a non-throwing function has a plain
-    /// signature and treats any error as a producer bug (a trap, not a typed
-    /// error). Defaults to `false`.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub throws: bool,
+    /// How the function can fail. Absent for a function that can't, which
+    /// treats any reported error as a producer bug (a trap, not a typed
+    /// error); an error domain's name (`throws: KvError`) for one that
+    /// reports that domain's codes; or `any` (`throws: any`) for one that
+    /// fails with an untyped error, a message under the generic runtime code
+    /// `-1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throws: Option<Throws>,
     /// Whether the function is asynchronous, lowering to a completion-callback
     /// form rather than a blocking call. Serialized under the IDL key `async`.
     #[serde(default, rename = "async", skip_serializing_if = "is_false")]
@@ -286,9 +324,9 @@ pub struct InterfaceDef {
 ///
 /// Methods are synchronous (never `async` or `cancellable`) and return
 /// nothing or any type except an iterator or a callback interface; a string,
-/// bytes, or buffer return is a run the consumer allocates and the producer
-/// adopts. A method may declare `throws` when an error domain is in scope,
-/// letting the consumer report that domain's codes. Parameters may use any
+/// bytes, slice, or buffer return is a run the consumer allocates and the
+/// producer adopts. A method may declare `throws` (a domain, letting the
+/// consumer report that domain's codes, or `any`). Parameters may use any
 /// type other than a callback interface or an iterator. A callback interface
 /// may itself be passed, bare or optional (`Listener?`), as a parameter of a
 /// function or interface member.
@@ -330,6 +368,116 @@ pub struct Param {
     /// generated bindings. `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
+}
+
+/// What a fallible callable reports: the IDL's `throws` value.
+///
+/// Serialized as a string: the name of an error domain (`throws: KvError`)
+/// or the keyword `any` (`throws: any`). Domain names are global, so the
+/// named domain may be declared in any module.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Throws {
+    /// The callable reports the codes of the named error domain, each a
+    /// positive code with an optional payload, plus the runtime's negative
+    /// codes.
+    Domain(String),
+    /// The callable fails with an untyped error: the generic runtime code
+    /// `-1` and a message, never a positive code.
+    Any,
+}
+
+/// The `throws` keyword for an untyped error.
+const THROWS_ANY: &str = "any";
+
+impl Throws {
+    /// The error domain's name for [`Throws::Domain`], or `None` for
+    /// [`Throws::Any`].
+    #[must_use]
+    pub fn domain(&self) -> Option<&str> {
+        match self {
+            Throws::Domain(name) => Some(name),
+            Throws::Any => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Throws {
+    /// Renders the IDL spelling: the domain name or `any`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Throws::Domain(name) => f.write_str(name),
+            Throws::Any => f.write_str(THROWS_ANY),
+        }
+    }
+}
+
+impl Serialize for Throws {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Throws {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = Throws;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an error domain name or `any`")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Throws, E> {
+                Ok(if s == THROWS_ANY {
+                    Throws::Any
+                } else {
+                    Throws::Domain(s.to_string())
+                })
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Throws, E> {
+                Err(E::custom(
+                    "`throws` names the error domain the callable reports (`throws: KvError`) \
+                     or is `any` for an untyped error; boolean `throws` was removed in schema 0.12",
+                ))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// Manual `JsonSchema` impl because [`Throws`] (de)serializes as a string:
+/// an error domain's name or `any`.
+#[cfg(feature = "idl")]
+impl JsonSchema for Throws {
+    fn schema_name() -> String {
+        "Throws".to_string()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(concat!(module_path!(), "::Throws"))
+    }
+
+    fn json_schema(_generator: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        let mut schema = schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::String.into()),
+            ..Default::default()
+        };
+        let meta = schema.metadata();
+        meta.title = Some("Throws".to_string());
+        meta.description = Some(
+            "What a fallible callable reports: the name of an error domain declared in any \
+             module, or `any` for an untyped error (code -1 and a message)."
+                .to_string(),
+        );
+        schema.into()
+    }
 }
 
 /// A reference to a type in the IDL, exactly as written.
@@ -630,14 +778,20 @@ pub struct StructField {
     pub doc: Option<String>,
 }
 
-/// A module's error domain: the named set of error codes its fallible functions
-/// can report.
+/// An error domain: a named, open set of error codes that fallible callables
+/// report by naming the domain in their `throws`.
+///
+/// A module may declare several. The domain's name is a type name (unique
+/// across the API); its code names are unique across the API too, and its
+/// code values are positive and unique within the domain. Domains are open:
+/// adding a code never breaks a deployed binding, which maps a positive code
+/// it doesn't know to the domain's base error type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "idl", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ErrorDomain {
     /// Error domain name, used to name the generated error type (for example
-    /// `ContactErrors`).
+    /// `ContactError`). Callables name it in their `throws`.
     pub name: String,
     /// The error codes that belong to this domain.
     pub codes: Vec<ErrorCode>,
@@ -787,7 +941,7 @@ mod tests {
     #[test]
     fn document_round_trips_through_yaml_and_json() {
         let yaml = r#"
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: contacts
     doc: Address book
@@ -806,7 +960,7 @@ modules:
     interfaces:
       - name: Book
         constructors:
-          - { name: open, params: [{ name: path, type: string }], throws: true }
+          - { name: open, params: [{ name: path, type: string }], throws: BookError }
         methods:
           - { name: find, params: [{ name: q, type: string }], return: "Contact?" }
           - { name: watch, params: [{ name: listener, type: ChangeListener }] }
@@ -814,11 +968,14 @@ modules:
       - name: ChangeListener
         methods:
           - { name: on_change, params: [{ name: id, type: i64 }] }
-          - { name: should_continue, params: [], return: bool }
+          - { name: should_continue, params: [], return: bool, throws: any }
     errors:
-      name: BookError
-      codes:
-        - { name: NotFound, code: 1, message: missing, fields: [{ name: id, type: i64 }] }
+      - name: BookError
+        codes:
+          - { name: NotFound, code: 1, message: missing, fields: [{ name: id, type: i64 }] }
+      - name: IoError
+        codes:
+          - { name: Disk, code: 1, message: disk }
     functions:
       - name: count
         params: []
@@ -829,9 +986,9 @@ modules:
     modules:
       - name: inner
         functions:
-          - { name: ping, params: [], return: string }
+          - { name: ping, params: [], return: string, throws: any }
 "#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        let api: Api = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(api.version, CURRENT_SCHEMA_VERSION);
         let m = &api.modules[0];
         assert_eq!(m.doc.as_deref(), Some("Address book"));
@@ -843,17 +1000,56 @@ modules:
                 "Contact".into()
             ))))
         );
+        assert_eq!(
+            m.interfaces[0].constructors[0].throws,
+            Some(Throws::Domain("BookError".into()))
+        );
         assert_eq!(m.callback_interfaces[0].methods.len(), 2);
-        assert_eq!(m.errors.as_ref().unwrap().codes[0].fields.len(), 1);
+        assert_eq!(
+            m.callback_interfaces[0].methods[1].throws,
+            Some(Throws::Any)
+        );
+        assert_eq!(m.errors.len(), 2);
+        assert_eq!(m.errors[0].codes[0].fields.len(), 1);
         assert!(m.functions[0].r#async && m.functions[0].cancellable);
+        assert_eq!(m.functions[0].throws, None);
         assert_eq!(m.modules[0].functions[0].name, "ping");
 
         let json = serde_json::to_string(&api).unwrap();
+        assert!(json.contains(r#""throws":"BookError""#), "{json}");
+        assert!(json.contains(r#""throws":"any""#), "{json}");
         let back: Api = serde_json::from_str(&json).unwrap();
         assert_eq!(back, api);
-        let yaml2 = serde_yaml::to_string(&api).unwrap();
-        let back2: Api = serde_yaml::from_str(&yaml2).unwrap();
+        let yaml2 = serde_yaml_ng::to_string(&api).unwrap();
+        let back2: Api = serde_yaml_ng::from_str(&yaml2).unwrap();
         assert_eq!(back2, api);
+    }
+
+    #[test]
+    fn boolean_throws_is_rejected_with_a_pointer_to_the_new_syntax() {
+        let yaml = r#"
+version: "0.12.0"
+modules:
+  - name: m
+    functions: [{ name: f, throws: true }]
+"#;
+        let err = serde_yaml_ng::from_str::<Api>(yaml).unwrap_err();
+        assert!(err.to_string().contains("throws: KvError"), "{err}");
+    }
+
+    #[test]
+    fn undeclared_type_names_are_the_foreign_references() {
+        let yaml = r#"
+version: "0.12.0"
+modules:
+  - name: m
+    structs: [{ name: Local, fields: [{ name: other, type: "[Remote]" }] }]
+    functions:
+      - { name: f, params: [{ name: x, type: "{string:Elsewhere?}" }], return: Local }
+"#;
+        let api: Api = serde_yaml_ng::from_str(yaml).unwrap();
+        let names: Vec<String> = api.undeclared_type_names().into_iter().collect();
+        assert_eq!(names, ["Elsewhere", "Remote"]);
     }
 
     #[test]
@@ -868,7 +1064,7 @@ modules:
                     params: vec![],
                     returns: None,
                     doc: None,
-                    throws: false,
+                    throws: None,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -877,12 +1073,14 @@ modules:
                 callback_interfaces: vec![],
                 structs: vec![],
                 enums: vec![],
-                errors: None,
+                errors: vec![],
                 modules: vec![],
             }],
         };
-        let yaml = serde_yaml::to_string(&api).unwrap();
-        for noise in ["null", "[]", "false", "async", "throws", "doc", "params"] {
+        let yaml = serde_yaml_ng::to_string(&api).unwrap();
+        for noise in [
+            "null", "[]", "false", "async", "throws", "doc", "params", "errors",
+        ] {
             assert!(
                 !yaml.contains(noise),
                 "{noise} leaked into canonical form:\n{yaml}"
@@ -900,5 +1098,6 @@ modules:
         assert!(json["properties"].get("package").is_none());
         assert!(json["properties"].get("generators").is_none());
         assert!(json["definitions"].get("CallbackInterfaceDef").is_some());
+        assert_eq!(json["definitions"]["Throws"]["type"], "string");
     }
 }

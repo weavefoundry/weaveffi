@@ -5,6 +5,8 @@
 # one generated gem and runs one consumer against it, which must exit 0.
 set -uo pipefail
 . "$(dirname "$0")/../lib.sh"
+. "$ROOT/scripts/toolchains.sh"
+use_ruby || require_tools ruby ruby3.2
 require_tools ruby ruby gem
 
 # Build the sample's generated gem with `gem build`, install it into a

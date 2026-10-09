@@ -1,15 +1,13 @@
 # Roadmap
 
-WeaveFFI is in active `0.x` development. Schema 0.11 and ABI revision 4 made
-names global, replaced the per-module checksums with per-declaration contract
-tables, gave callback methods rich returns, typed `throws`, optional callback
-parameters, and a size-checked vtable header, made `{prefix}_alloc` the one
-allocator contract on every target, moved the codec conformance lanes onto
-shared test vectors, and taught the CLI to read a Rust producer's API from
-its built library. This page lists what comes next. Items are **planned**
-(the design is settled) or **exploring** (wanted, with open design
-questions). Nothing carries a date; the
-[changelog](https://github.com/weavefoundry/weaveffi/blob/main/CHANGELOG.md)
+WeaveFFI is in active `0.x` development. Schema 0.12 and ABI revision 5 made
+error domains and callback interfaces open (every error code and callback
+method has its own contract entry), let callables throw any domain or an
+untyped error, passed optional scalars and numeric lists directly, and gave
+Rust producers generated error messages, custom types, and `usize`. This
+page lists what comes next. Items are **planned** (the design is settled) or
+**exploring** (wanted, with open design questions). Nothing carries a date;
+the [changelog](https://github.com/weavefoundry/weaveffi/blob/main/CHANGELOG.md)
 records what shipped.
 
 ## Callback interfaces
@@ -19,19 +17,22 @@ records what shipped.
 A callback method that returns a future on the consumer side needs a
 completion flowing the other way and a cancellation story when the producer
 drops the future. The vtable shape is simple (a completion function and
-context per async method); the hard part is one producer working the same way
+context per async method, which revision 5's growable vtables can add
+without a new revision); the hard part is one producer working the same way
 whether the consumer runtime is an event loop, a thread pool, or the
 single-threaded Wasm host.
 
-### Off-thread callbacks in Dart (exploring)
+### Off-thread value callbacks in Dart (exploring)
 
 Dart can't run a value-returning callback method synchronously on a thread
-that isn't a Dart isolate thread, so a producer that calls one from its own
-worker thread aborts the process today (void methods are forwarded to the
-isolate safely). Pure `dart:ffi` can't route that return, so the fix is
-either a small native shim that hops to the isolate and waits, or a
-per-vtable thread-affinity hint that lets the producer refuse the call with
-`-4` instead. See the [Dart page](generators/dart.md#known-limitations).
+that isn't its isolate's, so the Dart binding marks its vtables
+thread-affine, and a producer that calls such a method from one of its own
+threads gets `-4` (`callback called off its thread`) instead of a result.
+That's safe (it used to abort the process), but it means a Dart callback
+that returns a value only works when the producer calls it on the thread
+that passed it in. Lifting the restriction needs a small native shim that
+hops to the isolate and waits for the result. See the
+[Dart page](generators/dart.md#threading).
 
 ### Synchronous calls that wait on Node.js callbacks (exploring)
 
@@ -49,8 +50,23 @@ remove the heuristic. See the [Node.js page](generators/node.md#threading).
 An IDL API is one document. Large APIs want to split by module, and a
 monorepo wants to reference another package's types. The plan is an
 `imports:` list resolved at parse time, with bare type names still unique
-across the merged API, and `diff`, `validate`, and contract tables covering
-every imported file.
+across the merged API, and `validate`, `generate --check`, and contract
+tables covering every imported file.
+
+### Duration and timestamp primitives (exploring)
+
+Producers pass time as `i64` with a documented unit. `duration` and
+`timestamp` primitives mapped to each language's types would remove the
+ambiguity; the open question is the representation.
+
+### Consumer-side custom types (exploring)
+
+A Rust producer can declare a custom type (`#[weaveffi::custom]`) that
+crosses as a builtin, such as a `Uuid` as a `string`, but every binding
+still exposes the builtin. Per-language conversion hooks in `weaveffi.toml`
+would let a binding expose the language's own type (`java.util.UUID`,
+`Foundation.UUID`, `uuid.UUID`) instead; the open questions are how a hook
+is declared and how a codec failure on the consumer side is reported.
 
 ### Generic and trait-object interfaces (exploring)
 
@@ -59,41 +75,39 @@ Under discussion are trait-object interfaces (one declared method set with
 several producer implementations behind `Arc<dyn Trait>`) and, less likely,
 parameterized interfaces monomorphized per instantiation.
 
-### Duration and timestamp primitives (exploring)
-
-Producers pass time as `i64` with a documented unit. `duration` and
-`timestamp` primitives mapped to each language's types would remove the
-ambiguity; the open question is the representation.
-
-### Custom types (exploring)
-
-A producer type that crosses as a builtin (a `Uuid` as `string`, a `Url` as
-`string`, a fixed-point amount as `i64`) has to be converted by hand on both
-sides today. A declared custom type with per-language conversion hooks would
-let each binding expose the language's own type.
-
 ## Targets and runtime
 
-### Kotlin Multiplatform (exploring)
+### Kotlin Multiplatform and the JVM's FFM API (exploring)
 
-The Kotlin target reaches Android and the JVM through JNI. A Multiplatform
-flavor using Kotlin/Native `cinterop` for iOS and desktop is the natural next
-step.
+The Kotlin target reaches Android and the JVM through a generated JNI shim.
+A Multiplatform flavor using Kotlin/Native `cinterop` for iOS and desktop is
+the natural next step, and on JVMs with the Foreign Function and Memory API
+(Java 22 and later) the shim could go away entirely.
 
-### Wasm threads (exploring)
+### Wasm threads and JSPI (exploring)
 
-On `wasm32-unknown-unknown` futures run inline and callbacks fire only while
-a call is on the stack. A spawner that schedules on the JS event loop, or
-shared-memory builds with Web Workers, would lift both limits and let
-Emscripten mode support async functions and callback interfaces.
+On `wasm32-unknown-unknown` futures are polled inline and callbacks fire
+only while a call is on the stack. A spawner that schedules on the JS event
+loop, JavaScript Promise Integration (so a pending future can suspend the
+module until a promise settles), or shared-memory builds with Web Workers
+would lift those limits.
+
+### Replacing the Node.js addon transport (exploring)
+
+The Node.js target reaches the C ABI through a generated N-API addon, which
+`weaveffi build` prebuilds per desktop platform and npm compiles as a
+fallback (always, on Windows). A transport that needs no compiled glue would
+remove that build step and the Windows gap; the open question is which one
+offers the threading guarantees callbacks and async completions need.
 
 ### Zero-copy blittable records (exploring)
 
 Every record crosses as a serialized value buffer. A record of fixed-size
 scalars could instead cross as a `#[repr(C)]` struct passed by pointer, which
-matters for hot paths that move many small records. The open questions are
-how a record opts in, and how the contract hash and every target's layout
-checks keep the two sides agreeing on the layout.
+matters for hot paths that move many small records. (Revision 5 already
+passes numeric lists as typed arrays.) The open questions are how a record
+opts in, and how the contract hash and every target's layout checks keep the
+two sides agreeing on the layout.
 
 ### Poll-based async (exploring)
 
@@ -124,12 +138,15 @@ prebuilding the Node.js addon and JNI shim for `windows-x64`, which
 ## Toward 1.0
 
 1.0 means the surfaces in [What 1.0 will cover](stability.md#what-10-will-cover)
-stop changing without a major release. It needs:
+stop changing without a major release. ABI revision 5 was designed so that
+the ABI can keep growing after 1.0 without a new revision: new declarations,
+callback methods, and error codes are additive, and error domains and
+callback interfaces are open. 1.0 needs:
 
-- ABI revision 4 stable for several releases, so 1.0 doesn't need
-  revision 5;
-- every target passing the full conformance matrix on Linux, macOS, and
-  Windows;
+- every Tier 1 target (C, C++, Swift, Kotlin, Python, Node.js, and .NET)
+  passing the full conformance matrix on Linux, macOS, and Windows, and the
+  Tier 2 targets (Go, Ruby, Dart, and WebAssembly) on at least Linux and
+  macOS (see [Target tiers](stability.md#target-tiers));
 - multi-file IDL and the deprecation policy in place;
 - a schema migration tool and more than one accepted schema version;
 - the known limitations on each generator page resolved or documented as

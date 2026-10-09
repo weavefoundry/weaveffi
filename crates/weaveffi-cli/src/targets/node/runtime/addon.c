@@ -8,6 +8,7 @@
 #endif
 #include <node_api.h>
 #include <uv.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -23,11 +24,13 @@
  * The N-API transport of the JavaScript bindings. Every C symbol of the
  * library is exported to `index.js` under its own name and called with the
  * raw convention the shared JavaScript layer documents: direct values as
- * numbers, bigints, and booleans; strings as strings; bytes and value
- * buffers as Uint8Arrays; objects, iterators, and cancel tokens as bigint
- * handles (null when absent); callback interfaces as adapter objects (null
- * for an absent optional one). A failure throws an instance of the
- * runtime's `$Fault` class.
+ * numbers, bigints, and booleans (integers range-checked); optional scalars
+ * as the value or null; typed arrays (numeric lists) as the matching
+ * TypedArray; strings as strings; bytes and value buffers as Uint8Arrays;
+ * objects, iterators, and cancel tokens as bigint handles (null when
+ * absent); callback interfaces as adapter objects (null for an absent
+ * optional one). A failure throws an instance of the runtime's `$Fault`
+ * class.
  */
 
 typedef {{PREFIX}}_error js_error;
@@ -216,6 +219,12 @@ JS_HELPER napi_value js_new_bool(napi_env env, bool v) {
   return out;
 }
 
+JS_HELPER napi_value js_null(napi_env env) {
+  napi_value out;
+  napi_get_null(env, &out);
+  return out;
+}
+
 /* An object, iterator, or cancel token handle: the pointer as a bigint, or
  * null for NULL. */
 JS_HELPER napi_value js_new_handle(napi_env env, const void* p) {
@@ -241,6 +250,26 @@ JS_HELPER napi_value js_take_bytes(napi_env env, const uint8_t* ptr, size_t len)
   return out;
 }
 
+/* A typed array (numeric list) of `count` elements of `size` bytes: a
+ * TypedArray of `type` holding a copy. A zero-length run is never read. */
+JS_HELPER napi_value js_new_slice(napi_env env, napi_typedarray_type type, const void* ptr,
+                                  size_t count, size_t size) {
+  napi_value ab, out;
+  void* data = NULL;
+  napi_create_arraybuffer(env, count * size, &data, &ab);
+  if (count > 0) memcpy(data, ptr, count * size);
+  napi_create_typedarray(env, type, count, ab, 0, &out);
+  return out;
+}
+
+/* A returned typed array: copy it, then release the producer's run. */
+JS_HELPER napi_value js_take_slice(napi_env env, napi_typedarray_type type, const void* ptr,
+                                   size_t count, size_t size) {
+  napi_value out = js_new_slice(env, type, ptr, count, size);
+  if (ptr != NULL) {{PREFIX}}_free_bytes((uint8_t*)ptr, count * size);
+  return out;
+}
+
 /* A module's contract table as a BigUint64Array of `id, hash` pairs. */
 JS_HELPER napi_value js_new_contract(napi_env env, const {{PREFIX}}_contract_entry* table,
                                      size_t len) {
@@ -256,11 +285,13 @@ JS_HELPER napi_value js_new_contract(napi_env env, const {{PREFIX}}_contract_ent
   return out;
 }
 
-JS_HELPER napi_value js_fault(napi_env env, int32_t code, const char* message,
-                           const uint8_t* payload, size_t payload_len) {
+/* A `$Fault` for an error the library reported: its code, its message (a
+ * length-delimited UTF-8 run, NULL for none), and its payload. */
+JS_HELPER napi_value js_fault(napi_env env, int32_t code, const uint8_t* message,
+                              size_t message_len, const uint8_t* payload, size_t payload_len) {
   napi_value argv[3], ctor, out = NULL;
   napi_create_int32(env, code, &argv[0]);
-  napi_create_string_utf8(env, message != NULL ? message : "", NAPI_AUTO_LENGTH, &argv[1]);
+  argv[1] = js_new_str(env, message, message != NULL ? message_len : 0);
   if (payload != NULL) {
     argv[2] = js_new_bytes(env, payload, payload_len);
   } else {
@@ -276,7 +307,8 @@ JS_HELPER napi_value js_fault(napi_env env, int32_t code, const char* message,
 
 /* Throw the error a call reported, then release it. */
 JS_HELPER napi_value js_throw(napi_env env, js_error* err) {
-  napi_throw(env, js_fault(env, err->code, err->message, err->payload_ptr, err->payload_len));
+  napi_throw(env, js_fault(env, err->code, err->message_ptr, err->message_len, err->payload_ptr,
+                           err->payload_len));
   {{PREFIX}}_error_clear(err);
   return NULL;
 }
@@ -288,59 +320,97 @@ JS_HELPER bool js_type_error(napi_env env, const char* expected) {
   return false;
 }
 
-JS_HELPER bool js_arg_i32(napi_env env, napi_value v, int32_t* out) {
-  return napi_get_value_int32(env, v, out) == napi_ok || js_type_error(env, "expected a number");
+JS_HELPER bool js_range_error(napi_env env, const char* expected) {
+  bool pending = false;
+  napi_is_exception_pending(env, &pending);
+  if (!pending) napi_throw_range_error(env, NULL, expected);
+  return false;
 }
 
-JS_HELPER bool js_arg_u32(napi_env env, napi_value v, uint32_t* out) {
-  return napi_get_value_uint32(env, v, out) == napi_ok || js_type_error(env, "expected a number");
+/* An integer argument of at most 32 bits: a number that is an integer in
+ * [lo, hi]. The range is checked on the double before any conversion, so
+ * nothing wraps or truncates, on every platform. */
+JS_HELPER bool js_arg_int(napi_env env, napi_value v, double lo, double hi, const char* expected,
+                          double* out) {
+  napi_valuetype t;
+  napi_typeof(env, v, &t);
+  if (t != napi_number) return js_type_error(env, "expected a number");
+  double d = 0;
+  napi_get_value_double(env, v, &d);
+  if (!(d >= lo && d <= hi) || d != floor(d)) return js_range_error(env, expected);
+  *out = d;
+  return true;
 }
 
 JS_HELPER bool js_arg_i8(napi_env env, napi_value v, int8_t* out) {
-  int32_t t = 0;
-  if (!js_arg_i32(env, v, &t)) return false;
-  *out = (int8_t)t;
+  double d = 0;
+  if (!js_arg_int(env, v, -128.0, 127.0, "expected an integer in [-128, 127]", &d)) return false;
+  *out = (int8_t)d;
   return true;
 }
 
 JS_HELPER bool js_arg_i16(napi_env env, napi_value v, int16_t* out) {
-  int32_t t = 0;
-  if (!js_arg_i32(env, v, &t)) return false;
-  *out = (int16_t)t;
+  double d = 0;
+  if (!js_arg_int(env, v, -32768.0, 32767.0, "expected an integer in [-32768, 32767]", &d)) {
+    return false;
+  }
+  *out = (int16_t)d;
+  return true;
+}
+
+JS_HELPER bool js_arg_i32(napi_env env, napi_value v, int32_t* out) {
+  double d = 0;
+  if (!js_arg_int(env, v, -2147483648.0, 2147483647.0,
+                  "expected an integer in [-2147483648, 2147483647]", &d)) {
+    return false;
+  }
+  *out = (int32_t)d;
   return true;
 }
 
 JS_HELPER bool js_arg_u8(napi_env env, napi_value v, uint8_t* out) {
-  uint32_t t = 0;
-  if (!js_arg_u32(env, v, &t)) return false;
-  *out = (uint8_t)t;
+  double d = 0;
+  if (!js_arg_int(env, v, 0.0, 255.0, "expected an integer in [0, 255]", &d)) return false;
+  *out = (uint8_t)d;
   return true;
 }
 
 JS_HELPER bool js_arg_u16(napi_env env, napi_value v, uint16_t* out) {
-  uint32_t t = 0;
-  if (!js_arg_u32(env, v, &t)) return false;
-  *out = (uint16_t)t;
+  double d = 0;
+  if (!js_arg_int(env, v, 0.0, 65535.0, "expected an integer in [0, 65535]", &d)) return false;
+  *out = (uint16_t)d;
   return true;
 }
 
-/* 64-bit integers: a bigint that fits, or an integral number. */
+JS_HELPER bool js_arg_u32(napi_env env, napi_value v, uint32_t* out) {
+  double d = 0;
+  if (!js_arg_int(env, v, 0.0, 4294967295.0, "expected an integer in [0, 4294967295]", &d)) {
+    return false;
+  }
+  *out = (uint32_t)d;
+  return true;
+}
+
+/* 64-bit integers: a bigint that fits, or a number that is an integer in
+ * range. The double is range-checked before it is converted (converting
+ * an out-of-range double is undefined behavior in C); 2^63 and 2^64 are
+ * exact doubles, so the bounds are exclusive. */
 JS_HELPER bool js_arg_i64(napi_env env, napi_value v, int64_t* out) {
   napi_valuetype t;
   napi_typeof(env, v, &t);
   if (t == napi_bigint) {
     bool lossless = false;
     napi_get_value_bigint_int64(env, v, out, &lossless);
-    if (lossless) return true;
-    napi_throw_range_error(env, NULL, "bigint does not fit in a signed 64-bit integer");
-    return false;
+    return lossless || js_range_error(env, "expected a signed 64-bit integer");
   }
+  if (t != napi_number) return js_type_error(env, "expected a bigint");
   double d = 0;
-  if (t == napi_number && napi_get_value_double(env, v, &d) == napi_ok && d == (double)(int64_t)d) {
-    *out = (int64_t)d;
-    return true;
+  napi_get_value_double(env, v, &d);
+  if (!(d >= -9223372036854775808.0 && d < 9223372036854775808.0) || d != floor(d)) {
+    return js_range_error(env, "expected a signed 64-bit integer");
   }
-  return js_type_error(env, "expected a bigint");
+  *out = (int64_t)d;
+  return true;
 }
 
 JS_HELPER bool js_arg_u64(napi_env env, napi_value v, uint64_t* out) {
@@ -349,32 +419,56 @@ JS_HELPER bool js_arg_u64(napi_env env, napi_value v, uint64_t* out) {
   if (t == napi_bigint) {
     bool lossless = false;
     napi_get_value_bigint_uint64(env, v, out, &lossless);
-    if (lossless) return true;
-    napi_throw_range_error(env, NULL, "bigint does not fit in an unsigned 64-bit integer");
-    return false;
+    return lossless || js_range_error(env, "expected an unsigned 64-bit integer");
   }
+  if (t != napi_number) return js_type_error(env, "expected a bigint");
   double d = 0;
-  if (t == napi_number && napi_get_value_double(env, v, &d) == napi_ok && d >= 0 &&
-      d == (double)(uint64_t)d) {
-    *out = (uint64_t)d;
-    return true;
+  napi_get_value_double(env, v, &d);
+  if (!(d >= 0.0 && d < 18446744073709551616.0) || d != floor(d)) {
+    return js_range_error(env, "expected an unsigned 64-bit integer");
   }
-  return js_type_error(env, "expected a bigint");
+  *out = (uint64_t)d;
+  return true;
 }
 
 JS_HELPER bool js_arg_f64(napi_env env, napi_value v, double* out) {
   return napi_get_value_double(env, v, out) == napi_ok || js_type_error(env, "expected a number");
 }
 
+/* f32: any number, rounded to the nearest float as Float32Array rounds it.
+ * Converting a double outside the float range is undefined behavior in C,
+ * so the overflow cases are explicit: at or past FLT_MAX plus half an ulp a
+ * value rounds to an infinity, and below that to FLT_MAX. */
 JS_HELPER bool js_arg_f32(napi_env env, napi_value v, float* out) {
+  const double max = 3.4028234663852886e38;      /* FLT_MAX */
+  const double overflow = 3.4028235677973366e38; /* FLT_MAX + half an ulp */
   double d = 0;
   if (!js_arg_f64(env, v, &d)) return false;
-  *out = (float)d;
+  if (d >= overflow) {
+    *out = HUGE_VALF;
+  } else if (d <= -overflow) {
+    *out = -HUGE_VALF;
+  } else if (d > max) {
+    *out = (float)max;
+  } else if (d < -max) {
+    *out = (float)-max;
+  } else {
+    *out = (float)d;
+  }
   return true;
 }
 
 JS_HELPER bool js_arg_bool(napi_env env, napi_value v, bool* out) {
   return napi_get_value_bool(env, v, out) == napi_ok || js_type_error(env, "expected a boolean");
+}
+
+/* Whether an optional argument is present (neither null nor undefined),
+ * also stored in `*has`. */
+JS_HELPER bool js_present(napi_env env, napi_value v, bool* has) {
+  napi_valuetype t;
+  napi_typeof(env, v, &t);
+  *has = t != napi_null && t != napi_undefined;
+  return *has;
 }
 
 /* A handle argument; null or undefined is NULL when `nullable`. */
@@ -411,6 +505,24 @@ JS_HELPER bool js_arg_bytes(napi_env env, napi_value v, const uint8_t** ptr, siz
   return js_type_error(env, "expected a Uint8Array");
 }
 
+/* A borrowed typed array (numeric list) of `type`: its data and element
+ * count. */
+JS_HELPER bool js_arg_slice(napi_env env, napi_value v, napi_typedarray_type type, const void** ptr,
+                            size_t* count) {
+  bool is_typed = false;
+  napi_is_typedarray(env, v, &is_typed);
+  if (is_typed) {
+    napi_typedarray_type actual;
+    void* data = NULL;
+    napi_get_typedarray_info(env, v, &actual, count, &data, NULL, NULL);
+    if (actual == type) {
+      *ptr = data;
+      return true;
+    }
+  }
+  return js_type_error(env, "expected a typed array of the parameter's element type");
+}
+
 /* A string argument encoded as UTF-8: short strings live in the inline
  * buffer, longer ones on the heap until js_str_free. */
 typedef struct {
@@ -444,6 +556,11 @@ JS_HELPER void js_str_free(js_str* s) {
   napi_value argv[(n) + 1];                                     \
   napi_get_cb_info(env, info, &argc, argv, NULL, NULL)
 
+/* Set `err` to `code` with a NUL-terminated message. */
+JS_HELPER void js_error_set(js_error* err, int32_t code, const char* message) {
+  {{PREFIX}}_error_set(err, code, (const uint8_t*)message, strlen(message));
+}
+
 /* ---------------------------------------------------------------------------
  * Async calls: the completion may run on any thread, so it only records the
  * result and queues the settlement on the JavaScript thread through a
@@ -460,9 +577,13 @@ typedef enum {
   JS_R_BOOL,
   JS_R_STR,
   JS_R_BYTES,
-  JS_R_HANDLE
+  JS_R_HANDLE,
+  JS_R_SLICE
 } js_kind;
 
+/* One async call. The completion records its result here: the value (`v`,
+ * plus `len` for a run), whether an optional scalar is present (`opt` and
+ * `has`), and a typed array's type and element size. */
 typedef struct {
   napi_deferred deferred;
   napi_threadsafe_function tsfn;
@@ -476,6 +597,10 @@ typedef struct {
     const void* p;
   } v;
   size_t len;
+  bool opt;
+  bool has;
+  napi_typedarray_type slice_type;
+  size_t slice_size;
 } js_async;
 
 JS_HELPER void js_async_settle(napi_env env, napi_value cb, void* context, void* data) {
@@ -484,8 +609,11 @@ JS_HELPER void js_async_settle(napi_env env, napi_value cb, void* context, void*
   js_async* a = (js_async*)data;
   bool failed = a->err != NULL && a->err->code != 0;
   if (env != NULL && failed) {
-    napi_reject_deferred(env, a->deferred, js_fault(env, a->err->code, a->err->message,
-                                                    a->err->payload_ptr, a->err->payload_len));
+    napi_reject_deferred(env, a->deferred,
+                         js_fault(env, a->err->code, a->err->message_ptr, a->err->message_len,
+                                  a->err->payload_ptr, a->err->payload_len));
+  } else if (env != NULL && a->opt && !a->has) {
+    napi_resolve_deferred(env, a->deferred, js_null(env));
   } else if (env != NULL) {
     napi_value v = NULL;
     switch (a->kind) {
@@ -499,11 +627,16 @@ JS_HELPER void js_async_settle(napi_env env, napi_value cb, void* context, void*
       case JS_R_STR: v = js_take_str(env, (const uint8_t*)a->v.p, a->len); break;
       case JS_R_BYTES: v = js_take_bytes(env, (const uint8_t*)a->v.p, a->len); break;
       case JS_R_HANDLE: v = js_new_handle(env, a->v.p); break;
+      case JS_R_SLICE:
+        v = js_take_slice(env, a->slice_type, a->v.p, a->len, a->slice_size);
+        break;
     }
     napi_resolve_deferred(env, a->deferred, v);
   } else if (!failed && (a->kind == JS_R_STR || a->kind == JS_R_BYTES) && a->v.p != NULL) {
     /* The environment is shutting down: just release the result. */
     {{PREFIX}}_free_bytes((uint8_t*)a->v.p, a->len);
+  } else if (!failed && a->kind == JS_R_SLICE && a->v.p != NULL) {
+    {{PREFIX}}_free_bytes((uint8_t*)a->v.p, a->len * a->slice_size);
   }
   {{PREFIX}}_error_free(a->err);
   napi_release_threadsafe_function(a->tsfn, napi_tsfn_release);
@@ -653,7 +786,7 @@ JS_HELPER void js_cb_hop(js_cb* cb, int method, void* frame, js_error* out_err,
     uv_mutex_unlock(&t->mu);
     free(req);
     js_thread_release(t);
-    {{PREFIX}}_error_set(out_err, -4, "the callback implementation is no longer reachable");
+    js_error_set(out_err, -4, "the callback implementation is no longer reachable");
     return;
   }
   const uint64_t limit = (uint64_t)JS_CB_DEADLOCK_MS * 1000000u;
@@ -679,7 +812,7 @@ JS_HELPER void js_cb_hop(js_cb* cb, int method, void* frame, js_error* out_err,
                  "callback, so waiting longer would deadlock (call it asynchronously, or call "
                  "back on the calling thread)",
                  what, JS_CB_DEADLOCK_MS);
-        {{PREFIX}}_error_set(out_err, -4, msg);
+        js_error_set(out_err, -4, msg);
         return;
       }
       uv_cond_timedwait(&t->cv, &t->mu, limit - (now - since));
@@ -732,9 +865,11 @@ JS_HELPER char* js_cstring(napi_env env, napi_value v) {
 }
 
 /* Report the pending JavaScript exception (or `fallback`) through
- * `out_err`; nothing unwinds through the C frame. A `$Fault` (a domain error
- * a throwing method raised) reports its code, message, and payload; any
- * other exception is a foreign failure, code -4, with its message. */
+ * `out_err`; nothing unwinds through the C frame. A `$Fault` (the adapter's
+ * report of a method declared `throws`: a domain code with its payload, or
+ * -1) reports its code, message, and payload; any other exception (from a
+ * method that doesn't throw, or a return of the wrong type) is a callback
+ * failure, code -4, with its message. */
 JS_HELPER void js_cb_report(napi_env env, js_error* out_err, const char* fallback) {
   int32_t code = -4;
   char* msg = NULL;
@@ -770,7 +905,7 @@ JS_HELPER void js_cb_report(napi_env env, js_error* out_err, const char* fallbac
     napi_is_exception_pending(env, &pending);
     if (pending) napi_get_and_clear_last_exception(env, &exc);
   }
-  {{PREFIX}}_error_set(out_err, code, msg != NULL && msg[0] != 0 ? msg : fallback);
+  js_error_set(out_err, code, msg != NULL && msg[0] != 0 ? msg : fallback);
   if (payload != NULL) {{PREFIX}}_error_set_payload(out_err, payload, payload_len);
   free(msg);
 }
@@ -809,6 +944,21 @@ JS_HELPER bool js_ret_bytes(napi_env env, napi_value v, uint8_t** out_ptr, size_
   size_t len = 0;
   if (!js_arg_bytes(env, v, &ptr, &len)) return false;
   js_give(ptr, len, out_ptr, out_len);
+  return true;
+}
+
+/* A callback's typed-array return: a TypedArray of `type`, copied into a
+ * {p}_alloc run of `count * size` bytes the producer adopts. `*run` and
+ * `*count` are the run and its element count (NULL and 0 when empty). */
+JS_HELPER bool js_ret_slice(napi_env env, napi_value v, napi_typedarray_type type, size_t size,
+                            void** run, size_t* count) {
+  const void* data = NULL;
+  size_t n = 0;
+  if (!js_arg_slice(env, v, type, &data, &n)) return false;
+  uint8_t* out = {{PREFIX}}_alloc(n * size);
+  if (n > 0) memcpy(out, data, n * size);
+  *run = out;
+  *count = n;
   return true;
 }
 

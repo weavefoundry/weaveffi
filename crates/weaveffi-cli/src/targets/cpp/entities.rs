@@ -1,56 +1,58 @@
 //! Declared-entity rendering: plain enums, value types (records and rich
-//! enums), typed error domains, and interface RAII classes, plus the
-//! dependency ordering that keeps by-value members complete before use.
+//! enums), error domains, and interface wrapper classes, plus the dependency
+//! ordering that keeps by-value members complete before use.
 
 use std::collections::HashMap;
 
 use crate::codegen::common::DocCommentStyle;
+use crate::codegen::docs::Doc;
+use crate::codegen::errors::ErrorTable;
 use crate::codegen::CodeWriter;
+use crate::lang;
 use weaveffi_model::model::{
-    CallShape, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding, ModuleBinding, StructBinding,
+    CallShape, EnumBinding, FieldBinding, FnBinding, InterfaceBinding, ModuleBinding, StructBinding,
 };
-use weaveffi_model::ty::{Family, Ty};
+use weaveffi_model::ty::Ty;
 
-use crate::targets::cpp::calls::{
-    iterator_class_name, render_definition, render_iterator_range, render_member_decl, FnKind,
-};
-use crate::targets::cpp::codec::{read_expr, write_stmt};
-use crate::targets::cpp::types::{cpp_error_class, cpp_ident, cpp_member_name, cpp_type};
+use crate::targets::cpp::calls::{render_definition, render_member_decl, FnKind};
+use crate::targets::cpp::types::{cpp_ident, cpp_member_name, cpp_type, defaultable, Ctx};
 
-/// A doc comment with a trailing `@deprecated` line when the declaration is
+/// A type's doc comment, with a trailing `@deprecated` paragraph when it's
 /// deprecated. Types carry the deprecation in their docs rather than as an
-/// attribute, so the generated code that marshals them compiles warning-free.
-pub(crate) fn doc_text(doc: Option<&str>, deprecated: Option<&str>) -> Option<String> {
-    match (doc, deprecated) {
-        (Some(d), Some(msg)) => Some(format!("{d}\n\n@deprecated {msg}")),
-        (None, Some(msg)) => Some(format!("@deprecated {msg}")),
-        (d, None) => d.map(str::to_string),
+/// attribute, so the generated code that marshals them compiles
+/// warning-free.
+pub(crate) fn type_doc(
+    ctx: &Ctx<'_>,
+    doc: &Option<String>,
+    deprecated: &Option<String>,
+) -> Option<String> {
+    let doc = Doc::new(doc, deprecated);
+    let spell = |s: &str| ctx.spell(s);
+    let note = doc.deprecation(spell).map(|m| format!("@deprecated {m}"));
+    match (doc.text(spell), note) {
+        (Some(d), Some(n)) => Some(format!("{d}\n\n{n}")),
+        (d, n) => d.or(n),
     }
 }
 
-/// `expr` handed on to a constructor: moved, unless it's a direct value
-/// (a scalar or enum), which copies.
-fn pass_on(ty: &Ty, expr: &str) -> String {
-    if ty.family() == Family::Direct {
-        expr.to_string()
-    } else {
-        format!("std::move({expr})")
-    }
+/// A field's or variant's doc comment, rewritten.
+fn field_doc(ctx: &Ctx<'_>, doc: &Option<String>) -> Option<String> {
+    Doc::new(doc, &None).text(|s| ctx.spell(s))
 }
 
 // ── Enums ──
 
 /// Append one module's C-style enums as `enum class {Name} : int32_t`. Rich
 /// enums are value types, rendered with the records.
-pub(crate) fn render_cpp_enums(w: &mut CodeWriter, module: &ModuleBinding) {
+pub(crate) fn render_cpp_enums(w: &mut CodeWriter, ctx: &Ctx<'_>, module: &ModuleBinding) {
     for e in module.enums.iter().filter(|e| !e.is_rich()) {
         w.doc(
-            &doc_text(e.doc.as_deref(), e.deprecated.as_deref()),
+            &type_doc(ctx, &e.doc, &e.deprecated),
             DocCommentStyle::Javadoc,
         );
         w.block(format!("enum class {} : int32_t {{", e.name), "};", |w| {
             for v in &e.variants {
-                w.doc(&v.doc, DocCommentStyle::Javadoc);
+                w.doc(&field_doc(ctx, &v.doc), DocCommentStyle::Javadoc);
                 w.line(format!("{} = {},", cpp_ident(&v.name), v.value));
             }
         });
@@ -98,10 +100,10 @@ impl ValueDef<'_> {
     }
 
     /// Append the type's definition.
-    pub(crate) fn render(&self, w: &mut CodeWriter) {
+    pub(crate) fn render(&self, w: &mut CodeWriter, ctx: &Ctx<'_>) {
         match self {
-            ValueDef::Record(s) => render_cpp_record(w, s),
-            ValueDef::Rich(e) => render_cpp_rich_enum(w, e),
+            ValueDef::Record(s) => render_cpp_record(w, ctx, s),
+            ValueDef::Rich(e) => render_cpp_rich_enum(w, ctx, e),
         }
     }
 }
@@ -173,32 +175,99 @@ pub(crate) fn value_types_in_order(modules: &[ModuleBinding]) -> Vec<ValueDef<'_
         .collect()
 }
 
-/// Render a record as a plain C++ value struct: typed members in declaration
-/// (and wire) order. An interface-typed member is the RAII wrapper held by
-/// value, so copying the record clones the reference and destroying it
-/// releases one.
-fn render_cpp_record(w: &mut CodeWriter, s: &StructBinding) {
+/// One member declaration of a record or variant payload, with a default
+/// member initializer (zero for scalars and enums, empty otherwise) when its
+/// type can be value-initialized. A member holding an interface wrapper, or
+/// a record that holds one, has none, and an initializer must provide it.
+/// Every other member has a default, so a braced initializer may stop after
+/// the members it needs without `-Wmissing-field-initializers` warnings.
+fn member_decl(ctx: &Ctx<'_>, f: &FieldBinding) -> String {
+    let init = if defaultable(ctx.model, &f.ty) {
+        "{}"
+    } else {
+        ""
+    };
+    format!("{} {}{init};", cpp_type(&f.ty), cpp_ident(&f.name))
+}
+
+/// Whether `ty` is a scalar, `bool`, or C-style enum: trivially copied, and
+/// zero when value-initialized.
+fn is_scalar(ty: &Ty) -> bool {
+    match ty {
+        Ty::Prim(p) => p.is_scalar(),
+        Ty::Enum(_) => true,
+        _ => false,
+    }
+}
+
+/// Append the hidden-friend `operator==` and `operator!=` of a value
+/// struct: memberwise, in declaration order. Floating-point members compare
+/// as IEEE values, and interface members by identity.
+fn render_equality(w: &mut CodeWriter, name: &str, fields: &[FieldBinding]) {
+    w.line("/** Memberwise equality; interface members compare by identity. */");
+    if fields.is_empty() {
+        w.line(format!(
+            "friend bool operator==(const {name}&, const {name}&) noexcept {{ return true; }}"
+        ));
+    } else {
+        let cmp: Vec<String> = fields
+            .iter()
+            .map(|f| {
+                let n = cpp_ident(&f.name);
+                format!("a.{n} == b.{n}")
+            })
+            .collect();
+        let head = format!("friend bool operator==(const {name}& a, const {name}& b) {{");
+        if cmp.len() <= 2 {
+            w.line(format!("{head} return {}; }}", cmp.join(" && ")));
+        } else {
+            w.block(head, "}", |w| {
+                w.line(format!("return {}", cmp[0]));
+                w.scope(|w| {
+                    for (i, c) in cmp.iter().enumerate().skip(1) {
+                        let end = if i + 1 == cmp.len() { ";" } else { "" };
+                        w.line(format!("&& {c}{end}"));
+                    }
+                });
+            });
+        }
+    }
+    w.line(format!(
+        "friend bool operator!=(const {name}& a, const {name}& b) {{ return !(a == b); }}"
+    ));
+}
+
+/// Render a record as a plain C++ aggregate: typed members in declaration
+/// (and wire) order with default member initializers, and memberwise
+/// equality. An interface-typed member is the RAII wrapper held by value,
+/// so copying the record shares the object and destroying it releases one
+/// reference.
+fn render_cpp_record(w: &mut CodeWriter, ctx: &Ctx<'_>, s: &StructBinding) {
     w.doc(
-        &doc_text(s.doc.as_deref(), s.deprecated.as_deref()),
+        &type_doc(ctx, &s.doc, &s.deprecated),
         DocCommentStyle::Javadoc,
     );
     w.block(format!("struct {} {{", s.name), "};", |w| {
         for f in &s.fields {
-            w.doc(&f.doc, DocCommentStyle::Javadoc);
-            w.line(format!("{} {};", cpp_type(&f.ty), cpp_ident(&f.name)));
+            w.doc(&field_doc(ctx, &f.doc), DocCommentStyle::Javadoc);
+            w.line(member_decl(ctx, f));
         }
+        if !s.fields.is_empty() {
+            w.blank();
+        }
+        render_equality(w, &s.name, &s.fields);
     });
     w.blank();
 }
 
-/// Render a rich enum as a `std::variant`-backed sum type: one payload struct
-/// per variant, a `value` member holding the active payload, a nested `Tag`
-/// enum mirroring the wire discriminants, and a `tag()` reader. Construct one
-/// as `Shape{Shape::Circle{2.0}}`.
-fn render_cpp_rich_enum(w: &mut CodeWriter, e: &EnumBinding) {
+/// Render a rich enum as a `std::variant`-backed sum type: one payload
+/// struct per variant, a `value` member holding the active payload, a nested
+/// `Tag` enum mirroring the wire discriminants, a `tag()` reader, and
+/// equality. Construct one as `Shape{Shape::Circle{2.0}}`.
+fn render_cpp_rich_enum(w: &mut CodeWriter, ctx: &Ctx<'_>, e: &EnumBinding) {
     let name = &e.name;
     w.doc(
-        &doc_text(e.doc.as_deref(), e.deprecated.as_deref()),
+        &type_doc(ctx, &e.doc, &e.deprecated),
         DocCommentStyle::Javadoc,
     );
     w.block(format!("struct {name} {{"), "};", |w| {
@@ -212,12 +281,17 @@ fn render_cpp_rich_enum(w: &mut CodeWriter, e: &EnumBinding) {
         });
         w.blank();
         for v in &e.variants {
-            w.doc(&v.doc, DocCommentStyle::Javadoc);
-            w.block(format!("struct {} {{", cpp_ident(&v.name)), "};", |w| {
+            let vn = cpp_ident(&v.name);
+            w.doc(&field_doc(ctx, &v.doc), DocCommentStyle::Javadoc);
+            w.block(format!("struct {vn} {{"), "};", |w| {
                 for f in &v.fields {
-                    w.doc(&f.doc, DocCommentStyle::Javadoc);
-                    w.line(format!("{} {};", cpp_type(&f.ty), cpp_ident(&f.name)));
+                    w.doc(&field_doc(ctx, &f.doc), DocCommentStyle::Javadoc);
+                    w.line(member_decl(ctx, f));
                 }
+                if !v.fields.is_empty() {
+                    w.blank();
+                }
+                render_equality(w, &vn, &v.fields);
             });
             w.blank();
         }
@@ -234,55 +308,49 @@ fn render_cpp_rich_enum(w: &mut CodeWriter, e: &EnumBinding) {
             ));
             w.line("return tags[value.index()];");
         });
+        w.blank();
+        w.line("/** Equal when the same variant is active with equal payloads. */");
+        w.line(format!(
+            "friend bool operator==(const {name}& a, const {name}& b) {{ return a.value == b.value; }}"
+        ));
+        w.line(format!(
+            "friend bool operator!=(const {name}& a, const {name}& b) {{ return !(a == b); }}"
+        ));
     });
     w.blank();
 }
 
-// ── Typed error domains ──
+// ── Error domains ──
 
-/// `detail::make_{path}_error`: builds the exception for a code, message,
-/// and payload of the domain.
-pub(crate) fn make_error_fn(eb: &ErrorBinding) -> String {
-    format!("detail::make_{}_error", eb.owner_path)
+/// The member name of an error code's field: [`cpp_ident`], with a trailing
+/// underscore when it would hide a member every exception has (`code()`,
+/// `what()`).
+pub(crate) fn error_field(name: &str) -> String {
+    lang::escape_member(&cpp_ident(name), &["code", "what"])
 }
 
-/// `detail::check_{path}`: throws the domain's exception for a failed call.
-pub(crate) fn check_fn(eb: &ErrorBinding) -> String {
-    format!("detail::check_{}", eb.owner_path)
-}
-
-/// `detail::report_{path}_error`: reports a domain exception a callback
-/// implementation threw through the vtable entry's `out_err`.
-pub(crate) fn report_fn(eb: &ErrorBinding) -> String {
-    format!("detail::report_{}_error", eb.owner_path)
-}
-
-/// Append one module's typed error domain: a domain exception derived from
-/// `Error`, one subclass per declared code (with typed members for the
-/// code's payload fields), and the `detail` helpers that map a failed call's
-/// `out_err` to the typed exception. With `reports`, also the helper that
-/// reports a thrown domain exception from a callback trampoline.
+/// Append one error domain: its class derived from `Error`, one subclass
+/// per declared code (with typed members for the code's payload fields),
+/// and its `detail::Errors` policy.
 ///
-/// Domain codes are positive and the runtime owns every negative code, so
-/// the mapping sends -5 to `Cancelled` and any other negative code to the
-/// root `Error` before consulting the domain's codes; an undeclared positive
-/// code falls back to the domain class itself.
-pub(crate) fn render_domain_error(
-    w: &mut CodeWriter,
-    module: &ModuleBinding,
-    eb: &ErrorBinding,
-    prefix: &str,
-    reports: bool,
-) {
-    let domain = &eb.type_name;
+/// The policy's `raise` throws `Cancelled` for -5 and the root `Error` for
+/// any other negative (runtime) code, the code's class for a declared code,
+/// and the domain class itself for a positive code these bindings don't
+/// know (domains are open: a newer producer may add codes). Its `report`
+/// turns a domain exception a callback implementation threw into the
+/// producer's error slot, payload included; any other exception is a plain
+/// failure (-1).
+pub(crate) fn render_domain_error(w: &mut CodeWriter, ctx: &Ctx<'_>, table: &ErrorTable<'_>) {
+    let domain = &table.type_name;
+    let prefix = ctx.prefix;
     w.line(format!(
-        "/** The errors the `{}` module's throwing calls report; catch a code's subclass or this. */",
-        module.dot_path
+        "/** The `{}` error domain of module `{}`: catch a code's class or this. */",
+        table.domain.name, table.module.dot_path
     ));
     w.line(format!("class {domain} : public Error {{"));
     w.line("public:");
     w.scope(|w| {
-        w.line("/** Builds an error carrying a domain `code` and `message`. */");
+        w.line("/** Builds an error carrying one of the domain's `code`s and its `message`. */");
         w.line(format!(
             "{domain}(int32_t code, const std::string& message) : Error(code, message) {{}}"
         ));
@@ -290,9 +358,12 @@ pub(crate) fn render_domain_error(
     w.line("};");
     w.blank();
 
-    for code in &eb.codes {
-        let class = cpp_error_class(&code.name);
-        let doc = code.doc.clone().unwrap_or_else(|| code.message.clone());
+    for row in &table.codes {
+        let code = row.code;
+        let class = &row.type_name;
+        let doc = Doc::new(&code.doc, &None)
+            .text(|s| ctx.spell(s))
+            .unwrap_or_else(|| code.message.clone());
         w.doc(
             &Some(format!("{doc}\n\nCode {}.", code.value)),
             DocCommentStyle::Javadoc,
@@ -301,18 +372,27 @@ pub(crate) fn render_domain_error(
         w.line("public:");
         w.scope(|w| {
             for f in &code.fields {
-                w.doc(&f.doc, DocCommentStyle::Javadoc);
-                w.line(format!("{} {};", cpp_type(&f.ty), cpp_ident(&f.name)));
+                w.doc(&field_doc(ctx, &f.doc), DocCommentStyle::Javadoc);
+                w.line(format!("{} {};", cpp_type(&f.ty), error_field(&f.name)));
             }
             if !code.fields.is_empty() {
                 w.blank();
             }
-            let mut params = vec!["const std::string& message".to_string()];
-            let mut inits = vec![format!("{domain}({}, message)", code.value)];
+            // The message parameter steps aside for a field named `message`.
+            let mut message = "message".to_string();
+            while code.fields.iter().any(|f| error_field(&f.name) == message) {
+                message.push('_');
+            }
+            let mut params = vec![format!("const std::string& {message}")];
+            let mut inits = vec![format!("{domain}({}, {message})", code.value)];
             for f in &code.fields {
-                let name = cpp_ident(&f.name);
+                let name = error_field(&f.name);
                 params.push(format!("{} {name}", cpp_type(&f.ty)));
-                inits.push(format!("{name}({})", pass_on(&f.ty, &name)));
+                if is_scalar(&f.ty) {
+                    inits.push(format!("{name}({name})"));
+                } else {
+                    inits.push(format!("{name}(std::move({name}))"));
+                }
             }
             w.line("/** Builds the error with the producer's `message` and the code's fields. */");
             let explicit = if code.fields.is_empty() {
@@ -330,219 +410,80 @@ pub(crate) fn render_domain_error(
         w.blank();
     }
 
-    let path = &eb.owner_path;
     w.line("namespace detail {");
     w.blank();
     w.line(format!(
-        "/** The exception for a failed `{domain}` call: its code's subclass, Cancelled, or the root Error. */"
+        "/** Raises and reports `{domain}` and its codes' classes. */"
     ));
-    w.block(
-        format!(
-            "inline std::exception_ptr make_{path}_error(int32_t code, const std::string& message, const uint8_t* payload_ptr, size_t payload_len) {{"
-        ),
-        "}",
-        |w| {
-            w.line("if (code == -5) return std::make_exception_ptr(Cancelled(message));");
-            w.line("if (code < 0) return std::make_exception_ptr(Error(code, message));");
-            if eb.codes.iter().all(|c| c.fields.is_empty()) {
-                w.line("(void)payload_ptr;");
-                w.line("(void)payload_len;");
-            }
-            w.block("switch (code) {", "}", |w| {
-                for code in &eb.codes {
-                    let class = cpp_error_class(&code.name);
-                    if code.fields.is_empty() {
-                        w.line(format!(
-                            "case {}: return std::make_exception_ptr({class}(message));",
-                            code.value
-                        ));
-                        continue;
-                    }
-                    w.block(format!("case {}: {{", code.value), "}", |w| {
-                        // Locals, because constructor arguments evaluate in
-                        // an unspecified order and the fields are read in
-                        // wire order.
-                        w.line("BufferReader r(payload_ptr, payload_len);");
-                        let mut args = vec!["message".to_string()];
-                        for f in &code.fields {
-                            let var = format!("f_{}", f.name);
-                            w.line(format!("{} {var} = {};", cpp_type(&f.ty), read_expr(&f.ty, "r")));
-                            args.push(pass_on(&f.ty, &var));
+    w.line("template <>");
+    w.block(format!("struct Errors<{domain}> {{"), "};", |w| {
+        w.block(
+            format!("[[noreturn]] static void raise(const {prefix}_error& err) {{"),
+            "}",
+            |w| {
+                w.line("if (err.code < 0) raise_runtime<Error>(err);");
+                w.block("switch (err.code) {", "}", |w| {
+                    for row in &table.codes {
+                        let code = row.code;
+                        let class = &row.type_name;
+                        if code.fields.is_empty() {
+                            w.line(format!("case {}: throw {class}(message(err));", code.value));
+                        } else {
+                            let fields: Vec<String> =
+                                code.fields.iter().map(|f| cpp_type(&f.ty)).collect();
+                            w.line(format!(
+                                "case {}: raise_with_fields<{class}, {}>(err);",
+                                code.value,
+                                fields.join(", ")
+                            ));
                         }
-                        w.line("r.expect_end();");
+                    }
+                    w.line(format!("default: throw {domain}(err.code, message(err));"));
+                });
+            },
+        );
+        w.blank();
+        w.block(
+            format!("static void report({prefix}_error* out_err) noexcept {{"),
+            "}",
+            |w| {
+                w.line("try {");
+                w.scope(|w| {
+                    w.line("throw;");
+                });
+                for row in table.codes.iter().filter(|r| !r.code.fields.is_empty()) {
+                    let fields: Vec<String> = row
+                        .code
+                        .fields
+                        .iter()
+                        .map(|f| format!("e.{}", error_field(&f.name)))
+                        .collect();
+                    w.line(format!("}} catch (const {}& e) {{", row.type_name));
+                    w.scope(|w| {
                         w.line(format!(
-                            "return std::make_exception_ptr({class}({}));",
-                            args.join(", ")
+                            "report_with_fields(out_err, e, {});",
+                            fields.join(", ")
                         ));
                     });
                 }
-                w.line(format!(
-                    "default: return std::make_exception_ptr({domain}(code, message));"
-                ));
-            });
-        },
-    );
+                w.line(format!("}} catch (const {domain}& e) {{"));
+                w.scope(|w| {
+                    w.line("set_error(out_err, e.code(), e.what());");
+                });
+                w.line("} catch (...) {");
+                w.scope(|w| {
+                    w.line("report_current(out_err, -1);");
+                });
+                w.line("}");
+            },
+        );
+    });
     w.blank();
-    w.line(format!(
-        "/** Throws the typed `{domain}` exception if `err` carries a nonzero code. */"
-    ));
-    w.block(
-        format!("inline void check_{path}({prefix}_error& err) {{"),
-        "}",
-        |w| {
-            w.line("if (err.code == 0) return;");
-            // The error owns the payload, so the exception (which decodes
-            // it) is built before error_clear releases it.
-            w.line(format!(
-                "std::exception_ptr ex = make_{path}_error(err.code, error_message(err), err.payload_ptr, err.payload_len);"
-            ));
-            w.line(format!("{prefix}_error_clear(&err);"));
-            w.line("std::rethrow_exception(ex);");
-        },
-    );
-    w.blank();
-    if reports {
-        render_report_fn(w, eb, prefix);
-    }
     w.line("} // namespace detail");
     w.blank();
 }
 
-/// Append the helper a throwing callback method's trampoline uses to report a
-/// `{domain}` exception: a declared code goes back with its fields encoded as
-/// the payload; an exception whose code the domain doesn't declare (or a
-/// code with fields thrown as the bare domain class, which has no fields to
-/// send) is a callback failure, -4.
-fn render_report_fn(w: &mut CodeWriter, eb: &ErrorBinding, prefix: &str) {
-    let domain = &eb.type_name;
-    w.line(format!(
-        "/** Reports a `{domain}` a callback implementation threw through the vtable entry's `out_err`. */"
-    ));
-    w.block(
-        format!(
-            "inline void report_{}_error(const {domain}& e, {prefix}_error* out_err) {{",
-            eb.owner_path
-        ),
-        "}",
-        |w| {
-            w.block("switch (e.code()) {", "}", |w| {
-                for code in &eb.codes {
-                    let class = cpp_error_class(&code.name);
-                    if code.fields.is_empty() {
-                        w.line(format!(
-                            "case {}: {prefix}_error_set(out_err, {}, e.what()); return;",
-                            code.value, code.value
-                        ));
-                        continue;
-                    }
-                    w.block(format!("case {}: {{", code.value), "}", |w| {
-                        w.line(format!(
-                            "const auto* typed = dynamic_cast<const {class}*>(&e);"
-                        ));
-                        w.line("if (typed == nullptr) break;");
-                        w.line("BufferWriter payload;");
-                        for f in &code.fields {
-                            w.line(write_stmt(
-                                &f.ty,
-                                &format!("typed->{}", cpp_ident(&f.name)),
-                                "payload",
-                            ));
-                        }
-                        w.line(format!(
-                            "{prefix}_error_set(out_err, {}, e.what());",
-                            code.value
-                        ));
-                        w.line(format!(
-                            "{prefix}_error_set_payload(out_err, payload.data(), payload.size());"
-                        ));
-                        w.line("return;");
-                    });
-                }
-                w.line("default: break;");
-            });
-            w.line(format!("{prefix}_error_set(out_err, -4, e.what());"));
-        },
-    );
-    w.blank();
-}
-
 // ── Interfaces ──
-
-/// Append the reference-counting RAII skeleton of an interface class: the
-/// `raw_type` alias of the C tag, the tagged constructor adopting one strong
-/// reference, a destructor releasing it, copies that take a new reference
-/// through `_clone`, moves that transfer the pointer, and the
-/// `handle()`/`clone_handle()` readers.
-fn render_raii_skeleton(w: &mut CodeWriter, i: &InterfaceBinding) {
-    let name = &i.name;
-    let tag = &i.c_tag;
-    let clone = &i.clone_symbol;
-    let destroy = &i.destroy_symbol;
-
-    w.line("/** The C type this class wraps. */");
-    w.line(format!("using raw_type = {tag};"));
-    w.blank();
-    w.line(format!(
-        "/** Adopts one strong reference to a producer object: `{name}(adopt, raw)`. */"
-    ));
-    w.line(format!(
-        "explicit {name}(adopt_t, {tag}* h) noexcept : raw_(h) {{}}"
-    ));
-    w.blank();
-    w.line("/** Releases this wrapper's reference; the object is dropped with its last one. */");
-    w.block(format!("~{name}() {{"), "}", |w| {
-        w.line(format!("if (raw_ != nullptr) {destroy}(raw_);"));
-    });
-    w.blank();
-    w.line("/** Copies share the object: the copy takes a new strong reference. */");
-    w.line(format!(
-        "{name}(const {name}& other) : raw_({clone}(other.raw_)) {{}}"
-    ));
-    w.blank();
-    w.line("/** Takes a new reference to `other`'s object and releases the current one. */");
-    w.block(
-        format!("{name}& operator=(const {name}& other) {{"),
-        "}",
-        |w| {
-            w.block("if (this != &other) {", "}", |w| {
-                w.line(format!("{tag}* h = {clone}(other.raw_);"));
-                w.line(format!("if (raw_ != nullptr) {destroy}(raw_);"));
-                w.line("raw_ = h;");
-            });
-            w.line("return *this;");
-        },
-    );
-    w.blank();
-    w.line("/** Transfers `other`'s reference; `other` becomes empty. */");
-    w.line(format!(
-        "{name}({name}&& other) noexcept : raw_(other.raw_) {{ other.raw_ = nullptr; }}"
-    ));
-    w.blank();
-    w.line("/** Releases the current reference and takes over `other`'s. */");
-    w.block(
-        format!("{name}& operator=({name}&& other) noexcept {{"),
-        "}",
-        |w| {
-            w.block("if (this != &other) {", "}", |w| {
-                w.line(format!("if (raw_ != nullptr) {destroy}(raw_);"));
-                w.line("raw_ = other.raw_;");
-                w.line("other.raw_ = nullptr;");
-            });
-            w.line("return *this;");
-        },
-    );
-    w.blank();
-    w.line("/** The wrapped pointer, borrowed (null after a move): this wrapper keeps its reference. */");
-    w.line(format!(
-        "const {tag}* handle() const noexcept {{ return raw_; }}"
-    ));
-    w.blank();
-    w.line("/** A new strong reference to the object, which the caller owns. */");
-    w.line(format!(
-        "{tag}* clone_handle() const {{ return {clone}(raw_); }}"
-    ));
-    w.blank();
-}
 
 /// The C++ name and declaration kind of each interface member. The
 /// synchronous constructor named `new` becomes the C++ constructor; every
@@ -551,7 +492,7 @@ fn member_kinds(i: &InterfaceBinding) -> Vec<(&FnBinding, String, FnKind<'_>)> {
     let class = i.name.as_str();
     let mut members = Vec::new();
     for c in &i.constructors {
-        if c.name == "new" && matches!(c.shape, CallShape::Sync(_)) {
+        if c.name == "new" && matches!(c.shape, CallShape::Sync) && c.iterator().is_none() {
             members.push((c, class.to_string(), FnKind::Ctor { class }));
         } else {
             members.push((c, cpp_member_name(&c.name), FnKind::Static { class }));
@@ -566,68 +507,78 @@ fn member_kinds(i: &InterfaceBinding) -> Vec<(&FnBinding, String, FnKind<'_>)> {
     members
 }
 
-/// Append the forward declarations an interface needs before any class body:
-/// the wrapper class and the range class of every iterator-returning member.
-pub(crate) fn render_cpp_interface_forward_decls(w: &mut CodeWriter, i: &InterfaceBinding) {
-    w.line(format!("class {};", i.name));
-    for (f, _, kind) in member_kinds(i) {
-        if matches!(f.shape, CallShape::Iterator(_)) {
-            w.line(format!("class {};", iterator_class_name(f, kind)));
-        }
-    }
-}
-
-/// Append an interface's class definition: the RAII skeleton plus the
-/// *declarations* of its members. The member bodies follow every value type
-/// and codec ([`render_cpp_interface_members`]); the class itself comes
-/// first so records can hold it by value.
-pub(crate) fn render_cpp_interface_class(
-    w: &mut CodeWriter,
-    i: &InterfaceBinding,
-    error: Option<&ErrorBinding>,
-) {
+/// Append an interface's class: the reference-counting core (a
+/// `detail::Handle` with the class's `traits`, so the class itself follows
+/// the Rule of Zero), the `adopt` constructor, the `handle()` and
+/// `clone_handle()` readers, identity equality, and the *declarations* of
+/// its members. The member bodies follow every value type and codec
+/// ([`render_cpp_interface_members`]); the class comes first so records can
+/// hold it by value.
+pub(crate) fn render_cpp_interface_class(w: &mut CodeWriter, ctx: &Ctx<'_>, i: &InterfaceBinding) {
+    let name = &i.name;
+    let tag = &i.c_tag;
     w.doc(
-        &doc_text(i.doc.as_deref(), i.deprecated.as_deref()),
+        &type_doc(ctx, &i.doc, &i.deprecated),
         DocCommentStyle::Javadoc,
     );
-    w.line(format!("class {} {{", i.name));
-    w.scope(|w| {
-        w.line(format!("{}* raw_;", i.c_tag));
-        w.blank();
-    });
+    w.line(format!("class {name} {{"));
     w.line("public:");
     w.scope(|w| {
-        render_raii_skeleton(w, i);
+        w.line("/** The C type this class wraps. */");
+        w.line(format!("using raw_type = {tag};"));
+        w.blank();
+        w.line(format!(
+            "/** Adopts one strong reference to a producer object: `{name}(adopt, raw)`. */"
+        ));
+        w.line(format!(
+            "explicit {name}(adopt_t, raw_type* raw) noexcept : raw_(raw) {{}}"
+        ));
+        w.blank();
         for (f, cpp_name, kind) in member_kinds(i) {
-            render_member_decl(w, f, &cpp_name, kind, error);
+            render_member_decl(w, ctx, f, &cpp_name, kind);
         }
+        w.line("/** The wrapped pointer, borrowed (null after a move): this wrapper keeps its reference. */");
+        w.line("const raw_type* handle() const noexcept { return raw_.get(); }");
+        w.blank();
+        w.line("/** A new strong reference to the object, which the caller owns. */");
+        w.line("raw_type* clone_handle() const noexcept { return raw_.clone(); }");
+        w.blank();
+        w.line("/** Whether both wrap the same producer object. */");
+        w.line(format!(
+            "friend bool operator==(const {name}& a, const {name}& b) noexcept {{ return a.raw_.get() == b.raw_.get(); }}"
+        ));
+        w.line(format!(
+            "friend bool operator!=(const {name}& a, const {name}& b) noexcept {{ return !(a == b); }}"
+        ));
+    });
+    w.blank();
+    w.line("private:");
+    w.scope(|w| {
+        w.block("struct traits {", "};", |w| {
+            w.line(format!("using raw_type = {tag};"));
+            w.line(format!(
+                "static raw_type* clone(const raw_type* raw) noexcept {{ return {}(raw); }}",
+                i.clone_symbol
+            ));
+            w.line(format!(
+                "static void destroy(raw_type* raw) noexcept {{ {}(raw); }}",
+                i.destroy_symbol
+            ));
+        });
+        w.blank();
+        w.line("detail::Handle<traits> raw_;");
     });
     w.line("};");
     w.blank();
 }
 
-/// Append the range classes of an interface's iterator-returning members.
-pub(crate) fn render_cpp_interface_iterators(
-    w: &mut CodeWriter,
-    i: &InterfaceBinding,
-    error: Option<&ErrorBinding>,
-    prefix: &str,
-) {
-    for (f, cpp_name, kind) in member_kinds(i) {
-        if let CallShape::Iterator(it) = &f.shape {
-            render_iterator_range(w, f, it, &cpp_name, kind, error, prefix);
-        }
-    }
-}
-
 /// Append the out-of-line `inline` definitions of an interface's members.
 pub(crate) fn render_cpp_interface_members(
     w: &mut CodeWriter,
+    ctx: &Ctx<'_>,
     i: &InterfaceBinding,
-    error: Option<&ErrorBinding>,
-    prefix: &str,
 ) {
     for (f, cpp_name, kind) in member_kinds(i) {
-        render_definition(w, f, &cpp_name, kind, error, prefix);
+        render_definition(w, ctx, f, &cpp_name, kind);
     }
 }

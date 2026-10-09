@@ -22,4 +22,6 @@ pub mod paint {
     }
 }
 
+weaveffi::export_runtime!();
+
 fn main() {}

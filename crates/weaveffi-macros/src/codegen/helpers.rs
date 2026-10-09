@@ -1,17 +1,34 @@
 //! Shared rendering helpers: identifiers, C-type spelling, ABI slot lists,
 //! call targets, the producer-signature reader, and `#[cfg]` wrapping.
+//!
+//! Every thunk parameter and local is named `__wv_*` (a C slot `name_ptr` is
+//! the Rust parameter `__wv_name_ptr`), so nothing the producer declares in
+//! the module (a constant, a type, a function) can collide with them.
+//! Parameter names don't affect the C ABI.
 
 use proc_macro2::{Span, TokenStream};
-use quote::{quote, ToTokens};
+use quote::{format_ident, quote, ToTokens};
 use syn::spanned::Spanned as _;
 use syn::Ident;
 use weaveffi_model::abi::{AbiParam, CType, ConstPos};
-use weaveffi_model::model::ParamBinding;
-use weaveffi_model::ty::Ty;
+
+use super::custom::{CustomScope, Shape};
 
 /// Make a call-site identifier from a string.
 pub(crate) fn ident(name: &str) -> Ident {
     Ident::new(name, Span::call_site())
+}
+
+/// The Rust name of the C slot `name` in a thunk: `__wv_{name}`.
+pub(crate) fn slot(name: &str) -> Ident {
+    format_ident!("__wv_{}", name)
+}
+
+/// The Rust name of a lifted parameter `name` in a thunk: `__wv_p_{name}`
+/// (distinct from every slot name, so a parameter called `out_len` can't
+/// shadow the slot `__wv_out_len`).
+pub(crate) fn local(name: &str) -> Ident {
+    format_ident!("__wv_p_{}", name)
 }
 
 // ── C type -> Rust FFI type ──────────────────────────────────────────────
@@ -64,11 +81,13 @@ pub(crate) fn ctype_to_rust(ct: &CType, prefix: &str) -> TokenStream {
     }
 }
 
-/// Render one ABI slot as `name: ty`.
-pub(crate) fn slot_tokens(p: &AbiParam, prefix: &str) -> TokenStream {
-    let n = ident(&p.name);
-    let t = ctype_to_rust(&p.ty, prefix);
-    quote!(#n: #t)
+/// The pointee of a pointer C type (an out slot's value type), or the type
+/// itself.
+pub(crate) fn pointee(ct: &CType) -> &CType {
+    match ct {
+        CType::Ptr { pointee, .. } => pointee,
+        other => other,
+    }
 }
 
 /// Render the `-> T` return clause for a lowered symbol (empty for `void`).
@@ -120,10 +139,10 @@ pub(crate) fn name_lit(name: &str) -> syn::LitStr {
 ///
 /// The model knows every type *semantically* (`Ty::Interface("Store")`)
 /// but not how the producer spelled it (`&Store`, `Arc<Store>`,
-/// `Option<Arc<super::Store>>`). Thunks are emitted inside the producer's
-/// module, so reusing the written path keeps parent-module types in scope, and
-/// the wrapper (`&` vs `Arc`) decides whether the object is borrowed or
-/// retained for the call.
+/// `Option<Arc<super::Store>>`, `usize`, a custom type). Thunks are emitted
+/// inside the producer's module, so reusing the written path keeps
+/// parent-module types in scope, and the wrapper (`&` vs `Arc`) decides
+/// whether the object is borrowed or retained for the call.
 ///
 /// Inside an interface's `impl` block the producer may write `Self`; the thunk
 /// is a free function, so every type this view hands out has `Self` replaced
@@ -132,20 +151,32 @@ pub(crate) fn name_lit(name: &str) -> syn::LitStr {
 pub(crate) struct UserSig<'a> {
     sig: &'a syn::Signature,
     self_ty: Option<&'a Ident>,
+    customs: CustomScope<'a>,
 }
 
 impl<'a> UserSig<'a> {
-    pub(crate) fn new(sig: &'a syn::Signature, self_ty: Option<&'a Ident>) -> Self {
-        Self { sig, self_ty }
+    pub(crate) fn new(
+        sig: &'a syn::Signature,
+        self_ty: Option<&'a Ident>,
+        customs: CustomScope<'a>,
+    ) -> Self {
+        Self {
+            sig,
+            self_ty,
+            customs,
+        }
     }
 
-    /// Spell `ty` for use in a free-function thunk, substituting `Self`.
-    fn spell(&self, ty: &syn::Type) -> TokenStream {
-        let tokens = ty.to_token_stream();
+    /// Spell `tokens` for use in a free-function thunk, substituting `Self`.
+    pub(crate) fn spell_tokens(&self, tokens: TokenStream) -> TokenStream {
         match self.self_ty {
             Some(self_ty) => replace_self(tokens, self_ty),
             None => tokens,
         }
+    }
+
+    fn spell(&self, ty: &syn::Type) -> TokenStream {
+        self.spell_tokens(ty.to_token_stream())
     }
 
     /// The producer's source type for the parameter named `name`.
@@ -166,14 +197,6 @@ impl<'a> UserSig<'a> {
         match self.param_type(name) {
             Some(ty) => ty.to_token_stream(),
             None => self.sig.ident.to_token_stream(),
-        }
-    }
-
-    /// The written return type as tokens, to anchor a diagnostic on it.
-    pub(crate) fn ret_span(&self) -> TokenStream {
-        match &self.sig.output {
-            syn::ReturnType::Type(_, ty) => ty.to_token_stream(),
-            syn::ReturnType::Default => self.sig.ident.to_token_stream(),
         }
     }
 
@@ -199,6 +222,18 @@ impl<'a> UserSig<'a> {
         }
     }
 
+    /// Whether the parameter is written `&[P]` for a primitive `P` the
+    /// typed-array family can lend without copying (every slice element but
+    /// `usize` and `isize`, whose C element type differs).
+    pub(crate) fn param_is_borrowed_slice(&self, name: &str) -> bool {
+        const LENDABLE: &[&str] = &["i8", "i16", "i32", "i64", "u16", "u32", "u64", "f32", "f64"];
+        LENDABLE.iter().any(|p| self.param_is_borrowed(name, p))
+            && matches!(
+                self.param_type(name),
+                Some(syn::Type::Reference(r)) if matches!(r.elem.as_ref(), syn::Type::Slice(_))
+            )
+    }
+
     /// The span of the parameter's written type (or the function name), the
     /// place a type error about it should point.
     pub(crate) fn param_type_span(&self, name: &str) -> Span {
@@ -206,21 +241,41 @@ impl<'a> UserSig<'a> {
             .map_or_else(|| self.sig.ident.span(), syn::spanned::Spanned::span)
     }
 
+    /// The custom-type shape of a parameter, when its type mentions one.
+    pub(crate) fn param_shape(&self, name: &str) -> Option<Shape> {
+        self.param_type(name).and_then(|t| self.customs.shape(t))
+    }
+
     /// The producer's spelling of a by-value parameter type with any `&`
-    /// removed (`&Contact` is `Contact`, `&[Item]` is `Vec<Item>`), for a
-    /// lift that decodes an owned value.
+    /// removed (`&Contact` is `Contact`, `&[Item]` is `Vec<Item>`, `&str`
+    /// is `String`), for a lift that produces an owned value.
     pub(crate) fn param_owned(&self, name: &str) -> Option<TokenStream> {
         let ty = self.param_type(name)?;
-        Some(match ty {
+        Some(self.owned(ty))
+    }
+
+    fn owned(&self, ty: &syn::Type) -> TokenStream {
+        match ty {
             syn::Type::Reference(r) => match r.elem.as_ref() {
                 syn::Type::Slice(slice) => {
                     let elem = self.spell(&slice.elem);
                     quote!(::std::vec::Vec<#elem>)
                 }
+                syn::Type::Path(p) if p.path.is_ident("str") => quote!(::std::string::String),
                 other => self.spell(other),
             },
             other => self.spell(other),
-        })
+        }
+    }
+
+    /// The owned type a parameter is lifted as: its repr when it mentions a
+    /// custom type (see [`param_owned`](Self::param_owned)), else its owned
+    /// spelling.
+    pub(crate) fn param_lifted(&self, name: &str) -> Option<TokenStream> {
+        match self.param_shape(name) {
+            Some(shape) => Some(self.spell_tokens(shape.repr_ty())),
+            None => self.param_owned(name),
+        }
     }
 
     /// Whether the parameter is written as a slice reference (`&[T]`).
@@ -231,11 +286,6 @@ impl<'a> UserSig<'a> {
         )
     }
 
-    /// The producer's return type with `Result` peeled, spelled for a thunk.
-    pub(crate) fn ret_value_type(&self) -> Option<TokenStream> {
-        self.ret_syn().map(|t| self.spell(t))
-    }
-
     /// The span of the written return type (or the function name).
     pub(crate) fn ret_type_span(&self) -> Span {
         match &self.sig.output {
@@ -244,10 +294,51 @@ impl<'a> UserSig<'a> {
         }
     }
 
-    /// Whether the parameter's type (under any `&` and `Option`) is an
-    /// `Arc<..>`, meaning the producer wants to retain the object.
-    pub(crate) fn param_wants_arc(&self, name: &str) -> bool {
-        self.param_type(name).is_some_and(mentions_arc)
+    /// The written return type as tokens, to anchor a diagnostic on it.
+    pub(crate) fn ret_span(&self) -> TokenStream {
+        match &self.sig.output {
+            syn::ReturnType::Type(_, ty) => ty.to_token_stream(),
+            syn::ReturnType::Default => self.sig.ident.to_token_stream(),
+        }
+    }
+
+    /// The written error type `E` of a `Result<T, E>` return.
+    pub(crate) fn ret_error(&self) -> Option<&'a syn::Type> {
+        crate::extract::result_error(&self.sig.output)
+    }
+
+    /// The producer's error type spelled for a thunk, and the span to point
+    /// a bound on it at.
+    pub(crate) fn ret_error_spelled(&self) -> Option<(TokenStream, Span)> {
+        self.ret_error().map(|e| (self.spell(e), e.span()))
+    }
+
+    /// The producer's return type with `Result` peeled.
+    fn ret_syn(&self) -> Option<&'a syn::Type> {
+        match &self.sig.output {
+            syn::ReturnType::Default => None,
+            syn::ReturnType::Type(_, ty) => Some(peel_result(ty)),
+        }
+    }
+
+    /// The producer's return type with `Result` peeled, spelled for a thunk.
+    pub(crate) fn ret_value_type(&self) -> Option<TokenStream> {
+        self.ret_syn().map(|t| self.spell(t))
+    }
+
+    /// The custom-type shape of the (`Result`-peeled) return, when it
+    /// mentions one.
+    pub(crate) fn ret_shape(&self) -> Option<Shape> {
+        self.ret_syn().and_then(|t| self.customs.shape(t))
+    }
+
+    /// The type the return is lowered as: its repr when it mentions a custom
+    /// type, else its spelling.
+    pub(crate) fn ret_lowered_type(&self) -> Option<TokenStream> {
+        match self.ret_shape() {
+            Some(shape) => Some(self.spell_tokens(shape.repr_ty())),
+            None => self.ret_value_type(),
+        }
     }
 
     /// The producer's spelling of the object type behind an interface
@@ -257,6 +348,12 @@ impl<'a> UserSig<'a> {
             .map(peel_wrappers)
             .filter(|t| matches!(t, syn::Type::Path(_)))
             .map(|t| self.spell(t))
+    }
+
+    /// Whether the parameter's type (under any `&` and `Option`) is an
+    /// `Arc<..>`, meaning the producer wants to retain the object.
+    pub(crate) fn param_wants_arc(&self, name: &str) -> bool {
+        self.param_type(name).is_some_and(mentions_arc)
     }
 
     /// The `dyn Trait` behind a callback-interface parameter written as
@@ -277,14 +374,6 @@ impl<'a> UserSig<'a> {
         callback_dyn(ty)
     }
 
-    /// The producer's return type with `Result` peeled.
-    fn ret_syn(&self) -> Option<&'a syn::Type> {
-        match &self.sig.output {
-            syn::ReturnType::Default => None,
-            syn::ReturnType::Type(_, ty) => Some(weaveffi_model::rust::peel_result(ty)),
-        }
-    }
-
     /// The producer's spelling of the object type behind an interface return
     /// (`Result`, `Option`, and `Arc` peeled).
     pub(crate) fn ret_object(&self) -> Option<TokenStream> {
@@ -292,18 +381,6 @@ impl<'a> UserSig<'a> {
             .map(peel_wrappers)
             .filter(|t| matches!(t, syn::Type::Path(_)))
             .map(|t| self.spell(t))
-    }
-
-    /// The object type behind the element of an `Iter<X>` return, when `X` is
-    /// an object (`Arc<T>` or `Option<Arc<T>>`).
-    pub(crate) fn iter_elem_object(&self) -> Option<TokenStream> {
-        let elem = peel_wrappers(self.iter_elem()?);
-        matches!(elem, syn::Type::Path(_)).then(|| self.spell(elem))
-    }
-
-    /// The element type `X` of an `Iter<X>` return, spelled for a thunk.
-    pub(crate) fn iter_elem_type(&self) -> Option<TokenStream> {
-        self.iter_elem().map(|t| self.spell(t))
     }
 
     /// The element type `X` of an `Iter<X>` return.
@@ -321,12 +398,45 @@ impl<'a> UserSig<'a> {
         }
     }
 
+    /// The element type `X` of an `Iter<X>` return, spelled for a thunk.
+    pub(crate) fn iter_elem_type(&self) -> Option<TokenStream> {
+        self.iter_elem().map(|t| self.spell(t))
+    }
+
+    /// The custom-type shape of an `Iter<X>` return's element.
+    pub(crate) fn iter_elem_shape(&self) -> Option<Shape> {
+        self.iter_elem().and_then(|t| self.customs.shape(t))
+    }
+
+    /// The object type behind the element of an `Iter<X>` return, when `X` is
+    /// an object (`Arc<T>` or `Option<Arc<T>>`).
+    pub(crate) fn iter_elem_object(&self) -> Option<TokenStream> {
+        let elem = peel_wrappers(self.iter_elem()?);
+        matches!(elem, syn::Type::Path(_)).then(|| self.spell(elem))
+    }
+
     /// Whether the method receiver is `self: Arc<Self>` rather than `&self`.
     pub(crate) fn receiver_is_arc(&self) -> bool {
         self.sig
             .receiver()
             .is_some_and(|r| r.reference.is_none() && r.colon_token.is_some())
     }
+}
+
+/// Peel `Result<T, E>` to its `T`, returning any other type unchanged.
+pub(crate) fn peel_result(ty: &syn::Type) -> &syn::Type {
+    if let syn::Type::Path(p) = ty {
+        if let Some(seg) = p.path.segments.last() {
+            if seg.ident == "Result" {
+                if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+                    if let Some(syn::GenericArgument::Type(ok)) = args.args.first() {
+                        return ok;
+                    }
+                }
+            }
+        }
+    }
+    ty
 }
 
 /// Replace every `Self` identifier token in `tokens` with `self_ty`.
@@ -437,52 +547,54 @@ fn callback_dyn(ty: &syn::Type) -> syn::Result<TokenStream> {
 
 // ── slot spelling that honors the producer's types ───────────────────────
 
-/// Render one ABI slot as `name: ty`, spelling object and callback-interface
-/// pointers with the producer's own types.
+/// Which binding a slot list belongs to, for spelling object and vtable
+/// slots with the producer's own types.
+pub(crate) struct SlotOwners<'a> {
+    /// `(param name, object slot name)` pairs of object parameters.
+    pub(crate) objects: Vec<(&'a str, &'a str)>,
+    /// `(param name, vtable slot name)` pairs of callback parameters.
+    pub(crate) vtables: Vec<(&'a str, &'a str)>,
+}
+
+/// Render one ABI slot as `__wv_{name}: ty`, spelling object and
+/// callback-interface pointers with the producer's own types.
 ///
-/// An object slot lowered from `params` renders as `*const <written type>`
-/// so a `super::T` stays in scope where the thunk lands; a callback vtable
-/// slot renders as `*const <dyn Trait as CallbackInterface>::Vtable`, which
-/// resolves through the impl the trait's own module emitted. Every other slot
-/// renders from its C type. The implicit method receiver slot is named `self`
-/// at the C level, which is not a legal Rust parameter name, so it renders as
-/// `__wv_self`.
+/// An object slot renders as `*const <written type>` (or `*mut` for a
+/// callback method's adopted object) so a `super::T` stays in scope where
+/// the thunk lands; a callback vtable slot renders as
+/// `*const <dyn Trait as CallbackInterface>::Vtable`, which resolves through
+/// the impl the trait's own module emitted. Every other slot renders from
+/// its C type.
 pub(crate) fn slot_type_for(
     p: &AbiParam,
-    params: &[ParamBinding],
+    owners: &SlotOwners<'_>,
     user: &UserSig<'_>,
     prefix: &str,
 ) -> syn::Result<TokenStream> {
-    let n = if p.name == "self" {
-        ident("__wv_self")
-    } else {
-        ident(&p.name)
-    };
-    for pb in params {
-        if pb.ty.interface_name().is_some() && pb.name == p.name {
-            if let Some(obj) = user.param_object(&pb.name) {
-                // Borrowed top-level parameters are `const T*`; a callback
-                // method's object slot transfers ownership and is `T*`.
-                let owned = matches!(
-                    &p.ty,
-                    CType::Ptr {
-                        konst: ConstPos::None,
-                        ..
-                    }
-                );
-                return Ok(if owned {
-                    quote!(#n: *mut #obj)
-                } else {
-                    quote!(#n: *const #obj)
-                });
-            }
+    let n = slot(&p.name);
+    if let Some((param, _)) = owners.objects.iter().find(|(_, s)| *s == p.name) {
+        if let Some(obj) = user.param_object(param) {
+            // Borrowed top-level parameters are `const T*`; a callback
+            // method's object slot transfers ownership and is `T*`.
+            let owned = matches!(
+                &p.ty,
+                CType::Ptr {
+                    konst: ConstPos::None,
+                    ..
+                }
+            );
+            return Ok(if owned {
+                quote!(#n: *mut #obj)
+            } else {
+                quote!(#n: *const #obj)
+            });
         }
-        if pb.ty.callback_interface_name().is_some() && p.name == format!("{}_vtable", pb.name) {
-            let dyn_ty = user.param_callback(&pb.name)?;
-            return Ok(quote!(
-                #n: *const <#dyn_ty as ::weaveffi::abi::CallbackInterface>::Vtable
-            ));
-        }
+    }
+    if let Some((param, _)) = owners.vtables.iter().find(|(_, s)| *s == p.name) {
+        let dyn_ty = user.param_callback(param)?;
+        return Ok(quote!(
+            #n: *const <#dyn_ty as ::weaveffi::abi::CallbackInterface>::Vtable
+        ));
     }
     let t = ctype_to_rust(&p.ty, prefix);
     Ok(quote!(#n: #t))
@@ -491,25 +603,25 @@ pub(crate) fn slot_type_for(
 /// Render the slot list for a lowered signature (see [`slot_type_for`]).
 pub(crate) fn fn_slots(
     abi_params: &[AbiParam],
-    params: &[ParamBinding],
+    owners: &SlotOwners<'_>,
     user: &UserSig<'_>,
     prefix: &str,
 ) -> syn::Result<Vec<TokenStream>> {
     abi_params
         .iter()
-        .map(|p| slot_type_for(p, params, user, prefix))
+        .map(|p| slot_type_for(p, owners, user, prefix))
         .collect()
 }
 
-/// Render the `-> T` return clause, spelling an object return with the
-/// producer's own type.
+/// The `-> T` return clause, spelling an object return with the producer's
+/// own type.
 pub(crate) fn ret_arrow_for(
     ret: &CType,
-    ret_ty: Option<&Ty>,
+    object_ret: bool,
     user: &UserSig<'_>,
     prefix: &str,
 ) -> TokenStream {
-    if ret_ty.is_some_and(|t| t.interface_name().is_some()) {
+    if object_ret {
         if let Some(obj) = user.ret_object() {
             return quote!(-> *mut #obj);
         }
@@ -521,11 +633,11 @@ pub(crate) fn ret_arrow_for(
 /// spelling an object return with the producer's own type.
 pub(crate) fn ret_type_for(
     ret: &CType,
-    ret_ty: Option<&Ty>,
+    object_ret: bool,
     user: &UserSig<'_>,
     prefix: &str,
 ) -> TokenStream {
-    if ret_ty.is_some_and(|t| t.interface_name().is_some()) {
+    if object_ret {
         if let Some(obj) = user.ret_object() {
             return quote!(*mut #obj);
         }
@@ -544,10 +656,13 @@ pub(crate) fn thunk_attrs() -> TokenStream {
             unsafe_code,
             unused_unsafe,
             deprecated,
+            non_snake_case,
             clippy::missing_safety_doc,
             clippy::needless_return,
             clippy::let_unit_value,
-            clippy::unit_arg
+            clippy::unit_arg,
+            clippy::too_many_arguments,
+            clippy::useless_conversion
         )]
     }
 }

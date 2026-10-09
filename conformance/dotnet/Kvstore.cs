@@ -28,7 +28,15 @@
 //     OperationCanceledException at once, its background work stopping
 //     cooperatively), 32 concurrent async lists, and the nested module's
 //     async function;
-//   * the nested KvStats class and the sibling Report root.
+//   * the nested KvStats class and the sibling Report root;
+//   * the ABI 5 shapes: an optional scalar (`long?`) parameter, return,
+//     iterator item, async result, and callback parameter and return; typed
+//     arrays as a return, an async result, and a callback parameter (a
+//     span) and return (an array); `usize` counts (`ulong`); a `throws:
+//     any` method (the root exception with code -1); callback failures the
+//     sample turns into KvException.CallbackFailed; records with value
+//     equality; re-enumerable iterators; and async calls that can't be
+//     cancelled abandoning the wait when their token fires.
 //
 // Callback releases are observed through the producer's live-callback
 // counter. Ends by asserting every leak counter is zero.
@@ -101,6 +109,24 @@ internal sealed class TestPolicy : IPolicy
         _other = other;
     }
 
+    // An optional scalar in and out: "short" lives one tick, "forever"
+    // never expires, "ttl-fail" fails with a typed error, and every other
+    // key keeps the requested TTL.
+    public long? TtlFor(string key, long? requested)
+    {
+        switch (key)
+        {
+            case "short":
+                return 1;
+            case "forever":
+                return null;
+            case "ttl-fail":
+                throw new KvException.InvalidPath("no ttl for you");
+            default:
+                return requested;
+        }
+    }
+
     public Entry Admit(Entry entry)
     {
         Interlocked.Increment(ref Admitted);
@@ -115,8 +141,7 @@ internal sealed class TestPolicy : IPolicy
         }
         // Tag it and store it encrypted (and try to rename it, which the
         // store ignores).
-        return new Entry("renamed", entry.Value, EntryKind.Encrypted, entry.Version, entry.ExpiresAt,
-            new[] { "admitted" }, entry.Metadata);
+        return entry with { Key = "renamed", Kind = EntryKind.Encrypted, Tags = new[] { "admitted" } };
     }
 
     public Store Route(string key, Store home)
@@ -159,6 +184,36 @@ internal sealed class TestLoader : ILoader
             default:
                 return Encoding.UTF8.GetBytes("loaded:" + key);
         }
+    }
+}
+
+internal sealed class TestScorer : IScorer
+{
+    public enum Mode { Sizes, Fail, Short }
+
+    private readonly Mode _mode;
+    public ulong[] Seen;
+
+    public TestScorer(Mode mode)
+    {
+        _mode = mode;
+    }
+
+    // `sizes` is a span over the producer's typed array, valid for the call.
+    public double[] Scores(ReadOnlySpan<ulong> sizes)
+    {
+        Seen = sizes.ToArray();
+        if (_mode == Mode.Fail)
+        {
+            throw new InvalidOperationException("scorer is out of order");
+        }
+        var n = _mode == Mode.Short ? 1 : sizes.Length;
+        var scores = new double[n];
+        for (var i = 0; i < n; i++)
+        {
+            scores[i] = sizes[i] * 1.0;
+        }
+        return scores;
     }
 }
 
@@ -256,12 +311,17 @@ internal static class Program
         var e = Put(s, "alpha", "one");
         Expect(e.Key == "alpha" && Text(e.Value) == "one" && e.Kind == EntryKind.Persistent && e.Version == 1,
             "first put");
-        Expect(e.ExpiresAt == null && e.Tags.Length == 0 && e.Metadata.Count == 0, "first put defaults");
+        Expect(e.ExpiresAt == null && e.Tags.Count == 0 && e.Metadata.Count == 0, "first put defaults");
         e = Put(s, "alpha", "two", EntryKind.Volatile);
         Expect(e.Version == 2 && e.Kind == EntryKind.Volatile, "second put");
 
         // get (throwing record) and find (optional record).
         Expect(Text(s.Get("alpha").Value) == "two", "get");
+        // Records compare by value, byte arrays and collections included.
+        var first = s.Get("alpha");
+        var second = s.Get("alpha");
+        Expect(first == second && first.GetHashCode() == second.GetHashCode(), "entries are value-equal");
+        Expect(first != (second with { Tags = new[] { "x" } }), "a different list differs");
         var missing = Throws<KvException.KeyNotFound>(() => s.Get("nope"), "get(nope)");
         Expect(missing.Key == "nope" && missing.Message == "key not found: nope", $"KeyNotFound (got '{missing.Message}')");
         Expect(s.Find("alpha")?.Version == 2, "find present");
@@ -306,7 +366,13 @@ internal static class Program
         Put(s, "sys.x", "xx");
 
         Expect(s.Keys(null).SequenceEqual(new[] { "sys.x", "user.alice", "user.bob" }), "keys in order");
-        ExpectKeyNotFound(() => s.Keys("zzz"), "zzz", "keys(zzz)");
+        // Each enumeration launches its own native iterator, so a sequence
+        // can be enumerated again, and a launch failure throws on enumeration.
+        var all = s.Keys(null);
+        Expect(all.SequenceEqual(all) && all.Count() == 3, "keys re-enumerates");
+        var missing = s.Keys("zzz");
+        ExpectKeyNotFound(() => missing.GetEnumerator(), "zzz", "keys(zzz)");
+        ExpectKeyNotFound(() => missing.ToList(), "zzz", "keys(zzz) again");
 
         // Abandoning an iterator part-way releases it.
         using (var keys = s.Keys("user.").GetEnumerator())
@@ -405,20 +471,29 @@ internal static class Program
         Expect(s.Count() == 1 && other.Count() == 1, "routed");
 
         // A typed error from the throwing callback reaches the caller with
-        // its code, message, and fields.
+        // its code and fields, and the domain's own message for them.
         var rejected = Throws<KvException.Rejected>(() => Put(s, "secret", "3", EntryKind.Volatile), "secret");
-        Expect(rejected.Code == 1005 && rejected.Message == "secrets are not stored", $"Rejected (got '{rejected.Message}')");
+        Expect(rejected.Code == 1005 && rejected.Message == "write to secret rejected: no secrets",
+            $"Rejected (got '{rejected.Message}')");
         Expect(rejected.Key == "secret" && rejected.Reason == "no secrets", "Rejected fields");
 
-        // Any other exception arrives as -4 with the implementation's message.
-        var foreign = Throws<NativeException>(() => Put(s, "boom", "4", EntryKind.Volatile), "boom");
-        Expect(foreign.Code == NativeException.ForeignErrorCode && foreign.Message == "policy exploded",
-            $"foreign failure (got {foreign.Code} '{foreign.Message}')");
-        // A null required object is a return the runtime can't accept: -3.
-        var nullRoute = Throws<NativeException>(() => Put(s, "null/x", "6", EntryKind.Volatile), "null route");
-        Expect(nullRoute.Code == NativeException.MarshalErrorCode, $"null route is -3 (got {nullRoute.Code})");
+        // Any other exception is a callback failure, which the sample turns
+        // into CallbackFailed with the implementation's message.
+        var foreign = Throws<KvException.CallbackFailed>(() => Put(s, "boom", "4", EntryKind.Volatile), "boom");
+        Expect(foreign.Code == 1006 && foreign.Message == "policy exploded" && foreign.Message_ == "policy exploded",
+            $"callback failure (got {foreign.Code} '{foreign.Message}')");
+        // So is a null required object, a return the runtime can't accept.
+        Throws<KvException.CallbackFailed>(() => Put(s, "null/x", "6", EntryKind.Volatile), "null route");
         Expect(s.Count() == 1 && other.Count() == 1, "failed puts store nothing");
         Expect(p.Admitted == 5, $"admitted 5 times (got {p.Admitted})");
+
+        // ttl_for: an optional scalar in and out, consulted before admit.
+        Expect(Put(s, "short", "x", EntryKind.Volatile).ExpiresAt == 1, "ttl_for short");
+        Expect(Put(s, "forever", "x", EntryKind.Volatile, 5).ExpiresAt == null, "ttl_for forever");
+        Expect(Put(s, "kept", "x", EntryKind.Volatile, 5).ExpiresAt == 5, "ttl_for keeps the request");
+        var noTtl = Throws<KvException.InvalidPath>(() => Put(s, "ttl-fail", "x", EntryKind.Volatile), "ttl-fail");
+        Expect(noTtl.Code == 1004 && noTtl.Message == "invalid path", $"ttl_for's typed error (got '{noTtl.Message}')");
+        Expect(s.Count() == 4 && p.Admitted == 8, $"three more admitted (got {s.Count()}, {p.Admitted})");
 
         // Replacing the policy releases the old one; null removes it.
         Expect(LiveCallbacks() == baseline + 1, "one policy held");
@@ -427,7 +502,7 @@ internal static class Program
         s.SetPolicy(null);
         Expect(LiveCallbacks() == baseline && !s.HasPolicy(), "SetPolicy(null) releases it");
         Put(s, "secret", "now allowed");
-        Expect(s.Count() == 2, "no policy");
+        Expect(s.Count() == 5, "no policy");
     }
 
     static void Loaders()
@@ -461,11 +536,10 @@ internal static class Program
         Expect(s.GetOrLoad("missing", new TestLoader()) == null, "missing is none");
         // KeyNotFound for another key: passed through, fields intact.
         var elsewhere = Throws<KvException.KeyNotFound>(() => s.GetOrLoad("elsewhere", new TestLoader()), "elsewhere");
-        Expect(elsewhere.Key == "other" && elsewhere.Message == "not in the loader", "passed through");
-        // Any other failure is -4.
-        var broken = Throws<NativeException>(() => s.GetOrLoad("broken", new TestLoader()), "broken");
-        Expect(broken.Code == NativeException.ForeignErrorCode && broken.Message == "loader is broken",
-            $"broken loader (got {broken.Code} '{broken.Message}')");
+        Expect(elsewhere.Key == "other" && elsewhere.Message == "key not found: other", "passed through");
+        // Any other failure is CallbackFailed with the loader's message.
+        var broken = Throws<KvException.CallbackFailed>(() => s.GetOrLoad("broken", new TestLoader()), "broken");
+        Expect(broken.Message == "loader is broken", $"broken loader (got {broken.Code} '{broken.Message}')");
         Expect(LiveCallbacks() == baseline, "every loader is released");
     }
 
@@ -519,7 +593,7 @@ internal static class Program
         var many = Enumerable.Range(0, 32).Select(_ => s.GetMany(new[] { "keep", "gone", "keep" })).ToArray();
         foreach (var got in await Task.WhenAll(many))
         {
-            Expect(got.Length == 3 && got[0] != null && got[1] == null && got[2]?.Key == "keep", "get_many");
+            Expect(got.Count == 3 && got[0] != null && got[1] == null && got[2]?.Key == "keep", "get_many");
         }
 
         // The nested module's async free function: objects in a list in, a
@@ -529,6 +603,28 @@ internal static class Program
         var st = await KvStats.SummarizeAll(new[] { s, other });
         Expect(st.Entries == 2 && st.Bytes == 4, "summarize_all totals");
         Expect(st.ByKind.Count == 1 && st.ByKind[EntryKind.Persistent] == 2, "summarize_all by_kind");
+
+        // A call that can't be cancelled stops waiting when its token fires;
+        // the native call finishes and its result (here a Store) is released.
+        await ThrowsAsync<OperationCanceledException>(() => Kv.OpenStore("/never", new CancellationToken(true)),
+            "pre-cancelled open_store");
+        var abandoned = 0;
+        for (var i = 0; i < 32; i++)
+        {
+            using var cts = new CancellationTokenSource();
+            var pending = Kv.OpenStore("/abandoned", cts.Token);
+            cts.Cancel();
+            try
+            {
+                using var opened = await pending;
+            }
+            catch (OperationCanceledException)
+            {
+                abandoned++;
+            }
+            Expect(pending.IsCanceled || pending.IsCompletedSuccessfully, "abandoned or finished");
+        }
+        Console.WriteLine($"dotnet/kvstore: {abandoned} of 32 open_store calls abandoned");
     }
 
     static void ObjectGraph()
@@ -570,7 +666,7 @@ internal static class Program
 
         // open_many(): a list of objects; one bad path fails the whole call.
         var many = Store.OpenMany(new[] { "/a", "/b" });
-        Expect(many.Length == 2 && many[0].Path() == "/a" && many[1].Path() == "/b", "open_many");
+        Expect(many.Count == 2 && many[0].Path() == "/a" && many[1].Path() == "/b", "open_many");
         Throws<KvException.InvalidPath>(() => Store.OpenMany(new[] { "/a", "" }), "open_many with a bad path");
 
         // by_label(): records with objects in, a map with object values out.
@@ -614,8 +710,56 @@ internal static class Program
         Expect(nothing.Code == 2001 && nothing.Message == "nothing to report", "NothingToReport");
     }
 
+    static async Task Abi5Shapes()
+    {
+        using var s = Store.Open("/abi5");
+        Put(s, "b", "12");
+        s.Put("a", new byte[] { 1, 2, 3 }, EntryKind.Volatile, 7);
+        Expect(s.Count() == 2UL, "count is a usize");
+
+        // An optional scalar return.
+        Expect(s.ExpiresAt("a") == 7 && s.ExpiresAt("b") == null && s.ExpiresAt("zzz") == null, "expires_at");
+        // A typed-array return, in key order.
+        Expect(s.ValueSizes().SequenceEqual(new ulong[] { 3, 2 }), "value_sizes");
+        // Optional scalar iterator items, enumerated twice.
+        var expirations = s.Expirations();
+        for (var pass = 0; pass < 2; pass++)
+        {
+            Expect(expirations.SequenceEqual(new long?[] { 7, null }), $"expirations pass {pass}");
+        }
+        // An optional scalar async result.
+        Expect(await s.VersionOf("a") == 1u && await s.VersionOf("q") == null, "version_of");
+        // A typed-array async result.
+        Put(s, "b", "x");
+        Expect((await s.Versions(new[] { "b", "q", "a" })).SequenceEqual(new uint[] { 2, 0, 1 }), "versions");
+
+        // A callback taking and returning typed arrays.
+        using var r = Store.Open("/rank");
+        Put(r, "a", "1");
+        Put(r, "b", "333");
+        Put(r, "c", "22");
+        var scorer = new TestScorer(TestScorer.Mode.Sizes);
+        Expect(r.Rank(scorer).SequenceEqual(new[] { "b", "c", "a" }), "rank");
+        Expect(scorer.Seen.SequenceEqual(new ulong[] { 1, 3, 2 }), "the scorer saw the sizes");
+        var failed = Throws<KvException.CallbackFailed>(() => r.Rank(new TestScorer(TestScorer.Mode.Fail)), "failing scorer");
+        Expect(failed.Message == "scorer is out of order", $"failing scorer message (got '{failed.Message}')");
+        var shortScores = Throws<KvException.CallbackFailed>(() => r.Rank(new TestScorer(TestScorer.Mode.Short)), "short scorer");
+        Expect(shortScores.Message == "expected 3 scores, got 1", $"short scorer message (got '{shortScores.Message}')");
+
+        // `throws: any` and a `usize` return: the root exception, code -1.
+        using var imported = Store.Open("/import");
+        Expect(imported.ImportLines("a=1\n\nb=two\n") == 2UL, "import_lines");
+        Expect(Text(imported.Get("b").Value) == "two", "imported value");
+        var untyped = Throws<NativeException>(() => imported.ImportLines("c=3\nbroken\nd=4"), "import_lines broken");
+        Expect(untyped.GetType() == typeof(NativeException) && untyped.Code == NativeException.GenericErrorCode,
+            $"untyped failure (got {untyped.GetType().Name} {untyped.Code})");
+        Expect(untyped.Message == "line 2: expected key=value", $"untyped message (got '{untyped.Message}')");
+        Expect(imported.Count() == 3, "c was stored, d wasn't");
+    }
+
     static async Task Run()
     {
+        KvstoreLibrary.Check();
         await Constructors();
         Basics();
         Iterators();
@@ -625,6 +769,7 @@ internal static class Program
         await AsyncCalls();
         ObjectGraph();
         StatsAndReport();
+        await Abi5Shapes();
     }
 
     static int Main()

@@ -1,55 +1,51 @@
 //! Callback-interface renderers: the consumer-facing C# `interface` plus the
-//! process-wide vtable and its `[UnmanagedCallersOnly]` trampolines,
-//! rendering every clause of [`CallbackProtocol`].
+//! process-wide vtable and its `[UnmanagedCallersOnly]` trampolines.
 //!
 //! * One static vtable per callback interface, allocated once in native
 //!   memory and never freed, so its address is stable for the process. It
 //!   starts with the `{size, flags, free}` header, `size` being the struct's
-//!   real size as C# lays it out.
+//!   real size as C# lays it out and `flags` zero (methods may run on any
+//!   thread).
 //! * `ctx` is a `GCHandle` to the implementation, released by the vtable's
 //!   `free` entry, so the implementation lives exactly as long as the
 //!   producer holds it.
-//! * Trampoline arguments are received like returns, except that strings,
-//!   bytes, and buffers are borrowed (copied, never freed); objects are
-//!   adopted into wrappers the implementation owns.
-//! * Returns cross per [`RetPass`]: a direct value by value, an object as a
-//!   fresh strong reference (`CloneHandle()`), and a string, bytes, or
-//!   buffer as a `{prefix}_alloc` run written to the out slots.
-//! * A thrown exception never unwinds into native code: a method declared
-//!   `throws` reports its module's domain exception with its code and
-//!   payload, and any other exception is reported with the foreign error
-//!   code (`-4`). Trampolines run on whatever thread the producer calls
-//!   from.
+//! * Arguments are borrowed for the call ([`ArgPass`]): strings and buffers
+//!   are decoded, typed arrays and bytes are spans over the producer's
+//!   memory, and objects are adopted into wrappers the implementation owns.
+//! * Returns cross per [`CallbackRetPass`]: a scalar as the C return, an
+//!   optional scalar as presence plus out slot, an object as a fresh strong
+//!   reference, and everything else as a `{prefix}_alloc` run the producer
+//!   adopts.
+//! * A thrown exception never unwinds into native code: an exception of the
+//!   method's own domain reports its code and fields; any other is reported
+//!   with code -1 (or -4 from a method that can't fail).
+
+use heck::ToUpperCamelCase;
+use weaveffi_model::abi::AbiParam;
+use weaveffi_model::model::{CallbackInterfaceBinding, CallbackMethodBinding, Model};
+use weaveffi_model::plan::{ArgPass, CallbackRetPass, ErrorStrategy};
 
 use crate::codegen::CodeWriter;
-use heck::{ToLowerCamelCase, ToUpperCamelCase};
-use weaveffi_model::model::{CallbackInterfaceBinding, CallbackMethodBinding, ErrorBinding};
-use weaveffi_model::plan::{CallbackProtocol, ErrorStrategy, RetPass};
-
-use crate::targets::dotnet::calls::{
-    direct_to_slot, receive, write_obsolete, Own, UNMANAGED_CALLERS_ONLY,
-};
-use crate::targets::dotnet::codec::write_stmt;
-use crate::targets::dotnet::docs::{write_doc, write_fn_doc};
-use crate::targets::dotnet::runtime::dotnet_exception_name;
+use crate::targets::dotnet::calls::UNMANAGED_CALLERS_ONLY;
+use crate::targets::dotnet::codec::{read_lambda, write_lambda};
+use crate::targets::dotnet::docs::Docs;
+use crate::targets::dotnet::errors::ErrCtx;
 use crate::targets::dotnet::types::{
-    callback_interface_cs, cs_ctype, cs_type, fn_pointer_type, safe_cs_name, vtable_class_cs, Cx,
+    callback_interface_cs, callback_param_cs, callback_ret_cs, camel, cs_ctype, fn_pointer_type,
+    safe_cs_name, vtable_class_cs, Cx,
 };
 
-/// Render one callback interface declared by the module at `module_path`:
-/// the `public interface I{Name}` the consumer implements, then the
-/// internal class hosting its vtable. `domain` is the error domain in scope
-/// for the module, which methods declared `throws` report.
+/// Render one callback interface: the `public interface I{Name}` the
+/// consumer implements, then the internal class hosting its vtable.
 pub(crate) fn render_callback_interface(
     w: &mut CodeWriter,
-    module_path: &str,
+    model: &Model,
+    docs: &Docs,
     cb: &CallbackInterfaceBinding,
-    domain: Option<&ErrorBinding>,
     cx: Cx<'_>,
 ) {
-    let domain = domain.map(dotnet_exception_name);
-    render_consumer_interface(w, cb, domain.as_deref(), cx);
-    render_vtable_class(w, cx, module_path, cb, domain.as_deref());
+    render_consumer_interface(w, model, docs, cb, cx);
+    render_vtable_class(w, model, cb, cx);
 }
 
 fn method_cs(m: &CallbackMethodBinding) -> String {
@@ -59,43 +55,48 @@ fn method_cs(m: &CallbackMethodBinding) -> String {
 /// The consumer-facing interface: one method per callback method.
 fn render_consumer_interface(
     w: &mut CodeWriter,
+    model: &Model,
+    docs: &Docs,
     cb: &CallbackInterfaceBinding,
-    domain: Option<&str>,
     cx: Cx<'_>,
 ) {
     let iface = callback_interface_cs(&cb.name);
-    write_doc(w, &cb.doc);
+    docs.summary(w, &cb.doc);
     w.line("/// <remarks>The native library may call any method from any thread until");
-    w.line("/// it releases its last reference to the implementation. Object arguments");
-    w.line("/// belong to the implementation. An exception thrown by a method fails the");
-    w.line("/// native library's call in progress: a method documented to throw a domain");
-    w.line("/// exception reports it with its code and fields, and any other exception");
-    w.line(format!(
-        "/// reaches the library as <see cref=\"{}.ForeignErrorCode\"/>.</remarks>",
-        cx.base
-    ));
-    write_obsolete(w, &cb.deprecated);
+    w.line("/// it releases its last reference to the implementation. Span arguments are");
+    w.line("/// valid only during the call; object arguments belong to the implementation.");
+    w.line("/// An exception thrown by a method fails the native call in progress: an");
+    w.line("/// exception of the domain a method documents is reported with its code and");
+    w.line("/// fields, and any other reaches the library as a failure carrying its message.</remarks>");
+    docs.obsolete(w, &cb.deprecated);
     w.line(format!("public interface {iface}"));
     w.block("{", "}", |w| {
         for (i, m) in cb.methods.iter().enumerate() {
             if i > 0 {
                 w.blank();
             }
-            let mut params = m.params.clone();
-            for p in &mut params {
-                p.name = p.name.to_lower_camel_case();
+            docs.summary(w, &m.doc);
+            for p in &m.params {
+                docs.param(w, &camel(&p.name), &p.doc);
             }
-            write_fn_doc(w, &m.doc, &params);
-            if let (true, Some(exc)) = (m.throws, domain) {
-                w.line(format!(
-                    "/// <exception cref=\"{exc}\">Reported to the library with its code and fields.</exception>"
-                ));
+            if let ErrorStrategy::Domain(_) = &m.error {
+                let err = ErrCtx::new(model, &m.error, cx);
+                if let Some(exc) = &err.domain {
+                    w.line(format!(
+                        "/// <exception cref=\"{exc}\">Reported to the library with its code and fields.</exception>"
+                    ));
+                }
             }
-            write_obsolete(w, &m.deprecated);
-            let ret = m.ret.as_ref().map(cs_type).unwrap_or_else(|| "void".into());
-            let sig: Vec<String> = params
+            docs.obsolete(w, &m.deprecated);
+            let ret = m
+                .ret
+                .as_ref()
+                .map(|ty| callback_ret_cs(&m.ret_pass, ty))
+                .unwrap_or_else(|| "void".into());
+            let sig: Vec<String> = m
+                .params
                 .iter()
-                .map(|p| format!("{} {}", cs_type(&p.ty), safe_cs_name(&p.name)))
+                .map(|p| format!("{} {}", callback_param_cs(&p.pass, &p.ty), camel(&p.name)))
                 .collect();
             w.line(format!("{ret} {}({});", method_cs(m), sig.join(", ")));
         }
@@ -107,14 +108,12 @@ fn render_consumer_interface(
 /// in declaration order) and the trampolines it points at.
 fn render_vtable_class(
     w: &mut CodeWriter,
-    cx: Cx<'_>,
-    module_path: &str,
+    model: &Model,
     cb: &CallbackInterfaceBinding,
-    domain: Option<&str>,
+    cx: Cx<'_>,
 ) {
-    let protocol = cb.protocol();
     let iface = callback_interface_cs(&cb.name);
-    let class = vtable_class_cs(module_path, &cb.name);
+    let class = vtable_class_cs(&cb.name);
     w.line(format!(
         "/// <summary>The process-wide <c>{}</c> and the trampolines behind it,",
         cb.vtable_tag
@@ -133,7 +132,7 @@ fn render_vtable_class(
             for m in &cb.methods {
                 w.line(format!(
                     "public {} {};",
-                    fn_pointer_type(&m.abi_params, &m.abi_ret),
+                    fn_pointer_type(cx.ns, &m.abi.params, &m.abi.ret),
                     safe_cs_name(&m.name)
                 ));
             }
@@ -146,6 +145,7 @@ fn render_vtable_class(
         w.block("{", "}", |w| {
             w.line("var vtable = (Layout*)NativeMemory.AllocZeroed((nuint)sizeof(Layout));");
             w.line("vtable->Size = (uint)sizeof(Layout);");
+            w.line("// Not thread-affine: every method may be called from any thread.");
             w.line("vtable->Flags = 0;");
             w.line("vtable->Free = &FreeTrampoline;");
             for m in &cb.methods {
@@ -163,46 +163,77 @@ fn render_vtable_class(
         w.block("{", "}", |w| {
             w.line("Ffi.Unregister(ctx);");
         });
-        for (i, m) in cb.methods.iter().enumerate() {
+        for m in &cb.methods {
             w.blank();
-            let reports = match protocol.method_errors[i] {
-                ErrorStrategy::Throws => domain,
-                ErrorStrategy::Trap => None,
-            };
-            render_trampoline(w, cx, &iface, m, &protocol, i, reports);
+            render_trampoline(w, model, cx, &iface, m);
         }
     });
     w.blank();
 }
 
-/// The name of the slot at `from_end` places before the end of `m`'s slot
-/// list (`1` is `out_err`).
-fn slot_from_end(m: &CallbackMethodBinding, from_end: usize) -> String {
-    safe_cs_name(&m.abi_params[m.abi_params.len() - from_end].name)
+/// The expression receiving one borrowed argument from its slots.
+fn receive_arg(cx: Cx<'_>, pass: &ArgPass, ty: &weaveffi_model::ty::Ty) -> String {
+    let n = |slot: &AbiParam| safe_cs_name(&slot.name);
+    match pass {
+        ArgPass::Direct { slot } => n(slot),
+        ArgPass::OptDirect { has, value, .. } => format!("{} ? {} : null", n(has), n(value)),
+        ArgPass::Slice { ptr, len, .. } | ArgPass::Bytes { ptr, len } => {
+            format!("Ffi.Borrow({}, {})", n(ptr), n(len))
+        }
+        ArgPass::String { ptr, len } => format!("Ffi.ReadString({}, {})", n(ptr), n(len)),
+        ArgPass::Buffer { ptr, len } => format!(
+            "Ffi.ReadBuffer({}, {}, {})",
+            n(ptr),
+            n(len),
+            read_lambda(cx, ty, 0)
+        ),
+        ArgPass::Object {
+            slot,
+            nullable,
+            interface,
+        } => {
+            let class = cx.ty(interface);
+            if *nullable {
+                format!("{0} == IntPtr.Zero ? null : {class}.Adopt({0})", n(slot))
+            } else {
+                format!("{class}.Adopt({})", n(slot))
+            }
+        }
+        ArgPass::Callback { .. } => unreachable!("a callback method never takes a callback"),
+    }
 }
 
 /// One trampoline: receive the slots, call the implementation, and hand
-/// its result back; any exception is reported through `out_err`. `domain`
-/// is the exception class a `throws` method reports with its code and
-/// payload.
+/// its result back; any exception is reported through `out_err`.
 fn render_trampoline(
     w: &mut CodeWriter,
+    model: &Model,
     cx: Cx<'_>,
     iface: &str,
     m: &CallbackMethodBinding,
-    protocol: &CallbackProtocol<'_>,
-    index: usize,
-    domain: Option<&str>,
 ) {
     let sig: Vec<String> = m
-        .abi_params
+        .abi
+        .params
         .iter()
-        .map(|s| format!("{} {}", cs_ctype(&s.ty), safe_cs_name(&s.name)))
+        .map(|s| format!("{} {}", cs_ctype(cx.ns, &s.ty), safe_cs_name(&s.name)))
         .collect();
-    let ret = cs_ctype(&m.abi_ret);
+    let ret = cs_ctype(cx.ns, &m.abi.ret);
     let returns_value = ret != "void";
-    let ctx = safe_cs_name(&m.abi_params[0].name);
-    let out_err = slot_from_end(m, 1);
+    let ctx = safe_cs_name(&m.abi.params[0].name);
+    let out_err = safe_cs_name(
+        &m.abi
+            .params
+            .last()
+            .expect("a callback method ends with out_err")
+            .name,
+    );
+    let err = ErrCtx::new(model, &m.error, cx);
+    let fallback = match m.error {
+        ErrorStrategy::Trap => "ForeignErrorCode",
+        _ => "GenericErrorCode",
+    };
+    let n = |slot: &AbiParam| safe_cs_name(&slot.name);
     w.line(UNMANAGED_CALLERS_ONLY);
     w.line(format!(
         "private static {ret} {}Trampoline({})",
@@ -215,59 +246,58 @@ fn render_trampoline(
             let args: Vec<String> = m
                 .params
                 .iter()
-                .map(|p| {
-                    let ptr = safe_cs_name(&p.abi[0].name);
-                    let len = p
-                        .abi
-                        .get(1)
-                        .map(|s| safe_cs_name(&s.name))
-                        .unwrap_or_default();
-                    receive(cx, &p.ty, &ptr, &len, Own::Borrow)
-                })
+                .map(|p| receive_arg(cx, &p.pass, &p.ty))
                 .collect();
             let call = format!(
                 "Ffi.Target<{iface}>({ctx}).{}({})",
                 method_cs(m),
                 args.join(", ")
             );
-            match (&protocol.method_returns[index], &m.ret) {
-                (RetPass::Void, _) | (_, None) => w.line(format!("{call};")),
-                (RetPass::Direct, Some(ty)) => {
-                    w.line(format!("return {};", direct_to_slot(ty, &call)))
+            match &m.ret_pass {
+                CallbackRetPass::Void => w.line(format!("{call};")),
+                CallbackRetPass::Direct => w.line(format!("return {call};")),
+                CallbackRetPass::OptDirect { out_value } => w.line(format!(
+                    "return Ffi.ReturnOptional({call}, {});",
+                    n(out_value)
+                )),
+                CallbackRetPass::Slice {
+                    out_ptr, out_len, ..
+                } => w.line(format!(
+                    "Ffi.ReturnArray({call}, {}, {});",
+                    n(out_ptr),
+                    n(out_len)
+                )),
+                CallbackRetPass::String { out_ptr, out_len } => w.line(format!(
+                    "Ffi.ReturnString({call}, {}, {});",
+                    n(out_ptr),
+                    n(out_len)
+                )),
+                CallbackRetPass::Bytes { out_ptr, out_len } => w.line(format!(
+                    "Ffi.ReturnBytes({call}, {}, {});",
+                    n(out_ptr),
+                    n(out_len)
+                )),
+                CallbackRetPass::Buffer { out_ptr, out_len } => {
+                    let ty = m.ret.as_ref().expect("a buffered return has a type");
+                    w.line(format!(
+                        "Ffi.ReturnBuffer({call}, {}, {}, {});",
+                        write_lambda(ty, 0),
+                        n(out_ptr),
+                        n(out_len)
+                    ))
                 }
                 // One strong reference the producer adopts. A null for a
                 // required object passes through as null, which the
                 // producer rejects as a marshalling failure (-3).
-                (RetPass::Object { .. }, _) => {
+                CallbackRetPass::Object { .. } => {
                     w.line(format!("return {call}?.CloneHandle() ?? IntPtr.Zero;"))
-                }
-                (rp, Some(ty)) => {
-                    let (out_ptr, out_len) = (slot_from_end(m, 3), slot_from_end(m, 2));
-                    match rp {
-                        RetPass::String => {
-                            w.line(format!("Ffi.ReturnString({call}, {out_ptr}, {out_len});"))
-                        }
-                        RetPass::Bytes => {
-                            w.line(format!("Ffi.ReturnBytes({call}, {out_ptr}, {out_len});"))
-                        }
-                        _ => {
-                            w.line(format!("var ffiResult = {call};"));
-                            w.line("var ffiWriter = new FfiBufferWriter();");
-                            w.line(write_stmt(ty, "ffiWriter", "ffiResult"));
-                            w.line(format!(
-                                "Ffi.ReturnBuffer(ffiWriter, {out_ptr}, {out_len});"
-                            ))
-                        }
-                    }
                 }
             };
         });
-        if let Some(exc) = domain {
+        if let Some(exc) = &err.domain {
             w.line(format!("catch ({} e)", cx.ty(exc)));
             w.block("{", "}", |w| {
-                w.line(format!(
-                    "Ffi.SetDomainError({out_err}, e.Code, e, e.WritePayload);"
-                ));
+                w.line(format!("Ffi.ReportDomain({out_err}, e);"));
                 if returns_value {
                     w.line("return default;");
                 }
@@ -275,7 +305,7 @@ fn render_trampoline(
         }
         w.line("catch (Exception e)");
         w.block("{", "}", |w| {
-            w.line(format!("Ffi.SetForeignError({out_err}, e);"));
+            w.line(format!("Ffi.Report({out_err}, e, {}.{fallback});", cx.base));
             if returns_value {
                 w.line("return default;");
             }

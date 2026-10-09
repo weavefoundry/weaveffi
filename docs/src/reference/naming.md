@@ -136,10 +136,15 @@ constructor's (kvstore's async `open_store` becomes `KvOpenStore` because
 
 **Errors.** Each target has a root error type named after the package and
 one type (or case) per error domain and code, named from the IDL with at
-most one idiomatic suffix (`Error` or `Exception`). Write code names without
-a suffix (`KeyNotFound`, not `KeyNotFoundError`) and let the generator add
-it. Code names are global because several targets flatten them into one
-namespace.
+most one idiomatic suffix (`Error` or `Exception`). Every target applies one
+shared rule (`weaveffi_model::errors::type_name`): convert the name to
+PascalCase, strip one trailing `Exceptions`, `Exception`, `Errors`, or
+`Error`, then add the target's suffix. So `KvError` stays `KvError` (or
+becomes `KvException`), `KitchenErrors` becomes `KitchenError`, `Failure`
+becomes `FailureError`, and a code `KEY_NOT_FOUND` becomes
+`KeyNotFoundError`. Write code names without a suffix (`KeyNotFound`, not
+`KeyNotFoundError`) and let the generator add it. Code names are global
+because several targets flatten them into one namespace.
 
 **Reserved words.** A name that's a keyword in the target language gains a
 trailing `_` (`type` becomes `type_`), a rule that's stable under repetition.

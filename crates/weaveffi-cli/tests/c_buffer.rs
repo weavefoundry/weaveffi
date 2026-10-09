@@ -7,15 +7,14 @@
 use std::process::Command;
 
 use camino::Utf8Path;
-use weaveffi_cli::backend::LanguageBackend;
-use weaveffi_cli::targets::c::{CConfig, CGenerator};
+use weaveffi_cli::targets;
 use weaveffi_model::model::Model;
 use weaveffi_model::parse::parse_api_str;
 use weaveffi_model::pkg::Identity;
 use weaveffi_model::validate::validate;
 
 const SHOP: &str = r#"
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: shop
     enums:
@@ -46,23 +45,23 @@ modules:
           - { name: blob, type: bytes }
           - { name: matrix, type: "[[u8]]" }
     errors:
-      name: ShopError
-      codes:
-        - name: OutOfStock
-          code: 1
-          message: "out of stock"
-          fields:
-            - { name: missing, type: "[string]" }
+      - name: ShopError
+        codes:
+          - name: OutOfStock
+            code: 1
+            message: "out of stock"
+            fields:
+              - { name: missing, type: "[string]" }
     functions:
       - name: echo
         params:
           - { name: item, type: Item }
         return: "Item?"
-        throws: true
+        throws: ShopError
 "#;
 
 const PLAIN: &str = r#"
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: math
     functions:
@@ -78,9 +77,17 @@ fn load(yaml: &str, name: &str) -> Model {
     validate(&api, &Identity::named(name), None).expect("validate")
 }
 
-fn generate(model: &Model, config: &CConfig, dir: &Utf8Path) -> Vec<(String, String)> {
-    CGenerator
-        .files(model, dir, config)
+/// The C target with the `[generators.c]` table `config`.
+fn c_target(config: &str) -> Box<dyn targets::Target> {
+    targets::find("c")
+        .expect("the C target")
+        .build(toml::from_str(config).expect("a TOML table"))
+        .expect("a valid C configuration")
+}
+
+fn generate(model: &Model, config: &str) -> Vec<(String, String)> {
+    c_target(config)
+        .render(model)
         .into_iter()
         .map(|f| {
             let name = f.path.file_name().unwrap_or_default().to_string();
@@ -91,7 +98,7 @@ fn generate(model: &Model, config: &CConfig, dir: &Utf8Path) -> Vec<(String, Str
 
 fn buffer_header(yaml: &str, name: &str) -> String {
     let api = load(yaml, name);
-    let files = generate(&api, &CConfig::default(), Utf8Path::new("out"));
+    let files = generate(&api, "");
     files
         .into_iter()
         .find(|(n, _)| n == &format!("{name}_buffer.h"))
@@ -102,36 +109,24 @@ fn buffer_header(yaml: &str, name: &str) -> String {
 #[test]
 fn emits_the_helper_header_only_when_buffers_cross_the_abi() {
     let api = load(SHOP, "shop");
-    let names: Vec<String> = generate(&api, &CConfig::default(), Utf8Path::new("out"))
-        .into_iter()
-        .map(|(n, _)| n)
-        .collect();
+    let names: Vec<String> = generate(&api, "").into_iter().map(|(n, _)| n).collect();
     assert_eq!(names, ["shop.h", "shop_buffer.h"]);
 
-    let off = CConfig {
-        buffer_helpers: false,
-    };
-    let names: Vec<String> = generate(&api, &off, Utf8Path::new("out"))
+    let names: Vec<String> = generate(&api, "buffer_helpers = false")
         .into_iter()
         .map(|(n, _)| n)
         .collect();
     assert_eq!(names, ["shop.h"]);
 
     let plain = load(PLAIN, "math");
-    let names: Vec<String> = generate(&plain, &CConfig::default(), Utf8Path::new("out"))
-        .into_iter()
-        .map(|(n, _)| n)
-        .collect();
+    let names: Vec<String> = generate(&plain, "").into_iter().map(|(n, _)| n).collect();
     assert_eq!(names, ["math.h"]);
 }
 
 #[test]
-fn config_defaults_to_helpers_on_and_rejects_unknown_keys() {
-    let cfg: CConfig = serde_json::from_str("{}").expect("empty config");
-    assert!(cfg.buffer_helpers);
-    let cfg: CConfig = serde_json::from_str(r#"{"buffer_helpers": false}"#).expect("flag");
-    assert!(!cfg.buffer_helpers);
-    assert!(serde_json::from_str::<CConfig>(r#"{"prefix": "x"}"#).is_err());
+fn config_rejects_unknown_keys() {
+    let table = toml::from_str("prefix = \"x\"").unwrap();
+    assert!(targets::find("c").unwrap().build(table).is_err());
 }
 
 #[test]
@@ -149,7 +144,7 @@ fn renders_structs_unions_and_payloads() {
         "static inline bool shop_shop_ShopError_OutOfStock_payload_decode(const uint8_t* ptr, size_t len, shop_shop_ShopError_OutOfStock_payload* out);"
     ));
     assert!(h.contains(
-        "static inline void shop_opt_shop_Item_write(shop_writer* w, const shop_shop_Item* v);"
+        "static inline void shop_opt_Item_write(shop_writer* w, const shop_shop_Item* v);"
     ));
     // The price union is defined before the record that embeds it.
     let price = h.find("struct shop_shop_Price {").expect("price struct");
@@ -192,11 +187,11 @@ int main(void) {
 
     shop_writer w;
     memset(&w, 0, sizeof w);
-    shop_opt_shop_Item_write(&w, &item);
+    shop_opt_Item_write(&w, &item);
     assert(!w.failed);
 
     shop_shop_Item* back = NULL;
-    assert(shop_opt_shop_Item_decode(w.ptr, w.len, &back));
+    assert(shop_opt_Item_decode(w.ptr, w.len, &back));
     assert(back != NULL);
     assert(back->name.len == 5 && memcmp(back->name.ptr, "caf\xC3\xA9", 5) == 0);
     assert(back->name.ptr[5] == '\0');
@@ -210,26 +205,26 @@ int main(void) {
     assert(strcmp(back->price.as.Note.text.ptr, "half") == 0);
     assert(back->blob.len == 2 && back->blob.ptr[1] == 2);
     assert(back->matrix.len == 2 && back->matrix.items[0].len == 2 && back->matrix.items[1].len == 0);
-    shop_opt_shop_Item_free(&back);
+    shop_opt_Item_free(&back);
     assert(back == NULL);
 
     /* Truncation anywhere fails cleanly and leaves nothing allocated. */
     for (size_t cut = 0; cut < w.len; cut++) {
         shop_shop_Item* partial = NULL;
-        assert(!shop_opt_shop_Item_decode(w.ptr, cut, &partial));
+        assert(!shop_opt_Item_decode(w.ptr, cut, &partial));
         assert(partial == NULL);
     }
     /* Trailing bytes are rejected. */
     shop_writer_put_u8(&w, 0);
-    assert(!shop_opt_shop_Item_decode(w.ptr, w.len, &back));
+    assert(!shop_opt_Item_decode(w.ptr, w.len, &back));
     shop_writer_free(&w);
 
     /* An absent optional, a bad presence byte, a bad tag, and a count the
        buffer can't hold. */
     const uint8_t absent[1] = {0};
-    assert(shop_opt_shop_Item_decode(absent, 1, &back) && back == NULL);
+    assert(shop_opt_Item_decode(absent, 1, &back) && back == NULL);
     const uint8_t bad_flag[1] = {2};
-    assert(!shop_opt_shop_Item_decode(bad_flag, 1, &back));
+    assert(!shop_opt_Item_decode(bad_flag, 1, &back));
     const uint8_t bad_tag[4] = {9, 0, 0, 0};
     shop_shop_Price price;
     assert(!shop_shop_Price_decode(bad_tag, 4, &price));
@@ -237,6 +232,26 @@ int main(void) {
     shop_list_string list;
     assert(!shop_list_string_decode(huge, 4, &list));
     assert(list.items == NULL && list.len == 0);
+
+    /* A string must be well-formed UTF-8: a stray continuation byte, an
+       overlong encoding, and an encoded surrogate all fail the decoder. */
+    const uint8_t bad_utf8[3][7] = {
+        {3, 0, 0, 0, 'a', 0x80, 'b'},
+        {3, 0, 0, 0, 0xC0, 0xAF, 'b'},
+        {3, 0, 0, 0, 0xED, 0xA0, 0x80},
+    };
+    for (int i = 0; i < 3; i++) {
+        shop_list_string one;
+        uint8_t buf[11] = {1, 0, 0, 0};
+        memcpy(buf + 4, bad_utf8[i], 7);
+        assert(!shop_list_string_decode(buf, 11, &one));
+        assert(one.items == NULL && one.len == 0);
+    }
+    const uint8_t good_utf8[11] = {1, 0, 0, 0, 3, 0, 0, 0, 0xE2, 0x82, 0xAC};
+    shop_list_string euro;
+    assert(shop_list_string_decode(good_utf8, 11, &euro));
+    assert(euro.len == 1 && euro.items[0].len == 3);
+    shop_list_string_free(&euro);
 
     /* Error payloads decode through their own struct. */
     shop_writer pw;
@@ -280,7 +295,7 @@ fn codecs_round_trip_in_c_and_cpp() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = Utf8Path::from_path(tmp.path()).expect("utf8");
     let api = load(SHOP, "shop");
-    for (name, contents) in generate(&api, &CConfig::default(), dir) {
+    for (name, contents) in generate(&api, "") {
         std::fs::write(dir.join(name), contents).expect("write header");
     }
     for (cc, ext, std) in compilers {
@@ -318,5 +333,63 @@ fn codecs_round_trip_in_c_and_cpp() {
             String::from_utf8_lossy(&run.stdout),
             String::from_utf8_lossy(&run.stderr)
         );
+    }
+}
+
+/// Every snapshot fixture's headers compile cleanly as C11 and C++17, so a
+/// declaration shape the kitchen-sink snapshot doesn't show (reserved
+/// words, deep nesting, rich enums) can't produce an invalid header.
+#[test]
+fn fixture_headers_compile_in_c_and_cpp() {
+    let fixtures = [
+        "kitchen_sink",
+        "shapes",
+        "nested_modules",
+        "docs_everywhere",
+        "edge_cases",
+    ];
+    let compilers = [("cc", "c", "-std=c11"), ("c++", "cpp", "-std=c++17")];
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = Utf8Path::from_path(tmp.path()).expect("utf8");
+    for stem in fixtures {
+        let path = Utf8Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(format!("{stem}.yml"));
+        let yaml = std::fs::read_to_string(&path).expect("read fixture");
+        let files = generate(&load(&yaml, stem), "");
+        let include = files
+            .iter()
+            .map(|(n, _)| n.clone())
+            .find(|n| n.ends_with("_buffer.h"))
+            .unwrap_or_else(|| format!("{stem}.h"));
+        for (name, contents) in &files {
+            std::fs::write(dir.join(name), contents).expect("write header");
+        }
+        for (cc, ext, std) in compilers {
+            if !have(cc) {
+                continue;
+            }
+            let src = dir.join(format!("{stem}.{ext}"));
+            std::fs::write(
+                &src,
+                format!("#include \"{include}\"\nint main(void) {{ return 0; }}\n"),
+            )
+            .expect("write source");
+            let out = Command::new(cc)
+                .args([std, "-Wall", "-Wextra", "-Werror", "-pedantic"])
+                .arg("-I")
+                .arg(dir.as_str())
+                .arg("-c")
+                .arg(src.as_str())
+                .arg("-o")
+                .arg(dir.join(format!("{stem}_{ext}.o")).as_str())
+                .output()
+                .expect("run compiler");
+            assert!(
+                out.status.success(),
+                "{cc} failed on {stem}:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 }

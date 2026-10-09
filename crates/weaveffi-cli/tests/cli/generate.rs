@@ -10,8 +10,7 @@ fn generate_produces_expected_files() {
     let out_dir = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = out_dir.path();
 
-    assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
+    crate::weaveffi()
         .args([
             "generate",
             input.to_str().unwrap(),
@@ -48,8 +47,7 @@ fn generate_with_target_filter() {
     let out_dir = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = out_dir.path();
 
-    assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
+    crate::weaveffi()
         .args([
             "generate",
             input.to_str().unwrap(),
@@ -80,8 +78,7 @@ fn generate_cpp_target_filter() {
     let out_dir = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = out_dir.path();
 
-    assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
+    crate::weaveffi()
         .args([
             "generate",
             input.to_str().unwrap(),
@@ -109,8 +106,7 @@ fn validate_command_succeeds() {
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
     let input = repo_root.join("samples/calculator");
 
-    assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
+    crate::weaveffi()
         .args(["validate", input.to_str().unwrap()])
         .assert()
         .success()
@@ -126,8 +122,7 @@ fn quiet_flag_suppresses_output() {
     let out_dir = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = out_dir.path();
 
-    assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
+    crate::weaveffi()
         .args([
             "--quiet",
             "generate",
@@ -156,8 +151,7 @@ fn dev_bundles_the_debug_library_into_the_python_package() {
     let out_dir = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = out_dir.path();
 
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
+    let output = crate::weaveffi()
         .args(["dev", input.to_str().unwrap(), "-o"])
         .arg(out_path)
         .args(["--target", "c,python,dotnet"])

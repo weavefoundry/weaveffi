@@ -6,40 +6,25 @@
 //! runtime call); everything else delegates to its named function, so no
 //! loop is ever inlined at a call site. Every dispatch goes through
 //! [`Ty::wire`], and primitives dispatch on [`Prim::snake`] (`write_i32`,
-//! `read_string`).
+//! `read_string`). The composites and their names come from the shared
+//! [`codecs`](crate::codegen::codecs) emitter (`_read_list_i32`,
+//! `_write_map_string_Item`).
 
-use std::collections::HashSet;
-
+use crate::codegen::codecs::{composites, stem};
 use crate::codegen::CodeWriter;
 use weaveffi_model::model::{EnumBinding, Model, StructBinding};
 use weaveffi_model::ty::{Prim, Ty, WireType};
 
-use crate::targets::python::types::{py_field, py_type_hint, py_variant};
-
-/// The identifier fragment naming `ty` in its codec functions: a
-/// primitive's spelling (`i64`), a user type's name (`Entry`), or the
-/// composite's shape (`opt_i64`, `list_string`, `map_string_Store`).
-fn mangle(ty: &Ty) -> String {
-    match ty {
-        Ty::Optional(inner) => format!("opt_{}", mangle(inner)),
-        Ty::List(inner) => format!("list_{}", mangle(inner)),
-        Ty::Map(k, v) => format!("map_{}_{}", mangle(k), mangle(v)),
-        Ty::Prim(p) => p.snake().to_string(),
-        _ => ty
-            .user_name()
-            .expect("only optionals, lists, maps, primitives, and user types are mangled")
-            .to_string(),
-    }
-}
+use crate::targets::python::types::{py_field, py_type_hint, py_variant, Dir};
 
 /// `_write_{stem}`: the writer for a record, rich enum, or composite.
 fn write_fn(ty: &Ty) -> String {
-    format!("_write_{}", mangle(ty))
+    format!("_write_{}", stem(ty))
 }
 
 /// `_read_{stem}`: the reader for a record, rich enum, or composite.
 fn read_fn(ty: &Ty) -> String {
-    format!("_read_{}", mangle(ty))
+    format!("_read_{}", stem(ty))
 }
 
 /// The `struct` format character and byte width of a fixed-width numeric
@@ -194,70 +179,6 @@ pub(crate) fn render_rich_enum_codecs(w: &mut CodeWriter, e: &EnumBinding) {
     });
 }
 
-/// Record every optional, list, and map shape inside `ty`, innermost first.
-fn collect(ty: &Ty, out: &mut Vec<Ty>, seen: &mut HashSet<Ty>) {
-    match ty {
-        Ty::Optional(inner) | Ty::List(inner) => collect(inner, out, seen),
-        Ty::Map(k, v) => {
-            collect(k, out, seen);
-            collect(v, out, seen);
-        }
-        _ => return,
-    }
-    if seen.insert(ty.clone()) {
-        out.push(ty.clone());
-    }
-}
-
-/// Every distinct composite type a value buffer of the API carries, in
-/// first-use order: inside records, rich-enum variants, and error payloads,
-/// and at every buffered call boundary (parameters, returns, iterator
-/// elements, and callback parameters and returns).
-fn composites(model: &Model) -> Vec<Ty> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for m in &model.modules {
-        let fields = m
-            .structs
-            .iter()
-            .flat_map(|s| &s.fields)
-            .chain(
-                m.enums
-                    .iter()
-                    .flat_map(|e| &e.variants)
-                    .flat_map(|v| &v.fields),
-            )
-            .chain(
-                m.errors
-                    .iter()
-                    .flat_map(|e| &e.codes)
-                    .flat_map(|c| &c.fields),
-            );
-        for f in fields {
-            collect(&f.ty, &mut out, &mut seen);
-        }
-    }
-    let mut boundary = |ty: &Ty| {
-        let ty = ty.iterator_elem().unwrap_or(ty);
-        if ty.is_buffered() {
-            collect(ty, &mut out, &mut seen);
-        }
-    };
-    for m in &model.modules {
-        for f in m.callables() {
-            f.params.iter().for_each(|p| boundary(&p.ty));
-            f.ret.iter().for_each(&mut boundary);
-        }
-        for cb in &m.callback_interfaces {
-            for meth in &cb.methods {
-                meth.params.iter().for_each(|p| boundary(&p.ty));
-                meth.ret.iter().for_each(&mut boundary);
-            }
-        }
-    }
-    out
-}
-
 /// Append the writer and reader of every composite type the API uses, after
 /// every module (a function body resolves the codecs it calls when it runs,
 /// so definition order doesn't matter).
@@ -275,11 +196,11 @@ pub(crate) fn render_composite_codecs(w: &mut CodeWriter, model: &Model) {
 
 /// Append one composite type's writer and reader.
 fn render_composite(w: &mut CodeWriter, ty: &Ty) {
-    let hint = py_type_hint(ty);
     w.blank().blank();
     w.line(format!(
-        "def {}(_w: _Writer, value: {hint}) -> None:",
-        write_fn(ty)
+        "def {}(_w: _Writer, value: {}) -> None:",
+        write_fn(ty),
+        py_type_hint(ty, Dir::In)
     ));
     w.scope(|w| match ty {
         Ty::Optional(inner) => {
@@ -292,7 +213,10 @@ fn render_composite(w: &mut CodeWriter, ty: &Ty) {
         Ty::List(inner) => match inner.wire() {
             WireType::Prim(p) if numeric_format(p).is_some() => {
                 let (code, _) = numeric_format(p).expect("numeric");
-                w.line(format!("_w.write_numbers(\"{code}\", value)"));
+                w.line(format!(
+                    "_w.write_numbers(\"{code}\", \"{}\", value)",
+                    p.snake()
+                ));
             }
             _ => {
                 w.line("_w.write_count(len(value))");
@@ -314,7 +238,11 @@ fn render_composite(w: &mut CodeWriter, ty: &Ty) {
     });
 
     w.blank().blank();
-    w.line(format!("def {}(_r: _Reader) -> {hint}:", read_fn(ty)));
+    w.line(format!(
+        "def {}(_r: _Reader) -> {}:",
+        read_fn(ty),
+        py_type_hint(ty, Dir::Out)
+    ));
     w.scope(|w| match ty {
         Ty::Optional(inner) => {
             w.line(format!(

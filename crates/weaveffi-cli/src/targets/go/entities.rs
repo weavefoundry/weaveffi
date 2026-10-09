@@ -3,19 +3,19 @@
 
 use crate::codegen::CodeWriter;
 use weaveffi_model::model::{
-    CallShape, EnumBinding, ErrorBinding, FieldBinding, InterfaceBinding, ModuleBinding,
-    StructBinding,
+    EnumBinding, ErrorBinding, FieldBinding, InterfaceBinding, StructBinding,
 };
+use weaveffi_model::plan::CallbackRetPass;
 
-use crate::targets::go::calls::{render_async, render_sync, Receiver};
-use crate::targets::go::codec::{func, read_expr, write_stmt, BufferTypes};
-use crate::targets::go::docs::{GoDoc, Kind};
-use crate::targets::go::names::{self, constructor, domain_type, pascal};
+use crate::targets::go::calls::{render_function, Receiver};
+use crate::targets::go::codec::{func, read_expr, write_stmt};
+use crate::targets::go::docs::GoDoc;
+use crate::targets::go::names::{self, constructor, pascal};
 use crate::targets::go::types::{go_str, go_type};
 use crate::targets::go::Ctx;
 
-/// One `name rest` line inside a struct or const block, with its optional
-/// doc comment, for [`emit_aligned`].
+/// One `name rest` line inside a struct or const block, with its doc
+/// comment, for [`emit_aligned`].
 struct AlignedEntry {
     doc: Option<String>,
     name: String,
@@ -26,7 +26,7 @@ struct AlignedEntry {
 /// it out: gofmt aligns the second column of consecutive lines and starts a
 /// fresh column after a comment line, so each run of entries following a
 /// documented one (or the start) is padded to the widest name in that run.
-fn emit_aligned(w: &mut CodeWriter, entries: Vec<AlignedEntry>, kind: Kind) {
+fn emit_aligned(w: &mut CodeWriter, entries: Vec<AlignedEntry>) {
     let mut i = 0;
     while i < entries.len() {
         let mut j = i + 1;
@@ -39,7 +39,7 @@ fn emit_aligned(w: &mut CodeWriter, entries: Vec<AlignedEntry>, kind: Kind) {
             .max()
             .unwrap_or(0);
         for e in &entries[i..j] {
-            GoDoc::new(&e.name, e.doc.as_deref(), kind, None).emit(w);
+            GoDoc::plain(e.doc.clone()).emit(w);
             w.line(format!("{:<width$} {}", e.name, e.rest));
         }
         i = j;
@@ -47,11 +47,15 @@ fn emit_aligned(w: &mut CodeWriter, entries: Vec<AlignedEntry>, kind: Kind) {
 }
 
 /// The struct-body entries of `fields`, named by `name`.
-fn field_entries(fields: &[FieldBinding], name: fn(&str) -> String) -> Vec<AlignedEntry> {
+fn field_entries(
+    ctx: &Ctx,
+    fields: &[FieldBinding],
+    name: fn(&str) -> String,
+) -> Vec<AlignedEntry> {
     fields
         .iter()
         .map(|f| AlignedEntry {
-            doc: f.doc.clone().filter(|d| !d.trim().is_empty()),
+            doc: ctx.docs.of(&f.doc, &None).0,
             name: name(&f.name),
             rest: go_type(&f.ty),
         })
@@ -60,11 +64,10 @@ fn field_entries(fields: &[FieldBinding], name: fn(&str) -> String) -> Vec<Align
 
 /// Render a C-style enum: an `int32` type with one constant per variant,
 /// plus its codec pair when it appears inside a buffer.
-pub(crate) fn render_enum(w: &mut CodeWriter, e: &EnumBinding, codecs: &BufferTypes) {
+pub(crate) fn render_enum(w: &mut CodeWriter, ctx: &Ctx, e: &EnumBinding) {
     let name = pascal(&e.name);
-    GoDoc::new(&name, e.doc.as_deref(), Kind::Value, None)
-        .deprecated(e.deprecated.as_deref())
-        .emit(w);
+    let (doc, deprecated) = ctx.docs.of(&e.doc, &e.deprecated);
+    GoDoc::decl(&name, doc).deprecated(deprecated).emit(w);
     w.line(format!("type {name} int32"));
     w.blank();
     w.block("const (", ")", |w| {
@@ -72,15 +75,15 @@ pub(crate) fn render_enum(w: &mut CodeWriter, e: &EnumBinding, codecs: &BufferTy
             .variants
             .iter()
             .map(|v| AlignedEntry {
-                doc: v.doc.clone().filter(|d| !d.trim().is_empty()),
+                doc: ctx.docs.of(&v.doc, &None).0,
                 name: format!("{name}{}", pascal(&v.name)),
                 rest: format!("{name} = {}", v.value),
             })
             .collect();
-        emit_aligned(w, entries, Kind::Clause);
+        emit_aligned(w, entries);
     });
     w.blank();
-    if codecs.enums.contains(&e.name) {
+    if ctx.codecs.has_enum(&e.name) {
         func(
             w,
             &format!("func wvWrite{name}(w *wvWriter, v {name})"),
@@ -97,14 +100,16 @@ pub(crate) fn render_enum(w: &mut CodeWriter, e: &EnumBinding, codecs: &BufferTy
 /// Render a rich enum as a sealed interface (`type Shape interface {
 /// isShape() }`) with one struct per variant (`ShapeCircle`), plus its codec
 /// pair: the `i32` tag, then the variant's fields in order.
-pub(crate) fn render_rich_enum(w: &mut CodeWriter, package: &str, e: &EnumBinding) {
+pub(crate) fn render_rich_enum(w: &mut CodeWriter, ctx: &Ctx, e: &EnumBinding) {
+    let package = ctx.package;
     let name = pascal(&e.name);
-    GoDoc::new(&name, e.doc.as_deref(), Kind::Value, None)
+    let (doc, deprecated) = ctx.docs.of(&e.doc, &e.deprecated);
+    GoDoc::decl(&name, doc)
         .para(&format!(
             "{name} is a sealed sum type: exactly one of its variant structs is the \
              value at a time."
         ))
-        .deprecated(e.deprecated.as_deref())
+        .deprecated(deprecated)
         .emit(w);
     w.block(format!("type {name} interface {{"), "}", |w| {
         w.line(format!("is{name}()"));
@@ -113,18 +118,17 @@ pub(crate) fn render_rich_enum(w: &mut CodeWriter, package: &str, e: &EnumBindin
 
     for v in &e.variants {
         let vn = format!("{name}{}", pascal(&v.name));
-        GoDoc::new(
-            &vn,
-            v.doc.as_deref(),
-            Kind::Clause,
-            Some(format!("{vn} is the {} variant of {name}.", v.name)),
-        )
-        .emit(w);
+        let text = ctx.docs.of(&v.doc, &None).0;
+        let doc = match text {
+            Some(_) => GoDoc::decl(&vn, text),
+            None => GoDoc::plain(None).para(&format!("{vn} is the {} variant of {name}.", v.name)),
+        };
+        doc.emit(w);
         if v.fields.is_empty() {
             w.line(format!("type {vn} struct{{}}"));
         } else {
             w.block(format!("type {vn} struct {{"), "}", |w| {
-                emit_aligned(w, field_entries(&v.fields, names::field), Kind::Value);
+                emit_aligned(w, field_entries(ctx, &v.fields, names::field));
             });
         }
         w.blank();
@@ -197,13 +201,12 @@ pub(crate) fn render_rich_enum(w: &mut CodeWriter, package: &str, e: &EnumBindin
 
 /// Render a record as a value struct with exported fields, plus its codec
 /// pair: the fields in declaration order.
-pub(crate) fn render_struct(w: &mut CodeWriter, s: &StructBinding) {
+pub(crate) fn render_struct(w: &mut CodeWriter, ctx: &Ctx, s: &StructBinding) {
     let name = pascal(&s.name);
-    GoDoc::new(&name, s.doc.as_deref(), Kind::Value, None)
-        .deprecated(s.deprecated.as_deref())
-        .emit(w);
+    let (doc, deprecated) = ctx.docs.of(&s.doc, &s.deprecated);
+    GoDoc::decl(&name, doc).deprecated(deprecated).emit(w);
     w.block(format!("type {name} struct {{"), "}", |w| {
-        emit_aligned(w, field_entries(&s.fields, names::field), Kind::Value);
+        emit_aligned(w, field_entries(ctx, &s.fields, names::field));
     });
     w.blank();
     w.block(
@@ -235,50 +238,31 @@ pub(crate) fn render_struct(w: &mut CodeWriter, s: &StructBinding) {
     w.blank();
 }
 
-/// The name of the helper converting a failure in the domain `e` into its
-/// error-code type (`wvKvError`).
-pub(crate) fn domain_mapper(e: &ErrorBinding) -> String {
-    format!("wv{}", domain_type(e))
-}
-
-/// Render an error domain: the sealed `{Domain}` interface every code type
-/// implements, one `*{Code}Error` struct per code (its payload fields, a
-/// `Message`, `Error`, and `Code`), and the helper mapping a failure to the
-/// code's type, with an *Error for any code outside the domain.
-pub(crate) fn render_error(w: &mut CodeWriter, ctx: &Ctx, m: &ModuleBinding, e: &ErrorBinding) {
+/// Render an error domain: the sealed interface every code type implements
+/// (`KitchenError`), one `*{Code}Error` struct per code (its payload
+/// fields, a `Message`, `Error`, and `Code`), the `*Unknown{Domain}` type of
+/// a code these bindings don't declare, and the helper mapping a failure
+/// onto the domain (an `*Error` for a runtime code).
+pub(crate) fn render_error(w: &mut CodeWriter, ctx: &Ctx, e: &ErrorBinding) {
     let gn = ctx.names;
-    let domain = domain_type(e);
+    let d = gn.domain_of(e);
+    let domain = &d.iface;
     let marker = format!("is{domain}");
-    let codes: Vec<&str> = e.codes.iter().map(|c| gn.code(c)).collect();
-    let list = match codes.as_slice() {
-        [one] => format!("*{one}"),
-        [init @ .., last] => format!(
-            "{}, or *{last}",
-            init.iter()
-                .map(|c| format!("*{c}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        [] => unreachable!("an error domain declares at least one code"),
-    };
-    GoDoc::new(
-        &domain,
-        None,
-        Kind::Value,
-        Some(format!(
-            "{domain} is an error the {} module reports: {list}.",
-            m.dot_path
-        )),
-    )
-    .para(&if ctx.throwing_callbacks {
-        format!(
-            "Match one code with errors.As and its type, or any of them with a \
-             {domain}. A throwing callback method returns one to report that code."
-        )
-    } else {
-        format!("Match one code with errors.As and its type, or any of them with a {domain}.")
-    })
-    .emit(w);
+    let codes: Vec<String> = e.codes.iter().map(|c| format!("*{}", gn.code(c))).collect();
+    GoDoc::plain(None)
+        .para(&format!(
+            "{domain} is an error of the {} domain: {}, or *{} for a code these \
+             bindings don't declare.",
+            e.name,
+            codes.join(", "),
+            d.unknown
+        ))
+        .para(&format!(
+            "Match one code with errors.As and its type, or any code of the domain \
+             with a {domain}. A callback method that declares the domain returns \
+             one to report that code."
+        ))
+        .emit(w);
     w.block(format!("type {domain} interface {{"), "}", |w| {
         w.line("error");
         w.line("// Code returns the error's numeric code.");
@@ -289,25 +273,23 @@ pub(crate) fn render_error(w: &mut CodeWriter, ctx: &Ctx, m: &ModuleBinding, e: 
 
     for c in &e.codes {
         let ty = gn.code(c);
-        let doc = c
-            .doc
-            .as_deref()
-            .filter(|d| d.trim() != c.message.trim())
-            .map(str::to_string);
-        GoDoc::new(
-            ty,
-            doc.as_deref(),
-            Kind::Clause,
-            Some(format!(
+        let text = ctx
+            .docs
+            .of(&c.doc, &None)
+            .0
+            .filter(|d| d.trim() != c.message.trim());
+        let doc = match text {
+            Some(_) => GoDoc::decl(ty, text),
+            None => GoDoc::plain(None).para(&format!(
                 "{ty} is the {domain} code {} ({}): {}.",
                 c.name,
                 c.value,
                 c.message.trim_end_matches('.')
             )),
-        )
-        .emit(w);
+        };
+        doc.emit(w);
         w.block(format!("type {ty} struct {{"), "}", |w| {
-            emit_aligned(w, field_entries(&c.fields, names::error_field), Kind::Value);
+            emit_aligned(w, field_entries(ctx, &c.fields, names::error_field));
             w.line("// Message describes the failure; when it's empty, Error returns the");
             w.line(format!(
                 "// code's default message, {}.",
@@ -333,9 +315,7 @@ pub(crate) fn render_error(w: &mut CodeWriter, ctx: &Ctx, m: &ModuleBinding, e: 
         w.line(format!("func (*{ty}) {marker}() {{}}"));
         w.blank();
         if c.fields.is_empty() {
-            w.block(format!("func (*{ty}) wvPayload() []byte {{"), "}", |w| {
-                w.line("return nil");
-            });
+            func(w, &format!("func (*{ty}) wvPayload() []byte"), "return nil");
         } else {
             w.block(format!("func (e *{ty}) wvPayload() []byte {{"), "}", |w| {
                 w.line("w := &wvWriter{}");
@@ -345,12 +325,47 @@ pub(crate) fn render_error(w: &mut CodeWriter, ctx: &Ctx, m: &ModuleBinding, e: 
                 }
                 w.line("return w.buf");
             });
+            w.blank();
         }
-        w.blank();
     }
 
+    let unknown = &d.unknown;
+    GoDoc::plain(None)
+        .para(&format!(
+            "{unknown} is a {domain} code these bindings don't declare, which a \
+             newer library may report."
+        ))
+        .emit(w);
+    w.block(format!("type {unknown} struct {{"), "}", |w| {
+        w.line("code int32");
+        w.line("// Message is the library's message.");
+        w.line("Message string");
+    });
+    w.blank();
+    w.line("// Error returns the error's message.");
+    w.block(format!("func (e *{unknown}) Error() string {{"), "}", |w| {
+        w.block("if e.Message == \"\" {", "}", |w| {
+            w.line(format!("return wvCodeMessage({}, e.code)", go_str(&e.name)));
+        });
+        w.line("return e.Message");
+    });
+    w.blank();
+    w.line("// Code returns the code the library reported.");
+    func(
+        w,
+        &format!("func (e *{unknown}) Code() int32"),
+        "return e.code",
+    );
+    w.line(format!("func (*{unknown}) {marker}() {{}}"));
+    w.blank();
+    func(
+        w,
+        &format!("func (*{unknown}) wvPayload() []byte"),
+        "return nil",
+    );
+
     w.block(
-        format!("func {}(f wvFailure) error {{", domain_mapper(e)),
+        format!("func {}(f wvFailure) error {{", d.mapper),
         "}",
         |w| {
             w.line("switch f.code {");
@@ -378,50 +393,52 @@ pub(crate) fn render_error(w: &mut CodeWriter, ctx: &Ctx, m: &ModuleBinding, e: 
                 });
             }
             w.line("}");
+            w.block("if f.code > 0 {", "}", |w| {
+                w.line(format!(
+                    "return &{unknown}{{code: f.code, Message: f.message}}"
+                ));
+            });
             w.line("return f.err()");
         },
     );
     w.blank();
 }
 
-/// Render an interface as a reference-counted object wrapper whose `wvRef`
-/// owns one strong reference, released by `Close` (idempotent, and safe to
-/// race with in-flight calls) or, as a backstop, by a finalizer; its codec
-/// pair when it appears inside a buffer (an object token carrying a fresh
-/// reference); and its members: constructors as factories (`OpenStore`),
-/// methods on the wrapper, and statics prefixed with the type
-/// (`StoreDefaultCapacity`).
+/// Render an interface as a reference-counted object wrapper embedding a
+/// `wvObject`, which owns one strong reference released by `Close`
+/// (idempotent, and safe to race with in-flight calls) or by a cleanup once
+/// the wrapper is unreachable; its codec pair when it appears inside a
+/// buffer (an object token carrying a fresh reference); and its members:
+/// constructors as factories (`OpenStore`), methods on the wrapper, and
+/// statics prefixed with the type (`StoreDefaultCapacity`).
 pub(crate) fn render_interface(w: &mut CodeWriter, ctx: &Ctx, iface: &InterfaceBinding) {
     let package = ctx.package;
     let name = pascal(&iface.name);
     let c_tag = &iface.c_tag;
-    GoDoc::new(
-        &name,
-        iface.doc.as_deref(),
-        Kind::Value,
-        Some(format!(
+    let (doc, deprecated) = ctx.docs.of(&iface.doc, &iface.deprecated);
+    let doc = match doc {
+        Some(_) => GoDoc::decl(&name, doc),
+        None => GoDoc::plain(None).para(&format!(
             "{name} is a reference-counted object owned by the native library."
         )),
+    };
+    doc.para(
+        "Each wrapper holds one strong reference to the object. Close releases \
+         it; a wrapper that's never closed releases it some time after it becomes \
+         unreachable.",
     )
-    .para(
-        "Each wrapper holds one strong reference; Close releases it, and a \
-         finalizer releases it if the wrapper is garbage collected first.",
-    )
-    .deprecated(iface.deprecated.as_deref())
+    .deprecated(deprecated)
     .emit(w);
     w.block(format!("type {name} struct {{"), "}", |w| {
-        w.line("ref wvRef");
+        w.line("wvObject");
     });
     w.blank();
 
-    w.block(
-        format!("func wvDestroy{name}(ptr unsafe.Pointer) {{"),
-        "}",
-        |w| {
-            w.line(format!("C.{}((*C.{c_tag})(ptr))", iface.destroy_symbol));
-        },
+    func(
+        w,
+        &format!("func wvDestroy{name}(ptr unsafe.Pointer)"),
+        &format!("C.{}((*C.{c_tag})(ptr))", iface.destroy_symbol),
     );
-    w.blank();
 
     w.line(format!(
         "// wvAdopt{name} wraps one owned strong reference. A null pointer adopts to nil."
@@ -434,15 +451,14 @@ pub(crate) fn render_interface(w: &mut CodeWriter, ctx: &Ctx, iface: &InterfaceB
                 w.line("return nil");
             });
             w.line(format!("s := &{name}{{}}"));
-            w.line(format!("s.ref.init(unsafe.Pointer(ptr), wvDestroy{name})"));
-            w.line(format!("runtime.SetFinalizer(s, (*{name}).Close)"));
+            w.line(format!("s.adopt(unsafe.Pointer(ptr), wvDestroy{name})"));
             w.line("return s");
         },
     );
     w.blank();
 
     w.line("// native borrows the wrapper's pointer for one call; pair it with a");
-    w.line("// deferred s.ref.release().");
+    w.line("// deferred s.release().");
     w.block(
         format!("func (s *{name}) native() *C.{c_tag} {{"),
         "}",
@@ -450,28 +466,36 @@ pub(crate) fn render_interface(w: &mut CodeWriter, ctx: &Ctx, iface: &InterfaceB
             w.block("if s == nil {", "}", |w| {
                 w.line(format!("panic(\"{package}: nil *{name}\")"));
             });
-            w.line(format!("return (*C.{c_tag})(s.ref.acquire(\"{name}\"))"));
+            w.line(format!("return (*C.{c_tag})(s.acquire(\"{name}\"))"));
         },
     );
     w.blank();
 
-    w.line("// share returns a new strong reference to the wrapper's object for the");
-    w.line("// native library to adopt (the wrapper keeps its own), or null for nil.");
-    w.block(
-        format!("func (s *{name}) share() *C.{c_tag} {{"),
-        "}",
-        |w| {
-            w.block("if s == nil {", "}", |w| {
-                w.line("return nil");
-            });
-            w.line("ptr := s.native()");
-            w.line("defer s.ref.release()");
-            w.line(format!("return C.{}(ptr)", iface.clone_symbol));
-        },
-    );
-    w.blank();
+    let in_buffers = ctx.codecs.has_interface(&iface.name);
+    let returned = ctx.model.callback_interfaces().any(|(_, cb)| {
+        cb.methods.iter().any(|m| {
+            matches!(&m.ret_pass, CallbackRetPass::Object { interface, .. } if *interface == iface.name)
+        })
+    });
+    if in_buffers || returned {
+        w.line("// share returns a new strong reference to the wrapper's object for the");
+        w.line("// native library to adopt (the wrapper keeps its own), or null for nil.");
+        w.block(
+            format!("func (s *{name}) share() *C.{c_tag} {{"),
+            "}",
+            |w| {
+                w.block("if s == nil {", "}", |w| {
+                    w.line("return nil");
+                });
+                w.line("ptr := s.native()");
+                w.line("defer s.release()");
+                w.line(format!("return C.{}(ptr)", iface.clone_symbol));
+            },
+        );
+        w.blank();
+    }
 
-    if ctx.codecs.interfaces.contains(&iface.name) {
+    if in_buffers {
         func(
             w,
             &format!("func wvWrite{name}(w *wvWriter, v *{name})"),
@@ -493,36 +517,14 @@ pub(crate) fn render_interface(w: &mut CodeWriter, ctx: &Ctx, iface: &InterfaceB
         w.blank();
     }
 
-    w.line("// Close releases the wrapper's strong reference and always returns nil.");
-    w.line("// It's idempotent and safe to call from any goroutine, even while a call");
-    w.line("// on the wrapper is in flight: the reference is then released when that");
-    w.line("// call returns. The object itself is dropped once its last reference, from");
-    w.line("// any wrapper, record, or the native library, is gone.");
-    w.block(format!("func (s *{name}) Close() error {{"), "}", |w| {
-        w.line("runtime.SetFinalizer(s, nil)");
-        w.line("s.ref.close()");
-        w.line("return nil");
-    });
-    w.blank();
-
     for c in &iface.constructors {
-        render_sync(w, ctx, c, &constructor(&name, c), None);
+        render_function(w, ctx, c, &constructor(&name, c), None);
     }
     for f in &iface.methods {
         let go_name = names::method(&f.name);
-        let recv = Some(Receiver { ty: &name });
-        if let CallShape::Async(ab) = &f.shape {
-            render_async(w, ctx, f, ab, &go_name, recv);
-        } else {
-            render_sync(w, ctx, f, &go_name, recv);
-        }
+        render_function(w, ctx, f, &go_name, Some(Receiver { ty: &name }));
     }
     for f in &iface.statics {
-        let go_name = format!("{name}{}", pascal(&f.name));
-        if let CallShape::Async(ab) = &f.shape {
-            render_async(w, ctx, f, ab, &go_name, None);
-        } else {
-            render_sync(w, ctx, f, &go_name, None);
-        }
+        render_function(w, ctx, f, ctx.names.function(f), None);
     }
 }

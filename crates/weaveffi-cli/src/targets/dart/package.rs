@@ -56,17 +56,19 @@ import 'package:{package}/{package}.dart';
 The library loads `{macos}` (macOS), `{linux}` (Linux and Android), or
 `{windows}` (Windows) from the platform's search path on first use. Set
 `{env}` to a full path to load a specific build. On iOS, and as a macOS
-fallback, the bindings look the symbols up in the running executable.
+fallback, the bindings look the symbols up in the running executable. A
+library that can't be loaded, or that doesn't match these bindings, throws a
+`NativeLibraryException` from the first call; the next call tries again.
 
 ## Objects and callbacks
 
 Each interface wrapper holds one native reference: call `dispose()` when
 you're done, or let the garbage collector's finalizer release it.
 
-Callback-interface methods that return a value run synchronously and must
-be called by the native library on the isolate's thread during a call from
-Dart; void methods may be called from any thread and are delivered on the
-event loop.
+Callback-interface methods that return a value run synchronously on the
+isolate's thread, during a call from Dart; the native library can't call
+one from another thread (that call fails without running the method). Void
+methods may be called from any thread and are delivered on the event loop.
 
 ## Requirements
 

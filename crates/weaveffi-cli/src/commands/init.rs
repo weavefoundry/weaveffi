@@ -3,27 +3,38 @@
 //! In a Rust crate (a directory with a `Cargo.toml` that has a `[package]`),
 //! it writes a `weaveffi.toml` whose `[project] input` is the crate itself
 //! (`"."`), whose API WeaveFFI reads from the library the crate builds, then
-//! checks the things a producer needs (a `cdylib` crate type, a `weaveffi`
-//! dependency, a `#[weaveffi::module]`, and one `weaveffi::export_runtime!()`
-//! call) and prints any that are missing. It never edits `Cargo.toml` or
+//! checks the things a producer needs (a `weaveffi` dependency, a
+//! `#[weaveffi::module]`, and one `weaveffi::export_runtime!()` call) and
+//! prints any that are missing. It never edits `Cargo.toml` or
 //! source files. Anywhere else, it writes a starter IDL plus a
 //! `weaveffi.toml` that points at it.
+
+use std::process::ExitCode;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use miette::{bail, IntoDiagnostic, Result, WrapErr};
 use weaveffi_model::pkg::c_ident;
 
-use weaveffi_cli::config::CONFIG_FILE_NAME;
+use crate::config::CONFIG_FILE_NAME;
+
+/// The `targets` line `init` writes: the C header plus one language, which
+/// a project edits to the targets it ships.
+const TARGETS_LINE: &str = "targets = [\"c\", \"python\"]\n";
 
 /// Options for [`cmd_init`].
-pub(crate) struct InitArgs<'a> {
-    pub(crate) dir: &'a str,
-    pub(crate) name: Option<&'a str>,
-    pub(crate) force: bool,
-    pub(crate) quiet: bool,
+pub struct InitArgs<'a> {
+    /// The project directory.
+    pub dir: &'a str,
+    /// `--name`.
+    pub name: Option<&'a str>,
+    /// `--force`.
+    pub force: bool,
+    /// `--quiet`.
+    pub quiet: bool,
 }
 
-pub(crate) fn cmd_init(args: &InitArgs<'_>) -> Result<()> {
+/// Run `weaveffi init`.
+pub fn cmd_init(args: &InitArgs<'_>) -> Result<ExitCode> {
     let dir = Utf8PathBuf::from(args.dir);
     std::fs::create_dir_all(dir.as_std_path())
         .into_diagnostic()
@@ -43,9 +54,10 @@ pub(crate) fn cmd_init(args: &InitArgs<'_>) -> Result<()> {
                 .map(str::to_string)
         });
     match crate_name {
-        Some(name) => init_rust(&dir, &config_path, &name, args.quiet),
-        None => init_idl(&dir, &config_path, args.name, args.quiet),
+        Some(name) => init_rust(&dir, &config_path, &name, args.quiet)?,
+        None => init_idl(&dir, &config_path, args.name, args.quiet)?,
     }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn write(path: &Utf8Path, contents: &str) -> Result<()> {
@@ -57,11 +69,13 @@ fn write(path: &Utf8Path, contents: &str) -> Result<()> {
 fn init_rust(dir: &Utf8Path, config_path: &Utf8Path, crate_name: &str, quiet: bool) -> Result<()> {
     write(
         config_path,
-        "# WeaveFFI project configuration. See https://weaveffi.com/guides/config.html\n\
-         [project]\n\
-         input = \".\"\n\
-         out = \"bindings\"\n\
-         # targets = [\"c\", \"swift\", \"kotlin\", \"python\"]\n",
+        &format!(
+            "# WeaveFFI project configuration. See https://weaveffi.com/guides/config.html\n\
+             [project]\n\
+             input = \".\"\n\
+             out = \"bindings\"\n\
+             {TARGETS_LINE}"
+        ),
     )?;
     if quiet {
         return Ok(());
@@ -71,12 +85,6 @@ fn init_rust(dir: &Utf8Path, config_path: &Utf8Path, crate_name: &str, quiet: bo
         std::fs::read_to_string(dir.join("Cargo.toml").as_std_path()).unwrap_or_default();
     let lib = std::fs::read_to_string(dir.join("src/lib.rs").as_std_path()).unwrap_or_default();
     let mut todo = Vec::new();
-    if !manifest.contains("cdylib") {
-        todo.push(
-            "add `crate-type = [\"cdylib\"]` under [lib] in Cargo.toml so `cargo build` \
-             produces the shared library (`weaveffi build` picks the right kinds itself)",
-        );
-    }
     if !manifest.contains("weaveffi") {
         todo.push("run `cargo add weaveffi`");
     }
@@ -138,6 +146,7 @@ fn init_idl(dir: &Utf8Path, config_path: &Utf8Path, name: Option<&str>, quiet: b
              [project]\n\
              input = \"{idl_name}\"\n\
              out = \"bindings\"\n\
+             {TARGETS_LINE}\
              \n\
              [package]\n\
              name = \"{name}\"\n\
@@ -147,8 +156,9 @@ fn init_idl(dir: &Utf8Path, config_path: &Utf8Path, name: Option<&str>, quiet: b
     if !quiet {
         println!("Wrote {idl_path} and {config_path}.");
         println!(
-            "Run `weaveffi generate --target c` to produce the header your native library \
-             implements, then generate the other targets you ship."
+            "Run `weaveffi generate` to produce the C header your native library implements \
+             and the Python package over it; edit `targets` in {config_path} for the other \
+             languages you ship."
         );
     }
     Ok(())
@@ -169,15 +179,12 @@ mod tests {
             quiet: true,
         })
         .unwrap();
-        let project = weaveffi_cli::project::Project::locate(
-            Some(root.join(CONFIG_FILE_NAME).as_str()),
-            None,
-            None,
-        )
-        .unwrap();
+        let project =
+            crate::project::Project::locate(Some(root.join(CONFIG_FILE_NAME).as_str()), None, None)
+                .unwrap();
         assert!(matches!(
             &project.source,
-            weaveffi_cli::project::Source::Idl(p) if *p == root.join("greeter.yml")
+            crate::project::Source::Idl(p) if *p == root.join("greeter.yml")
         ));
         assert_eq!(
             project.config.package.identity.name.as_deref(),
@@ -205,8 +212,14 @@ mod tests {
             quiet: true,
         })
         .unwrap();
-        let cfg =
-            weaveffi_cli::config::ProjectConfig::from_file(&root.join(CONFIG_FILE_NAME)).unwrap();
+        let cfg = crate::config::ProjectConfig::from_file(&root.join(CONFIG_FILE_NAME)).unwrap();
         assert_eq!(cfg.project.input.as_deref(), Some(Utf8Path::new(".")));
+        let names: Vec<&str> = cfg
+            .targets(None)
+            .unwrap()
+            .iter()
+            .map(|t| t.name())
+            .collect();
+        assert_eq!(names, ["c", "python"]);
     }
 }

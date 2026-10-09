@@ -188,8 +188,9 @@ impl ValidationError {
             | Self::DuplicateInterfaceMember { name, .. }
             | Self::DuplicateCallbackMethod { name, .. } => Second(name),
             Self::CancellableNotAsync { .. }
-            | Self::ThrowsWithoutErrorDomain { .. }
-            | Self::AsyncIteratorReturn { .. } => Scope,
+            | Self::AsyncIteratorReturn { .. }
+            | Self::SlotCollision { .. } => Scope,
+            Self::UnknownErrorDomain { domain, .. } => Text(domain),
             Self::DuplicateEnumValue { enum_name, .. } => Decl(enum_name),
             Self::ConstructorHasReturn { constructor, .. }
             | Self::AsyncConstructor { constructor, .. } => Decl(constructor),
@@ -197,6 +198,7 @@ impl ValidationError {
             Self::UnknownTypeRef { name }
             | Self::QualifiedTypeRef { name }
             | Self::UnsupportedPrimitive { name }
+            | Self::ErrorDomainAsType { name }
             | Self::InterfaceInInvalidPosition { name, .. }
             | Self::CallbackInterfaceInInvalidPosition { name, .. } => Text(name),
             Self::InvalidMapKey { key_type } => Text(key_type),
@@ -265,15 +267,15 @@ fn find_token(src: &str, from: usize, needle: &str) -> Option<usize> {
 }
 
 /// The byte offset of the first occurrence of `name` at or after `from` that
-/// is the value of a `name` key, in YAML (`name: x`), JSON
-/// (`"name": "x"`), or TOML (`name = "x"`) syntax.
+/// is the value of a `name` key, in YAML (`name: x`) or JSON
+/// (`"name": "x"`) syntax.
 #[cfg(feature = "idl")]
 fn find_decl(src: &str, from: usize, name: &str) -> Option<usize> {
     let mut at = from;
     loop {
         let hit = find_token(src, at, name)?;
         let before = src[..hit].trim_end_matches(['"', '\'']).trim_end();
-        if let Some(key) = before.strip_suffix([':', '=']) {
+        if let Some(key) = before.strip_suffix(':') {
             let key = key.trim_end().trim_end_matches(['"', '\'']);
             if key
                 .strip_suffix("name")

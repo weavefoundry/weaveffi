@@ -48,6 +48,8 @@ mod tree {
     }
 }
 
+weaveffi::export_runtime!();
+
 fn main() {
     let _ = tree::Store::new();
 }

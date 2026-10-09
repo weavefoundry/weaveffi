@@ -6,8 +6,8 @@
 //! extraction's [`SourceMap`] records the span of every such path, so the
 //! error lands on the item, member, or written type at fault.
 
+use crate::extract::SourceMap;
 use proc_macro2::Span;
-use weaveffi_model::rust::SourceMap;
 use weaveffi_model::validate::{Found, ValidationError};
 
 /// What to look for under an error's declaration path.
@@ -109,11 +109,8 @@ fn hint(error: &ValidationError) -> Option<&'static str> {
     use ValidationError as E;
     Some(match error {
         E::UnsupportedPrimitive { .. } => {
-            "use `u64` or `i64` for sizes and counts (their width is the same on every \
-             platform), or `String` for a `char`"
-        }
-        E::ThrowsWithoutErrorDomain { .. } => {
-            "declare a #[weaveffi::error] enum in this module or a parent module"
+            "use `u64`, `i64`, `usize`, or `isize` (which cross as `u64` and `i64`), or a \
+             #[weaveffi::custom] type with a `String` repr for wider integers"
         }
         _ => return None,
     })

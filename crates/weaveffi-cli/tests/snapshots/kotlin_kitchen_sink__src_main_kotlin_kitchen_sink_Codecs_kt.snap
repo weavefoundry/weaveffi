@@ -7,36 +7,40 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 package kitchen_sink
 
-internal fun packListOfGadget(_w: BufferWriter, _v: List<Gadget>) = _w.writeList(_v) { _w.writeObject(it.cloneHandle(), JniBridge::kitchen_Gadget_destroy) }
+internal fun pack_list_string(_w: BufferWriter, _v: List<String>) = _w.writeList(_v) { _w.writeString(it) }
 
-internal fun unpackListOfGadget(_r: BufferReader): List<Gadget> = _r.readList { Gadget.fromHandle(_r.readObject()) }
+internal fun unpack_list_string(_r: BufferReader): List<String> = _r.readList { _r.readString() }
 
-internal fun packListOfItem(_w: BufferWriter, _v: List<Item>) = _w.writeList(_v) { packItem(_w, it) }
+internal fun pack_map_string_string(_w: BufferWriter, _v: Map<String, String>) = _w.writeMap(_v, { _w.writeString(it) }, { _w.writeString(it) })
 
-internal fun unpackListOfItem(_r: BufferReader): List<Item> = _r.readList { unpackItem(_r) }
+internal fun unpack_map_string_string(_r: BufferReader): Map<String, String> = _r.readMap({ _r.readString() }, { _r.readString() })
 
-internal fun packListOfString(_w: BufferWriter, _v: List<String>) = _w.writeList(_v) { _w.writeString(it) }
+internal fun pack_opt_i64(_w: BufferWriter, _v: Long?) = _w.writeOptional(_v) { _w.writeI64(it) }
 
-internal fun unpackListOfString(_r: BufferReader): List<String> = _r.readList { _r.readString() }
+internal fun unpack_opt_i64(_r: BufferReader): Long? = _r.readOptional { _r.readI64() }
 
-internal fun packMapOfStringToI32(_w: BufferWriter, _v: Map<String, Int>) = _w.writeMap(_v, { _w.writeString(it) }, { _w.writeI32(it) })
+internal fun pack_opt_Gadget(_w: BufferWriter, _v: Gadget?) = _w.writeOptional(_v) { _w.writeObject(it.cloneHandle(), JniBridge::kitchen_Gadget_destroy) }
 
-internal fun unpackMapOfStringToI32(_r: BufferReader): Map<String, Int> = _r.readMap({ _r.readString() }, { _r.readI32() })
+internal fun unpack_opt_Gadget(_r: BufferReader): Gadget? = _r.readOptional { Gadget.fromHandle(_r.readObject()) }
 
-internal fun packMapOfStringToString(_w: BufferWriter, _v: Map<String, String>) = _w.writeMap(_v, { _w.writeString(it) }, { _w.writeString(it) })
+internal fun pack_list_Gadget(_w: BufferWriter, _v: List<Gadget>) = _w.writeList(_v) { _w.writeObject(it.cloneHandle(), JniBridge::kitchen_Gadget_destroy) }
 
-internal fun unpackMapOfStringToString(_r: BufferReader): Map<String, String> = _r.readMap({ _r.readString() }, { _r.readString() })
+internal fun unpack_list_Gadget(_r: BufferReader): List<Gadget> = _r.readList { Gadget.fromHandle(_r.readObject()) }
 
-internal fun packOptionalOfGadget(_w: BufferWriter, _v: Gadget?) = _w.writeOptional(_v) { _w.writeObject(it.cloneHandle(), JniBridge::kitchen_Gadget_destroy) }
+internal fun pack_opt_Item(_w: BufferWriter, _v: Item?) = _w.writeOptional(_v) { pack_Item(_w, it) }
 
-internal fun unpackOptionalOfGadget(_r: BufferReader): Gadget? = _r.readOptional { Gadget.fromHandle(_r.readObject()) }
+internal fun unpack_opt_Item(_r: BufferReader): Item? = _r.readOptional { unpack_Item(_r) }
 
-internal fun packOptionalOfI64(_w: BufferWriter, _v: Long?) = _w.writeOptional(_v) { _w.writeI64(it) }
+internal fun pack_list_Item(_w: BufferWriter, _v: List<Item>) = _w.writeList(_v) { pack_Item(_w, it) }
 
-internal fun unpackOptionalOfI64(_r: BufferReader): Long? = _r.readOptional { _r.readI64() }
+internal fun unpack_list_Item(_r: BufferReader): List<Item> = _r.readList { unpack_Item(_r) }
 
-internal fun packOptionalOfItem(_w: BufferWriter, _v: Item?) = _w.writeOptional(_v) { packItem(_w, it) }
+internal fun pack_map_string_i32(_w: BufferWriter, _v: Map<String, Int>) = _w.writeMap(_v, { _w.writeString(it) }, { _w.writeI32(it) })
 
-internal fun unpackOptionalOfItem(_r: BufferReader): Item? = _r.readOptional { unpackItem(_r) }
+internal fun unpack_map_string_i32(_r: BufferReader): Map<String, Int> = _r.readMap({ _r.readString() }, { _r.readI32() })
+
+internal fun pack_opt_string(_w: BufferWriter, _v: String?) = _w.writeOptional(_v) { _w.writeString(it) }
+
+internal fun unpack_opt_string(_r: BufferReader): String? = _r.readOptional { _r.readString() }
 
 // END Codecs.kt

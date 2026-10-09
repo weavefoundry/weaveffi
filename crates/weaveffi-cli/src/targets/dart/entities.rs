@@ -1,41 +1,24 @@
 //! Entity rendering: error domains, C-style enums, rich enums, records, and
 //! interface wrapper classes, plus their value-buffer codec helpers.
 
+use crate::codegen::errors::ErrorTable;
 use crate::codegen::CodeWriter;
-use heck::ToUpperCamelCase;
 use weaveffi_model::model::{
-    EnumBinding, EnumVariantBinding, ErrorBinding, FieldBinding, InterfaceBinding, ModuleBinding,
-    StructBinding,
+    EnumBinding, EnumVariantBinding, FieldBinding, InterfaceBinding, Model, StructBinding,
 };
-use weaveffi_model::ty::Ty;
+use weaveffi_model::ty::{Prim, Ty};
 
 use crate::targets::dart::calls::{
-    emit_bindings, emit_destroy, emit_wrapper, lookup, mapper_fn, DartDecl, ErrCtx,
+    emit_bindings, emit_destroy, emit_wrapper, lookup, mapper_fn, DartDecl,
 };
-use crate::targets::dart::codec::{read_expr, write_expr};
-use crate::targets::dart::docs::{write_deprecated, write_doc};
+use crate::targets::dart::codec::{pack_fn, read_expr, unpack_fn, write_expr};
+use crate::targets::dart::docs::Docs;
 use crate::targets::dart::types::{
-    dart_class, dart_ident, dart_member, dart_str_literal, dart_type, ffi_var,
+    dart_class, dart_field, dart_ident, dart_member, dart_str_literal, dart_type, error_field,
+    ffi_var,
 };
 
-/// The Dart exception class of an error domain or code: the PascalCase name
-/// with a trailing `Error` swapped for `Exception` (`KvError` becomes
-/// `KvException`, a code `IoError` becomes `IoException`, and a bare
-/// `Error` becomes `ErrorException`).
-pub(crate) fn dart_exception_name(raw: &str) -> String {
-    let pascal = raw.to_upper_camel_case();
-    let stem = pascal
-        .strip_suffix("Error")
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&pascal);
-    if stem.ends_with("Exception") {
-        dart_class(stem)
-    } else {
-        dart_class(&format!("{stem}Exception"))
-    }
-}
-
-/// The `_{exception}Payload` function encoding a domain exception's fields
+/// The `_payloadOf{Exception}` function encoding a domain exception's fields
 /// for a callback that reports it.
 pub(crate) fn payload_fn(exception: &str) -> String {
     format!("_payloadOf{exception}")
@@ -50,15 +33,17 @@ fn article(class: &str) -> &'static str {
     }
 }
 
-/// Render the final fields of a value class, with their docs.
-fn render_fields(w: &mut CodeWriter, fields: &[FieldBinding]) {
+/// Render the final fields of a value class, with their docs; `name`
+/// spells a field.
+fn render_fields(
+    w: &mut CodeWriter,
+    docs: &Docs,
+    fields: &[FieldBinding],
+    name: fn(&str) -> String,
+) {
     for f in fields {
-        write_doc(w, &f.doc);
-        w.line(format!(
-            "final {} {};",
-            dart_type(&f.ty),
-            dart_ident(&f.name)
-        ));
+        docs.write(w, &f.doc);
+        w.line(format!("final {} {};", dart_type(&f.ty), name(&f.name)));
     }
 }
 
@@ -67,7 +52,7 @@ fn render_fields(w: &mut CodeWriter, fields: &[FieldBinding]) {
 fn is_collection(ty: &Ty) -> bool {
     match ty {
         Ty::Optional(inner) => is_collection(inner),
-        Ty::List(_) | Ty::Map(..) | Ty::Prim(weaveffi_model::ty::Prim::Bytes) => true,
+        Ty::List(_) | Ty::Map(..) | Ty::Prim(Prim::Bytes) => true,
         _ => false,
     }
 }
@@ -95,7 +80,7 @@ fn render_value_members(w: &mut CodeWriter, class: &str, fields: &[FieldBinding]
             w.line("identical(this, other) ||");
             w.line(format!("other is {class} &&"));
             for (i, f) in fields.iter().enumerate() {
-                let n = dart_ident(&f.name);
+                let n = dart_field(&f.name);
                 let end = if i + 1 == fields.len() { ";" } else { " &&" };
                 if is_collection(&f.ty) {
                     w.line(format!("_deepEquals({n}, other.{n}){end}"));
@@ -110,7 +95,7 @@ fn render_value_members(w: &mut CodeWriter, class: &str, fields: &[FieldBinding]
     let hashes: Vec<String> = fields
         .iter()
         .map(|f| {
-            let n = dart_ident(&f.name);
+            let n = dart_field(&f.name);
             if is_collection(&f.ty) {
                 format!("_deepHash({n})")
             } else {
@@ -127,7 +112,7 @@ fn render_value_members(w: &mut CodeWriter, class: &str, fields: &[FieldBinding]
     let shown: Vec<String> = fields
         .iter()
         .map(|f| {
-            let n = dart_ident(&f.name);
+            let n = dart_field(&f.name);
             format!("{n}: ${n}")
         })
         .collect();
@@ -137,29 +122,26 @@ fn render_value_members(w: &mut CodeWriter, class: &str, fields: &[FieldBinding]
     ));
 }
 
-/// Render one module's declared error domain: a sealed domain exception (a
-/// `NativeException` subclass) with one final subclass per code carrying
-/// its code, default message, and decoded payload fields; the
-/// `_map{Domain}` mapper that throwing wrappers route codes through (only
-/// declared codes gain a `case`; every other code, including the negative
-/// runtime range, maps onto the runtime exceptions); and, when `reported`
-/// (a callback method of the API reports this domain), the encoder of each
-/// code's fields.
-pub(crate) fn render_error(
-    w: &mut CodeWriter,
-    module: &ModuleBinding,
-    eb: &ErrorBinding,
-    reported: bool,
-) {
-    let exc = dart_exception_name(&eb.type_name);
+/// Render one error domain: an open domain exception (a `NativeException`
+/// subclass) with one final subclass per code carrying its code, default
+/// message, and decoded payload fields; the `_map{Domain}` mapper the
+/// domain's callables route codes through (a declared code is its subclass,
+/// any other positive code the domain class itself with its code and
+/// message, and a negative code a runtime exception); and, when `reported`
+/// (a callback method reports this domain), the encoder of each code's
+/// fields.
+pub(crate) fn render_error(w: &mut CodeWriter, docs: &Docs, table: &ErrorTable, reported: bool) {
+    let exc = dart_class(&table.type_name);
     w.blank();
     w.line(format!(
         "/// The `{}` error domain of module `{}`: catch it to handle any of",
-        eb.name, module.dot_path
+        table.domain.name, table.module.dot_path
     ));
-    w.line("/// its codes, or a subclass for one code.");
+    w.line("/// its codes, or a subclass for one code. The domain is open: a code");
+    w.line("/// these bindings don't declare (from a newer library) arrives as this");
+    w.line("/// class itself, with its [code] and [message].");
     w.block(
-        format!("sealed class {exc} extends NativeException {{"),
+        format!("class {exc} extends NativeException {{"),
         "}",
         |w| {
             w.line("/// Creates a domain error carrying [code] and [message].");
@@ -167,11 +149,12 @@ pub(crate) fn render_error(
         },
     );
 
-    for c in &eb.codes {
-        let class = dart_exception_name(&c.name);
+    for row in &table.codes {
+        let c = row.code;
+        let class = dart_class(&row.type_name);
         let message = dart_str_literal(&c.message);
         w.blank();
-        write_doc(w, &c.doc.clone().or_else(|| Some(c.message.clone())));
+        docs.write(w, &c.doc.clone().or_else(|| Some(c.message.clone())));
         w.block(format!("final class {class} extends {exc} {{"), "}", |w| {
             w.line(format!(
                 "/// Creates {} [{class}] (code {}).",
@@ -187,7 +170,7 @@ pub(crate) fn render_error(
                 let params: Vec<String> = c
                     .fields
                     .iter()
-                    .map(|f| format!("this.{}", dart_ident(&f.name)))
+                    .map(|f| format!("this.{}", error_field(&f.name)))
                     .collect();
                 w.line(format!(
                     "{class}({}, [String message = '{message}'])",
@@ -195,43 +178,41 @@ pub(crate) fn render_error(
                 ));
                 w.line(format!("    : super({}, message);", c.value));
                 w.blank();
-                render_fields(w, &c.fields);
+                render_fields(w, docs, &c.fields, error_field);
             }
         });
     }
 
     w.blank();
-    w.block(
-        format!(
-            "NativeException {}(int code, String message, Uint8List payload) {{",
-            mapper_fn(&exc)
-        ),
-        "}",
-        |w| {
-            w.block("switch (code) {", "}", |w| {
-                for c in &eb.codes {
-                    let class = dart_exception_name(&c.name);
-                    w.line(format!("case {}:", c.value));
-                    w.scope(|w| {
-                        if c.fields.is_empty() {
-                            w.line(format!("return {class}(message);"));
-                        } else {
-                            let args: Vec<String> =
-                                c.fields.iter().map(|f| read_expr(&f.ty, "r")).collect();
-                            w.line(format!(
-                                "return _decode(payload, (r) => {class}({}, message));",
-                                args.join(", ")
-                            ));
-                        }
-                    });
+    w.line(format!(
+        "NativeException {}(int code, String message, Uint8List payload) =>",
+        mapper_fn(&exc)
+    ));
+    w.scope(|w| {
+        w.scope(|w| {
+            w.line("switch (code) {");
+            w.scope(|w| {
+                for row in &table.codes {
+                    let c = row.code;
+                    let class = dart_class(&row.type_name);
+                    if c.fields.is_empty() {
+                        w.line(format!("{} => {class}(message),", c.value));
+                    } else {
+                        let args: Vec<String> =
+                            c.fields.iter().map(|f| read_expr(&f.ty, "r")).collect();
+                        w.line(format!(
+                            "{} => _decode(payload, (r) => {class}({}, message)),",
+                            c.value,
+                            args.join(", ")
+                        ));
+                    }
                 }
-                w.line("default:");
-                w.scope(|w| {
-                    w.line("return _runtimeException(code, message, payload);");
-                });
+                w.line(format!("> 0 => {exc}(code, message),"));
+                w.line("_ => _runtimeException(code, message, payload),");
             });
-        },
-    );
+            w.line("};");
+        });
+    });
 
     if !reported {
         return;
@@ -242,24 +223,23 @@ pub(crate) fn render_error(
         format!("Uint8List? {}({exc} e) {{", payload_fn(&exc)),
         "}",
         |w| {
+            w.line("final w = _BufferWriter();");
             w.block("switch (e) {", "}", |w| {
-                for c in &eb.codes {
-                    let class = dart_exception_name(&c.name);
-                    w.line(format!("case {class}():"));
+                for row in table.codes.iter().filter(|r| !r.code.fields.is_empty()) {
+                    w.line(format!("case {}():", dart_class(&row.type_name)));
                     w.scope(|w| {
-                        if c.fields.is_empty() {
-                            w.line("return null;");
-                        } else {
-                            w.line("final w = _BufferWriter();");
-                            for f in &c.fields {
-                                let expr = format!("e.{}", dart_ident(&f.name));
-                                w.line(format!("{};", write_expr(&f.ty, "w", &expr)));
-                            }
-                            w.line("return w.takeBytes();");
+                        for f in &row.code.fields {
+                            let expr = format!("e.{}", error_field(&f.name));
+                            w.line(format!("{};", write_expr(&f.ty, "w", &expr)));
                         }
                     });
                 }
+                w.line("default:");
+                w.scope(|w| {
+                    w.line("return null;");
+                });
             });
+            w.line("return w.takeBytes();");
         },
     );
 }
@@ -268,11 +248,11 @@ pub(crate) fn render_error(
 /// then a wrapper class over the runtime's `_NativeObject` where the
 /// canonical `new` constructor is an unnamed factory, other constructors are
 /// named factories, methods borrow the wrapper's pointer, and statics are
-/// `static`. `exception` is the domain exception class in scope for the
-/// interface's module.
+/// `static`.
 pub(crate) fn render_interface(
     w: &mut CodeWriter,
-    exception: Option<&str>,
+    model: &Model,
+    docs: &Docs,
     i: &InterfaceBinding,
     leaf: bool,
 ) {
@@ -304,14 +284,14 @@ pub(crate) fn render_interface(
     }
 
     w.blank();
-    write_doc(w, &i.doc);
+    docs.write(w, &i.doc);
     if i.doc.is_some() {
         w.line("///");
     }
     w.line("/// A reference-counted native object. Each instance holds one strong");
     w.line("/// reference, released by [dispose] or, when an undisposed instance is");
     w.line("/// collected, by a finalizer.");
-    write_deprecated(w, &i.deprecated);
+    docs.write_deprecated(w, &i.deprecated);
     w.block(
         format!("final class {class} extends _NativeObject {{"),
         "}",
@@ -333,7 +313,7 @@ pub(crate) fn render_interface(
                 "Pointer<Void> _clone(Pointer<Void> ptr) => {clone}(ptr);"
             ));
             for (f, kind) in members() {
-                emit_wrapper(w, f, &kind, &dart_member(&f.name), ErrCtx::of(f, exception));
+                emit_wrapper(w, model, docs, f, &kind, &dart_member(&f.name));
             }
         },
     );
@@ -345,22 +325,22 @@ const ENUM_MEMBERS: &[&str] = &["fromValue", "index", "name", "value", "values"]
 
 /// Render one enum: a C-style enum becomes an enhanced Dart `enum` carrying
 /// its discriminant; a rich enum becomes a sealed class hierarchy.
-pub(crate) fn render_enum(w: &mut CodeWriter, e: &EnumBinding) {
+pub(crate) fn render_enum(w: &mut CodeWriter, docs: &Docs, e: &EnumBinding) {
     if e.is_rich() {
-        render_rich_enum(w, e);
+        render_rich_enum(w, docs, e);
         return;
     }
     let name = dart_class(&e.name);
     w.blank();
-    write_doc(w, &e.doc);
-    write_deprecated(w, &e.deprecated);
+    docs.write(w, &e.doc);
+    docs.write_deprecated(w, &e.deprecated);
     w.block(format!("enum {name} {{"), "}", |w| {
         for (i, v) in e.variants.iter().enumerate() {
             let mut variant = dart_ident(&v.name);
             if ENUM_MEMBERS.contains(&variant.as_str()) {
                 variant.push('_');
             }
-            write_doc(w, &v.doc);
+            docs.write(w, &v.doc);
             let end = if i + 1 == e.variants.len() { ';' } else { ',' };
             w.line(format!("{variant}({}){end}", v.value));
         }
@@ -382,12 +362,13 @@ pub(crate) fn render_enum(w: &mut CodeWriter, e: &EnumBinding) {
 
 /// Render one record as a Dart value class (final fields, one named
 /// constructor argument per field, optional fields not required, value
-/// equality) plus its `_pack{Name}`/`_unpack{Name}` helpers.
-pub(crate) fn render_struct(w: &mut CodeWriter, s: &StructBinding) {
+/// equality) plus its `_pack_{Name}`/`_unpack_{Name}` helpers.
+pub(crate) fn render_struct(w: &mut CodeWriter, docs: &Docs, s: &StructBinding) {
     let class = dart_class(&s.name);
+    let ty = Ty::Record(s.name.clone());
     w.blank();
-    write_doc(w, &s.doc);
-    write_deprecated(w, &s.deprecated);
+    docs.write(w, &s.doc);
+    docs.write_deprecated(w, &s.deprecated);
     w.block(format!("final class {class} {{"), "}", |w| {
         w.line(format!("/// Creates {} [{class}].", article(&class)));
         if s.fields.is_empty() {
@@ -397,7 +378,7 @@ pub(crate) fn render_struct(w: &mut CodeWriter, s: &StructBinding) {
                 .fields
                 .iter()
                 .map(|f| {
-                    let n = dart_ident(&f.name);
+                    let n = dart_field(&f.name);
                     if matches!(f.ty, Ty::Optional(_)) {
                         format!("this.{n}")
                     } else {
@@ -407,7 +388,7 @@ pub(crate) fn render_struct(w: &mut CodeWriter, s: &StructBinding) {
                 .collect();
             w.line(format!("{class}({{{}}});", params.join(", ")));
             w.blank();
-            render_fields(w, &s.fields);
+            render_fields(w, docs, &s.fields, dart_field);
         }
         render_value_members(w, &class, &s.fields);
     });
@@ -415,15 +396,16 @@ pub(crate) fn render_struct(w: &mut CodeWriter, s: &StructBinding) {
     w.blank();
     if s.fields.is_empty() {
         w.line(format!(
-            "void _pack{class}(_BufferWriter w, {class} v) {{}}"
+            "void {}(_BufferWriter w, {class} v) {{}}",
+            pack_fn(&ty)
         ));
     } else {
         w.block(
-            format!("void _pack{class}(_BufferWriter w, {class} v) {{"),
+            format!("void {}(_BufferWriter w, {class} v) {{", pack_fn(&ty)),
             "}",
             |w| {
                 for f in &s.fields {
-                    let expr = format!("v.{}", dart_ident(&f.name));
+                    let expr = format!("v.{}", dart_field(&f.name));
                     w.line(format!("{};", write_expr(&f.ty, "w", &expr)));
                 }
             },
@@ -434,17 +416,19 @@ pub(crate) fn render_struct(w: &mut CodeWriter, s: &StructBinding) {
     w.blank();
     if s.fields.is_empty() {
         w.line(format!(
-            "{class} _unpack{class}(_BufferReader r) => const {class}();"
+            "{class} {}(_BufferReader r) => const {class}();",
+            unpack_fn(&ty)
         ));
     } else {
         w.line(format!(
-            "{class} _unpack{class}(_BufferReader r) => {class}("
+            "{class} {}(_BufferReader r) => {class}(",
+            unpack_fn(&ty)
         ));
         w.indent().indent().indent();
         for f in &s.fields {
             w.line(format!(
                 "{}: {},",
-                dart_ident(&f.name),
+                dart_field(&f.name),
                 read_expr(&f.ty, "r")
             ));
         }
@@ -460,13 +444,14 @@ fn variant_class(e: &EnumBinding, v: &EnumVariantBinding) -> String {
 
 /// Render one rich enum as a sealed class hierarchy: a sealed base plus one
 /// final subclass per variant carrying its fields (positional constructor,
-/// value equality), and `_pack{Name}`/`_unpack{Name}` helpers encoding the
+/// value equality), and `_pack_{Name}`/`_unpack_{Name}` helpers encoding the
 /// `i32` tag followed by the active variant's fields.
-fn render_rich_enum(w: &mut CodeWriter, e: &EnumBinding) {
+fn render_rich_enum(w: &mut CodeWriter, docs: &Docs, e: &EnumBinding) {
     let base = dart_class(&e.name);
+    let ty = Ty::RichEnum(e.name.clone());
     w.blank();
-    write_doc(w, &e.doc);
-    write_deprecated(w, &e.deprecated);
+    docs.write(w, &e.doc);
+    docs.write_deprecated(w, &e.deprecated);
     w.block(format!("sealed class {base} {{"), "}", |w| {
         w.line(format!("const {base}();"));
     });
@@ -474,7 +459,7 @@ fn render_rich_enum(w: &mut CodeWriter, e: &EnumBinding) {
     for v in &e.variants {
         let cls = variant_class(e, v);
         w.blank();
-        write_doc(w, &v.doc);
+        docs.write(w, &v.doc);
         w.block(format!("final class {cls} extends {base} {{"), "}", |w| {
             w.line(format!("/// Creates {} [{cls}].", article(&cls)));
             if v.fields.is_empty() {
@@ -483,11 +468,11 @@ fn render_rich_enum(w: &mut CodeWriter, e: &EnumBinding) {
                 let params: Vec<String> = v
                     .fields
                     .iter()
-                    .map(|f| format!("this.{}", dart_ident(&f.name)))
+                    .map(|f| format!("this.{}", dart_field(&f.name)))
                     .collect();
                 w.line(format!("{cls}({});", params.join(", ")));
                 w.blank();
-                render_fields(w, &v.fields);
+                render_fields(w, docs, &v.fields, dart_field);
             }
             render_value_members(w, &cls, &v.fields);
         });
@@ -497,7 +482,7 @@ fn render_rich_enum(w: &mut CodeWriter, e: &EnumBinding) {
     // the switch exhaustive.
     w.blank();
     w.block(
-        format!("void _pack{base}(_BufferWriter w, {base} v) {{"),
+        format!("void {}(_BufferWriter w, {base} v) {{", pack_fn(&ty)),
         "}",
         |w| {
             w.block("switch (v) {", "}", |w| {
@@ -507,7 +492,7 @@ fn render_rich_enum(w: &mut CodeWriter, e: &EnumBinding) {
                     w.scope(|w| {
                         w.line(format!("w.writeI32({});", var.value));
                         for f in &var.fields {
-                            let expr = format!("v.{}", dart_ident(&f.name));
+                            let expr = format!("v.{}", dart_field(&f.name));
                             w.line(format!("{};", write_expr(&f.ty, "w", &expr)));
                         }
                     });
@@ -519,7 +504,7 @@ fn render_rich_enum(w: &mut CodeWriter, e: &EnumBinding) {
     // Unpack: positional arguments evaluate left to right, in wire order.
     w.blank();
     w.block(
-        format!("{base} _unpack{base}(_BufferReader r) {{"),
+        format!("{base} {}(_BufferReader r) {{", unpack_fn(&ty)),
         "}",
         |w| {
             w.line("final tag = r.readI32();");

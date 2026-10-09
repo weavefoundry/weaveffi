@@ -6,31 +6,27 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "IR, parsers, Rust extractor, validation, and the validated model for WeaveFFI API definitions"
+description = "IR, parsers, validation, and the validated model for WeaveFFI API definitions"
 keywords = ["ffi", "codegen", "bindings", "ir", "parser"]
 categories = ["development-tools::ffi"]
 
 [features]
 default = ["idl"]
-# The IDL text formats (YAML, JSON, TOML), JSON Schema derivation, and fancy
+# The IDL text formats (YAML and JSON), JSON Schema derivation, and fancy
 # miette diagnostics. The proc-macros build without it.
-idl = ["dep:serde_yaml", "dep:toml", "dep:schemars", "dep:miette"]
+idl = ["dep:serde_yaml_ng", "dep:schemars", "dep:miette"]
 
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
 heck = { workspace = true }
-syn = { workspace = true }
-proc-macro2 = "1.0"
-serde_yaml = { workspace = true, optional = true }
+serde_yaml_ng = { workspace = true, optional = true }
 serde_json = { workspace = true }
-toml = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }
 miette = { workspace = true, optional = true }
 
 [dev-dependencies]
-serde_yaml = { workspace = true }
-toml = { workspace = true }
+serde_yaml_ng = { workspace = true }
 
 [lints]
 workspace = true

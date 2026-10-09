@@ -22,6 +22,8 @@ pub mod timers {
     }
 }
 
+weaveffi::export_runtime!();
+
 extern "C" fn done(ctx: *mut c_void, err: *mut FfiError, ptr: *const u8, len: usize) {
     // Clone the sender before sending: the test may free the context as soon
     // as the value arrives, which can be before `send` returns.

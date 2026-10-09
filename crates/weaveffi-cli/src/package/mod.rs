@@ -1,4 +1,4 @@
-//! The packaging layer: the artifacts a backend assembles from a set of
+//! The packaging layer: the artifacts a target assembles from a set of
 //! per-platform builds, and the driver that writes them to the dist
 //! directory.
 //!
@@ -6,23 +6,23 @@
 //! point at a native library themselves. `weaveffi package` produces the
 //! next artifact up: an installable package for each ecosystem (a wheel, an
 //! npm tarball, a gem, a SwiftPM `XCFramework` archive, …) with the prebuilt
-//! native library for each [`Platform`] inside, so
+//! native library for each platform inside, so
 //! `pip install`, `npm install`, and `gem install` work with no local
 //! toolchain.
 //!
-//! A backend opts in by overriding
-//! [`LanguageBackend::package`](crate::backend::LanguageBackend::package),
-//! returning [`Artifact`]s: a directory tree or an archive, each a list of
-//! [`PackagedFile`]s. Rendering stays pure (it returns values and does no
-//! I/O), so package layouts are testable exactly like generated source, and
-//! [`write_artifact`] does the I/O with the writers in [`archive`].
+//! A target opts in by overriding [`Target::package`](crate::targets::Target::package),
+//! returning [`Artifact`]s: a directory tree, an archive, or a single file,
+//! each a list of [`PackagedFile`]s. Packaging returns values and leaves the
+//! writing to `weaveffi package`, so package layouts are testable exactly
+//! like generated source.
 
-pub mod archive;
+pub(crate) mod archive;
 
 use std::borrow::Cow;
+use std::sync::Mutex;
 
-use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
+use miette::{IntoDiagnostic, Result, WrapErr};
 
 use crate::platform::{read_file, BinarySet, Platform};
 
@@ -125,6 +125,8 @@ pub enum ArtifactKind {
     Wheel(WheelMeta),
     /// A RubyGems package: a tar of the gzipped specification and data.
     Gem(GemSpec),
+    /// A single file: the contents of the artifact's one entry.
+    File,
 }
 
 /// One installable artifact a target produces.
@@ -164,50 +166,94 @@ impl Artifact {
         }
     }
 
+    /// A single file at `path` holding `contents`.
+    pub fn single_file(path: impl Into<Utf8PathBuf>, contents: Vec<u8>) -> Self {
+        let path = normalize_separators(path.into());
+        let name = path.file_name().unwrap_or_default().to_string();
+        Self {
+            path,
+            kind: ArtifactKind::File,
+            files: vec![PackagedFile::bytes(name, contents)],
+        }
+    }
+
     /// The file at `path` inside this artifact, if any.
     pub fn file(&self, path: &str) -> Option<&PackagedFile> {
         self.files.iter().find(|f| f.path == path)
     }
 }
 
-/// The prebuilt `XCFramework` archive a Swift package's binary target points
-/// at.
+/// An artifact skipped because an external tool it needs is missing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct XcframeworkArchive {
-    /// The archive's file name (`CKvstore.xcframework.zip`).
-    pub file_name: String,
-    /// The SHA-256 checksum of the archive, as `swift package
-    /// compute-checksum` prints it.
-    pub checksum: String,
+pub(crate) struct Skipped {
+    /// The artifact (`the NuGet package`, `the Node.js addon for linux-x64`).
+    pub(crate) what: String,
+    /// Why it was skipped.
+    pub(crate) reason: String,
 }
 
-/// Everything a backend's [`package`](crate::backend::LanguageBackend::package)
+/// The artifacts a `build` or `package` run skipped, collected for the
+/// summary at the end of the run.
+#[derive(Debug, Default)]
+pub(crate) struct Skips(Mutex<Vec<Skipped>>);
+
+impl Skips {
+    /// Record that `what` was skipped for `reason`, warning about it now.
+    pub(crate) fn skip(&self, what: impl Into<String>, reason: impl std::fmt::Display) {
+        let skipped = Skipped {
+            what: what.into(),
+            reason: reason.to_string(),
+        };
+        eprintln!("warning: skipping {}: {}", skipped.what, skipped.reason);
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(skipped);
+    }
+
+    /// Everything skipped so far, in order.
+    pub(crate) fn list(&self) -> Vec<Skipped> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Everything a target's [`package`](crate::targets::Target::package) hook
 /// needs beyond the [`Model`](weaveffi_model::model::Model) and its own
 /// configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct PackageContext<'a> {
     /// The per-platform builds to bundle.
-    pub binaries: &'a BinarySet,
+    pub(crate) binaries: &'a BinarySet,
     /// The macOS deployment target the libraries were built for (`"11.0"`),
     /// which wheel tags and Swift platforms carry.
-    pub macos_deployment_target: &'a str,
-    /// The iOS deployment target the libraries were built for (`"13.0"`).
-    pub ios_deployment_target: &'a str,
-    /// The assembled `XCFramework` archive, when the Swift target packages
-    /// Apple static libraries.
-    pub xcframework: Option<&'a XcframeworkArchive>,
+    pub(crate) macos_deployment_target: &'a str,
+    /// Where skipped artifacts are recorded.
+    pub(crate) skips: Option<&'a Skips>,
 }
 
 impl<'a> PackageContext<'a> {
-    /// A context for `binaries` built for the default deployment targets
-    /// (macOS 11.0, iOS 13.0), without an `XCFramework` archive.
-    #[must_use]
-    pub fn new(binaries: &'a BinarySet) -> Self {
+    /// A context for `binaries` built for the default macOS deployment
+    /// target (11.0).
+    #[cfg(test)]
+    pub(crate) fn new(binaries: &'a BinarySet) -> Self {
         Self {
             binaries,
             macos_deployment_target: "11.0",
-            ios_deployment_target: "13.0",
-            xcframework: None,
+            skips: None,
+        }
+    }
+
+    /// Record that the artifact `what` was skipped because an external tool
+    /// it needs (named in `reason`) is missing. `weaveffi package` warns,
+    /// lists every skipped artifact at the end, and fails only with
+    /// `--strict`.
+    pub fn skip(&self, what: impl Into<String>, reason: impl std::fmt::Display) {
+        match self.skips {
+            Some(skips) => skips.skip(what, reason),
+            None => eprintln!("warning: skipping {}: {reason}", what.into()),
         }
     }
 }
@@ -215,7 +261,7 @@ impl<'a> PackageContext<'a> {
 /// The producer library of every build `keep` accepts, laid out as
 /// `{dir}/<platform-id>/<library file>`, plus the import library MSVC links
 /// a Windows DLL through.
-pub fn per_platform_libraries(
+pub(crate) fn per_platform_libraries(
     binaries: &BinarySet,
     dir: &str,
     keep: impl Fn(Platform) -> bool,
@@ -247,12 +293,13 @@ pub fn per_platform_libraries(
 ///
 /// Returns an error when a directory can't be created or replaced, a file
 /// can't be read or written, or an archive can't be assembled.
-pub fn write_artifact(dist: &Utf8Path, artifact: &Artifact) -> Result<Utf8PathBuf> {
+pub(crate) fn write_artifact(dist: &Utf8Path, artifact: &Artifact) -> Result<Utf8PathBuf> {
     let path = dist.join(&artifact.path);
     if let ArtifactKind::Directory = artifact.kind {
         if path.exists() {
             std::fs::remove_dir_all(path.as_std_path())
-                .with_context(|| format!("failed to replace {path}"))?;
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to replace {path}"))?;
         }
         for file in &artifact.files {
             let dest = path.join(&file.path);
@@ -260,10 +307,12 @@ pub fn write_artifact(dist: &Utf8Path, artifact: &Artifact) -> Result<Utf8PathBu
             match &file.content {
                 FileContent::Copy(source) => {
                     std::fs::copy(source.as_std_path(), dest.as_std_path())
-                        .with_context(|| format!("failed to copy {source} to {dest}"))?;
+                        .into_diagnostic()
+                        .wrap_err_with(|| format!("failed to copy {source} to {dest}"))?;
                 }
                 content => std::fs::write(dest.as_std_path(), content.bytes()?)
-                    .with_context(|| format!("failed to write {dest}"))?,
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("failed to write {dest}"))?,
             }
         }
         return Ok(path);
@@ -277,16 +326,27 @@ pub fn write_artifact(dist: &Utf8Path, artifact: &Artifact) -> Result<Utf8PathBu
         ArtifactKind::Zip => archive::zip(&archive::entries(&artifact.files, None)?)?,
         ArtifactKind::Wheel(meta) => archive::wheel(meta, &artifact.files)?,
         ArtifactKind::Gem(spec) => archive::gem(spec, &artifact.files)?,
+        ArtifactKind::File => match artifact.files.as_slice() {
+            [file] => file.content.bytes()?.into_owned(),
+            _ => {
+                return Err(miette::miette!(
+                    "the file artifact {path} must hold one entry"
+                ))
+            }
+        },
     };
     create_parent(&path)?;
-    std::fs::write(path.as_std_path(), bytes).with_context(|| format!("failed to write {path}"))?;
+    std::fs::write(path.as_std_path(), bytes)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write {path}"))?;
     Ok(path)
 }
 
 fn create_parent(path: &Utf8Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent.as_std_path())
-            .with_context(|| format!("failed to create {parent}"))?;
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create {parent}"))?;
     }
     Ok(())
 }

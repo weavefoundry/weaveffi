@@ -5,12 +5,10 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::weaveffi;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/producer")
-}
-
-fn weaveffi() -> assert_cmd::Command {
-    assert_cmd::Command::cargo_bin("weaveffi").expect("binary not found")
 }
 
 fn stdout_of(output: &std::process::Output) -> String {
@@ -94,7 +92,7 @@ fn extract_formats_and_a_library_alone() {
             .output()
             .unwrap(),
     );
-    let api: weaveffi_model::ir::Api = serde_yaml::from_str(&yaml).unwrap();
+    let api: weaveffi_model::ir::Api = serde_yaml_ng::from_str(&yaml).unwrap();
     let json = stdout_of(
         &weaveffi()
             .args(["-q", "extract", "-f", "json"])
@@ -106,17 +104,13 @@ fn extract_formats_and_a_library_alone() {
         serde_json::from_str::<weaveffi_model::ir::Api>(&json).unwrap(),
         api
     );
-    let toml_text = stdout_of(
-        &weaveffi()
-            .args(["-q", "extract", "-f", "toml"])
-            .arg(fixture())
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(
-        toml::from_str::<weaveffi_model::ir::Api>(&toml_text).unwrap(),
-        api
-    );
+    // An IDL is YAML or JSON; TOML is only for `weaveffi.toml`.
+    let toml = weaveffi()
+        .args(["-q", "extract", "-f", "toml"])
+        .arg(fixture())
+        .output()
+        .unwrap();
+    assert!(!toml.status.success());
 }
 
 /// What isn't a Rust producer's library is refused with a reason: an IDL,

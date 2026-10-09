@@ -281,12 +281,14 @@ mod tests {
     }
 
     #[test]
-    fn package_table_parses_from_toml() {
+    fn package_table_deserializes_strictly() {
+        // The CLI reads this table from `weaveffi.toml`; any serde format
+        // exercises the same derive.
         let pkg: Package =
-            toml::from_str("name = \"kv\"\nversion = \"2.0.0\"\nauthors = [\"A\", \"B\"]\n")
+            serde_json::from_str(r#"{"name": "kv", "version": "2.0.0", "authors": ["A", "B"]}"#)
                 .unwrap();
         assert_eq!(pkg.name.as_deref(), Some("kv"));
         assert_eq!(pkg.authors.len(), 2);
-        assert!(toml::from_str::<Package>("bogus = 1").is_err());
+        assert!(serde_json::from_str::<Package>(r#"{"bogus": 1}"#).is_err());
     }
 }

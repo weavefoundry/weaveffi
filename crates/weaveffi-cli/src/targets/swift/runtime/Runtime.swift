@@ -1,25 +1,119 @@
-// MARK: - Runtime support
+import {{C_MODULE}}
+import Foundation
 
-/// A failure the native library reports outside any declared error domain:
-/// an unknown error code or a runtime failure. Throwing wrappers raise it;
-/// non-throwing wrappers stop the process with `fatalError` instead, since
-/// Swift has no unchecked errors.
+// MARK: - The library
+
+/// The native library `{{LIBRARY}}` these bindings call.
+///
+/// Before the first call, the bindings check once that the library
+/// implements C ABI revision {{ABI_VERSION}} and carries every declaration they were
+/// generated with, unchanged. Call ``check()`` at startup to handle a
+/// mismatch as an error; a call made while the library doesn't match stops
+/// the process instead, since a stale binding would otherwise corrupt
+/// memory.
+public enum {{LIBRARY_TYPE}} {
+    /// Why the native library can't be used with these bindings.
+    public enum LoadError: Error, LocalizedError, Hashable, Sendable {
+        /// The library implements another C ABI revision than `expected`.
+        case abiMismatch(found: UInt32, expected: UInt32)
+        /// The library lacks a declaration, named by its dotted IDL path
+        /// (`kv.Store.put`).
+        case missing(declaration: String)
+        /// A declaration's signature changed since these bindings were
+        /// generated.
+        case changed(declaration: String)
+
+        public var errorDescription: String? {
+            switch self {
+            case let .abiMismatch(found, expected):
+                return "{{MODULE}}: the native library '{{LIBRARY}}' implements C ABI revision \(found), but these bindings need revision \(expected)"
+            case let .missing(declaration):
+                return "{{MODULE}}: \(declaration) is missing from the library '{{LIBRARY}}'; regenerate the bindings or rebuild the library"
+            case let .changed(declaration):
+                return "{{MODULE}}: \(declaration) changed since these bindings were generated; regenerate the bindings or rebuild the library '{{LIBRARY}}'"
+            }
+        }
+    }
+
+    /// The C ABI revision these bindings were generated against.
+    public static let abiVersion: UInt32 = {{ABI_VERSION}}
+
+    /// Checks that the loaded library matches these bindings: its C ABI
+    /// revision, then every declaration's signature. The checks run once per
+    /// process; later calls return or throw the same result.
+    ///
+    /// - Throws: ``LoadError`` naming the first mismatch.
+    public static func check() throws {
+        if let failure = wvLoadFailure {
+            throw failure
+        }
+    }
+}
+
+/// The outcome of the load-time checks, computed once.
+let wvLoadFailure: {{LIBRARY_TYPE}}.LoadError? = {
+    let abi = {{PREFIX}}_abi_version()
+    guard abi == {{LIBRARY_TYPE}}.abiVersion else {
+        return .abiMismatch(found: abi, expected: {{LIBRARY_TYPE}}.abiVersion)
+    }
+    return wvCheckContracts()
+}()
+
+/// Stops the process unless the load-time checks passed. Every entry point
+/// that doesn't already hold an object runs it first.
+@inline(__always)
+func wvLoad() {
+    if let failure = wvLoadFailure {
+        fatalError(failure.errorDescription ?? "{{MODULE}}: the native library doesn't match these bindings")
+    }
+}
+
+/// The first expected row that a top-level module's contract table lacks or
+/// declares with another signature hash. Rows the library adds are fine.
+func wvCheckContract(
+    _ table: (UnsafeMutablePointer<Int>?) -> UnsafePointer<{{PREFIX}}_contract_entry>?,
+    _ expected: [(id: UInt64, hash: UInt64, path: String)]
+) -> {{LIBRARY_TYPE}}.LoadError? {
+    var len = 0
+    let entries = UnsafeBufferPointer(start: table(&len), count: len)
+    var hashes: [UInt64: UInt64] = [:]
+    for entry in entries {
+        hashes[entry.id] = entry.hash
+    }
+    for (id, hash, path) in expected {
+        guard let actual = hashes[id] else {
+            return .missing(declaration: path)
+        }
+        guard actual == hash else {
+            return .changed(declaration: path)
+        }
+    }
+    return nil
+}
+
+// MARK: - Errors
+
+/// A failure the library reports outside any declared error domain: the
+/// failure of a call declared `throws: any` (code ``untypedCode``), or a
+/// runtime failure (a panic, a value that failed to marshal, a callback
+/// implementation that failed). Throwing calls raise it; calls that can't
+/// throw stop the process instead.
 public struct {{RUNTIME_ERROR}}: Error, LocalizedError, Hashable, Sendable {
-    /// The code of a generic runtime failure.
-    public static let genericCode: Int32 = -1
+    /// The code of a failure of a call declared `throws: any`.
+    public static let untypedCode: Int32 = -1
     /// The code of a panic caught at the library boundary.
     public static let panicCode: Int32 = -2
     /// The code of an argument or result that failed to marshal.
     public static let marshalCode: Int32 = -3
-    /// The code of a callback implementation that threw.
-    public static let foreignCode: Int32 = -4
+    /// The code of a callback implementation that failed.
+    public static let callbackCode: Int32 = -4
 
-    /// The numeric code the native library reported.
+    /// The numeric code the library reported.
     public let errorCode: Int32
-    /// The message the native library reported.
+    /// The message the library reported.
     public let message: String
 
-    /// Creates an error carrying a native code and message.
+    /// Creates an error carrying a code and message.
     public init(errorCode: Int32, message: String) {
         self.errorCode = errorCode
         self.message = message
@@ -31,50 +125,26 @@ public struct {{RUNTIME_ERROR}}: Error, LocalizedError, Hashable, Sendable {
 /// The error slot every native call reports through.
 typealias WvError = {{PREFIX}}_error
 
-/// The C ABI revision these bindings were generated against.
-let wvAbiVersion: UInt32 = {{ABI_VERSION}}
-
-/// Runs the load-time checks if they haven't run yet.
-@inline(__always)
-func wvLoad() {
-    _ = wvContract
+/// A declared error domain: an `Error` enum with one case per code, plus a
+/// case for codes a newer library added.
+protocol WvDomain: Error {
+    /// The error for a filled slot with a positive code, decoding the
+    /// code's fields from the payload.
+    init(wvError err: WvError)
+    /// Reports this error through a callback method's error slot: its code,
+    /// message, and fields.
+    func wvReport(_ outErr: UnsafeMutablePointer<WvError>?)
 }
 
-/// Stops the process unless the library implements the ABI revision these
-/// bindings were generated against.
-func wvCheckAbiVersion() {
-    let abi = {{PREFIX}}_abi_version()
-    guard abi == wvAbiVersion else {
-        fatalError("{{MODULE}}: the native library '{{LIBRARY}}' implements C ABI revision \(abi), but these bindings need revision \(wvAbiVersion)")
-    }
-}
-
-/// Stops the process unless every declaration these bindings were generated
-/// with is in a top-level module's contract table with an equal signature
-/// hash. Declarations the library adds are fine.
-func wvCheckContract(
-    _ table: (UnsafeMutablePointer<Int>?) -> UnsafePointer<{{PREFIX}}_contract_entry>?,
-    _ expected: [(id: UInt64, hash: UInt64, path: StaticString)]
-) {
-    var len = 0
-    let entries = UnsafeBufferPointer(start: table(&len), count: len)
-    var hashes: [UInt64: UInt64] = [:]
-    for entry in entries {
-        hashes[entry.id] = entry.hash
-    }
-    for (id, hash, path) in expected {
-        guard let actual = hashes[id] else {
-            fatalError("{{MODULE}}: \(path) is missing from the library '{{LIBRARY}}'; regenerate the bindings or rebuild the library")
-        }
-        guard actual == hash else {
-            fatalError("{{MODULE}}: \(path) changed since these bindings were generated; regenerate the bindings or rebuild the library '{{LIBRARY}}'")
-        }
-    }
-}
-
-/// The message carried by an error slot.
+/// The message carried by an error slot (UTF-8, not NUL-terminated).
 func wvErrorMessage(_ err: WvError) -> String {
-    err.message.map { String(cString: $0) } ?? ""
+    guard let ptr = err.message_ptr, err.message_len > 0 else { return "" }
+    return String(decoding: UnsafeBufferPointer(start: ptr, count: err.message_len), as: UTF8.self)
+}
+
+/// The payload reader of an error slot, for a code with fields.
+func wvPayload(_ err: WvError) -> WvReader {
+    WvReader(err.payload_ptr, err.payload_len)
 }
 
 /// The Swift error for a code outside any declared domain: cancellation
@@ -86,10 +156,16 @@ func wvRuntimeError(_ err: WvError) -> Error {
     return {{RUNTIME_ERROR}}(errorCode: err.code, message: wvErrorMessage(err))
 }
 
+/// The Swift error for a failed call declared `throws: Domain`: a positive
+/// code is the domain's, anything else a runtime error.
+func wvDomainError<D: WvDomain>(_ err: WvError, _ domain: D.Type) -> Error {
+    err.code > 0 ? D(wvError: err) : wvRuntimeError(err)
+}
+
 /// Stops the process for a failed call that can't throw, naming the code and
 /// message the library reported.
-func wvFatal(_ code: Int32, _ message: String, _ function: StaticString) -> Never {
-    fatalError("{{MODULE}}.\(function) failed with code \(code): \(message)")
+func wvFatal(_ err: WvError, _ function: StaticString = #function) -> Never {
+    fatalError("{{MODULE}}.\(function) failed with code \(err.code): \(wvErrorMessage(err))")
 }
 
 /// Throws the runtime error for a filled error slot, clearing it.
@@ -101,42 +177,49 @@ func wvCheck(_ err: inout WvError) throws {
     throw error
 }
 
+/// Throws the domain or runtime error for a filled error slot, clearing it.
+@inline(__always)
+func wvCheck<D: WvDomain>(_ err: inout WvError, _ domain: D.Type) throws {
+    guard err.code != 0 else { return }
+    let error = wvDomainError(err, domain)
+    {{PREFIX}}_error_clear(&err)
+    throw error
+}
+
 /// Stops the process for a filled error slot of a call that can't throw.
 @inline(__always)
 func wvTrap(_ err: inout WvError, _ function: StaticString = #function) {
     guard err.code != 0 else { return }
-    let code = err.code
-    let message = wvErrorMessage(err)
-    {{PREFIX}}_error_clear(&err)
-    wvFatal(code, message, function)
+    wvFatal(err, function)
 }
 
-/// Maps and releases the heap-boxed error an async completion received.
-func wvTakeError(_ err: UnsafeMutablePointer<WvError>, _ map: (WvError) -> Error) -> Error {
-    let error = map(err.pointee)
+/// Maps and releases the heap-boxed error of an async completion.
+func wvTakeError(_ err: UnsafeMutablePointer<WvError>) -> Error {
+    defer { {{PREFIX}}_error_free(err) }
+    return wvRuntimeError(err.pointee)
+}
+
+/// Maps and releases the heap-boxed error of an async completion of a call
+/// declared `throws: Domain`.
+func wvTakeError<D: WvDomain>(_ err: UnsafeMutablePointer<WvError>, _ domain: D.Type) -> Error {
+    defer { {{PREFIX}}_error_free(err) }
+    return wvDomainError(err.pointee, domain)
+}
+
+/// Maps and releases the boxed error of a cancellable async call that
+/// declares no errors: cancellation throws `CancellationError`, anything
+/// else stops the process.
+func wvTakeCancellation(_ err: UnsafeMutablePointer<WvError>, _ function: StaticString = #function) -> Error {
+    guard err.pointee.code == -5 else { wvFatal(err.pointee, function) }
     {{PREFIX}}_error_free(err)
-    return error
-}
-
-/// The error mapping of a cancellable call that declares no error domain:
-/// cancellation throws `CancellationError`, anything else stops the process.
-func wvCancelledOrTrap(_ err: WvError) -> Error {
-    if err.code == -5 {
-        return CancellationError()
-    }
-    wvFatal(err.code, wvErrorMessage(err), "async call")
-}
-
-/// Stops the process for the boxed error of an async call that can't throw.
-func wvTrapBoxed(_ err: UnsafeMutablePointer<WvError>, _ function: StaticString = #function) -> Never {
-    wvFatal(err.pointee.code, wvErrorMessage(err.pointee), function)
+    return CancellationError()
 }
 
 /// Unwraps a pointer the library promised is non-null.
 @inline(__always)
 func wvNonNull<P>(_ ptr: P?, _ function: StaticString = #function) -> P {
     guard let ptr = ptr else {
-        wvFatal({{RUNTIME_ERROR}}.marshalCode, "the native library returned a null pointer", function)
+        fatalError("{{MODULE}}.\(function): the native library returned a null pointer")
     }
     return ptr
 }
@@ -149,7 +232,7 @@ func wvEnumCase<E: RawRepresentable>(_ type: E.Type, _ raw: Int32) -> E where E.
     return value
 }
 
-// MARK: Strings, bytes, and buffers
+// MARK: - Strings, bytes, typed arrays, and buffers
 
 /// Lends the UTF-8 bytes of `s` (not NUL-terminated) for one call.
 @inline(__always)
@@ -164,6 +247,12 @@ func wvWithBytes<R>(_ d: Data, _ body: (UnsafePointer<UInt8>?, Int) throws -> R)
     try d.withUnsafeBytes { try body($0.baseAddress?.assumingMemoryBound(to: UInt8.self), $0.count) }
 }
 
+/// Lends the storage of `a` (aligned for its element) for one call.
+@inline(__always)
+func wvWithSlice<T, R>(_ a: [T], _ body: (UnsafePointer<T>?, Int) throws -> R) rethrows -> R {
+    try a.withUnsafeBufferPointer { try body($0.baseAddress, $0.count) }
+}
+
 /// Encodes `value` as a value buffer and lends it for one call.
 @inline(__always)
 func wvWithEncoded<T: WvCodable, R>(_ value: T, _ body: (UnsafePointer<UInt8>?, Int) throws -> R) rethrows -> R {
@@ -172,43 +261,63 @@ func wvWithEncoded<T: WvCodable, R>(_ value: T, _ body: (UnsafePointer<UInt8>?, 
     return try w.bytes.withUnsafeBufferPointer { try body($0.baseAddress, $0.count) }
 }
 
-/// Copies a returned string, then releases the library's allocation.
+/// Releases a run the library handed over.
+@inline(__always)
+func wvFree(_ ptr: UnsafeRawPointer, _ byteCount: Int) {
+    {{PREFIX}}_free_bytes(UnsafeMutablePointer(mutating: ptr.assumingMemoryBound(to: UInt8.self)), byteCount)
+}
+
+/// Copies a returned string, then releases the library's run.
 func wvTakeString(_ ptr: UnsafePointer<UInt8>?, _ len: Int) -> String {
     guard let ptr = ptr else { return "" }
-    defer { {{PREFIX}}_free_bytes(UnsafeMutablePointer(mutating: ptr), len) }
+    defer { wvFree(ptr, len) }
     return String(decoding: UnsafeBufferPointer(start: ptr, count: len), as: UTF8.self)
 }
 
-/// Copies returned bytes, then releases the library's allocation.
+/// Copies returned bytes, then releases the library's run.
 func wvTakeBytes(_ ptr: UnsafePointer<UInt8>?, _ len: Int) -> Data {
     guard let ptr = ptr else { return Data() }
-    defer { {{PREFIX}}_free_bytes(UnsafeMutablePointer(mutating: ptr), len) }
+    defer { wvFree(ptr, len) }
     return Data(bytes: ptr, count: len)
+}
+
+/// Copies a returned typed array of `count` elements, then releases the
+/// library's run.
+func wvTakeSlice<T>(_ ptr: UnsafePointer<T>?, _ count: Int) -> [T] {
+    guard let ptr = ptr else { return [] }
+    defer { wvFree(ptr, count * MemoryLayout<T>.stride) }
+    return Array(UnsafeBufferPointer(start: ptr, count: count))
 }
 
 /// Decodes a returned value buffer in place, then releases it.
 func wvTakeBuffer<T: WvCodable>(_ ptr: UnsafePointer<UInt8>?, _ len: Int, as type: T.Type) -> T {
     defer {
-        if let ptr = ptr { {{PREFIX}}_free_bytes(UnsafeMutablePointer(mutating: ptr), len) }
+        if let ptr = ptr { wvFree(ptr, len) }
     }
     return wvBorrowBuffer(ptr, len, as: type)
 }
 
 /// Copies a borrowed string.
 func wvBorrowString(_ ptr: UnsafePointer<UInt8>?, _ len: Int) -> String {
-    guard let ptr = ptr else { return "" }
+    guard let ptr = ptr, len > 0 else { return "" }
     return String(decoding: UnsafeBufferPointer(start: ptr, count: len), as: UTF8.self)
 }
 
 /// Copies borrowed bytes.
 func wvBorrowBytes(_ ptr: UnsafePointer<UInt8>?, _ len: Int) -> Data {
-    guard let ptr = ptr else { return Data() }
+    guard let ptr = ptr, len > 0 else { return Data() }
     return Data(bytes: ptr, count: len)
+}
+
+/// Copies a borrowed typed array of `count` elements.
+func wvBorrowSlice<T>(_ ptr: UnsafePointer<T>?, _ count: Int) -> [T] {
+    guard let ptr = ptr, count > 0 else { return [] }
+    return Array(UnsafeBufferPointer(start: ptr, count: count))
 }
 
 /// Decodes a borrowed value buffer in place.
 func wvBorrowBuffer<T: WvCodable>(_ ptr: UnsafePointer<UInt8>?, _ len: Int, as type: T.Type) -> T {
-    var r = WvReader(UnsafeRawPointer(ptr), len)
+    var r = WvReader(ptr, len)
     let value: T = r.read()
     r.finish()
     return value
@@ -378,7 +487,7 @@ struct WvReader {
     }
 }
 
-// MARK: Value-buffer codecs
+// MARK: - Value-buffer codecs
 
 /// A type that crosses the C ABI inside a value buffer. Every primitive,
 /// optional, list, and map conforms here; each record, enum, and interface
@@ -396,6 +505,23 @@ protocol WvCEnum: WvCodable, RawRepresentable where RawValue == Int32 {}
 extension WvCEnum {
     static func wvRead(_ r: inout WvReader) -> Self { wvEnumCase(Self.self, r.readI32()) }
     func wvWrite(_ w: inout WvWriter) { w.writeI32(rawValue) }
+}
+
+/// An interface wrapper: one strong reference to a native object, which
+/// crosses inside a value buffer as an object token.
+protocol WvObject: AnyObject, WvCodable {
+    /// The reference this wrapper owns.
+    var ptr: OpaquePointer { get }
+    /// Adopts one strong reference.
+    init(ptr: OpaquePointer)
+    /// Returns a new strong reference to the same object, for a position
+    /// that takes ownership of it.
+    func clonePtr() -> OpaquePointer
+}
+
+extension WvObject {
+    static func wvRead(_ r: inout WvReader) -> Self { Self(ptr: r.readObject()) }
+    func wvWrite(_ w: inout WvWriter) { w.writeObject(clonePtr()) }
 }
 
 extension Bool: WvCodable {
@@ -515,7 +641,80 @@ extension Dictionary: WvCodable where Key: WvCodable, Value: WvCodable {
     }
 }
 
-// MARK: Async and callbacks
+// MARK: - Iterators
+
+/// A lazy sequence over the elements a native iterator streams, returned by
+/// every function declared to return `iter<T>`.
+///
+/// Each `next()` pulls exactly one element from the library. The native
+/// iterator is released as soon as the stream ends (or fails), and from
+/// `deinit` when iteration stops early. The sequence is single-pass: once
+/// exhausted, `next()` keeps returning `nil`.
+///
+/// `next()` can't throw, so when the library reports an error mid-stream,
+/// iteration ends and the error is kept in ``error``. ``collect()`` pulls
+/// the rest and throws that error instead. A function that declares no
+/// errors stops the process on a mid-stream failure.
+public final class NativeSequence<Element>: Sequence, IteratorProtocol {
+    private var handle: OpaquePointer?
+    private let pull: (OpaquePointer, UnsafeMutablePointer<WvError>) -> Element?
+    private let release: (OpaquePointer) -> Void
+    private let failure: (WvError) -> Error
+
+    /// The error that ended iteration early, if any.
+    public private(set) var error: Error?
+
+    init(
+        _ handle: OpaquePointer,
+        release: @escaping (OpaquePointer) -> Void,
+        failure: @escaping (WvError) -> Error,
+        pull: @escaping (OpaquePointer, UnsafeMutablePointer<WvError>) -> Element?
+    ) {
+        self.handle = handle
+        self.release = release
+        self.failure = failure
+        self.pull = pull
+    }
+
+    deinit {
+        if let handle = handle {
+            release(handle)
+        }
+    }
+
+    /// Pulls the next element from the library, or returns `nil` once the
+    /// stream has ended.
+    public func next() -> Element? {
+        guard let handle = handle else { return nil }
+        var err = WvError()
+        if let item = pull(handle, &err) {
+            return item
+        }
+        self.handle = nil
+        release(handle)
+        if err.code != 0 {
+            error = failure(err)
+            {{PREFIX}}_error_clear(&err)
+        }
+        return nil
+    }
+
+    /// Pulls every remaining element.
+    ///
+    /// - Throws: The error that ended iteration early, if any.
+    public func collect() throws -> [Element] {
+        var items: [Element] = []
+        while let item = next() {
+            items.append(item)
+        }
+        if let error = error {
+            throw error
+        }
+        return items
+    }
+}
+
+// MARK: - Async and callbacks
 
 /// A native cancel token owned by one cancellable call. The library takes its
 /// own reference at launch, so this one is released whenever the wrapper is
@@ -577,64 +776,114 @@ func wvRelease<T>(_ ctx: UnsafeMutableRawPointer?, as type: T.Type) {
     Unmanaged<WvBox<T>>.fromOpaque(ctx!).release()
 }
 
+/// The implementation behind `ctx`.
+@inline(__always)
+func wvImpl<T>(_ ctx: UnsafeMutableRawPointer?, as type: T.Type) -> T {
+    Unmanaged<WvBox<T>>.fromOpaque(ctx!).takeUnretainedValue().value
+}
+
+/// Reports an error a callback method threw as an untyped failure (`-1`)
+/// with its description.
+func wvReport(_ error: Error, _ outErr: UnsafeMutablePointer<WvError>?) {
+    let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+    wvSetError(outErr, {{RUNTIME_ERROR}}.untypedCode, message)
+}
+
 /// Runs one callback method on the implementation behind `ctx`. A thrown
-/// error never unwinds through the library: `domain` reports it when it's
-/// the method's declared error, anything else is reported as a callback
-/// failure (`-4`), and the method returns `fallback`.
+/// error never unwinds through the library: it's reported through `outErr`
+/// as an untyped failure, and the method returns `fallback`.
 func wvInvoke<T, R>(
     _ ctx: UnsafeMutableRawPointer?,
     _ outErr: UnsafeMutablePointer<WvError>?,
     as type: T.Type,
     fallback: R,
-    domain: (Error, UnsafeMutablePointer<WvError>?) -> Bool = { _, _ in false },
     _ body: (T) throws -> R
 ) -> R {
-    let impl = Unmanaged<WvBox<T>>.fromOpaque(ctx!).takeUnretainedValue().value
     do {
-        return try body(impl)
+        return try body(wvImpl(ctx, as: type))
     } catch {
-        if !domain(error, outErr) {
-            let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-            message.withCString { {{PREFIX}}_error_set(outErr, {{RUNTIME_ERROR}}.foreignCode, $0) }
-        }
+        wvReport(error, outErr)
         return fallback
     }
 }
 
-/// Reports a declared domain error from a callback method: its code, its
-/// message, and its fields as the payload.
+/// Runs one callback method declared `throws: Domain`: a thrown `D` is
+/// reported with its code, message, and fields; any other error as an
+/// untyped failure.
+func wvInvoke<T, R, D: WvDomain>(
+    _ ctx: UnsafeMutableRawPointer?,
+    _ outErr: UnsafeMutablePointer<WvError>?,
+    as type: T.Type,
+    throwing domain: D.Type,
+    fallback: R,
+    _ body: (T) throws -> R
+) -> R {
+    do {
+        return try body(wvImpl(ctx, as: type))
+    } catch let error as D {
+        error.wvReport(outErr)
+        return fallback
+    } catch {
+        wvReport(error, outErr)
+        return fallback
+    }
+}
+
+/// Fills a callback method's error slot: a code, a message, and the fields
+/// of a domain code as the payload.
 func wvSetError(_ outErr: UnsafeMutablePointer<WvError>?, _ code: Int32, _ message: String, _ payload: WvWriter? = nil) {
-    message.withCString { {{PREFIX}}_error_set(outErr, code, $0) }
+    wvWithUTF8(message) { {{PREFIX}}_error_set(outErr, code, $0, $1) }
     if let payload = payload {
         payload.bytes.withUnsafeBufferPointer { {{PREFIX}}_error_set_payload(outErr, $0.baseAddress, $0.count) }
     }
 }
 
+/// Returns an optional scalar from a callback method: the value through
+/// `outValue` and whether it's present.
+func wvReturnOptional<T>(_ value: T?, _ outValue: UnsafeMutablePointer<T>?) -> Bool {
+    guard let value = value else { return false }
+    outValue?.pointee = value
+    return true
+}
+
 /// Hands `bytes` to the library as a callback method's return: a run
 /// allocated with `{{PREFIX}}_alloc` that the library adopts.
-func wvHandOver(_ bytes: UnsafeRawBufferPointer, _ outPtr: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?, _ outLen: UnsafeMutablePointer<Int>?) {
-    let run = {{PREFIX}}_alloc(bytes.count)
-    if let run = run, let base = bytes.baseAddress {
-        run.initialize(from: base.assumingMemoryBound(to: UInt8.self), count: bytes.count)
+func wvHandOver(_ bytes: UnsafeRawBufferPointer) -> (UnsafeMutableRawPointer?, Int) {
+    guard let base = bytes.baseAddress, bytes.count > 0, let run = {{PREFIX}}_alloc(bytes.count) else {
+        return (nil, 0)
     }
-    outPtr?.pointee = run
-    outLen?.pointee = run == nil ? 0 : bytes.count
+    run.initialize(from: base.assumingMemoryBound(to: UInt8.self), count: bytes.count)
+    return (UnsafeMutableRawPointer(run), bytes.count)
 }
 
 /// Returns a string from a callback method through its out slots.
 func wvReturnString(_ value: String, _ outPtr: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?, _ outLen: UnsafeMutablePointer<Int>?) {
     var value = value
-    value.withUTF8 { wvHandOver(UnsafeRawBufferPointer($0), outPtr, outLen) }
+    let (run, len) = value.withUTF8 { wvHandOver(UnsafeRawBufferPointer($0)) }
+    outPtr?.pointee = run?.assumingMemoryBound(to: UInt8.self)
+    outLen?.pointee = len
 }
 
 /// Returns bytes from a callback method through its out slots.
 func wvReturnBytes(_ value: Data, _ outPtr: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?, _ outLen: UnsafeMutablePointer<Int>?) {
-    value.withUnsafeBytes { wvHandOver($0, outPtr, outLen) }
+    let (run, len) = value.withUnsafeBytes { wvHandOver($0) }
+    outPtr?.pointee = run?.assumingMemoryBound(to: UInt8.self)
+    outLen?.pointee = len
+}
+
+/// Returns a typed array from a callback method through its out slots: the
+/// element count, in a run the library adopts.
+func wvReturnSlice<T>(_ value: [T], _ outPtr: UnsafeMutablePointer<UnsafeMutablePointer<T>?>?, _ outLen: UnsafeMutablePointer<Int>?) {
+    let (run, len) = value.withUnsafeBytes { wvHandOver($0) }
+    outPtr?.pointee = run?.bindMemory(to: T.self, capacity: value.count)
+    outLen?.pointee = len / MemoryLayout<T>.stride
 }
 
 /// Returns a value buffer from a callback method through its out slots.
 func wvReturnBuffer<T: WvCodable>(_ value: T, _ outPtr: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?, _ outLen: UnsafeMutablePointer<Int>?) {
     var w = WvWriter()
     w.write(value)
-    w.bytes.withUnsafeBytes { wvHandOver($0, outPtr, outLen) }
+    let (run, len) = w.bytes.withUnsafeBytes { wvHandOver($0) }
+    outPtr?.pointee = run?.assumingMemoryBound(to: UInt8.self)
+    outLen?.pointee = len
 }

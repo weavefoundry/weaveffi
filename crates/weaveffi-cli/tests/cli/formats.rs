@@ -1,4 +1,5 @@
-//! The JSON and TOML spellings of an IDL generate and validate like YAML.
+//! The JSON spelling of an IDL generates and validates like YAML, and a TOML
+//! IDL is rejected (TOML is only for `weaveffi.toml`).
 
 use weaveffi_model::ir::Api;
 
@@ -6,15 +7,15 @@ use weaveffi_model::ir::Api;
 fn load_calculator_api() -> Api {
     weaveffi_model::parse::parse_api_str(
         concat!(
-            "version: \"0.11.0\"\n",
+            "version: \"0.12.0\"\n",
             "modules:\n",
             "  - name: calculator\n",
             "    errors:\n",
-            "      name: CalcError\n",
-            "      codes: [{ name: DivisionByZero, code: 1, message: division by zero }]\n",
+            "      - name: CalcError\n",
+            "        codes: [{ name: DivisionByZero, code: 1, message: division by zero }]\n",
             "    functions:\n",
             "      - { name: add, params: [{ name: a, type: i32 }, { name: b, type: i32 }], return: i32 }\n",
-            "      - { name: divide, params: [{ name: a, type: i32 }, { name: b, type: i32 }], return: i32, throws: true }\n",
+            "      - { name: divide, params: [{ name: a, type: i32 }, { name: b, type: i32 }], return: i32, throws: CalcError }\n",
             "      - { name: greet, params: [{ name: name, type: string }], return: string }\n",
         ),
         "yaml",
@@ -33,8 +34,7 @@ fn generate_from_json_input() {
 
     let out_dir = tempfile::tempdir().expect("failed to create output dir");
 
-    assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
+    crate::weaveffi()
         .args([
             "generate",
             json_path.to_str().unwrap(),
@@ -51,30 +51,21 @@ fn generate_from_json_input() {
 }
 
 #[test]
-fn generate_from_toml_input() {
-    let api = load_calculator_api();
-    let toml_str = toml::to_string_pretty(&api).expect("failed to serialize to TOML");
-
+fn toml_idl_is_rejected() {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let toml_path = tmp.path().join("calculator.toml");
-    std::fs::write(&toml_path, &toml_str).expect("failed to write TOML file");
+    std::fs::write(&toml_path, "version = \"0.12.0\"\nmodules = []\n")
+        .expect("failed to write TOML file");
 
-    let out_dir = tempfile::tempdir().expect("failed to create output dir");
-
-    assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args([
-            "generate",
-            toml_path.to_str().unwrap(),
-            "-o",
-            out_dir.path().to_str().unwrap(),
-        ])
-        .assert()
-        .success();
-
+    let output = crate::weaveffi()
+        .args(["validate", toml_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = crate::stderr(&output);
     assert!(
-        out_dir.path().join("c").exists(),
-        "c/ output directory should exist"
+        stderr.contains("calculator.toml (.toml)") && stderr.contains("yml|yaml|json"),
+        "{stderr}"
     );
 }
 
@@ -87,8 +78,7 @@ fn validate_from_json() {
     let json_path = tmp.path().join("calculator.json");
     std::fs::write(&json_path, &json).expect("failed to write JSON file");
 
-    assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
+    crate::weaveffi()
         .args(["validate", json_path.to_str().unwrap()])
         .assert()
         .success()

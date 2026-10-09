@@ -40,7 +40,14 @@ EOF
            dotnet run -c Release --nologo -v quiet 2>&1 )
 }
 
-dotnet_calculator() { dotnet_consumer calculator Calculator.cs; }
+# The calculator consumer also runs against a library path that doesn't
+# exist, where it checks that the load failure is a catchable exception.
+dotnet_calculator() {
+    dotnet_consumer calculator Calculator.cs || return 1
+    ( cd "$OUT/dotnet-calculator" \
+        && env EXPECT_LOAD_FAILURE=1 "$(library_env calculator)=$OUT/missing/libcalculator.$EXT" \
+           dotnet run -c Release --no-build --nologo -v quiet 2>&1 )
+}
 dotnet_codec() { dotnet_consumer codec Codec.cs; }
 dotnet_kvstore() { dotnet_consumer kvstore Kvstore.cs; }
 

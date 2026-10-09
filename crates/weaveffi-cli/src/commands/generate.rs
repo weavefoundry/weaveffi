@@ -1,90 +1,80 @@
-//! `weaveffi generate`: parse, validate, and run the selected targets
-//! through the orchestrator (plus `--dry-run`).
+//! `weaveffi generate`: parse, validate, plan the selected targets against
+//! the output directory, then write the plan, or with `--dry-run`,
+//! `--check`, or `--diff`, report it without writing.
 
-use camino::Utf8Path;
-use miette::{miette, IntoDiagnostic, Result, WrapErr};
-use weaveffi_cli::codegen::{relative_path, GenerateReport, Orchestrator};
-use weaveffi_cli::project::Project;
-use weaveffi_model::model::Model;
+use std::process::ExitCode;
+
+use miette::Result;
 
 use super::Locate;
+use crate::codegen::Orchestrator;
 
 /// Options for [`cmd_generate`].
-pub(crate) struct GenerateArgs<'a> {
-    pub(crate) locate: Locate<'a>,
-    pub(crate) out: Option<&'a str>,
-    pub(crate) targets: Option<&'a str>,
-    pub(crate) warn: bool,
-    pub(crate) dry_run: bool,
+pub struct GenerateArgs<'a> {
+    /// Where the project is.
+    pub locate: Locate<'a>,
+    /// `--out`.
+    pub out: Option<&'a str>,
+    /// `--target`.
+    pub targets: Option<&'a [String]>,
+    /// `--warn`.
+    pub warn: bool,
+    /// `--dry-run`: list the files the targets render.
+    pub dry_run: bool,
+    /// `--check`: exit 1 when anything would change.
+    pub check: bool,
+    /// `--diff`: print the unified diff of what would change.
+    pub diff: bool,
 }
 
-pub(crate) fn cmd_generate(args: &GenerateArgs<'_>) -> Result<()> {
+/// Run `weaveffi generate`.
+pub fn cmd_generate(args: &GenerateArgs<'_>) -> Result<ExitCode> {
+    let quiet = args.locate.quiet;
     let project = args.locate.project()?;
     let model = super::load_model(&project, args.warn)?;
     let out_dir = project.config.out_dir(args.out);
-    let report = generate(&project, &model, &out_dir, args.targets, args.dry_run)?;
-    if let Some(report) = report {
-        if !args.locate.quiet {
-            println!("{}", report_summary(&report, &out_dir));
-        }
-    }
-    Ok(())
-}
+    let targets = project.config.targets(args.targets)?;
+    let plan = Orchestrator::new()
+        .with_targets(targets.iter().map(AsRef::as_ref))
+        .plan(&model, &out_dir)?;
 
-/// Generate the selected targets into `out_dir` (or, with `dry_run`, list
-/// the files that would be written), returning the run's report.
-pub(crate) fn generate(
-    project: &Project,
-    model: &Model,
-    out_dir: &Utf8Path,
-    targets: Option<&str>,
-    dry_run: bool,
-) -> Result<Option<GenerateReport>> {
-    let selected = project.config.select_targets(targets)?;
-    if dry_run {
-        for target in &selected {
-            for file in target.render(model, out_dir) {
-                println!("{}", relative_path(out_dir, &file.path));
+    if args.dry_run {
+        for path in plan.rendered() {
+            println!("{path}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    if args.diff {
+        print!("{}", plan.unified_diff());
+    }
+    if args.check {
+        let changes: Vec<_> = plan.changes().collect();
+        if !args.diff {
+            for change in &changes {
+                println!("{} {}", change.kind.marker(), change.path);
             }
         }
-        return Ok(None);
-    }
-
-    std::fs::create_dir_all(out_dir.as_std_path())
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to create output directory: {out_dir}"))?;
-
-    let mut orchestrator = Orchestrator::new();
-    for target in &selected {
-        orchestrator = orchestrator.with_target(target.as_ref());
-    }
-    let report = orchestrator
-        .run(model, out_dir)
-        .map_err(|e| miette!("{:#}", e))?;
-    Ok(Some(report))
-}
-
-/// One line describing what a generation run did.
-pub(crate) fn report_summary(report: &GenerateReport, out_dir: &Utf8Path) -> String {
-    if report.generated.is_empty() {
-        return format!(
-            "{out_dir} is up to date ({} targets)",
-            report.up_to_date.len()
+        if changes.is_empty() {
+            if !quiet {
+                eprintln!("{out_dir} is up to date");
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        eprintln!(
+            "{} generated file{} in {out_dir} would change; run `weaveffi generate`",
+            changes.len(),
+            if changes.len() == 1 { "" } else { "s" }
         );
+        return Ok(ExitCode::FAILURE);
     }
-    let mut line = format!(
-        "Generated {} in {out_dir}: {} written, {} unchanged",
-        report.generated.join(", "),
-        report.written,
-        report.unchanged
-    );
-    if !report.removed.is_empty() {
-        line.push_str(&format!(", {} stale removed", report.removed.len()));
+    if args.diff {
+        return Ok(ExitCode::SUCCESS);
     }
-    if !report.up_to_date.is_empty() {
-        line.push_str(&format!(" ({} up to date)", report.up_to_date.join(", ")));
+    let report = plan.apply()?;
+    if !quiet {
+        println!("{}", report.summary(&out_dir));
     }
-    line
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
@@ -97,19 +87,22 @@ mod tests {
         let yml = dir.path().join("api.yml");
         std::fs::write(
             &yml,
-            "version: \"0.11.0\"\nmodules:\n  - name: math\n    functions:\n      - { name: add, params: [{ name: a, type: i32 }], return: i32 }\n",
+            "version: \"0.12.0\"\nmodules:\n  - name: math\n    functions:\n      - { name: add, params: [{ name: a, type: i32 }], return: i32 }\n",
         )
         .unwrap();
         let out = dir.path().join("out");
+        let targets = ["c".to_string()];
         cmd_generate(&GenerateArgs {
             locate: Locate {
                 input: yml.to_str(),
                 ..Locate::default()
             },
             out: out.to_str(),
-            targets: Some("c"),
+            targets: Some(&targets),
             warn: false,
             dry_run: true,
+            check: false,
+            diff: false,
         })
         .unwrap();
         assert!(!out.exists(), "dry-run should not create output directory");

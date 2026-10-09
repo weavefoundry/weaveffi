@@ -17,6 +17,15 @@
 //   6. objects: token values, sum_holder twice over the same holder,
 //      primary_of returning the same native object, identity (not value)
 //      in same_primary, one wrapper in several slots;
+//   7. records are value-equal: every object-free vector decoded twice is
+//      equal (lists, maps, and byte arrays compare by content) with equal
+//      hashes, and `with` makes an unequal copy;
+//   8. the ABI 5 shapes: optional scalars (`int?`, `double?`, `bool?`,
+//      `Color?`) both ways, an undeclared optional enum value rejected
+//      (-3), typed arrays both ways (bit-identical floats, extreme
+//      integers, empty, a span over part of an array), a `usize`, a `char`
+//      (and its rejections), a custom type (and its lift failures), and an
+//      iterator of typed arrays, enumerated twice;
 //
 // and ends by asserting the producer's leak counters are zero.
 
@@ -185,19 +194,19 @@ internal static class Program
         Expect(c.Blob.Length == 6 && c.Blob[5] == 255, "composite blob");
         Expect(c.SomeI64 == long.MinValue && c.NoneI64 == null, "composite optionals");
         Expect(c.SomeText == "", "composite some_text is present and empty");
-        Expect(c.Names.Length == 3 && c.Names[1] == "", "composite names");
-        Expect(c.Matrix.Length == 3 && c.Matrix[1].Length == 0 && c.Matrix[2][0] == -4, "composite matrix");
-        Expect(c.Floats.Length == 6 && double.IsNaN(c.Floats[0]) && double.IsNegative(c.Floats[3]),
+        Expect(c.Names.Count == 3 && c.Names[1] == "", "composite names");
+        Expect(c.Matrix.Count == 3 && c.Matrix[1].Count == 0 && c.Matrix[2][0] == -4, "composite matrix");
+        Expect(c.Floats.Count == 6 && double.IsNaN(c.Floats[0]) && double.IsNegative(c.Floats[3]),
             "composite floats");
         Expect(c.ByName.Count == 4 && c.ById.Count == 3 && c.ByColor.Count == 2 && c.Flags.Count == 2,
             "composite map sizes");
         Expect(c.Scalars.U32Value == 4_000_000_000U, "composite scalars");
         Expect(c.Shape is Shape.Labeled { Count: 3 }, "composite shape");
-        Expect(c.Shapes.Length == 6 && c.Shapes[5] is Shape.Nested { Note: null }, "composite shapes");
+        Expect(c.Shapes.Count == 6 && c.Shapes[5] is Shape.Nested { Note: null }, "composite shapes");
         Expect(c.MaybeShape is Shape.Nested, "composite maybe_shape");
         Expect(c.MaybeList != null && c.MaybeList.Length == 2, "composite maybe_list");
-        Expect(c.Sparse.Length == 3 && c.Sparse[1] == null && c.Sparse[0] == true, "composite sparse");
-        Expect(c.Colors.Length == 4 && c.Colors[3] == Color.Infrared, "composite colors");
+        Expect(c.Sparse.Count == 3 && c.Sparse[1] == null && c.Sparse[0] == true, "composite sparse");
+        Expect(c.Colors.Count == 4 && c.Colors[3] == Color.Infrared, "composite colors");
     }
 
     static void OutOfRange(uint n)
@@ -245,7 +254,7 @@ internal static class Program
     {
         var full = Fetch<Vector.Objects>(n, "objects full").Value;
         Expect(full.Primary.Value() == 10 && full.Spare != null && full.Spare.Value() == 11, "primary and spare");
-        Expect(full.Many.Length == 3 && full.Many[2].Value() == long.MinValue, "many");
+        Expect(full.Many.Count == 3 && full.Many[2].Value() == long.MinValue, "many");
         Expect(full.ByName.Count == 2 && full.ByName["b"].Value() == 21, "by_name");
         // Each encoding mints fresh references, so the holder can be sent twice.
         var expected = unchecked(10L + 11 + 12 + 13 + 20 + 21 + long.MinValue);
@@ -277,8 +286,154 @@ internal static class Program
         }
     }
 
+    static bool HasObjects(Vector v) => v is Vector.Objects;
+
+    static void ValueEquality(uint n)
+    {
+        for (uint i = 0; i < n; i++)
+        {
+            var a = C.Vector(i);
+            var b = C.Vector(i);
+            if (HasObjects(a))
+            {
+                // Distinct wrappers of fresh references: equal only by identity.
+                Release(a);
+                Release(b);
+                continue;
+            }
+            var name = C.VectorName(i);
+            if (name.Contains("nan"))
+            {
+                // Record equality follows double.Equals, where NaN equals NaN.
+                Expect(a.Equals(b), $"{name}: NaN equals itself in a record");
+                continue;
+            }
+            Expect(a == b && a.GetHashCode() == b.GetHashCode(), $"{name}: decoded twice is equal");
+            Expect(!ReferenceEquals(a, b), $"{name}: two decodes are two objects");
+        }
+        var deep = Fetch<Vector.Deep>(n, "composite canonical").Value;
+        var copy = deep with { Names = deep.Names.ToList() };
+        Expect(copy == deep && copy.GetHashCode() == deep.GetHashCode(), "a list compares by content");
+        var changed = deep with { Names = deep.Names.Append("extra").ToList() };
+        Expect(changed != deep, "a longer list differs");
+        var blob = deep with { Blob = (byte[])deep.Blob.Clone() };
+        Expect(blob == deep, "a byte array compares by content");
+        blob.Blob[0] ^= 1;
+        Expect(blob != deep, "a changed byte differs");
+        var map = deep with { ByName = new Dictionary<string, long>(deep.ByName) };
+        Expect(map == deep, "a map compares by content");
+    }
+
+    static void OptionalScalars()
+    {
+        Expect(C.EchoOptI32(null) == null, "echo_opt_i32(none)");
+        Expect(C.EchoOptI32(int.MinValue) == int.MinValue, "echo_opt_i32(MIN)");
+        Expect(C.EchoOptI32(0) == 0, "echo_opt_i32(0) is present");
+        var negZero = C.EchoOptF64(-0.0);
+        Expect(negZero.HasValue && SameBits(negZero.Value, -0.0), "echo_opt_f64(-0.0) keeps the sign");
+        Expect(C.EchoOptF64(double.NaN) is double nan && double.IsNaN(nan), "echo_opt_f64(NaN)");
+        Expect(C.EchoOptF64(null) == null, "echo_opt_f64(none)");
+        Expect(C.EchoOptBool(true) == true && C.EchoOptBool(false) == false && C.EchoOptBool(null) == null,
+            "echo_opt_bool");
+        Expect(C.EchoOptColor(Color.Infrared) == Color.Infrared && C.EchoOptColor(Color.Blue) == Color.Blue,
+            "echo_opt_color");
+        Expect(C.EchoOptColor(null) == null, "echo_opt_color(none)");
+        var e = Throws<NativeBugException>(() => C.EchoOptColor((Color)3), "echo_opt_color(3)");
+        Expect(e.Code == NativeException.MarshalErrorCode, $"an undeclared present value is -3 (got {e.Code})");
+    }
+
+    static void TypedArrays()
+    {
+        var floats = new[] { double.NaN, -0.0, 5e-324, double.PositiveInfinity };
+        var echoed = C.EchoF64s(floats);
+        Expect(echoed.Length == 4, "echo_f64s length");
+        for (var i = 0; i < floats.Length; i++)
+        {
+            Expect(SameBits(echoed[i], floats[i]), $"echo_f64s[{i}] is bit-identical");
+        }
+        Expect(C.EchoI32s(new[] { int.MinValue, 0, int.MaxValue }).SequenceEqual(new[] { int.MinValue, 0, int.MaxValue }),
+            "echo_i32s");
+        Expect(C.EchoI32s(Array.Empty<int>()).Length == 0, "echo_i32s([])");
+        var big = new[] { ulong.MaxValue, 1UL << 63 };
+        Expect(C.EchoU64s(big).SequenceEqual(big), "echo_u64s");
+        Expect(C.EchoU64s(default).Length == 0, "echo_u64s([])");
+        // A span over the middle of an array crosses without a copy.
+        var window = new[] { 1, 2, 3, 4, 5 };
+        Expect(C.EchoI32s(window.AsSpan(1, 3)).SequenceEqual(new[] { 2, 3, 4 }), "echo_i32s of a slice");
+        var many = Enumerable.Range(0, 100_000).Select(i => (double)i).ToArray();
+        Expect(C.EchoF64s(many).SequenceEqual(many), "echo_f64s of 100k elements");
+    }
+
+    static void Conversions()
+    {
+        Expect(C.EchoUsize(4_294_967_295UL) == 4_294_967_295UL, "echo_usize(u32::MAX)");
+        Expect(C.EchoUsize(ulong.MaxValue) == ulong.MaxValue, "echo_usize(u64::MAX)");
+
+        Expect(C.EchoChar("🦀") == "🦀" && C.EchoChar("é") == "é" && C.EchoChar("a") == "a", "echo_char");
+        var two = Throws<NativeBugException>(() => C.EchoChar("ab"), "echo_char(ab)");
+        Expect(two.Code == -3 && two.Message.Contains("value: \"ab\" is not a valid char"),
+            $"echo_char(ab) message (got '{two.Message}')");
+        var none = Throws<NativeBugException>(() => C.EchoChar(""), "echo_char(\"\")");
+        Expect(none.Code == -3 && none.Message.Contains("value: \"\" is not a valid char"),
+            $"echo_char(\"\") message (got '{none.Message}')");
+
+        Expect(C.EchoHex("ff") == "ff" && C.EchoHex("00FF") == "ff" && C.EchoHex("0") == "0", "echo_hex");
+        foreach (var (input, message) in new[]
+        {
+            ("xyz", "value: invalid digit found in string"),
+            ("", "value: cannot parse integer from empty string"),
+            ("100000000", "value: number too large to fit in target type"),
+        })
+        {
+            var e = Throws<NativeBugException>(() => C.EchoHex(input), $"echo_hex({input})");
+            Expect(e.Code == -3 && e.Message.Contains(message), $"echo_hex({input}) message (got '{e.Message}')");
+        }
+    }
+
+    static void Chunks()
+    {
+        var chunks = C.Chunks(new[] { int.MinValue, 0, int.MaxValue }, 2);
+        // The sequence is re-enumerable: each enumeration is a new native
+        // iterator over the same (copied) input.
+        for (var pass = 0; pass < 2; pass++)
+        {
+            var got = chunks.ToList();
+            Expect(got.Count == 2 && got[0].SequenceEqual(new[] { int.MinValue, 0 })
+                && got[1].SequenceEqual(new[] { int.MaxValue }), $"chunks pass {pass}");
+        }
+        var pairs = C.Chunks(new[] { 1, 2, 3, 4 }, 2).ToList();
+        Expect(pairs.Count == 2 && pairs[1].SequenceEqual(new[] { 3, 4 }), "chunks([1, 2, 3, 4], 2)");
+        Expect(!C.Chunks(new[] { 1, 2 }, 0).Any(), "chunks(size 0) is empty");
+        Expect(!C.Chunks(Array.Empty<int>(), 3).Any(), "chunks([]) is empty");
+        // Abandoning an enumeration part-way releases its iterator.
+        using (var e = chunks.GetEnumerator())
+        {
+            Expect(e.MoveNext() && LeakCheck.Live("codec", LeakCheck.Iterators) == 1, "one live iterator");
+        }
+        Expect(LeakCheck.Live("codec", LeakCheck.Iterators) == 0, "released on dispose");
+    }
+
+    static T Throws<T>(Action action, string what) where T : Exception
+    {
+        try
+        {
+            action();
+        }
+        catch (T e)
+        {
+            return e;
+        }
+        catch (Exception e)
+        {
+            Expect(false, $"{what}: expected {typeof(T).Name}, got {e.GetType().Name}: {e.Message}");
+        }
+        Expect(false, $"{what}: expected {typeof(T).Name}, nothing thrown");
+        return null;
+    }
+
     static int Main()
     {
+        CodecLibrary.Check();
         var n = C.VectorCount();
         Expect(n >= 60, $"vector_count >= 60 (got {n})");
 
@@ -288,6 +443,11 @@ internal static class Program
         OutOfRange(n);
         Malformed();
         Objects(n);
+        ValueEquality(n);
+        OptionalScalars();
+        TypedArrays();
+        Conversions();
+        Chunks();
 
         LeakCheck.AssertNoLeaks("codec");
         Console.WriteLine($"dotnet/codec: OK ({n} vectors)");

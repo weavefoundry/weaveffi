@@ -10,7 +10,9 @@
 // payload, malformed input rejected as marshalling failures (through the
 // internal JNI bridge, which takes raw bytes), and object identity and
 // reference counting through buffers. Ends by asserting the producer's leak
-// counters are zero. Compiled with `-Xfriend-paths`, so the bindings'
+// counters are zero. Also the ABI 5 shapes: optional scalars, typed arrays
+// (in, out, and as iterator items), `usize`, `char`, a custom type, and
+// content equality of records holding bytes. Compiled with `-Xfriend-paths`, so the bindings'
 // `internal` codec and bridge are reachable.
 @file:JvmName("Main")
 
@@ -28,8 +30,8 @@ import codec.Token
 import codec.Vector
 import codec.decodeBuffer
 import codec.encodeBuffer
-import codec.packVector
-import codec.unpackVector
+import codec.pack_Vector
+import codec.unpack_Vector
 
 /** Release the tokens a decoded vector carries (only `Objects` has any). */
 fun release(v: Vector) {
@@ -38,11 +40,11 @@ fun release(v: Vector) {
         h.primary.close()
         h.spare?.close()
         h.many.forEach { it.close() }
-        h.by_name.values.forEach { it.close() }
+        h.byName.values.forEach { it.close() }
     }
 }
 
-fun encode(v: Vector): ByteArray = encodeBuffer { packVector(it, v) }
+fun encode(v: Vector): ByteArray = encodeBuffer { pack_Vector(it, v) }
 
 /** The index of the vector named [name]. */
 fun find(n: UInt, name: String): UInt {
@@ -53,27 +55,46 @@ fun find(n: UInt, name: String): UInt {
     return 0u
 }
 
-/** Push a primitive vector's value through its direct-family echo. */
+/**
+ * Push a primitive vector's value through its direct-family echo, and the
+ * ones that also cross as an optional scalar or a typed array through those.
+ */
 fun echo(v: Vector) {
     when (v) {
+        is Vector.I32 -> {
+            expect(Codec.echoI32(v.value) == v.value, "echoI32 ${v.value}")
+            expect(Codec.echoOptI32(v.value) == v.value, "echoOptI32 ${v.value}")
+            expect(Codec.echoI32s(listOf(v.value, v.value)) == listOf(v.value, v.value), "echoI32s ${v.value}")
+        }
+        is Vector.U64 -> {
+            expect(Codec.echoU64(v.value) == v.value, "echoU64 ${v.value}")
+            expect(Codec.echoU64s(listOf(v.value)) == listOf(v.value), "echoU64s ${v.value}")
+            expect(Codec.echoUsize(v.value) == v.value, "echoUsize ${v.value}")
+        }
+        is Vector.F64 -> {
+            val bits = v.value.toRawBits()
+            expect(Codec.echoF64(v.value).toRawBits() == bits, "echoF64 ${v.value}")
+            expect(Codec.echoOptF64(v.value)?.toRawBits() == bits, "echoOptF64 ${v.value}")
+            expect(Codec.echoF64s(listOf(v.value)).single().toRawBits() == bits, "echoF64s ${v.value}")
+        }
+        is Vector.Flag -> {
+            expect(Codec.echoBool(v.value) == v.value, "echoBool ${v.value}")
+            expect(Codec.echoOptBool(v.value) == v.value, "echoOptBool ${v.value}")
+        }
+        is Vector.Hue -> {
+            expect(Codec.echoColor(v.value) == v.value, "echoColor ${v.value}")
+            expect(Codec.echoOptColor(v.value) == v.value, "echoOptColor ${v.value}")
+        }
         is Vector.I8 -> expect(Codec.echoI8(v.value) == v.value, "echoI8 ${v.value}")
         is Vector.U8 -> expect(Codec.echoU8(v.value) == v.value, "echoU8 ${v.value}")
         is Vector.I16 -> expect(Codec.echoI16(v.value) == v.value, "echoI16 ${v.value}")
         is Vector.U16 -> expect(Codec.echoU16(v.value) == v.value, "echoU16 ${v.value}")
-        is Vector.I32 -> expect(Codec.echoI32(v.value) == v.value, "echoI32 ${v.value}")
         is Vector.U32 -> expect(Codec.echoU32(v.value) == v.value, "echoU32 ${v.value}")
         is Vector.I64 -> expect(Codec.echoI64(v.value) == v.value, "echoI64 ${v.value}")
-        is Vector.U64 -> expect(Codec.echoU64(v.value) == v.value, "echoU64 ${v.value}")
         is Vector.F32 -> expect(
             Codec.echoF32(v.value).toRawBits() == v.value.toRawBits(),
             "echoF32 ${v.value}",
         )
-        is Vector.F64 -> expect(
-            Codec.echoF64(v.value).toRawBits() == v.value.toRawBits(),
-            "echoF64 ${v.value}",
-        )
-        is Vector.Flag -> expect(Codec.echoBool(v.value) == v.value, "echoBool ${v.value}")
-        is Vector.Hue -> expect(Codec.echoColor(v.value) == v.value, "echoColor ${v.value}")
         is Vector.Text -> expect(Codec.echoText(v.value) == v.value, "echoText")
         is Vector.Blob -> expect(Codec.echoBlob(v.value).contentEquals(v.value), "echoBlob")
         else -> {}
@@ -83,7 +104,7 @@ fun echo(v: Vector) {
 fun everyVector(n: UInt) {
     for (i in 0u until n) {
         val raw = JniBridge.codec_vector(i.toInt())
-        val v = decodeBuffer(raw) { unpackVector(it) }
+        val v = decodeBuffer(raw) { unpack_Vector(it) }
         if (!Codec.checkVector(i, v)) {
             expect(
                 false,
@@ -102,16 +123,16 @@ fun everyVector(n: UInt) {
 }
 
 fun canonicalScalars() = Scalars(
-    i8_value = -8,
-    u8_value = 200u,
-    i16_value = -16000,
-    u16_value = 60000u,
-    i32_value = -2000000000,
-    u32_value = 4000000000u,
-    i64_value = -9007199254740993L,
-    u64_value = ULong.MAX_VALUE,
-    f32_value = 1.5f,
-    f64_value = -2.25e100,
+    i8Value = -8,
+    u8Value = 200u,
+    i16Value = -16000,
+    u16Value = 60000u,
+    i32Value = -2000000000,
+    u32Value = 4000000000u,
+    i64Value = -9007199254740993L,
+    u64Value = ULong.MAX_VALUE,
+    f32Value = 1.5f,
+    f64Value = -2.25e100,
     flag = true,
     color = Color.Blue,
 )
@@ -120,7 +141,7 @@ fun literalVectors(n: UInt) {
     val canonical = canonicalScalars()
     expect(Codec.checkVector(find(n, "scalars canonical"), Vector.AllScalars(canonical)), "scalars canonical")
     expect(
-        !Codec.checkVector(find(n, "scalars canonical"), Vector.AllScalars(canonical.copy(u16_value = 60001u))),
+        !Codec.checkVector(find(n, "scalars canonical"), Vector.AllScalars(canonical.copy(u16Value = 60001u))),
         "a changed field no longer matches",
     )
     expect(Codec.checkVector(find(n, "shape labeled"), Vector.Figure(Shape.Labeled("tag", 3))), "shape labeled")
@@ -165,10 +186,10 @@ fun spotChecks(n: UInt) {
     val minimum = fetch(find(n, "scalars minimum"))
     expect(minimum is Vector.AllScalars, "scalars minimum is AllScalars")
     val m = (minimum as Vector.AllScalars).value
-    expect(m.i8_value == Byte.MIN_VALUE && m.i16_value == Short.MIN_VALUE, "scalars minimum i8/i16")
-    expect(m.i32_value == Int.MIN_VALUE && m.i64_value == Long.MIN_VALUE, "scalars minimum i32/i64")
-    expect(m.u8_value == UByte.MIN_VALUE && m.u64_value == 0uL, "scalars minimum unsigned")
-    expect(m.f32_value == Float.NEGATIVE_INFINITY && m.f64_value.isNaN(), "scalars minimum floats")
+    expect(m.i8Value == Byte.MIN_VALUE && m.i16Value == Short.MIN_VALUE, "scalars minimum i8/i16")
+    expect(m.i32Value == Int.MIN_VALUE && m.i64Value == Long.MIN_VALUE, "scalars minimum i32/i64")
+    expect(m.u8Value == UByte.MIN_VALUE && m.u64Value == 0uL, "scalars minimum unsigned")
+    expect(m.f32Value == Float.NEGATIVE_INFINITY && m.f64Value.isNaN(), "scalars minimum floats")
     expect(m.color == Color.Infrared && !m.flag, "scalars minimum color and flag")
 
     val deep = fetch(find(n, "composite canonical"))
@@ -176,8 +197,8 @@ fun spotChecks(n: UInt) {
     val c: Composite = (deep as Vector.Deep).value
     expect(c.name == "héllo wörld ✓", "composite name (got ${c.name})")
     expect(c.blob.size == 6 && c.blob[5] == 255.toByte(), "composite blob")
-    expect(c.some_i64 == Long.MIN_VALUE && c.none_i64 == null, "composite optionals")
-    expect(c.some_text == "", "composite some_text is present and empty")
+    expect(c.someI64 == Long.MIN_VALUE && c.noneI64 == null, "composite optionals")
+    expect(c.someText == "", "composite someText is present and empty")
     expect(c.names.size == 3 && c.names[1] == "", "composite names")
     expect(c.matrix.size == 3 && c.matrix[1].isEmpty() && c.matrix[2][0] == -4, "composite matrix")
     expect(
@@ -185,15 +206,15 @@ fun spotChecks(n: UInt) {
         "composite floats",
     )
     expect(
-        c.by_name.size == 4 && c.by_id.size == 3 && c.by_color.size == 2 && c.flags.size == 2,
+        c.byName.size == 4 && c.byId.size == 3 && c.byColor.size == 2 && c.flags.size == 2,
         "composite maps",
     )
-    expect(c.scalars.u32_value == 4000000000u, "composite scalars.u32_value")
+    expect(c.scalars.u32Value == 4000000000u, "composite scalars.u32Value")
     expect(c.shape is Shape.Labeled && (c.shape as Shape.Labeled).count == 3, "composite shape")
     val lastShape = c.shapes.last()
     expect(c.shapes.size == 6 && lastShape is Shape.Nested && lastShape.note == null, "composite shapes")
-    expect(c.maybe_shape is Shape.Nested, "composite maybe_shape")
-    expect(c.maybe_list?.size == 2, "composite maybe_list")
+    expect(c.maybeShape is Shape.Nested, "composite maybeShape")
+    expect(c.maybeList?.size == 2, "composite maybeList")
     expect(c.sparse.size == 3 && c.sparse[0] == true && c.sparse[1] == null, "composite sparse")
     expect(c.colors.size == 4 && c.colors[3] == Color.Infrared, "composite colors")
 }
@@ -241,7 +262,7 @@ fun malformed() {
     expect(encode(Vector.Counts(emptyMap()))[0] == 19.toByte(), "Counts tag")
 
     // The generated decoder rejects the same inputs.
-    val unknown = thrownBy { decodeBuffer(byteArrayOf(0xE7.toByte(), 0x03, 0, 0)) { unpackVector(it) } }
+    val unknown = thrownBy { decodeBuffer(byteArrayOf(0xE7.toByte(), 0x03, 0, 0)) { unpack_Vector(it) } }
     expect(unknown is NativeBugException && unknown.code == -3, "an unknown tag fails to decode")
 
     // Color can't spell an undeclared value, but the raw bridge can: the
@@ -258,7 +279,7 @@ fun objects(n: UInt) {
     val h = (full as Vector.Objects).value
     expect(h.primary.value() == 10L && h.spare?.value() == 11L, "holder primary and spare")
     expect(h.many.map { it.value() } == listOf(12L, 13L, Long.MIN_VALUE), "holder many")
-    expect(h.by_name.mapValues { it.value.value() } == mapOf("a" to 20L, "b" to 21L), "holder by_name")
+    expect(h.byName.mapValues { it.value.value() } == mapOf("a" to 20L, "b" to 21L), "holder byName")
     // Each encoding mints fresh references, so the holder can be sent twice.
     val expected = 10L + 11 + 12 + 13 + 20 + 21 + Long.MIN_VALUE
     expect(Codec.sumHolder(h) == expected && Codec.sumHolder(h) == expected, "sumHolder twice")
@@ -287,6 +308,95 @@ fun objects(n: UInt) {
     expect(thrownBy { p.value() } is IllegalStateException, "a closed wrapper can't be used")
 }
 
+/** The ABI 5 shapes: optional scalars, typed arrays, usize, char, a custom type, and an iterator of arrays. */
+fun abi5Shapes() {
+    // Optional scalars cross as a presence flag and a value.
+    expect(Codec.echoOptI32(null) == null, "echoOptI32(null)")
+    expect(Codec.echoOptI32(Int.MIN_VALUE) == Int.MIN_VALUE, "echoOptI32(MIN)")
+    expect(Codec.echoOptI32(0) == 0, "echoOptI32(0) is present")
+    val negZero = Codec.echoOptF64(-0.0)
+    expect(negZero != null && negZero.toRawBits() == (-0.0).toRawBits(), "echoOptF64(-0.0) keeps the sign")
+    expect(Codec.echoOptF64(Double.NaN)?.isNaN() == true, "echoOptF64(NaN)")
+    expect(Codec.echoOptF64(null) == null, "echoOptF64(null)")
+    expect(Codec.echoOptBool(true) == true && Codec.echoOptBool(false) == false, "echoOptBool")
+    expect(Codec.echoOptBool(null) == null, "echoOptBool(null)")
+    expect(Codec.echoOptColor(Color.Infrared) == Color.Infrared, "echoOptColor(Infrared)")
+    expect(Codec.echoOptColor(Color.Blue) == Color.Blue, "echoOptColor(Blue)")
+    expect(Codec.echoOptColor(null) == null, "echoOptColor(null)")
+    // The raw bridge can send an undeclared enum value: -3.
+    val badOpt = thrownBy { JniBridge.codec_echo_opt_color(true, 3) }
+    expect(badOpt is NativeBugException && badOpt.code == -3, "an undeclared Color? is rejected (got $badOpt)")
+    expect(JniBridge.codec_echo_opt_color(false, 3) == null, "an absent value is ignored")
+
+    // Typed arrays.
+    val floats = listOf(Double.NaN, -0.0, Double.MIN_VALUE, Double.POSITIVE_INFINITY)
+    val echoed = Codec.echoF64s(floats)
+    expect(
+        echoed.size == 4 && echoed.zip(floats).all { (a, b) -> a.toRawBits() == b.toRawBits() },
+        "echoF64s is bit-identical (got $echoed)",
+    )
+    expect(Codec.echoF64s(emptyList()).isEmpty(), "echoF64s([])")
+    val ints = listOf(Int.MIN_VALUE, 0, Int.MAX_VALUE)
+    expect(Codec.echoI32s(ints) == ints, "echoI32s")
+    expect(Codec.echoI32s(emptyList()).isEmpty(), "echoI32s([])")
+    val longs = List(5000) { it * 7 }
+    expect(Codec.echoI32s(longs) == longs, "echoI32s of a heap-copied array")
+    val big = listOf(ULong.MAX_VALUE, 9223372036854775808uL)
+    expect(Codec.echoU64s(big) == big, "echoU64s keeps unsigned values")
+    expect(Codec.echoU64s(emptyList()).isEmpty(), "echoU64s([])")
+
+    // usize crosses as u64.
+    expect(Codec.echoUsize(4294967295uL) == 4294967295uL, "echoUsize(u32::MAX)")
+    expect(Codec.echoUsize(ULong.MAX_VALUE) == ULong.MAX_VALUE, "echoUsize(u64::MAX)")
+
+    // char crosses as a one-scalar string.
+    for (c in listOf("\uD83E\uDD80", "é", "a")) {
+        expect(Codec.echoChar(c) == c, "echoChar($c)")
+    }
+    val two = thrownBy { Codec.echoChar("ab") }
+    expect(
+        two is NativeBugException && two.code == -3 && two.message!!.endsWith("value: \"ab\" is not a valid char"),
+        "echoChar(ab) is a marshalling error (got ${two?.message})",
+    )
+    val none = thrownBy { Codec.echoChar("") }
+    expect(none is NativeBugException && none.code == -3, "echoChar(\"\") is a marshalling error (got $none)")
+
+    // A custom type (a u32 in hex) crosses as its string repr.
+    expect(Codec.echoHex("ff") == "ff" && Codec.echoHex("00FF") == "ff" && Codec.echoHex("0") == "0", "echoHex normalizes")
+    for ((input, message) in listOf(
+        "xyz" to "value: invalid digit found in string",
+        "" to "value: cannot parse integer from empty string",
+        "100000000" to "value: number too large to fit in target type",
+    )) {
+        val e = thrownBy { Codec.echoHex(input) }
+        expect(
+            e is NativeBugException && e.code == -3 && e.message!!.endsWith(message),
+            "echoHex($input) is a marshalling error (got ${e?.message})",
+        )
+    }
+
+    // An iterator of typed arrays.
+    expect(
+        Codec.chunks(listOf(Int.MIN_VALUE, 0, Int.MAX_VALUE), 2u).asSequence().toList() ==
+            listOf(listOf(Int.MIN_VALUE, 0), listOf(Int.MAX_VALUE)),
+        "chunks of 2",
+    )
+    expect(
+        Codec.chunks(listOf(1, 2, 3, 4), 2u).asSequence().toList() == listOf(listOf(1, 2), listOf(3, 4)),
+        "chunks([1, 2, 3, 4], 2)",
+    )
+    expect(!Codec.chunks(listOf(1, 2), 0u).hasNext(), "chunks of 0 is empty")
+    expect(!Codec.chunks(emptyList(), 3u).hasNext(), "chunks of [] is empty")
+    expect(JniBridge.debug_live(2) == 0L, "exhausted chunk iterators are released")
+
+    // Records holding bytes compare by content.
+    val blob = byteArrayOf(1, 2, 3)
+    expect(Vector.Blob(blob) == Vector.Blob(blob.copyOf()), "Blob compares by content")
+    expect(Vector.Blob(blob).hashCode() == Vector.Blob(blob.copyOf()).hashCode(), "Blob hashes by content")
+    expect(Vector.Blob(blob) != Vector.Blob(byteArrayOf(1, 2)), "different bytes differ")
+    expect(Vector.Blob(blob).toString() == "Blob(value=[1, 2, 3])", "Blob prints its bytes")
+}
+
 fun main() {
     expect(JniBridge.debug_live(-1) == 1L, "the sample counts live allocations")
     val n = Codec.vectorCount()
@@ -298,6 +408,7 @@ fun main() {
     outOfRange(n)
     malformed()
     objects(n)
+    abi5Shapes()
 
     expectNoLeaks(JniBridge::debug_live)
     println("kotlin/codec: OK ($n vectors)")

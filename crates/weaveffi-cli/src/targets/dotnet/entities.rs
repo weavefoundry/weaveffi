@@ -1,130 +1,174 @@
 //! Entity renderers: C-style enums, records, rich (algebraic) enums, and the
 //! interface wrapper classes.
 
-use crate::codegen::CodeWriter;
-use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_model::model::{
-    CallShape, EnumBinding, EnumVariantBinding, ErrorBinding, FieldBinding, InterfaceBinding,
-    StructBinding,
+    CallShape, EnumBinding, FieldBinding, InterfaceBinding, Model, StructBinding,
 };
 
-use crate::targets::dotnet::calls::{render_callable, write_obsolete, ErrCtx, Receiver};
-use crate::targets::dotnet::codec::{read_expr, write_stmt};
-use crate::targets::dotnet::docs::write_doc;
-use crate::targets::dotnet::types::{cs_member, cs_type, safe_cs_name, Cx};
+use crate::codegen::CodeWriter;
+use crate::targets::dotnet::calls::{render_callable, Receiver};
+use crate::targets::dotnet::codec::{
+    equal_expr, hash_expr, needs_deep_equality, read_expr, write_call,
+};
+use crate::targets::dotnet::docs::Docs;
+use crate::targets::dotnet::errors::ErrCtx;
+use crate::targets::dotnet::types::{cs_member, cs_type, field_cs, Cx};
 
-/// Render a C-style enum as a C# `enum` with its ABI discriminants.
-pub(crate) fn render_enum(w: &mut CodeWriter, e: &EnumBinding) {
-    write_doc(w, &e.doc);
-    write_obsolete(w, &e.deprecated);
+/// Render a C-style enum as a C# `enum` with its ABI discriminants (an
+/// `int` underneath, like the C typedef).
+pub(crate) fn render_enum(w: &mut CodeWriter, docs: &Docs, e: &EnumBinding) {
+    docs.summary(w, &e.doc);
+    docs.obsolete(w, &e.deprecated);
     w.line(format!("public enum {}", e.name));
     w.block("{", "}", |w| {
         for v in &e.variants {
-            write_doc(w, &v.doc);
+            docs.summary(w, &v.doc);
             w.line(format!("{} = {},", v.name, v.value));
         }
     });
     w.blank();
 }
 
-/// The get-only properties and positional constructor shared by records and
-/// rich-enum variants.
-fn render_value_members(w: &mut CodeWriter, class: &str, fields: &[FieldBinding]) {
-    for f in fields {
-        write_doc(w, &f.doc);
-        w.line(format!(
-            "public {} {} {{ get; }}",
-            cs_type(&f.ty),
-            f.name.to_upper_camel_case()
-        ));
-        w.blank();
-    }
-    let params: Vec<String> = fields
+/// The positional parameter list of a record or variant: one PascalCase
+/// property per field.
+fn positional(class: &str, fields: &[FieldBinding]) -> String {
+    fields
         .iter()
-        .map(|f| {
-            format!(
-                "{} {}",
-                cs_type(&f.ty),
-                safe_cs_name(&f.name.to_lower_camel_case())
-            )
-        })
-        .collect();
-    w.line(format!(
-        "/// <summary>Creates a <see cref=\"{class}\"/> from every field.</summary>"
-    ));
-    w.line(format!("public {class}({})", params.join(", ")));
-    w.block("{", "}", |w| {
-        for f in fields {
-            w.line(format!(
-                "{} = {};",
-                f.name.to_upper_camel_case(),
-                safe_cs_name(&f.name.to_lower_camel_case())
-            ));
-        }
-    });
+        .map(|f| format!("{} {}", cs_type(&f.ty), field_cs(&f.name, class)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-/// Emit `return new {class}(...)` reading every field in declaration (and
-/// wire) order. C# evaluates arguments left to right, so the reads happen in
-/// order.
-fn render_field_reads(w: &mut CodeWriter, cx: Cx<'_>, class: &str, fields: &[FieldBinding]) {
-    if fields.is_empty() {
-        w.line(format!("return new {class}();"));
+/// The `<param>` docs of a positional record's properties.
+fn field_docs(w: &mut CodeWriter, docs: &Docs, class: &str, fields: &[FieldBinding]) {
+    for f in fields {
+        docs.param(w, &field_cs(&f.name, class), &f.doc);
+    }
+}
+
+/// The value equality of a record whose fields include a byte array, list,
+/// or map, which a record would otherwise compare by reference: `Equals`
+/// compares their contents, and `GetHashCode` agrees with it.
+fn render_equality(w: &mut CodeWriter, class: &str, fields: &[FieldBinding]) {
+    if !fields.iter().any(|f| needs_deep_equality(&f.ty)) {
         return;
     }
-    w.line(format!("return new {class}("));
-    w.indent();
-    for (i, f) in fields.iter().enumerate() {
-        let sep = if i + 1 == fields.len() { ");" } else { "," };
-        w.line(format!("{}{sep}", read_expr(cx, &f.ty, "reader")));
-    }
-    w.dedent();
+    w.line("/// <summary>True when every field of <paramref name=\"other\"/> is equal to this");
+    w.line("/// one's, comparing byte arrays, lists, and maps by their contents.</summary>");
+    w.line(format!("public bool Equals({class}? other)"));
+    w.block("{", "}", |w| {
+        w.line("return ReferenceEquals(this, other) || other is not null");
+        w.indent();
+        for (i, f) in fields.iter().enumerate() {
+            let p = field_cs(&f.name, class);
+            let end = if i + 1 == fields.len() { ";" } else { "" };
+            w.line(format!(
+                "&& {}{end}",
+                equal_expr(&f.ty, &p, &format!("other.{p}"), 0)
+            ));
+        }
+        w.dedent();
+    });
+    w.blank();
+    w.line("/// <inheritdoc/>");
+    w.line("public override int GetHashCode()");
+    w.block("{", "}", |w| {
+        w.line("var hash = new global::System.HashCode();");
+        for f in fields {
+            w.line(format!(
+                "hash.Add({});",
+                hash_expr(&f.ty, &field_cs(&f.name, class))
+            ));
+        }
+        w.line("return hash.ToHashCode();");
+    });
+    w.blank();
 }
 
-/// Render a record as a sealed data class: get-only properties, a
-/// positional constructor, and the internal `WriteTo`/`ReadFrom` pair
+/// `new {class}(...)` reading every field in declaration (and wire) order,
+/// one argument per line after the first line when there are several. C#
+/// evaluates arguments left to right, so the reads happen in order.
+fn construct(cx: Cx<'_>, class: &str, fields: &[FieldBinding], indent: &str) -> String {
+    let reads: Vec<String> = fields
+        .iter()
+        .map(|f| read_expr(cx, &f.ty, "reader", 0))
+        .collect();
+    if reads.len() < 2 {
+        return format!("new {class}({})", reads.join(""));
+    }
+    let sep = format!(",\n{indent}    ");
+    format!("new {class}(\n{indent}    {})", reads.join(&sep))
+}
+
+/// Render a record as a positional `sealed record` (value equality, `with`,
+/// deconstruction), plus the internal `WriteTo`/`ReadFrom` pair
 /// implementing its value-buffer encoding (fields in declaration order).
-pub(crate) fn render_record(w: &mut CodeWriter, cx: Cx<'_>, s: &StructBinding) {
-    write_doc(w, &s.doc);
-    write_obsolete(w, &s.deprecated);
-    w.line(format!("public sealed class {}", s.name));
+pub(crate) fn render_record(w: &mut CodeWriter, cx: Cx<'_>, docs: &Docs, s: &StructBinding) {
+    let name = &s.name;
+    docs.summary(w, &s.doc);
+    field_docs(w, docs, name, &s.fields);
+    docs.obsolete(w, &s.deprecated);
+    w.line(format!(
+        "public sealed record {name}({})",
+        positional(name, &s.fields)
+    ));
     w.block("{", "}", |w| {
-        render_value_members(w, &s.name, &s.fields);
-        w.blank();
+        render_equality(w, name, &s.fields);
         w.line("internal void WriteTo(FfiBufferWriter writer)");
         w.block("{", "}", |w| {
             for f in &s.fields {
-                w.line(write_stmt(&f.ty, "writer", &f.name.to_upper_camel_case()));
+                let value = field_cs(&f.name, name);
+                w.line(format!("{};", write_call(&f.ty, "writer", &value, 0)));
             }
         });
         w.blank();
         w.line(format!(
-            "internal static {} ReadFrom(FfiBufferReader reader)",
-            s.name
+            "internal static {name} ReadFrom(FfiBufferReader reader)"
         ));
         w.block("{", "}", |w| {
-            render_field_reads(w, cx, &s.name, &s.fields);
+            let indent = w.indent_str();
+            w.line(format!(
+                "return {};",
+                construct(cx, name, &s.fields, &indent)
+            ));
         });
     });
     w.blank();
 }
 
-/// Render a rich enum as a closed class hierarchy: an abstract base with a
-/// private constructor and one nested sealed class per variant
-/// (`Shape.Circle`). The base hosts the codec: an `i32` tag, then the active
-/// variant's fields.
-pub(crate) fn render_rich_enum(w: &mut CodeWriter, cx: Cx<'_>, e: &EnumBinding) {
+/// Render a rich enum as a closed record hierarchy: an abstract record with
+/// a private constructor and one nested sealed record per variant
+/// (`Shape.Circle`). The base hosts the codec: an `i32` tag, then the
+/// active variant's fields.
+pub(crate) fn render_rich_enum(w: &mut CodeWriter, cx: Cx<'_>, docs: &Docs, e: &EnumBinding) {
     let name = &e.name;
-    write_doc(w, &e.doc);
-    write_obsolete(w, &e.deprecated);
-    w.line(format!("public abstract class {name}"));
+    docs.summary(w, &e.doc);
+    docs.obsolete(w, &e.deprecated);
+    w.line(format!("public abstract record {name}"));
     w.block("{", "}", |w| {
         w.line(format!("private {name}()"));
         w.line("{");
         w.line("}");
         w.blank();
         for v in &e.variants {
-            render_variant(w, name, v);
+            docs.summary(w, &v.doc);
+            field_docs(w, docs, &v.name, &v.fields);
+            if v.fields.is_empty() {
+                w.line(format!("public sealed record {} : {name};", v.name));
+            } else {
+                w.line(format!(
+                    "public sealed record {}({}) : {name}",
+                    v.name,
+                    positional(&v.name, &v.fields)
+                ));
+                if v.fields.iter().any(|f| needs_deep_equality(&f.ty)) {
+                    w.block("{", "}", |w| render_equality(w, &v.name, &v.fields));
+                } else {
+                    w.line("{");
+                    w.line("}");
+                }
+            }
+            w.blank();
         }
         w.line("internal void WriteTo(FfiBufferWriter writer)");
         w.block("{", "}", |w| {
@@ -136,8 +180,8 @@ pub(crate) fn render_rich_enum(w: &mut CodeWriter, cx: Cx<'_>, e: &EnumBinding) 
                     w.scope(|w| {
                         w.line(format!("writer.WriteI32({});", v.value));
                         for f in &v.fields {
-                            let expr = format!("v.{}", f.name.to_upper_camel_case());
-                            w.line(write_stmt(&f.ty, "writer", &expr));
+                            let value = format!("v.{}", field_cs(&f.name, &v.name));
+                            w.line(format!("{};", write_call(&f.ty, "writer", &value, 0)));
                         }
                         w.line("break;");
                     });
@@ -156,34 +200,23 @@ pub(crate) fn render_rich_enum(w: &mut CodeWriter, cx: Cx<'_>, e: &EnumBinding) 
         ));
         w.block("{", "}", |w| {
             w.line("var tag = reader.ReadI32();");
-            w.line("switch (tag)");
-            w.block("{", "}", |w| {
-                for v in &e.variants {
-                    w.line(format!("case {}:", v.value));
-                    w.block("{", "}", |w| {
-                        render_field_reads(w, cx, &v.name, &v.fields);
-                    });
-                }
-                w.line("default:");
-                w.scope(|w| {
-                    w.line(format!(
-                        "throw FfiBufferReader.Malformed(\"unknown {name} tag \" + tag);"
-                    ));
-                });
-            });
+            w.line("return tag switch");
+            w.line("{");
+            w.indent();
+            let indent = w.indent_str();
+            for v in &e.variants {
+                w.line(format!(
+                    "{} => {},",
+                    v.value,
+                    construct(cx, &v.name, &v.fields, &indent)
+                ));
+            }
+            w.line(format!(
+                "_ => throw FfiBufferReader.Malformed(\"unknown {name} tag \" + tag),"
+            ));
+            w.dedent();
+            w.line("};");
         });
-    });
-    w.blank();
-}
-
-/// One nested sealed variant class of a rich enum.
-fn render_variant(w: &mut CodeWriter, enum_name: &str, v: &EnumVariantBinding) {
-    write_doc(w, &v.doc);
-    w.line(format!("public sealed class {} : {enum_name}", v.name));
-    w.block("{", "}", |w| {
-        if !v.fields.is_empty() {
-            render_value_members(w, &v.name, &v.fields);
-        }
     });
     w.blank();
 }
@@ -196,13 +229,14 @@ fn render_variant(w: &mut CodeWriter, enum_name: &str, v: &EnumVariantBinding) {
 /// reference the same native object.
 pub(crate) fn render_interface(
     w: &mut CodeWriter,
+    model: &Model,
+    docs: &Docs,
     i: &InterfaceBinding,
-    error: Option<&ErrorBinding>,
     cx: Cx<'_>,
 ) {
     let name = &i.name;
-    write_doc(w, &i.doc);
-    write_obsolete(w, &i.deprecated);
+    docs.summary(w, &i.doc);
+    docs.obsolete(w, &i.deprecated);
     w.line(format!(
         "public sealed unsafe class {name} : IDisposable, IEquatable<{name}>"
     ));
@@ -230,22 +264,22 @@ pub(crate) fn render_interface(
         w.blank();
 
         for c in &i.constructors {
-            let err = ErrCtx::for_fn(c, error, cx);
+            let err = ErrCtx::new(model, &c.error, cx);
             let method = cs_member(&c.name, name);
-            let receiver = if c.name == "new" && matches!(c.shape, CallShape::Sync(_)) {
+            let receiver = if c.name == "new" && matches!(c.shape, CallShape::Sync) && c.iterator().is_none() {
                 Receiver::Constructor(name)
             } else {
                 Receiver::Static
             };
-            render_callable(w, c, &method, receiver, &err);
+            render_callable(w, docs, c, &method, receiver, &err, cx);
         }
         for m in &i.methods {
-            let err = ErrCtx::for_fn(m, error, cx);
-            render_callable(w, m, &cs_member(&m.name, name), Receiver::Instance, &err);
+            let err = ErrCtx::new(model, &m.error, cx);
+            render_callable(w, docs, m, &cs_member(&m.name, name), Receiver::Instance, &err, cx);
         }
         for s in &i.statics {
-            let err = ErrCtx::for_fn(s, error, cx);
-            render_callable(w, s, &cs_member(&s.name, name), Receiver::Static, &err);
+            let err = ErrCtx::new(model, &s.error, cx);
+            render_callable(w, docs, s, &cs_member(&s.name, name), Receiver::Static, &err, cx);
         }
 
         w.line("/// <summary>Releases this wrapper's reference. The native object is");

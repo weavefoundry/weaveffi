@@ -8,15 +8,19 @@ migrate to the current release.
 
 ## Three version numbers
 
-- **The crate version** (`0.24.x`) is shared by every published crate
-  (`weaveffi`, `weaveffi-macros`, `weaveffi-model`, `weaveffi-cli`) and by
-  the CLI. Releases are cut from Conventional Commits by release-plz.
-- **The IDL schema version** (`0.11.0`) is the `version:` an IDL document
+- **The crate version** (`0.25.x` until the next release) is shared by
+  every published crate (`weaveffi`, `weaveffi-macros`, `weaveffi-model`,
+  `weaveffi-cli`) and by the CLI. Releases are cut from Conventional Commits
+  by release-plz, which bumps it.
+- **The IDL schema version** (`0.12.0`) is the `version:` an IDL document
   declares. Pre-1.0, only the current version is accepted; a document
   declaring any other is rejected with `UnsupportedSchemaVersion`.
-- **The C ABI revision** (`4`) is what `{prefix}_abi_version()` returns. It
+- **The C ABI revision** (`5`) is what `{prefix}_abi_version()` returns. It
   changes only when the runtime surface or a calling convention changes
-  incompatibly, independently of the other two.
+  incompatibly, independently of the other two. Revision 5 is designed to
+  grow additively: new declarations, new callback methods, and new error
+  codes each get their own contract entry, so adding one never needs a
+  revision 6 and never breaks a deployed binding.
 
 ## What 1.0 will cover
 
@@ -31,6 +35,19 @@ After 1.0.0, these surfaces change incompatibly only in a major release:
   add symbols but won't remove or rename any.
 - **The C ABI revision** and the [contract](reference/abi.md) it names.
 - **The public Rust API** of the published crates.
+
+## Target tiers
+
+Every target passes the same conformance gate (real consumers against every
+sample, with every leak counter at zero) before a release ships, but they
+come in two tiers:
+
+- **Tier 1**: C, C++, Swift, Kotlin, Python, Node.js, and .NET. A change to
+  the ABI or the IDL lands in every Tier 1 target at once, and their
+  generated APIs are what 1.0 will freeze first.
+- **Tier 2**: Go, Ruby, Dart, and WebAssembly. These are fully supported and
+  conformance-tested, but may lag Tier 1 on new ABI work and may change
+  shape more freely before 1.0.
 
 Deprecation will precede removal: a deprecated feature warns for at least
 one minor release (the CLI prints a diagnostic, and generators emit each
@@ -49,25 +66,276 @@ the definition that triggers it.
 ## CI workflow
 
 Pin the CLI version and commit the generated output, so an upgrade is an
-explicit, reviewable change. Then gate CI on `weaveffi diff --check`, which
-regenerates in memory and compares with the committed directory without
+explicit, reviewable change. Then gate CI on `weaveffi generate --check`,
+which renders in memory and compares with the committed directory without
 writing anything:
 
 ```yaml
 - name: Bindings are up to date
   run: |
-    cargo install weaveffi-cli --locked --version =0.24.0
+    cargo install weaveffi-cli --locked --version =0.25.0
     weaveffi validate --warn
-    weaveffi diff --check
+    weaveffi generate --check
 ```
 
-`diff --check` exits `0` when the output matches, `2` when files would
-change, and `3` when files would be added or removed. For a Rust producer,
+`generate --check` lists the files that would change and exits `0` when
+the output matches and `1` otherwise (`generate --diff` prints the diff).
+For a Rust producer,
 both commands build the crate first (see [Library Mode](guides/extract.md)),
 so the job needs the Rust toolchain; pass `--library <path>` to reuse a
 library an earlier step built.
 
-## Migrating to schema 0.11 and ABI 4
+## Migrating from 0.25 to the next release (schema 0.12, ABI 5)
+
+The next release moves to schema `0.12.0` and C ABI revision 5. It makes
+error domains and callback interfaces open, lets a callable throw any
+domain or an untyped error, passes optional scalars and numeric lists
+directly, and reworks the Rust producer's error and callback API around
+generated `Display` impls and ordinary `Result`s. Every consumer must be
+regenerated, and every hand-written producer or consumer updated. There are
+no compatibility shims.
+
+### C ABI (revision 4 to 5)
+
+- `{prefix}_abi_version()` returns `5`.
+- **Enums are `int32_t`.** C-style enums, rich-enum tags, and error-domain
+  code types are `typedef int32_t {p}_{path}_{E};` with their constants in
+  an anonymous `enum`, never `typedef enum`, so their size no longer depends
+  on the compiler.
+- **Error messages are length-delimited.** The error struct's `const char*
+  message` is replaced by `const uint8_t* message_ptr; size_t message_len;`
+  (UTF-8, not NUL-terminated; an empty message is null with length `0`, even
+  on failure), and `{prefix}_error_set(err, code, message_ptr, message_len)`
+  takes a run instead of a C string. The struct is now five fields.
+- **Optional scalars cross directly (OptDirect).** A `T?` of an integer,
+  float, `bool`, or C-style enum is no longer a value buffer at a call
+  boundary: a parameter is `bool has_x, T x`; a return is a C `bool`
+  (present) plus a trailing `T* out_value`; an async result is `bool
+  has_result, T result`; an iterator item is `bool* out_has_item, T*
+  out_item`; callback parameters and returns follow the same shapes.
+- **Numeric lists cross as typed arrays (Slice).** `[i8]`, `[i16]`,
+  `[i32]`, `[i64]`, `[u16]`, `[u32]`, `[u64]`, `[f32]`, and `[f64]` are no
+  longer value buffers at a call boundary: a parameter is `const T* x_ptr,
+  size_t x_len` (an element count, aligned for `T`); a return is a C `T*`
+  plus `size_t* out_len`, released with `{prefix}_free_bytes((uint8_t*)ptr,
+  len * sizeof(T))`; a callback returns one allocated with
+  `{prefix}_alloc(len * sizeof(T))`. Inside value buffers both families keep
+  their old encoding.
+- **Runs are 8-aligned.** Every run a producer hands out, and every
+  `{prefix}_alloc` run, is allocated with alignment 8. A hand-written
+  producer must allocate (and free) accordingly; `malloc` already does.
+- **Contract tables changed.** Parameter and field names are no longer part
+  of a canonical signature, `throws` renders as ` throws {Domain}` or
+  ` throws any`, and every error code and every callback method has an entry
+  of its own, so every hash changed. Regenerate, and have a hand-written
+  producer return the new header's `{PREFIX}_{MODULE}_CONTRACT`.
+- **Thread-affine vtables.** Bit 0 of a vtable's `flags` is
+  `{PREFIX}_VTABLE_THREAD_AFFINE`: a producer must fail a value-returning
+  method called off the adopting thread with `-4` instead of calling it.
+  Only Dart sets it.
+- **Callback failures.** A consumer reports a failure of a `throws: any`
+  method as `-1` with a message, and one of a method that declares no errors
+  as `-4` (any non-zero code still works); a declared domain code with its
+  payload stays typed.
+- An iterator's `_next` checks every out slot for null before it pulls an
+  element, and a misaligned or null-with-length typed array is `-3`.
+- The C buffer header names composite codecs by their element types alone
+  (`{p}_opt_Item`, not `{p}_opt_kv_Item`), and its string reader rejects
+  malformed UTF-8.
+
+### IDL (schema 0.11 to 0.12)
+
+- Set `version: "0.12.0"`.
+- **`throws` names what a callable throws.** Replace `throws: true` with
+  `throws: {Domain}` (any domain in the API; names are global) or
+  `throws: any` for an untyped error. A boolean `throws` fails to parse
+  with a message pointing at the new syntax. Callback methods use the same
+  key.
+- **`errors:` is a list.** A module may declare several domains, each
+  `{ name, codes }`:
+
+  ```yaml
+  errors:
+    - name: KvError
+      codes:
+        - { name: KeyNotFound, code: 1001, message: key not found }
+  ```
+
+  There's no "domain in scope" anymore, so `ThrowsWithoutErrorDomain` is
+  gone; a `throws` naming something that isn't a domain is
+  `UnknownErrorDomain`, a domain used as a value type is
+  `ErrorDomainAsType`, and `any` can't name a domain (`ReservedKeyword`).
+  Code values must be unique within their domain (`DuplicateErrorCode`
+  names the domain); code names stay unique across the API.
+- Two C slots of one function that would share a name (a parameter `name`
+  next to one called `name_ptr`, or a parameter named `out_err`) are a new
+  `SlotCollision` error.
+- **TOML IDL is gone.** IDL documents are YAML or JSON; convert a `.toml`
+  IDL with any TOML-to-YAML tool (or `weaveffi extract -f yaml` from a Rust
+  producer). TOML remains the format of `weaveffi.toml`.
+
+### Rust producers
+
+- **Error domains generate `Display`.** `#[weaveffi::error]` now generates
+  `Display` and `std::error::Error` (so the enum must derive `Debug`); delete
+  your hand-written `impl Display`. A variant's message is its
+  `#[weaveffi(message = "...")]` template (with `{field}` interpolation), else
+  its doc comment's first line. To keep your own `Display` (from thiserror,
+  say), write `#[weaveffi::error(no_display)]`.
+- **Several domains per module, any error type per function.** A module may
+  declare several `#[weaveffi::error]` enums. A `Result<T, E>` throws `E`
+  when `E` is a domain of the module tree, and otherwise throws `any`,
+  requiring only `E: Display` (`String`, `std::io::Error`, `anyhow::Error`,
+  `Box<dyn Error>`). A `Result` no longer needs a domain in scope, and the
+  `weaveffi::ErrorReport` trait is gone.
+- **Callback methods return `Result<T, E>` with `E: From<ForeignError>`.**
+  `#[weaveffi::throws]` is gone: a method whose `E` is a domain throws that
+  domain (the consumer's typed codes arrive as its variants), and any other
+  `E` (`ForeignError` included) throws `any`. Wrapper enums that combined a
+  domain error with a `ForeignError` (the old `kvstore` sample's
+  `StoreError`) are unnecessary: implement `From<ForeignError>` for the
+  domain and use `?`. A typed callback error's message is now rendered by the
+  domain's `Display` from its fields, not taken from the consumer.
+- `ForeignError` as an exported function's error type is `throws: any`, so a
+  propagated consumer failure reaches the caller as `-1` with its message
+  (it used to keep `-4`); propagate through a domain to keep it typed.
+- `usize` and `isize` are supported (they cross as `u64` and `i64`, checked
+  on the way in), and so is `char` (a one-scalar `string`).
+- `#[weaveffi::custom(repr = R, lift = f, lower = g)] pub type Name = T;`
+  declares a custom type, and `#[weaveffi::skip]` leaves a `pub fn` out of
+  an interface.
+- Marker attributes must be written `#[weaveffi::...]`, and one outside a
+  `#[weaveffi::module]` is a compile error. A crate whose modules use the
+  macro but never call `weaveffi::export_runtime!()` fails to compile.
+- **Tokio is the default executor.** The `weaveffi` crate's `tokio` feature
+  is on by default; the hand-rolled worker pool (and
+  `weaveffi::abi::default_pool_size`) is gone. With `default-features =
+  false`, each async call runs on a thread of its own.
+- The crate needs no `crate-type`: the CLI builds the `cdylib` itself.
+- Runtime API (`weaveffi::abi`), for code that calls it directly: `CEnum` is
+  replaced by `Scalar`; `ErrorReport`, `lift_enum`, `lift_string_param`,
+  `callback_ret_enum`, `callback_ret_string`, `str_slots`, and
+  `FfiError::from_report` are gone; `FfiError` has `message_ptr` and
+  `message_len` fields instead of `message`; `ErrorDomain` (with a
+  `Display` supertrait) is the one error trait; `callback_status` takes any
+  `E: From<ForeignError>`.
+
+### CLI and configuration
+
+- **`weaveffi diff` is gone.** Use `weaveffi generate --check` (lists what
+  would change, exits `1` if anything would) or `generate --diff` (prints a
+  unified diff).
+- **`weaveffi schema-version` is gone.** Use `weaveffi schema --version`.
+- **`--release` and `--debug` are gone.** Every command that builds a
+  producer takes `--profile <name>` (a Cargo profile): `dev` by default for
+  `generate`, `dev`, `validate`, and `extract`, and `[build] profile`, else
+  `release`, for `build` and `package`. `[build] release = true` becomes
+  `[build] profile = "release"` (the old key is an unknown-key error).
+- Producer builds run `cargo rustc --lib --crate-type cdylib`, so a crate
+  needs no `crate-type`, and the `staticlib` fallback is gone.
+- `weaveffi init` writes an active `targets = ["c", "python"]` line.
+- `build` and `package` warn and skip an artifact whose external tool is
+  missing, list the skips at the end, and exit `1` only with the new
+  `--strict` flag (CI should pass it).
+- `weaveffi dev` accepts `--library` to reuse an existing build.
+- `[generators.wasm] emscripten` is gone with the Emscripten mode it
+  selected; `[generators.go] package` names the Go package.
+- `weaveffi extract -f toml` is gone (`yaml` or `json`).
+- The `weaveffi-cli` library's public surface is `project`, `config`,
+  `targets` (the `Target` trait and its registry), `codegen` (the
+  `Orchestrator` and `OutputFile`), and `package`; everything else is
+  private.
+
+### Generated bindings
+
+Regenerate every target. Beyond the ABI changes:
+
+- **Domain type names are no longer doubled.** Every target names a domain
+  with one shared rule that strips a trailing `Error`, `Errors`, or
+  `Exception` before adding its suffix: `KitchenErrors` becomes
+  `KitchenError` (or `KitchenException`), not `KitchenErrorsError`.
+  `KvError` is unchanged.
+- **Domains are open.** A positive code a binding wasn't generated with
+  surfaces as the domain's base error, with its code and message.
+- `throws: any` callables raise the library's root error type (Swift's
+  `{Module}RuntimeError`) with the producer's message.
+- A non-zero code from a callable that declares no errors is a trap; see
+  [the trap policy](guides/errors-and-memory.md#the-trap-policy) for each
+  target's error type.
+- Optional scalars and numeric lists keep their surface types in every
+  language (an optional integer, a list or array of doubles); only the
+  transport changed.
+- Every callback method a Rust producer declares now throws (`any` or a
+  domain), so every consumer implementation may raise. A failure that isn't
+  a code of the method's own domain is reported as `-1` with its message, or
+  as `-4` from a method that declares no errors.
+- Load-time check failures are catchable in every language (see
+  [Load-time checks](guides/errors-and-memory.md#load-time-checks)); Swift
+  and Go gain a check function in place of a trap or an `init()` panic.
+- The C header declares enums and error codes as `int32_t` typedefs (see
+  above).
+
+Per target, the names to update consumer code against:
+
+- **C++**: one `Error` root (a `std::runtime_error` with `code()`) under
+  every domain class, `LoadError`, `InternalError`, and `Cancelled`;
+  `check_library()` runs the load check; `iter<T>` returns a move-only
+  `Range<T>` (a C++20 input range).
+- **Swift**: `{Module}Library.check()` throws a `{Module}Library.LoadError`
+  (calls made without a successful check still `fatalError`); domain enums
+  gain an `unknown(code:message:)` case; `{Module}RuntimeError` carries
+  untyped and runtime codes; `iter<T>` returns `NativeSequence<T>`.
+- **Kotlin**: `NativeLibrary.load()` runs the load check and throws an
+  `UnsatisfiedLinkError`; module functions are `@JvmStatic`, and throwing
+  functions and callback methods carry `@Throws`; record fields are
+  lowerCamelCase; a failed non-throwing call throws `NativeBugException`.
+- **Python**: a failed load raises `LibraryLoadError(ImportError)`; each
+  code's exception is `{Code}Error` (`KeyNotFoundError`, aliased as
+  `KvError.KeyNotFound`); records are frozen, slotted dataclasses; a failed
+  non-throwing call raises `InternalError`.
+- **.NET**: `{Name}Library.Check()` runs the load check, which throws
+  `NativeLoadException`; a failed non-throwing call throws
+  `NativeBugException`.
+- **Node.js and WebAssembly**: the leak counters moved to a `./debug`
+  subpath export (`debugLive`); iterators are typed `NativeIterator<T>`.
+  WebAssembly poisons the instance after a trap: every later call fails
+  with code `-2`.
+- **Go**: `Check() error` replaces the `init()` panic (a call made after a
+  failed check panics with the same error); a throwing `iter<T>` is an
+  `iter.Seq2[T, error]`; an unknown code is `Unknown{Domain}`.
+- **Ruby**: records are `Data.define` classes; the `Native` and `Bridge`
+  modules are private; a failed load raises `{Module}::LoadError`, a
+  `::LoadError`; a failed non-throwing call raises `NativeBugError`. IDL
+  modules are flattened into the gem's module.
+- **Dart**: `bytes` is `Uint8List`; the package is one library split into
+  parts under `lib/src/`; a failed load throws `NativeLibraryException`; a
+  failed non-throwing call throws `NativeError`; value-returning callback
+  methods are thread-affine (see [Dart threading](generators/dart.md#threading)).
+
+Each [language page](generators/README.md) documents its full surface and
+its [tier](#target-tiers).
+
+### Samples
+
+- `calculator` gains a second domain (`ParseError`, thrown by `parse`), a
+  `throws: any` function (`sqrt`), an optional-scalar return (`mean`), and
+  numeric lists in and out (`running_total`).
+- `kvstore`'s `KvError` gains `CallbackFailed`, its `count` and
+  `listener_count` return `u64` (Rust `usize`), `Store.put`'s TTL is an
+  optional scalar, `Policy` gains a first method `ttl_for`, every callback
+  method throws (`any` or `KvError`), and new methods cover optional and
+  typed-array returns, iterators, and async results (`expires_at`,
+  `value_sizes`, `expirations`, `version_of`, `versions`), a `Scorer`
+  callback (`rank`), and a `throws: any` method (`import_lines`).
+- `codec` adds `echo_opt_*`, `echo_f64s`, `echo_i32s`, `echo_u64s`,
+  `echo_usize`, `echo_char`, `echo_hex` (a custom type), and `chunks` (an
+  iterator of typed arrays).
+
+## Migrating from 0.24 to 0.25 (schema 0.11, ABI 4)
+
+These notes describe the 0.25 release. Where the section above changes
+something again (`throws: true`, `#[weaveffi::throws]`, `weaveffi diff`,
+`--release`, the worker-pool executor, TOML IDL), the section above wins.
 
 This release makes names global, replaces the per-module checksums with
 contract tables, lets callback interfaces return any value and report typed
@@ -236,28 +504,8 @@ value-buffer oracle, rebuilt around shared test vectors), and `kvstore`
 `kvstore` and removed, and every language's conformance consumers follow
 suit: three lanes per language. See [Samples](samples.md).
 
-## Migrating to schema 0.10 and ABI 3
-
-WeaveFFI 0.24.0 shipped schema 0.10 and ABI revision 3. Coming from an
-older release, apply these changes first, then the ones above:
-
-- Every symbol, type, constant, and macro carries the library's prefix
-  (`{prefix}_error`, `{prefix}_free_bytes`, `{PREFIX}_API`,
-  `{prefix}_kv_Store_open`), the header is `{library}.h`, and generated
-  packages and loaders are named after the library's identity, never after
-  WeaveFFI. `[global] c_prefix` and every per-target prefix key are gone; an
-  IDL sets `[package] c_prefix` or `library`, and a Rust producer's prefix is
-  its crate's library name.
-- Strings cross as UTF-8 `(ptr, len)` runs everywhere, and returned strings
-  are freed with `{prefix}_free_bytes`.
-- Async launchers drop the `_async` suffix, cancel tokens are reference
-  counted, and runtime code `-5` means cancelled.
-- Map keys can't be floats, and `cancellable: true` on a synchronous
-  callable is an error.
-- The runtime is exported with `weaveffi::export_runtime!()`, and a
-  `#[weaveffi::error]` enum must implement `Display`.
-- The `[project]` table and `weaveffi init` are new, and generation rewrites
-  only changed files and deletes stale ones.
+## Older releases
 
 The [changelog](https://github.com/weavefoundry/weaveffi/blob/main/CHANGELOG.md)
-lists every release.
+lists every release; migration notes for releases before 0.25 are in this
+page's history.
