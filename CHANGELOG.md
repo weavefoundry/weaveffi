@@ -7,6 +7,12 @@ by release-plz, and earlier ones by semantic-release.
 
 ## [Unreleased]
 
+## [0.25.0](https://github.com/weavefoundry/weaveffi/compare/v0.24.0...v0.25.0) - 2026-10-09
+
+### Features
+
+- [**breaking**] rebuild WeaveFFI on C ABI 4, one model, and library mode ([#55](https://github.com/weavefoundry/weaveffi/pull/55))
+
 ## [0.24.0](https://github.com/weavefoundry/weaveffi/compare/v0.23.0...v0.24.0) - 2026-10-03
 
 ### Features
