@@ -1,68 +1,150 @@
-//! Kvstore sample cdylib: a production-quality, in-memory key/value store that
-//! exercises every IDL feature WeaveFFI supports through the
-//! `#[weaveffi::module]` macro: a reference-counted interface with
-//! constructors, methods, statics, and `_clone`/`_destroy` symbols, a typed
-//! error domain (`#[weaveffi::error]`), a consumer-implemented callback
-//! interface, optional/list/map/bytes record fields, records and lists that
-//! carry objects, `Store?` in both directions, an iterator return, a
-//! cancellable async method, deprecated and nested-submodule surface, all
-//! over the C ABI. Records cross the boundary as value buffers: each
-//! `#[weaveffi::record]` gets a generated `BufferValue` implementation instead
-//! of per-field C accessors.
+//! Kvstore sample cdylib: an in-memory key-value store that uses every
+//! feature WeaveFFI supports, written as plain, safe Rust.
 //!
-//! `Store` is exported as an interface, so each object owns its rich state
-//! (its entries and the monotonic entry-id counter) directly. Methods take
-//! `&self` and guard that state with a `Mutex` because the object is shared
-//! across the FFI boundary; the last `kvstore_kv_Store_destroy` releases the
-//! state with it.
+//! The `kv` module tree is the feature-complete producer the conformance
+//! harness runs in every language:
+//!
+//! * a reference-counted `Store` interface with fallible and infallible
+//!   constructors, methods, statics, and a deprecated method;
+//! * the `KvError` domain, whose codes carry payload fields;
+//! * records (`Entry`, `StoreInfo`), a C-style enum (`EntryKind`), and a rich
+//!   enum (`Change`), with optionals, lists, and maps (including maps keyed by
+//!   the C-style enum);
+//! * `Store` objects in every position: parameters, returns, optionals,
+//!   lists, map values, record fields, iterator elements, an async result,
+//!   and both a parameter and the return of a callback method;
+//! * three callback interfaces the consumer implements: `Listener` (retained,
+//!   and notified from a producer thread during compaction), `Policy`
+//!   (rich returns and a throwing method whose typed error, payload
+//!   included, reaches the original caller), and `Loader` (string, bytes, and
+//!   optional-object returns, passed as an optional parameter);
+//! * lazy iterators of strings, records, and objects;
+//! * async methods and functions, including a cancellable one that stops its
+//!   background work cooperatively, with a test hook (`Store::active_jobs`)
+//!   that shows it did;
+//! * a nested `kv.stats` module that uses the parent's `Store` and inherits
+//!   the parent's error domain, and a sibling `report` root that shares the
+//!   `Entry` record.
+//!
+//! Time is a logical clock per store (`now`, advanced by `tick`), so TTLs are
+//! deterministic: an entry put with `ttl_seconds: Some(t)` expires once the
+//! clock reaches `now + t`.
+//!
+//! No lock is held while a consumer callback runs: each operation snapshots
+//! the callbacks it needs, releases its locks, and then calls out, so a
+//! callback may call back into the store.
 
-/// An embedded key-value store API with TTLs, iteration, and async compaction.
+/// An embedded key-value store with listeners, policies, read-through
+/// loaders, iteration, and async compaction.
 #[weaveffi::module]
 pub mod kv {
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
-    #[cfg(not(target_arch = "wasm32"))]
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::task::{Context, Poll};
 
-    /// The store's error domain. Each variant's discriminant is the stable
-    /// ABI code a throwing method reports through `out_err`, its `Display`
-    /// output is the runtime message, and its doc comment is the documented
-    /// default message.
+    use weaveffi::{CancelToken, ErrorReport, ForeignError};
+
+    /// The store's error domain. Each code's fields travel as the error's
+    /// payload, so every binding raises a typed error carrying them.
     #[weaveffi::error]
-    #[derive(Debug)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[repr(i32)]
     pub enum KvError {
         /// key not found
-        KeyNotFound = 1001,
+        KeyNotFound {
+            /// The key that was looked up.
+            key: String,
+        } = 1001,
         /// entry expired
-        Expired = 1002,
-        /// store has reached capacity
-        StoreFull = 1003,
-        /// I/O failure
-        IoError = 1004,
+        Expired {
+            /// The expired entry's key.
+            key: String,
+            /// The logical time at which it expired.
+            expired_at: i64,
+        } = 1002,
+        /// store is full
+        StoreFull {
+            /// The store's capacity.
+            capacity: u32,
+        } = 1003,
+        /// invalid path
+        InvalidPath = 1004,
+        /// write rejected by policy
+        Rejected {
+            /// The rejected key.
+            key: String,
+            /// Why the policy rejected it.
+            reason: String,
+        } = 1005,
     }
 
     impl std::fmt::Display for KvError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(match self {
-                Self::KeyNotFound => "key not found",
-                Self::Expired => "entry expired",
-                Self::StoreFull => "store has reached capacity",
-                Self::IoError => "I/O failure",
-            })
+            match self {
+                Self::KeyNotFound { key } => write!(f, "key not found: {key}"),
+                Self::Expired { key, expired_at } => {
+                    write!(f, "entry {key} expired at {expired_at}")
+                }
+                Self::StoreFull { capacity } => write!(f, "store is full ({capacity} entries)"),
+                Self::InvalidPath => f.write_str("invalid path"),
+                Self::Rejected { key, reason } => write!(f, "write to {key} rejected: {reason}"),
+            }
         }
     }
 
-    /// The largest number of live entries one store will hold before `put`
-    /// rejects a new key with [`KvError::StoreFull`].
-    const STORE_CAPACITY: usize = 1_000_000;
+    /// A store operation's failure: a `KvError`, or a consumer callback's
+    /// failure passed through unchanged (its code, message, and payload), so
+    /// a typed error a callback raised reaches the original caller typed.
+    #[derive(Debug)]
+    pub enum StoreError {
+        /// A failure of the store itself.
+        Kv(KvError),
+        /// A callback's failure.
+        Callback(ForeignError),
+    }
+
+    impl From<KvError> for StoreError {
+        fn from(e: KvError) -> Self {
+            Self::Kv(e)
+        }
+    }
+
+    impl From<ForeignError> for StoreError {
+        fn from(e: ForeignError) -> Self {
+            Self::Callback(e)
+        }
+    }
+
+    impl ErrorReport for StoreError {
+        fn code(&self) -> i32 {
+            match self {
+                Self::Kv(e) => e.code(),
+                Self::Callback(e) => e.code(),
+            }
+        }
+        fn message(&self) -> String {
+            match self {
+                Self::Kv(e) => e.message(),
+                Self::Callback(e) => e.message(),
+            }
+        }
+        fn payload(&self) -> Vec<u8> {
+            match self {
+                Self::Kv(e) => e.payload(),
+                Self::Callback(e) => e.payload(),
+            }
+        }
+    }
 
     /// Persistence semantics applied to a stored entry.
     #[weaveffi::enumeration]
     #[repr(i32)]
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     pub enum EntryKind {
-        /// In-memory only; lost on close.
+        /// In-memory only.
         Volatile = 0,
         /// Flushed to durable storage.
         Persistent = 1,
@@ -70,72 +152,60 @@ pub mod kv {
         Encrypted = 2,
     }
 
-    /// A single key-value entry persisted in the store.
+    /// A stored entry.
     #[weaveffi::record]
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, PartialEq)]
     pub struct Entry {
-        /// Stable monotonic identifier assigned on insert.
-        pub id: i64,
-        /// UTF-8 lookup key.
+        /// The entry's key.
         pub key: String,
-        /// Opaque binary payload.
+        /// The stored bytes.
         pub value: Vec<u8>,
-        /// Unix-timestamp seconds when the entry was created.
-        pub created_at: i64,
-        /// Optional unix-timestamp seconds at which the entry expires.
+        /// How the entry is persisted.
+        pub kind: EntryKind,
+        /// `1` on first insert, incremented by every later `put` of the key.
+        pub version: u32,
+        /// The logical time at which the entry expires, if it has a TTL.
         pub expires_at: Option<i64>,
-        /// Free-form labels attached to the entry.
+        /// Free-form labels (a policy may add some).
         pub tags: Vec<String>,
-        /// Arbitrary string-valued metadata pairs.
+        /// String metadata (a loaded entry records its loader under
+        /// `source`).
         pub metadata: BTreeMap<String, String>,
     }
 
     impl Entry {
-        /// Whether the entry's TTL has elapsed as of `now` (unix seconds).
         fn is_expired(&self, now: i64) -> bool {
             matches!(self.expires_at, Some(t) if t <= now)
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    fn now_unix_seconds() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
-    }
-
-    // `wasm32-unknown-unknown` has no wall clock; `SystemTime::now()` traps. Use
-    // a fixed epoch so TTL arithmetic stays deterministic and entries never
-    // appear spuriously expired when the bindings are exercised from JavaScript.
-    #[cfg(target_arch = "wasm32")]
-    fn now_unix_seconds() -> i64 {
-        1_700_000_000
-    }
-
-    /// Why an entry left the store.
+    /// A change a listener is told about.
     #[weaveffi::enumeration]
-    #[repr(i32)]
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum EvictionReason {
-        /// Removed by an explicit `delete`.
-        Deleted = 0,
-        /// Its TTL elapsed and a read evicted it.
-        Expired = 1,
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum Change {
+        /// An entry was stored.
+        Put {
+            /// The stored entry.
+            entry: Entry,
+            /// Whether it replaced an existing entry.
+            replaced: bool,
+        },
+        /// An entry was removed.
+        Removed {
+            /// The removed key.
+            key: String,
+            /// `true` when it left because its TTL elapsed, `false` for an
+            /// explicit `delete`.
+            expired: bool,
+        },
+        /// The store was cleared.
+        Cleared {
+            /// How many entries were removed.
+            count: u32,
+        },
     }
 
-    /// A consumer-implemented observer of evictions. One listener at a time
-    /// is attached to a store with [`Store::set_eviction_listener`]; the store
-    /// retains it until it's replaced, cleared, or the store is dropped.
-    #[weaveffi::callback_interface]
-    pub trait EvictionListener: Send + Sync {
-        /// An entry left the store. Returns whether the listener wants to keep
-        /// receiving notifications; `false` detaches it.
-        fn on_evict(&self, entry: &Entry, reason: EvictionReason) -> bool;
-    }
-
-    /// A named view of a store, used to exercise objects inside records: the
-    /// `store` field carries a strong reference and `mirror` may be absent.
+    /// A labeled view of a store: a record carrying objects.
     #[weaveffi::record]
     #[derive(Clone)]
     pub struct StoreInfo {
@@ -143,95 +213,498 @@ pub mod kv {
         pub label: String,
         /// The described store.
         pub store: Arc<Store>,
-        /// An optional second store to compare against.
+        /// An optional second store.
         pub mirror: Option<Arc<Store>>,
-        /// Live entry count at the time of the snapshot.
-        pub count: i64,
+        /// The described store's live entry count at the time of the
+        /// snapshot.
+        pub count: u32,
     }
 
-    /// An embedded key-value store owning its entries. Exported as an
-    /// interface: each object holds its own entry map and id counter behind a
-    /// `Mutex` (methods take `&self` because the object is shared across the
-    /// FFI boundary), and the last generated `destroy` releases the state.
+    /// An observer of a store's changes, retained from `subscribe` until
+    /// `unsubscribe`, a failure, or the store's release. Changes made by
+    /// `compact` arrive on a producer thread.
+    #[weaveffi::callback_interface]
+    pub trait Listener: Send + Sync {
+        /// Whether the listener wants changes to `key` (`Cleared` changes
+        /// are always delivered).
+        fn accepts(&self, key: &str) -> Result<bool, ForeignError>;
+
+        /// A change the listener accepted. A failure here (or in `accepts`)
+        /// unsubscribes the listener; the store operation still succeeds.
+        fn on_change(&self, change: &Change) -> Result<(), ForeignError>;
+    }
+
+    /// A store's write policy, consulted by every `put` while installed
+    /// with `set_policy`.
+    #[weaveffi::callback_interface]
+    pub trait Policy: Send + Sync {
+        /// Admit an entry about to be stored, returning it as it should be
+        /// stored. The policy may change its value, kind, TTL, tags, and
+        /// metadata (its key and version are kept). Fail with
+        /// `Rejected` to veto the write: `put` then fails with that same
+        /// error.
+        #[weaveffi::throws]
+        fn admit(&self, entry: &Entry) -> Result<Entry, ForeignError>;
+
+        /// The store `key` belongs in: return `home` (the store `put` was
+        /// called on) to keep it there, or another store to redirect it.
+        fn route(&self, key: &str, home: Arc<Store>) -> Result<Arc<Store>, ForeignError>;
+    }
+
+    /// A read-through source that `get_or_load` consults on a miss.
+    #[weaveffi::callback_interface]
+    pub trait Loader: Send + Sync {
+        /// The loader's name, recorded in a loaded entry's metadata under
+        /// `source`.
+        fn name(&self) -> Result<String, ForeignError>;
+
+        /// A store that may already hold `key`, consulted first, if any.
+        fn fallback(&self, key: &str) -> Result<Option<Arc<Store>>, ForeignError>;
+
+        /// The value for `key`. Fail with `KeyNotFound` naming
+        /// `key` when there's none.
+        #[weaveffi::throws]
+        fn load(&self, key: &str) -> Result<Vec<u8>, ForeignError>;
+    }
+
+    /// The default capacity of a new store.
+    const DEFAULT_CAPACITY: u32 = 1_000_000;
+
+    /// Background jobs (cooperative pauses) still running, across stores.
+    static ACTIVE_JOBS: AtomicU32 = AtomicU32::new(0);
+
+    fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// An embedded key-value store. Each object owns its entries, logical
+    /// clock, listeners, and policy; the last release drops them (and frees
+    /// the consumer's callbacks).
     #[weaveffi::interface]
     pub struct Store {
+        path: String,
         entries: Mutex<BTreeMap<String, Entry>>,
-        next_entry_id: AtomicI64,
-        listener: Mutex<Option<Arc<dyn EvictionListener>>>,
+        clock: AtomicI64,
+        capacity: AtomicU32,
+        listeners: Mutex<Vec<(u32, Arc<dyn Listener>)>>,
+        next_listener: AtomicU32,
+        policy: Mutex<Option<Arc<dyn Policy>>>,
     }
 
     impl Store {
-        /// Notify the attached listener (if any) outside every lock; detach it
-        /// when it asks to stop.
-        fn notify_eviction(&self, entry: &Entry, reason: EvictionReason) {
-            let listener = self
-                .listener
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            if let Some(listener) = listener {
-                if !listener.on_evict(entry, reason) {
-                    *self.listener.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        fn with_path(path: String) -> Store {
+            Store {
+                path,
+                entries: Mutex::new(BTreeMap::new()),
+                clock: AtomicI64::new(0),
+                capacity: AtomicU32::new(DEFAULT_CAPACITY),
+                listeners: Mutex::new(Vec::new()),
+                next_listener: AtomicU32::new(1),
+                policy: Mutex::new(None),
+            }
+        }
+
+        /// Tell every listener that accepts `change`'s key about it, with no
+        /// lock held, unsubscribing a listener that fails.
+        fn notify(&self, change: &Change) {
+            let key = match change {
+                Change::Put { entry, .. } => Some(entry.key.as_str()),
+                Change::Removed { key, .. } => Some(key.as_str()),
+                Change::Cleared { .. } => None,
+            };
+            let listeners = lock(&self.listeners).clone();
+            for (id, listener) in listeners {
+                let delivered = match key {
+                    Some(k) => listener.accepts(k).and_then(|wanted| {
+                        if wanted {
+                            listener.on_change(change)
+                        } else {
+                            Ok(())
+                        }
+                    }),
+                    None => listener.on_change(change),
+                };
+                if delivered.is_err() {
+                    lock(&self.listeners).retain(|(i, _)| *i != id);
                 }
             }
         }
+
+        /// Store `entry` (whose key and version this sets), enforcing the
+        /// capacity, and notify listeners.
+        fn insert(&self, mut entry: Entry, key: String) -> Result<Entry, KvError> {
+            let replaced = {
+                let mut entries = lock(&self.entries);
+                let previous = entries.get(&key).map(|e| e.version);
+                let capacity = self.capacity.load(Ordering::Relaxed);
+                if previous.is_none() && entries.len() >= capacity as usize {
+                    return Err(KvError::StoreFull { capacity });
+                }
+                entry.version = previous.map_or(1, |v| v.wrapping_add(1));
+                entry.key = key.clone();
+                entries.insert(key, entry.clone());
+                previous.is_some()
+            };
+            self.notify(&Change::Put {
+                entry: entry.clone(),
+                replaced,
+            });
+            Ok(entry)
+        }
+
+        /// The live entries whose keys start with `prefix`, in key order.
+        fn live(&self, prefix: Option<&str>) -> Vec<Entry> {
+            let now = self.now();
+            lock(&self.entries)
+                .values()
+                .filter(|e| !e.is_expired(now))
+                .filter(|e| prefix.is_none_or(|p| e.key.starts_with(p)))
+                .cloned()
+                .collect()
+        }
+
+        fn copy_of(&self, entries: Vec<Entry>, path: String) -> Store {
+            let store = Store::with_path(path);
+            store.clock.store(self.now(), Ordering::Relaxed);
+            *lock(&store.entries) = entries.into_iter().map(|e| (e.key.clone(), e)).collect();
+            store
+        }
+
+        /// Remove every expired entry and notify listeners; returns how many
+        /// were removed.
+        fn sweep(&self) -> u32 {
+            let now = self.now();
+            let removed: Vec<String> = {
+                let mut entries = lock(&self.entries);
+                let keys: Vec<String> = entries
+                    .values()
+                    .filter(|e| e.is_expired(now))
+                    .map(|e| e.key.clone())
+                    .collect();
+                for k in &keys {
+                    entries.remove(k);
+                }
+                keys
+            };
+            for key in &removed {
+                self.notify(&Change::Removed {
+                    key: key.clone(),
+                    expired: true,
+                });
+            }
+            removed.len() as u32
+        }
     }
 
     impl Store {
-        /// Open (or create) a store backed by the given filesystem path. This
-        /// demo is purely in-memory, so the path is accepted but not used to
-        /// back the data; an empty path is rejected with
-        /// [`KvError::IoError`].
+        /// Open a store at `path` (in memory; the path is only a label).
+        /// Fails with `InvalidPath` for an empty path.
         pub fn open(path: String) -> Result<Store, KvError> {
             if path.is_empty() {
-                return Err(KvError::IoError);
+                return Err(KvError::InvalidPath);
             }
-            Ok(Store {
-                entries: Mutex::new(BTreeMap::new()),
-                next_entry_id: AtomicI64::new(1),
-                listener: Mutex::new(None),
-            })
+            Ok(Store::with_path(path))
         }
 
-        /// Attach `listener`, replacing any previous one (whose consumer
-        /// `free` then runs).
-        pub fn set_eviction_listener(&self, listener: Arc<dyn EvictionListener>) {
-            *self.listener.lock().unwrap_or_else(PoisonError::into_inner) = Some(listener);
+        /// Create an empty store with the path `memory`.
+        pub fn new() -> Store {
+            Store::with_path("memory".to_string())
         }
 
-        /// Detach the current listener, if any.
-        pub fn clear_eviction_listener(&self) {
-            *self.listener.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        /// Open one store per path, in order. Fails with
+        /// `InvalidPath` if any path is empty.
+        pub fn open_many(paths: Vec<String>) -> Result<Vec<Arc<Store>>, KvError> {
+            paths
+                .into_iter()
+                .map(|p| Store::open(p).map(Arc::new))
+                .collect()
         }
 
-        /// A second reference to this same store (the returned pointer equals
-        /// the receiver's; both must eventually be destroyed).
+        /// Index store infos by label (a later duplicate label wins).
+        pub fn by_label(infos: Vec<StoreInfo>) -> BTreeMap<String, Arc<Store>> {
+            infos.into_iter().map(|i| (i.label, i.store)).collect()
+        }
+
+        /// The total live entry count of `stores`, the values of `named`,
+        /// and `extra`'s store (if present). A store passed twice counts
+        /// twice.
+        pub fn total_count(
+            stores: Vec<Arc<Store>>,
+            named: BTreeMap<String, Arc<Store>>,
+            extra: Option<StoreInfo>,
+        ) -> u32 {
+            stores
+                .iter()
+                .chain(named.values())
+                .chain(extra.as_ref().map(|i| &i.store))
+                .map(|s| s.count())
+                .sum()
+        }
+
+        /// The capacity of a new store.
+        pub fn default_capacity() -> u32 {
+            DEFAULT_CAPACITY
+        }
+
+        /// Background jobs still running across every store (a test hook for
+        /// cooperative cancellation: it returns to zero shortly after a
+        /// cancelled `compact` stops its pause).
+        pub fn active_jobs() -> u32 {
+            ACTIVE_JOBS.load(Ordering::SeqCst)
+        }
+
+        /// The path the store was opened with.
+        pub fn path(&self) -> String {
+            self.path.clone()
+        }
+
+        /// The store's logical time.
+        pub fn now(&self) -> i64 {
+            self.clock.load(Ordering::SeqCst)
+        }
+
+        /// Advance the logical clock by `seconds`, returning the new time.
+        pub fn tick(&self, seconds: i64) -> i64 {
+            self.clock.fetch_add(seconds, Ordering::SeqCst) + seconds
+        }
+
+        /// The most entries the store holds.
+        pub fn capacity(&self) -> u32 {
+            self.capacity.load(Ordering::Relaxed)
+        }
+
+        /// Change the capacity. Existing entries stay; a new key is
+        /// rejected with `StoreFull` while the store is at or past
+        /// it.
+        pub fn set_capacity(&self, capacity: u32) {
+            self.capacity.store(capacity, Ordering::Relaxed);
+        }
+
+        /// Store `value` under `key`, returning the stored entry. The
+        /// installed policy (if any) admits the entry first and may route it
+        /// to another store, where it's stored instead. Fails with
+        /// `StoreFull`, or with the policy's failure unchanged (such as
+        /// `Rejected`).
+        pub fn put(
+            self: Arc<Self>,
+            key: String,
+            value: Vec<u8>,
+            kind: EntryKind,
+            ttl_seconds: Option<i64>,
+        ) -> Result<Entry, StoreError> {
+            let mut entry = Entry {
+                key: key.clone(),
+                value,
+                kind,
+                version: 0,
+                expires_at: ttl_seconds.map(|t| self.now() + t),
+                tags: Vec::new(),
+                metadata: BTreeMap::new(),
+            };
+            let policy = lock(&self.policy).clone();
+            let target = match policy {
+                Some(policy) => {
+                    entry = policy.admit(&entry)?;
+                    policy.route(&key, Arc::clone(&self))?
+                }
+                None => self,
+            };
+            Ok(target.insert(entry, key)?)
+        }
+
+        /// The live entry for `key`. Fails with `KeyNotFound`, or with
+        /// `Expired` for an entry whose TTL elapsed, which is
+        /// then removed (and listeners told).
+        pub fn get(&self, key: String) -> Result<Entry, KvError> {
+            let now = self.now();
+            let expired_at = {
+                let mut entries = lock(&self.entries);
+                match entries.get(&key) {
+                    None => return Err(KvError::KeyNotFound { key }),
+                    Some(e) if !e.is_expired(now) => return Ok(e.clone()),
+                    Some(e) => {
+                        let at = e.expires_at.unwrap_or(now);
+                        entries.remove(&key);
+                        at
+                    }
+                }
+            };
+            self.notify(&Change::Removed {
+                key: key.clone(),
+                expired: true,
+            });
+            Err(KvError::Expired { key, expired_at })
+        }
+
+        /// The live entry for `key`, if any (an expired entry stays until
+        /// `get` or `compact` removes it).
+        pub fn find(&self, key: String) -> Option<Entry> {
+            let now = self.now();
+            lock(&self.entries)
+                .get(&key)
+                .filter(|e| !e.is_expired(now))
+                .cloned()
+        }
+
+        /// The live entry for `key`, else one from `loader`: its `fallback`
+        /// store's entry if that has one, otherwise a new `Volatile` entry
+        /// holding what `load` returns, with metadata `source` set to the
+        /// loader's name (either way it's stored here). Returns no entry
+        /// with no loader, or when `load` fails with `KeyNotFound` for
+        /// this same key; any other loader failure fails the call unchanged.
+        pub fn get_or_load(
+            &self,
+            key: String,
+            loader: Option<Arc<dyn Loader>>,
+        ) -> Result<Option<Entry>, StoreError> {
+            if let Some(entry) = self.find(key.clone()) {
+                return Ok(Some(entry));
+            }
+            let Some(loader) = loader else {
+                return Ok(None);
+            };
+            if let Some(entry) = loader.fallback(&key)?.and_then(|s| s.find(key.clone())) {
+                return Ok(Some(self.insert(entry, key)?));
+            }
+            let value = match loader.load(&key) {
+                Ok(value) => value,
+                Err(e) => {
+                    return match e.domain::<KvError>() {
+                        Some(KvError::KeyNotFound { key: missing }) if missing == key => Ok(None),
+                        _ => Err(e.into()),
+                    }
+                }
+            };
+            let entry = Entry {
+                key: key.clone(),
+                value,
+                kind: EntryKind::Volatile,
+                version: 0,
+                expires_at: None,
+                tags: Vec::new(),
+                metadata: BTreeMap::from([("source".to_string(), loader.name()?)]),
+            };
+            Ok(Some(self.insert(entry, key)?))
+        }
+
+        /// Remove `key`, returning whether it existed (listeners are told).
+        pub fn delete(&self, key: String) -> bool {
+            if lock(&self.entries).remove(&key).is_none() {
+                return false;
+            }
+            self.notify(&Change::Removed {
+                key,
+                expired: false,
+            });
+            true
+        }
+
+        /// Remove every entry, returning how many there were (listeners are
+        /// told once).
+        pub fn clear(&self) -> u32 {
+            let count = {
+                let mut entries = lock(&self.entries);
+                let n = entries.len() as u32;
+                entries.clear();
+                n
+            };
+            self.notify(&Change::Cleared { count });
+            count
+        }
+
+        /// The number of live (unexpired) entries.
+        pub fn count(&self) -> u32 {
+            self.live(None).len() as u32
+        }
+
+        /// The number of live entries.
+        #[deprecated(note = "use count()")]
+        pub fn size(&self) -> u32 {
+            self.count()
+        }
+
+        /// The live keys in order, optionally only those starting with
+        /// `prefix`, pulled lazily from a snapshot. Fails with
+        /// `KeyNotFound` naming the prefix when a prefix matches
+        /// nothing.
+        pub fn keys(&self, prefix: Option<String>) -> Result<weaveffi::Iter<String>, KvError> {
+            let keys: Vec<String> = self
+                .live(prefix.as_deref())
+                .into_iter()
+                .map(|e| e.key)
+                .collect();
+            match prefix {
+                Some(p) if keys.is_empty() => Err(KvError::KeyNotFound { key: p }),
+                _ => Ok(weaveffi::Iter::new(keys)),
+            }
+        }
+
+        /// The live entries in key order, optionally only those whose keys
+        /// start with `prefix`.
+        pub fn entries(&self, prefix: Option<String>) -> weaveffi::Iter<Entry> {
+            weaveffi::Iter::new(self.live(prefix.as_deref()))
+        }
+
+        /// One new store per prefix, created lazily as the iterator is
+        /// pulled, holding copies of the live entries under that prefix
+        /// (with the prefix as its path).
+        pub fn partition(self: Arc<Self>, prefixes: Vec<String>) -> weaveffi::Iter<Arc<Store>> {
+            weaveffi::Iter::new(prefixes.into_iter().map(move |p| {
+                let entries = self.live(Some(&p));
+                Arc::new(self.copy_of(entries, p))
+            }))
+        }
+
+        /// Subscribe `listener`, returning its subscription id.
+        pub fn subscribe(&self, listener: Arc<dyn Listener>) -> u32 {
+            let id = self.next_listener.fetch_add(1, Ordering::Relaxed);
+            lock(&self.listeners).push((id, listener));
+            id
+        }
+
+        /// Unsubscribe a listener by id, returning whether it was
+        /// subscribed (its consumer `free` runs once no call holds it).
+        pub fn unsubscribe(&self, id: u32) -> bool {
+            let removed = {
+                let mut listeners = lock(&self.listeners);
+                let at = listeners.iter().position(|(i, _)| *i == id);
+                at.map(|at| listeners.remove(at))
+            };
+            // Released here, with no lock held.
+            removed.is_some()
+        }
+
+        /// The number of subscribed listeners.
+        pub fn listener_count(&self) -> u32 {
+            lock(&self.listeners).len() as u32
+        }
+
+        /// Install a write policy, replacing (and releasing) any previous
+        /// one; passing none removes it.
+        pub fn set_policy(&self, policy: Option<Arc<dyn Policy>>) {
+            let previous = std::mem::replace(&mut *lock(&self.policy), policy);
+            drop(previous);
+        }
+
+        /// Whether a policy is installed.
+        pub fn has_policy(&self) -> bool {
+            lock(&self.policy).is_some()
+        }
+
+        /// Another reference to this same store.
         pub fn share(self: Arc<Self>) -> Arc<Store> {
             self
         }
 
-        /// A new store holding a copy of every live entry.
+        /// A new, independent store holding a copy of every live entry (with
+        /// the same path and clock, and no listeners or policy).
         pub fn fork(&self) -> Arc<Store> {
-            let now = now_unix_seconds();
-            let entries: BTreeMap<String, Entry> = self
-                .entries
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(_, e)| !e.is_expired(now))
-                .map(|(k, e)| (k.clone(), e.clone()))
-                .collect();
-            let next = self.next_entry_id.load(Ordering::Relaxed);
-            Arc::new(Store {
-                entries: Mutex::new(entries),
-                next_entry_id: AtomicI64::new(next),
-                listener: Mutex::new(None),
-            })
+            Arc::new(self.copy_of(self.live(None), self.path.clone()))
         }
 
-        /// Whichever of `self` and `other` holds more live entries, or `None`
-        /// when `other` is absent and `self` is empty. Exercises `Store?` as
-        /// both a parameter and a return.
+        /// Whichever of this store and `other` holds more live entries (this
+        /// one on a tie), or no store when `other` is absent and this store is
+        /// empty.
         pub fn larger(self: Arc<Self>, other: Option<Arc<Store>>) -> Option<Arc<Store>> {
             match other {
                 Some(o) if o.count() > self.count() => Some(o),
@@ -241,7 +714,7 @@ pub mod kv {
             }
         }
 
-        /// Snapshot this store into a record that carries the object itself.
+        /// Snapshot this store into a record that carries the store itself.
         pub fn describe(self: Arc<Self>, label: String, mirror: Option<Arc<Store>>) -> StoreInfo {
             let count = self.count();
             StoreInfo {
@@ -252,880 +725,200 @@ pub mod kv {
             }
         }
 
-        /// Open one store per path. Exercises a list of objects as a return.
-        pub fn open_many(paths: Vec<String>) -> Result<Vec<Arc<Store>>, KvError> {
-            paths
-                .into_iter()
-                .map(|p| Store::open(p).map(Arc::new))
-                .collect()
-        }
-
-        /// Total live entries across `stores`. Exercises a list of objects as
-        /// a parameter and an object inside a record as a parameter.
-        pub fn total_count(stores: Vec<Arc<Store>>, extra: Option<StoreInfo>) -> i64 {
-            let base: i64 = stores.iter().map(|s| s.count()).sum();
-            base + extra.map_or(0, |info| info.store.count())
-        }
-
-        /// Insert or replace a value, returning true on success. A new key is
-        /// rejected with [`KvError::StoreFull`] once the store holds
-        /// [`Store::default_capacity`] entries.
-        pub fn put(
-            &self,
-            key: String,
-            value: Vec<u8>,
-            kind: EntryKind,
-            ttl_seconds: Option<i64>,
-        ) -> Result<bool, KvError> {
-            // `kind` selects persistence semantics for a real backing store;
-            // this in-memory demo accepts it but does not surface it on the
-            // `Entry` record, so it is intentionally not retained.
-            let _ = kind;
-            let now = now_unix_seconds();
-            let mut entries = self.entries.lock().unwrap();
-            if entries.len() >= STORE_CAPACITY && !entries.contains_key(&key) {
-                return Err(KvError::StoreFull);
-            }
-            let expires_at = ttl_seconds.map(|t| now + t);
-            let entry_id = self.next_entry_id.fetch_add(1, Ordering::Relaxed);
-            entries.insert(
-                key.clone(),
-                Entry {
-                    id: entry_id,
-                    key,
-                    value,
-                    created_at: now,
-                    expires_at,
-                    tags: Vec::new(),
-                    metadata: BTreeMap::new(),
-                },
-            );
-            Ok(true)
-        }
-
-        /// Look up an entry by key; returns null if missing or expired (and
-        /// reports the matching [`KvError`] code through `out_err`). An
-        /// expired entry is evicted on read, notifying the eviction listener.
-        pub fn get(&self, key: String) -> Result<Option<Entry>, KvError> {
-            let now = now_unix_seconds();
-            let (result, evicted) = {
-                let mut entries = self.entries.lock().unwrap();
-                match entries.get(&key) {
-                    Some(entry) if entry.is_expired(now) => {
-                        let gone = entries.remove(&key);
-                        (Err(KvError::Expired), gone)
-                    }
-                    Some(entry) => (Ok(Some(entry.clone())), None),
-                    None => (Err(KvError::KeyNotFound), None),
-                }
-            };
-            if let Some(entry) = evicted {
-                self.notify_eviction(&entry, EvictionReason::Expired);
-            }
-            result
-        }
-
-        /// Remove the entry for the given key, returning true if it existed.
-        /// A removed entry notifies the eviction listener.
-        pub fn delete(&self, key: String) -> Result<bool, KvError> {
-            let removed = self.entries.lock().unwrap().remove(&key);
-            match removed {
-                Some(entry) => {
-                    self.notify_eviction(&entry, EvictionReason::Deleted);
-                    Ok(true)
-                }
-                None => Ok(false),
-            }
-        }
-
-        /// Stream every key, optionally filtered by a prefix. Expired entries
-        /// are skipped, and keys are yielded in sorted order (the backing map
-        /// is a `BTreeMap`).
-        pub fn list_keys(&self, prefix: Option<String>) -> Result<weaveffi::Iter<String>, KvError> {
-            let now = now_unix_seconds();
-            let keys: Vec<String> = self
-                .entries
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(_, e)| !e.is_expired(now))
-                .filter(|(k, _)| match &prefix {
-                    Some(p) => k.starts_with(p),
-                    None => true,
-                })
-                .map(|(k, _)| k.clone())
-                .collect();
-            Ok(weaveffi::Iter::new(keys))
-        }
-
-        /// Return the number of live (non-expired) entries in the store.
-        pub fn count(&self) -> i64 {
-            let now = now_unix_seconds();
-            self.entries
-                .lock()
-                .unwrap()
-                .values()
-                .filter(|e| !e.is_expired(now))
-                .count() as i64
-        }
-
-        /// Drop every entry from the store.
-        pub fn clear(&self) {
-            self.entries.lock().unwrap().clear();
-        }
-
-        /// Reclaim space asynchronously; returns the number of bytes
-        /// reclaimed. Cancelling the call's token completes it with the
-        /// cancelled code (the runtime drops the work); the check here only
-        /// covers a cancellation that lands as compaction starts.
+        /// Remove every expired entry, telling listeners from a producer
+        /// thread, and complete with how many were removed. First pauses for
+        /// `pause_ms` on a background thread that polls the cancel token
+        /// (counted by `active_jobs` while it runs). Cancelling
+        /// completes the call with the cancelled code at once; the
+        /// background pause then notices and stops.
         #[weaveffi::cancellable]
-        pub async fn compact(&self, cancel: weaveffi::CancelToken) -> Result<i64, KvError> {
-            if cancel.is_cancelled() {
-                return Err(KvError::IoError);
-            }
-            let now = now_unix_seconds();
-            let mut entries = self.entries.lock().unwrap();
-            let expired: Vec<String> = entries
-                .iter()
-                .filter(|(_, e)| e.is_expired(now))
-                .map(|(k, _)| k.clone())
-                .collect();
-            let mut reclaimed = 0i64;
-            for key in expired {
-                if let Some(entry) = entries.remove(&key) {
-                    reclaimed += entry.value.len() as i64;
-                }
-            }
-            Ok(reclaimed)
+        pub async fn compact(&self, pause_ms: u32, cancel: CancelToken) -> u32 {
+            Pause::start(pause_ms, &cancel).await;
+            self.sweep()
         }
 
-        /// Legacy single-shot put kept for compatibility.
-        #[deprecated(note = "use put() with explicit kind")]
-        pub fn legacy_put(&self, key: String, value: Vec<u8>) -> Result<bool, KvError> {
-            self.put(key, value, EntryKind::Volatile, None)
-        }
-
-        /// The largest number of live entries one store will hold.
-        pub fn default_capacity() -> i64 {
-            STORE_CAPACITY as i64
+        /// The live entry for each key, in order (absent where there's
+        /// none), resolved on a producer thread.
+        pub async fn get_many(&self, keys: Vec<String>) -> Vec<Option<Entry>> {
+            keys.into_iter().map(|k| self.find(k)).collect()
         }
     }
 
-    /// Aggregate store-statistics surface, namespaced under `kv.stats`.
+    /// Open a store asynchronously, completing with the new object. Fails
+    /// with `InvalidPath` for an empty path.
+    #[weaveffi::export]
+    pub async fn open_store(path: String) -> Result<Arc<Store>, KvError> {
+        Store::open(path).map(Arc::new)
+    }
+
+    impl Default for Store {
+        fn default() -> Self {
+            Store::new()
+        }
+    }
+
+    /// A pause that runs on a background thread polling a cancel token, so
+    /// a cancelled call stops its work instead of sleeping on.
+    struct Pause {
+        state: Option<Arc<PauseState>>,
+    }
+
+    #[derive(Default)]
+    struct PauseState {
+        done: std::sync::atomic::AtomicBool,
+        waker: Mutex<Option<std::task::Waker>>,
+    }
+
+    impl Pause {
+        #[cfg(not(target_arch = "wasm32"))]
+        fn start(ms: u32, cancel: &CancelToken) -> Pause {
+            if ms == 0 {
+                return Pause { state: None };
+            }
+            let state = Arc::new(PauseState::default());
+            let shared = Arc::clone(&state);
+            let cancel = cancel.clone();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms.into());
+            ACTIVE_JOBS.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || {
+                while !cancel.is_cancelled() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                drop(cancel);
+                shared.done.store(true, Ordering::SeqCst);
+                if let Some(w) = lock(&shared.waker).take() {
+                    w.wake();
+                }
+                ACTIVE_JOBS.fetch_sub(1, Ordering::SeqCst);
+            });
+            Pause { state: Some(state) }
+        }
+
+        // `wasm32-unknown-unknown` has neither threads nor a clock, so the
+        // pause elapses at once there.
+        #[cfg(target_arch = "wasm32")]
+        fn start(ms: u32, cancel: &CancelToken) -> Pause {
+            let _ = (ms, cancel);
+            Pause { state: None }
+        }
+    }
+
+    impl Future for Pause {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let Some(state) = &self.state else {
+                return Poll::Ready(());
+            };
+            *lock(&state.waker) = Some(cx.waker().clone());
+            if state.done.load(Ordering::SeqCst) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    /// Aggregate statistics, namespaced under `kv.stats`: functions that
+    /// take the parent module's `Store` and report its `KvError` domain.
     #[weaveffi::module]
     pub mod stats {
-        use super::{KvError, Store};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
 
-        /// Aggregate store statistics.
+        use super::{EntryKind, KvError, Store};
+
+        /// Aggregate statistics over a set of entries.
         #[weaveffi::record]
-        #[derive(Clone, Debug)]
+        #[derive(Clone, Debug, PartialEq, Default)]
         pub struct Stats {
-            /// Number of live entries.
-            pub total_entries: i64,
-            /// Sum of all value byte lengths.
-            pub total_bytes: i64,
-            /// Number of entries past their TTL but not yet evicted.
-            pub expired_entries: i64,
+            /// The number of live entries.
+            pub entries: u32,
+            /// The total size of their values in bytes.
+            pub bytes: u64,
+            /// Live entries per kind (kinds with none are absent).
+            pub by_kind: BTreeMap<EntryKind, u32>,
         }
 
-        /// Snapshot the current store statistics. Takes the parent module's
-        /// `Store` interface by reference across the module boundary.
-        #[weaveffi::export]
-        pub fn get_stats(store: &Store) -> Result<Stats, KvError> {
-            let now = super::now_unix_seconds();
-            let entries = store.entries.lock().unwrap();
-            let total_entries = entries.len() as i64;
-            let total_bytes: i64 = entries.values().map(|e| e.value.len() as i64).sum();
-            let expired_entries = entries.values().filter(|e| e.is_expired(now)).count() as i64;
-            Ok(Stats {
-                total_entries,
-                total_bytes,
-                expired_entries,
-            })
+        fn add(stats: &mut Stats, store: &Store, prefix: Option<&str>) {
+            for e in store.live(prefix) {
+                stats.entries += 1;
+                stats.bytes += e.value.len() as u64;
+                *stats.by_kind.entry(e.kind).or_insert(0) += 1;
+            }
         }
+
+        /// Statistics over `store`'s live entries, optionally only those
+        /// whose keys start with `prefix`. Fails with
+        /// `KeyNotFound` naming the prefix when it matches
+        /// nothing.
+        #[weaveffi::export]
+        pub fn summarize(store: &Store, prefix: Option<String>) -> Result<Stats, KvError> {
+            let mut stats = Stats::default();
+            add(&mut stats, store, prefix.as_deref());
+            match prefix {
+                Some(p) if stats.entries == 0 => Err(KvError::KeyNotFound { key: p }),
+                _ => Ok(stats),
+            }
+        }
+
+        /// Statistics over every store's live entries, computed on a
+        /// producer thread.
+        #[weaveffi::export]
+        pub async fn summarize_all(stores: Vec<Arc<Store>>) -> Stats {
+            let mut stats = Stats::default();
+            for store in &stores {
+                add(&mut stats, store, None);
+            }
+            stats
+        }
+    }
+}
+
+/// Plain-text reports over entries. A sibling root of `kv`, so it shares
+/// only the `Entry` record (a value type) with it, and has its own error
+/// domain.
+#[weaveffi::module]
+pub mod report {
+    use super::kv::Entry;
+
+    /// The report module's error domain.
+    #[weaveffi::error]
+    #[derive(Debug)]
+    pub enum ReportError {
+        /// nothing to report
+        NothingToReport = 2001,
+    }
+
+    impl std::fmt::Display for ReportError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("nothing to report")
+        }
+    }
+
+    /// One line per entry, sorted by key: `"{key}: {n} bytes, {kind}"`, with
+    /// `, v{version}` appended when the version is above 1. Fails with
+    /// `NothingToReport` for an empty list.
+    #[weaveffi::export]
+    pub fn render_report(mut entries: Vec<Entry>) -> Result<Vec<String>, ReportError> {
+        if entries.is_empty() {
+            return Err(ReportError::NothingToReport);
+        }
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(entries
+            .iter()
+            .map(|e| {
+                let mut line = format!("{}: {} bytes, {:?}", e.key, e.value.len(), e.kind);
+                if e.version > 1 {
+                    line.push_str(&format!(", v{}", e.version));
+                }
+                line
+            })
+            .collect())
     }
 }
 
 weaveffi::export_runtime!();
 
 #[cfg(test)]
-#[allow(unsafe_code)]
-mod tests {
-    use crate::kv::stats::*;
-    use crate::kv::*;
-    use std::collections::BTreeMap;
-    use std::ffi::c_void;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{mpsc, Arc, Mutex};
-    use std::time::Duration;
-    use weaveffi::abi::{self, FfiError};
-
-    /// Decode a buffered return and release the producer-owned bytes.
-    fn decode_and_free<T: abi::BufferValue>(ptr: *const u8, len: usize) -> T {
-        assert!(!ptr.is_null());
-        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-        let value = abi::decode_value::<T>(bytes).expect("well-formed value buffer");
-        unsafe { abi::free_bytes(ptr.cast_mut(), len) };
-        value
-    }
-
-    /// Copy a returned string and release it.
-    fn take_string(ptr: *const u8, len: usize) -> String {
-        let s = unsafe { abi::lift_string(ptr, len) }.expect("UTF-8");
-        unsafe { abi::free_bytes(ptr.cast_mut(), len) };
-        s
-    }
-
-    fn message(err: &FfiError) -> &str {
-        unsafe { err.message_str() }.unwrap_or_default()
-    }
-
-    // Stores are independent objects, but the tests share process-wide
-    // vtables and counters, so they run serialized for readable failures.
-    static TEST_MUTEX: Mutex<()> = Mutex::new(());
-
-    fn setup() -> std::sync::MutexGuard<'static, ()> {
-        TEST_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn open() -> *mut Store {
-        let mut err = FfiError::default();
-        let path = "/tmp/kvstore-test";
-        let s = unsafe { kvstore_kv_Store_open(path.as_ptr(), path.len(), &mut err) };
-        assert_eq!(err.code, 0);
-        assert!(!s.is_null());
-        s
-    }
-
-    fn destroy(s: *mut Store) {
-        unsafe { kvstore_kv_Store_destroy(s) };
-    }
-
-    fn count(s: *const Store) -> i64 {
-        let mut err = FfiError::default();
-        unsafe { kvstore_kv_Store_count(s, &mut err) }
-    }
-
-    /// `put` through the thunk; the optional TTL is buffered, so it's
-    /// encoded as `Option<i64>` and passed as a borrowed (ptr, len) pair.
-    fn put(
-        s: *mut Store,
-        key: &str,
-        value: &[u8],
-        kind: i32,
-        ttl: Option<i64>,
-        err: &mut FfiError,
-    ) -> bool {
-        let ttl = abi::encode_value(&ttl);
-        unsafe {
-            kvstore_kv_Store_put(
-                s,
-                key.as_ptr(),
-                key.len(),
-                value.as_ptr(),
-                value.len(),
-                kind,
-                ttl.as_ptr(),
-                ttl.len(),
-                err,
-            )
-        }
-    }
-
-    fn put_simple(s: *mut Store, k: &str, v: &[u8]) {
-        let mut err = FfiError::default();
-        assert!(put(s, k, v, EntryKind::Persistent as i32, None, &mut err));
-        assert_eq!(err.code, 0);
-    }
-
-    fn get(s: *mut Store, key: &str, err: &mut FfiError) -> Option<Entry> {
-        let mut out_len = 0usize;
-        let ptr = unsafe { kvstore_kv_Store_get(s, key.as_ptr(), key.len(), &mut out_len, err) };
-        if ptr.is_null() {
-            assert_ne!(err.code, 0);
-            return None;
-        }
-        decode_and_free::<Option<Entry>>(ptr, out_len)
-    }
-
-    fn delete(s: *mut Store, key: &str, err: &mut FfiError) -> bool {
-        unsafe { kvstore_kv_Store_delete(s, key.as_ptr(), key.len(), err) }
-    }
-
-    fn keys(s: *mut Store, prefix: Option<&str>) -> Vec<String> {
-        let mut err = FfiError::default();
-        let prefix = abi::encode_value(&prefix.map(str::to_string));
-        let iter =
-            unsafe { kvstore_kv_Store_list_keys(s, prefix.as_ptr(), prefix.len(), &mut err) };
-        assert_eq!(err.code, 0);
-        assert!(!iter.is_null());
-        let mut got = Vec::new();
-        loop {
-            let mut item: *const u8 = std::ptr::null();
-            let mut len = 0usize;
-            let has = unsafe {
-                kvstore_kv_Store_ListKeysIterator_next(iter, &mut item, &mut len, &mut err)
-            };
-            assert_eq!(err.code, 0);
-            if has == 0 {
-                assert!(item.is_null());
-                break;
-            }
-            got.push(take_string(item, len));
-        }
-        unsafe { kvstore_kv_Store_ListKeysIterator_destroy(iter) };
-        got
-    }
-
-    #[test]
-    fn open_destroy_lifecycle() {
-        let _g = setup();
-        destroy(open());
-    }
-
-    #[test]
-    fn open_empty_path_reports_io_error() {
-        let _g = setup();
-        let mut err = FfiError::default();
-        // The fallible constructor rejects an empty path (here the canonical
-        // `(NULL, 0)` empty string) with the IoError domain code.
-        let s = unsafe { kvstore_kv_Store_open(std::ptr::null(), 0, &mut err) };
-        assert!(s.is_null());
-        assert_eq!(err.code, 1004, "KvError::IoError's declared code");
-        assert_eq!(message(&err), "I/O failure");
-    }
-
-    #[test]
-    fn open_invalid_path_is_a_marshalling_error() {
-        let _g = setup();
-        let mut err = FfiError::default();
-        // A null pointer with a length, or bytes that aren't UTF-8, are
-        // rejected with the reserved marshalling code before `open` runs.
-        let s = unsafe { kvstore_kv_Store_open(std::ptr::null(), 4, &mut err) };
-        assert!(s.is_null());
-        assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
-        let bad = [0xC0u8, 0x00];
-        let s = unsafe { kvstore_kv_Store_open(bad.as_ptr(), bad.len(), &mut err) };
-        assert!(s.is_null());
-        assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
-    }
-
-    #[test]
-    fn default_capacity_static() {
-        let _g = setup();
-        let mut err = FfiError::default();
-        assert_eq!(
-            unsafe { kvstore_kv_Store_default_capacity(&mut err) },
-            1_000_000
-        );
-        assert_eq!(err.code, 0);
-    }
-
-    #[test]
-    fn null_self_method_call_reports_error() {
-        let _g = setup();
-        let mut err = FfiError::default();
-        let n = unsafe { kvstore_kv_Store_count(std::ptr::null(), &mut err) };
-        assert_eq!(n, 0);
-        assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
-    }
-
-    #[test]
-    fn put_and_get_roundtrip() {
-        let _g = setup();
-        let s = open();
-        put_simple(s, "alpha", b"hello");
-        let mut err = FfiError::default();
-        let e = get(s, "alpha", &mut err).expect("entry present");
-        assert_eq!(err.code, 0);
-        assert_eq!(e.key, "alpha");
-        assert_eq!(e.value, b"hello");
-        assert!(e.id > 0);
-        destroy(s);
-    }
-
-    #[test]
-    fn put_invalid_kind_errors() {
-        let _g = setup();
-        let s = open();
-        let mut err = FfiError::default();
-        // An out-of-range `EntryKind` discriminant is rejected by the macro's
-        // enum lift with the reserved marshalling code.
-        assert!(!put(s, "k", b"", 999, None, &mut err));
-        assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
-        destroy(s);
-    }
-
-    #[test]
-    fn get_missing_key_returns_not_found() {
-        let _g = setup();
-        let s = open();
-        let mut err = FfiError::default();
-        assert!(get(s, "nope", &mut err).is_none());
-        assert_eq!(err.code, 1001, "KvError::KeyNotFound's declared code");
-        assert_eq!(message(&err), "key not found");
-        destroy(s);
-    }
-
-    #[test]
-    fn put_with_ttl_expires() {
-        let _g = setup();
-        let s = open();
-        let mut err = FfiError::default();
-        assert!(put(
-            s,
-            "ttl",
-            b"x",
-            EntryKind::Volatile as i32,
-            Some(-1),
-            &mut err
-        ));
-        assert!(get(s, "ttl", &mut err).is_none());
-        assert_eq!(err.code, 1002, "KvError::Expired's declared code");
-        destroy(s);
-    }
-
-    #[test]
-    fn delete_returns_existed() {
-        let _g = setup();
-        let s = open();
-        put_simple(s, "k", b"v");
-        let mut err = FfiError::default();
-        assert!(delete(s, "k", &mut err));
-        assert_eq!(err.code, 0);
-        assert!(!delete(s, "k", &mut err));
-        destroy(s);
-    }
-
-    #[test]
-    fn list_keys_iterates_in_order() {
-        let _g = setup();
-        let s = open();
-        put_simple(s, "alpha", b"1");
-        put_simple(s, "beta", b"2");
-        put_simple(s, "gamma", b"3");
-        assert_eq!(keys(s, None), vec!["alpha", "beta", "gamma"]);
-        destroy(s);
-    }
-
-    #[test]
-    fn list_keys_with_prefix_filter() {
-        let _g = setup();
-        let s = open();
-        put_simple(s, "user.alice", b"1");
-        put_simple(s, "user.bob", b"2");
-        put_simple(s, "system.x", b"3");
-        assert_eq!(keys(s, Some("user.")), vec!["user.alice", "user.bob"]);
-        destroy(s);
-    }
-
-    #[test]
-    fn count_and_clear() {
-        let _g = setup();
-        let s = open();
-        let mut err = FfiError::default();
-        assert_eq!(count(s), 0);
-        put_simple(s, "a", b"1");
-        put_simple(s, "b", b"2");
-        assert_eq!(count(s), 2);
-        unsafe { kvstore_kv_Store_clear(s, &mut err) };
-        assert_eq!(err.code, 0);
-        assert_eq!(count(s), 0);
-        destroy(s);
-    }
-
-    #[test]
-    fn legacy_put_inserts_volatile() {
-        let _g = setup();
-        let s = open();
-        let mut err = FfiError::default();
-        let (k, v) = ("legacy", b"v");
-        // The generated thunk carries its own `#[allow(deprecated)]`, so
-        // calling it needs no opt-in here.
-        let ok = unsafe {
-            kvstore_kv_Store_legacy_put(s, k.as_ptr(), k.len(), v.as_ptr(), v.len(), &mut err)
-        };
-        assert!(ok);
-        assert_eq!(count(s), 1);
-        destroy(s);
-    }
-
-    type Done = mpsc::Sender<(i32, i64)>;
-
-    extern "C" fn on_compacted(context: *mut c_void, err: *mut FfiError, result: i64) {
-        let tx = unsafe { &*(context as *const Done) };
-        let code = if err.is_null() {
-            0
-        } else {
-            let code = unsafe { (*err).code };
-            unsafe { crate::kvstore_error_free(err) };
-            code
-        };
-        tx.send((code, result)).unwrap();
-    }
-
-    fn compact(s: *mut Store, cancelled: bool) -> (i32, i64) {
-        let (tx, rx) = mpsc::channel::<(i32, i64)>();
-        let tx_ptr = Box::into_raw(Box::new(tx));
-        let token = crate::kvstore_cancel_token_create();
-        unsafe {
-            if cancelled {
-                crate::kvstore_cancel_token_cancel(token);
-            }
-            kvstore_kv_Store_compact(s, token, on_compacted, tx_ptr.cast());
-            // The launcher took its own reference, so the consumer may
-            // release the token right away.
-            crate::kvstore_cancel_token_destroy(token);
-        }
-        let out = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        drop(unsafe { Box::from_raw(tx_ptr) });
-        out
-    }
-
-    #[test]
-    fn compact_reclaims_expired_bytes() {
-        let _g = setup();
-        let s = open();
-        let mut err = FfiError::default();
-        put(
-            s,
-            "dead",
-            b"hello",
-            EntryKind::Volatile as i32,
-            Some(-1),
-            &mut err,
-        );
-        put(
-            s,
-            "alive",
-            b"x",
-            EntryKind::Persistent as i32,
-            None,
-            &mut err,
-        );
-        assert_eq!(compact(s, false), (0, 5));
-        destroy(s);
-    }
-
-    #[test]
-    fn compact_honors_cancel_token() {
-        let _g = setup();
-        let s = open();
-        assert_eq!(compact(s, true), (abi::CANCELLED_ERROR_CODE, 0));
-        destroy(s);
-    }
-
-    #[test]
-    fn get_stats_snapshots_state() {
-        let _g = setup();
-        let s = open();
-        put_simple(s, "a", b"hi");
-        put_simple(s, "b", b"bye");
-        let mut err = FfiError::default();
-        let mut out_len: usize = 0;
-        let ptr = unsafe { kvstore_kv_stats_get_stats(s, &mut out_len, &mut err) };
-        assert_eq!(err.code, 0);
-        let stats = decode_and_free::<Stats>(ptr, out_len);
-        assert_eq!(stats.total_entries, 2);
-        assert_eq!(stats.total_bytes, 5);
-        assert_eq!(stats.expired_entries, 0);
-        destroy(s);
-    }
-
-    #[test]
-    fn entry_buffer_round_trip() {
-        // The `Entry` record crosses the ABI as a value buffer; the macro
-        // implements `BufferValue`, so every field (including the optional,
-        // list, map, and bytes fields) round-trips through encode/decode.
-        let mut metadata = BTreeMap::new();
-        metadata.insert("source".to_string(), "test".to_string());
-        let entry = Entry {
-            id: 7,
-            key: "k".to_string(),
-            value: b"abc".to_vec(),
-            created_at: 123,
-            expires_at: Some(9999),
-            tags: vec!["hot".to_string()],
-            metadata,
-        };
-
-        let bytes = abi::encode_value(&entry);
-        let back = abi::decode_value::<Entry>(&bytes).unwrap();
-        assert_eq!(back.id, 7);
-        assert_eq!(back.key, "k");
-        assert_eq!(back.value, b"abc");
-        assert_eq!(back.created_at, 123);
-        assert_eq!(back.expires_at, Some(9999));
-        assert_eq!(back.tags, vec!["hot"]);
-        assert_eq!(
-            back.metadata.get("source").map(String::as_str),
-            Some("test")
-        );
-    }
-
-    #[test]
-    fn entry_buffer_round_trips_absent_expiry() {
-        let entry = Entry {
-            id: 1,
-            key: "x".to_string(),
-            value: Vec::new(),
-            created_at: 0,
-            expires_at: None,
-            tags: Vec::new(),
-            metadata: BTreeMap::new(),
-        };
-        let bytes = abi::encode_value(&entry);
-        let back = abi::decode_value::<Entry>(&bytes).unwrap();
-        assert_eq!(back.expires_at, None);
-        assert!(back.value.is_empty());
-        assert!(back.tags.is_empty());
-        assert!(back.metadata.is_empty());
-    }
-
-    #[test]
-    fn stats_buffer_round_trip() {
-        let stats = Stats {
-            total_entries: 10,
-            total_bytes: 200,
-            expired_entries: 3,
-        };
-        let bytes = abi::encode_value(&stats);
-        let back = abi::decode_value::<Stats>(&bytes).unwrap();
-        assert_eq!(back.total_entries, 10);
-        assert_eq!(back.total_bytes, 200);
-        assert_eq!(back.expired_entries, 3);
-    }
-
-    /// A consumer-side eviction listener, exactly as a generated binding
-    /// builds one: a heap context plus a process-wide vtable.
-    struct ListenerState {
-        evictions: Mutex<Vec<(String, i32)>>,
-        keep_after: usize,
-        freed: Arc<AtomicUsize>,
-    }
-
-    unsafe extern "C" fn on_evict(
-        ctx: *mut c_void,
-        entry_ptr: *const u8,
-        entry_len: usize,
-        reason: i32,
-        _out_err: *mut FfiError,
-    ) -> bool {
-        let state = unsafe { &*(ctx as *const ListenerState) };
-        let entry: Entry =
-            abi::decode_value(unsafe { std::slice::from_raw_parts(entry_ptr, entry_len) }).unwrap();
-        let mut seen = state.evictions.lock().unwrap();
-        seen.push((entry.key, reason));
-        seen.len() < state.keep_after
-    }
-
-    unsafe extern "C" fn free_listener(ctx: *mut c_void) {
-        let state = unsafe { Box::from_raw(ctx as *mut ListenerState) };
-        state.freed.fetch_add(1, Ordering::SeqCst);
-    }
-
-    static LISTENER_VTABLE: kvstore_kv_EvictionListener_vtable =
-        kvstore_kv_EvictionListener_vtable {
-            on_evict,
-            free: free_listener,
-        };
-
-    fn new_listener(keep_after: usize, freed: &Arc<AtomicUsize>) -> *mut c_void {
-        Box::into_raw(Box::new(ListenerState {
-            evictions: Mutex::new(Vec::new()),
-            keep_after,
-            freed: Arc::clone(freed),
-        }))
-        .cast()
-    }
-
-    #[test]
-    fn eviction_listener_sees_deletes_and_expiry_then_detaches() {
-        let _g = setup();
-        let s = open();
-        let freed = Arc::new(AtomicUsize::new(0));
-        let mut err = FfiError::default();
-        unsafe {
-            kvstore_kv_Store_set_eviction_listener(
-                s,
-                new_listener(2, &freed),
-                &LISTENER_VTABLE,
-                &mut err,
-            )
-        };
-        assert_eq!(err.code, 0);
-
-        put_simple(s, "evict-me", b"v");
-        assert!(delete(s, "evict-me", &mut err));
-
-        put(
-            s,
-            "expiring",
-            b"x",
-            EntryKind::Volatile as i32,
-            Some(-1),
-            &mut err,
-        );
-        assert!(get(s, "expiring", &mut err).is_none());
-        assert_eq!(err.code, 1002);
-
-        // The second eviction returned `false`, so the store detached (and
-        // freed) the listener; a third eviction is not observed.
-        assert_eq!(
-            freed.load(Ordering::SeqCst),
-            1,
-            "detached listener is freed"
-        );
-        put_simple(s, "again", b"x");
-        delete(s, "again", &mut err);
-        destroy(s);
-    }
-
-    #[test]
-    fn eviction_listener_is_retained_until_replaced() {
-        let _g = setup();
-        let s = open();
-        let freed = Arc::new(AtomicUsize::new(0));
-        let mut err = FfiError::default();
-        unsafe {
-            kvstore_kv_Store_set_eviction_listener(
-                s,
-                new_listener(usize::MAX, &freed),
-                &LISTENER_VTABLE,
-                &mut err,
-            );
-            assert_eq!(freed.load(Ordering::SeqCst), 0);
-            kvstore_kv_Store_set_eviction_listener(
-                s,
-                new_listener(usize::MAX, &freed),
-                &LISTENER_VTABLE,
-                &mut err,
-            );
-            assert_eq!(
-                freed.load(Ordering::SeqCst),
-                1,
-                "replaced listener is freed"
-            );
-            kvstore_kv_Store_clear_eviction_listener(s, &mut err);
-        }
-        assert_eq!(freed.load(Ordering::SeqCst), 2);
-        destroy(s);
-    }
-
-    #[test]
-    fn share_and_fork_reference_counting() {
-        let _g = setup();
-        let s = open();
-        put_simple(s, "a", b"1");
-        let mut err = FfiError::default();
-
-        let shared = unsafe { kvstore_kv_Store_share(s, &mut err) };
-        assert_eq!(shared, s, "share returns the same object");
-        destroy(s);
-        assert_eq!(count(shared), 1, "still alive");
-
-        let forked = unsafe { kvstore_kv_Store_fork(shared, &mut err) };
-        assert_ne!(forked, shared);
-        put_simple(forked, "b", b"2");
-        assert_eq!(count(forked), 2);
-        assert_eq!(count(shared), 1);
-
-        let cloned = unsafe { kvstore_kv_Store_clone(forked) };
-        destroy(forked);
-        assert_eq!(count(cloned), 2);
-        destroy(cloned);
-        destroy(shared);
-    }
-
-    #[test]
-    fn larger_handles_nullable_objects_both_ways() {
-        let _g = setup();
-        let a = open();
-        let b = open();
-        put_simple(b, "x", b"1");
-        let mut err = FfiError::default();
-        unsafe {
-            assert!(kvstore_kv_Store_larger(a, std::ptr::null(), &mut err).is_null());
-            let bigger = kvstore_kv_Store_larger(a, b, &mut err);
-            assert_eq!(bigger, b);
-            destroy(bigger);
-            let own = kvstore_kv_Store_larger(b, std::ptr::null(), &mut err);
-            assert_eq!(own, b);
-            destroy(own);
-        }
-        destroy(a);
-        destroy(b);
-    }
-
-    #[test]
-    fn objects_inside_records_and_lists() {
-        let _g = setup();
-        let s = open();
-        put_simple(s, "k", b"v");
-        let mut err = FfiError::default();
-
-        let label = "primary";
-        let mut out_len = 0usize;
-        let ptr = unsafe {
-            kvstore_kv_Store_describe(
-                s,
-                label.as_ptr(),
-                label.len(),
-                std::ptr::null(),
-                &mut out_len,
-                &mut err,
-            )
-        };
-        assert_eq!(err.code, 0);
-        let info = decode_and_free::<StoreInfo>(ptr, out_len);
-        assert_eq!(info.label, "primary");
-        assert_eq!(info.count, 1);
-        assert!(info.mirror.is_none());
-        // The record's object token carried its own reference.
-        assert_eq!(Arc::as_ptr(&info.store), s as *const Store);
-        assert_eq!(Arc::strong_count(&info.store), 2);
-
-        let paths = abi::encode_value(&vec!["/a".to_string(), "/b".to_string()]);
-        let mut many_len = 0usize;
-        let many_ptr = unsafe {
-            kvstore_kv_Store_open_many(paths.as_ptr(), paths.len(), &mut many_len, &mut err)
-        };
-        assert_eq!(err.code, 0);
-        let many = decode_and_free::<Vec<Arc<Store>>>(many_ptr, many_len);
-        assert_eq!(many.len(), 2);
-        put_simple(Arc::as_ptr(&many[0]).cast_mut(), "m", b"1");
-
-        // Objects written into a parameter buffer carry one reference each.
-        let stores = abi::encode_value(&many);
-        let extra = abi::encode_value(&Some(info.clone()));
-        let total = unsafe {
-            kvstore_kv_Store_total_count(
-                stores.as_ptr(),
-                stores.len(),
-                extra.as_ptr(),
-                extra.len(),
-                &mut err,
-            )
-        };
-        assert_eq!(total, 2);
-        drop(info);
-        drop(many);
-        destroy(s);
-    }
-
-    #[test]
-    fn runtime_symbols_carry_the_crate_prefix() {
-        assert_eq!(crate::kvstore_abi_version(), weaveffi::abi::ABI_VERSION);
-        assert_ne!(crate::kv::kvstore_kv_checksum(), 0);
-        let t = crate::kvstore_cancel_token_create();
-        assert!(!t.is_null());
-        unsafe {
-            assert!(!crate::kvstore_cancel_token_is_cancelled(t));
-            crate::kvstore_cancel_token_cancel(t);
-            assert!(crate::kvstore_cancel_token_is_cancelled(t));
-            crate::kvstore_cancel_token_destroy(t);
-        }
-    }
-}
+mod tests;

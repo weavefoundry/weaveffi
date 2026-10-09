@@ -1,8 +1,0 @@
-[package]
-name = "events"
-version = "1.0.0"
-description = "Publish/subscribe bus built on a callback interface, a shared object, and an iterator."
-license = "MIT"
-authors = ["WeaveFoundry <hello@weavefoundry.dev>"]
-homepage = "https://github.com/weavefoundry/weaveffi"
-repository = "https://github.com/weavefoundry/weaveffi"

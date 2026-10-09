@@ -9,12 +9,14 @@
 //! `Contact?`, and so on) rather than as a tagged object.
 //!
 //! The document model is deliberately *unresolved*: every user-defined type
-//! reference is a [`TypeRef::Named`] carrying the name exactly as written.
+//! reference is a [`TypeRef::Named`] carrying the bare name exactly as
+//! written. Type names are global across the API, so a name alone identifies
+//! a declaration; there are no module-qualified (`a.b.T`) references.
 //! Whether that name is a record, an enum, an interface, or a callback
 //! interface is decided by the [validator](crate::validate), which lowers the
-//! document into the resolved binding model generators consume. Keeping the
-//! two representations distinct means an IDL document always round-trips
-//! losslessly through this module.
+//! document into the [`Model`](crate::model::Model) generators consume.
+//! Keeping the two representations distinct means an IDL document always
+//! round-trips losslessly through this module.
 //!
 //! Package identity and per-generator options are not part of the IDL: they
 //! describe how bindings are *shipped*, not what the API *is*, and live in the
@@ -23,6 +25,8 @@
 #[cfg(feature = "idl")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use crate::ty::Prim;
 
 /// The current IR schema version that the parser, validator, and every
 /// generator expect.
@@ -35,7 +39,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// See [`docs/src/stability.md`](https://github.com/weavefoundry/weaveffi/blob/main/docs/src/stability.md)
 /// for the full schema policy and the surfaces covered by SemVer.
-pub const CURRENT_SCHEMA_VERSION: &str = "0.10.0";
+pub const CURRENT_SCHEMA_VERSION: &str = "0.11.0";
 
 /// Every IR schema version the current tools accept.
 ///
@@ -65,12 +69,61 @@ fn is_false(b: &bool) -> bool {
     schemars(description = "Top-level WeaveFFI API definition.")
 )]
 pub struct Api {
-    /// IR schema version this document targets (for example `0.10.0`).
+    /// IR schema version this document targets (for example `0.11.0`).
     /// Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].
     pub version: String,
     /// Top-level modules that make up the API surface. Each is an independent
     /// namespace; modules may nest further through [`Module::modules`].
     pub modules: Vec<Module>,
+}
+
+impl Api {
+    /// Call `f` on every type reference written anywhere in the document:
+    /// parameters and returns of every function, interface member, and
+    /// callback method, and the fields of every record, enum variant, and
+    /// error code, in declaration order (outermost references only; use
+    /// [`TypeRef::walk`] to reach nested ones).
+    pub fn for_each_type_ref<'a>(&'a self, f: &mut dyn FnMut(&'a TypeRef)) {
+        fn functions<'a>(fs: &'a [Function], f: &mut dyn FnMut(&'a TypeRef)) {
+            for func in fs {
+                for p in &func.params {
+                    f(&p.ty);
+                }
+                if let Some(r) = &func.returns {
+                    f(r);
+                }
+            }
+        }
+        fn fields<'a>(fields: &'a [StructField], f: &mut dyn FnMut(&'a TypeRef)) {
+            for field in fields {
+                f(&field.ty);
+            }
+        }
+        fn modules<'a>(ms: &'a [Module], f: &mut dyn FnMut(&'a TypeRef)) {
+            for m in ms {
+                functions(&m.functions, f);
+                for i in &m.interfaces {
+                    functions(&i.constructors, f);
+                    functions(&i.methods, f);
+                    functions(&i.statics, f);
+                }
+                for c in &m.callback_interfaces {
+                    functions(&c.methods, f);
+                }
+                for s in &m.structs {
+                    fields(&s.fields, f);
+                }
+                for v in m.enums.iter().flat_map(|e| &e.variants) {
+                    fields(&v.fields, f);
+                }
+                for c in m.errors.iter().flat_map(|d| &d.codes) {
+                    fields(&c.fields, f);
+                }
+                modules(&m.modules, f);
+            }
+        }
+        modules(&self.modules, f);
+    }
 }
 
 /// A module: a named namespace grouping related functions, types, callback
@@ -231,10 +284,14 @@ pub struct InterfaceDef {
 /// thread. At the C ABI it lowers to a context pointer plus a vtable of
 /// function pointers; see the C ABI contract.
 ///
-/// Methods are synchronous, can't declare `throws`, `async`, or `cancellable`,
-/// and return either nothing or a value in the direct family (integers,
-/// floats, `bool`, or a C-style enum). Parameters may use any type other than
-/// another callback interface or an iterator.
+/// Methods are synchronous (never `async` or `cancellable`) and return
+/// nothing or any type except an iterator or a callback interface; a string,
+/// bytes, or buffer return is a run the consumer allocates and the producer
+/// adopts. A method may declare `throws` when an error domain is in scope,
+/// letting the consumer report that domain's codes. Parameters may use any
+/// type other than a callback interface or an iterator. A callback interface
+/// may itself be passed, bare or optional (`Listener?`), as a parameter of a
+/// function or interface member.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "idl", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -290,36 +347,13 @@ pub struct Param {
 /// C ABI can't represent uniformly.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeRef {
-    /// Signed 8-bit integer (`i8`).
-    I8,
-    /// Signed 16-bit integer (`i16`).
-    I16,
-    /// Signed 32-bit integer (`i32`).
-    I32,
-    /// Signed 64-bit integer (`i64`).
-    I64,
-    /// Unsigned 8-bit integer (`u8`).
-    U8,
-    /// Unsigned 16-bit integer (`u16`).
-    U16,
-    /// Unsigned 32-bit integer (`u32`).
-    U32,
-    /// Unsigned 64-bit integer (`u64`).
-    U64,
-    /// 32-bit IEEE 754 floating-point number (`f32`).
-    F32,
-    /// 64-bit IEEE 754 floating-point number (`f64`).
-    F64,
-    /// Boolean (`bool`).
-    Bool,
-    /// UTF-8 string (`string`). Borrowed when passed in, owned when returned.
-    StringUtf8,
-    /// Byte buffer (`bytes`). Borrowed when passed in, owned when returned.
-    Bytes,
-    /// A reference to a user-defined type (record, enum, interface, or callback
-    /// interface) by its bare or dot-qualified name (`Contact`,
-    /// `shared.Status`), exactly as parsed. Resolution happens in the
-    /// validator, not here.
+    /// A built-in primitive (`i32`, `bool`, `string`, `bytes`, and so on).
+    /// Strings and bytes are borrowed when passed in and owned when returned.
+    Prim(Prim),
+    /// A reference to a user-defined type (record, enum, interface, or
+    /// callback interface) by its bare name (`Contact`), exactly as parsed.
+    /// Resolution happens in the validator, which rejects a dotted
+    /// (module-qualified) name: type names are global.
     Named(String),
     /// Optional value (`T?`): either the inner type or nothing.
     Optional(Box<TypeRef>),
@@ -357,7 +391,7 @@ pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
             // what Rust producers declare (`Vec<u8>`), so canonicalizing here
             // keeps the top-level ABI slots consistent between an IDL-driven
             // consumer and a macro-driven producer.
-            TypeRef::U8 => TypeRef::Bytes,
+            TypeRef::Prim(Prim::U8) => TypeRef::Prim(Prim::Bytes),
             t => TypeRef::List(Box::new(t)),
         });
     }
@@ -378,22 +412,7 @@ pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
     {
         return parse_type_ref(inner).map(|t| TypeRef::Iterator(Box::new(t)));
     }
-    match s {
-        "i8" => Ok(TypeRef::I8),
-        "i16" => Ok(TypeRef::I16),
-        "i32" => Ok(TypeRef::I32),
-        "i64" => Ok(TypeRef::I64),
-        "u8" => Ok(TypeRef::U8),
-        "u16" => Ok(TypeRef::U16),
-        "u32" => Ok(TypeRef::U32),
-        "u64" => Ok(TypeRef::U64),
-        "f32" => Ok(TypeRef::F32),
-        "f64" => Ok(TypeRef::F64),
-        "bool" => Ok(TypeRef::Bool),
-        "string" => Ok(TypeRef::StringUtf8),
-        "bytes" => Ok(TypeRef::Bytes),
-        name => Ok(TypeRef::Named(name.to_string())),
-    }
+    Ok(Prim::from_name(s).map_or_else(|| TypeRef::Named(s.to_string()), TypeRef::Prim))
 }
 
 /// The byte offset of the top-level `:` separating a map's key from its value,
@@ -440,19 +459,7 @@ impl TypeRef {
 
 fn type_ref_to_string(ty: &TypeRef) -> String {
     match ty {
-        TypeRef::I8 => "i8".to_string(),
-        TypeRef::I16 => "i16".to_string(),
-        TypeRef::I32 => "i32".to_string(),
-        TypeRef::I64 => "i64".to_string(),
-        TypeRef::U8 => "u8".to_string(),
-        TypeRef::U16 => "u16".to_string(),
-        TypeRef::U32 => "u32".to_string(),
-        TypeRef::U64 => "u64".to_string(),
-        TypeRef::F32 => "f32".to_string(),
-        TypeRef::F64 => "f64".to_string(),
-        TypeRef::Bool => "bool".to_string(),
-        TypeRef::StringUtf8 => "string".to_string(),
-        TypeRef::Bytes => "bytes".to_string(),
+        TypeRef::Prim(p) => p.snake().to_string(),
         TypeRef::Named(name) => name.clone(),
         TypeRef::Optional(inner) => format!("{}?", type_ref_to_string(inner)),
         TypeRef::List(inner) => format!("[{}]", type_ref_to_string(inner)),
@@ -488,7 +495,7 @@ impl<'de> Deserialize<'de> for TypeRef {
 
 /// Manual `JsonSchema` impl because `TypeRef` (de)serializes as a string with
 /// custom syntax: primitive names (`i32`, `string`, ...), `iter<{T}>`,
-/// `[{T}]`, `{ {K}: {V} }`, `{name}?`, or any user-defined type name.
+/// `[{T}]`, `{ {K}: {V} }`, `{name}?`, or a user-defined type's bare name.
 #[cfg(feature = "idl")]
 impl JsonSchema for TypeRef {
     fn schema_name() -> String {
@@ -510,8 +517,9 @@ impl JsonSchema for TypeRef {
             "Reference to a type. Encoded as a string with custom syntax: \
              primitives (`i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, \
              `f32`, `f64`, `bool`, `string`, `bytes`), iterators (`iter<{T}>`), \
-             lists (`[{T}]`), maps (`{{K:V}}`), optionals (`{T}?`), or any \
-             user-defined struct, enum, interface, or callback interface name."
+             lists (`[{T}]`), maps (`{{K:V}}`), optionals (`{T}?`), or the bare \
+             (unqualified) name of a user-defined struct, enum, interface, or callback \
+             interface."
                 .to_string(),
         );
         schema.into()
@@ -672,19 +680,19 @@ mod tests {
     #[test]
     fn primitives_round_trip() {
         let cases: &[(&str, TypeRef)] = &[
-            ("i8", TypeRef::I8),
-            ("i16", TypeRef::I16),
-            ("i32", TypeRef::I32),
-            ("i64", TypeRef::I64),
-            ("u8", TypeRef::U8),
-            ("u16", TypeRef::U16),
-            ("u32", TypeRef::U32),
-            ("u64", TypeRef::U64),
-            ("f32", TypeRef::F32),
-            ("f64", TypeRef::F64),
-            ("bool", TypeRef::Bool),
-            ("string", TypeRef::StringUtf8),
-            ("bytes", TypeRef::Bytes),
+            ("i8", TypeRef::Prim(Prim::I8)),
+            ("i16", TypeRef::Prim(Prim::I16)),
+            ("i32", TypeRef::Prim(Prim::I32)),
+            ("i64", TypeRef::Prim(Prim::I64)),
+            ("u8", TypeRef::Prim(Prim::U8)),
+            ("u16", TypeRef::Prim(Prim::U16)),
+            ("u32", TypeRef::Prim(Prim::U32)),
+            ("u64", TypeRef::Prim(Prim::U64)),
+            ("f32", TypeRef::Prim(Prim::F32)),
+            ("f64", TypeRef::Prim(Prim::F64)),
+            ("bool", TypeRef::Prim(Prim::Bool)),
+            ("string", TypeRef::Prim(Prim::String)),
+            ("bytes", TypeRef::Prim(Prim::Bytes)),
         ];
         for (s, expected) in cases {
             assert_eq!(&rt(s), expected);
@@ -694,15 +702,23 @@ mod tests {
     #[test]
     fn composites_round_trip() {
         assert_eq!(rt("Contact"), TypeRef::Named("Contact".into()));
+        // A dotted name parses as written; validation rejects it with a
+        // dedicated diagnostic (type names are global).
         assert_eq!(rt("shared.Status"), TypeRef::Named("shared.Status".into()));
         assert_eq!(
             rt("Contact?"),
             TypeRef::Optional(Box::new(TypeRef::Named("Contact".into())))
         );
-        assert_eq!(rt("[string]"), TypeRef::List(Box::new(TypeRef::StringUtf8)));
+        assert_eq!(
+            rt("[string]"),
+            TypeRef::List(Box::new(TypeRef::Prim(Prim::String)))
+        );
         assert_eq!(
             rt("{string:i32}"),
-            TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32))
+            TypeRef::Map(
+                Box::new(TypeRef::Prim(Prim::String)),
+                Box::new(TypeRef::Prim(Prim::I32))
+            )
         );
         assert_eq!(
             rt("iter<Contact>"),
@@ -711,9 +727,9 @@ mod tests {
         assert_eq!(
             rt("[{string:[i32?]}]"),
             TypeRef::List(Box::new(TypeRef::Map(
-                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::Prim(Prim::String)),
                 Box::new(TypeRef::List(Box::new(TypeRef::Optional(Box::new(
-                    TypeRef::I32
+                    TypeRef::Prim(Prim::I32)
                 )))))
             )))
         );
@@ -721,10 +737,10 @@ mod tests {
 
     #[test]
     fn u8_list_canonicalizes_to_bytes() {
-        assert_eq!(parse_type_ref("[u8]").unwrap(), TypeRef::Bytes);
+        assert_eq!(parse_type_ref("[u8]").unwrap(), TypeRef::Prim(Prim::Bytes));
         assert_eq!(
             parse_type_ref("[[u8]]").unwrap(),
-            TypeRef::List(Box::new(TypeRef::Bytes))
+            TypeRef::List(Box::new(TypeRef::Prim(Prim::Bytes)))
         );
     }
 
@@ -734,10 +750,10 @@ mod tests {
             parse_type_ref("{{string:i32}:bool}").unwrap(),
             TypeRef::Map(
                 Box::new(TypeRef::Map(
-                    Box::new(TypeRef::StringUtf8),
-                    Box::new(TypeRef::I32)
+                    Box::new(TypeRef::Prim(Prim::String)),
+                    Box::new(TypeRef::Prim(Prim::I32))
                 )),
-                Box::new(TypeRef::Bool)
+                Box::new(TypeRef::Prim(Prim::Bool))
             )
         );
     }
@@ -771,7 +787,7 @@ mod tests {
     #[test]
     fn document_round_trips_through_yaml_and_json() {
         let yaml = r#"
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: contacts
     doc: Address book

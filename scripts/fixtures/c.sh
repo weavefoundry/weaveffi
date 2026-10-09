@@ -2,6 +2,8 @@
 # Compile every generated C header (the ABI header and, when present, the
 # value-buffer helper header) as C11 and C++17 with warnings as errors.
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+require cc c++
 dir=$1
 for header in "$dir"/c/*.h; do
     name=$(basename "$header" .h)

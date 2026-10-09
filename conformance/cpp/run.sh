@@ -12,6 +12,7 @@
 # UndefinedBehaviorSanitizer.
 set -uo pipefail
 . "$(dirname "$0")/../lib.sh"
+require_tools cpp cmake "${CXX:-clang++}"
 
 # cpp_lane <sample> <consumer source stem>
 cpp_lane() {
@@ -38,17 +39,11 @@ EOF
 }
 
 cpp_calculator() { cpp_lane calculator calculator; }
-cpp_contacts() { cpp_lane contacts contacts; }
-cpp_events() { cpp_lane events events; }
-cpp_kvstore() { cpp_lane kvstore kvstore; }
-cpp_async_demo() { cpp_lane async-demo async_demo; }
 cpp_codec() { cpp_lane codec codec; }
+cpp_kvstore() { cpp_lane kvstore kvstore; }
 
 lane cpp-calculator cpp_calculator
-lane cpp-contacts cpp_contacts
-lane cpp-events cpp_events
-lane cpp-kvstore cpp_kvstore
-lane cpp-async-demo cpp_async_demo
 lane cpp-codec cpp_codec
+lane cpp-kvstore cpp_kvstore
 
 finish_lanes

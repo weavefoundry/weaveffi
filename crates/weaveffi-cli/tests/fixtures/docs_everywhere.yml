@@ -1,6 +1,8 @@
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: docs
+    doc: |
+      Document storage: create, publish, and observe documents.
     enums:
       - name: Status
         doc: |

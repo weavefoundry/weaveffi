@@ -5,6 +5,7 @@
 # against one sample and must exit 0.
 set -uo pipefail
 . "$(dirname "$0")/../lib.sh"
+require_tools python python3
 
 # Run a Python consumer against the generated package as-is: its directory
 # goes on PYTHONPATH, and the producer cdylib is selected through the
@@ -18,22 +19,11 @@ py_consumer() {
 }
 
 python_calculator() { py_consumer calculator calculator_consumer.py; }
-
-python_contacts()   { py_consumer contacts contacts_consumer.py; }
-
-python_events()     { py_consumer events events_consumer.py; }
-
-python_kvstore()    { py_consumer kvstore kvstore_consumer.py; }
-
-python_async_demo() { py_consumer async-demo async_demo_consumer.py; }
-
-python_codec()      { py_consumer codec codec_consumer.py; }
+python_codec() { py_consumer codec codec_consumer.py; }
+python_kvstore() { py_consumer kvstore kvstore_consumer.py; }
 
 lane python-calculator python_calculator
-lane python-contacts python_contacts
-lane python-events python_events
-lane python-kvstore python_kvstore
-lane python-async-demo python_async_demo
 lane python-codec python_codec
+lane python-kvstore python_kvstore
 
 finish_lanes

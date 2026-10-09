@@ -15,21 +15,21 @@ fn write_file(path: &Path, contents: &str) {
     f.write_all(contents.as_bytes()).unwrap();
 }
 
-fn calculator_idl() -> std::path::PathBuf {
+fn calculator_crate() -> std::path::PathBuf {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     Path::new(manifest_dir)
         .parent()
         .unwrap()
         .parent()
         .unwrap()
-        .join("samples/calculator/src/lib.rs")
+        .join("samples/calculator")
 }
 
 #[test]
 fn diff_check_passes_when_output_matches() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("generated");
-    let input = calculator_idl();
+    let input = calculator_crate();
 
     cargo_bin()
         .args([
@@ -76,7 +76,7 @@ fn diff_check_fails_when_idl_changed() {
     write_file(
         &idl,
         concat!(
-            "version: \"0.10.0\"\n",
+            "version: \"0.11.0\"\n",
             "modules:\n",
             "  - name: calc\n",
             "    functions:\n",
@@ -102,7 +102,7 @@ fn diff_check_fails_when_idl_changed() {
     write_file(
         &idl,
         concat!(
-            "version: \"0.10.0\"\n",
+            "version: \"0.11.0\"\n",
             "modules:\n",
             "  - name: calc\n",
             "    functions:\n",
@@ -156,7 +156,7 @@ fn diff_check_fails_when_idl_changed() {
 
 #[test]
 fn validate_json_format_outputs_object() {
-    let input = calculator_idl();
+    let input = calculator_crate();
 
     let output = cargo_bin()
         .args(["validate", input.to_str().unwrap(), "--format", "json"])
@@ -189,7 +189,7 @@ fn validate_warn_json_format_outputs_warnings_array() {
     write_file(
         &path,
         concat!(
-            "version: \"0.10.0\"\n",
+            "version: \"0.11.0\"\n",
             "modules:\n",
             "  - name: nodocs\n",
             "    functions:\n",
@@ -235,4 +235,46 @@ fn validate_warn_json_format_outputs_warnings_array() {
         "warnings are advisory, so a valid IDL still reports ok"
     );
     assert!(output.status.success(), "warnings must not fail validate");
+}
+
+#[test]
+fn validate_json_failures_carry_the_code_and_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("global.yml");
+    write_file(
+        &path,
+        concat!(
+            "version: \"0.11.0\"\n",
+            "modules:\n",
+            "  - name: a\n",
+            "    structs: [{ name: Item, fields: [{ name: n, type: usize }] }]\n",
+            "    functions: [{ name: open, params: [{ name: i, type: a.Item }] }]\n",
+            "  - name: b\n",
+            "    functions: [{ name: open }]\n",
+        ),
+    );
+
+    let output = cargo_bin()
+        .args(["validate", path.to_str().unwrap(), "--format", "json"])
+        .output()
+        .expect("failed to run weaveffi validate --format json");
+    assert!(!output.status.success(), "global name clashes must fail");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
+    let errors = parsed["errors"].as_array().expect("errors array");
+    let find = |code: &str| {
+        errors
+            .iter()
+            .find(|e| e["code"] == code)
+            .unwrap_or_else(|| panic!("no {code} in {parsed}"))
+    };
+    assert_eq!(find("UnsupportedPrimitive")["name"], "usize");
+    assert_eq!(find("QualifiedTypeRef")["name"], "a.Item");
+    let dup = find("DuplicateFunctionName");
+    assert_eq!(dup["name"], "open");
+    assert_eq!(dup["first"], "a");
+    assert_eq!(dup["second"], "b");
+    assert!(dup["suggestion"].as_str().is_some_and(|s| !s.is_empty()));
 }

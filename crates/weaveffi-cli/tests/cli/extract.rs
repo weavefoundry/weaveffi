@@ -1,708 +1,152 @@
-//! End-to-end tests for `weaveffi extract`, which reads annotated Rust source
-//! (via the shared `weaveffi_model::rust`) and emits the IDL. The annotation scheme
-//! is the one the `#[weaveffi::module]` macro uses: a `#[weaveffi::module]`
-//! marks the exported namespace, and item markers (`#[weaveffi::export]`,
-//! `#[weaveffi::record]`, `#[weaveffi::enumeration]`, ...) tag the surface.
+//! Library mode end to end: `weaveffi extract` and `weaveffi generate` read
+//! a Rust producer's API from the library it builds. The producer is the
+//! fixture crate at `tests/fixtures/producer`, whose expected API is
+//! `tests/fixtures/producer/expected.yml`.
 
-use std::io::Write;
+use std::path::{Path, PathBuf};
 
-fn write_src(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().expect("failed to create temp dir");
-    let src_path = dir.path().join("lib.rs");
-    let mut f = std::fs::File::create(&src_path).unwrap();
-    f.write_all(contents.as_bytes()).unwrap();
-    (dir, src_path)
+fn fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/producer")
 }
 
-#[test]
-fn extract_basic_rust_file() {
-    let (_dir, src_path) = write_src(
-        r#"
-#[weaveffi::module]
-mod math {
-    #[weaveffi::export]
-    fn add(a: i32, b: i32) -> i32 {
-        a + b
-    }
-}
-"#,
-    );
-
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args(["extract", src_path.to_str().unwrap()])
-        .output()
-        .expect("failed to run extract");
-
-    assert!(output.status.success(), "extract command failed");
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let api: serde_yaml::Value =
-        serde_yaml::from_str(&stdout).expect("output should be valid YAML");
-    let modules = api["modules"]
-        .as_sequence()
-        .expect("should have modules array");
-    assert_eq!(modules.len(), 1);
-
-    let module = &modules[0];
-    assert_eq!(module["name"].as_str().unwrap(), "math");
-
-    let functions = module["functions"]
-        .as_sequence()
-        .expect("should have functions array");
-    assert_eq!(functions.len(), 1);
-
-    let func = &functions[0];
-    assert_eq!(func["name"].as_str().unwrap(), "add");
-
-    let params = func["params"]
-        .as_sequence()
-        .expect("should have params array");
-    assert_eq!(params.len(), 2);
-    assert_eq!(params[0]["name"].as_str().unwrap(), "a");
-    assert_eq!(params[0]["type"].as_str().unwrap(), "i32");
-    assert_eq!(params[1]["name"].as_str().unwrap(), "b");
-    assert_eq!(params[1]["type"].as_str().unwrap(), "i32");
-
-    assert_eq!(func["return"].as_str().unwrap(), "i32");
+fn weaveffi() -> assert_cmd::Command {
+    assert_cmd::Command::cargo_bin("weaveffi").expect("binary not found")
 }
 
-#[test]
-fn unmarked_module_is_ignored() {
-    // A module without #[weaveffi::module] exports nothing, even if its items
-    // carry item markers: the module attribute is the opt-in.
-    let (_dir, src_path) = write_src(
-        r#"
-mod plain {
-    #[weaveffi::export]
-    fn add(a: i32) -> i32 { a }
-}
-"#,
-    );
-
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args(["extract", src_path.to_str().unwrap()])
-        .output()
-        .expect("failed to run extract");
-
-    assert!(output.status.success(), "extract command failed");
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let api: serde_yaml::Value =
-        serde_yaml::from_str(&stdout).expect("output should be valid YAML");
-    assert!(
-        api["modules"]
-            .as_sequence()
-            .map(|m| m.is_empty())
-            .unwrap_or(true),
-        "an unmarked module should produce no exported modules: {stdout}"
-    );
-}
-
-#[test]
-fn extract_with_struct_and_enum() {
-    let (_dir, src_path) = write_src(
-        r#"
-#[weaveffi::module]
-mod shapes {
-    #[weaveffi::record]
-    struct Point {
-        x: f64,
-        y: f64,
-    }
-
-    #[weaveffi::enumeration]
-    #[repr(i32)]
-    enum Color {
-        Red = 0,
-        Green = 1,
-        Blue = 2,
-    }
-
-    #[weaveffi::export]
-    fn create_point(x: f64, y: f64) -> Point {
-        todo!()
-    }
-}
-"#,
-    );
-
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args(["extract", src_path.to_str().unwrap()])
-        .output()
-        .expect("failed to run extract");
-
-    assert!(output.status.success(), "extract command failed");
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let api: serde_yaml::Value =
-        serde_yaml::from_str(&stdout).expect("output should be valid YAML");
-
-    let module = &api["modules"].as_sequence().unwrap()[0];
-    assert_eq!(module["name"].as_str().unwrap(), "shapes");
-
-    let structs = module["structs"].as_sequence().unwrap();
-    assert_eq!(structs.len(), 1);
-    assert_eq!(structs[0]["name"].as_str().unwrap(), "Point");
-    let fields = structs[0]["fields"].as_sequence().unwrap();
-    assert_eq!(fields.len(), 2);
-    assert_eq!(fields[0]["name"].as_str().unwrap(), "x");
-    assert_eq!(fields[1]["name"].as_str().unwrap(), "y");
-
-    let enums = module["enums"].as_sequence().unwrap();
-    assert_eq!(enums.len(), 1);
-    assert_eq!(enums[0]["name"].as_str().unwrap(), "Color");
-    let variants = enums[0]["variants"].as_sequence().unwrap();
-    assert_eq!(variants.len(), 3);
-    assert_eq!(variants[0]["name"].as_str().unwrap(), "Red");
-    assert_eq!(variants[1]["name"].as_str().unwrap(), "Green");
-    assert_eq!(variants[2]["name"].as_str().unwrap(), "Blue");
-
-    let functions = module["functions"].as_sequence().unwrap();
-    assert_eq!(functions.len(), 1);
-    assert_eq!(functions[0]["name"].as_str().unwrap(), "create_point");
-}
-
-#[test]
-fn extract_with_optional_and_list() {
-    let (_dir, src_path) = write_src(
-        r#"
-#[weaveffi::module]
-mod collections {
-    #[weaveffi::export]
-    fn process(items: Vec<i32>, label: Option<String>) -> Option<Vec<i32>> {
-        todo!()
-    }
-}
-"#,
-    );
-
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args(["extract", src_path.to_str().unwrap()])
-        .output()
-        .expect("failed to run extract");
-
-    assert!(output.status.success(), "extract command failed");
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let api: serde_yaml::Value =
-        serde_yaml::from_str(&stdout).expect("output should be valid YAML");
-
-    let func = &api["modules"].as_sequence().unwrap()[0]["functions"]
-        .as_sequence()
-        .unwrap()[0];
-    assert_eq!(func["name"].as_str().unwrap(), "process");
-
-    let params = func["params"].as_sequence().unwrap();
-    assert_eq!(params.len(), 2);
-    assert_eq!(params[0]["name"].as_str().unwrap(), "items");
-    assert_eq!(params[0]["type"].as_str().unwrap(), "[i32]");
-    assert_eq!(params[1]["name"].as_str().unwrap(), "label");
-    assert_eq!(params[1]["type"].as_str().unwrap(), "string?");
-
-    assert_eq!(func["return"].as_str().unwrap(), "[i32]?");
-}
-
-#[test]
-fn extract_to_json_format() {
-    let (_dir, src_path) = write_src(
-        r#"
-#[weaveffi::module]
-mod math {
-    #[weaveffi::export]
-    fn add(a: i32, b: i32) -> i32 {
-        a + b
-    }
-}
-"#,
-    );
-
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args(["extract", src_path.to_str().unwrap(), "--format", "json"])
-        .output()
-        .expect("failed to run extract");
-
-    assert!(output.status.success(), "extract --format json failed");
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let api: serde_json::Value =
-        serde_json::from_str(&stdout).expect("output should be valid JSON");
-
-    let modules = api["modules"]
-        .as_array()
-        .expect("should have modules array");
-    assert_eq!(modules.len(), 1);
-    assert_eq!(modules[0]["name"].as_str().unwrap(), "math");
-
-    let functions = modules[0]["functions"]
-        .as_array()
-        .expect("should have functions array");
-    assert_eq!(functions.len(), 1);
-    assert_eq!(functions[0]["name"].as_str().unwrap(), "add");
-}
-
-#[test]
-fn extract_async_function() {
-    let (_dir, src_path) = write_src(
-        r#"
-#[weaveffi::module]
-mod async_demo {
-    /// Fetch data asynchronously.
-    #[weaveffi::export]
-    async fn fetch(url: String) -> String {
-        todo!()
-    }
-}
-"#,
-    );
-
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args(["extract", src_path.to_str().unwrap()])
-        .output()
-        .expect("failed to run extract");
-
-    assert!(output.status.success(), "extract command failed");
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let api: serde_yaml::Value =
-        serde_yaml::from_str(&stdout).expect("output should be valid YAML");
-    let func = &api["modules"].as_sequence().unwrap()[0]["functions"]
-        .as_sequence()
-        .unwrap()[0];
-    assert_eq!(func["name"].as_str().unwrap(), "fetch");
-    assert_eq!(
-        func["async"].as_bool(),
-        Some(true),
-        "async flag should be set"
-    );
-}
-
-#[test]
-fn extract_fails_loud_on_invalid_api_without_warn() {
-    // An undeclared object type makes the extracted API fail validation.
-    // Without `--warn`, `extract` must abort instead of emitting broken IDL.
-    let (_dir, src_path) = write_src(
-        r#"
-use std::sync::Arc;
-
-#[weaveffi::module]
-mod sessions {
-    use std::sync::Arc;
-
-    #[weaveffi::export]
-    fn close(session: Arc<Session>) {
-        todo!()
-    }
-}
-"#,
-    );
-
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args(["extract", src_path.to_str().unwrap()])
-        .output()
-        .expect("failed to run extract");
-
-    assert!(
-        !output.status.success(),
-        "extract should fail loudly on an API that does not validate"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--lenient"),
-        "the error should point users at --lenient: {stderr}"
-    );
-}
-
-#[test]
-fn extract_callback_interface_definition() {
-    let (_dir, src_path) = write_src(
-        r#"
-use std::sync::Arc;
-
-#[weaveffi::module]
-mod events {
-    use std::sync::Arc;
-
-    #[weaveffi::interface]
-    struct Ticker;
-
-    impl Ticker {
-        pub fn new() -> Self { Ticker }
-    }
-
-    /// Consumer-implemented sink for data events.
-    #[weaveffi::callback_interface]
-    trait DataListener: Send + Sync {
-        /// Fired when data arrives.
-        fn on_data(&self, payload: String, source: Arc<Ticker>);
-        /// Asks whether to keep delivering.
-        fn keep_going(&self, n: i32) -> bool;
-    }
-
-    #[weaveffi::export]
-    fn subscribe(listener: Arc<dyn DataListener>) {}
-}
-"#,
-    );
-
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args(["extract", src_path.to_str().unwrap()])
-        .output()
-        .expect("failed to run extract");
-
+fn stdout_of(output: &std::process::Output) -> String {
     assert!(
         output.status.success(),
-        "extract command failed: {}",
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let api: serde_yaml::Value =
-        serde_yaml::from_str(&stdout).expect("output should be valid YAML");
-    let module = &api["modules"].as_sequence().unwrap()[0];
-
-    let interfaces = module["callback_interfaces"].as_sequence().unwrap();
-    assert_eq!(interfaces.len(), 1);
-    let listener = &interfaces[0];
-    assert_eq!(listener["name"].as_str().unwrap(), "DataListener");
-    assert_eq!(
-        listener["doc"].as_str(),
-        Some("Consumer-implemented sink for data events.")
-    );
-
-    let methods = listener["methods"].as_sequence().unwrap();
-    assert_eq!(methods.len(), 2);
-    assert_eq!(methods[0]["name"].as_str().unwrap(), "on_data");
-    assert_eq!(methods[0]["doc"].as_str(), Some("Fired when data arrives."));
-    let params = methods[0]["params"].as_sequence().unwrap();
-    assert_eq!(params[0]["type"].as_str().unwrap(), "string");
-    assert_eq!(
-        params[1]["type"].as_str().unwrap(),
-        "Ticker",
-        "an `Arc<Interface>` parameter extracts as the bare interface type"
-    );
-    assert_eq!(methods[1]["name"].as_str().unwrap(), "keep_going");
-    assert_eq!(methods[1]["return"].as_str().unwrap(), "bool");
-
-    let subscribe = &module["functions"].as_sequence().unwrap()[0];
-    assert_eq!(
-        subscribe["params"].as_sequence().unwrap()[0]["type"]
-            .as_str()
-            .unwrap(),
-        "DataListener",
-        "an `Arc<dyn Trait>` parameter extracts as the callback interface"
-    );
+    String::from_utf8(output.stdout.clone()).unwrap()
 }
 
+/// The extracted IDL is exactly the expected one: every declaration kind,
+/// declaration order, docs, the type alias resolved, the sibling tree, and
+/// only the declarations the default build compiles (`list_price`, not the
+/// `#[cfg(feature = "extra")]` function, `impl` block, or module).
 #[test]
-fn extract_interface_with_error_domain() {
-    let (_dir, src_path) = write_src(
-        r#"
-#[weaveffi::module]
-mod store {
-    #[weaveffi::error]
-    enum StoreError {
-        /// resource is missing
-        Missing = 1,
-    }
-
-    /// A tiny stateful object.
-    #[weaveffi::interface]
-    struct Session {
-        id: i64,
-    }
-
-    impl Session {
-        /// Open a session, failing when the id is invalid.
-        pub fn open(id: i64) -> Result<Session, StoreError> {
-            Ok(Session { id })
-        }
-
-        /// Fetch a value, failing when it is missing.
-        pub fn fetch(&self, key: String) -> Result<i64, StoreError> {
-            Err(StoreError::Missing)
-        }
-
-        /// The session subsystem version.
-        pub fn version() -> i32 {
-            1
-        }
-    }
-}
-"#,
-    );
-
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args(["extract", src_path.to_str().unwrap()])
+fn extract_reads_the_api_from_the_built_library() {
+    let output = weaveffi()
+        .args(["-q", "extract"])
+        .arg(fixture())
         .output()
-        .expect("failed to run extract");
-
-    assert!(output.status.success(), "extract command failed");
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let api: serde_yaml::Value =
-        serde_yaml::from_str(&stdout).expect("output should be valid YAML");
-    let module = &api["modules"].as_sequence().unwrap()[0];
-
-    let errors = &module["errors"];
-    assert_eq!(errors["name"].as_str().unwrap(), "StoreError");
-    let codes = errors["codes"].as_sequence().unwrap();
-    assert_eq!(codes.len(), 1);
-    assert_eq!(codes[0]["name"].as_str().unwrap(), "Missing");
-    assert_eq!(codes[0]["code"].as_i64(), Some(1));
-    assert_eq!(
-        codes[0]["message"].as_str().unwrap(),
-        "resource is missing",
-        "the variant's doc comment becomes the default message"
-    );
-
-    let interfaces = module["interfaces"].as_sequence().unwrap();
-    assert_eq!(interfaces.len(), 1);
-    let session = &interfaces[0];
-    assert_eq!(session["name"].as_str().unwrap(), "Session");
-    assert_eq!(session["doc"].as_str(), Some("A tiny stateful object."));
-
-    let constructors = session["constructors"].as_sequence().unwrap();
-    assert_eq!(constructors.len(), 1);
-    assert_eq!(constructors[0]["name"].as_str().unwrap(), "open");
-    assert_eq!(
-        constructors[0]["throws"].as_bool(),
-        Some(true),
-        "a Result<Self, E> constructor should extract as throws: true"
-    );
-
-    let methods = session["methods"].as_sequence().unwrap();
-    assert_eq!(methods.len(), 1);
-    assert_eq!(methods[0]["name"].as_str().unwrap(), "fetch");
-    assert_eq!(methods[0]["throws"].as_bool(), Some(true));
-    assert_eq!(
-        methods[0]["params"].as_sequence().unwrap()[0]["type"]
-            .as_str()
-            .unwrap(),
-        "string"
-    );
-    assert_eq!(methods[0]["return"].as_str().unwrap(), "i64");
-
-    let statics = session["statics"].as_sequence().unwrap();
-    assert_eq!(statics.len(), 1);
-    assert_eq!(statics[0]["name"].as_str().unwrap(), "version");
-    assert_eq!(statics[0]["return"].as_str().unwrap(), "i32");
+        .unwrap();
+    let expected = std::fs::read_to_string(fixture().join("expected.yml")).unwrap();
+    assert_eq!(stdout_of(&output), expected);
+    assert!(expected.contains("list_price") && !expected.contains("discount"));
 }
 
+/// Bindings generated from the library are byte-identical to bindings
+/// generated from its extracted IDL under the same identity.
 #[test]
-fn extract_deprecated_attribute_to_note() {
-    let (_dir, src_path) = write_src(
-        r#"
-#[weaveffi::module]
-mod legacy {
-    /// Legacy add.
-    #[weaveffi::export]
-    #[deprecated(since = "0.2.0", note = "Use add_v2 instead")]
-    fn add_old(a: i32, b: i32) -> i32 {
-        a + b
-    }
+fn generating_from_the_library_matches_generating_from_its_idl() {
+    let dir = tempfile::tempdir().unwrap();
+    let from_library = dir.path().join("library");
+    weaveffi()
+        .args(["-q", "generate"])
+        .arg(fixture())
+        .args(["--target", "c", "-o"])
+        .arg(&from_library)
+        .assert()
+        .success();
+
+    let idl_dir = dir.path().join("idl");
+    std::fs::create_dir_all(&idl_dir).unwrap();
+    std::fs::copy(fixture().join("expected.yml"), idl_dir.join("api.yml")).unwrap();
+    std::fs::write(
+        idl_dir.join("weaveffi.toml"),
+        concat!(
+            "[package]\n",
+            "name = \"producer-fixture\"\n",
+            "version = \"0.3.0\"\n",
+            "c_prefix = \"producer_fixture\"\n",
+            "library = \"producer_fixture\"\n",
+        ),
+    )
+    .unwrap();
+    let from_idl = dir.path().join("from-idl");
+    weaveffi()
+        .args(["-q", "generate"])
+        .arg(idl_dir.join("api.yml"))
+        .args(["--target", "c", "-o"])
+        .arg(&from_idl)
+        .assert()
+        .success();
+
+    let header = "c/producer_fixture.h";
+    let a = std::fs::read_to_string(from_library.join(header)).unwrap();
+    let b = std::fs::read_to_string(from_idl.join(header)).unwrap();
+    assert!(a.contains("producer_fixture_shop_Cart_total"), "{a}");
+    assert_eq!(a, b);
 }
-"#,
-    );
 
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args(["extract", src_path.to_str().unwrap()])
-        .output()
-        .expect("failed to run extract");
-
-    assert!(output.status.success(), "extract command failed");
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let api: serde_yaml::Value =
-        serde_yaml::from_str(&stdout).expect("output should be valid YAML");
-    let func = &api["modules"].as_sequence().unwrap()[0]["functions"]
-        .as_sequence()
-        .unwrap()[0];
-    assert_eq!(func["name"].as_str().unwrap(), "add_old");
-    assert_eq!(func["deprecated"].as_str().unwrap(), "Use add_v2 instead");
-    assert!(
-        func.get("since").is_none(),
-        "schema 0.10.0 has no `since`; the version rides in the deprecation note only"
-    );
-}
-
+/// `--library` reads a library standing alone (no crate, no IDL), and the
+/// output formats round-trip.
 #[test]
-fn extract_rejects_mutable_reference_params() {
-    // Write-back parameters were removed with schema 0.10.0: every parameter
-    // is borrowed or moved across the boundary, so `&mut T` has no lowering
-    // and the extractor must refuse it with an actionable message.
-    let (_dir, src_path) = write_src(
-        r#"
-#[weaveffi::module]
-mod buffers {
-    #[weaveffi::export]
-    fn fill(buf: &mut String, value: i32) {
-        todo!()
-    }
-}
-"#,
-    );
-
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args(["extract", src_path.to_str().unwrap()])
-        .output()
-        .expect("failed to run extract");
-
-    assert!(
-        !output.status.success(),
-        "extract should reject `&mut` parameters"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("`&mut` parameters cannot cross the FFI boundary"),
-        "unexpected diagnostic: {stderr}"
-    );
-}
-
-#[test]
-fn extract_rejects_raw_pointers_and_box() {
-    for (ty, needle) in [
-        ("*mut Widget", "raw pointers cannot cross the FFI boundary"),
-        ("Box<Widget>", "`Box` cannot cross the FFI boundary"),
-    ] {
-        let (_dir, src_path) = write_src(&format!(
-            r#"
-#[weaveffi::module]
-mod objects {{
-    #[weaveffi::interface]
-    struct Widget;
-
-    impl Widget {{
-        pub fn new() -> Self {{ Widget }}
-    }}
-
-    #[weaveffi::export]
-    fn take(w: {ty}) {{}}
-}}
-"#
-        ));
-
-        let output = assert_cmd::Command::cargo_bin("weaveffi")
-            .expect("binary not found")
-            .args(["extract", src_path.to_str().unwrap()])
+fn extract_formats_and_a_library_alone() {
+    let yaml = stdout_of(
+        &weaveffi()
+            .args(["-q", "extract"])
+            .arg(fixture())
             .output()
-            .expect("failed to run extract");
-
-        assert!(!output.status.success(), "extract should reject `{ty}`");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(needle),
-            "unexpected diagnostic for `{ty}`: {stderr}"
-        );
-    }
+            .unwrap(),
+    );
+    let api: weaveffi_model::ir::Api = serde_yaml::from_str(&yaml).unwrap();
+    let json = stdout_of(
+        &weaveffi()
+            .args(["-q", "extract", "-f", "json"])
+            .arg(fixture())
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        serde_json::from_str::<weaveffi_model::ir::Api>(&json).unwrap(),
+        api
+    );
+    let toml_text = stdout_of(
+        &weaveffi()
+            .args(["-q", "extract", "-f", "toml"])
+            .arg(fixture())
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        toml::from_str::<weaveffi_model::ir::Api>(&toml_text).unwrap(),
+        api
+    );
 }
 
+/// What isn't a Rust producer's library is refused with a reason: an IDL,
+/// a binary without WeaveFFI metadata, and Rust source.
 #[test]
-fn extract_arc_object_shapes() {
-    // `Arc<T>` in every position lowers to the bare interface type, with
-    // `Option`, `Vec`, and record fields composing on top.
-    let (_dir, src_path) = write_src(
-        r#"
-use std::sync::Arc;
+fn extract_explains_what_it_cannot_read() {
+    let idl = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kitchen_sink.yml");
+    let output = weaveffi().arg("extract").arg(&idl).output().unwrap();
+    assert!(!output.status.success());
+    let err = crate::stderr(&output);
+    assert!(err.contains("already an IDL"), "{err}");
 
-#[weaveffi::module]
-mod graph {
-    use std::sync::Arc;
-
-    #[weaveffi::interface]
-    struct Node;
-
-    #[weaveffi::record]
-    struct Edge {
-        from: Arc<Node>,
-        to: Option<Arc<Node>>,
-    }
-
-    impl Node {
-        pub fn new() -> Self { Node }
-        pub fn me(self: Arc<Self>) -> Arc<Self> { self }
-        pub fn parent(&self) -> Option<Arc<Node>> { None }
-        pub fn children(&self) -> Vec<Arc<Node>> { vec![] }
-        pub fn edges(&self) -> weaveffi::Iter<Arc<Node>> { weaveffi::Iter::new(vec![]) }
-    }
-}
-"#,
-    );
-
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args(["extract", src_path.to_str().unwrap()])
+    // The CLI binary itself is a real executable with no metadata.
+    let bin = assert_cmd::cargo::cargo_bin("weaveffi");
+    let output = weaveffi()
+        .args(["extract", "--library"])
+        .arg(&bin)
         .output()
-        .expect("failed to run extract");
+        .unwrap();
+    assert!(!output.status.success());
+    let err = crate::stderr(&output);
+    assert!(err.contains("no WeaveFFI metadata"), "{err}");
+    assert!(err.contains("export_runtime!"), "{err}");
 
-    assert!(
-        output.status.success(),
-        "extract command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let api: serde_yaml::Value =
-        serde_yaml::from_str(&stdout).expect("output should be valid YAML");
-    let module = &api["modules"].as_sequence().unwrap()[0];
-
-    let edge = &module["structs"].as_sequence().unwrap()[0];
-    let fields = edge["fields"].as_sequence().unwrap();
-    assert_eq!(fields[0]["type"].as_str().unwrap(), "Node");
-    assert_eq!(fields[1]["type"].as_str().unwrap(), "Node?");
-
-    let node = &module["interfaces"].as_sequence().unwrap()[0];
-    let methods = node["methods"].as_sequence().unwrap();
-    let by_name = |n: &str| {
-        methods
-            .iter()
-            .find(|m| m["name"].as_str() == Some(n))
-            .unwrap_or_else(|| panic!("missing method {n}"))
-    };
-    assert_eq!(by_name("me")["return"].as_str().unwrap(), "Node");
-    assert_eq!(by_name("parent")["return"].as_str().unwrap(), "Node?");
-    assert_eq!(by_name("children")["return"].as_str().unwrap(), "[Node]");
-    assert_eq!(by_name("edges")["return"].as_str().unwrap(), "iter<Node>");
-}
-
-#[test]
-fn extract_to_toml_format() {
-    let (_dir, src_path) = write_src(
-        r#"
-#[weaveffi::module]
-mod math {
-    #[weaveffi::export]
-    fn add(a: i32, b: i32) -> i32 {
-        a + b
-    }
-}
-"#,
-    );
-
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args(["extract", src_path.to_str().unwrap(), "--format", "toml"])
+    let output = weaveffi()
+        .arg("extract")
+        .arg(fixture().join("src/lib.rs"))
         .output()
-        .expect("failed to run extract");
-
-    assert!(output.status.success(), "extract --format toml failed");
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let api: toml::Value = stdout.parse().expect("output should be valid TOML");
-
-    let modules = api["modules"]
-        .as_array()
-        .expect("should have modules array");
-    assert_eq!(modules.len(), 1);
-    assert_eq!(modules[0]["name"].as_str().unwrap(), "math");
-
-    let functions = modules[0]["functions"]
-        .as_array()
-        .expect("should have functions array");
-    assert_eq!(functions.len(), 1);
-    assert_eq!(functions[0]["name"].as_str().unwrap(), "add");
+        .unwrap();
+    assert!(!output.status.success());
+    let err = crate::stderr(&output);
+    assert!(err.contains("pass the crate"), "{err}");
 }

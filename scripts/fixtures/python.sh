@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Byte-compile every generated Python file, then type-check the package with
-# mypy when it is available: the `.pyi` stub under --strict and the
-# implementation module itself (which catches undefined names and bad calls
-# into the runtime). Without mypy, only the byte-compile runs.
+# Byte-compile every generated Python file, then type-check each package
+# with mypy --strict: the implementation module is fully annotated (it ships
+# `py.typed` and no separate stub), so this checks both the public surface
+# consumers type against and the bodies (undefined names, bad calls into the
+# runtime). A missing mypy is handled as lib.sh describes, after the
+# byte-compile has run.
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+require python3
 dir=$1
 find "$dir/python" -name '*.py' -print0 | xargs -0 python3 -m py_compile
 if command -v mypy >/dev/null 2>&1; then
@@ -11,11 +15,8 @@ if command -v mypy >/dev/null 2>&1; then
 elif python3 -c "import mypy" >/dev/null 2>&1; then
     mypy=(python3 -m mypy)
 else
-    echo "note: mypy not found; type checks skipped (pip install mypy)"
-    exit 0
+    missing "mypy not found; type checks not run (pip install 'mypy<2')"
 fi
 for pkg in "$dir"/python/*/; do
-    name=$(basename "$pkg")
-    "${mypy[@]}" --strict --python-version 3.9 --no-incremental "$pkg$name.pyi"
-    "${mypy[@]}" --python-version 3.9 --no-incremental "$pkg$name.py"
+    "${mypy[@]}" --strict --python-version 3.9 --no-incremental "$pkg"
 done

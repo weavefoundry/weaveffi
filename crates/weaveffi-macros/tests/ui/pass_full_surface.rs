@@ -44,9 +44,9 @@ mod surface {
 
     #[weaveffi::callback_interface]
     pub trait Observer: Send + Sync {
-        fn on_item(&self, item: &Item, widget: Arc<Widget>);
-        fn should_continue(&self, n: i32) -> bool;
-        fn pick(&self) -> Mode;
+        fn on_item(&self, item: &Item, widget: Arc<Widget>) -> Result<(), weaveffi::ForeignError>;
+        fn should_continue(&self, n: i32) -> Result<bool, weaveffi::ForeignError>;
+        fn pick(&self) -> Result<Mode, weaveffi::ForeignError>;
         fn label(&self, text: &str, data: &[u8]) -> Result<i32, weaveffi::ForeignError>;
     }
 
@@ -85,17 +85,20 @@ mod surface {
 
     #[weaveffi::export]
     pub fn watch(observer: Arc<dyn Observer>, widget: Arc<Widget>) -> bool {
-        observer.on_item(
+        let Ok(mode) = observer.pick() else {
+            return false;
+        };
+        let _ = observer.on_item(
             &Item {
                 id: 1,
                 name: "x".into(),
                 tags: vec![],
-                mode: observer.pick(),
+                mode,
                 owner: Some(widget.clone()),
             },
             widget,
         );
-        observer.should_continue(1)
+        observer.should_continue(1).unwrap_or(false)
     }
 
     #[weaveffi::export]

@@ -1,21 +1,33 @@
-//! The validation rules: per-module name/uniqueness checks, type-reference
-//! existence, ABI-representability of element shapes, callback-interface
-//! shape rules, interface positions, and error-domain consistency.
+//! The validation rules: global name uniqueness, per-module identifier and
+//! shape checks, type-reference resolution, ABI-representability of element
+//! shapes, callback-interface rules, interface positions, and error-domain
+//! consistency.
 //!
-//! Every rule pushes into a shared `Vec<ValidationError>` sink instead of
-//! returning early, so one validation pass reports every violation in the
-//! document.
+//! Every rule pushes into a shared sink instead of returning early, so one
+//! validation pass reports every violation in the document. Each violation
+//! carries the declaration path that encloses it (module segments, then
+//! declaration and member names), which the diagnostic uses to locate the
+//! offending text.
 
-use super::ValidationError;
+use super::{Found, Options, ValidationError};
 use crate::ir::{
-    CallbackInterfaceDef, ErrorDomain, Function, InterfaceDef, Module, Param, StructField, TypeRef,
+    Api, CallbackInterfaceDef, ErrorDomain, Function, InterfaceDef, Module, StructField, TypeRef,
 };
+use crate::ty::{Prim, TypeIndex, TypeKind};
 use std::collections::{BTreeMap, BTreeSet};
 
 const RESERVED: &[&str] = &[
     "if", "else", "for", "while", "loop", "match", "type", "return", "async", "await", "break",
     "continue", "fn", "struct", "enum", "mod", "use",
 ];
+
+/// Primitive spellings other languages have that WeaveFFI deliberately
+/// doesn't support; a reference to one gets a dedicated diagnostic instead
+/// of "unknown type".
+const UNSUPPORTED_PRIMITIVES: &[&str] = &["usize", "isize", "u128", "i128", "char"];
+
+const IDENTIFIER_RULE: &str =
+    "must start with a letter or underscore and contain only alphanumeric characters or underscores";
 
 fn is_valid_identifier(s: &str) -> bool {
     let mut chars = s.chars();
@@ -26,96 +38,702 @@ fn is_valid_identifier(s: &str) -> bool {
     }
 }
 
-fn check_identifier(name: &str, errors: &mut Vec<ValidationError>) -> bool {
-    if !is_valid_identifier(name) {
-        errors.push(ValidationError::InvalidIdentifier(
-            name.to_string(),
-            "must start with a letter or underscore and contain only alphanumeric characters or underscores",
-        ));
-        return false;
-    }
-    if RESERVED.contains(&name) {
-        errors.push(ValidationError::ReservedKeyword(name.to_string()));
-        return false;
-    }
-    true
+/// `scope` extended with `names`.
+fn within(scope: &[String], names: &[&str]) -> Vec<String> {
+    let mut out = scope.to_vec();
+    out.extend(names.iter().map(|n| (*n).to_string()));
+    out
 }
 
-/// The kinds of declarations a bare name can refer to, gathered from the
-/// whole module forest before any rule runs. Validation operates on the
-/// document as written (every user reference is a [`TypeRef::Named`]), so
-/// positional rules consult this index to learn what a name is.
-#[derive(Default)]
-pub(super) struct TypeIndex {
-    /// Bare name of every struct, enum, interface, and callback interface
-    /// anywhere in the API, mapped to its declaring module's dot path.
-    pub all: BTreeMap<String, String>,
-    /// Bare names of every interface anywhere in the API.
-    pub interfaces: BTreeSet<String>,
-    /// Bare names of every callback interface anywhere in the API.
-    pub callback_interfaces: BTreeSet<String>,
-    /// Bare names of every C-style (payload-free) enum anywhere in the API.
-    pub plain_enums: BTreeSet<String>,
+/// Run every rule over `api`, whose declarations `types` indexes.
+pub(super) fn check(api: &Api, types: &TypeIndex, options: Options, found: &mut Vec<Found>) {
+    let mut cx = Cx {
+        types,
+        options,
+        found,
+    };
+    let mut names = BTreeSet::new();
+    for m in &api.modules {
+        if !names.insert(m.name.as_str()) {
+            cx.push(
+                &within(&[], &[&m.name]),
+                ValidationError::DuplicateModuleName {
+                    module: m.name.clone(),
+                },
+            );
+        }
+        cx.module(m, &[], false);
+    }
+    check_global_names(&api.modules, found);
 }
 
-impl TypeIndex {
-    pub(super) fn build(modules: &[Module]) -> Self {
-        let mut index = Self::default();
-        index.walk(modules, "");
-        index
+/// Enforce API-wide name uniqueness: every type name (records, enums,
+/// interfaces, callback interfaces, and error domains), every free-function
+/// name, and every error-code name is global. A free function also may not
+/// share its name with an error domain.
+fn check_global_names(modules: &[Module], found: &mut Vec<Found>) {
+    #[derive(Default)]
+    struct Seen<'a> {
+        types: BTreeMap<&'a str, String>,
+        functions: BTreeMap<&'a str, String>,
+        codes: BTreeMap<&'a str, String>,
+        domains: BTreeMap<&'a str, String>,
+        /// Every free function, as `(name, module path, module segments)`.
+        all_functions: Vec<(&'a str, String, Vec<String>)>,
     }
-
-    fn walk(&mut self, modules: &[Module], parent: &str) {
+    fn walk<'a>(
+        modules: &'a [Module],
+        parent: &[String],
+        seen: &mut Seen<'a>,
+        found: &mut Vec<Found>,
+    ) {
         for m in modules {
-            let path = if parent.is_empty() {
-                m.name.clone()
-            } else {
-                format!("{parent}.{}", m.name)
-            };
-            let mut declare = |name: &str| {
-                self.all
-                    .entry(name.to_string())
-                    .or_insert_with(|| path.clone());
-            };
-            for s in &m.structs {
-                declare(&s.name);
-            }
-            for e in &m.enums {
-                declare(&e.name);
-                if !e.is_rich() {
-                    self.plain_enums.insert(e.name.clone());
+            let segments = within(parent, &[&m.name]);
+            let path = segments.join(".");
+            let types = m
+                .structs
+                .iter()
+                .map(|s| s.name.as_str())
+                .chain(m.enums.iter().map(|e| e.name.as_str()))
+                .chain(m.interfaces.iter().map(|i| i.name.as_str()))
+                .chain(m.callback_interfaces.iter().map(|c| c.name.as_str()))
+                .chain(m.errors.iter().map(|d| d.name.as_str()));
+            for name in types {
+                match seen.types.get(name) {
+                    Some(first) => found.push((
+                        ValidationError::DuplicateTypeName {
+                            name: name.to_string(),
+                            first: first.clone(),
+                            second: path.clone(),
+                        },
+                        segments.clone(),
+                    )),
+                    None => {
+                        seen.types.insert(name, path.clone());
+                    }
                 }
             }
-            for i in &m.interfaces {
-                declare(&i.name);
-                self.interfaces.insert(i.name.clone());
+            for f in &m.functions {
+                match seen.functions.get(f.name.as_str()) {
+                    Some(first) => found.push((
+                        ValidationError::DuplicateFunctionName {
+                            name: f.name.clone(),
+                            first: first.clone(),
+                            second: path.clone(),
+                        },
+                        segments.clone(),
+                    )),
+                    None => {
+                        seen.functions.insert(&f.name, path.clone());
+                    }
+                }
+                seen.all_functions
+                    .push((&f.name, path.clone(), segments.clone()));
             }
-            for cb in &m.callback_interfaces {
-                declare(&cb.name);
-                self.callback_interfaces.insert(cb.name.clone());
+            if let Some(domain) = &m.errors {
+                seen.domains.entry(&domain.name).or_insert(path.clone());
+                let owner = format!("{path}.{}", domain.name);
+                for code in &domain.codes {
+                    match seen.codes.get(code.name.as_str()) {
+                        Some(first) => found.push((
+                            ValidationError::DuplicateErrorCodeName {
+                                name: code.name.clone(),
+                                first: first.clone(),
+                                second: owner.clone(),
+                            },
+                            within(&segments, &[&domain.name]),
+                        )),
+                        None => {
+                            seen.codes.insert(&code.name, owner.clone());
+                        }
+                    }
+                }
             }
-            self.walk(&m.modules, &path);
+            walk(&m.modules, &segments, seen, found);
+        }
+    }
+    let mut seen = Seen::default();
+    walk(modules, &[], &mut seen, found);
+    for (name, function, segments) in &seen.all_functions {
+        if let Some(domain) = seen.domains.get(name) {
+            found.push((
+                ValidationError::NameCollisionWithErrorDomain {
+                    name: (*name).to_string(),
+                    function: function.clone(),
+                    domain: domain.clone(),
+                },
+                segments.clone(),
+            ));
+        }
+    }
+}
+
+/// The rule context: the type index, the options, and the violation sink.
+struct Cx<'a> {
+    types: &'a TypeIndex,
+    options: Options,
+    found: &'a mut Vec<Found>,
+}
+
+impl Cx<'_> {
+    fn push(&mut self, scope: &[String], error: ValidationError) {
+        self.found.push((error, scope.to_vec()));
+    }
+
+    /// Check that `name` is a valid, non-reserved identifier.
+    fn identifier(&mut self, scope: &[String], name: &str) {
+        if !is_valid_identifier(name) {
+            self.push(
+                scope,
+                ValidationError::InvalidIdentifier {
+                    name: name.to_string(),
+                    reason: IDENTIFIER_RULE,
+                },
+            );
+        } else if RESERVED.contains(&name) {
+            self.push(
+                scope,
+                ValidationError::ReservedKeyword {
+                    name: name.to_string(),
+                },
+            );
         }
     }
 
-    /// Is `name` (bare or dot-qualified) an interface?
-    fn is_interface(&self, name: &str) -> bool {
-        self.interfaces.contains(bare(name))
+    fn kind(&self, name: &str) -> Option<TypeKind> {
+        self.types.kind(name)
     }
 
-    /// Is `name` (bare or dot-qualified) a callback interface?
-    fn is_callback_interface(&self, name: &str) -> bool {
-        self.callback_interfaces.contains(bare(name))
+    fn module(&mut self, module: &Module, parent: &[String], ancestor_has_domain: bool) {
+        if module.name.trim().is_empty() {
+            self.push(parent, ValidationError::NoModuleName);
+            return;
+        }
+        if !is_valid_identifier(&module.name) {
+            self.push(
+                parent,
+                ValidationError::InvalidModuleName {
+                    name: module.name.clone(),
+                    reason: IDENTIFIER_RULE,
+                },
+            );
+        } else if RESERVED.contains(&module.name.as_str()) {
+            self.push(
+                parent,
+                ValidationError::InvalidModuleName {
+                    name: module.name.clone(),
+                    reason: "reserved word",
+                },
+            );
+        }
+        let scope = within(parent, &[&module.name]);
+        let path = scope.join(".");
+        let has_domain = ancestor_has_domain || module.errors.is_some();
+
+        for f in &module.functions {
+            self.function(&scope, &path, &f.name, f, has_domain);
+            self.callable_types(&within(&scope, &[&f.name]), &path, &f.name, f);
+        }
+
+        for s in &module.structs {
+            self.identifier(&scope, &s.name);
+            if s.fields.is_empty() {
+                self.push(
+                    &scope,
+                    ValidationError::EmptyStruct {
+                        module: path.clone(),
+                        name: s.name.clone(),
+                    },
+                );
+            }
+            let decl = within(&scope, &[&s.name]);
+            let mut names = BTreeSet::new();
+            for f in &s.fields {
+                self.identifier(&decl, &f.name);
+                if !names.insert(&f.name) {
+                    self.push(
+                        &decl,
+                        ValidationError::DuplicateStructField {
+                            struct_name: s.name.clone(),
+                            field: f.name.clone(),
+                        },
+                    );
+                }
+                let location = || format!("field '{}' of struct '{}'", f.name, s.name);
+                self.buffered_field(&decl, f, &location);
+            }
+        }
+
+        for e in &module.enums {
+            self.identifier(&scope, &e.name);
+            if e.variants.is_empty() {
+                self.push(
+                    &scope,
+                    ValidationError::EmptyEnum {
+                        module: path.clone(),
+                        name: e.name.clone(),
+                    },
+                );
+            }
+            let decl = within(&scope, &[&e.name]);
+            let mut names = BTreeSet::new();
+            let mut values = BTreeSet::new();
+            for v in &e.variants {
+                self.identifier(&decl, &v.name);
+                if !names.insert(&v.name) {
+                    self.push(
+                        &decl,
+                        ValidationError::DuplicateEnumVariant {
+                            enum_name: e.name.clone(),
+                            variant: v.name.clone(),
+                        },
+                    );
+                }
+                if !values.insert(v.value) {
+                    self.push(
+                        &scope,
+                        ValidationError::DuplicateEnumValue {
+                            enum_name: e.name.clone(),
+                            value: v.value,
+                        },
+                    );
+                }
+                let variant = within(&decl, &[&v.name]);
+                let mut fields = BTreeSet::new();
+                for f in &v.fields {
+                    self.identifier(&variant, &f.name);
+                    if !fields.insert(&f.name) {
+                        self.push(
+                            &variant,
+                            ValidationError::DuplicateEnumVariantField {
+                                enum_name: e.name.clone(),
+                                variant: v.name.clone(),
+                                field: f.name.clone(),
+                            },
+                        );
+                    }
+                    let location =
+                        || format!("field '{}' of variant '{}::{}'", f.name, e.name, v.name);
+                    self.buffered_field(&variant, f, &location);
+                }
+            }
+        }
+
+        for i in &module.interfaces {
+            self.identifier(&scope, &i.name);
+            self.interface(&scope, &path, i, has_domain);
+        }
+
+        for cb in &module.callback_interfaces {
+            self.identifier(&scope, &cb.name);
+            self.callback_interface(&scope, &path, cb, has_domain);
+        }
+
+        if let Some(domain) = &module.errors {
+            self.error_domain(&scope, &path, domain);
+        }
+
+        let mut names = BTreeSet::new();
+        for sub in &module.modules {
+            if !names.insert(sub.name.as_str()) {
+                self.push(
+                    &within(&scope, &[&sub.name]),
+                    ValidationError::DuplicateModuleName {
+                        module: format!("{path}.{}", sub.name),
+                    },
+                );
+            }
+            self.module(sub, &scope, has_domain);
+        }
     }
 
-    /// Does a declaration with this name exist? A bare name may refer to a
-    /// declaration in any module; a dot-qualified name must spell the
-    /// declaring module's path exactly.
-    fn exists(&self, name: &str) -> bool {
-        match (self.all.get(bare(name)), name.rsplit_once('.')) {
-            (None, _) => false,
-            (Some(_), None) => true,
-            (Some(path), Some((qualifier, _))) => path == qualifier,
+    /// A field of a record, a rich-enum variant, or an error payload is
+    /// serialized inside a value buffer, so it obeys the buffered positional
+    /// rules: no iterators, no callback interfaces, no interface map keys,
+    /// and every reference must resolve.
+    fn buffered_field(&mut self, scope: &[String], f: &StructField, location: &dyn Fn() -> String) {
+        let scope = within(scope, &[&f.name]);
+        if contains_iterator(&f.ty) {
+            self.push(
+                &scope,
+                ValidationError::IteratorInInvalidPosition {
+                    location: location(),
+                },
+            );
+        }
+        self.type_ref(&scope, &f.ty);
+        self.interface_positions(&scope, &f.ty, location);
+        self.no_callback_interface(&scope, &f.ty, location);
+    }
+
+    /// Validate an interface's shape: unique member names across
+    /// constructors, methods, and statics; constructor restrictions;
+    /// per-member signature rules. C symbol collisions are checked API-wide
+    /// once the model is built.
+    fn interface(&mut self, scope: &[String], path: &str, iface: &InterfaceDef, has_domain: bool) {
+        if iface.constructors.is_empty() && iface.methods.is_empty() && iface.statics.is_empty() {
+            self.push(
+                scope,
+                ValidationError::EmptyInterface {
+                    module: path.to_string(),
+                    name: iface.name.clone(),
+                },
+            );
+        }
+        let decl = within(scope, &[&iface.name]);
+        let mut names = BTreeSet::new();
+        for (f, constructor) in iface.constructors.iter().map(|c| (c, true)).chain(
+            iface
+                .methods
+                .iter()
+                .chain(&iface.statics)
+                .map(|m| (m, false)),
+        ) {
+            if !names.insert(&f.name) {
+                self.push(
+                    &decl,
+                    ValidationError::DuplicateInterfaceMember {
+                        interface: iface.name.clone(),
+                        name: f.name.clone(),
+                    },
+                );
+            }
+            let display = format!("{}.{}", iface.name, f.name);
+            self.function(&decl, path, &display, f, has_domain);
+            self.callable_types(&within(&decl, &[&f.name]), path, &display, f);
+            if constructor && f.returns.is_some() {
+                self.push(
+                    &decl,
+                    ValidationError::ConstructorHasReturn {
+                        interface: iface.name.clone(),
+                        constructor: f.name.clone(),
+                    },
+                );
+            }
+            if constructor && f.r#async {
+                self.push(
+                    &decl,
+                    ValidationError::AsyncConstructor {
+                        interface: iface.name.clone(),
+                        constructor: f.name.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Validate a callback interface: at least one method, unique method
+    /// names, and per-method restrictions. A callback method is implemented
+    /// by the consumer, so it is synchronous, never takes a cancel token,
+    /// returns nothing or any value but an iterator or a callback interface,
+    /// takes no callback interface or iterator as a parameter, and may
+    /// declare `throws` only when an error domain is in scope.
+    fn callback_interface(
+        &mut self,
+        scope: &[String],
+        path: &str,
+        cb: &CallbackInterfaceDef,
+        has_domain: bool,
+    ) {
+        if cb.methods.is_empty() {
+            self.push(
+                scope,
+                ValidationError::EmptyCallbackInterface {
+                    module: path.to_string(),
+                    name: cb.name.clone(),
+                },
+            );
+        }
+        let decl = within(scope, &[&cb.name]);
+        let mut names = BTreeSet::new();
+        for m in &cb.methods {
+            self.identifier(&decl, &m.name);
+            if !names.insert(&m.name) {
+                self.push(
+                    &decl,
+                    ValidationError::DuplicateCallbackMethod {
+                        interface: cb.name.clone(),
+                        name: m.name.clone(),
+                    },
+                );
+            }
+            let reject = |cx: &mut Self, reason: &'static str| {
+                cx.push(
+                    &decl,
+                    ValidationError::InvalidCallbackMethod {
+                        interface: cb.name.clone(),
+                        method: m.name.clone(),
+                        reason,
+                    },
+                );
+            };
+            if m.r#async {
+                reject(self, "cannot be async");
+            }
+            if m.cancellable {
+                reject(self, "cannot be cancellable");
+            }
+            let method = within(&decl, &[&m.name]);
+            if m.throws && !has_domain {
+                self.push(
+                    &method,
+                    ValidationError::ThrowsWithoutErrorDomain {
+                        module: path.to_string(),
+                        function: format!("{}.{}", cb.name, m.name),
+                    },
+                );
+            }
+            if let Some(ret) = &m.returns {
+                let location = || format!("return type of {path}::{}.{}", cb.name, m.name);
+                if contains_iterator(ret) {
+                    reject(self, "cannot return an iterator");
+                }
+                self.type_ref(&method, ret);
+                self.interface_positions(&method, ret, &location);
+                self.no_callback_interface(&method, ret, &location);
+            }
+            let mut params = BTreeSet::new();
+            for p in &m.params {
+                self.identifier(&method, &p.name);
+                if !params.insert(&p.name) {
+                    self.push(
+                        &method,
+                        ValidationError::DuplicateParamName {
+                            module: path.to_string(),
+                            function: format!("{}.{}", cb.name, m.name),
+                            param: p.name.clone(),
+                        },
+                    );
+                }
+                let param = within(&method, &[&p.name]);
+                let location = || {
+                    format!(
+                        "param '{}' of callback interface method '{}.{}'",
+                        p.name, cb.name, m.name
+                    )
+                };
+                if contains_iterator(&p.ty) {
+                    self.push(
+                        &param,
+                        ValidationError::IteratorInInvalidPosition {
+                            location: location(),
+                        },
+                    );
+                }
+                self.type_ref(&param, &p.ty);
+                self.interface_positions(&param, &p.ty, &location);
+                self.no_callback_interface(&param, &p.ty, &location);
+            }
+        }
+    }
+
+    /// Name-level checks for one callable declared in `scope`: a valid
+    /// identifier, unique parameter names, and an error domain in scope when
+    /// the callable declares `throws`.
+    fn function(
+        &mut self,
+        scope: &[String],
+        path: &str,
+        display: &str,
+        f: &Function,
+        has_domain: bool,
+    ) {
+        self.identifier(scope, &f.name);
+        let decl = within(scope, &[&f.name]);
+        if f.cancellable && !f.r#async {
+            self.push(
+                &decl,
+                ValidationError::CancellableNotAsync {
+                    module: path.to_string(),
+                    function: display.to_string(),
+                },
+            );
+        }
+        if f.throws && !has_domain {
+            self.push(
+                &decl,
+                ValidationError::ThrowsWithoutErrorDomain {
+                    module: path.to_string(),
+                    function: display.to_string(),
+                },
+            );
+        }
+        let mut names = BTreeSet::new();
+        for p in &f.params {
+            self.identifier(&decl, &p.name);
+            if !names.insert(&p.name) {
+                self.push(
+                    &decl,
+                    ValidationError::DuplicateParamName {
+                        module: path.to_string(),
+                        function: display.to_string(),
+                        param: p.name.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Type-level checks for one callable's parameters and return: iterator
+    /// positions, async-iterator exclusion, reference resolution, element
+    /// shapes, interface map keys, and callback-interface positions. `scope`
+    /// ends with the callable's own name.
+    fn callable_types(&mut self, scope: &[String], path: &str, display: &str, f: &Function) {
+        for p in &f.params {
+            let param = within(scope, &[&p.name]);
+            let location = || format!("param '{}' of function '{path}::{display}'", p.name);
+            if contains_iterator(&p.ty) {
+                self.push(
+                    &param,
+                    ValidationError::IteratorInInvalidPosition {
+                        location: location(),
+                    },
+                );
+            }
+            self.type_ref(&param, &p.ty);
+            self.interface_positions(&param, &p.ty, &location);
+            // A bare or optional callback interface is the one legal
+            // callback position; anything nested (`[Listener]`, a record
+            // field) is not.
+            let top = match &p.ty {
+                TypeRef::Optional(inner) => inner.as_ref(),
+                other => other,
+            };
+            match top {
+                TypeRef::Named(name) if self.kind(name) == Some(TypeKind::CallbackInterface) => {}
+                _ => self.no_callback_interface(&param, &p.ty, &location),
+            }
+        }
+        if let Some(ret) = &f.returns {
+            let location = || format!("return type of {path}::{display}");
+            // An async function completes through a one-shot callback; an
+            // iterator needs a pull-based handle. The two shapes cannot
+            // compose on the C ABI, so reject the combination up front
+            // instead of letting backends lower it inconsistently.
+            if f.r#async && contains_iterator(ret) {
+                self.push(
+                    scope,
+                    ValidationError::AsyncIteratorReturn {
+                        module: path.to_string(),
+                        function: display.to_string(),
+                    },
+                );
+            }
+            // An iterator is a pull handle, valid only as the outermost
+            // return shape: `[iter<T>]`, `iter<T>?`, `iter<iter<T>>`, and
+            // iterators inside a map have no lowering.
+            let nested_iterator = match ret {
+                TypeRef::Iterator(elem) => contains_iterator(elem),
+                other => contains_iterator(other),
+            };
+            if nested_iterator {
+                self.push(
+                    scope,
+                    ValidationError::IteratorInInvalidPosition {
+                        location: format!("nested inside the {}", location()),
+                    },
+                );
+            }
+            self.type_ref(scope, ret);
+            self.interface_positions(scope, ret, &location);
+            self.no_callback_interface(scope, ret, &location);
+        }
+    }
+
+    /// Enforce the one place an interface reference may not appear: as a
+    /// map key. Objects are reference-counted tokens, so they compose with
+    /// every other buffered shape (fields, elements, map values, optionals),
+    /// but no target can hash an object by identity in a way that survives
+    /// the ABI.
+    fn interface_positions(
+        &mut self,
+        scope: &[String],
+        ty: &TypeRef,
+        location: &dyn Fn() -> String,
+    ) {
+        let mut keys = Vec::new();
+        ty.walk(&mut |t| {
+            if let TypeRef::Map(k, _) = t {
+                if let TypeRef::Named(name) = &**k {
+                    keys.push(name.clone());
+                }
+            }
+        });
+        for name in keys {
+            if self.kind(&name) == Some(TypeKind::Interface) {
+                self.push(
+                    scope,
+                    ValidationError::InterfaceInInvalidPosition {
+                        name,
+                        location: format!("map key of {}", location()),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Reject any callback-interface reference reachable from `ty`. Callers
+    /// that permit a bare top-level callback interface unwrap it first.
+    fn no_callback_interface(
+        &mut self,
+        scope: &[String],
+        ty: &TypeRef,
+        location: &dyn Fn() -> String,
+    ) {
+        let mut names = Vec::new();
+        ty.walk(&mut |t| {
+            if let TypeRef::Named(name) = t {
+                names.push(name.clone());
+            }
+        });
+        for name in names {
+            if self.kind(&name) == Some(TypeKind::CallbackInterface) {
+                self.push(
+                    scope,
+                    ValidationError::CallbackInterfaceInInvalidPosition {
+                        name,
+                        location: location(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Check that every name in `ty` resolves to a declaration, and that
+    /// every map key is a legal key type.
+    fn type_ref(&mut self, scope: &[String], ty: &TypeRef) {
+        match ty {
+            TypeRef::Named(name) => {
+                let error = if name.contains('.') {
+                    ValidationError::QualifiedTypeRef { name: name.clone() }
+                } else if self.kind(name).is_some() {
+                    return;
+                } else if UNSUPPORTED_PRIMITIVES.contains(&name.as_str()) {
+                    ValidationError::UnsupportedPrimitive { name: name.clone() }
+                } else if self.options.foreign_names {
+                    // A record or rich enum from another module tree.
+                    return;
+                } else {
+                    ValidationError::UnknownTypeRef { name: name.clone() }
+                };
+                self.push(scope, error);
+            }
+            TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+                self.type_ref(scope, inner);
+            }
+            TypeRef::Map(k, v) => {
+                if !self.is_map_key(k) {
+                    self.push(
+                        scope,
+                        ValidationError::InvalidMapKey {
+                            key_type: k.to_string(),
+                        },
+                    );
+                }
+                self.type_ref(scope, k);
+                self.type_ref(scope, v);
+            }
+            TypeRef::Prim(_) => {}
         }
     }
 
@@ -126,293 +744,50 @@ impl TypeIndex {
     /// bytes, and objects are rejected.
     fn is_map_key(&self, ty: &TypeRef) -> bool {
         match ty {
-            TypeRef::I8
-            | TypeRef::I16
-            | TypeRef::I32
-            | TypeRef::U8
-            | TypeRef::U16
-            | TypeRef::U32
-            | TypeRef::I64
-            | TypeRef::U64
-            | TypeRef::Bool
-            | TypeRef::StringUtf8 => true,
-            TypeRef::Named(name) => self.plain_enums.contains(bare(name)),
+            TypeRef::Prim(p) => p.is_integer() || matches!(p, Prim::Bool | Prim::String),
+            TypeRef::Named(name) => self.kind(name) == Some(TypeKind::Enum),
             _ => false,
         }
     }
 
-    /// May `ty` be returned from a callback-interface method? Only `void`
-    /// and the direct family: scalars, bool, and C-style enums.
-    fn is_direct(&self, ty: &TypeRef) -> bool {
-        match ty {
-            TypeRef::I8
-            | TypeRef::I16
-            | TypeRef::I32
-            | TypeRef::U8
-            | TypeRef::U16
-            | TypeRef::U32
-            | TypeRef::I64
-            | TypeRef::U64
-            | TypeRef::F32
-            | TypeRef::F64
-            | TypeRef::Bool => true,
-            TypeRef::Named(name) => self.plain_enums.contains(bare(name)),
-            _ => false,
+    fn error_domain(&mut self, scope: &[String], path: &str, domain: &ErrorDomain) {
+        if domain.name.trim().is_empty() {
+            self.push(
+                scope,
+                ValidationError::ErrorDomainMissingName {
+                    module: path.to_string(),
+                },
+            );
+            return;
         }
-    }
-}
-
-/// The final segment of a possibly dot-qualified name.
-fn bare(name: &str) -> &str {
-    name.rsplit('.').next().unwrap_or(name)
-}
-
-/// Enforce global bare-name uniqueness for the type namespace: structs,
-/// enums, interfaces, callback interfaces, and error domains across every
-/// module (including nested submodules).
-///
-/// Generators emit flat per-language type names, and unqualified cross-module
-/// references resolve by bare name, so two types sharing a name would collide
-/// in generated code and make references ambiguous.
-pub(super) fn check_global_type_names(modules: &[Module], errors: &mut Vec<ValidationError>) {
-    fn walk<'a>(
-        modules: &'a [Module],
-        prefix: &str,
-        seen: &mut BTreeMap<&'a str, String>,
-        errors: &mut Vec<ValidationError>,
-    ) {
-        for m in modules {
-            let path = if prefix.is_empty() {
-                m.name.clone()
-            } else {
-                format!("{prefix}.{}", m.name)
-            };
-            let names = m
-                .structs
-                .iter()
-                .map(|s| s.name.as_str())
-                .chain(m.enums.iter().map(|e| e.name.as_str()))
-                .chain(m.interfaces.iter().map(|i| i.name.as_str()))
-                .chain(m.callback_interfaces.iter().map(|c| c.name.as_str()))
-                .chain(m.errors.iter().map(|d| d.name.as_str()));
-            for name in names {
-                if let Some(first) = seen.get(name) {
-                    errors.push(ValidationError::DuplicateTypeName {
-                        name: name.to_string(),
-                        first: first.clone(),
-                        second: path.clone(),
-                    });
-                } else {
-                    seen.insert(name, path.clone());
-                }
-            }
-            walk(&m.modules, &path, seen, errors);
-        }
-    }
-    let mut seen = BTreeMap::new();
-    walk(modules, "", &mut seen, errors);
-}
-
-/// Enforce API-global uniqueness of error *code* names across domains.
-///
-/// Backends with flat namespaces derive one error class or constant per
-/// code, so `NotFound` declared in two different domains would collide in
-/// generated code even though each domain is internally consistent.
-pub(super) fn check_global_error_code_names(modules: &[Module], errors: &mut Vec<ValidationError>) {
-    fn walk<'a>(
-        modules: &'a [Module],
-        prefix: &str,
-        seen: &mut BTreeMap<&'a str, String>,
-        errors: &mut Vec<ValidationError>,
-    ) {
-        for m in modules {
-            let path = if prefix.is_empty() {
-                m.name.clone()
-            } else {
-                format!("{prefix}.{}", m.name)
-            };
-            if let Some(domain) = &m.errors {
-                let owner = format!("{path}.{}", domain.name);
-                for code in &domain.codes {
-                    if let Some(first) = seen.get(code.name.as_str()) {
-                        errors.push(ValidationError::DuplicateErrorCodeName {
-                            name: code.name.clone(),
-                            first: first.clone(),
-                            second: owner.clone(),
-                        });
-                    } else {
-                        seen.insert(&code.name, owner.clone());
-                    }
-                }
-            }
-            walk(&m.modules, &path, seen, errors);
-        }
-    }
-    let mut seen = BTreeMap::new();
-    walk(modules, "", &mut seen, errors);
-}
-
-pub(super) fn validate_module(
-    module: &Module,
-    types: &TypeIndex,
-    ancestor_has_domain: bool,
-    errors: &mut Vec<ValidationError>,
-) {
-    if module.name.trim().is_empty() {
-        errors.push(ValidationError::NoModuleName);
-        return;
-    }
-    if !is_valid_identifier(&module.name) {
-        errors.push(ValidationError::InvalidModuleName(
-            module.name.clone(),
-            "must start with a letter or underscore and contain only alphanumeric characters or underscores",
-        ));
-    } else if RESERVED.contains(&module.name.as_str()) {
-        errors.push(ValidationError::InvalidModuleName(
-            module.name.clone(),
-            "reserved word",
-        ));
-    }
-
-    let has_domain = ancestor_has_domain || module.errors.is_some();
-
-    let mut function_names = BTreeSet::new();
-    for f in &module.functions {
-        if !function_names.insert(f.name.clone()) {
-            errors.push(ValidationError::DuplicateFunctionName {
-                module: module.name.clone(),
-                function: f.name.clone(),
-            });
-        }
-        validate_function(&module.name, &f.name, f, has_domain, errors);
-    }
-
-    let mut struct_names = BTreeSet::new();
-    for s in &module.structs {
-        check_identifier(&s.name, errors);
-        if !struct_names.insert(s.name.clone()) {
-            errors.push(ValidationError::DuplicateStructName {
-                module: module.name.clone(),
-                name: s.name.clone(),
-            });
-        }
-        if s.fields.is_empty() {
-            errors.push(ValidationError::EmptyStruct {
-                module: module.name.clone(),
-                name: s.name.clone(),
-            });
-        }
-        let mut field_names = BTreeSet::new();
-        for f in &s.fields {
-            check_identifier(&f.name, errors);
-            if !field_names.insert(f.name.clone()) {
-                errors.push(ValidationError::DuplicateStructField {
-                    struct_name: s.name.clone(),
-                    field: f.name.clone(),
-                });
-            }
-        }
-    }
-
-    let mut enum_names = BTreeSet::new();
-    for e in &module.enums {
-        check_identifier(&e.name, errors);
-        if !enum_names.insert(e.name.clone()) {
-            errors.push(ValidationError::DuplicateEnumName {
-                module: module.name.clone(),
-                name: e.name.clone(),
-            });
-        }
-        if e.variants.is_empty() {
-            errors.push(ValidationError::EmptyEnum {
-                module: module.name.clone(),
-                name: e.name.clone(),
-            });
-        }
-        let mut variant_names = BTreeSet::new();
-        let mut variant_values = BTreeMap::new();
-        for v in &e.variants {
-            check_identifier(&v.name, errors);
-            if !variant_names.insert(v.name.clone()) {
-                errors.push(ValidationError::DuplicateEnumVariant {
-                    enum_name: e.name.clone(),
-                    variant: v.name.clone(),
-                });
-            }
-            if variant_values.insert(v.value, v.name.clone()).is_some() {
-                errors.push(ValidationError::DuplicateEnumValue {
-                    enum_name: e.name.clone(),
-                    value: v.value,
-                });
-            }
-            let mut variant_field_names = BTreeSet::new();
-            for f in &v.fields {
-                check_identifier(&f.name, errors);
-                if !variant_field_names.insert(f.name.clone()) {
-                    errors.push(ValidationError::DuplicateEnumVariantField {
-                        enum_name: e.name.clone(),
-                        variant: v.name.clone(),
-                        field: f.name.clone(),
-                    });
-                }
-            }
-        }
-    }
-
-    let mut local_interface_names = BTreeSet::new();
-    for i in &module.interfaces {
-        check_identifier(&i.name, errors);
-        if !local_interface_names.insert(i.name.clone()) {
-            errors.push(ValidationError::DuplicateInterfaceName {
-                module: module.name.clone(),
-                name: i.name.clone(),
-            });
-        }
-        validate_interface(module, i, has_domain, errors);
-    }
-
-    let mut callback_names = BTreeSet::new();
-    for cb in &module.callback_interfaces {
-        check_identifier(&cb.name, errors);
-        if !callback_names.insert(cb.name.clone()) {
-            errors.push(ValidationError::DuplicateCallbackInterfaceName {
-                module: module.name.clone(),
-                name: cb.name.clone(),
-            });
-        }
-        validate_callback_interface(module, cb, types, errors);
-    }
-
-    // A field of a record, a rich-enum variant, or an error payload is
-    // serialized inside a value buffer, so it obeys the buffered positional
-    // rules: no iterators, no callback interfaces, no interface map keys, and
-    // every reference must resolve.
-    let mut check_buffered_field = |f: &StructField, location: &dyn Fn() -> String| {
-        if contains_iterator(&f.ty) {
-            errors.push(ValidationError::IteratorInInvalidPosition {
-                location: location(),
-            });
-        }
-        validate_type_ref(&f.ty, types, errors);
-        check_interface_positions(&f.ty, types, location, errors);
-        check_no_callback_interface(&f.ty, types, location, errors);
-    };
-    for s in &module.structs {
-        for f in &s.fields {
-            let location = || format!("field '{}' of struct '{}'", f.name, s.name);
-            check_buffered_field(f, &location);
-        }
-    }
-    for e in &module.enums {
-        for v in &e.variants {
-            for f in &v.fields {
-                let location = || format!("field '{}' of variant '{}::{}'", f.name, e.name, v.name);
-                check_buffered_field(f, &location);
-            }
-        }
-    }
-    if let Some(domain) = &module.errors {
+        self.identifier(scope, &domain.name);
+        let decl = within(scope, &[&domain.name]);
+        let mut values = BTreeSet::new();
         for c in &domain.codes {
+            self.identifier(&decl, &c.name);
+            // 0 means success and the whole negative range is reserved for
+            // the runtime (-1 generic error, -2 panic, -3 marshalling
+            // failure, -4 foreign callback error, -5 cancelled, and room to
+            // grow), so domain codes must be positive.
+            if c.code <= 0 {
+                self.push(
+                    &decl,
+                    ValidationError::InvalidErrorCode {
+                        module: path.to_string(),
+                        name: c.name.clone(),
+                    },
+                );
+            }
+            if !values.insert(c.code) {
+                self.push(
+                    &decl,
+                    ValidationError::DuplicateErrorCode {
+                        module: path.to_string(),
+                        value: c.code,
+                    },
+                );
+            }
+            let code = within(&decl, &[&c.name]);
             for f in &c.fields {
                 let location = || {
                     format!(
@@ -420,384 +795,14 @@ pub(super) fn validate_module(
                         f.name, domain.name, c.name
                     )
                 };
-                check_buffered_field(f, &location);
+                self.buffered_field(&code, f, &location);
             }
         }
     }
-    for f in &module.functions {
-        validate_callable_types(&module.name, &f.name, f, types, errors);
-    }
-    for i in &module.interfaces {
-        for f in i.constructors.iter().chain(&i.methods).chain(&i.statics) {
-            let display = format!("{}.{}", i.name, f.name);
-            validate_callable_types(&module.name, &display, f, types, errors);
-        }
-    }
-
-    if let Some(domain) = &module.errors {
-        validate_error_domain(module, domain, &function_names, errors);
-    }
-
-    let mut sub_module_names = BTreeSet::new();
-    for sub in &module.modules {
-        if !sub_module_names.insert(sub.name.clone()) {
-            errors.push(ValidationError::DuplicateModuleName(sub.name.clone()));
-        }
-        validate_module(sub, types, has_domain, errors);
-    }
-}
-
-/// Validate an interface's shape: unique member names across constructors,
-/// methods, and statics; constructor restrictions; per-member signature
-/// rules. C symbol collisions are checked API-wide once the model is built.
-fn validate_interface(
-    module: &Module,
-    iface: &InterfaceDef,
-    has_domain: bool,
-    errors: &mut Vec<ValidationError>,
-) {
-    if iface.constructors.is_empty() && iface.methods.is_empty() && iface.statics.is_empty() {
-        errors.push(ValidationError::EmptyInterface {
-            module: module.name.clone(),
-            name: iface.name.clone(),
-        });
-    }
-    let mut member_names = BTreeSet::new();
-    let mut check_member = |f: &Function, errors: &mut Vec<ValidationError>| {
-        if !member_names.insert(f.name.clone()) {
-            errors.push(ValidationError::DuplicateInterfaceMember {
-                interface: iface.name.clone(),
-                name: f.name.clone(),
-            });
-        }
-        let display = format!("{}.{}", iface.name, f.name);
-        validate_function(&module.name, &display, f, has_domain, errors);
-    };
-    for c in &iface.constructors {
-        check_member(c, errors);
-        if c.returns.is_some() {
-            errors.push(ValidationError::ConstructorHasReturn {
-                interface: iface.name.clone(),
-                constructor: c.name.clone(),
-            });
-        }
-        if c.r#async {
-            errors.push(ValidationError::AsyncConstructor {
-                interface: iface.name.clone(),
-                constructor: c.name.clone(),
-            });
-        }
-    }
-    for m in &iface.methods {
-        check_member(m, errors);
-    }
-    for s in &iface.statics {
-        check_member(s, errors);
-    }
-}
-
-/// Validate a callback interface: at least one method, unique method names,
-/// and per-method restrictions. A callback method is implemented by the
-/// consumer, so it is synchronous, never throws, never takes a cancel token,
-/// returns nothing or a direct value, and takes no callback interface or
-/// iterator as a parameter.
-fn validate_callback_interface(
-    module: &Module,
-    cb: &CallbackInterfaceDef,
-    types: &TypeIndex,
-    errors: &mut Vec<ValidationError>,
-) {
-    if cb.methods.is_empty() {
-        errors.push(ValidationError::EmptyCallbackInterface {
-            module: module.name.clone(),
-            name: cb.name.clone(),
-        });
-    }
-    let mut method_names = BTreeSet::new();
-    for m in &cb.methods {
-        check_identifier(&m.name, errors);
-        if !method_names.insert(m.name.clone()) {
-            errors.push(ValidationError::DuplicateCallbackMethod {
-                interface: cb.name.clone(),
-                name: m.name.clone(),
-            });
-        }
-        let reject = |reason: &'static str, errors: &mut Vec<ValidationError>| {
-            errors.push(ValidationError::InvalidCallbackMethod {
-                interface: cb.name.clone(),
-                method: m.name.clone(),
-                reason,
-            });
-        };
-        if m.r#async {
-            reject("cannot be async", errors);
-        }
-        if m.throws {
-            reject("cannot declare throws", errors);
-        }
-        if m.cancellable {
-            reject("cannot be cancellable", errors);
-        }
-        if let Some(ret) = &m.returns {
-            validate_type_ref(ret, types, errors);
-            if !types.is_direct(ret) {
-                reject(
-                    "must return nothing or a direct value (scalar, bool, or C-style enum)",
-                    errors,
-                );
-            }
-        }
-        let mut param_names = BTreeSet::new();
-        for p in &m.params {
-            validate_param(p, errors);
-            if !param_names.insert(p.name.clone()) {
-                errors.push(ValidationError::DuplicateParamName {
-                    module: module.name.clone(),
-                    function: format!("{}.{}", cb.name, m.name),
-                    param: p.name.clone(),
-                });
-            }
-            let location = || {
-                format!(
-                    "param '{}' of callback interface method '{}.{}'",
-                    p.name, cb.name, m.name
-                )
-            };
-            if contains_iterator(&p.ty) {
-                errors.push(ValidationError::IteratorInInvalidPosition {
-                    location: location(),
-                });
-            }
-            validate_type_ref(&p.ty, types, errors);
-            check_interface_positions(&p.ty, types, location, errors);
-            check_no_callback_interface(&p.ty, types, location, errors);
-        }
-    }
-}
-
-/// Name-level checks for one callable: a valid identifier, unique parameter
-/// names, and an error domain in scope when the callable declares `throws`.
-fn validate_function(
-    module_name: &str,
-    display_name: &str,
-    f: &Function,
-    has_domain: bool,
-    errors: &mut Vec<ValidationError>,
-) {
-    check_identifier(&f.name, errors);
-
-    if f.cancellable && !f.r#async {
-        errors.push(ValidationError::CancellableNotAsync {
-            module: module_name.to_string(),
-            function: display_name.to_string(),
-        });
-    }
-
-    if f.throws && !has_domain {
-        errors.push(ValidationError::ThrowsWithoutErrorDomain {
-            module: module_name.to_string(),
-            function: display_name.to_string(),
-        });
-    }
-
-    let mut param_names = BTreeSet::new();
-    for p in &f.params {
-        validate_param(p, errors);
-        if !param_names.insert(p.name.clone()) {
-            errors.push(ValidationError::DuplicateParamName {
-                module: module_name.to_string(),
-                function: display_name.to_string(),
-                param: p.name.clone(),
-            });
-        }
-    }
-}
-
-/// Type-level checks for one callable's parameters and return: iterator
-/// positions, async-iterator exclusion, reference existence, element shapes,
-/// interface map keys, and callback-interface positions.
-fn validate_callable_types(
-    module_name: &str,
-    display_name: &str,
-    f: &Function,
-    types: &TypeIndex,
-    errors: &mut Vec<ValidationError>,
-) {
-    for p in &f.params {
-        let location = || {
-            format!(
-                "param '{}' of function '{module_name}::{display_name}'",
-                p.name
-            )
-        };
-        if contains_iterator(&p.ty) {
-            errors.push(ValidationError::IteratorInInvalidPosition {
-                location: location(),
-            });
-        }
-        validate_type_ref(&p.ty, types, errors);
-        check_interface_positions(&p.ty, types, location, errors);
-        // A bare callback interface is the one legal callback position;
-        // anything nested (`Listener?`, `[Listener]`) is not.
-        match &p.ty {
-            TypeRef::Named(name) if types.is_callback_interface(name) => {}
-            other => check_no_callback_interface(other, types, location, errors),
-        }
-    }
-    if let Some(ret) = &f.returns {
-        let location = || format!("return type of {module_name}::{display_name}");
-        // An async function completes through a one-shot callback; an
-        // iterator needs a pull-based handle. The two shapes cannot
-        // compose on the C ABI, so reject the combination up front
-        // instead of letting backends lower it inconsistently.
-        if f.r#async && contains_iterator(ret) {
-            errors.push(ValidationError::AsyncIteratorReturn {
-                module: module_name.to_string(),
-                function: display_name.to_string(),
-            });
-        }
-        // An iterator is a pull handle, valid only as the outermost return
-        // shape: `[iter<T>]`, `iter<T>?`, `iter<iter<T>>`, and iterators
-        // inside a map have no lowering.
-        let nested_iterator = match ret {
-            TypeRef::Iterator(elem) => contains_iterator(elem),
-            other => contains_iterator(other),
-        };
-        if nested_iterator {
-            errors.push(ValidationError::IteratorInInvalidPosition {
-                location: format!("nested inside the {}", location()),
-            });
-        }
-        validate_type_ref(ret, types, errors);
-        check_interface_positions(ret, types, location, errors);
-        check_no_callback_interface(ret, types, location, errors);
-    }
-}
-
-fn validate_param(p: &Param, errors: &mut Vec<ValidationError>) {
-    check_identifier(&p.name, errors);
-}
-
-/// Enforce the one place an interface reference may not appear: as a map
-/// key. Objects are reference-counted tokens, so they compose with every
-/// other buffered shape (fields, elements, map values, optionals), but no
-/// target can hash an object by identity in a way that survives the ABI.
-fn check_interface_positions(
-    ty: &TypeRef,
-    types: &TypeIndex,
-    location: impl Fn() -> String + Copy,
-    errors: &mut Vec<ValidationError>,
-) {
-    ty.walk(&mut |t| {
-        if let TypeRef::Map(k, _) = t {
-            if let TypeRef::Named(name) = &**k {
-                if types.is_interface(name) {
-                    errors.push(ValidationError::InterfaceInInvalidPosition {
-                        name: name.clone(),
-                        location: format!("map key of {}", location()),
-                    });
-                }
-            }
-        }
-    });
-}
-
-/// Reject any callback-interface reference reachable from `ty`. Callers that
-/// permit a bare top-level callback interface unwrap it before calling.
-fn check_no_callback_interface(
-    ty: &TypeRef,
-    types: &TypeIndex,
-    location: impl Fn() -> String + Copy,
-    errors: &mut Vec<ValidationError>,
-) {
-    ty.walk(&mut |t| {
-        if let TypeRef::Named(name) = t {
-            if types.is_callback_interface(name) {
-                errors.push(ValidationError::CallbackInterfaceInInvalidPosition {
-                    name: name.clone(),
-                    location: location(),
-                });
-            }
-        }
-    });
 }
 
 fn contains_iterator(ty: &TypeRef) -> bool {
     let mut found = false;
-    ty.walk(&mut |t| {
-        if matches!(t, TypeRef::Iterator(_)) {
-            found = true;
-        }
-    });
+    ty.walk(&mut |t| found |= matches!(t, TypeRef::Iterator(_)));
     found
-}
-
-fn validate_type_ref(ty: &TypeRef, types: &TypeIndex, errors: &mut Vec<ValidationError>) {
-    match ty {
-        TypeRef::Named(name) => {
-            if !types.exists(name) {
-                errors.push(ValidationError::UnknownTypeRef { name: name.clone() });
-            }
-        }
-        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            validate_type_ref(inner, types, errors);
-        }
-        TypeRef::Map(k, v) => {
-            if !types.is_map_key(k) {
-                errors.push(ValidationError::InvalidMapKey {
-                    key_type: k.to_string(),
-                });
-            }
-            validate_type_ref(k, types, errors);
-            validate_type_ref(v, types, errors);
-        }
-        _ => {}
-    }
-}
-
-fn validate_error_domain(
-    module: &Module,
-    domain: &ErrorDomain,
-    function_names: &BTreeSet<String>,
-    errors: &mut Vec<ValidationError>,
-) {
-    if domain.name.trim().is_empty() {
-        errors.push(ValidationError::ErrorDomainMissingName(module.name.clone()));
-        return;
-    }
-    check_identifier(&domain.name, errors);
-    if function_names.contains(&domain.name) {
-        errors.push(ValidationError::NameCollisionWithErrorDomain {
-            module: module.name.clone(),
-            name: domain.name.clone(),
-        });
-    }
-
-    let mut by_name: BTreeSet<String> = BTreeSet::new();
-    let mut by_code: BTreeMap<i32, String> = BTreeMap::new();
-    for c in &domain.codes {
-        check_identifier(&c.name, errors);
-        // 0 means success and the whole negative range is reserved for the
-        // runtime (-1 generic error, -2 panic, -3 marshalling failure, -4
-        // foreign callback error, and room to grow), so domain codes must be
-        // positive.
-        if c.code <= 0 {
-            errors.push(ValidationError::InvalidErrorCode {
-                module: module.name.clone(),
-                name: c.name.clone(),
-            });
-        }
-        if !by_name.insert(c.name.clone()) {
-            errors.push(ValidationError::DuplicateErrorName {
-                module: module.name.clone(),
-                name: c.name.clone(),
-            });
-        }
-        if by_code.insert(c.code, c.name.clone()).is_some() {
-            errors.push(ValidationError::DuplicateErrorCode {
-                module: module.name.clone(),
-                code: c.code,
-            });
-        }
-    }
 }

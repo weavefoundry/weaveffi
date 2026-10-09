@@ -1,4 +1,4 @@
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: shared
     structs:
@@ -52,6 +52,19 @@ modules:
               - { name: item, type: Item }
               - { name: gadget, type: Gadget }
             return: bool
+          - name: label
+            doc: A display label, failing with a kitchen error
+            params: []
+            return: string
+            throws: true
+          - name: latest
+            doc: The most recent item the listener kept, if any
+            params: []
+            return: "Item?"
+          - name: favorite
+            doc: The listener's favorite gadget
+            params: []
+            return: Gadget
     errors:
       name: KitchenErrors
       codes:
@@ -116,6 +129,11 @@ modules:
         params:
           - { name: listener, type: ReadyListener }
         return: i32
+      - name: maybe_subscribe
+        doc: Register a listener if one is given
+        params:
+          - { name: listener, type: "ReadyListener?" }
+        return: bool
       - name: maybe_gadget
         doc: Optional object in both directions
         params:

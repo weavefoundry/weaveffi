@@ -1,6 +1,6 @@
 # WeaveFFI
 
-[![CI](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml/badge.svg)](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT) [![crates.io](https://img.shields.io/crates/v/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli) [![Schema](https://img.shields.io/badge/schema-0.10.0-orange)](./weaveffi.schema.json) [![C ABI](https://img.shields.io/badge/C%20ABI-3-orange)](docs/src/reference/abi.md)
+[![CI](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml/badge.svg)](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT) [![crates.io](https://img.shields.io/crates/v/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli) [![Schema](https://img.shields.io/badge/schema-0.11.0-orange)](./weaveffi.schema.json) [![C ABI](https://img.shields.io/badge/C%20ABI-4-orange)](docs/src/reference/abi.md)
 
 WeaveFFI generates idiomatic, type-safe bindings for 11 languages (C, C++,
 Swift, Kotlin, Node.js, WebAssembly, Python, .NET, Dart, Go, and Ruby) for any
@@ -26,8 +26,9 @@ What you get, in every language:
   abstract class the consumer implements and the library calls from any
   thread.
 - **Load-time safety.** Each generated package checks the library's ABI
-  revision and a per-module contract checksum before the first call, so a
-  stale binding fails with a clear error instead of corrupting memory.
+  revision and its contract table before the first call, so a stale binding
+  fails with an error naming the declaration that changed instead of
+  corrupting memory.
 
 ## Quickstart
 
@@ -37,8 +38,15 @@ What you get, in every language:
 cargo install weaveffi-cli
 ```
 
-**2. Write the library.** In a Rust crate with `crate-type = ["cdylib"]` and
-`cargo add weaveffi`:
+**2. Write the library.**
+
+```bash
+cargo new --lib kvstore && cd kvstore
+cargo add weaveffi
+```
+
+Add `crate-type = ["cdylib"]` under `[lib]` in `Cargo.toml`, then put this in
+`src/lib.rs`:
 
 ```rust
 #[weaveffi::module]
@@ -99,17 +107,30 @@ weaveffi::export_runtime!();
 
 The macro emits the `extern "C"` functions; you write no `unsafe` code. An
 interface type must be `Send + Sync`, because the object is shared across the
-boundary as an `Arc<T>`.
+boundary as an `Arc<T>`. This is a trimmed-down store; the full
+[`samples/kvstore`](samples/kvstore/src/lib.rs) adds records, enums,
+callbacks, iterators, async, and the rest (see [Samples](docs/src/samples.md)).
 
-**3. Generate bindings.**
+**3. Generate bindings.** The package name, the C prefix (`kvstore_`), and
+the library name all come from the crate.
 
 ```bash
-weaveffi init           # writes weaveffi.toml: [project] input = "src/lib.rs"
-weaveffi generate       # every target, into ./bindings
-cargo build             # builds libkvstore
+weaveffi init           # writes weaveffi.toml: [project] input = "." (this crate)
+weaveffi generate       # builds libkvstore, reads its API, writes every target to ./bindings
 ```
 
+`weaveffi generate` builds the crate and reads the API from the library it
+compiled (the macro embeds it), so the bindings always describe exactly what
+the library exports. While iterating, use `weaveffi dev` instead: it does the
+same and also copies the fresh debug library into the generated Python,
+Node.js, and Ruby packages (and prints how to point the other targets at it).
+
 **4. Use them.** From Python, for example:
+
+```bash
+weaveffi dev                       # regenerate and copy libkvstore into bindings/python/kvstore
+pip install ./bindings/python
+```
 
 ```python
 import kvstore
@@ -117,21 +138,20 @@ import kvstore
 with kvstore.Store.open("data.kv") as store:
     store.put("greeting", b"hello")
     print(store.count())  # 1
-
-try:
-    ...
-except kvstore.StoreFull as e:
-    print(e.code, e.message)  # 1003 store has reached capacity
+    try:
+        store.put("another", b"value")
+    except kvstore.StoreFull as e:
+        print(e.code, e.message)  # 1003 store has reached capacity
 ```
 
 <details>
 <summary>The C header every target binds to (<code>bindings/c/kvstore.h</code>)</summary>
 
 ```c
-#define KVSTORE_ABI_VERSION 3u
+#define KVSTORE_ABI_VERSION 4u
 KVSTORE_API uint32_t kvstore_abi_version(void);
-#define KVSTORE_KV_CHECKSUM 0xf6b8170a59ae07a7ull
-KVSTORE_API uint64_t kvstore_kv_checksum(void);
+KVSTORE_API const kvstore_contract_entry* kvstore_kv_contract(size_t* out_len);
+#define KVSTORE_KV_CONTRACT_LEN 5
 
 typedef enum {
     kvstore_kv_KvError_KeyNotFound = 1001,
@@ -172,19 +192,28 @@ public final class Store: @unchecked Sendable {
 </details>
 
 <details>
-<summary>Python type stubs (<code>bindings/python/kvstore/kvstore.pyi</code>)</summary>
+<summary>Python, fully annotated (<code>bindings/python/kvstore/kvstore.py</code>)</summary>
 
 ```python
-class KvError(Error): ...
-class KeyNotFound(KvError): ...
-class StoreFull(KvError): ...
+class KvError(Error):
+    """Base exception for the `kv` module's error domain."""
 
-class Store:
-    def close(self) -> None: ...
-    def __enter__(self) -> "Store": ...
-    def __exit__(self, *exc: object) -> None: ...
+class KeyNotFound(KvError):
+    CODE = 1001
+
+class StoreFull(KvError):
+    CODE = 1003
+
+class Store(_Object):  # close() it, or use `with`
     @classmethod
-    def open(cls, path: str) -> "Store": ...
+    def open(cls, path: str) -> Store:
+        _path_b = path.encode("utf-8")
+        _err = _ErrorStruct()
+        _ret = _c_kv_Store_open(_path_b, len(_path_b), ctypes.byref(_err))
+        if _err.code:
+            raise _kv_error_from(*_read_error(_err))
+        return cls._adopt(_required(_ret))
+
     def put(self, key: str, value: bytes) -> bool: ...
     def count(self) -> int: ...
 ```
@@ -206,7 +235,7 @@ Started](docs/src/getting-started.md).
 | Kotlin | Gradle (Android or JVM) | `AutoCloseable` + cleaner | `suspend` | coroutine cancellation | `interface` |
 | Node.js | npm package (N-API addon) | `close()`, `Symbol.dispose` | `Promise` | `AbortSignal` | object |
 | WebAssembly | npm package (ESM) | `close()`, `Symbol.dispose` | `Promise` | `AbortSignal` | object |
-| Python | `pyproject.toml` package + `.pyi` | `close()`, `with` | awaitable | task cancellation | ABC |
+| Python | `pyproject.toml` package (typed, `py.typed`) | `close()`, `with` | awaitable | task cancellation | ABC |
 | .NET | `.csproj` (NuGet) | `IDisposable` over `SafeHandle` | `Task` | `CancellationToken` | interface |
 | Dart | pub package | `dispose()` + `NativeFinalizer` | `Future` | `CancelToken` | abstract class |
 | Go | Go module (cgo) | `Close() error` | blocking call | `context.Context` | interface |
@@ -231,11 +260,13 @@ release](https://github.com/weavefoundry/weaveffi/releases).
 | Command | What it does |
 |---|---|
 | `weaveffi init [dir]` | Write `weaveffi.toml` (and a starter IDL outside a Rust crate) |
-| `weaveffi generate [input]` | Generate bindings; `--target c,swift` to subset, `--dry-run` to list files. Only changed files are rewritten, and files a previous run produced that are no longer generated are removed |
+| `weaveffi generate [input]` | Generate bindings from a Rust producer crate (built first; `--library <path>` reads an existing build) or an IDL; `--target c,swift` to subset, `--dry-run` to list files. Only changed files are rewritten, and files a previous run produced that are no longer generated are removed |
 | `weaveffi validate [input]` | Validate without generating; `--warn` for lints, `--format json` |
 | `weaveffi diff [input]` | Show what regenerating would change; `--check` exits non-zero for CI |
-| `weaveffi package [input]` | Assemble publishable packages that bundle prebuilt native libraries |
-| `weaveffi extract <file.rs>` | Print the IDL derived from annotated Rust |
+| `weaveffi build [input]` | Cross-compile the Rust producer per platform (`--platforms`) into `target/weaveffi/<platform>/`, with prebuilt Node.js and JNI glue |
+| `weaveffi package [input]` | Build, then write installable artifacts per target to `dist/`: wheels, npm tarballs, gems, an `XCFramework` SwiftPM package, a `.nupkg`, and more |
+| `weaveffi dev [input]` | Build the producer's debug library, generate, and point the bindings at the library |
+| `weaveffi extract [input]` | Print the IDL a Rust producer's built library embeds (`--library <path>` to read a given build) |
 | `weaveffi schema` | Print the JSON Schema of the IDL |
 
 With a `[project]` table in `weaveffi.toml`, every command works without
@@ -243,7 +274,7 @@ arguments from anywhere in the project:
 
 ```toml
 [project]
-input = "src/lib.rs"     # or an IDL such as "kvstore.yml"
+input = "."              # this crate, or an IDL such as "kvstore.yml"
 out = "bindings"
 targets = ["c", "swift", "kotlin", "python"]
 
@@ -252,7 +283,7 @@ version = "1.0.0"
 license = "MIT"
 
 [generators.swift]
-module_name = "KVStore"
+name = "KVStore"
 ```
 
 A Rust producer's package name, C prefix, and library name come from its
@@ -273,7 +304,7 @@ others.
 
 ## Status
 
-WeaveFFI is pre-1.0: the IDL schema is `0.10.0` and the C ABI is revision 3,
+WeaveFFI is pre-1.0: the IDL schema is `0.11.0` and the C ABI is revision 4,
 and either may change in a minor release. See [Stability and
 Versioning](docs/src/stability.md) for the policy and the migration notes, and
 the [Roadmap](docs/src/roadmap.md) for what's next.

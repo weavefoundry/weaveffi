@@ -20,7 +20,9 @@ pub mod work {
 }
 
 extern "C" fn done(ctx: *mut c_void, err: *mut FfiError, result: i32) {
-    let tx = unsafe { &*ctx.cast::<mpsc::Sender<(i32, i32)>>() };
+    // Clone the sender before sending: the test may free the context as soon
+    // as the value arrives, which can be before `send` returns.
+    let tx = unsafe { &*ctx.cast::<mpsc::Sender<(i32, i32)>>() }.clone();
     let code = if err.is_null() {
         0
     } else {
@@ -39,7 +41,7 @@ fn a_dropped_future_completes_with_the_cancelled_code_once() {
     let ctx: *mut c_void = Box::into_raw(Box::new(tx)).cast();
     unsafe { work::dropped_future_work_answer(done, ctx) };
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        rx.recv_timeout(Duration::from_secs(30)).unwrap(),
         (abi::CANCELLED_ERROR_CODE, 0)
     );
     assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());

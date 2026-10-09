@@ -4,7 +4,7 @@
 //! Interface members (constructors, methods, statics) share the callable
 //! dispatch in [`super::sync`]; only the object lifecycle is
 //! interface-specific. An interface object is an `Arc<T>` handed out as a raw
-//! pointer (see `weaveffi_abi::object`), so `_clone` bumps the count and
+//! pointer (see `weaveffi::abi::object`), so `_clone` bumps the count and
 //! `_destroy` releases one reference.
 
 use proc_macro2::TokenStream;

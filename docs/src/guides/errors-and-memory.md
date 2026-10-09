@@ -19,6 +19,30 @@ normative text. Examples use the `kvstore` sample, whose prefix is `kvstore`.
 *Borrowed* means the callee may read the value only until the call returns
 and copies anything it keeps. Everything a producer hands back belongs to the
 receiver, who releases it exactly once with the function in the last column.
+The one transfer in the other direction is a callback method's return value,
+which the producer adopts (see [Callback interfaces](#callback-interfaces)).
+
+## Byte runs
+
+Every string, bytes, and value buffer the producer returns is a **byte run**
+it allocated, and the producer owns the allocator. Two runtime functions
+manage runs:
+
+```c
+uint8_t* kvstore_alloc(size_t len);                 /* a zero-filled run, NULL for 0 */
+void kvstore_free_bytes(uint8_t* ptr, size_t len);  /* returned runs and alloc runs */
+```
+
+A consumer releases a returned run with `{prefix}_free_bytes(ptr, len)`,
+passing the exact length it received. It allocates a run with
+`{prefix}_alloc(len)` only when it hands bytes *to* the producer: a callback
+method's string, bytes, or buffer return, which the producer adopts and
+frees, or (on `wasm32`) an argument staged in the module's linear memory,
+which the consumer frees itself with `{prefix}_free_bytes`. Null with length
+`0` is the empty run everywhere: `{prefix}_alloc(0)` returns null, and
+`{prefix}_free_bytes(ptr, 0)` is a no-op. Never free a run with the
+language's own allocator, and never hand the producer memory that didn't come
+from `{prefix}_alloc`.
 
 ## Strings and bytes
 
@@ -35,11 +59,11 @@ passing the exact length it received. An empty result may come back as
 `NULL` with length `0`.
 
 ```c
-/* The calculator sample's `echo(s: string) -> string`. */
+/* The calculator sample's `greet(name: string) -> string`. */
 calculator_error err = {0};
 size_t len = 0;
 const uint8_t* text =
-    calculator_calculator_echo((const uint8_t*)"hi", 2, &len, &err);
+    calculator_calculator_greet((const uint8_t*)"Ada", 3, &len, &err);
 if (err.code == 0) {
     printf("%.*s\n", (int)len, (const char*)text);
     calculator_free_bytes((uint8_t*)text, len);
@@ -96,13 +120,28 @@ The [capability matrix](../generators/README.md) lists each target's idiom.
 A callback-interface parameter lowers to `void* {name}_ctx` plus
 `const {vtable}* {name}_vtable`. The consumer owns `ctx` (a generated binding
 uses a key into a table that keeps the implementation alive) and a static
-vtable per interface. The producer may call any entry, any number of times,
-from any thread, until it calls `free(ctx)` exactly once.
+vtable per interface, whose header records its `size` and `free` hook. The
+producer may call any entry, any number of times, from any thread, until it
+calls `free(ctx)` exactly once; `free` may also run on any producer thread.
+An optional callback parameter (`Cb?`) passes a null vtable for none.
 
 Arguments to a callback method follow the parameter rules above, seen from
 the consumer: strings, bytes, and buffers are borrowed for the duration of
 the call and must be copied or decoded before returning; objects transfer one
 reference the consumer adopts.
+
+A callback method's return transfers to the producer:
+
+| Return | Slot | Ownership |
+|--------|------|-----------|
+| direct value | the C return | copied |
+| object (`I`, `I?`) | the C return, `{prefix}_{path}_{I}*` | one strong reference (a fresh `_clone`) the producer adopts; `I` must not be null |
+| `string`, `bytes`, value buffer | trailing `uint8_t** out_ptr, size_t* out_len` | a run the consumer allocated with `{prefix}_alloc`, which the producer adopts and frees |
+
+The producer adopts whatever the slots hold even when the method fails, so a
+consumer that fails after allocating doesn't leak. A return the producer
+can't accept (text that isn't UTF-8, a null `I`, an out-of-range enum value,
+a malformed buffer) fails the method with `-3`.
 
 ## Iterators
 
@@ -110,7 +149,10 @@ An `iter<T>` return is an opaque handle. `{Iter}_next` writes one element
 (returning `1`) or reports the end (returning `0`); each element is owned by
 the consumer under the return rules above. `{Iter}_destroy` is called exactly
 once, either on exhaustion or when the consumer abandons the iteration early.
-The generated wrappers do both.
+The generated wrappers do both. An iterator is advanced by one caller at a
+time: a `_next` that arrives while another is in progress on the same
+iterator (from another thread, or re-entrantly from a callback the producer's
+`next` calls) fails with `-3` rather than blocking.
 
 ## Errors
 
@@ -152,9 +194,9 @@ success), released with `{prefix}_error_free`, which also frees the box.
 |------|---------|
 | `0` | success |
 | `> 0` | a declared code of the module's [error domain](../reference/idl.md#error-domains) |
-| `-1` | generic: an untyped producer error (`Result<T, String>`, an error type without a domain code) |
+| `-1` | generic: an untyped producer error (`Result<T, String>`, an error type without a domain code), or an async call the executor couldn't start |
 | `-2` | the producer panicked; the message carries the panic text |
-| `-3` | marshalling failure: a null or invalid argument, non-UTF-8 text, an out-of-range enum value, a malformed value buffer |
+| `-3` | marshalling failure: a null or invalid argument, non-UTF-8 text, an out-of-range enum value, a malformed value buffer (including a map with a repeated key), a callback vtable smaller than the producer's, an iterator advanced concurrently |
 | `-4` | a consumer's callback-interface implementation failed; the message is the consumer's |
 | `-5` | cancelled: an async call's cancel token fired, or its executor dropped it (async completions only) |
 
@@ -172,10 +214,9 @@ flag, and every target applies the same rule:
   producer's message, and the payload fields as properties. A negative code
   surfaces as the package's root error type with that code.
 - **No `throws`.** The function can't report a domain error, so any non-zero
-  code is a producer bug or a failed callback. The binding raises it through
-  the target's programming-error idiom (an unchecked exception, a Go panic,
-  a Swift `fatalError` that includes the code and message) and never dresses
-  it up as a domain error.
+  code is a bug, and the binding traps on it (see
+  [The trap policy](#the-trap-policy)). It never dresses the code up as a
+  domain error.
 - **`-5` on an async call** always surfaces as the language's own
   cancellation error (Swift's `CancellationError`, Kotlin's
   `CancellationException`, .NET's `OperationCanceledException`, Python's
@@ -189,6 +230,31 @@ A Rust producer's domain error message is its `Display` output. An IDL
 `message:` (or a Rust variant's doc comment) is the documented default that
 generated docs and consumer-side constructors use.
 
+### The trap policy
+
+A failure of a call that isn't `throws` is a producer bug (a panic, an
+argument the producer couldn't lift, a callback failure it let through a
+call that can't report one), and every binding treats it the same way: it
+raises the language's unchecked error rather than a declared one, naming the
+runtime code and the producer's message so the bug can be diagnosed from the
+report.
+
+| Target | What a failed non-throwing call raises |
+|--------|-----------------------------------------|
+| C | nothing; the caller reads `err.code` itself |
+| C++ | `{namespace}::InternalError` (a `std::runtime_error`) |
+| Swift | `fatalError`, since Swift has no unchecked errors (as in UniFFI) |
+| Kotlin | `NativeBugException` (an `IllegalStateException`) |
+| Node.js, WebAssembly | the package's root error class, `{PascalCase(name)}Error` (`KvstoreError`), with the negative `code` |
+| Python | `InternalError` (a `RuntimeError`) |
+| .NET | `NativeBugException` (an `InvalidOperationException`) |
+| Dart | `NativeError` (an `Error`, not an `Exception`) |
+| Go | a `panic` whose value is the package's `*Error` |
+| Ruby | `NativeBugError` (a subclass of the gem's root `Error < StandardError`) |
+
+Cancellation (`-5`) isn't a bug and always surfaces as the language's
+cancellation error, as above.
+
 ### Payloads
 
 An error code may declare fields. When the producer raises it, the fields are
@@ -201,21 +267,48 @@ no fields leaves the payload null. `{prefix}_error_clear` and
 
 A consumer's callback implementation can fail in the consumer's language. The
 binding catches the exception in its trampoline and reports it through the
-vtable entry's `out_err` by calling
+vtable entry's `out_err` with the runtime surface:
 
 ```c
 void kvstore_error_set(kvstore_error* err, int32_t code, const char* message);
+void kvstore_error_set_payload(kvstore_error* err, const uint8_t* ptr, size_t len);
 ```
 
-with code `-4` and a borrowed message, which the producer copies with its own
-allocator. A hand-written C consumer must do the same and never store its own
-allocation in `message`. A positive code written there is reported as `-4`,
-so a consumer failure can't impersonate a domain error. The producer then
-abandons the call it was making (or handles the failure, if its callback
-method returns `Result<T, ForeignError>`), and the original caller sees `-4`
-with the consumer's message. Because `-4` isn't a domain code, a consumer
-that wants to catch its own callback failures should call the producer
-through a `throws: true` function.
+Both copy their arguments with the producer's allocator; a consumer never
+stores its own allocation in `message`. What the producer receives depends
+on the method:
+
+- A method declared `throws` (it needs an error domain in scope for its
+  module) may report a positive code of that domain, attaching the code's
+  fields encoded as a value buffer with `{prefix}_error_set_payload`. The
+  fields may not include objects. The producer receives the code, message,
+  and payload as written.
+- Every other failure, including a code the domain doesn't declare or a
+  positive code from a method without `throws`, reaches the producer as `-4`
+  with the consumer's message, so a consumer bug can't impersonate a domain
+  error.
+
+The producer decides what the failure means for the call in progress. Nothing
+unwinds and nothing is deferred: in a Rust producer every callback trait
+method returns `Result<T, weaveffi::ForeignError>`, and the failure arrives
+as an `Err`:
+
+```rust
+pub struct ForeignError {
+    pub code: i32,         // -4, a declared domain code, or -3 for a bad return
+    pub message: String,   // the consumer's message
+    pub payload: Vec<u8>,  // a domain code's fields, else empty
+}
+```
+
+`ForeignError::domain::<E>()` decodes a declared domain code and its payload
+into the module's `#[weaveffi::error]` enum, returning `None` for anything
+else. A producer function that returns `Result<T, ForeignError>` (and is
+therefore `throws`, so its module needs an error domain in scope) can
+propagate the failure with `?`, and the original caller then sees the
+consumer's code, message, and payload. A function that handles the failure
+itself returns whatever it likes. See the
+[producer macro guide](producer-macro.md#callback-interfaces) for examples.
 
 ### Panics
 
@@ -223,6 +316,17 @@ A Rust producer's thunks catch panics and report them as `-2`. Destructors
 (`_destroy`) have no error slot, so a panic in a `Drop` implementation is
 swallowed rather than unwinding into C. Async functions report panics through
 the completion callback.
+
+## Leak checks
+
+`{prefix}_debug_live(kind)` reports how many resources are live, so a test
+harness can assert that a consumer released everything: `0` objects, `1`
+foreign callbacks, `2` iterators, `3` cancel tokens, and `4` byte runs
+(returned runs and `{prefix}_alloc` runs not yet freed or adopted). Kind `-1`
+returns `1` when the producer counts at all and `0` when it doesn't, so a
+harness can tell "nothing is live" from "nothing is counted". A Rust producer
+counts only with the `weaveffi` crate's `leak-check` feature; without it
+every kind returns `0`.
 
 ## Thread safety
 
@@ -245,6 +349,9 @@ should document it.
 - **Not clearing the error.** The message and payload leak, and a stale
   non-zero `code` confuses the next check. Start every slot at `{0}`.
 - **`error_clear` on an async error.** It leaks the box; use `error_free`.
-- **Holding a lock across a callback call.** With a plain-return callback
-  method, a consumer failure unwinds through the producer and poisons a
-  `std::sync::Mutex`; snapshot state, release the lock, then call.
+- **Freeing a callback's returned run.** A string, bytes, or buffer a
+  callback method returns belongs to the producer once it's written to the
+  out slots; allocate it with `{prefix}_alloc` and don't free it.
+- **Holding a lock across a callback call.** The consumer's implementation
+  may call back into the producer, which then waits on the lock you hold;
+  snapshot state, release the lock, then call.

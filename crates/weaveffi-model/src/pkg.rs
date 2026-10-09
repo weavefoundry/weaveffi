@@ -2,13 +2,12 @@
 //!
 //! The `[package]` table of a project's `weaveffi.toml` ([`Package`]) declares
 //! what the library is called and how it is published. The CLI resolves it
-//! once into an [`Identity`] and attaches it to the [`ResolvedApi`], so the C
-//! symbol prefix, the native library name, and every ecosystem's package,
-//! module, and namespace name derive from the same values. Nothing a
-//! generator emits is named after WeaveFFI itself, so any number of
-//! WeaveFFI-built libraries can coexist in one process and one application.
-//!
-//! [`ResolvedApi`]: crate::ResolvedApi
+//! once into an [`Identity`], and validation builds it into the
+//! [`Model`](crate::model::Model), so the C symbol prefix, the native library
+//! name, and every ecosystem's package, module, and namespace name derive
+//! from the same values. Nothing a generator emits is named after WeaveFFI
+//! itself, so any number of WeaveFFI-built libraries can coexist in one
+//! process and one application.
 
 use serde::{Deserialize, Serialize};
 
@@ -43,8 +42,8 @@ pub struct Package {
     /// Source repository URL.
     pub repository: Option<String>,
     /// C symbol prefix for an IDL-defined library. Defaults to the snake-case
-    /// package name. A Rust producer's prefix is always its crate name, so
-    /// setting this for a `.rs` input is an error.
+    /// package name. A Rust producer's prefix is always its crate's library
+    /// name, so setting this for a Rust producer is an error.
     pub c_prefix: Option<String>,
     /// Base name of the native library (`lib{library}.so`, `{library}.dll`)
     /// for an IDL-defined library. Defaults to the snake-case package name.

@@ -1,13 +1,13 @@
 //! Shared rendering helpers: identifiers, C-type spelling, ABI slot lists,
-//! sentinels, call targets, the producer-signature reader, and the
-//! panic-catching thunk wrapper.
+//! call targets, the producer-signature reader, and `#[cfg]` wrapping.
 
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, ToTokens};
 use syn::spanned::Spanned as _;
 use syn::Ident;
 use weaveffi_model::abi::{AbiParam, CType, ConstPos};
-use weaveffi_model::model::{ParamBinding, Ty};
+use weaveffi_model::model::ParamBinding;
+use weaveffi_model::ty::Ty;
 
 /// Make a call-site identifier from a string.
 pub(crate) fn ident(name: &str) -> Ident {
@@ -81,80 +81,36 @@ pub(crate) fn ret_arrow(ret: &CType, prefix: &str) -> TokenStream {
     }
 }
 
-/// The statement that leaves a thunk early: `return sentinel;`, or a bare
-/// `return;` for a `void` symbol (`sentinel` is `None`).
-pub(crate) fn early_return(sentinel: Option<&TokenStream>) -> TokenStream {
-    match sentinel {
-        Some(s) => quote!(return #s;),
-        None => quote!(return;),
+/// The C return type a thunk's body evaluates to (`()` for `void`).
+pub(crate) fn ret_type(ret: &CType, prefix: &str) -> TokenStream {
+    if matches!(ret, CType::Void) {
+        quote!(())
+    } else {
+        ctype_to_rust(ret, prefix)
     }
 }
 
-/// The zero/null value a fallible symbol returns on the error path, or
-/// `None` for a `void` symbol.
-pub(crate) fn sentinel(ret: &CType) -> Option<TokenStream> {
-    Some(match ret {
-        CType::Void => return None,
-        CType::Ptr {
-            konst: ConstPos::None,
-            ..
-        } => quote!(::std::ptr::null_mut()),
-        CType::Ptr { .. } => quote!(::std::ptr::null()),
-        CType::Bool => quote!(false),
-        CType::Float | CType::Double => quote!(0.0),
-        _ => quote!(0),
-    })
-}
-
-/// The statement every thunk runs right after the producer's code returns:
-/// if a consumer callback failure was deferred during the call (a
-/// `panic = "abort"` build), report it through `out_err` and return
-/// `sentinel`, dropping the producer's result unlowered.
-pub(crate) fn deferred_failure_check(sentinel: Option<&TokenStream>) -> TokenStream {
-    let ret = early_return(sentinel);
-    quote! {
-        if let ::std::option::Option::Some(__wv_f) = ::weaveffi::abi::take_foreign_error() {
-            unsafe { ::weaveffi::abi::error_set(out_err, __wv_f.code, &__wv_f.message) };
-            #ret
-        }
+/// Put the `#[cfg]` attributes of the declaration generated items belong
+/// to on each of them, so they exist exactly when it does. Items without a
+/// `#[cfg]` pass through unchanged.
+pub(crate) fn cfg_wrap(cfgs: &[&syn::Attribute], items: TokenStream) -> TokenStream {
+    if cfgs.is_empty() || items.is_empty() {
+        return items;
+    }
+    match syn::parse2::<syn::File>(items.clone()) {
+        Ok(file) => file
+            .items
+            .iter()
+            .map(|item| quote!(#(#cfgs)* #item))
+            .collect(),
+        // Unreachable for well-formed output; let the compiler report it.
+        Err(_) => items,
     }
 }
 
-/// The `error_set(out_err, MARSHAL_ERROR_CODE, msg); return sentinel;` tail a
-/// synchronous thunk uses to reject an invalid input.
-pub(crate) fn reject(msg: &str, sentinel: Option<&TokenStream>) -> TokenStream {
-    let ret = early_return(sentinel);
-    quote! {
-        unsafe {
-            ::weaveffi::abi::error_set(out_err, ::weaveffi::abi::MARSHAL_ERROR_CODE, #msg)
-        };
-        #ret
-    }
-}
-
-/// True when this type crosses the ABI by value without owning heap data.
-pub(crate) fn is_copy(ty: &Ty) -> bool {
-    matches!(
-        ty,
-        Ty::I8
-            | Ty::I16
-            | Ty::I32
-            | Ty::I64
-            | Ty::U8
-            | Ty::U16
-            | Ty::U32
-            | Ty::U64
-            | Ty::F32
-            | Ty::F64
-            | Ty::Bool
-            | Ty::Enum(_)
-    )
-}
-
-/// The bare Rust type name of a struct/enum reference (dropping any qualifying
-/// module path the resolver added).
-pub(crate) fn rust_type_ident(name: &str) -> Ident {
-    ident(name.rsplit('.').next().unwrap_or(name))
+/// A string literal naming a parameter, for marshalling error messages.
+pub(crate) fn name_lit(name: &str) -> syn::LitStr {
+    syn::LitStr::new(name, Span::call_site())
 }
 
 // ── the producer's own signature ─────────────────────────────────────────
@@ -162,7 +118,7 @@ pub(crate) fn rust_type_ident(name: &str) -> Ident {
 /// A view of the producer's written signature, used wherever the thunk must
 /// spell a type the way the producer did.
 ///
-/// The binding model knows every type *semantically* (`Ty::Interface("Store")`)
+/// The model knows every type *semantically* (`Ty::Interface("Store")`)
 /// but not how the producer spelled it (`&Store`, `Arc<Store>`,
 /// `Option<Arc<super::Store>>`). Thunks are emitted inside the producer's
 /// module, so reusing the written path keeps parent-module types in scope, and
@@ -243,10 +199,49 @@ impl<'a> UserSig<'a> {
         }
     }
 
-    /// Whether the method returns `Result<T, ForeignError>` (a callback
-    /// method that receives the consumer's failure as a value).
-    pub(crate) fn returns_result(&self) -> bool {
-        weaveffi_model::rust::output_is_result(&self.sig.output)
+    /// The span of the parameter's written type (or the function name), the
+    /// place a type error about it should point.
+    pub(crate) fn param_type_span(&self, name: &str) -> Span {
+        self.param_type(name)
+            .map_or_else(|| self.sig.ident.span(), syn::spanned::Spanned::span)
+    }
+
+    /// The producer's spelling of a by-value parameter type with any `&`
+    /// removed (`&Contact` is `Contact`, `&[Item]` is `Vec<Item>`), for a
+    /// lift that decodes an owned value.
+    pub(crate) fn param_owned(&self, name: &str) -> Option<TokenStream> {
+        let ty = self.param_type(name)?;
+        Some(match ty {
+            syn::Type::Reference(r) => match r.elem.as_ref() {
+                syn::Type::Slice(slice) => {
+                    let elem = self.spell(&slice.elem);
+                    quote!(::std::vec::Vec<#elem>)
+                }
+                other => self.spell(other),
+            },
+            other => self.spell(other),
+        })
+    }
+
+    /// Whether the parameter is written as a slice reference (`&[T]`).
+    pub(crate) fn param_is_slice(&self, name: &str) -> bool {
+        matches!(
+            self.param_type(name),
+            Some(syn::Type::Reference(r)) if matches!(r.elem.as_ref(), syn::Type::Slice(_))
+        )
+    }
+
+    /// The producer's return type with `Result` peeled, spelled for a thunk.
+    pub(crate) fn ret_value_type(&self) -> Option<TokenStream> {
+        self.ret_syn().map(|t| self.spell(t))
+    }
+
+    /// The span of the written return type (or the function name).
+    pub(crate) fn ret_type_span(&self) -> Span {
+        match &self.sig.output {
+            syn::ReturnType::Type(_, ty) => syn::spanned::Spanned::span(ty),
+            syn::ReturnType::Default => self.sig.ident.span(),
+        }
     }
 
     /// Whether the parameter's type (under any `&` and `Option`) is an
@@ -522,6 +517,22 @@ pub(crate) fn ret_arrow_for(
     ret_arrow(ret, prefix)
 }
 
+/// The C return type a thunk's body evaluates to (`()` for `void`),
+/// spelling an object return with the producer's own type.
+pub(crate) fn ret_type_for(
+    ret: &CType,
+    ret_ty: Option<&Ty>,
+    user: &UserSig<'_>,
+    prefix: &str,
+) -> TokenStream {
+    if ret_ty.is_some_and(|t| t.interface_name().is_some()) {
+        if let Some(obj) = user.ret_object() {
+            return quote!(*mut #obj);
+        }
+    }
+    ret_type(ret, prefix)
+}
+
 /// The attributes every exported thunk carries. Thunks are `unsafe extern
 /// "C"` (they trust the caller's pointers), hidden from the producer's docs,
 /// and exempt from the lints generated code can't satisfy.
@@ -575,70 +586,18 @@ impl CallTarget {
         }
     }
 
-    /// The receiver-lift preamble for a synchronous method: null-check, report
-    /// through `out_err`, and bind `__wv_obj` as a borrow (`&self`) or a
-    /// retained reference (`self: Arc<Self>`). Empty for free functions and
-    /// statics.
-    pub(crate) fn self_preamble(
-        &self,
-        sentinel: Option<&TokenStream>,
-        as_arc: bool,
-    ) -> TokenStream {
+    /// The receiver lift for a method (`None` for free functions and
+    /// statics): a borrow for `&self`, or a retained reference for
+    /// `self: Arc<Self>` and for every async method (`retain`), whose
+    /// future outlives the call.
+    pub(crate) fn self_lift(&self, retain: bool) -> Option<TokenStream> {
         let CallTarget::Method(ty) = self else {
-            return TokenStream::new();
+            return None;
         };
-        let fail = reject("self is null", sentinel);
-        let lift = if as_arc {
-            quote!(unsafe { ::weaveffi::abi::object_arc::<#ty>(__wv_self) })
+        Some(if retain {
+            quote!(::weaveffi::abi::lift_self_arc::<#ty>(__wv_self))
         } else {
-            quote!(unsafe { ::weaveffi::abi::object_ref::<#ty>(__wv_self) })
-        };
-        quote! {
-            let __wv_obj = match #lift {
-                ::std::option::Option::Some(__wv_o) => __wv_o,
-                ::std::option::Option::None => { #fail }
-            };
-        }
-    }
-}
-
-/// Wrap a thunk body in `catch_unwind` so a producer panic is reported through
-/// `out_err` (with the reserved panic code, or the foreign code when the
-/// payload is a consumer callback's failure) instead of unwinding across the C
-/// boundary. On a non-throwing function this is the only way `out_err` can
-/// report failure, which consumers interpret per
-/// [`weaveffi_model::plan::ErrorStrategy::Trap`]. `sentinel` is the value the
-/// thunk returns on the panic path (`None` for a `void` thunk).
-///
-/// The body runs inside a [`ThunkScope`](weaveffi_abi::ThunkScope), so on a
-/// `panic = "abort"` build a consumer failure deferred during the call is
-/// recorded for this thunk (and checked by [`deferred_failure_check`] in the
-/// body) rather than for some later, unrelated call.
-pub(crate) fn wrap_unwind(body: TokenStream, sentinel: Option<&TokenStream>) -> TokenStream {
-    let tail = match sentinel {
-        Some(s) => quote!(#s),
-        None => TokenStream::new(),
-    };
-    quote! {
-        let __wv_scope = ::weaveffi::abi::ThunkScope::enter();
-        let __wv_out = match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(move || {
-            #[allow(unused_unsafe)]
-            unsafe {
-                #body
-            }
-        })) {
-            ::std::result::Result::Ok(__wv_v) => __wv_v,
-            ::std::result::Result::Err(__wv_panic) => {
-                unsafe {
-                    ::weaveffi::abi::error_store(
-                        out_err,
-                        ::weaveffi::abi::FfiError::from_panic(&*__wv_panic),
-                    )
-                };
-                #tail
-            }
-        };
-        ::std::mem::drop(__wv_scope);
-        __wv_out
+            quote!(::weaveffi::abi::lift_self::<#ty>(__wv_self))
+        })
     }
 }

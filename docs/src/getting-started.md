@@ -92,30 +92,36 @@ objects, callbacks, iterators, and async functions.
 ## Configure and generate
 
 Run `weaveffi init` in the crate. It writes a `weaveffi.toml` whose
-`[project]` table points at `src/lib.rs`, then lists anything the crate still
-needs (a `cdylib` crate type, the `weaveffi` dependency, the
-`export_runtime!` call):
+`[project]` table points at the crate itself, then lists anything the crate
+still needs (a `cdylib` crate type, the `export_runtime!` call, a
+`#[weaveffi::module]`):
 
 ```bash
 weaveffi init
 ```
 
+The file it writes generates all eleven targets; uncomment `targets` to pick
+a subset:
+
 ```toml
 # weaveffi.toml
 [project]
-input = "src/lib.rs"
+input = "."                 # this crate
 out = "bindings"
-targets = ["c", "python"]   # omit to generate all eleven
+targets = ["c", "python"]
 ```
 
-Build the library and generate the bindings. With a `[project]` table,
-`weaveffi generate` needs no arguments and works from any directory in the
-project:
+Generate the bindings. With a `[project]` table, `weaveffi generate` needs
+no arguments and works from any directory in the project:
 
 ```bash
-cargo build
 weaveffi generate
 ```
+
+`weaveffi generate` runs `cargo build`, then reads the API from the library
+it built: the macro embeds a description of every exported declaration in
+the library, so the bindings match the compiled code exactly, `#[cfg]`
+included. `weaveffi extract` prints that description as an IDL.
 
 The output has one directory per target. The C target writes
 `bindings/c/mathlib.h`; the Python target writes an installable package
@@ -125,15 +131,21 @@ that are no longer produced.
 
 ## Call it from Python
 
-Install the generated package and point it at the library you built. Every
-generated loader honors a `{PREFIX}_LIBRARY` environment variable, here
-`MATHLIB_LIBRARY`; a packaged release bundles the library instead (see
-[Packaging](guides/packaging.md)).
+Run `weaveffi dev` instead of `weaveffi generate` while you iterate: it
+builds the debug library, generates, and copies the library into the
+generated Python package, which loads a bundled copy first. Then install the
+package:
 
 ```bash
+weaveffi dev
 pip install ./bindings/python
-export MATHLIB_LIBRARY="$PWD/target/debug/libmathlib.dylib"   # .so on Linux
 ```
+
+To load a library from somewhere else, set `MATHLIB_LIBRARY` to its full
+path; the Python, Ruby, .NET, Dart, and Kotlin (JVM) packages all honor that
+`{PREFIX}_LIBRARY` variable at run time, and `weaveffi dev` prints the value
+for them. A packaged release bundles the library instead (see
+[Packaging](guides/packaging.md)).
 
 ```python
 import mathlib
@@ -144,12 +156,12 @@ print(mathlib.greet("Python"))    # Hello, Python!
 try:
     mathlib.div(1, 0)
 except mathlib.MathError as e:
-    print("caught:", e)           # caught: division by zero
+    print(e.code, e.message)      # 1 division by zero
 ```
 
-On import the package checks the library's ABI revision and the contract
-checksum of the `math` module, so a library built from different source
-fails to load with an error naming the module. The
+On import the package checks the library's ABI revision and the `math`
+module's contract table, so a library built from incompatible source fails
+to load with an error naming the declaration that's missing or changed. The
 [Python page](generators/python.md) documents the generated surface.
 
 ## Call it from C
@@ -165,7 +177,7 @@ returned strings are released with `mathlib_free_bytes`:
 
 int main(void) {
     if (mathlib_abi_version() != MATHLIB_ABI_VERSION ||
-        mathlib_math_checksum() != MATHLIB_MATH_CHECKSUM) {
+        mathlib_math_contract_check() != 0) {
         fprintf(stderr, "mathlib.h does not match the loaded library\n");
         return 1;
     }
@@ -197,6 +209,25 @@ DYLD_LIBRARY_PATH=target/debug ./main    # LD_LIBRARY_PATH on Linux
 [Errors and Memory](guides/errors-and-memory.md) states every ownership rule
 the generated bindings follow for you.
 
+## Ship it
+
+```bash
+weaveffi package --target python,node
+```
+
+`weaveffi package` builds the library in release mode for this machine
+(that's `weaveffi build`), then writes installable artifacts to `dist/`:
+here a wheel with the library inside, and npm tarballs carrying the library
+and a prebuilt addon. Neither needs `MATHLIB_LIBRARY` or a compiler:
+
+```bash
+pip install dist/python/mathlib-*.whl
+npm install dist/node/*.tgz
+```
+
+[Packaging](guides/packaging.md) covers more platforms (iOS, Android,
+Windows, `wasm32`), every target's artifacts, and publishing.
+
 ## Implementing an IDL in C
 
 A producer doesn't have to be Rust. Start from an IDL, generate the C header,
@@ -212,7 +243,7 @@ Edit `greeter.yml` to declare the API (the [IDL reference](reference/idl.md)
 has the full schema):
 
 ```yaml
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: greeter
     functions:
@@ -233,12 +264,19 @@ weaveffi generate --target c     # writes bindings/c/greeter.h
 
 ```c
 /* greeter.c */
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include "greeter.h"
 
 uint32_t greeter_abi_version(void) { return GREETER_ABI_VERSION; }
-uint64_t greeter_greeter_checksum(void) { return GREETER_GREETER_CHECKSUM; }
+
+/* The contract table the header was generated with. */
+const greeter_contract_entry* greeter_greeter_contract(size_t* out_len) {
+    static const greeter_contract_entry table[] = GREETER_GREETER_CONTRACT;
+    *out_len = GREETER_GREETER_CONTRACT_LEN;
+    return table;
+}
 
 int32_t greeter_greeter_add(int32_t a, int32_t b, greeter_error* out_err) {
     (void)out_err;   /* written only on failure */
@@ -257,31 +295,72 @@ void greeter_error_clear(greeter_error* err) {
     memset(err, 0, sizeof *err);
 }
 
+void greeter_error_set_payload(greeter_error* err, const uint8_t* ptr, size_t len) {
+    free((void*)err->payload_ptr);
+    err->payload_ptr = NULL;
+    err->payload_len = 0;
+    if (ptr && len) {
+        uint8_t* copy = malloc(len);
+        memcpy(copy, ptr, len);
+        err->payload_ptr = copy;
+        err->payload_len = len;
+    }
+}
+
 void greeter_error_free(greeter_error* err) {
     if (err) { greeter_error_clear(err); free(err); }
 }
 
+/* One allocator for every byte run, returned or consumer-allocated. */
+uint8_t* greeter_alloc(size_t len) { return len ? calloc(len, 1) : NULL; }
 void greeter_free_bytes(uint8_t* ptr, size_t len) { (void)len; free(ptr); }
 
-/* Also required: the four greeter_cancel_token_* functions and
-   greeter_debug_live (which may return 0). */
+/* Cancel tokens (used by async functions; this API has none, but the runtime
+   surface is the same for every library). */
+struct greeter_cancel_token { atomic_bool cancelled; };
+greeter_cancel_token* greeter_cancel_token_create(void) {
+    return calloc(1, sizeof(greeter_cancel_token));
+}
+void greeter_cancel_token_cancel(greeter_cancel_token* token) {
+    if (token) atomic_store(&token->cancelled, true);
+}
+bool greeter_cancel_token_is_cancelled(const greeter_cancel_token* token) {
+    return token && atomic_load(&((greeter_cancel_token*)token)->cancelled);
+}
+void greeter_cancel_token_destroy(greeter_cancel_token* token) { free(token); }
+
+/* Leak counters: a producer that doesn't count returns 0 for every kind. */
+uint64_t greeter_debug_live(int32_t kind) { (void)kind; return 0; }
 ```
 
 The library must export every runtime symbol the header declares, each
-top-level module's checksum function, and the API itself; the
+top-level module's contract function, and the API itself; the
 [C ABI contract](reference/abi.md#runtime-surface) lists them, and
 [`conformance/c/producer.c`](https://github.com/weavefoundry/weaveffi/blob/main/conformance/c/producer.c)
 is a complete hand-written producer to copy from. Build it as
-`libgreeter.so` (`libgreeter.dylib`, `greeter.dll`), then run
-`weaveffi generate` for the other targets; they load it exactly as they load
-a Rust producer.
+`libgreeter.so` (`libgreeter.dylib` on macOS, `greeter.dll` on Windows):
+
+```bash
+cc -shared -fPIC -I bindings/c greeter.c -o libgreeter.so
+```
+
+Then run `weaveffi generate` for the other targets; they load it exactly as
+they load a Rust producer. From Python, for example:
+
+```bash
+weaveffi generate --target python
+pip install ./bindings/python
+GREETER_LIBRARY=$PWD/libgreeter.so python3 -c "import greeter; print(greeter.add(2, 3))"   # 5
+```
 
 ## Next steps
 
-- [Project Configuration](guides/config.md): `[package]` metadata, per-target
-  options, and the generation cache.
-- [Samples](samples.md): six complete producers, from `calculator` to the
-  kitchen-sink `kvstore`.
+- [Project Configuration](guides/config.md): `[package]` metadata, `[build]`
+  settings, per-target options, and how regeneration cleans up stale files.
+- [Packaging](guides/packaging.md): building every platform and publishing
+  the artifacts.
+- [Samples](samples.md): three complete producers, from the minimal
+  `calculator` to the feature-complete `kvstore`.
 - [Generators](generators/README.md): what each language gets.
 - Gate CI on `weaveffi diff --check` so committed bindings can't drift; see
   [Stability and Versioning](stability.md#ci-workflow).

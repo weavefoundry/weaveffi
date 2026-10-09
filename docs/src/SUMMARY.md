@@ -11,7 +11,7 @@
 - [Async and Cancellation](guides/async.md)
 - [Project Configuration](guides/config.md)
 - [Packaging](guides/packaging.md)
-- [Extracting an IDL from Rust](guides/extract.md)
+- [Library Mode](guides/extract.md)
 
 # Reference
 

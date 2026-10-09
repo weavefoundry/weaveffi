@@ -17,6 +17,7 @@ jobs:
   lint:
     name: Format, clippy, and rustdoc
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -35,6 +36,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -48,13 +50,19 @@ jobs:
           tool: cargo-insta
       # One pass runs every test and fails on any snapshot drift.
       - run: cargo insta test --workspace --check
-      - name: Benchmarks compile
+      # Bench smoke run: every benchmark compiles, and criterion's `--test`
+      # mode executes each body once, with no warmup or sampling, which
+      # catches panics and stale inputs. bench.yml collects the numbers.
+      - name: Benchmarks build and run once
         if: runner.os == 'Linux'
-        run: cargo bench --workspace --no-run
+        run: |
+          cargo bench --workspace --no-run
+          cargo bench -p weaveffi-cli --bench codegen_bench -- --test
 
   generated-drift:
     name: Samples, schema, and wasm build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -69,12 +77,12 @@ jobs:
         run: |
           set -euo pipefail
           BIN=target/debug/weaveffi
-          for sample in calculator contacts events kvstore async-demo codec; do
-            "$BIN" generate "samples/$sample/src/lib.rs" -o "diffcheck/$sample" --quiet
-            "$BIN" diff "samples/$sample/src/lib.rs" -o "diffcheck/$sample" --check --quiet
+          for sample in calculator codec kvstore; do
+            "$BIN" generate "samples/$sample" -o "diffcheck/$sample" --quiet
+            "$BIN" diff "samples/$sample" -o "diffcheck/$sample" --check --quiet
           done
           echo "stale" >> diffcheck/calculator/c/calculator.h
-          if "$BIN" diff samples/calculator/src/lib.rs -o diffcheck/calculator --check --quiet; then
+          if "$BIN" diff samples/calculator -o diffcheck/calculator --check --quiet; then
             echo "diff --check did not detect a modified file" >&2
             exit 1
           fi
@@ -83,14 +91,27 @@ jobs:
           target/debug/weaveffi schema > weaveffi.schema.json.regenerated
           diff -u weaveffi.schema.json weaveffi.schema.json.regenerated
       - name: Every sample builds for wasm32
-        run: cargo build --target wasm32-unknown-unknown -p calculator -p contacts -p events -p kvstore -p async-demo -p codec
+        run: cargo build --target wasm32-unknown-unknown -p calculator -p codec -p kvstore
+      # A `.wasm` module carries its metadata in a custom section rather
+      # than in symbols; it must describe the same API as the native build.
+      - name: The wasm32 metadata matches the native metadata
+        run: |
+          set -euo pipefail
+          for sample in calculator codec kvstore; do
+            target/debug/weaveffi extract -q "samples/$sample" > "native-$sample.yml"
+            target/debug/weaveffi extract -q "samples/$sample" \
+              --library "target/wasm32-unknown-unknown/debug/$sample.wasm" > "wasm-$sample.yml"
+            diff -u "native-$sample.yml" "wasm-$sample.yml"
+          done
 
   fixtures:
     # Snapshot tests pin the generated text; this compiles or type-checks it
     # with each language's own toolchain, for every fixture, so invalid code
-    # in shapes no sample exercises still fails CI.
+    # in shapes no sample exercises still fails CI. GitHub sets CI=true, so a
+    # missing tool fails the job instead of skipping a check.
     name: Fixture compile check (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -144,6 +165,7 @@ jobs:
     # producer built for Android.
     name: Android (NDK link)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -163,9 +185,44 @@ jobs:
           NDK: ${{ steps.ndk.outputs.ndk-path }}
         run: |
           set -euxo pipefail
-          cargo run -q -p weaveffi-cli -- generate samples/kvstore/src/lib.rs -o generated --target c,kotlin
+          cargo run -q -p weaveffi-cli -- generate samples/kvstore -o generated --target c,kotlin \
+            --library target/aarch64-linux-android/release/libkvstore.so
           CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
           shim=$(ls generated/kotlin/src/main/cpp/*.c | head -1)
           "$CLANG" -shared -fPIC -Werror -I generated/kotlin/src/main/cpp -I generated/c "$shim" \
             -L target/aarch64-linux-android/release -lkvstore -o libkvstore_jni.so
           "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -d libkvstore_jni.so | grep 'libkvstore.so'
+      - name: weaveffi build cross-compiles the producer and prebuilds the shim
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euxo pipefail
+          cargo run -q -p weaveffi-cli -- build samples/kvstore --platforms android-arm64 --target kotlin
+          readelf="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          "$readelf" -d target/weaveffi/android-arm64/libkvstore.so | grep 'SONAME.*libkvstore.so'
+          "$readelf" -d target/weaveffi/android-arm64/libkvstore_jni.so | grep 'NEEDED.*libkvstore.so'
+
+  package-smoke:
+    # `weaveffi package` must produce artifacts each ecosystem's own tool
+    # installs with no compiler: the wheel into a venv, the npm tarballs into
+    # a throwaway project (using the prebuilt addon), and on macOS the
+    # SwiftPM package over its XCFramework. GitHub sets CI=true, so a missing
+    # tool fails the job instead of skipping a target.
+    name: Package install smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/toolchains
+        with:
+          lang: python
+      - uses: ./.github/actions/toolchains
+        with:
+          lang: node
+      - run: bash scripts/package-smoke.sh

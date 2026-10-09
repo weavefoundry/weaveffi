@@ -3,6 +3,8 @@
 # wrapper sources must compile against the bundled C module map with
 # warnings as errors, in both the Swift 5 and Swift 6 language modes.
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+require swift swiftc
 dir=$1
 pkg="$dir/swift"
 cdir=$(ls -d "$pkg"/Sources/C*/ | head -1)

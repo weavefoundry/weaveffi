@@ -10,10 +10,28 @@ use crate::ir::CURRENT_SCHEMA_VERSION;
 use crate::parse::parse_api_str;
 
 /// Parse a YAML body (without the `version:` line) and validate it.
-fn check(body: &str) -> Result<ResolvedApi, ValidationDiagnostics> {
+fn check(body: &str) -> Result<Model, ValidationDiagnostics> {
     let doc = format!("version: \"{CURRENT_SCHEMA_VERSION}\"\n{body}");
     let api = parse_api_str(&doc, "yaml").expect("fixture must parse");
-    validate_api(api, None)
+    validate(&api, &Identity::named("api"), None)
+}
+
+/// Validate a full YAML document with its source attached, returning the
+/// underlined text of every diagnostic.
+fn spans(doc: &str) -> Vec<(String, String)> {
+    let api = parse_api_str(doc, "yaml").expect("fixture must parse");
+    let err = validate(&api, &Identity::named("api"), Some(("api.yml", doc))).unwrap_err();
+    err.diagnostics
+        .iter()
+        .map(|d| {
+            let span = d.span.expect("span located");
+            let line = doc[..span.offset()].lines().count();
+            (
+                variant(&d.error),
+                format!("{line}:{}", &doc[span.offset()..span.offset() + span.len()]),
+            )
+        })
+        .collect()
 }
 
 /// Variant discriminator names of every error the document produced.
@@ -90,9 +108,14 @@ modules:
             params: [{ name: p, type: Point }, { name: raw, type: bytes }, { name: from, type: Store }]
           - { name: wants_more, params: [{ name: seen, type: u32 }], return: bool }
           - { name: status, params: [], return: Status }
+          - { name: label, params: [], return: string, throws: true }
+          - { name: nearest, params: [], return: "Point?" }
+          - { name: store, params: [], return: "Store?" }
+          - { name: payload, params: [], return: bytes }
     functions:
       - { name: fetch, params: [{ name: id, type: i64 }], return: "[Point]", async: true, cancellable: true }
       - { name: subscribe, params: [{ name: l, type: PointListener }, { name: s, type: Store }] }
+      - { name: maybe_subscribe, params: [{ name: l, type: "PointListener?" }] }
     modules:
       - name: inner
         functions:
@@ -134,6 +157,18 @@ modules:
 "#,
         ),
         (
+            "DuplicateFunctionName",
+            r#"
+modules:
+  - name: a
+    functions: [{ name: open, params: [] }]
+  - name: b
+    modules:
+      - name: c
+        functions: [{ name: open, params: [] }]
+"#,
+        ),
+        (
             "DuplicateParamName",
             r#"
 modules:
@@ -159,7 +194,7 @@ modules:
 "#,
         ),
         (
-            "DuplicateErrorName",
+            "DuplicateErrorCodeName",
             r#"
 modules:
   - name: m
@@ -209,6 +244,16 @@ modules:
   - name: m
     functions: [{ name: E, params: [] }]
     errors: { name: E, codes: [{ name: A, code: 1, message: a }] }
+"#,
+        ),
+        (
+            "NameCollisionWithErrorDomain",
+            r#"
+modules:
+  - name: m
+    errors: { name: E, codes: [{ name: A, code: 1, message: a }] }
+  - name: n
+    functions: [{ name: E, params: [] }]
 "#,
         ),
         (
@@ -267,13 +312,21 @@ modules:
 "#,
         ),
         (
-            "UnknownTypeRef",
+            "QualifiedTypeRef",
             r#"
 modules:
   - name: m
     structs: [{ name: P, fields: [{ name: v, type: i32 }] }]
-    functions: [{ name: f, params: [{ name: p, type: nowhere.P }] }]
+    functions: [{ name: f, params: [{ name: p, type: m.P }] }]
 "#,
+        ),
+        (
+            "UnsupportedPrimitive",
+            "modules: [{ name: m, functions: [{ name: f, params: [{ name: n, type: usize }] }] }]",
+        ),
+        (
+            "UnsupportedPrimitive",
+            "modules: [{ name: m, structs: [{ name: S, fields: [{ name: c, type: '[char]' }] }] }]",
         ),
         (
             "SymbolCollision",
@@ -342,7 +395,7 @@ modules:
 "#,
         ),
         (
-            "DuplicateStructName",
+            "DuplicateTypeName",
             r#"
 modules:
   - name: m
@@ -365,7 +418,7 @@ modules:
             "modules: [{ name: m, structs: [{ name: S, fields: [] }] }]",
         ),
         (
-            "DuplicateEnumName",
+            "DuplicateTypeName",
             r#"
 modules:
   - name: m
@@ -408,7 +461,7 @@ modules:
 "#,
         ),
         (
-            "DuplicateInterfaceName",
+            "DuplicateTypeName",
             r#"
 modules:
   - name: m
@@ -503,7 +556,7 @@ modules:
             "modules: [{ name: m, functions: [{ name: f, params: [], return: '{bytes:i32}' }] }]",
         ),
         (
-            "DuplicateCallbackInterfaceName",
+            "DuplicateTypeName",
             r#"
 modules:
   - name: m
@@ -530,7 +583,7 @@ modules:
             "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [], async: true }] }] }]",
         ),
         (
-            "InvalidCallbackMethod",
+            "ThrowsWithoutErrorDomain",
             "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [], throws: true }] }] }]",
         ),
         (
@@ -539,15 +592,14 @@ modules:
         ),
         (
             "InvalidCallbackMethod",
-            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [], return: string }] }] }]",
+            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [], return: 'iter<i32>' }] }] }]",
         ),
         (
-            "InvalidCallbackMethod",
+            "CallbackInterfaceInInvalidPosition",
             r#"
 modules:
   - name: m
-    interfaces: [{ name: I, methods: [{ name: a, params: [] }] }]
-    callback_interfaces: [{ name: L, methods: [{ name: a, params: [], return: I }] }]
+    callback_interfaces: [{ name: L, methods: [{ name: a, params: [], return: "L?" }] }]
 "#,
         ),
         (
@@ -565,7 +617,7 @@ modules:
 modules:
   - name: m
     callback_interfaces: [{ name: L, methods: [{ name: a, params: [] }] }]
-    functions: [{ name: f, params: [{ name: l, type: "L?" }] }]
+    functions: [{ name: f, params: [{ name: l, type: "[L]" }] }]
 "#,
         ),
         (
@@ -639,7 +691,7 @@ fn unsupported_schema_version_short_circuits() {
         "yaml",
     )
     .unwrap();
-    let err = validate_api(api, None).unwrap_err();
+    let err = validate(&api, &Identity::named("api"), None).unwrap_err();
     assert_eq!(err.diagnostics.len(), 1);
     assert!(matches!(
         &err.first().error,
@@ -685,20 +737,148 @@ fn diagnostics_render_every_message_and_related() {
 }
 
 #[test]
+fn global_duplicates_are_reported_once() {
+    let got = errors(
+        r#"
+modules:
+  - name: m
+    structs:
+      - { name: S, fields: [{ name: x, type: i32 }] }
+      - { name: S, fields: [{ name: x, type: i32 }] }
+    functions:
+      - { name: f, params: [] }
+      - { name: f, params: [] }
+    errors:
+      name: E
+      codes:
+        - { name: A, code: 1, message: a }
+        - { name: A, code: 2, message: a }
+"#,
+    );
+    assert_eq!(
+        got,
+        [
+            "DuplicateTypeName",
+            "DuplicateFunctionName",
+            "DuplicateErrorCodeName"
+        ]
+    );
+}
+
+#[test]
+fn symbol_collisions_use_the_real_prefix() {
+    // `acme_list_*` is reserved by the C buffer helpers only under the
+    // `acme` prefix the library actually uses.
+    let doc = format!(
+        "version: \"{CURRENT_SCHEMA_VERSION}\"\nmodules: [{{ name: list, functions: [{{ name: names }}] }}]"
+    );
+    let api = parse_api_str(&doc, "yaml").unwrap();
+    let err = validate(&api, &Identity::named("acme"), None).unwrap_err();
+    assert!(err.to_string().contains("'acme_list_names'"), "{err}");
+}
+
+#[test]
+fn buffer_header_structs_and_codecs_are_reserved_symbols() {
+    // The C buffer header declares a struct for every record, rich enum,
+    // and error code with fields, each with `_write`, `_read`, `_decode`,
+    // and `_free`; a function spelled like any of them would redefine it.
+    let cases = [
+        (
+            "errors: { name: E, codes: [{ name: Busy, code: 1, message: b, fields: [{ name: n, type: i32 }] }] }\n    functions: [{ name: E_Busy_payload }]",
+            "'kv_m_E_Busy_payload'",
+            "the payload struct of error code 'm.E.Busy'",
+        ),
+        (
+            "errors: { name: E, codes: [{ name: Busy, code: 1, message: b, fields: [{ name: n, type: i32 }] }] }\n    functions: [{ name: E_Busy_payload_read }]",
+            "'kv_m_E_Busy_payload_read'",
+            "codec 'kv_m_E_Busy_payload_read'",
+        ),
+        (
+            "structs: [{ name: S, fields: [{ name: x, type: i32 }] }]\n    functions: [{ name: S_free }]",
+            "'kv_m_S_free'",
+            "of record 'm.S'",
+        ),
+        (
+            "enums: [{ name: Shape, variants: [{ name: Dot, value: 0, fields: [{ name: r, type: f64 }] }] }]\n    functions: [{ name: Shape_decode }]",
+            "'kv_m_Shape_decode'",
+            "of enum 'm.Shape'",
+        ),
+    ];
+    for (decls, symbol, origin) in cases {
+        let doc =
+            format!("version: \"{CURRENT_SCHEMA_VERSION}\"\nmodules:\n  - name: m\n    {decls}\n");
+        let api = parse_api_str(&doc, "yaml").unwrap();
+        let err = validate(&api, &Identity::named("kv"), None).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(symbol) && text.contains(origin), "{text}");
+    }
+    // An error code without fields has no payload struct.
+    let doc = format!(
+        "version: \"{CURRENT_SCHEMA_VERSION}\"\nmodules:\n  - name: m\n    errors: {{ name: E, codes: [{{ name: Busy, code: 1, message: b }}] }}\n    functions: [{{ name: E_Busy_payload }}]\n"
+    );
+    let api = parse_api_str(&doc, "yaml").unwrap();
+    assert!(validate(&api, &Identity::named("kv"), None).is_ok());
+}
+
+#[test]
 fn source_spans_underline_the_offending_identifier() {
-    let src = "version: \"0.10.0\"\nmodules:\n  - name: \"dup\"\n  - name: \"dup\"\n";
-    let api = parse_api_str(src, "yaml").unwrap();
-    let err = validate_api(api, Some(("api.yml", src))).unwrap_err();
+    let src = format!(
+        "version: \"{CURRENT_SCHEMA_VERSION}\"\nmodules:\n  - name: \"dup\"\n  - name: \"dup\"\n"
+    );
+    let api = parse_api_str(&src, "yaml").unwrap();
+    let err = validate(&api, &Identity::named("api"), Some(("api.yml", &src))).unwrap_err();
     let d = err.first();
     let span = d.span.expect("span located");
+    assert_eq!(span.offset(), src.rfind("\"dup\"").unwrap());
     assert_eq!(&src[span.offset()..span.offset() + span.len()], "\"dup\"");
     assert!(d.labels().is_some());
     assert!(d.source_code().is_some());
 }
 
 #[test]
-fn resolved_api_qualifies_cross_module_types() {
-    let api = check(
+fn spans_are_scoped_to_the_enclosing_declaration() {
+    let doc = format!(
+        r#"version: "{CURRENT_SCHEMA_VERSION}"
+modules:
+  - name: a
+    structs:
+      - name: x
+        fields: [{{ name: Nope, type: i32 }}]
+    functions:
+      - name: f
+        params: [{{ name: x, type: i32 }}]
+      - name: g
+        params: [{{ name: x, type: i32 }}, {{ name: x, type: Nope }}]
+  - name: b
+    functions:
+      - name: h
+        params: [{{ name: s, type: a.x }}]
+        return: usize
+  - name: c
+    interfaces:
+      - name: Store
+        methods:
+          - {{ name: h }}
+          - {{ name: put, cancellable: true }}
+  - name: c
+"#
+    );
+    assert_eq!(
+        spans(&doc),
+        [
+            ("DuplicateParamName".to_string(), "11:x".to_string()),
+            ("UnknownTypeRef".to_string(), "11:Nope".to_string()),
+            ("QualifiedTypeRef".to_string(), "15:a.x".to_string()),
+            ("UnsupportedPrimitive".to_string(), "16:usize".to_string()),
+            ("CancellableNotAsync".to_string(), "22:put".to_string()),
+            ("DuplicateModuleName".to_string(), "23:c".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn model_resolves_bare_names() {
+    let model = check(
         r#"
 modules:
   - name: shared
@@ -714,35 +894,20 @@ modules:
 "#,
     )
     .unwrap();
-    use crate::ir::TypeRef;
-    use crate::model::Ty;
-    let f = &api.modules[1].functions[0];
-    assert_eq!(
-        api.resolve(&f.params[0].ty),
-        Ty::Interface("shared.Store".into())
-    );
-    assert_eq!(
-        api.resolve(&f.params[1].ty),
-        Ty::Enum("shared.Status".into())
-    );
-    assert_eq!(
-        api.resolve(&f.params[2].ty),
-        Ty::CallbackInterface("shared.Watcher".into())
-    );
-    assert_eq!(
-        api.resolve(f.returns.as_ref().unwrap()),
-        Ty::List(Box::new(Ty::Record("shared.Point".into())))
-    );
-    assert_eq!(
-        api.resolve(&TypeRef::Named("Point".into())),
-        Ty::Record("shared.Point".into())
-    );
+    use crate::ty::Ty;
+    let f = &model.modules[1].functions[0];
+    assert_eq!(f.params[0].ty, Ty::Interface("Store".into()));
+    assert_eq!(f.params[1].ty, Ty::Enum("Status".into()));
+    assert_eq!(f.params[2].ty, Ty::CallbackInterface("Watcher".into()));
+    assert_eq!(f.ret, Some(Ty::List(Box::new(Ty::Record("Point".into())))));
+    assert_eq!(model.owner("Point").dot_path, "shared");
+    assert_eq!(model.prefix(), "api");
+    assert_eq!(model.version, CURRENT_SCHEMA_VERSION);
 }
 
 #[test]
 fn warnings_are_advisory() {
-    let api = check(
-        r#"
+    let body = r#"
 modules:
   - name: m
     enums:
@@ -757,10 +922,10 @@ modules:
       - name: documented
         doc: Has a module doc.
         functions: [{ name: f, params: [] }]
-"#,
-    )
-    .unwrap();
-    let warnings = collect_warnings(&api);
+"#;
+    check(body).unwrap();
+    let doc = format!("version: \"{CURRENT_SCHEMA_VERSION}\"\n{body}");
+    let warnings = collect_warnings(&parse_api_str(&doc, "yaml").unwrap());
     let kinds: Vec<String> = warnings
         .iter()
         .map(|w| format!("{w:?}").split(' ').next().unwrap().to_string())

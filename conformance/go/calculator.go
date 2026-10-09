@@ -1,35 +1,51 @@
-// Conformance consumer: calculator sample, Go target.
+// Conformance consumer: calculator sample, Go target (ABI revision 4).
 //
-// The minimal surface: plain scalar functions, the throwing Div with its
-// typed *CalcError, and a string round trip that keeps interior NUL bytes and
-// non-ASCII text intact through the (pointer, length) string ABI. Exits 0 on
-// success; aborts (non-zero) on any mismatch.
+// The getting-started surface: a direct-value call (wrapping on overflow),
+// a throwing call that returns the typed *DivisionByZeroError, and a string
+// in and out (non-ASCII and astral text and an interior NUL byte survive).
+// Importing the bindings checks the ABI revision and the contract table.
+// Ends by asserting the library's leak counters are zero.
 
 package main
 
 import (
-	"errors"
 	"fmt"
+	"math"
 
-	wv "__MODPATH__"
+	calc "__MODPATH__"
 )
 
 func main() {
-	expect(wv.Add(2, 3) == 5, "add")
-	expect(wv.Mul(-4, 6) == -24, "mul")
+	expect(calc.Add(2, 3) == 5, "add(2, 3)")
+	expect(calc.Add(-7, 7) == 0, "add(-7, 7)")
+	expect(calc.Add(math.MaxInt32, 1) == math.MinInt32, "add wraps")
 
-	q, err := wv.Div(17, 5)
-	expect(err == nil && q == 3, fmt.Sprintf("div (got %d, %v)", q, err))
-	_, err = wv.Div(1, 0)
-	var cerr *wv.CalcError
-	expect(errors.As(err, &cerr), fmt.Sprintf("div by zero yields *CalcError (got %T %v)", err, err))
-	expect(cerr.Code == wv.CalcErrorDivisionByZero, "division-by-zero code")
-	expect(cerr.Message == "division by zero", fmt.Sprintf("message (got %q)", cerr.Message))
-
-	for _, s := range []string{"", "hello", "a\x00b\x00", "héllo ✓ 😀"} {
-		expect(wv.Echo(s) == s, fmt.Sprintf("echo %q", s))
+	for _, c := range []struct{ a, b, q int32 }{
+		{10, 2, 5},
+		{-7, 2, -3}, // rounds toward zero
+		{math.MinInt32, -1, math.MinInt32},
+	} {
+		q, err := calc.Divide(c.a, c.b)
+		expect(err == nil && q == c.q, fmt.Sprintf("divide(%d, %d) = %d, %v", c.a, c.b, q, err))
 	}
 
-	expectNoLeaks(wv.DebugLive)
+	q, err := calc.Divide(1, 0)
+	expect(q == 0, "a failed divide returns zero")
+	e := expectAs[*calc.DivisionByZeroError](err, "divide(1, 0)")
+	expect(e.Code() == 1 && e.Error() == "division by zero", fmt.Sprintf("DivisionByZero code and message (got %d %q)", e.Code(), e.Error()))
+	expectAs[calc.CalcError](err, "divide(1, 0) is a CalcError")
+
+	for name, want := range map[string]string{
+		"World":    "Hello, World!",
+		"":         "Hello, !",
+		"Wörld 🦀":  "Hello, Wörld 🦀!",
+		"a\x00b":   "Hello, a\x00b!",
+		"😀 astral": "Hello, 😀 astral!",
+	} {
+		got := calc.Greet(name)
+		expect(got == want, fmt.Sprintf("greet(%q) = %q", name, got))
+	}
+
+	expectNoLeaks(calc.DebugLive)
 	fmt.Println("go/calculator: OK")
 }

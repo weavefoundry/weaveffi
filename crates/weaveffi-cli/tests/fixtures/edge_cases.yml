@@ -1,9 +1,11 @@
-version: "0.10.0"
+version: "0.11.0"
 # Shapes the mainstream fixtures do not reach: identifiers that are reserved
-# words in one or more target languages, deeply nested composites, optional
-# parameters, interfaces in every legal position (including inside records,
-# lists, maps, and iterators), async functions with non-string results,
-# type-level deprecation, scalar and string iterators, and callback interfaces
+# words in one or more target languages, interface members spelled like the
+# members object wrappers declare or inherit (close, dispose, handle,
+# to_string), deeply nested composites, optional parameters, interfaces in
+# every legal position (including inside records, lists, maps, and
+# iterators), async functions with non-string results, type-level
+# deprecation, scalar and string iterators, and callback interfaces
 # carrying composite payloads and objects. Snapshots pin how every generator
 # renders each of these, so a regression in keyword escaping or a codec edge
 # shows up as a diff instead of as a compile error in a downstream project.
@@ -182,6 +184,14 @@ modules:
             deprecated: "Use rename instead"
             params: []
             return: string
+          - name: close
+            doc: Spelled like the release method of several wrappers
+            params: []
+            return: bool
+          - name: dispose
+            doc: Spelled like the release method of the Dart and .NET wrappers
+            params:
+              - { name: force, type: bool }
       - name: Vault
         doc: Deprecated interface with a throwing constructor
         deprecated: "Use Widget instead"
@@ -195,12 +205,20 @@ modules:
           - name: peek
             params: []
             return: "Widget?"
+          - name: handle
+            doc: Spelled like the handle accessor of several wrappers
+            params: []
+            return: i64
         statics:
           - name: probe
             doc: Throwing static
             params: []
             return: bool
             throws: true
+          - name: to_string
+            doc: Static spelled like an inherited object member
+            params: []
+            return: string
     functions:
       - name: noop
         doc: No parameters and no result

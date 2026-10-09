@@ -1,9 +1,10 @@
 //! `weaveffi init`: set up a project so a bare `weaveffi generate` works.
 //!
 //! In a Rust crate (a directory with a `Cargo.toml` that has a `[package]`),
-//! it writes a `weaveffi.toml` whose `[project] input` is the crate's
-//! `src/lib.rs`, then checks the three things a producer needs (a `cdylib`
-//! crate type, a `weaveffi` dependency, and one `weaveffi::export_runtime!()`
+//! it writes a `weaveffi.toml` whose `[project] input` is the crate itself
+//! (`"."`), whose API WeaveFFI reads from the library the crate builds, then
+//! checks the things a producer needs (a `cdylib` crate type, a `weaveffi`
+//! dependency, a `#[weaveffi::module]`, and one `weaveffi::export_runtime!()`
 //! call) and prints any that are missing. It never edits `Cargo.toml` or
 //! source files. Anywhere else, it writes a starter IDL plus a
 //! `weaveffi.toml` that points at it.
@@ -12,7 +13,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use miette::{bail, IntoDiagnostic, Result, WrapErr};
 use weaveffi_model::pkg::c_ident;
 
-use crate::config::CONFIG_FILE_NAME;
+use weaveffi_cli::config::CONFIG_FILE_NAME;
 
 /// Options for [`cmd_init`].
 pub(crate) struct InitArgs<'a> {
@@ -58,7 +59,7 @@ fn init_rust(dir: &Utf8Path, config_path: &Utf8Path, crate_name: &str, quiet: bo
         config_path,
         "# WeaveFFI project configuration. See https://weaveffi.com/guides/config.html\n\
          [project]\n\
-         input = \"src/lib.rs\"\n\
+         input = \".\"\n\
          out = \"bindings\"\n\
          # targets = [\"c\", \"swift\", \"kotlin\", \"python\"]\n",
     )?;
@@ -72,7 +73,8 @@ fn init_rust(dir: &Utf8Path, config_path: &Utf8Path, crate_name: &str, quiet: bo
     let mut todo = Vec::new();
     if !manifest.contains("cdylib") {
         todo.push(
-            "add `crate-type = [\"cdylib\"]` (and \"staticlib\" for iOS) under [lib] in Cargo.toml",
+            "add `crate-type = [\"cdylib\"]` under [lib] in Cargo.toml so `cargo build` \
+             produces the shared library (`weaveffi build` picks the right kinds itself)",
         );
     }
     if !manifest.contains("weaveffi") {
@@ -167,12 +169,21 @@ mod tests {
             quiet: true,
         })
         .unwrap();
-        let (cfg, input) =
-            crate::config::ProjectConfig::locate(Some(root.join(CONFIG_FILE_NAME).as_str()), None)
-                .unwrap();
-        assert_eq!(input, root.join("greeter.yml"));
-        assert_eq!(cfg.package.name.as_deref(), Some("greeter"));
-        crate::commands::load_validated_api(input.as_str()).unwrap();
+        let project = weaveffi_cli::project::Project::locate(
+            Some(root.join(CONFIG_FILE_NAME).as_str()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            &project.source,
+            weaveffi_cli::project::Source::Idl(p) if *p == root.join("greeter.yml")
+        ));
+        assert_eq!(
+            project.config.package.identity.name.as_deref(),
+            Some("greeter")
+        );
+        project.model().unwrap();
         let again = cmd_init(&InitArgs {
             dir: root.as_str(),
             name: None,
@@ -183,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn rust_project_points_at_lib_rs() {
+    fn rust_project_points_at_the_crate() {
         let dir = tempfile::tempdir().unwrap();
         let root = Utf8Path::from_path(dir.path()).unwrap();
         std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"kv\"\n").unwrap();
@@ -194,10 +205,8 @@ mod tests {
             quiet: true,
         })
         .unwrap();
-        let cfg = crate::config::ProjectConfig::from_file(&root.join(CONFIG_FILE_NAME)).unwrap();
-        assert_eq!(
-            cfg.project.input.as_deref(),
-            Some(Utf8Path::new("src/lib.rs"))
-        );
+        let cfg =
+            weaveffi_cli::config::ProjectConfig::from_file(&root.join(CONFIG_FILE_NAME)).unwrap();
+        assert_eq!(cfg.project.input.as_deref(), Some(Utf8Path::new(".")));
     }
 }

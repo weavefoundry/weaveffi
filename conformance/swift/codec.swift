@@ -1,20 +1,15 @@
-// Conformance consumer: codec sample, Swift target.
+// Conformance consumer: codec sample, Swift target (ABI revision 4).
 //
-// Binds through the generated `Codec` module and checks the value-buffer
-// codec the Swift backend ships in both directions. `sample*` fixtures the
-// producer encodes are decoded and checked field by field against the
-// canonical values in `samples/codec/src/lib.rs`; `verify*` sends them back
-// (the producer decodes what Swift encoded and compares against its own
-// canonical value); `roundtrip*` returns the argument unchanged so consumer
-// encoder and decoder are checked against each other, including a `Scalars`
-// and a `Composite` built from scratch with edge values (empty strings, lists,
-// and maps; unicode; Int64/UInt64 extremes; NaN, infinities, and negative
-// zero). `Shape` covers every rich-enum variant, and `Holder` covers object
-// tokens inside buffers: a field, an optional, and a list, each carrying one
-// strong reference that the wrapper's deinit releases. Strings with interior
-// NULs survive, since strings cross as pointer and length. At exit, every
-// native object and allocation has been released. Exits non-zero on any
-// mismatch.
+// The shared-vector loop through the generated `Codec` module: every vector
+// the producer serves is decoded by the Swift codec, re-encoded on the way
+// back into `checkVector` (which must accept it, and reject it for the
+// neighboring index), and, for primitive vectors, pushed through the
+// matching direct-family `echo*`. Then vectors built from Swift literals (so
+// a symmetric encode/decode bug can't hide), spot checks of decoded values,
+// the typed `CodecError.outOfRange` with its payload, malformed buffers sent
+// through the raw C entry points (the Swift encoder can't produce them), and
+// object identity and reference counting through buffers. Ends by asserting
+// the producer's leak counters are zero. Exits non-zero on any mismatch.
 
 import CCodec
 import Codec
@@ -25,358 +20,266 @@ func fail(_ msg: String) -> Never {
     exit(1)
 }
 
-func expect(_ cond: Bool, _ msg: String) {
-    if !cond { fail(msg) }
+func expect(_ cond: Bool, _ msg: @autoclosure () -> String) {
+    if !cond { fail(msg()) }
 }
 
-/// Every live-object counter the producer keeps must settle at zero.
+/// Every live-resource counter must settle at zero: 0 objects, 1 callbacks,
+/// 2 iterators, 3 cancel tokens, 4 allocations.
 func assertNoLeaks() {
     let kinds = ["objects", "callbacks", "iterators", "cancel tokens", "allocations"]
     var live: [UInt64] = []
-    for _ in 0..<200 {
+    for _ in 0..<2000 {
         live = (0..<5).map { codec_debug_live(Int32($0)) }
         if live.allSatisfy({ $0 == 0 }) { return }
-        usleep(10_000)
+        usleep(1000)
     }
     for (kind, n) in live.enumerated() where n != 0 {
         fail("\(n) live \(kinds[kind]) at exit")
     }
 }
 
-// --- Equality helpers: NaN and negative zero need bit-pattern comparisons.
-
-func scalarsEqual(_ a: Scalars, _ b: Scalars) -> Bool {
-    a.i8Value == b.i8Value && a.u8Value == b.u8Value
-        && a.i16Value == b.i16Value && a.u16Value == b.u16Value
-        && a.i32Value == b.i32Value && a.u32Value == b.u32Value
-        && a.i64Value == b.i64Value && a.u64Value == b.u64Value
-        && a.f32Value.bitPattern == b.f32Value.bitPattern
-        && a.f64Value.bitPattern == b.f64Value.bitPattern
-        && a.flag == b.flag && a.color == b.color
+/// Byte-exact string equality (Swift's `==` compares canonical equivalence).
+func same(_ a: String, _ b: String) -> Bool {
+    Array(a.utf8) == Array(b.utf8)
 }
 
-func shapeEqual(_ a: Shape, _ b: Shape) -> Bool {
-    switch (a, b) {
-    case (.empty, .empty):
-        return true
-    case let (.circle(r1), .circle(r2)):
-        return r1.bitPattern == r2.bitPattern
-    case let (.rect(w1, h1), .rect(w2, h2)):
-        return w1.bitPattern == w2.bitPattern && h1.bitPattern == h2.bitPattern
-    case let (.labeled(l1, c1), .labeled(l2, c2)):
-        return l1 == l2 && c1 == c2
-    case let (.nested(i1, n1), .nested(i2, n2)):
-        return scalarsEqual(i1, i2) && n1 == n2
-    default:
-        return false
+func vector(_ i: UInt32) -> Vector {
+    do {
+        return try Codec.vector(index: i)
+    } catch {
+        fail("vector(\(i)) threw \(error)")
     }
 }
 
-func shapesEqual(_ a: [Shape], _ b: [Shape]) -> Bool {
-    a.count == b.count && zip(a, b).allSatisfy { shapeEqual($0, $1) }
+/// The index of every vector, by name.
+func vectorIndex(_ n: UInt32) -> [String: UInt32] {
+    var names: [String: UInt32] = [:]
+    for i in 0..<n {
+        do {
+            names[try Codec.vectorName(index: i)] = i
+        } catch {
+            fail("vectorName(\(i)) threw \(error)")
+        }
+    }
+    return names
 }
 
-func optionalShapeEqual(_ a: Shape?, _ b: Shape?) -> Bool {
-    switch (a, b) {
-    case (nil, nil): return true
-    case let (x?, y?): return shapeEqual(x, y)
-    default: return false
+/// Push a primitive vector's value through its direct-family echo.
+func echo(_ v: Vector) {
+    switch v {
+    case let .i8(x): expect(Codec.echoI8(value: x) == x, "echoI8(\(x))")
+    case let .u8(x): expect(Codec.echoU8(value: x) == x, "echoU8(\(x))")
+    case let .i16(x): expect(Codec.echoI16(value: x) == x, "echoI16(\(x))")
+    case let .u16(x): expect(Codec.echoU16(value: x) == x, "echoU16(\(x))")
+    case let .i32(x): expect(Codec.echoI32(value: x) == x, "echoI32(\(x))")
+    case let .u32(x): expect(Codec.echoU32(value: x) == x, "echoU32(\(x))")
+    case let .i64(x): expect(Codec.echoI64(value: x) == x, "echoI64(\(x))")
+    case let .u64(x): expect(Codec.echoU64(value: x) == x, "echoU64(\(x))")
+    case let .f32(x):
+        expect(Codec.echoF32(value: x).bitPattern == x.bitPattern, "echoF32(\(x)) bit for bit")
+    case let .f64(x):
+        expect(Codec.echoF64(value: x).bitPattern == x.bitPattern, "echoF64(\(x)) bit for bit")
+    case let .flag(x): expect(Codec.echoBool(value: x) == x, "echoBool(\(x))")
+    case let .text(x): expect(same(Codec.echoText(value: x), x), "echoText(\(x.debugDescription))")
+    case let .blob(x): expect(Codec.echoBlob(value: x) == x, "echoBlob(\(x as NSData))")
+    case let .hue(x): expect(Codec.echoColor(value: x) == x, "echoColor(\(x))")
+    default: break
     }
 }
 
-func compositeEqual(_ a: Composite, _ b: Composite) -> Bool {
-    guard a.name == b.name, a.blob == b.blob, a.someI64 == b.someI64, a.noneI64 == b.noneI64,
-          a.someText == b.someText, a.names == b.names, a.matrix == b.matrix,
-          a.empty.map({ $0.bitPattern }) == b.empty.map({ $0.bitPattern }),
-          a.byName == b.byName, a.byId.count == b.byId.count,
-          scalarsEqual(a.scalars, b.scalars), shapeEqual(a.shape, b.shape),
-          shapesEqual(a.shapes, b.shapes), optionalShapeEqual(a.maybeShape, b.maybeShape),
-          a.maybeList == b.maybeList, a.sparse == b.sparse, a.colors == b.colors
-    else { return false }
-    for (k, v) in a.byId {
-        guard let w = b.byId[k], scalarsEqual(v, w) else { return false }
+func everyVector(_ n: UInt32) {
+    for i in 0..<n {
+        let v = vector(i)
+        if !Codec.checkVector(index: i, value: v) {
+            let name = (try? Codec.vectorName(index: i)) ?? "?"
+            fail("vector \(i) (\(name)) did not round-trip; producer saw \(Codec.describeVector(value: v))")
+        }
+        expect(!Codec.checkVector(index: (i + 1) % n, value: v), "vector \(i) never matches its neighbor")
+        echo(v)
     }
-    return true
+}
+
+let canonicalScalars = Scalars(
+    i8Value: -8, u8Value: 200, i16Value: -16_000, u16Value: 60_000,
+    i32Value: -2_000_000_000, u32Value: 4_000_000_000,
+    i64Value: -9_007_199_254_740_993, u64Value: .max,
+    f32Value: 1.5, f64Value: -2.25e100, flag: true, color: .blue)
+
+func literalVectors(_ index: [String: UInt32]) {
+    func check(_ name: String, _ v: Vector, _ want: Bool) {
+        guard let i = index[name] else { fail("no vector named \(name)") }
+        expect(Codec.checkVector(index: i, value: v) == want, "literal vs \(name) should be \(want)")
+    }
+
+    check("scalars canonical", .allScalars(value: canonicalScalars), true)
+    var tweaked = canonicalScalars
+    tweaked.u16Value = 60_001
+    check("scalars canonical", .allScalars(value: tweaked), false)
+    check("shape labeled", .figure(value: .labeled(label: "tag", count: 3)), true)
+    check("string interior nul", .text(value: "nul\0inside\0"), true)
+    // Any NaN matches the NaN vector; zero keeps its sign.
+    check("f64 nan", .f64(value: Double(bitPattern: 0x7ff8_0000_0000_0001)), true)
+    check("f64 -0", .f64(value: -0.0), true)
+    check("f64 -0", .f64(value: 0.0), false)
+    check("u64 max", .u64(value: .max), true)
+    check("enum infrared", .hue(value: .infrared), true)
+    check("optional zero", .maybeI64(value: 0), true)
+    check("optional absent", .maybeI64(value: nil), true)
+    check("optional zero", .maybeI64(value: nil), false)
+    // A map's entry order doesn't matter on the wire.
+    check("map of strings", .counts(value: ["x": 0, "héllo": -1, "": .max]), true)
+    check("blank", .blank, true)
+    // A holder of a Swift-made token checks against the table by value.
+    check("objects sparse", .objects(value: Holder(primary: Token(value: -1), spare: nil, many: [], byName: [:])), true)
+}
+
+func spotChecks(_ index: [String: UInt32]) {
+    func named(_ name: String) -> Vector {
+        guard let i = index[name] else { fail("no vector named \(name)") }
+        return vector(i)
+    }
+
+    guard case let .i64(big) = named("i64 past 2^53"), big == -9_007_199_254_740_993 else {
+        fail("i64 past 2^53")
+    }
+    _ = big
+    guard case let .f32(tiny) = named("f32 min subnormal"), tiny.bitPattern == 1 else {
+        fail("f32 min subnormal")
+    }
+    _ = tiny
+    guard case let .text(astral) = named("string astral"), same(astral, "🦀 crab 😀") else {
+        fail("string astral")
+    }
+    _ = astral
+
+    guard case let .allScalars(m) = named("scalars minimum") else { fail("scalars minimum") }
+    expect(m.i8Value == .min && m.u8Value == 0 && m.i16Value == .min && m.u16Value == 0, "scalars minimum ints")
+    expect(m.i32Value == .min && m.u32Value == 0 && m.i64Value == .min && m.u64Value == 0, "scalars minimum wide ints")
+    expect(m.f32Value == -.infinity && m.f64Value.isNaN, "scalars minimum floats")
+    expect(m.color == .infrared && !m.flag, "scalars minimum color and flag")
+
+    guard case let .deep(c) = named("composite canonical") else { fail("composite canonical") }
+    expect(same(c.name, "héllo wörld ✓"), "composite name")
+    expect(c.blob == Data([0, 1, 2, 253, 254, 255]), "composite blob")
+    expect(c.someI64 == .min && c.noneI64 == nil && c.someText == "", "composite optionals")
+    expect(c.names == ["a", "", "ccc"] && c.matrix == [[1, 2, 3], [], [-4]], "composite lists")
+    expect(c.floats.count == 6 && c.floats[0].isNaN && c.floats[1] == .infinity, "composite floats")
+    expect(c.floats[3].bitPattern == (-0.0 as Double).bitPattern && c.floats[4] == .leastNonzeroMagnitude, "composite float edges")
+    expect(c.byName == ["one": 1, "two": 2, "neg": -3, "": .max], "composite byName")
+    expect(c.byId.count == 3 && c.byId[-1]?.u32Value == 4_000_000_000 && c.byId[42]?.color == .red, "composite byId")
+    expect(c.byColor == [.infrared: "below", .blue: "sky"], "composite byColor")
+    expect(c.flags == [0: false, .max: true], "composite flags")
+    expect(c.scalars == canonicalScalars, "composite scalars")
+    expect(c.shape == .labeled(label: "tag", count: 3), "composite shape")
+    expect(c.shapes.count == 6, "composite shapes")
+    guard case .rect(let width, let height) = c.shapes[2] else { fail("composite shapes[2]") }
+    expect(width.bitPattern == (-0.0 as Float).bitPattern && height == .infinity, "composite rect")
+    guard case .nested(_, nil) = c.shapes[5] else { fail("composite shapes[5]") }
+    guard case .nested(_, nil)? = c.maybeShape else { fail("composite maybeShape") }
+    expect(c.maybeList == Data([9, 8]), "composite maybeList")
+    expect(c.sparse == [true, nil, false], "composite sparse")
+    expect(c.colors == [.red, .green, .blue, .infrared], "composite colors")
+}
+
+func outOfRange(_ n: UInt32) {
+    do {
+        _ = try Codec.vector(index: n)
+        fail("vector(\(n)) returned")
+    } catch let CodecError.outOfRange(message, index, count) {
+        expect(index == n && count == n, "outOfRange payload (got \(index), \(count))")
+        expect(message == "vector \(n) is out of range (count \(n))", "outOfRange message (got \(message))")
+    } catch {
+        fail("vector(\(n)) threw \(error)")
+    }
+    do {
+        _ = try Codec.vectorName(index: n + 5)
+        fail("vectorName(\(n + 5)) returned")
+    } catch let error as CodecError {
+        guard case let .outOfRange(_, index, count) = error else { fail("unexpected \(error)") }
+        expect(error.errorCode == 1 && index == n + 5 && count == n, "vectorName outOfRange payload")
+    } catch {
+        fail("vectorName(\(n + 5)) threw \(error)")
+    }
+    expect(!Codec.checkVector(index: n, value: .blank), "checkVector past the end is false")
+}
+
+/// Hand `bytes` to `check_vector` through the raw C entry point: the Swift
+/// encoder never produces a malformed buffer, but the producer must reject
+/// one with a marshalling failure (-3).
+func reject(_ bytes: [UInt8], _ what: String) {
+    var err = codec_error()
+    let ok = bytes.withUnsafeBufferPointer { codec_codec_check_vector(0, $0.baseAddress, $0.count, &err) }
+    expect(!ok && err.code == -3, "\(what) is rejected with -3 (got \(err.code))")
+    codec_error_clear(&err)
+}
+
+func le<T: FixedWidthInteger>(_ v: T) -> [UInt8] {
+    withUnsafeBytes(of: v.littleEndian) { Array($0) }
+}
+
+func malformed() {
+    let i64Tag: Int32 = 7, flagTag: Int32 = 11, textTag: Int32 = 12, hueTag: Int32 = 14, countsTag: Int32 = 19
+    reject(le(i64Tag) + le(UInt32(7)), "a truncated value")
+    reject(le(Int32(999)), "an unknown tag")
+    reject(le(Int32(0)) + [0], "trailing bytes")
+    reject(le(flagTag) + [2], "a bool of 2")
+    reject(le(hueTag) + le(Int32(3)), "an undeclared enum value")
+    let a = le(UInt32(1)) + Array("a".utf8)
+    reject(le(countsTag) + le(UInt32(2)) + a + le(Int64(1)) + a + le(Int64(2)), "a repeated map key")
+    reject(le(textTag) + le(UInt32(2)) + [0xC3, 0x28], "a string that isn't UTF-8")
+
+    // Direct families: an undeclared enum value (which Swift's `Color` can't
+    // even spell) and invalid UTF-8.
+    var err = codec_error()
+    _ = codec_codec_echo_color(codec_codec_Color(rawValue: 3), &err)
+    expect(err.code == -3, "echo_color(3) is rejected (got \(err.code))")
+    codec_error_clear(&err)
+    var len = 0
+    let bad: [UInt8] = [0xC3, 0x28]
+    let out = bad.withUnsafeBufferPointer { codec_codec_echo_text($0.baseAddress, $0.count, &len, &err) }
+    expect(out == nil && err.code == -3, "echo_text(invalid UTF-8) is rejected")
+    codec_error_clear(&err)
+}
+
+func objects(_ index: [String: UInt32]) {
+    guard let full = index["objects full"], case let .objects(h) = vector(full) else { fail("objects full") }
+    expect(h.primary.value() == 10 && h.spare?.value() == 11, "objects full primary and spare")
+    expect(h.many.map { $0.value() } == [12, 13, .min], "objects full many")
+    expect(h.byName.mapValues { $0.value() } == ["a": 20, "b": 21], "objects full byName")
+    // Each encoding mints fresh references, so the holder can be sent twice.
+    let expected = [10, 11, 12, 13, 20, 21, Int64.min].reduce(0, &+)
+    expect(Codec.sumHolder(holder: h) == expected && Codec.sumHolder(holder: h) == expected, "sumHolder twice")
+
+    // primaryOf returns the very same native object (a new wrapper).
+    let p = Codec.primaryOf(holder: h)
+    expect(p.value() == 10, "primaryOf value")
+    expect(Codec.samePrimary(a: h, b: Holder(primary: p, spare: nil, many: [], byName: [:])), "samePrimary identity")
+    let twin = Token(value: 10)
+    expect(!Codec.samePrimary(a: h, b: Holder(primary: twin, spare: nil, many: [], byName: [:])), "an equal value is not the same object")
+
+    // A holder of Swift-made tokens, the same wrapper in several slots.
+    let mine = Holder(primary: twin, spare: twin, many: [twin, twin, Token(value: -4)], byName: ["k": twin])
+    expect(Codec.sumHolder(holder: mine) == 10 * 5 - 4, "sumHolder of consumer tokens")
+    expect(twin.value() == 10, "the twin is still usable")
 }
 
 func run() {
-    // --- Scalars ------------------------------------------------------------------
-
-    let canonical = Scalars(
-        i8Value: -8, u8Value: 200, i16Value: -16_000, u16Value: 60_000,
-        i32Value: -2_000_000_000, u32Value: 4_000_000_000,
-        i64Value: -9_007_199_254_740_993, u64Value: UInt64.max,
-        f32Value: 1.5, f64Value: -2.25e100, flag: true, color: .blue)
-
-    let scalars = Codec.sampleScalars()
-    expect(scalars.i8Value == -8, "i8 (got \(scalars.i8Value))")
-    expect(scalars.u8Value == 200, "u8 (got \(scalars.u8Value))")
-    expect(scalars.i16Value == -16_000, "i16 (got \(scalars.i16Value))")
-    expect(scalars.u16Value == 60_000, "u16 (got \(scalars.u16Value))")
-    expect(scalars.i32Value == -2_000_000_000, "i32 (got \(scalars.i32Value))")
-    expect(scalars.u32Value == 4_000_000_000, "u32 (got \(scalars.u32Value))")
-    expect(scalars.i64Value == -9_007_199_254_740_993, "i64 (got \(scalars.i64Value))")
-    expect(scalars.u64Value == UInt64.max, "u64 (got \(scalars.u64Value))")
-    expect(scalars.f32Value == 1.5, "f32 (got \(scalars.f32Value))")
-    expect(scalars.f64Value == -2.25e100, "f64 (got \(scalars.f64Value))")
-    expect(scalars.flag == true, "flag")
-    expect(scalars.color == .blue, "color (got \(scalars.color))")
-    expect(scalarsEqual(scalars, canonical), "sampleScalars matches the canonical fixture")
-
-    do {
-        expect(try Codec.verifyScalars(value: scalars) == true, "producer accepts the re-encoded sample")
-        expect(try Codec.verifyScalars(value: canonical) == true, "producer accepts a locally built canonical")
-    } catch {
-        fail("verifyScalars threw: \(error)")
-    }
-    expect(scalarsEqual(Codec.roundtripScalars(value: scalars), scalars), "roundtripScalars is the identity")
-
-    // A single changed field is a typed CodecError.mismatch (code 1).
-    var tweaked = canonical
-    tweaked.u64Value -= 1
-    do {
-        _ = try Codec.verifyScalars(value: tweaked)
-        fail("expected CodecError.mismatch for a tweaked Scalars")
-    } catch let e as CodecError {
-        guard case let .mismatch(message) = e else { fail("expected .mismatch, got \(e)") }
-        expect(e.errorCode == 1, "mismatch code == 1 (got \(e.errorCode))")
-        expect(message == "value does not match the canonical fixture", "mismatch message (got \(message))")
-    } catch {
-        fail("expected CodecError, got \(error)")
-    }
-
-    // Scalars built from scratch at the extremes, with non-finite floats and a
-    // negative zero, survive a round trip bit for bit.
-    let extremes = Scalars(
-        i8Value: Int8.min, u8Value: UInt8.max, i16Value: Int16.max, u16Value: UInt16.max,
-        i32Value: Int32.min, u32Value: UInt32.max, i64Value: Int64.min, u64Value: 1 << 63,
-        f32Value: -0.0, f64Value: Double.nan, flag: false, color: .red)
-    let extremesBack = Codec.roundtripScalars(value: extremes)
-    expect(extremesBack.i64Value == Int64.min && extremesBack.u64Value == 1 << 63, "64-bit extremes")
-    expect(extremesBack.f32Value == 0 && extremesBack.f32Value.sign == .minus, "negative zero f32 keeps its sign")
-    expect(extremesBack.f64Value.isNaN, "NaN f64 round-trips")
-    expect(scalarsEqual(extremesBack, extremes), "extreme Scalars round-trip bit for bit")
-    let infinities = Scalars(
-        i8Value: Int8.max, u8Value: 0, i16Value: Int16.min, u16Value: 0, i32Value: Int32.max, u32Value: 0,
-        i64Value: Int64.max, u64Value: 0, f32Value: Float.infinity, f64Value: -Double.infinity,
-        flag: true, color: .green)
-    expect(scalarsEqual(Codec.roundtripScalars(value: infinities), infinities), "infinities round-trip")
-
-    // --- Composite ----------------------------------------------------------------
-
-    let composite = Codec.sampleComposite()
-    expect(composite.name == "héllo wörld ✓", "name (got \(composite.name))")
-    expect(composite.blob == Data([0, 1, 2, 253, 254, 255]), "blob (got \(Array(composite.blob)))")
-    expect(composite.someI64 == Int64.min, "someI64 (got \(String(describing: composite.someI64)))")
-    expect(composite.noneI64 == nil, "noneI64 nil")
-    expect(composite.someText == "", "someText is a present empty string (got \(String(describing: composite.someText)))")
-    expect(composite.names == ["a", "", "ccc"], "names (got \(composite.names))")
-    expect(composite.matrix == [[1, 2, 3], [], [-4]], "matrix (got \(composite.matrix))")
-    expect(composite.empty.isEmpty, "empty list")
-    expect(composite.byName == ["one": 1, "two": 2, "neg": -3], "byName (got \(composite.byName))")
-    expect(composite.byId.count == 2, "byId has two entries (got \(composite.byId.count))")
-    expect(composite.byId[-1].map { scalarsEqual($0, canonical) } == true, "byId[-1] is the canonical Scalars")
-    expect(composite.byId[42]?.flag == false, "byId[42] has flag false")
-    var flagless = canonical
-    flagless.flag = false
-    expect(composite.byId[42].map { scalarsEqual($0, flagless) } == true, "byId[42] otherwise canonical")
-    expect(scalarsEqual(composite.scalars, canonical), "nested scalars")
-    expect(shapeEqual(composite.shape, .labeled(label: "tag", count: 3)), "shape (got \(composite.shape))")
-    expect(composite.shapes.count == 5, "five shapes (got \(composite.shapes.count))")
-    expect(shapesEqual(composite.shapes, [
-        .empty,
-        .circle(radius: 2.5),
-        .rect(width: 1.0, height: 0.5),
-        .labeled(label: "", count: -1),
-        .nested(inner: canonical, note: "n"),
-    ]), "shapes one of each variant (got \(composite.shapes))")
-    expect(optionalShapeEqual(composite.maybeShape, .nested(inner: canonical, note: nil)),
-           "maybeShape is a nested variant with an absent note (got \(String(describing: composite.maybeShape)))")
-    expect(composite.maybeList == Data([9, 8]), "maybeList (got \(String(describing: composite.maybeList)))")
-    expect(composite.sparse == [true, nil, false], "sparse (got \(composite.sparse))")
-    expect(composite.colors == [.red, .green, .blue], "colors (got \(composite.colors))")
-
-    do {
-        expect(try Codec.verifyComposite(value: composite) == true, "producer accepts the re-encoded composite")
-    } catch {
-        fail("verifyComposite threw: \(error); producer saw: \(Codec.describeComposite(value: composite))")
-    }
-    expect(compositeEqual(Codec.roundtripComposite(value: composite), composite), "roundtripComposite is the identity")
-    let described = Codec.describeComposite(value: composite)
-    expect(described.hasPrefix("Composite {") && described.contains("héllo wörld ✓"), "describeComposite (got \(described))")
-
-    // A changed nested value is rejected.
-    var changed = composite
-    changed.sparse[1] = true
-    do {
-        _ = try Codec.verifyComposite(value: changed)
-        fail("expected CodecError.mismatch for a changed composite")
-    } catch let e as CodecError {
-        expect(e.errorCode == 1, "composite mismatch code == 1")
-    } catch {
-        fail("expected CodecError, got \(error)")
-    }
-
-    // A Composite built from scratch with edge values: empty text, bytes, lists,
-    // and maps; unicode beyond the BMP; present-but-empty optionals; and
-    // non-finite, negative-zero, and subnormal floats inside nested positions.
-    let homemade = Composite(
-        name: "",
-        blob: Data(),
-        someI64: Int64.max,
-        noneI64: -1,
-        someText: nil,
-        names: ["日本語", "🚀 rocket", "", "\u{0}nul"],
-        matrix: [[], [Int32.min, Int32.max], []],
-        empty: [Double.nan, -0.0, Double.infinity, -Double.infinity, Double.leastNonzeroMagnitude],
-        byName: [:],
-        byId: [Int32.min: extremes, 0: canonical, Int32.max: infinities],
-        scalars: extremes,
-        shape: .empty,
-        shapes: [],
-        maybeShape: nil,
-        maybeList: Data(),
-        sparse: [nil, nil, true],
-        colors: [.blue, .blue, .red, .green])
-    let homemadeBack = Codec.roundtripComposite(value: homemade)
-    expect(homemadeBack.name.isEmpty && homemadeBack.blob.isEmpty, "empty string and bytes")
-    expect(homemadeBack.someText == nil, "absent optional string")
-    expect(homemadeBack.maybeList != nil && homemadeBack.maybeList!.isEmpty, "present empty optional bytes")
-    expect(homemadeBack.names == homemade.names, "unicode names (got \(homemadeBack.names))")
-    expect(homemadeBack.matrix == [[], [Int32.min, Int32.max], []], "matrix with empty rows")
-    expect(homemadeBack.empty[0].isNaN, "NaN inside a list")
-    expect(homemadeBack.empty[1] == 0 && homemadeBack.empty[1].sign == .minus, "negative zero inside a list")
-    expect(homemadeBack.empty[2] == Double.infinity && homemadeBack.empty[3] == -Double.infinity, "infinities inside a list")
-    expect(homemadeBack.empty[4] == Double.leastNonzeroMagnitude, "subnormal double inside a list")
-    expect(homemadeBack.byName.isEmpty && homemadeBack.byId.count == 3, "empty map, three-entry map")
-    expect(homemadeBack.byId[Int32.min].map { scalarsEqual($0, extremes) } == true, "Int32.min key")
-    expect(homemadeBack.shapes.isEmpty && homemadeBack.maybeShape == nil, "empty shapes, absent maybeShape")
-    expect(compositeEqual(homemadeBack, homemade), "homemade Composite round-trips")
-    expect(Codec.describeComposite(value: homemade).contains("日本語"), "describe renders unicode")
-    do {
-        _ = try Codec.verifyComposite(value: homemade)
-        fail("homemade composite is not the canonical one")
-    } catch let e as CodecError {
-        expect(e.errorCode == 1, "homemade composite mismatch code == 1")
-    } catch {
-        fail("expected CodecError, got \(error)")
-    }
-
-    // --- Shape (rich enum) ---------------------------------------------------------
-
-    let allShapes: [Shape] = [
-        .empty,
-        .circle(radius: -0.0),
-        .rect(width: Float.nan, height: -Float.infinity),
-        .labeled(label: "ünïcödé ✓", count: Int32.min),
-        .nested(inner: extremes, note: ""),
-        .nested(inner: canonical, note: nil),
-    ]
-    for s in allShapes {
-        expect(shapeEqual(Codec.roundtripShape(value: s), s), "roundtripShape identity for \(s)")
-    }
-    expect(shapesEqual(Codec.roundtripShapes(value: allShapes), allShapes), "roundtripShapes identity")
-    expect(Codec.roundtripShapes(value: []).isEmpty, "roundtripShapes of an empty list")
-    expect(Codec.describeShape(value: .empty) == "Empty", "describe Empty")
-    expect(Codec.describeShape(value: .circle(radius: 2.5)) == "Circle { radius: 2.5 }", "describe Circle")
-    expect(Codec.describeShape(value: .rect(width: 1.0, height: 0.5)) == "Rect { width: 1.0, height: 0.5 }",
-           "describe Rect")
-    expect(Codec.describeShape(value: .labeled(label: "tag", count: 3)) == "Labeled { label: \"tag\", count: 3 }",
-           "describe Labeled")
-    expect(Codec.describeShape(value: .nested(inner: canonical, note: nil)).hasPrefix("Nested { inner: Scalars {"),
-           "describe Nested")
-
-    // --- Direct, string, bytes, and standalone buffered families --------------------
-
-    expect(Codec.roundtripOptI64(value: nil) == nil, "optional i64 absent")
-    expect(Codec.roundtripOptI64(value: Int64.min) == Int64.min, "optional i64 present")
-    expect(Codec.roundtripOptI64(value: 0) == 0, "optional i64 zero is present, not absent")
-    expect(Codec.roundtripMap(value: [:]).isEmpty, "empty map")
-    let bigMap: [String: Int64] = ["": 0, "a": Int64.max, "ключ": Int64.min, "z": -1]
-    expect(Codec.roundtripMap(value: bigMap) == bigMap, "map with empty and unicode keys")
-    expect(Codec.roundtripString(value: "") == "", "empty string")
-    expect(Codec.roundtripString(value: "héllo wörld ✓ 🚀") == "héllo wörld ✓ 🚀", "unicode string")
-    // Strings cross as pointer and length, so an interior NUL survives both
-    // directions, alone and inside a buffered record.
-    let withNul = "before\u{0}after\u{0}"
-    expect(Codec.roundtripString(value: withNul) == withNul, "interior NUL string round-trips")
-    expect(Codec.roundtripString(value: "\u{0}") == "\u{0}", "lone NUL string round-trips")
-    expect(Codec.roundtripComposite(value: homemade).names[3] == "\u{0}nul", "NUL inside a record field")
-    expect(Codec.roundtripBytes(value: Data()).isEmpty, "empty bytes")
-    let allBytes = Data((0...255).map { UInt8($0) })
-    expect(Codec.roundtripBytes(value: allBytes) == allBytes, "every byte value")
-    expect(Codec.roundtripI64(value: Int64.min) == Int64.min, "i64 min")
-    expect(Codec.roundtripI64(value: Int64.max) == Int64.max, "i64 max")
-    expect(Codec.roundtripI64(value: -1) == -1, "i64 -1")
-    expect(Codec.roundtripU64(value: UInt64.max) == UInt64.max, "u64 max")
-    expect(Codec.roundtripU64(value: 1 << 63) == 1 << 63, "u64 above 2^63")
-    expect(Codec.roundtripU64(value: 0) == 0, "u64 zero")
-    expect(Codec.roundtripF64(value: Double.nan).isNaN, "f64 NaN")
-    expect(Codec.roundtripF64(value: Double.infinity) == Double.infinity, "f64 +inf")
-    expect(Codec.roundtripF64(value: -Double.infinity) == -Double.infinity, "f64 -inf")
-    let negZero = Codec.roundtripF64(value: -0.0)
-    expect(negZero == 0 && negZero.sign == .minus, "f64 negative zero keeps its sign")
-    expect(Codec.roundtripF64(value: Double.leastNonzeroMagnitude) == Double.leastNonzeroMagnitude, "f64 subnormal")
-    expect(Codec.roundtripF64(value: -2.25e100) == -2.25e100, "f64 large negative")
-    expect(Codec.roundtripBool(value: true) == true && Codec.roundtripBool(value: false) == false, "bool")
-    expect(Codec.roundtripColor(value: .blue) == .blue, "color blue (discriminant 7)")
-    expect(Codec.roundtripColor(value: .red) == .red, "color red")
-
-    // --- Holder: objects inside buffers -------------------------------------------
-
-    let holder = Codec.makeHolder(base: 10, withSpare: true)
-    expect(holder.primary.value() == 10, "primary token (got \(holder.primary.value()))")
-    expect(holder.spare?.value() == 11, "spare token (got \(String(describing: holder.spare?.value())))")
-    expect(holder.many.map { $0.value() } == [12, 13, 14], "many tokens (got \(holder.many.map { $0.value() }))")
-    // Encoding clones every token; the producer adopts and drops those clones,
-    // and the wrappers remain valid for the next call.
-    expect(Codec.sumHolder(holder: holder) == 60, "sumHolder (got \(Codec.sumHolder(holder: holder)))")
-    expect(Codec.sumHolder(holder: holder) == 60, "sumHolder again: no reference was consumed")
-    expect(holder.primary.value() == 10 && holder.many[2].value() == 14, "tokens still alive after encoding")
-
-    // primaryOf returns the very object stored in holder.primary.
-    let primary = Codec.primaryOf(holder: holder)
-    expect(primary.value() == 10, "primaryOf value")
-    let rebuilt = Holder(primary: primary, spare: nil, many: [])
-    expect(Codec.samePrimary(a: holder, b: rebuilt), "primaryOf returned the same object as holder.primary")
-    expect(Codec.samePrimary(a: holder, b: holder), "a holder shares its own primary")
-    expect(!Codec.samePrimary(a: holder, b: Codec.makeHolder(base: 10, withSpare: true)),
-           "a fresh holder with equal values is a different object")
-    expect(Codec.sumHolder(holder: rebuilt) == 10, "sumHolder over a consumer-built holder")
-
-    let bare = Codec.makeHolder(base: 0, withSpare: false)
-    expect(bare.spare == nil, "withSpare false yields no spare")
-    expect(bare.primary.value() == 0 && bare.many.map { $0.value() } == [2, 3, 4], "bare tokens")
-    expect(Codec.sumHolder(holder: bare) == 9, "sumHolder without spare (got \(Codec.sumHolder(holder: bare)))")
-
-    // Consumer-created tokens, including one object referenced twice from the
-    // same buffer (two clones, two adoptions).
-    let shared = Token(value: 100)
-    let mine = Holder(primary: shared, spare: Token(value: 5), many: [shared, Token(value: 1), shared])
-    expect(Codec.sumHolder(holder: mine) == 100 + 5 + 100 + 1 + 100, "sumHolder over shared tokens")
-    expect(Codec.samePrimary(a: mine, b: Holder(primary: shared, spare: nil, many: [])), "shared primary identity")
-    expect(shared.value() == 100, "shared token alive after three encodings")
-    expect(Codec.sumHolder(holder: Holder(primary: Token(value: -7), spare: nil, many: [])) == -7, "minimal holder")
-
-    // Release: every wrapper's deinit releases its strong reference, including
-    // the ones adopted from a decoded buffer and the one returned by primaryOf.
-    weak var weakPrimary: Token?
-    weak var weakSpare: Token?
-    weak var weakMany: Token?
-    weak var weakReturned: Token?
-    do {
-        let h = Codec.makeHolder(base: 20, withSpare: true)
-        weakPrimary = h.primary
-        weakSpare = h.spare
-        weakMany = h.many[0]
-        let p = Codec.primaryOf(holder: h)
-        weakReturned = p
-        expect(p.value() == 20 && Codec.sumHolder(holder: h) == 20 + 21 + 22 + 23 + 24, "scoped holder usable")
-    }
-    expect(weakPrimary == nil && weakSpare == nil && weakMany == nil && weakReturned == nil,
-           "every token wrapper was deinitialized when the holder left scope")
+    let n = Codec.vectorCount()
+    expect(n >= 60, "vectorCount (got \(n))")
+    let index = vectorIndex(n)
+    expect(index.count == Int(n), "vector names are unique")
+    everyVector(n)
+    literalVectors(index)
+    spotChecks(index)
+    outOfRange(n)
+    malformed()
+    objects(index)
+    print("swift/codec: \(n) vectors")
 }
 
 run()
+expect(codec_abi_version() == 4, "ABI revision 4")
+expect(codec_debug_live(-1) == 1, "the sample counts live resources")
 assertNoLeaks()
 print("swift/codec: OK")

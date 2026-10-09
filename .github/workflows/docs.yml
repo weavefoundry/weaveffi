@@ -17,6 +17,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
@@ -29,9 +30,9 @@ jobs:
 
       - name: Install mdbook + mdbook-linkcheck2
         # Keep this in sync with the docs linkcheck job in quality.yml.
-        run: |
-          cargo install mdbook --locked
-          cargo install mdbook-linkcheck2 --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook,mdbook-linkcheck2
 
       - name: Build mdBook
         run: mdbook build docs
@@ -60,6 +61,7 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4

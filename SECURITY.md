@@ -60,10 +60,12 @@ Expected flow:
 
 Security-sensitive areas include:
 
-- The `weaveffi-abi` runtime and generated C ABI ownership rules.
+- The `weaveffi::abi` runtime and generated C ABI ownership rules.
 - Generated bindings that manage pointers, callbacks, async contexts, or
   language-runtime handles.
-- The parser, validator, and `weaveffi extract` input handling.
-- CLI behavior that reads project files, runs hooks, or writes generated output.
+- The parser and validator, and the library-metadata reader behind
+  `weaveffi generate` and `weaveffi extract` (which parses built libraries).
+- CLI behavior that reads project files, builds a producer crate with Cargo,
+  or writes generated output and packages.
 
 Bug reports outside this scope are still welcome through normal GitHub issues.

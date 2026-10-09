@@ -12,11 +12,11 @@
 # targets generate the same JavaScript API.
 set -uo pipefail
 . "$(dirname "$0")/../lib.sh"
+require_tools node node npm
 
 node_consumer() {
     local sample="$1" src="$2"
     local dir="$OUT/node-$sample" tarball
-    command -v npm >/dev/null 2>&1 || { echo "npm not found" >&2; return 1; }
     rm -rf "$dir"
     mkdir -p "$dir"
     tarball=$(cd "$dir" && npm pack --silent "$GENROOT/$sample/node") \
@@ -29,20 +29,12 @@ node_consumer() {
     ( cd "$dir" && node --expose-gc "$src" )
 }
 
-node_contacts()   { node_consumer contacts contacts.mjs; }
+node_calculator() { node_consumer calculator calculator.mjs; }
+node_codec() { node_consumer codec codec.mjs; }
+node_kvstore() { node_consumer kvstore kvstore.mjs; }
 
-node_events()     { node_consumer events events.mjs; }
-
-node_kvstore()    { node_consumer kvstore kvstore.mjs; }
-
-node_async_demo() { node_consumer async-demo async_demo.mjs; }
-
-node_codec()      { node_consumer codec codec.mjs; }
-
-lane node-contacts node_contacts
-lane node-events node_events
-lane node-kvstore node_kvstore
-lane node-async-demo node_async_demo
+lane node-calculator node_calculator
 lane node-codec node_codec
+lane node-kvstore node_kvstore
 
 finish_lanes

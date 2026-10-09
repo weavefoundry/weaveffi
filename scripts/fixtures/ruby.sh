@@ -2,6 +2,8 @@
 # Syntax-check every generated Ruby file with warnings enabled (any warning
 # fails), then build the gem from its generated gemspec.
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+require ruby gem
 dir=$(cd "$1" && pwd)
 status=0
 while IFS= read -r file; do

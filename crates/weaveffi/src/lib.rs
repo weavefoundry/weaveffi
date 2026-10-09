@@ -42,9 +42,10 @@
 //! weaveffi::export_runtime!();
 //! ```
 //!
-//! The same annotated source is what `weaveffi generate path/to/lib.rs` reads to
-//! emit the IDL, header, and bindings, so the producer and the bindings cannot
-//! drift: they are two views of one parse.
+//! The macro also embeds the API in the built library, which is what
+//! `weaveffi generate` (run in the crate) reads to emit the header and
+//! bindings, so the producer and the bindings can't drift: the bindings
+//! describe exactly what the library was compiled with.
 //!
 //! # What you get
 //!
@@ -58,10 +59,12 @@
 //!   as `&T` or `Arc<T>`, return one as `Self`, `T`, or `Arc<T>`.
 //! * [`macro@error`] - the module's error domain.
 //! * [`macro@callback_interface`] - a trait the consumer implements; accept
-//!   one as `Arc<dyn Trait>`.
+//!   one as `Arc<dyn Trait>` (or `Option<Arc<dyn Trait>>`). Its methods
+//!   return `Result<T, ForeignError>`; [`macro@throws`] lets one report the
+//!   module's domain errors.
 //! * [`macro@cancellable`] - mark an `async fn` as accepting a cancel token.
-//! * [`set_spawner`] - install the executor async exports run on (Tokio, for
-//!   example); the default drives each future on its own thread.
+//! * [`set_spawner`] - install the executor async exports run on; the default
+//!   is a small pool of worker threads, or Tokio with the `tokio` feature.
 //! * [`export_runtime!`] - export the runtime symbols (memory, errors, cancel
 //!   tokens, ABI version) under the crate's prefix, once per library.
 //! * [`abi`] - the C ABI runtime: the error struct, memory helpers, and the
@@ -72,34 +75,43 @@
 //! * `leak-check` counts live objects, callbacks, iterators, cancel tokens,
 //!   and returned allocations, reported by `{prefix}_debug_live` so a test
 //!   harness can assert a consumer released everything. Off by default.
+//! * `tokio` runs exported `async fn`s on Tokio: the current runtime when a
+//!   launcher is called from inside one, otherwise a multi-thread runtime
+//!   created on first use. [`set_spawner`] still overrides it. Off by
+//!   default.
 
 #![deny(missing_docs)]
+#![warn(clippy::missing_errors_doc)]
+#![warn(clippy::missing_panics_doc)]
+#![warn(clippy::missing_safety_doc)]
+#![warn(clippy::doc_markdown)]
 
-/// The stable C ABI runtime: error type, cancel tokens, memory management, and
-/// the `lift_*`/`lower_*` marshalling converters the macro expansion calls.
-///
-/// Re-exported from [`weaveffi_abi`] so producers depend on a single `weaveffi`
-/// crate; the generated thunks reference these items as `::weaveffi::abi::*`.
-pub use weaveffi_abi as abi;
+pub mod abi;
 
 /// An owned, lazily-pulled iterator returned by a producer function whose IDL
 /// return type is `iter<T>`. Construct one from any iterator with
-/// [`Iter::new`](weaveffi_abi::Iter::new); the [`macro@module`] expansion turns
+/// [`Iter::new`](abi::Iter::new); the [`macro@module`] expansion turns
 /// it into the opaque iterator handle the generated bindings consume.
-pub use weaveffi_abi::Iter;
+pub use abi::Iter;
 
 /// The producer's handle on a consumer's cancel token, accepted as the final
 /// parameter of a `#[weaveffi::cancellable]` `async fn`. When the consumer
 /// cancels, the runtime drops the function's future and completes the call
 /// with the cancelled code; poll
-/// [`is_cancelled`](weaveffi_abi::CancelToken::is_cancelled) only for
+/// [`is_cancelled`](abi::CancelToken::is_cancelled) only for
 /// cooperative cleanup (work on other threads, say).
-pub use weaveffi_abi::CancelToken;
+pub use abi::CancelToken;
 
-/// A consumer's callback-interface implementation failed. A callback trait
-/// method declared to return `Result<T, ForeignError>` receives the failure
-/// as an `Err` instead of unwinding.
-pub use weaveffi_abi::ForeignError;
+/// A consumer's callback-interface implementation failed. Every callback
+/// trait method returns `Result<T, ForeignError>`, so the failure arrives as
+/// an `Err`; a method marked `#[weaveffi::throws]` can decode a declared
+/// domain error from it with [`ForeignError::domain`](abi::ForeignError::domain).
+pub use abi::ForeignError;
+
+/// A module's error domain: the trait the `#[weaveffi::error]` expansion
+/// implements so [`ForeignError::domain`](abi::ForeignError::domain) can
+/// decode a typed error a callback reported.
+pub use abi::ErrorDomain;
 
 /// Maps a producer error onto the ABI's `(code, message)` pair. A fallible
 /// `#[weaveffi::export]` function reports `Err(e)` through its trailing
@@ -107,22 +119,23 @@ pub use weaveffi_abi::ForeignError;
 /// generic code `-1` out of the box, while a `#[weaveffi::error]` enum (or a
 /// manual [`ErrorReport`] impl) surfaces the named codes of an IDL error
 /// domain, with its `Display` output as the message.
-pub use weaveffi_abi::ErrorReport;
+pub use abi::ErrorReport;
 
 /// Install the process-wide executor that exported `async fn`s run on. Call it
 /// once at startup (before the first async export is launched) to hand futures
-/// to a runtime such as Tokio; until then, and if never called, each future is
-/// driven to completion on its own thread.
-pub use weaveffi_abi::set_spawner;
+/// to a runtime of your choice; until then, and if never called, futures run
+/// on the default executor (a small worker pool, or Tokio with the `tokio`
+/// feature).
+pub use abi::set_spawner;
 
 /// The executor hook [`set_spawner`] accepts: anything callable as
 /// `Fn(BoxFuture)` that is `Send + Sync + 'static`.
-pub use weaveffi_abi::Spawner;
+pub use abi::Spawner;
 
 /// The type-erased `Send + 'static` future a [`Spawner`] receives.
-pub use weaveffi_abi::BoxFuture;
+pub use abi::BoxFuture;
 
 pub use weaveffi_macros::{
     callback_interface, cancellable, enumeration, error, export, export_runtime, interface, module,
-    record,
+    record, throws,
 };

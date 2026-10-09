@@ -5,6 +5,7 @@
 # consumer against one sample and must exit 0.
 set -uo pipefail
 . "$(dirname "$0")/../lib.sh"
+require_tools kotlin kotlinc java cmake
 
 # Kotlin (JVM): build the generated JNI shim with its own CMakeLists.txt
 # against the producer in $LIBDIR, compile the generated Kotlin sources on
@@ -44,20 +45,12 @@ kotlin_consumer() {
         java -Djava.library.path="$b/shim" -cp "$b/app.jar:$b/bindings.jar:$coro:$kstdlib" Main
 }
 
-kotlin_contacts()   { kotlin_consumer contacts contacts.kt; }
+kotlin_calculator() { kotlin_consumer calculator calculator.kt; }
+kotlin_codec() { kotlin_consumer codec codec.kt; }
+kotlin_kvstore() { kotlin_consumer kvstore kvstore.kt; }
 
-kotlin_events()     { kotlin_consumer events events.kt; }
-
-kotlin_kvstore()    { kotlin_consumer kvstore kvstore.kt; }
-
-kotlin_async_demo() { kotlin_consumer async-demo async_demo.kt; }
-
-kotlin_codec()      { kotlin_consumer codec codec.kt; }
-
-lane kotlin-contacts kotlin_contacts
-lane kotlin-events kotlin_events
-lane kotlin-kvstore kotlin_kvstore
-lane kotlin-async-demo kotlin_async_demo
+lane kotlin-calculator kotlin_calculator
 lane kotlin-codec kotlin_codec
+lane kotlin-kvstore kotlin_kvstore
 
 finish_lanes

@@ -13,7 +13,7 @@ read consistently and the doc lints stay green in CI.
 - Document fallible and panicking behavior with `# Errors`, `# Panics`, and
   `# Safety` sections. These are the Rust analog of "what can go wrong," and
   the matching Clippy lints require them.
-- Link other items with intra-doc links: `` [`BindingModel`] `` or
+- Link other items with intra-doc links: `` [`Model`] `` or
   `` [`Api`](weaveffi_model::ir::Api) ``.
 - Wrap code-like identifiers in backticks. Product and tool names
   (WeaveFFI, SwiftPM, CMake) are allow-listed in `clippy.toml` instead.
@@ -47,7 +47,7 @@ Google-style docstring.
 ```rust
 /// Generate bindings for every requested target and write them to `out_dir`.
 ///
-/// Targets are rendered from a shared [`BindingModel`] so symbol names and
+/// Targets are rendered from a shared [`Model`] so symbol names and
 /// parameter lowering are computed once and reused across languages.
 ///
 /// # Errors
@@ -111,7 +111,7 @@ obligations. Clippy's `missing_safety_doc` enforces this.
 ///
 /// `arena` must be a valid pointer returned by `arena_create`. `ptr` and
 /// `dtor` must stay valid until `arena_destroy` is called.
-pub fn arena_register(arena: *mut HandleArena, ptr: *mut c_void, dtor: Dtor) {
+pub unsafe fn arena_register(arena: *mut HandleArena, ptr: *mut c_void, dtor: Dtor) {
     // ...
 }
 ```
@@ -125,10 +125,16 @@ flags undocumented `pub` fields and variants, not just the type itself.
 /// Error struct passed across the C ABI boundary.
 #[repr(C)]
 pub struct FfiError {
-    /// Status code. `0` means success; any non-zero value indicates failure.
+    /// Status code. `0` means success; a positive value is a domain error
+    /// code and a negative value is one of the reserved runtime codes.
     pub code: i32,
     /// Owned, NUL-terminated UTF-8 message, or null when `code` is `0`.
     pub message: *const c_char,
+    /// Owned value buffer holding the error code's payload fields, or null
+    /// when the code declares no fields.
+    pub payload_ptr: *const u8,
+    /// Byte length of `payload_ptr`; `0` when null.
+    pub payload_len: usize,
 }
 
 /// How a value crosses the ABI boundary.
@@ -181,7 +187,7 @@ Link to other items so rustdoc can resolve and cross-reference them. This
 is the Rust analog of the docs site's autorefs:
 
 ```rust
-/// Renders from the shared [`BindingModel`], never re-deriving lowering.
+/// Renders from the shared [`Model`], never re-deriving lowering.
 ///
 /// See [`Api`](weaveffi_model::ir::Api) for the input model and
 /// [`LanguageBackend`](crate::backend::LanguageBackend) for the trait every
@@ -195,7 +201,7 @@ Use the short `` [`Type`] `` form when the item is in scope, and the
 
 Clippy's `doc_markdown` lint flags identifiers that look like code but
 aren't wrapped in backticks. Wrap real identifiers, types, paths, and
-file names in backticks (`` `BindingModel` ``, `` `weaveffi.yml` ``).
+file names in backticks (`` `Model` ``, `` `weaveffi.toml` ``).
 
 Product names, tool names, and naming-convention terms (WeaveFFI, SwiftPM,
 CMake, NuGet, `snake_case`, `PascalCase`) read as prose, not code. Rather
@@ -205,8 +211,11 @@ name.
 
 ## Enforcement
 
-The doc lints are configured per library crate (in each crate's `lib.rs`)
-and centrally in `clippy.toml`:
+The doc lints are set in each library crate's `lib.rs`, and `clippy.toml`
+holds the `doc_markdown` allow list. Every library crate denies
+`missing_docs`; `weaveffi`, `weaveffi-model`, and `weaveffi-cli` also turn
+on the Clippy doc lints below (`weaveffi-macros` exports only proc macros,
+which `missing_docs` covers):
 
 | Lint | What it requires |
 | --- | --- |
@@ -224,12 +233,12 @@ fail the build. Check your changes locally before pushing:
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Build the API docs the way the rustdoc job does.
-RUSTDOCFLAGS="-D rustdoc::all -D rustdoc::missing_crate_level_docs" \
+RUSTDOCFLAGS="-D warnings -D rustdoc::all -D rustdoc::missing_crate_level_docs" \
     cargo doc --workspace --no-deps
 
-# Or run both through the shared recipe.
-just doc
+# Or run formatting, clippy, and rustdoc together.
+just check
 ```
 
-The generated API reference is published under
-[`/api/rust/`](rust.md) when the docs site deploys.
+The generated API reference is published under `/api/rust/` on the docs
+site when it deploys; the [Rust API Map](rust.md) is the guided tour.

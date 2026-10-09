@@ -1,17 +1,13 @@
 [workspace]
 members = [
     "crates/weaveffi-model",
-    "crates/weaveffi-abi",
     "crates/weaveffi-macros",
     "crates/weaveffi",
-    "crates/weaveffi-gen",
     "crates/weaveffi-cli",
     "samples/calculator",
-    "samples/contacts",
-    "samples/async-demo",
-    "samples/events",
     "samples/kvstore",
     "samples/codec",
+    "crates/weaveffi-cli/tests/fixtures/producer",
     "crates/weaveffi-fuzz",
 ]
 resolver = "2"
@@ -31,10 +27,8 @@ description = "WeaveFFI: Rust core with stable C ABI and multi-language bindings
 
 [workspace.dependencies]
 weaveffi = { path = "crates/weaveffi", version = "0.24.0" }
-weaveffi-abi = { path = "crates/weaveffi-abi", version = "0.24.0" }
 weaveffi-macros = { path = "crates/weaveffi-macros", version = "0.24.0" }
 weaveffi-model = { path = "crates/weaveffi-model", version = "0.24.0", default-features = false }
-weaveffi-gen = { path = "crates/weaveffi-gen", version = "0.24.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1.0"
@@ -44,7 +38,6 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 camino = { version = "1.1", features = ["serde1"] }
-sha2 = "0.10"
 heck = "0.5"
 syn = { version = "2.0", features = ["full", "parsing", "visit"] }
 quote = "1.0"

@@ -1,417 +1,602 @@
-// Conformance consumer: kvstore sample, C++ target.
+// Conformance consumer: kvstore sample, C++ target (ABI revision 4).
 //
-// Drives the generated header-only wrapper over the object-graph surface:
-//  - `Store` is a copyable RAII interface wrapper (copies `_clone`, moves
-//    transfer, destructors release) constructed via the `Store::open`
-//    static factory, which throws the typed `IoError` on failure.
-//  - `share()` returns a wrapper to the SAME producer object; `fork()` a new
-//    one; `larger(std::optional<Store>)` exercises `Store?` both ways;
-//    `describe()` returns a record carrying a `Store` field and an optional
-//    one; `open_many` returns a vector of objects; `total_count` takes a
-//    vector of objects plus an optional record holding an object.
-//  - `EvictionListener` is an abstract class the consumer subclasses; a
-//    returned `false` detaches (and frees) it, replacing or clearing frees
-//    the previous one, and an implementation that throws surfaces to the
-//    caller as `Error` code -4.
-//  - the pre-existing surface still works: value records with optional,
-//    list, map, and bytes fields, the `KvError` hierarchy, the lazy
-//    `list_keys` range, the `kv::stats` nested module, and the
-//    std::future-backed cancellable `compact`, cancelled through an RAII
-//    `CancelToken` into `Cancelled`.
-// Ends by asserting the producer's leak counters are all zero.
-// Exits non-zero on the first failed check.
+// Drives the feature-complete producer through the generated header:
+//
+//   * the load-time check (ABI revision and both modules' contract tables;
+//     a doctored table is refused by name);
+//   * the `Store` RAII class: fallible and infallible constructors, methods,
+//     statics, the deprecated `size`, records (`Entry`, `StoreInfo`), the
+//     `EntryKind` enum, maps and optionals, and the logical clock;
+//   * the `KvError` hierarchy with payload fields (`KeyNotFoundError`,
+//     `ExpiredError`, `StoreFullError`, `RejectedError`) and runtime codes on
+//     throwing calls (the root `Error`);
+//   * lazy ranges of strings (throwing), records, and objects;
+//   * three callback interfaces implemented as subclasses: a `Listener`
+//     (retained, filtered by `accepts`, told about every `Change`, detached
+//     when it throws, and notified from a producer thread during
+//     compaction), a `Policy` (a record return, a typed `RejectedError`
+//     thrown back through `put` with its fields, an object parameter and
+//     object return, and returns the producer rejects), and a `Loader` passed
+//     as an optional callback (string, bytes, and optional-object returns;
+//     typed errors decoded by the producer or passed through);
+//   * `Store` objects in every position, compared by native identity;
+//   * futures: an async free function returning an object, a cancellable
+//     method cancelled mid-pause, an async list, an async function in the
+//     nested `kv.stats` module, and concurrent calls;
+//   * the nested `kv.stats` module and the sibling `report` root.
+//
+// Ends by asserting every callback implementation was released and the
+// producer's leak counters are all zero.
 
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <thread>
+#include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "check.hpp"
 #include "kvstore.hpp"
 
 using namespace kvstore;
+namespace stats = ::kvstore::kv::stats;
 
-static void check(bool ok, const char* what) {
-    if (!ok) {
-        std::fprintf(stderr, "cpp/kvstore: FAIL: %s\n", what);
-        std::exit(1);
+static const std::thread::id g_main_thread = std::this_thread::get_id();
+static std::atomic<int> g_listeners_freed{0};
+static std::atomic<int> g_policies_freed{0};
+static std::atomic<int> g_loaders_freed{0};
+
+static std::vector<uint8_t> bytes(std::string_view s) { return std::vector<uint8_t>(s.begin(), s.end()); }
+
+static bool starts_with(std::string_view s, std::string_view prefix) {
+    return s.substr(0, prefix.size()) == prefix;
+}
+
+static Entry put(const Store& s, std::string_view key, std::string_view value,
+                 EntryKind kind = EntryKind::Persistent, std::optional<int64_t> ttl = std::nullopt) {
+    return s.put(key, bytes(value), kind, ttl);
+}
+
+template <typename F>
+static KeyNotFoundError expect_key_not_found(F&& fn, const std::string& key, const char* what) {
+    KeyNotFoundError e = expect_throw<KeyNotFoundError>(std::forward<F>(fn), what);
+    CHECK(e.code() == 1001 && e.key == key);
+    return e;
+}
+
+// ── load ────────────────────────────────────────────────────────────────────
+
+static void load_checks() {
+    check_library();
+
+    // A table entry the library lacks, or one whose signature changed, is
+    // refused by its path.
+    const detail::ContractEntry missing[] = {{1, 2, "kv.Store.vanished"}};
+    CHECK(detail::contract_mismatch(kvstore_kv_contract, missing) ==
+          "kv.Store.vanished is missing from the library");
+    const detail::ContractEntry& first = detail::kv_contract[0];
+    const detail::ContractEntry changed[] = {{first.id, first.hash ^ 1, first.path}};
+    CHECK(detail::contract_mismatch(kvstore_kv_contract, changed) ==
+          std::string(first.path) + " changed since these bindings were generated");
+    CHECK(detail::contract_mismatch(kvstore_kv_contract, detail::kv_contract).empty());
+    CHECK(detail::contract_mismatch(kvstore_report_contract, detail::report_contract).empty());
+}
+
+// ── constructors ────────────────────────────────────────────────────────────
+
+static void constructors() {
+    InvalidPathError e = expect_throw<InvalidPathError>([] { Store::open(""); }, "open('')");
+    CHECK(e.code() == 1004 && std::string(e.what()) == "invalid path");
+    CHECK(dynamic_cast<const KvError*>(&e) != nullptr && dynamic_cast<const Error*>(&e) != nullptr);
+
+    Store s;
+    CHECK(s.path() == "memory");
+    CHECK(s.capacity() == Store::default_capacity() && s.capacity() == 1000000);
+
+    Store opened = kv::open_store("/async").get();
+    CHECK(opened.path() == "/async");
+    std::future<Store> failing = kv::open_store("");
+    e = expect_throw<InvalidPathError>([&] { failing.get(); }, "open_store('')");
+    CHECK(e.code() == 1004 && std::string(e.what()) == "invalid path");
+}
+
+// ── basics ──────────────────────────────────────────────────────────────────
+
+static void basics() {
+    Store s = Store::open("/basics");
+    Entry e = put(s, "alpha", "one");
+    CHECK(e.key == "alpha" && e.value == bytes("one") && e.kind == EntryKind::Persistent);
+    CHECK(e.version == 1 && !e.expires_at.has_value() && e.tags.empty() && e.metadata.empty());
+    e = put(s, "alpha", "two", EntryKind::Volatile);
+    CHECK(e.version == 2 && e.kind == EntryKind::Volatile);
+    CHECK(s.get("alpha").value == bytes("two"));
+    KeyNotFoundError nf = expect_key_not_found([&] { s.get("nope"); }, "nope", "get('nope')");
+    CHECK(std::string(nf.what()) == "key not found: nope");
+    std::optional<Entry> found = s.find("alpha");
+    CHECK(found.has_value() && found->version == 2);
+    CHECK(!s.find("nope").has_value());
+
+    // TTLs follow the logical clock; an expired get reports when.
+    CHECK(put(s, "ttl", "x", EntryKind::Volatile, 10).expires_at == 10);
+    CHECK(s.now() == 0);
+    CHECK(s.tick(9) == 9 && s.count() == 2);
+    CHECK(s.tick(1) == 10 && s.count() == 1);
+    ExpiredError ex = expect_throw<ExpiredError>([&] { s.get("ttl"); }, "get expired");
+    CHECK(ex.code() == 1002 && ex.key == "ttl" && ex.expired_at == 10);
+    expect_key_not_found([&] { s.get("ttl"); }, "ttl", "the expired read removed it");
+
+    // Capacity: a new key past it is StoreFull { capacity }.
+    s.set_capacity(1);
+    CHECK(s.capacity() == 1);
+    put(s, "alpha", "three");
+    StoreFullError full = expect_throw<StoreFullError>([&] { put(s, "beta", "b"); }, "StoreFull");
+    CHECK(full.code() == 1003 && full.capacity == 1);
+    s.set_capacity(100);
+
+    // An undeclared enum value is a marshalling failure: on a call that
+    // declares errors it's the root Error, not a KvError.
+    Error bad = expect_throw<Error>(
+        [&] { s.put("k", bytes("v"), static_cast<EntryKind>(9), std::nullopt); }, "bad EntryKind");
+    CHECK(bad.code() == -3 && dynamic_cast<const KvError*>(&bad) == nullptr);
+
+    put(s, "beta", "b");
+    CHECK(s.delete_("beta") && !s.delete_("beta"));
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    CHECK(s.size() == s.count() && s.count() == 1);
+#pragma GCC diagnostic pop
+    CHECK(s.clear() == 1 && s.count() == 0);
+}
+
+// ── iterators ───────────────────────────────────────────────────────────────
+
+static void iterators() {
+    Store s = Store::open("/iter");
+    put(s, "user.bob", "b");
+    put(s, "user.alice", "a");
+    put(s, "sys.x", "xx");
+
+    std::vector<std::string> keys;
+    for (const std::string& k : s.keys(std::nullopt)) keys.push_back(k);
+    CHECK((keys == std::vector<std::string>{"sys.x", "user.alice", "user.bob"}));
+    expect_key_not_found([&] { s.keys(std::string("zzz")); }, "zzz", "keys('zzz')");
+
+    // Abandoning a range part-way releases the producer iterator.
+    {
+        auto range = s.keys(std::string("user."));
+        std::optional<std::string> next = range.next();
+        CHECK(next == "user.alice");
+        CHECK(kvstore_debug_live(2) == 1);
+    }
+    CHECK(kvstore_debug_live(2) == 0);
+
+    std::vector<Entry> entries;
+    for (Entry& e : s.entries(std::string("sys."))) entries.push_back(std::move(e));
+    CHECK(entries.size() == 1 && entries[0].key == "sys.x" && entries[0].value == bytes("xx"));
+
+    const std::vector<std::string> prefixes{"user.", "sys.", "none."};
+    std::vector<Store> parts;
+    for (Store& p : s.partition(prefixes)) parts.push_back(std::move(p));
+    CHECK(parts.size() == 3);
+    const uint32_t counts[] = {2, 1, 0};
+    for (size_t i = 0; i < parts.size(); ++i) {
+        CHECK(parts[i].handle() != s.handle());
+        for (size_t j = 0; j < i; ++j) CHECK(parts[i].handle() != parts[j].handle());
+        CHECK(parts[i].count() == counts[i] && parts[i].path() == prefixes[i]);
     }
 }
 
-// State outlives the listener so the test can inspect it after the producer
-// has freed the implementation.
-struct ListenerState {
-    std::vector<std::pair<std::string, EvictionReason>> evictions;
-    std::vector<int64_t> ids;
-    int freed = 0;
-};
+// ── listener ────────────────────────────────────────────────────────────────
 
-class RecordingListener : public EvictionListener {
-    std::shared_ptr<ListenerState> state_;
-    size_t keep_while_fewer_than_;
-    std::string bomb_key_;
+// Records every change; `accepts` says no to `skip` and throws on `fail_on`.
+class RecordingListener : public Listener {
+    std::string skip_;
+    std::string fail_on_;
+    mutable std::mutex mu_;
+    std::vector<Change> changes_;
+    std::vector<std::thread::id> threads_;
 
 public:
-    RecordingListener(std::shared_ptr<ListenerState> state, size_t keep_while_fewer_than,
-                      std::string bomb_key = "")
-        : state_(std::move(state)),
-          keep_while_fewer_than_(keep_while_fewer_than),
-          bomb_key_(std::move(bomb_key)) {}
+    explicit RecordingListener(std::string skip = "", std::string fail_on = "")
+        : skip_(std::move(skip)), fail_on_(std::move(fail_on)) {}
 
-    ~RecordingListener() override { state_->freed++; }
+    ~RecordingListener() override { ++g_listeners_freed; }
 
-    bool on_evict(const Entry& entry, EvictionReason reason) override {
-        if (entry.key == bomb_key_) throw std::runtime_error("listener refused " + entry.key);
-        state_->evictions.emplace_back(entry.key, reason);
-        state_->ids.push_back(entry.id);
-        return state_->evictions.size() < keep_while_fewer_than_;
+    bool accepts(std::string_view key) override {
+        if (!fail_on_.empty() && key == fail_on_) throw std::runtime_error("listener refused");
+        return key != skip_;
+    }
+
+    void on_change(const Change& change) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        threads_.push_back(std::this_thread::get_id());
+        changes_.push_back(change);
+    }
+
+    std::vector<Change> changes() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return changes_;
+    }
+
+    std::vector<std::thread::id> threads() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return threads_;
+    }
+
+    Change last() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        CHECK(!changes_.empty());
+        return changes_.back();
+    }
+
+    template <typename V>
+    size_t count_of() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        size_t n = 0;
+        for (const Change& c : changes_) n += std::holds_alternative<V>(c.value) ? 1 : 0;
+        return n;
     }
 };
 
-static void run() {
-    check_library();
+static void listeners() {
+    Store s = Store::open("/listen");
+    auto listener = std::make_shared<RecordingListener>("quiet");
+    uint32_t sub = s.subscribe(listener);
+    CHECK(sub > 0 && s.listener_count() == 1 && listener.use_count() == 2);
 
-    check(Store::default_capacity() == 1000000, "static default_capacity");
+    put(s, "a", "1");
+    Change last = listener->last();
+    const auto* p = std::get_if<Change::Put>(&last.value);
+    CHECK(p != nullptr && p->entry.version == 1 && !p->replaced);
+    put(s, "a", "2");
+    last = listener->last();
+    p = std::get_if<Change::Put>(&last.value);
+    CHECK(p != nullptr && p->entry.version == 2 && p->replaced);
+    put(s, "quiet", "x");
+    CHECK(listener->count_of<Change::Put>() == 2);
+    CHECK(s.delete_("a"));
+    last = listener->last();
+    const auto* r = std::get_if<Change::Removed>(&last.value);
+    CHECK(r != nullptr && r->key == "a" && !r->expired);
 
-    Store store = Store::open("/tmp/conformance-kvstore-cpp");
-    check(store.handle() != nullptr, "open yields a live handle");
+    // An expired read removes the entry and says so.
+    put(s, "short", "x", EntryKind::Volatile, 1);
+    s.tick(1);
+    expect_throw<ExpiredError>([&] { s.get("short"); }, "get short");
+    last = listener->last();
+    r = std::get_if<Change::Removed>(&last.value);
+    CHECK(r != nullptr && r->key == "short" && r->expired);
+    CHECK(s.clear() == 1);
+    last = listener->last();
+    CHECK(last.tag() == Change::Tag::Cleared && std::get<Change::Cleared>(last.value).count == 1);
+    for (std::thread::id t : listener->threads()) CHECK(t == g_main_thread);
 
-    // A failing constructor throws the most-derived typed exception.
-    {
-        bool caught = false;
-        try {
-            Store bad = Store::open("");
-        } catch (const IoError& e) {
-            caught = (e.code() == 1004);
-            check(dynamic_cast<const KvError*>(&e) != nullptr, "IoError is a KvError");
-            check(dynamic_cast<const Error*>(&e) != nullptr, "IoError is an Error");
+    // Unsubscribing releases the producer's reference exactly once.
+    CHECK(s.unsubscribe(sub) && listener.use_count() == 1);
+    CHECK(!s.unsubscribe(sub) && s.listener_count() == 0);
+    int freed = g_listeners_freed;
+    listener.reset();
+    CHECK(g_listeners_freed == freed + 1);
+
+    // A listener that throws is detached (and released); the put succeeds.
+    auto failing = std::make_shared<RecordingListener>("", "boom");
+    s.subscribe(failing);
+    put(s, "fine", "1");
+    CHECK(failing->count_of<Change::Put>() == 1);
+    put(s, "boom", "1");
+    CHECK(s.count() == 2 && s.listener_count() == 0 && failing.use_count() == 1);
+
+    // A null listener is refused before the call.
+    expect_throw<std::invalid_argument>([&] { s.subscribe(nullptr); }, "subscribe(nullptr)");
+
+    // Destroying the store releases the listeners it still holds.
+    freed = g_listeners_freed;
+    s.subscribe(std::make_shared<RecordingListener>());
+    s.subscribe(std::make_shared<RecordingListener>());
+    CHECK(s.listener_count() == 2 && g_listeners_freed == freed);
+    { Store gone = std::move(s); }
+    CHECK(g_listeners_freed == freed + 2);
+}
+
+// ── policy ──────────────────────────────────────────────────────────────────
+
+// Tags and encrypts admitted entries, routes `b/` keys to `other`, and fails
+// in various ways for some keys.
+class TestPolicy : public Policy {
+    Store other_;
+
+public:
+    std::atomic<int> admitted{0};
+    std::atomic<bool> saw_version_zero{true};
+
+    explicit TestPolicy(Store other) : other_(std::move(other)) {}
+    ~TestPolicy() override { ++g_policies_freed; }
+
+    Entry admit(const Entry& entry) override {
+        ++admitted;
+        if (entry.version != 0) saw_version_zero = false;
+        if (starts_with(entry.key, "secret")) {
+            throw RejectedError("secrets are not stored", entry.key, "no secrets");
         }
-        check(caught, "open(\"\") throws IoError 1004");
+        if (starts_with(entry.key, "boom")) throw std::runtime_error("policy exploded");
+        Entry out = entry;
+        out.tags = {"admitted"};
+        out.kind = EntryKind::Encrypted;
+        out.key = "renamed";  // ignored by the store
+        // An undeclared enum value makes the record malformed (-3).
+        if (starts_with(entry.key, "garbage")) out.kind = static_cast<EntryKind>(9);
+        return out;
     }
 
-    const std::vector<uint8_t> payload{1, 2, 3};
-    check(store.put("alpha", payload, EntryKind::Persistent, std::nullopt), "put alpha");
-    check(store.put("beta", payload, EntryKind::Volatile, std::nullopt), "put beta");
-    check(store.count() == 2, "count is 2");
-
-    // Copy semantics: copies share the object; mutations through one are
-    // visible through the other; destructors release without killing it.
-    {
-        Store copy = store;
-        check(copy.handle() == store.handle(), "copy constructor clones the same object");
-        check(copy.count() == 2, "copy is usable");
-        check(copy.put("gamma", payload, EntryKind::Volatile, std::nullopt), "put through copy");
-        check(store.count() == 3, "mutation through the copy is visible through the original");
-
-        Store other = Store::open("/tmp/other");
-        check(other.handle() != store.handle(), "a second open is a distinct object");
-        other = store;
-        check(other.handle() == store.handle(), "copy assignment clones the same object");
-        Store& same = other;
-        other = same;
-        check(other.handle() == store.handle(), "self-assignment keeps the handle");
-
-        Store moved = std::move(copy);
-        check(moved.handle() == store.handle(), "move constructor transfers the handle");
-        check(copy.handle() == nullptr, "moved-from wrapper is empty");
-        Store moved_into = Store::open("/tmp/x");
-        moved_into = std::move(other);
-        check(moved_into.handle() == store.handle() && other.handle() == nullptr,
-              "move assignment transfers the handle");
-        check(store.delete_("gamma"), "delete gamma through the original");
-        // copy (empty), other (empty), moved, moved_into all destruct here.
-    }
-    check(store.count() == 2, "store survives its copies' destructors");
-
-    // share(): the same object again (refcount bump), not a snapshot.
-    {
-        Store shared = store.share();
-        check(shared.handle() == store.handle(), "share returns the same object");
-        check(shared.put("via-share", payload, EntryKind::Volatile, std::nullopt),
-              "put through share");
-        check(store.count() == 3, "mutation through share is visible through the original");
-        check(store.delete_("via-share"), "delete via original");
-        check(shared.count() == 2, "deletion visible through share");
-    }
-
-    // fork(): a distinct object with a copy of the entries.
-    {
-        Store forked = store.fork();
-        check(forked.handle() != store.handle(), "fork is a distinct object");
-        check(forked.count() == 2, "fork copied the live entries");
-        check(forked.put("only-in-fork", payload, EntryKind::Volatile, std::nullopt),
-              "put into fork");
-        check(forked.count() == 3 && store.count() == 2, "fork is independent");
-    }
-
-    // larger(): `Store?` as a parameter and as a return.
-    {
-        Store empty = Store::open("/tmp/empty");
-        check(!empty.larger(std::nullopt).has_value(), "larger(null) on an empty store is none");
-        std::optional<Store> own = store.larger(std::nullopt);
-        check(own.has_value() && own->handle() == store.handle(),
-              "larger(null) on a non-empty store returns itself");
-        std::optional<Store> bigger = empty.larger(store);
-        check(bigger.has_value() && bigger->handle() == store.handle(),
-              "larger(other) picks the bigger other");
-        std::optional<Store> self_wins = store.larger(empty);
-        check(self_wins.has_value() && self_wins->handle() == store.handle(),
-              "larger(smaller) returns self");
-        std::optional<Store> none;
-        check(!empty.larger(none).has_value(), "disengaged optional passes as null");
-    }
-
-    // describe(): a record carrying the object itself plus an optional one.
-    {
-        StoreInfo info = store.describe("primary", std::nullopt);
-        check(info.label == "primary", "describe label");
-        check(info.count == 2, "describe count");
-        check(info.store.handle() == store.handle(), "describe().store is the same object");
-        check(!info.mirror.has_value(), "describe mirror absent");
-        check(info.store.count() == 2, "the record's store is usable");
-
-        Store mirror = Store::open("/tmp/mirror");
-        StoreInfo with_mirror = store.describe("mirrored", mirror);
-        check(with_mirror.mirror.has_value() && with_mirror.mirror->handle() == mirror.handle(),
-              "describe mirror present and identical");
-
-        // A record copy clones its object fields.
-        StoreInfo info_copy = info;
-        check(info_copy.store.handle() == store.handle(), "copied record shares the object");
-    }
-
-    // open_many(): a list of objects as a return; total_count(): a list of
-    // objects and an optional record holding an object as parameters.
-    {
-        std::vector<Store> many = Store::open_many({"/a", "/b", "/c"});
-        check(many.size() == 3, "open_many returns three stores");
-        check(many[0].handle() != many[1].handle() && many[1].handle() != many[2].handle(),
-              "open_many stores are distinct");
-        check(many[0].put("m0", payload, EntryKind::Volatile, std::nullopt), "put into many[0]");
-        check(many[0].put("m1", payload, EntryKind::Volatile, std::nullopt), "put into many[0]");
-        check(many[2].put("m2", payload, EntryKind::Volatile, std::nullopt), "put into many[2]");
-        check(many[0].count() == 2 && many[1].count() == 0 && many[2].count() == 1,
-              "open_many stores are independent");
-
-        check(Store::total_count(many, std::nullopt) == 3, "total_count over the list");
-        StoreInfo info = store.describe("extra", std::nullopt);
-        check(Store::total_count(many, info) == 5, "total_count adds the record's store");
-        check(Store::total_count({}, info) == 2, "total_count with an empty list");
-        check(Store::total_count({}, std::nullopt) == 0, "total_count with nothing");
-        // Encoding the parameters cloned each object; every wrapper is still
-        // valid and holds its own reference.
-        check(many[0].count() == 2 && info.store.count() == 2,
-              "wrappers survive being encoded into parameter buffers");
-
-        bool caught = false;
-        try {
-            Store::open_many({"/ok", ""});
-        } catch (const IoError& e) {
-            caught = (e.code() == 1004);
+    Store route(std::string_view key, Store home) override {
+        if (starts_with(key, "b/")) return other_;
+        if (starts_with(key, "null/")) {
+            // A moved-from wrapper is a null object, which `route` can't
+            // return (-3).
+            Store taken = std::move(home);
+            return home;
         }
-        check(caught, "open_many with an empty path throws IoError");
+        return home;
+    }
+};
+
+static void policies() {
+    Store s = Store::open("/policy");
+    Store other = Store::open("/other");
+    auto policy = std::make_shared<TestPolicy>(other);
+    s.set_policy(policy);
+    CHECK(s.has_policy() && policy.use_count() == 2);
+
+    // admit's record return is what's stored (its key and version aside).
+    Entry e = put(s, "a", "1", EntryKind::Volatile);
+    CHECK(e.key == "a" && e.version == 1 && e.kind == EntryKind::Encrypted);
+    CHECK((e.tags == std::vector<std::string>{"admitted"}));
+
+    // route: the object parameter and object return redirect a write.
+    put(s, "b/x", "2", EntryKind::Volatile);
+    CHECK(s.count() == 1 && other.count() == 1);
+
+    // A typed error thrown by the throwing callback reaches the caller with
+    // its code, message, and fields.
+    RejectedError rej = expect_throw<RejectedError>([&] { put(s, "secret", "3"); }, "Rejected");
+    CHECK(rej.code() == 1005 && rej.key == "secret" && rej.reason == "no secrets");
+    CHECK(std::string(rej.what()) == "secrets are not stored");
+
+    // Any other exception arrives as -4 with its message.
+    Error boom = expect_throw<Error>([&] { put(s, "boom", "4"); }, "non-domain failure");
+    CHECK(boom.code() == -4 && std::string(boom.what()) == "policy exploded");
+    CHECK(dynamic_cast<const KvError*>(&boom) == nullptr);
+
+    // A return the producer can't accept is -3: a malformed record, or a
+    // null required object.
+    Error garbage = expect_throw<Error>([&] { put(s, "garbage", "5"); }, "malformed admit");
+    CHECK(garbage.code() == -3);
+    Error null_route = expect_throw<Error>([&] { put(s, "null/x", "6"); }, "null route");
+    CHECK(null_route.code() == -3);
+    CHECK(s.count() == 1 && other.count() == 1);
+    CHECK(policy->admitted == 6 && policy->saw_version_zero);
+
+    // Replacing the policy releases the old one; an empty pointer removes it.
+    s.set_policy(std::make_shared<TestPolicy>(other));
+    CHECK(policy.use_count() == 1);
+    int freed = g_policies_freed;
+    s.set_policy(nullptr);
+    CHECK(g_policies_freed == freed + 1 && !s.has_policy());
+    put(s, "secret", "now allowed");
+    CHECK(s.count() == 2);
+}
+
+// ── loader ──────────────────────────────────────────────────────────────────
+
+class TestLoader : public Loader {
+    std::optional<Store> backup_;
+
+public:
+    explicit TestLoader(std::optional<Store> backup = std::nullopt) : backup_(std::move(backup)) {}
+    ~TestLoader() override { ++g_loaders_freed; }
+
+    std::string name() override { return "cpp-loader"; }
+
+    std::optional<Store> fallback(std::string_view key) override {
+        return key == "fb" ? backup_ : std::nullopt;
     }
 
-    // Lazy iterator: sorted keys, one producer `next` per step.
+    std::vector<uint8_t> load(std::string_view key) override {
+        if (key == "missing") throw KeyNotFoundError("not in the loader", "missing");
+        if (key == "elsewhere") throw KeyNotFoundError("not in the loader", "other");
+        if (key == "broken") throw std::runtime_error("loader is broken");
+        return bytes("loaded:" + std::string(key));
+    }
+};
+
+static void loaders() {
+    Store s = Store::open("/load");
+    CHECK(!s.get_or_load("k", nullptr).has_value());
+
+    auto loader = std::make_shared<TestLoader>();
+    std::optional<Entry> e = s.get_or_load("k", loader);
+    CHECK(e.has_value() && e->value == bytes("loaded:k") && e->kind == EntryKind::Volatile);
+    CHECK(e->metadata.size() == 1 && e->metadata.at("source") == "cpp-loader");
+    CHECK(loader.use_count() == 1);  // released before the call returned
+    CHECK(s.count() == 1);
+    e = s.get_or_load("k", loader);
+    CHECK(e.has_value() && e->version == 1);
+
     {
-        std::vector<std::string> keys;
-        for (auto&& k : store.list_keys(std::nullopt)) keys.push_back(k);
-        check(keys.size() == 2 && keys[0] == "alpha" && keys[1] == "beta",
-              "list_keys yields sorted keys");
-        keys.clear();
-        for (auto&& k : store.list_keys(std::string("al"))) keys.push_back(k);
-        check(keys.size() == 1 && keys[0] == "alpha", "list_keys honors the prefix");
-        auto range = store.list_keys(std::nullopt);
-        auto it = range.begin();
-        check(*it == "alpha", "early-abandoned range yields the first key");
+        Store backup = Store::open("/backup");
+        put(backup, "fb", "from backup");
+        e = s.get_or_load("fb", std::make_shared<TestLoader>(backup));
+        CHECK(e.has_value() && e->value == bytes("from backup") && e->kind == EntryKind::Persistent);
     }
 
-    // Value record with optional, list, map, and bytes fields.
+    CHECK(!s.get_or_load("missing", loader).has_value());
+    KeyNotFoundError nf =
+        expect_key_not_found([&] { s.get_or_load("elsewhere", loader); }, "other", "elsewhere");
+    CHECK(std::string(nf.what()) == "not in the loader");
+    Error broken = expect_throw<Error>([&] { s.get_or_load("broken", loader); }, "broken loader");
+    CHECK(broken.code() == -4 && std::string(broken.what()) == "loader is broken");
+    CHECK(loader.use_count() == 1);
+    int freed = g_loaders_freed;
+    loader.reset();
+    CHECK(g_loaders_freed == freed + 1);
+}
+
+// ── async ───────────────────────────────────────────────────────────────────
+
+static void async_calls() {
+    Store s = Store::open("/async-calls");
+    auto listener = std::make_shared<RecordingListener>();
+    s.subscribe(listener);
+    put(s, "old1", "x", EntryKind::Volatile, 1);
+    put(s, "old2", "x", EntryKind::Volatile, 1);
+    put(s, "keep", "x");
+    s.tick(5);
+
+    // compact runs on a producer thread and notifies listeners there.
     {
-        std::optional<Entry> found = store.get("alpha");
-        check(found.has_value(), "get alpha present");
-        check(found->id > 0 && found->key == "alpha" && found->value == payload,
-              "entry fields");
-        check(found->created_at > 0 && !found->expires_at.has_value(), "entry timestamps");
-        check(found->tags.empty() && found->metadata.empty(), "entry collections empty");
-
-        check(store.put("ttl", payload, EntryKind::Volatile, 3600), "put with ttl");
-        std::optional<Entry> ttl_entry = store.get("ttl");
-        check(ttl_entry.has_value() && ttl_entry->expires_at.has_value() &&
-                  *ttl_entry->expires_at > ttl_entry->created_at,
-              "ttl surfaces as a present optional");
-        check(store.delete_("ttl"), "delete ttl");
-        check(!store.delete_("ttl"), "second delete reports false");
-
-        // Drive the generated pack/unpack pair directly for the list and map
-        // fields the sample never accepts as a parameter.
-        Entry entry{7, "k", payload, 1000, 55, {"hot", "fast"}, {{"source", "test"}, {"env", "prod"}}};
-        detail::BufferWriter w;
-        detail::write_Entry(w, entry);
-        detail::BufferReader r(w.data(), w.size());
-        Entry back = detail::read_Entry(r);
-        r.expect_end();
-        check(back.id == 7 && back.key == "k" && back.value == payload && back.created_at == 1000,
-              "entry scalar fields round-trip");
-        check(back.expires_at.has_value() && *back.expires_at == 55, "entry optional round-trips");
-        check(back.tags.size() == 2 && back.tags[0] == "hot" && back.tags[1] == "fast",
-              "entry list round-trips in order");
-        check(back.metadata.size() == 2 && back.metadata.at("source") == "test" &&
-                  back.metadata.at("env") == "prod",
-              "entry map round-trips");
-    }
-
-    // Typed errors: the per-code subclass is the most-derived type.
-    {
-        bool caught_base = false;
-        try {
-            store.get("missing");
-        } catch (const KvError& e) {
-            caught_base = (e.code() == 1001);
-        }
-        check(caught_base, "missing key throws KvError 1001");
-        bool caught_typed = false;
-        try {
-            store.get("missing");
-        } catch (const KeyNotFoundError& e) {
-            caught_typed = (std::string(e.what()) == "key not found");
-        }
-        check(caught_typed, "missing key throws KeyNotFoundError with the doc message");
-    }
-
-    // kv.stats nested module takes the interface by const reference.
-    {
-        Stats st = kv::stats::get_stats(store);
-        check(st.total_entries == 2 && st.total_bytes == 6 && st.expired_entries == 0,
-              "get_stats snapshot");
-    }
-
-    // Eviction listener: delete and expiry-on-read notify it; returning
-    // false detaches it (the producer frees it); replacement and clear free.
-    {
-        auto state = std::make_shared<ListenerState>();
-        store.set_eviction_listener(std::make_shared<RecordingListener>(state, 2));
-        check(state->freed == 0, "attached listener is retained");
-
-        check(store.put("evict-me", payload, EntryKind::Volatile, std::nullopt), "put evict-me");
-        std::optional<Entry> to_evict = store.get("evict-me");
-        check(store.delete_("evict-me"), "delete evict-me");
-        check(state->evictions.size() == 1 && state->evictions[0].first == "evict-me" &&
-                  state->evictions[0].second == EvictionReason::Deleted,
-              "delete notified the listener with Deleted");
-        check(to_evict.has_value() && state->ids[0] == to_evict->id,
-              "the evicted entry carries its id");
-
-        check(store.put("expiring", payload, EntryKind::Volatile, -1), "put already expired");
-        bool caught = false;
-        try {
-            store.get("expiring");
-        } catch (const ExpiredError& e) {
-            caught = (e.code() == 1002);
-        }
-        check(caught, "reading an expired entry throws ExpiredError 1002");
-        check(state->evictions.size() == 2 && state->evictions[1].first == "expiring" &&
-                  state->evictions[1].second == EvictionReason::Expired,
-              "expiry on read notified the listener with Expired");
-        // The second eviction returned false, so the store detached and
-        // freed the listener; a third eviction is not observed.
-        check(state->freed == 1, "detached listener was freed");
-        check(store.put("again", payload, EntryKind::Volatile, std::nullopt), "put again");
-        check(store.delete_("again"), "delete again");
-        check(state->evictions.size() == 2, "detached listener is not notified");
-
-        auto first = std::make_shared<ListenerState>();
-        auto second = std::make_shared<ListenerState>();
-        store.set_eviction_listener(std::make_shared<RecordingListener>(first, 1000));
-        check(first->freed == 0, "first listener retained");
-        store.set_eviction_listener(std::make_shared<RecordingListener>(second, 1000));
-        check(first->freed == 1, "replaced listener is freed");
-        check(second->freed == 0, "replacement is retained");
-        store.clear_eviction_listener();
-        check(second->freed == 1, "cleared listener is freed");
-        store.clear_eviction_listener();
-
-        bool threw = false;
-        try {
-            store.set_eviction_listener(nullptr);
-        } catch (const std::invalid_argument&) {
-            threw = true;
-        }
-        check(threw, "null listener throws std::invalid_argument");
-    }
-
-    // A listener that throws surfaces to the caller as a foreign error (-4)
-    // on a `throws` method: the generic Error, not a KvError.
-    {
-        auto state = std::make_shared<ListenerState>();
-        store.set_eviction_listener(std::make_shared<RecordingListener>(state, 1000, "bomb"));
-        check(store.put("bomb", payload, EntryKind::Volatile, std::nullopt), "put bomb");
-        bool caught = false;
-        try {
-            store.delete_("bomb");
-        } catch (const KvError&) {
-            check(false, "a foreign error must not be mapped to a domain exception");
-        } catch (const Error& e) {
-            caught = true;
-            check(e.code() == -4, "listener exception maps to FOREIGN_ERROR_CODE (-4)");
-            check(std::string(e.what()).find("listener refused bomb") != std::string::npos,
-                  "foreign error carries the C++ exception message");
-        }
-        check(caught, "delete threw for a throwing listener");
-        check(!store.delete_("bomb"), "the entry was removed before the listener ran");
-        check(state->freed == 0, "a throwing listener stays attached");
-        // Still usable, and a non-bomb key is observed normally.
-        check(store.put("fine", payload, EntryKind::Volatile, std::nullopt), "put fine");
-        check(store.delete_("fine"), "delete fine");
-        check(state->evictions.size() == 1 && state->evictions[0].first == "fine",
-              "listener still attached after the foreign error");
-        store.clear_eviction_listener();
-        check(state->freed == 1, "listener freed on clear");
-    }
-
-    // Async: an immediately-expired entry gives compact 3 bytes to reclaim.
-    {
-        check(store.put("doomed", payload, EntryKind::Volatile, 0), "put doomed");
-        std::future<int64_t> pending = store.compact();
-        check(pending.get() == 3, "compact reclaimed the expired bytes");
-        check(store.count() == 2, "compact left the live entries");
-
         CancelToken token;
-        check(!token.is_cancelled(), "a new token is not cancelled");
-        token.cancel();
-        check(token.is_cancelled(), "cancel() marks the token");
-        std::future<int64_t> cancelled = store.compact(token);
-        bool caught = false;
-        try {
-            cancelled.get();
-        } catch (const Cancelled& e) {
-            caught = (e.code() == -5);
-        }
-        check(caught, "a pre-cancelled compact settles the future with Cancelled");
+        CHECK(s.compact(0, token).get() == 2);
+    }
+    CHECK(listener->count_of<Change::Removed>() == 2);
+    std::vector<std::thread::id> threads = listener->threads();
+    CHECK(threads.size() == 5);  // three puts, then the two removals
+    CHECK(threads[3] != g_main_thread && threads[4] != g_main_thread);
+    CHECK(s.count() == 1);
+
+    // No token never cancels.
+    CHECK(s.compact(5).get() == 0);
+
+    // Cancel mid-pause: the call stops at once, and the background pause
+    // notices the token and stops.
+    CancelToken token;
+    std::future<uint32_t> pending = s.compact(60000, token);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK(pending.wait_for(std::chrono::seconds(0)) != std::future_status::ready);
+    CHECK(Store::active_jobs() >= 1);
+    auto started = std::chrono::steady_clock::now();
+    token.cancel();
+    expect_throw<Cancelled>([&] { pending.get(); }, "cancelled compact");
+    CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(1));
+    for (int i = 0; i < 2000 && Store::active_jobs() != 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(Store::active_jobs() == 0);
+
+    // get_many: an async list of optional records, launched concurrently.
+    std::vector<std::future<std::vector<std::optional<Entry>>>> many;
+    for (int i = 0; i < 32; ++i) many.push_back(s.get_many({"keep", "gone", "keep"}));
+    for (auto& f : many) {
+        std::vector<std::optional<Entry>> got = f.get();
+        CHECK(got.size() == 3 && got[0].has_value() && !got[1].has_value());
+        CHECK(got[2].has_value() && got[2]->key == "keep");
     }
 
-    // Non-throwing method still works, then release everything via RAII.
-    store.clear();
-    check(store.count() == 0, "clear empties the store");
+    // The nested module's async free function: objects in a list in, a
+    // record out.
+    Store other = Store::open("/other");
+    put(other, "a", "123");
+    Stats st = stats::summarize_all({s, other}).get();
+    CHECK(st.entries == 2 && st.bytes == 4);
+    CHECK(st.by_kind.size() == 1 && st.by_kind.at(EntryKind::Persistent) == 2);
+}
 
-    // Destroying the last wrapper releases the object; a move-emptied wrapper
-    // destructs as a no-op.
-    {
-        Store last = std::move(store);
-        check(store.handle() == nullptr, "moved-from store is empty");
-        check(last.count() == 0, "moved-to store is usable");
-    }
+// ── object graph ────────────────────────────────────────────────────────────
 
+static void object_graph() {
+    std::optional<Store> original = Store::open("/graph");
+    put(*original, "k", "v");
+
+    // share(): the same object behind a new wrapper; copies share it too.
+    Store s = original->share();
+    CHECK(s.handle() == original->handle());
+    Store copy = s;
+    CHECK(copy.handle() == s.handle());
+    original.reset();
+    CHECK(s.count() == 1 && copy.count() == 1);
+
+    Store fork = s.fork();
+    CHECK(fork.handle() != s.handle() && fork.count() == 1 && fork.path() == "/graph");
+    put(fork, "k2", "v");
+    CHECK(fork.count() == 2 && s.count() == 1);
+
+    Store empty = Store::open("/empty");
+    CHECK(!empty.larger(std::nullopt).has_value());
+    std::optional<Store> larger = empty.larger(fork);
+    CHECK(larger.has_value() && larger->handle() == fork.handle());
+    larger = s.larger(std::nullopt);
+    CHECK(larger.has_value() && larger->handle() == s.handle());
+
+    StoreInfo info = s.describe("main", fork);
+    CHECK(info.label == "main" && info.store.handle() == s.handle() && info.count == 1);
+    CHECK(info.mirror.has_value() && info.mirror->handle() == fork.handle());
+    CHECK(info.mirror->count() == 2);
+
+    std::vector<Store> many = Store::open_many({"/a", "/b"});
+    CHECK(many.size() == 2 && many[0].path() == "/a" && many[1].path() == "/b");
+    expect_throw<InvalidPathError>([] { Store::open_many({"/a", ""}); }, "open_many with ''");
+
+    std::unordered_map<std::string, Store> named =
+        Store::by_label({info, StoreInfo{"first", many[0], std::nullopt, 0}});
+    CHECK(named.size() == 2 && named.at("main").handle() == s.handle());
+    CHECK(named.at("first").handle() == many[0].handle());
+
+    put(many[0], "m", "1");
+    CHECK(Store::total_count({many[0], many[1], fork}, named, info) == 6);
+    CHECK(Store::total_count({many[0], many[1], fork}, named, std::nullopt) == 5);
+    CHECK(s.count() == 1 && fork.count() == 2 && many[0].count() == 1);
+}
+
+// ── stats and report ────────────────────────────────────────────────────────
+
+static void stats_and_report() {
+    Store s = Store::open("/stats");
+    put(s, "b", "12");
+    put(s, "a", "1");
+    put(s, "a", "123");
+    put(s, "c", "x", EntryKind::Encrypted);
+
+    Stats st = stats::summarize(s, std::nullopt);
+    CHECK(st.entries == 3 && st.bytes == 6 && st.by_kind.size() == 2);
+    CHECK(st.by_kind.at(EntryKind::Persistent) == 2 && st.by_kind.at(EntryKind::Encrypted) == 1);
+    expect_key_not_found([&] { stats::summarize(s, std::string("q")); }, "q", "summarize('q')");
+
+    std::vector<Entry> entries;
+    for (Entry& e : s.entries(std::nullopt)) entries.push_back(std::move(e));
+    std::vector<std::string> lines = report::render_report(entries);
+    CHECK((lines == std::vector<std::string>{"a: 3 bytes, Persistent, v2", "b: 2 bytes, Persistent",
+                                             "c: 1 bytes, Encrypted"}));
+    NothingToReportError none =
+        expect_throw<NothingToReportError>([] { report::render_report({}); }, "empty report");
+    CHECK(none.code() == 2001 && std::string(none.what()) == "nothing to report");
+    CHECK(dynamic_cast<const ReportError*>(&none) != nullptr);
+    CHECK(dynamic_cast<const KvError*>(&none) == nullptr);
 }
 
 int main() {
-    run();
+    load_checks();
+    constructors();
+    basics();
+    iterators();
+    listeners();
+    policies();
+    loaders();
+    async_calls();
+    object_graph();
+    stats_and_report();
+
+    CHECK(kvstore_debug_live(1) == 0);
     check_no_leaks(kvstore_debug_live, "kvstore");
-    std::printf("cpp/kvstore: OK\n");
+    std::printf("cpp/kvstore: OK (%d listeners, %d policies, %d loaders released)\n",
+                g_listeners_freed.load(), g_policies_freed.load(), g_loaders_freed.load());
     return 0;
 }

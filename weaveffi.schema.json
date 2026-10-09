@@ -9,7 +9,7 @@
   ],
   "properties": {
     "version": {
-      "description": "IR schema version this document targets (for example `0.10.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
+      "description": "IR schema version this document targets (for example `0.11.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
       "type": "string"
     },
     "modules": {
@@ -186,7 +186,7 @@
     },
     "TypeRef": {
       "title": "TypeRef",
-      "description": "Reference to a type. Encoded as a string with custom syntax: primitives (`i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `bool`, `string`, `bytes`), iterators (`iter<{T}>`), lists (`[{T}]`), maps (`{{K:V}}`), optionals (`{T}?`), or any user-defined struct, enum, interface, or callback interface name.",
+      "description": "Reference to a type. Encoded as a string with custom syntax: primitives (`i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `bool`, `string`, `bytes`), iterators (`iter<{T}>`), lists (`[{T}]`), maps (`{{K:V}}`), optionals (`{T}?`), or the bare (unqualified) name of a user-defined struct, enum, interface, or callback interface.",
       "type": "string"
     },
     "InterfaceDef": {

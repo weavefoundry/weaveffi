@@ -6,6 +6,7 @@
 # plus the value-buffer helper header) and must exit 0.
 set -uo pipefail
 . "$(dirname "$0")/../lib.sh"
+require_tools c clang
 
 # c_consumer <sample> <source>: compile conformance/c/<source> against the
 # sample's generated headers with warnings as errors and the address and
@@ -20,15 +21,13 @@ c_consumer() {
         && "$exe"
 }
 
-c_contacts() { c_consumer contacts contacts.c; }
-c_events() { c_consumer events events.c; }
-c_kvstore() { c_consumer kvstore kvstore.c; }
-c_async_demo() { c_consumer async-demo async_demo.c; }
+c_calculator() { c_consumer calculator calculator.c; }
 c_codec() { c_consumer codec codec.c; }
+c_kvstore() { c_consumer kvstore kvstore.c; }
 
 # Producer lane: unlike every other lane (which *consumes* a prebuilt cdylib),
 # this compiles a C library that *implements* the generated calculator header,
-# including every runtime and checksum symbol a hand-written producer must
+# including every runtime and contract symbol a hand-written producer must
 # export, under hidden default visibility (-fvisibility=hidden, the release
 # norm and the MSVC default). The header tags each prototype with
 # CALCULATOR_API, so the definitions stay exported; the lane checks each one
@@ -43,11 +42,12 @@ c_producer_exports() {
     local syms
     syms=$(nm -g --defined-only "$lib" 2>/dev/null) || syms=$(nm -gU "$lib" 2>/dev/null)
     local sym
-    for sym in calculator_calculator_add calculator_calculator_mul \
-        calculator_calculator_div calculator_calculator_echo \
-        calculator_abi_version calculator_calculator_checksum \
-        calculator_error_set calculator_error_clear calculator_error_free \
-        calculator_free_bytes calculator_cancel_token_create \
+    for sym in calculator_calculator_add calculator_calculator_divide \
+        calculator_calculator_greet \
+        calculator_abi_version calculator_calculator_contract \
+        calculator_error_set calculator_error_set_payload calculator_error_clear \
+        calculator_error_free calculator_alloc calculator_free_bytes \
+        calculator_cancel_token_create \
         calculator_cancel_token_cancel calculator_cancel_token_is_cancelled \
         calculator_cancel_token_destroy calculator_debug_live; do
         if ! printf '%s\n' "$syms" | grep -Eq "(^| )_?${sym}\$"; then
@@ -68,11 +68,9 @@ c_producer_exports() {
             LD_LIBRARY_PATH="$OUT:${LD_LIBRARY_PATH:-}" "$OUT/c_producer_check"
 }
 
-lane c-contacts c_contacts
-lane c-events c_events
-lane c-kvstore c_kvstore
-lane c-async-demo c_async_demo
+lane c-calculator c_calculator
 lane c-codec c_codec
+lane c-kvstore c_kvstore
 lane c-producer-exports c_producer_exports
 
 finish_lanes

@@ -4,6 +4,8 @@
 set -euo pipefail
 dir=$1/wasm
 here=$(cd "$(dirname "$0")" && pwd)
+. "$here/lib.sh"
 . "$here/js.sh"
+require node
 
 js_check "$dir" index.js runtime.js linear.js

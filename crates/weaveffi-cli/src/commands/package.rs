@@ -1,209 +1,259 @@
-//! `weaveffi package`: assemble publishable, per-platform packages that bundle
-//! a prebuilt native library for each target platform.
+//! `weaveffi package`: turn the per-platform builds into installable
+//! artifacts, one set per target, in the dist directory.
 //!
-//! `generate` emits binding *source*; `package` goes one step further and
-//! produces ready-to-publish ecosystem packages (an npm tarball tree with
-//! `optionalDependencies`, a NuGet `runtimes/` project, platform-tagged Python
-//! wheels, …) with the native library bundled so consumers need no local
-//! toolchain. The native libraries come from one of two sources:
-//!
-//! * `--binaries <dir>`: prebuilt libraries laid out as `<dir>/<platform>/<lib>`
-//!   (the platform tokens are [`Platform::id`] values, e.g. `darwin-arm64`).
-//!   This is the path CI uses, building each platform on its own runner.
-//! * `--build <crate>`: cross-compile the given Cargo package as a `cdylib`
-//!   for each platform's Rust target triple. Convenient locally, but each
-//!   target needs its rustup target and a working cross-linker installed.
+//! The builds come from `weaveffi build` (run here first, for the requested
+//! platforms) or, with `--binaries <dir>`, from a directory laid out the same
+//! way, `<dir>/<platform-id>/`, which is how CI hands libraries built on
+//! separate runners to one packaging job. Each target then writes its
+//! ecosystem's artifacts: wheels, npm tarballs, gems, a SwiftPM package with
+//! its `XCFramework` archive, a NuGet package, and so on.
+
+use std::process::{Command, Stdio};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use miette::{bail, miette, IntoDiagnostic, Result, WrapErr};
-use std::process::{Command, Stdio};
-use weaveffi_gen::package::{summarize, write_package, PackageContext};
-use weaveffi_gen::platform::{BinarySet, Os, Platform};
+use weaveffi_cli::package::{
+    archive, write_artifact, Artifact, PackageContext, PackagedFile, XcframeworkArchive,
+};
+use weaveffi_cli::platform::{BinarySet, Os, Platform};
 
-/// How `weaveffi package` should obtain the native libraries it bundles.
-pub(crate) enum BinarySource<'a> {
-    /// A directory laid out as `<dir>/<platform-id>/<library>`.
-    Prebuilt(&'a str),
-    /// A Cargo package to cross-compile as a `cdylib` for each platform.
-    Build(&'a str),
-}
+use weaveffi_cli::project::Project;
+use weaveffi_model::model::Model;
+
+use super::build::{build_project, library_name, model_from_binaries, resolve_platforms};
 
 /// Options for [`cmd_package`].
 pub(crate) struct PackageArgs<'a> {
     pub(crate) input: Option<&'a str>,
-    pub(crate) out: &'a str,
+    pub(crate) out: Option<&'a str>,
     pub(crate) targets: Option<&'a str>,
     pub(crate) config: Option<&'a str>,
     pub(crate) binaries: Option<&'a str>,
-    pub(crate) build: Option<&'a str>,
     pub(crate) platforms: Option<&'a str>,
+    pub(crate) debug: bool,
+    pub(crate) manifest_path: Option<&'a str>,
     pub(crate) warn: bool,
     pub(crate) quiet: bool,
 }
 
 pub(crate) fn cmd_package(args: &PackageArgs<'_>) -> Result<()> {
-    let PackageArgs {
-        out,
-        targets,
-        binaries,
-        build,
-        platforms,
-        quiet,
-        ..
-    } = *args;
-    let source = match (binaries, build) {
-        (Some(_), Some(_)) => {
-            return Err(miette::miette!("--binaries and --build are mutually exclusive; choose one source for the native libraries"))
-        }
-        (Some(dir), None) => BinarySource::Prebuilt(dir),
-        (None, Some(crate_name)) => BinarySource::Build(crate_name),
-        (None, None) => return Err(miette::miette!(
-            "provide native libraries with --binaries <dir> (laid out as <dir>/<platform>/<lib>) \
-             or --build <crate> to cross-compile a Rust producer"
-        )),
-    };
-
-    let project = super::load_project(args.input, args.config, args.warn)?;
-    let (config, api) = (&project.config, &project.api);
-
-    let explicit_platforms = platforms.is_some();
-    let input_basename = project.input.file_name();
-    let lib_name = api.identity().library.clone();
-
-    let binary_set = match source {
-        BinarySource::Prebuilt(dir) => {
-            // Without --platforms, package every platform the directory has.
-            let selected = match platforms {
-                Some(_) => parse_platforms(platforms)?,
-                None => Platform::ALL.to_vec(),
-            };
-            discover_prebuilt(
-                Utf8Path::new(dir),
-                &lib_name,
-                &selected,
-                quiet || !explicit_platforms,
-            )?
-        }
-        BinarySource::Build(crate_name) => {
-            cross_build(crate_name, &lib_name, &parse_platforms(platforms)?, quiet)?
-        }
-    };
-
-    if binary_set.is_empty() {
-        bail!("no native libraries were found for any requested platform; nothing to package");
-    }
-
-    let out_dir = Utf8Path::new(out);
-    std::fs::create_dir_all(out_dir.as_std_path())
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to create output directory: {out}"))?;
-
-    let selected = config.select_targets(targets)?;
-
+    let quiet = args.quiet;
+    let project = Project::locate(args.config, args.input, None)?.quiet(quiet);
+    let config = &project.config;
+    let selected = config.select_targets(args.targets)?;
     if selected.is_empty() {
         bail!("no targets selected to package");
     }
+    let settings = config.build.settings(args.debug);
 
-    let ctx = PackageContext {
-        binaries: &binary_set,
-        input_basename,
+    let (binaries, model) = match args.binaries {
+        Some(dir) => {
+            let platforms = match args.platforms {
+                Some(_) => Some(resolve_platforms(args.platforms, &project)?),
+                None => None,
+            };
+            let (library, model) = library_name(&project, args.warn)?;
+            let binaries = BinarySet::read_dir(Utf8Path::new(dir), &library, platforms.as_deref())
+                .map_err(|e| miette!("{e:#}"))?;
+            let model = match model {
+                Some(model) => model,
+                None => model_from_binaries(&project, &binaries, args.warn)?,
+            };
+            (binaries, model)
+        }
+        None => {
+            let platforms = resolve_platforms(args.platforms, &project)?;
+            let built = build_project(
+                &project,
+                &selected,
+                &platforms,
+                &settings,
+                args.manifest_path,
+                args.warn,
+            )?;
+            (built.binaries, built.model)
+        }
     };
+    let library = model.identity.library.clone();
 
+    let dist = config.dist_dir(args.out);
+    std::fs::create_dir_all(dist.as_std_path())
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create the dist directory {dist}"))?;
     if !quiet {
-        let plats: Vec<&str> = binary_set.platforms().map(Platform::id).collect();
-        println!("Packaging '{lib_name}' for platforms: {}", plats.join(", "));
+        let plats: Vec<&str> = binaries.platforms().map(Platform::id).collect();
+        println!("Packaging `{library}` for {} into {dist}", plats.join(", "));
     }
 
-    let mut packaged = 0usize;
-    let mut skipped: Vec<&str> = Vec::new();
-    for gen in &selected {
-        match gen.package(api, &ctx, out_dir) {
-            Some(files) => {
-                write_package(&files).map_err(|e| miette!("{:#}", e))?;
-                let (text, bins) = summarize(&files);
-                packaged += 1;
+    let xcframework = if selected.iter().any(|t| t.name() == "swift") {
+        assemble_xcframework(&project, &model, &binaries, &dist, quiet)?
+    } else {
+        None
+    };
+    let ctx = PackageContext {
+        binaries: &binaries,
+        macos_deployment_target: &settings.macos_deployment_target,
+        ios_deployment_target: &settings.ios_deployment_target,
+        xcframework: xcframework.as_ref(),
+    };
+
+    let mut written = 0usize;
+    let mut skipped = Vec::new();
+    let mut failures = Vec::new();
+    for target in &selected {
+        let artifacts = target.package(&model, &ctx).unwrap_or_default();
+        if artifacts.is_empty() {
+            skipped.push(target.name());
+            continue;
+        }
+        if target.name() == "swift" {
+            if let Some(archive) = &xcframework {
                 if !quiet {
-                    println!(
-                        "  {}: {text} file(s), {bins} bundled binary(ies)",
-                        gen.name()
-                    );
+                    println!("  swift: swift/{}", archive.file_name);
                 }
             }
-            None => skipped.push(gen.name()),
+        }
+        for artifact in &artifacts {
+            let path = write_artifact(&dist, artifact).map_err(|e| miette!("{e:#}"))?;
+            written += 1;
+            if !quiet {
+                println!("  {}: {}", target.name(), relative(&dist, &path));
+            }
+        }
+        if target.name() == "dotnet" {
+            match dotnet_pack(&dist, &artifacts) {
+                Ok(nupkgs) => {
+                    for nupkg in nupkgs {
+                        if !quiet {
+                            println!("  dotnet: dotnet/{}", nupkg.file_name().unwrap_or_default());
+                        }
+                    }
+                }
+                Err(e) => failures.push(format!("{e}")),
+            }
         }
     }
 
     if !skipped.is_empty() && !quiet {
         eprintln!(
-            "note: these targets produced no package and were skipped: {}. A target is \
-             skipped when it has no binary packaging or when no binary was found for the \
-             platforms it ships (for example `wasm32` for wasm). Run `weaveffi generate` \
-             for their source bindings.",
-            skipped.join(", ")
+            "note: no artifacts for {}: none of the built platforms ({}) is one they ship. \
+             Run `weaveffi generate` for their source bindings.",
+            skipped.join(", "),
+            binaries
+                .platforms()
+                .map(Platform::id)
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
-
-    if packaged == 0 {
+    if !failures.is_empty() {
+        bail!("{}", failures.join("\n"));
+    }
+    if written == 0 {
         bail!(
-            "none of the selected targets produced a package: check that --binaries (or \
-             --build) provides a library for a platform each target ships"
+            "none of the selected targets produced an artifact: build a platform each one ships \
+             (with --platforms)"
         );
-    }
-
-    if selected.iter().any(|t| t.name() == "swift") {
-        assemble_xcframework(&project, &binary_set, out_dir, quiet)?;
-    }
-
-    if !quiet {
-        println!("Packaged {packaged} target(s) into {out}");
     }
     Ok(())
 }
 
-/// Parse the comma-separated `--platforms` list into [`Platform`] values,
-/// defaulting to the full v1 matrix when omitted.
-/// The platforms to build with `--build`; without `--platforms`, just the
-/// host (cross builds need targets and linkers most machines don't have, so
-/// they are opt-in).
-/// Fuse the Apple slices into `swift/C{Module}.xcframework` beside the
-/// generated `Package.swift`, which switches to it as a binary target.
+/// `path` relative to `dist`, for progress lines.
+fn relative(dist: &Utf8Path, path: &Utf8Path) -> String {
+    path.strip_prefix(dist)
+        .map(|p| p.to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// Run `dotnet pack` on the project directory the .NET target wrote,
+/// returning the `.nupkg` files it produced under `dist/dotnet/`.
+fn dotnet_pack(dist: &Utf8Path, artifacts: &[Artifact]) -> Result<Vec<Utf8PathBuf>> {
+    let mut produced = Vec::new();
+    for artifact in artifacts {
+        let Some(csproj) = artifact
+            .files
+            .iter()
+            .find(|f| f.path.extension() == Some("csproj"))
+        else {
+            continue;
+        };
+        let project = dist.join(&artifact.path).join(&csproj.path);
+        let out = std::path::absolute(dist.join("dotnet").as_std_path())
+            .ok()
+            .and_then(|p| Utf8PathBuf::from_path_buf(p).ok())
+            .unwrap_or_else(|| dist.join("dotnet"));
+        // `PackageOutputPath` rather than `--output`, which some SDKs
+        // mis-forward when a project path is given.
+        let Ok(output) = Command::new("dotnet")
+            .args(["pack", project.as_str(), "--configuration", "Release"])
+            .arg(format!("-p:PackageOutputPath={out}"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+        else {
+            bail!(
+                "the .NET SDK isn't installed (no `dotnet` on PATH), so the NuGet package wasn't \
+                 built; install the SDK and rerun, or run `dotnet pack {project} -c Release`"
+            );
+        };
+        if !output.status.success() {
+            bail!(
+                "`dotnet pack {project}` failed:\n{}{}",
+                String::from_utf8_lossy(&output.stdout).trim_end(),
+                String::from_utf8_lossy(&output.stderr).trim_end()
+            );
+        }
+        let stem = csproj.path.file_stem().unwrap_or_default();
+        for entry in out.read_dir_utf8().into_diagnostic()? {
+            let path = entry.into_diagnostic()?.path().to_path_buf();
+            if path.extension() == Some("nupkg")
+                && path
+                    .file_name()
+                    .is_some_and(|n| n.starts_with(&format!("{stem}.")))
+            {
+                produced.push(path);
+            }
+        }
+    }
+    Ok(produced)
+}
+
+/// Fuse the Apple static libraries into `C{Module}.xcframework`, zip it into
+/// `dist/swift/C{Module}.xcframework.zip`, and write its SHA-256 checksum
+/// next to it, returning the archive's name and checksum for the Swift
+/// package's binary target.
 ///
-/// Runs only when the set includes an iOS slice (iOS needs the XCFramework;
-/// macOS alone links the bundled dylib through the system-library target).
-/// Each slice is a static library: iOS slices are the crate's `staticlib`
-/// output, and a macOS slice is the `lib{library}.a` next to its dylib (so a
-/// producer that ships to both declares `crate-type = ["cdylib", "staticlib"]`).
-/// Simulator and macOS architectures are fused with `lipo`.
+/// Slices are grouped the way `xcodebuild -create-xcframework` needs them
+/// (iOS device, iOS simulator, macOS), with the architectures of a group
+/// fused by `lipo`. Returns `None` (with a note) when there are no Apple
+/// static libraries or the host isn't macOS.
 fn assemble_xcframework(
-    project: &super::Project,
+    project: &Project,
+    model: &Model,
     binaries: &BinarySet,
-    out_dir: &Utf8Path,
+    dist: &Utf8Path,
     quiet: bool,
-) -> Result<()> {
-    if !binaries.platforms().any(|p| p.os() == Os::Ios) {
-        return Ok(());
+) -> Result<Option<XcframeworkArchive>> {
+    let static_lib = |p: Platform| binaries.get(p).and_then(|nb| nb.staticlib.clone());
+    let any_apple = binaries
+        .platforms()
+        .any(|p| matches!(p.os(), Os::MacOs | Os::Ios) && static_lib(p).is_some());
+    if !any_apple {
+        if !quiet {
+            eprintln!(
+                "note: the Swift package needs an Apple platform (darwin-*, ios-*) built with \
+                 `weaveffi build`, which adds the static library its XCFramework is made from"
+            );
+        }
+        return Ok(None);
     }
     if !cfg!(target_os = "macos") {
         eprintln!("warning: skipping the Swift XCFramework: xcodebuild needs macOS");
-        return Ok(());
+        return Ok(None);
     }
-    let identity = project.api.identity();
-    let library = &identity.library;
-    let module = project
-        .config
-        .generators
-        .swift
-        .module_name
-        .clone()
-        .unwrap_or_else(|| identity.pascal_name());
-    let static_lib = |p: Platform| -> Option<Utf8PathBuf> {
-        let nb = binaries.get(p)?;
-        if p.os() == Os::Ios {
-            return Some(nb.source.clone());
-        }
-        let sibling = nb.source.parent()?.join(format!("lib{library}.a"));
-        sibling.exists().then_some(sibling)
-    };
+    let library = &model.identity.library;
+    let c_module = project.config.generators.swift.c_module_name(model);
+
     let scratch = tempfile::tempdir().into_diagnostic()?;
     let scratch = Utf8Path::from_path(scratch.path())
         .ok_or_else(|| miette!("temp directory path is not valid UTF-8"))?
@@ -211,16 +261,14 @@ fn assemble_xcframework(
     let headers = scratch.join("Headers");
     std::fs::create_dir_all(headers.as_std_path()).into_diagnostic()?;
     let header = format!("{library}.h");
-    let model = weaveffi_model::model::BindingModel::build(&project.api);
-    let input_basename = project.input.file_name().unwrap_or("api");
     std::fs::write(
         headers.join(&header).as_std_path(),
-        weaveffi_gen::targets::c::render_c_header_from_model(&model, input_basename, &header),
+        weaveffi_cli::targets::c::render_c_header_from_model(model, &header),
     )
     .into_diagnostic()?;
     std::fs::write(
         headers.join("module.modulemap").as_std_path(),
-        format!("module C{module} {{\n  header \"{header}\"\n  export *\n}}\n"),
+        format!("module {c_module} {{\n  header \"{header}\"\n  export *\n}}\n"),
     )
     .into_diagnostic()?;
 
@@ -256,305 +304,60 @@ fn assemble_xcframework(
         args.extend(["-library".into(), lib.to_string()]);
         args.extend(["-headers".into(), headers.to_string()]);
     }
-    let output = out_dir.join("swift").join(format!("C{module}.xcframework"));
-    if output.exists() {
-        std::fs::remove_dir_all(output.as_std_path()).into_diagnostic()?;
-    }
-    args.extend(["-output".into(), output.to_string()]);
-    let status = Command::new("xcodebuild")
+    let framework_name = format!("{c_module}.xcframework");
+    let framework = scratch.join(&framework_name);
+    args.extend(["-output".into(), framework.to_string()]);
+    let output = Command::new("xcodebuild")
         .args(&args)
-        .stdout(Stdio::null())
-        .status()
+        .output()
         .into_diagnostic()
-        .wrap_err("failed to run xcodebuild")?;
-    if !status.success() {
-        bail!("xcodebuild -create-xcframework failed");
-    }
-    if !quiet {
-        println!("  swift: assembled {output}");
-    }
-    Ok(())
-}
-
-fn parse_platforms(platforms: Option<&str>) -> Result<Vec<Platform>> {
-    let Some(list) = platforms else {
-        return Platform::host().map(|p| vec![p]).ok_or_else(|| {
-            miette!("the host is not a packaging platform; pass --platforms explicitly")
-        });
-    };
-    let mut out = Vec::new();
-    for token in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let p = Platform::from_id(token).ok_or_else(|| {
-            let known: Vec<&str> = Platform::ALL.iter().map(|p| p.id()).collect();
-            miette!(
-                "unknown platform '{token}'; expected one of: {}",
-                known.join(", ")
-            )
-        })?;
-        if !out.contains(&p) {
-            out.push(p);
-        }
-    }
-    if out.is_empty() {
-        bail!("--platforms was empty; expected a comma-separated list of platform ids");
-    }
-    Ok(out)
-}
-
-/// Locate prebuilt libraries under `dir/<platform-id>/`, one per requested
-/// platform. Missing platforms are warned about and skipped rather than fatal,
-/// so a partial matrix still produces artifacts for what is available.
-fn discover_prebuilt(
-    dir: &Utf8Path,
-    lib_name: &str,
-    platforms: &[Platform],
-    quiet: bool,
-) -> Result<BinarySet> {
-    if !dir.as_std_path().is_dir() {
-        bail!("--binaries path is not a directory: {dir}");
-    }
-    let mut set = BinarySet::new(lib_name);
-    for &platform in platforms {
-        let platform_dir = dir.join(platform.id());
-        if !platform_dir.as_std_path().is_dir() {
-            if !quiet {
-                eprintln!(
-                    "warning: no directory for platform {} at {platform_dir}; skipping",
-                    platform.id()
-                );
-            }
-            continue;
-        }
-        match find_library(&platform_dir, platform, lib_name)? {
-            Some(path) => set.insert(platform, path),
-            None => {
-                if !quiet {
-                    eprintln!(
-                        "warning: no .{} library found in {platform_dir}; skipping {}",
-                        platform.lib_extension(),
-                        platform.id()
-                    );
-                }
-            }
-        }
-    }
-    Ok(set)
-}
-
-/// Find the single shared library with `platform`'s extension inside
-/// `platform_dir`. When several are present, prefer the one whose name matches
-/// the canonical `lib_name`; otherwise the choice is ambiguous and is an error.
-fn find_library(
-    platform_dir: &Utf8Path,
-    platform: Platform,
-    lib_name: &str,
-) -> Result<Option<Utf8PathBuf>> {
-    let ext = platform.lib_extension();
-    let mut matches: Vec<Utf8PathBuf> = Vec::new();
-    let entries = std::fs::read_dir(platform_dir.as_std_path())
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read {platform_dir}"))?;
-    for entry in entries {
-        let entry = entry.into_diagnostic()?;
-        let path = Utf8PathBuf::from_path_buf(entry.path())
-            .map_err(|p| miette!("non-UTF-8 path in binaries directory: {}", p.display()))?;
-        if path.extension() == Some(ext) {
-            matches.push(path);
-        }
-    }
-    matches.sort();
-    match matches.len() {
-        0 => Ok(None),
-        1 => Ok(Some(matches.into_iter().next().unwrap())),
-        _ => {
-            let canonical = platform.lib_filename(lib_name);
-            if let Some(hit) = matches.iter().find(|p| p.file_name() == Some(&canonical)) {
-                Ok(Some(hit.clone()))
-            } else {
-                Err(miette::miette!(
-                    "multiple .{ext} libraries in {platform_dir}; \
-                     name one '{canonical}' to disambiguate"
-                ))
-            }
-        }
-    }
-}
-
-/// Cross-compile `crate_name` as a `cdylib` for each requested platform and
-/// collect the produced libraries.
-fn cross_build(
-    crate_name: &str,
-    lib_name: &str,
-    platforms: &[Platform],
-    quiet: bool,
-) -> Result<BinarySet> {
-    let mut set = BinarySet::new(lib_name);
-    let mut failed = Vec::new();
-    for &platform in platforms {
-        if !quiet {
-            println!(
-                "Building {crate_name} for {} ({})...",
-                platform.display_name(),
-                platform.rust_target()
-            );
-        }
-        match build_one(crate_name, platform) {
-            Ok(lib) => set.insert(platform, lib),
-            Err(e) => {
-                eprintln!("error: {e:?}");
-                failed.push(platform.id());
-            }
-        }
-    }
-    if !failed.is_empty() {
-        bail!(
-            "cargo build failed for {}; the other platforms built (fix or drop the failing \
-             ones with --platforms)",
-            failed.join(", ")
-        );
-    }
-    Ok(set)
-}
-
-/// Run `cargo build --release` for one platform and return the path to the
-/// produced `cdylib`, parsed from cargo's JSON artifact messages.
-fn build_one(crate_name: &str, platform: Platform) -> Result<Utf8PathBuf> {
-    let triple = platform.rust_target();
-    let child = Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "--message-format=json-render-diagnostics",
-            "--target",
-            triple,
-            "-p",
-            crate_name,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .into_diagnostic()
-        .wrap_err("failed to launch cargo")?;
-    let output = child
-        .wait_with_output()
-        .into_diagnostic()
-        .wrap_err("failed to wait for cargo")?;
+        .wrap_err("failed to run xcodebuild (is Xcode installed?)")?;
     if !output.status.success() {
         bail!(
-            "cargo build for {} failed (is the `{triple}` target installed and a cross-linker available? \
-             `rustup target add {triple}`)",
-            platform.id()
+            "xcodebuild -create-xcframework failed:\n{}",
+            String::from_utf8_lossy(&output.stderr).trim_end()
         );
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let ext = platform.lib_extension();
-    let mut produced: Vec<Utf8PathBuf> = Vec::new();
-    for line in stdout.lines() {
-        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
-            continue;
-        }
-        let want = if platform.os() == Os::Ios {
-            "staticlib"
-        } else {
-            "cdylib"
-        };
-        let is_cdylib = msg
-            .get("target")
-            .and_then(|t| t.get("kind"))
-            .and_then(|k| k.as_array())
-            .map(|kinds| kinds.iter().any(|k| k.as_str() == Some(want)))
-            .unwrap_or(false);
-        if !is_cdylib {
-            continue;
-        }
-        if let Some(files) = msg.get("filenames").and_then(|f| f.as_array()) {
-            for f in files.iter().filter_map(|f| f.as_str()) {
-                if f.ends_with(&format!(".{ext}")) {
-                    produced.push(Utf8PathBuf::from(f));
-                }
-            }
-        }
-    }
-
-    match produced.len() {
-        0 => Err(miette::miette!(
-            "cargo built {crate_name} for {triple} but produced no .{ext} cdylib; \
-             ensure the crate declares `crate-type = [\"cdylib\", \"staticlib\"]` \
-             (iOS slices are static libraries)"
-        )),
-        1 => Ok(produced.into_iter().next().unwrap()),
-        _ => {
-            // Prefer the artifact whose stem matches the crate's normalized lib name.
-            let normalized = crate_name.replace('-', "_");
-            let preferred = produced.iter().find(|p| {
-                p.file_stem()
-                    .map(|s| s == normalized || s == format!("lib{normalized}"))
-                    .unwrap_or(false)
-            });
-            Ok(preferred.cloned().unwrap_or_else(|| produced[0].clone()))
-        }
-    }
+    let mut files = Vec::new();
+    collect_files(&framework, &framework_name, &mut files)?;
+    let entries = archive::entries(&files, None).map_err(|e| miette!("{e:#}"))?;
+    let zip = archive::zip(&entries).map_err(|e| miette!("{e:#}"))?;
+    let checksum = archive::sha256_hex(&zip);
+    let file_name = format!("{framework_name}.zip");
+    let swift_dist = dist.join("swift");
+    std::fs::create_dir_all(swift_dist.as_std_path()).into_diagnostic()?;
+    std::fs::write(swift_dist.join(&file_name).as_std_path(), &zip)
+        .into_diagnostic()
+        .wrap_err("failed to write the XCFramework archive")?;
+    std::fs::write(
+        swift_dist.join(format!("{file_name}.sha256")).as_std_path(),
+        format!("{checksum}  {file_name}\n"),
+    )
+    .into_diagnostic()?;
+    Ok(Some(XcframeworkArchive {
+        file_name,
+        checksum,
+    }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_platforms_defaults_to_the_host() {
-        if let Some(host) = Platform::host() {
-            assert_eq!(parse_platforms(None).unwrap(), vec![host]);
+/// Every file under `dir`, in sorted order, as an archive entry under
+/// `prefix/`.
+fn collect_files(dir: &Utf8Path, prefix: &str, out: &mut Vec<PackagedFile>) -> Result<()> {
+    let mut entries: Vec<Utf8PathBuf> = dir
+        .read_dir_utf8()
+        .into_diagnostic()?
+        .map(|e| e.map(|e| e.path().to_path_buf()))
+        .collect::<std::io::Result<_>>()
+        .into_diagnostic()?;
+    entries.sort();
+    for path in entries {
+        let name = format!("{prefix}/{}", path.file_name().unwrap_or_default());
+        if path.is_dir() {
+            collect_files(&path, &name, out)?;
+        } else {
+            out.push(PackagedFile::copy(name, path));
         }
     }
-
-    #[test]
-    fn parse_platforms_selects_and_dedups() {
-        let got = parse_platforms(Some("darwin-arm64, linux-x64 , darwin-arm64")).unwrap();
-        assert_eq!(got, vec![Platform::MacosArm64, Platform::LinuxX64]);
-    }
-
-    #[test]
-    fn parse_platforms_rejects_unknown() {
-        let err = parse_platforms(Some("solaris-sparc")).unwrap_err();
-        assert!(err.to_string().contains("unknown platform"));
-    }
-
-    #[test]
-    fn discover_prebuilt_finds_per_platform_libs() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = Utf8Path::from_path(dir.path()).unwrap();
-        // darwin-arm64/libcontacts.dylib and linux-x64/libcontacts.so
-        let mac = root.join("darwin-arm64");
-        let lin = root.join("linux-x64");
-        std::fs::create_dir_all(mac.as_std_path()).unwrap();
-        std::fs::create_dir_all(lin.as_std_path()).unwrap();
-        std::fs::write(mac.join("libcontacts.dylib").as_std_path(), b"m").unwrap();
-        std::fs::write(lin.join("libcontacts.so").as_std_path(), b"l").unwrap();
-
-        let set = discover_prebuilt(root, "contacts", &Platform::ALL, true).unwrap();
-        assert_eq!(set.binaries.len(), 2);
-        assert!(set.get(Platform::MacosArm64).is_some());
-        assert!(set.get(Platform::LinuxX64).is_some());
-        assert!(set.get(Platform::WindowsX64).is_none());
-    }
-
-    #[test]
-    fn discover_prebuilt_disambiguates_by_canonical_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = Utf8Path::from_path(dir.path()).unwrap();
-        let mac = root.join("darwin-arm64");
-        std::fs::create_dir_all(mac.as_std_path()).unwrap();
-        std::fs::write(mac.join("libcontacts.dylib").as_std_path(), b"m").unwrap();
-        std::fs::write(mac.join("libother.dylib").as_std_path(), b"o").unwrap();
-
-        let set = discover_prebuilt(root, "contacts", &[Platform::MacosArm64], true).unwrap();
-        assert_eq!(
-            set.get(Platform::MacosArm64).unwrap().source.file_name(),
-            Some("libcontacts.dylib")
-        );
-    }
+    Ok(())
 }

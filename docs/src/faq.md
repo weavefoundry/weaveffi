@@ -8,9 +8,9 @@ maximum maturity, it's the safer pick. WeaveFFI exists for a different set of
 needs: eleven first-party targets from one definition, a producer that can be
 written in any language with a C ABI (the generated header is a public
 contract, not private scaffolding), a standalone CLI built for CI, and a
-schema-checked YAML, JSON, or TOML IDL. UniFFI is still ahead on callback
-methods that return rich types, async callback methods, and cross-crate type
-imports. See the [comparison](comparison.md) for the full table.
+schema-checked YAML, JSON, or TOML IDL. UniFFI is still ahead on async
+callback methods, custom types, and cross-crate type imports. See the
+[comparison](comparison.md) for the full table.
 
 ## Can I use it with a C++ codebase?
 
@@ -38,7 +38,7 @@ borrowed `(ptr, len)` views, so the producer copies only what it keeps.
 Objects pass as one pointer. Records and collections are encoded into one
 value buffer per value, with single-copy fast paths for byte and numeric
 lists. Async calls add a completion callback and whatever executor drives
-the future. The runtime itself is the small `weaveffi-abi` crate; the
+the future. The runtime itself is the small `weaveffi::abi` module; the
 `leak-check` counters cost an atomic update per counted operation and are off
 by default.
 
@@ -50,7 +50,7 @@ domain, negative codes are the runtime's (generic, panic, marshalling,
 callback failure, cancelled). A function marked `throws: true` (a `Result` in
 Rust) surfaces domain codes as typed errors in every language; a function
 without it traps on failure, since a failure there is a bug. See
-[Errors and Memory](guides/errors-and-memory.md).
+[Errors and Memory](guides/errors-and-memory.md#the-trap-policy).
 
 ## Can two WeaveFFI libraries live in one process?
 
@@ -63,27 +63,41 @@ own copy of the small runtime.
 ## What happens if the bindings and the library drift apart?
 
 They refuse to load. Every generated consumer compares the library's ABI
-revision and each top-level module's contract checksum with the values it
-was generated against, and raises the language's load error naming the
-module on a mismatch. The checksum covers names, types, order, and flags, but
-not documentation, so editing doc comments never breaks a deployed binding.
+revision with the one it was generated against, and checks that every
+declaration it uses is in the library's contract table with the same
+signature hash. On a mismatch it raises the language's load error naming the
+declaration that's missing or changed. The hashes cover names, types, and
+flags, but not documentation or declaration order, so editing doc comments
+never breaks a deployed binding, and neither does adding a function, method,
+or type.
 In CI, `weaveffi diff --check` catches stale committed bindings before they
 ship.
+
+## Does the CLI parse my Rust source?
+
+No. `#[weaveffi::module]` embeds a description of the API in the library it
+compiles, and `weaveffi generate` builds the crate and reads that
+description back out of the library, so macros, type aliases, and `#[cfg]`
+are already resolved and the bindings match the build exactly. `weaveffi
+extract` prints it as an IDL. See [Library Mode](guides/extract.md).
 
 ## Can I customize the generated code?
 
 Through `weaveffi.toml`: package metadata, per-target names (the Swift
-module, the Kotlin package, the Go module path), target-specific options, and
-`pre_generate`/`post_generate` hooks for formatters. See
+module, the Kotlin package, the Go module path, each set with `name`), and
+target-specific options. Run formatters as a separate step after
+`weaveffi generate`. See
 [Project Configuration](guides/config.md). Changing the C ABI itself is a
 generator contribution; see the [architecture guide](architecture.md).
 
 ## Does it work with Flutter?
 
 The Dart target emits `dart:ffi` bindings with a `pubspec.yaml` usable from
-Flutter and plain Dart on every platform that supports `dart:ffi`. You ship
-the native library for each platform yourself; Flutter's native-assets build
-isn't generated yet. For the web, use the WebAssembly target. See
+Flutter and plain Dart on every platform that supports `dart:ffi`.
+`weaveffi package --target dart` bundles the desktop libraries under
+`native/<platform>/`; for iOS and Android you add the library to the Flutter
+app's native build yourself, since Flutter's native-assets build isn't
+generated yet. For the web, use the WebAssembly target. See
 [Dart](generators/dart.md).
 
 ## Is it Windows-friendly?
@@ -115,9 +129,11 @@ objects passed to the producer are borrowed. See
 
 ## Which executor runs my async functions, and how does cancellation work?
 
-The one you install with `weaveffi::set_spawner`, such as a Tokio handle;
-by default each future runs on its own thread. Consumers see their native
-async idiom, and cancelling it (a Swift `Task`, a Kotlin coroutine, an
+By default, a small pool of worker threads (one per core, at least two)
+started on the first call. With the `weaveffi` crate's `tokio` feature it's
+Tokio: the current runtime when the call is made from inside one, otherwise
+one the library creates. `weaveffi::set_spawner` installs any other executor
+and overrides both. Consumers see their native async idiom, and cancelling it (a Swift `Task`, a Kotlin coroutine, an
 `AbortSignal`, a `CancellationToken`, a Go `context`) cancels the native
 call: the runtime drops the future and completes with the cancelled code,
 which surfaces as the language's cancellation error. See

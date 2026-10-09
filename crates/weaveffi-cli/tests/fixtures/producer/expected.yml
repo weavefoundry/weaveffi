@@ -1,0 +1,102 @@
+version: 0.11.0
+modules:
+- name: receipt
+  doc: Receipts, in a sibling tree that uses the shop's record.
+  functions:
+  - name: line
+    params:
+    - name: item
+      type: Item
+    return: string
+    doc: One line describing `item`.
+- name: shop
+  doc: The shop.
+  functions:
+  - name: price_of
+    params:
+    - name: item
+      type: Item
+    return: u64
+    doc: What `item` costs.
+  - name: buy
+    params:
+    - name: name
+      type: string
+    return: Item
+    doc: |-
+      Buy one `name`. Fails with `ShopError::SoldOut` for anything but
+      `"tea"`.
+    throws: true
+  - name: list_price
+    return: u64
+    doc: The list price of everything.
+  interfaces:
+  - name: Cart
+    doc: A shopping cart.
+    constructors:
+    - name: new
+      doc: An empty cart.
+    methods:
+    - name: add
+      params:
+      - name: item
+        type: Item
+      - name: watcher
+        type: Watcher?
+      doc: Add `item`, telling `watcher`.
+    - name: total
+      return: u64
+      doc: The sum of every item's price.
+  callback_interfaces:
+  - name: Watcher
+    doc: Told about every item added to a cart.
+    methods:
+    - name: added
+      params:
+      - name: item
+        type: Item
+      doc: '`item` was added.'
+  structs:
+  - name: Item
+    doc: Something for sale.
+    fields:
+    - name: name
+      type: string
+      doc: The item's name.
+    - name: price
+      type: u64
+      doc: What it costs.
+    - name: size
+      type: Size
+      doc: How big it is.
+  enums:
+  - name: Size
+    doc: How big an item is.
+    variants:
+    - name: Small
+      value: 0
+      doc: Small.
+    - name: Large
+      value: 1
+      doc: Large.
+  errors:
+    name: ShopError
+    codes:
+    - name: SoldOut
+      code: 1
+      message: sold out
+      doc: sold out
+      fields:
+      - name: item
+        type: string
+        doc: The item that ran out.
+  modules:
+  - name: stock
+    doc: Stock levels.
+    functions:
+    - name: count
+      params:
+      - name: cart
+        type: Cart?
+      return: u32
+      doc: How many items `cart` holds, if there is one.

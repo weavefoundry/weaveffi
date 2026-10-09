@@ -9,26 +9,26 @@ the runtime, or the orchestrator.
 The pipeline:
 
 ```text
-annotated Rust (.rs) or IDL (YAML/JSON/TOML)
+a Rust producer crate (the API read from its built library's metadata)
+or an IDL (YAML/JSON/TOML)
   → IR (Api)
-  → validate (every rule, including the C symbol table)
-  → ResolvedApi + Identity (names from weaveffi.toml / Cargo.toml)
-  → BindingModel (C symbols and ABI signatures, computed once)
-  → marshalling plan
+  → validate (every rule, including the C symbol table, under the
+    Identity from weaveffi.toml / cargo metadata)
+  → Model (C symbols and ABI signatures, computed once; the plan)
   → Target::render (pure, per language)
-  → Orchestrator (capability gate, cache records, changed-file writes,
-    stale-file removal)
+  → Orchestrator (changed-file writes, generation records, stale-file
+    removal)
 ```
 
 The workspace crates:
 
-- `weaveffi-model`: the IR, IDL parsing, Rust extraction, validation, the
-  resolved view, package identity, the binding model, ABI lowering, the
-  marshalling plan, and contract checksums.
-- `weaveffi-gen`: the backend framework, the orchestrator and cache, and the
-  eleven language targets under `targets/`.
-- `weaveffi-cli`: the `weaveffi` command.
-- `weaveffi-abi`: the C ABI runtime linked into every producer.
+- `weaveffi-model`: the IR, IDL parsing, the macro's Rust extraction,
+  library metadata frames, validation, package identity, the model, ABI
+  lowering, the marshalling plan, and contract tables.
+- `weaveffi-cli`: the `weaveffi` command and the library behind it: the
+  backend framework, the orchestrator and generation records, packaging, and
+  the eleven language targets under `src/targets/`.
 - `weaveffi-macros`: `#[weaveffi::module]` and `export_runtime!`.
-- `weaveffi`: the producer facade crate.
+- `weaveffi`: the producer facade crate and the C ABI runtime
+  (`weaveffi::abi`) linked into every producer.
 - `weaveffi-fuzz`: unpublished fuzz harnesses.

@@ -3,6 +3,8 @@
 # targets net8.0; restore needs that reference pack (cached by any earlier
 # net8.0 restore, or downloaded from NuGet).
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+require dotnet
 dir=$1
 csproj=$(ls "$dir"/dotnet/*.csproj | head -1)
 dotnet build "$csproj" -warnaserror -nologo -v quiet \

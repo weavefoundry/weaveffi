@@ -3,6 +3,8 @@
 # warnings fatal. Resolving the `ffi` dependency uses the pub cache when it
 # can and the network otherwise.
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+require dart
 dir=$1
 cd "$dir/dart"
 dart pub get --offline >/dev/null 2>&1 || dart pub get >/dev/null

@@ -1,0 +1,5 @@
+error: weaveffi: a callback interface method must return `Result<T, weaveffi::ForeignError>` (or `Result<(), weaveffi::ForeignError>` for no value), because the consumer's implementation can fail and the `Err` is how its failure reaches you
+ --> tests/ui/fail_callback_plain_return.rs:9:27
+  |
+9 |         fn name(&self) -> String;
+  |                           ^^^^^^

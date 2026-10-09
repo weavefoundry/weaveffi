@@ -1,16 +1,25 @@
-use std::path::Path;
+//! The JSON and TOML spellings of an IDL generate and validate like YAML.
 
 use weaveffi_model::ir::Api;
 
-fn repo_root() -> &'static Path {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    Path::new(manifest_dir).parent().unwrap().parent().unwrap()
-}
-
+/// The calculator sample's API, read from YAML.
 fn load_calculator_api() -> Api {
-    let src = std::fs::read_to_string(repo_root().join("samples/calculator/src/lib.rs"))
-        .expect("failed to read calculator lib.rs");
-    weaveffi_model::rust::api_from_src_stringly(&src).expect("failed to extract calculator API")
+    weaveffi_model::parse::parse_api_str(
+        concat!(
+            "version: \"0.11.0\"\n",
+            "modules:\n",
+            "  - name: calculator\n",
+            "    errors:\n",
+            "      name: CalcError\n",
+            "      codes: [{ name: DivisionByZero, code: 1, message: division by zero }]\n",
+            "    functions:\n",
+            "      - { name: add, params: [{ name: a, type: i32 }, { name: b, type: i32 }], return: i32 }\n",
+            "      - { name: divide, params: [{ name: a, type: i32 }, { name: b, type: i32 }], return: i32, throws: true }\n",
+            "      - { name: greet, params: [{ name: name, type: string }], return: string }\n",
+        ),
+        "yaml",
+    )
+    .expect("failed to parse the calculator API")
 }
 
 #[test]

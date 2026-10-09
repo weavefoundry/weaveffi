@@ -2,8 +2,9 @@
 
 An IDL document describes an API: its modules, types, and functions. YAML,
 JSON, and TOML are all accepted; this page uses YAML. It documents schema
-version `0.10.0`, the only version the current tools accept. A Rust producer
-never writes one by hand (the CLI extracts it from the source), but the
+version `0.11.0`, the only version the current tools accept. A Rust producer
+never writes one by hand (the macro embeds the API in the built library, and
+[`weaveffi extract`](../guides/extract.md) prints it as an IDL), but the
 schema is the same either way.
 
 Every YAML block on this page is a complete document that passes
@@ -24,7 +25,7 @@ Editors using the YAML Language Server pick it up from a header comment:
 ## Document structure
 
 ```text
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: my_module
     doc: "..."
@@ -43,7 +44,7 @@ keys, so a misspelled field fails to parse instead of being ignored.
 
 | Field | Type | Required | Meaning |
 |-------|------|----------|---------|
-| `version` | string | yes | Must be `"0.10.0"` |
+| `version` | string | yes | Must be `"0.11.0"` |
 | `modules` | array of Module | yes | Top-level modules |
 
 ### Module
@@ -90,11 +91,18 @@ A `TypeRef` is a string:
 | `bool` | Boolean |
 | `string` | UTF-8 text |
 | `bytes` | Byte string (`[u8]` is accepted and becomes `bytes`) |
-| `Name`, `a.b.Name` | A struct, enum, interface, or callback interface |
+| `Name` | A struct, enum, interface, or callback interface, by its bare name |
 | `T?` | Optional |
 | `[T]` | List |
 | `{K:V}` | Map |
 | `iter<T>` | Lazy iterator (returns only) |
+
+A user type is always written as its bare name: type names are global (see
+[Modules and names](#modules-and-names)), so there's no module-qualified
+spelling, and a dotted name such as `kv.Store` is rejected with
+`QualifiedTypeRef`. `usize`, `isize`, `u128`, `i128`, and `char` aren't
+primitives; a reference to one is reported as `UnsupportedPrimitive` (use
+`u64` or `i64` for sizes and wide integers, and `string` for characters).
 
 The parser reads outside in: `[Contact?]` is a list of optional contacts and
 `[Contact]?` an optional list. Composites nest to any depth. Quote anything
@@ -107,7 +115,7 @@ every target can use its native dictionary with exact equality. Floats,
 
 ```yaml
 # rejected: InvalidMapKey
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: maps
     functions:
@@ -124,7 +132,7 @@ and as the return of an async function (`AsyncIteratorReturn`):
 
 ```yaml
 # rejected: IteratorInInvalidPosition
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: streaming
     functions:
@@ -141,13 +149,13 @@ payload field.
 | Type | Param | Return | Buffered field | Inside `T?` `[T]` `{K:V}` | Map key | Callback param | Callback return |
 |------|-------|--------|----------------|---------------------------|---------|----------------|-----------------|
 | integers, floats, `bool` | yes | yes | yes | yes | integers, `bool` | yes | yes |
-| `string` | yes | yes | yes | yes | yes | yes | no |
-| `bytes` | yes | yes | yes | yes | no | yes | no |
+| `string` | yes | yes | yes | yes | yes | yes | yes |
+| `bytes` | yes | yes | yes | yes | no | yes | yes |
 | C-style enum | yes | yes | yes | yes | yes | yes | yes |
-| struct, rich enum | yes | yes | yes | yes | no | yes | no |
-| interface | yes | yes | yes | yes | no | yes | no |
-| callback interface | yes | no | no | no | no | no | no |
-| `T?`, `[T]`, `{K:V}` | yes | yes | yes | yes | no | yes | no |
+| struct, rich enum | yes | yes | yes | yes | no | yes | yes |
+| interface | yes | yes | yes | yes | no | yes | yes |
+| callback interface | yes | no | no | `Cb?` as a top-level parameter only | no | no | no |
+| `T?`, `[T]`, `{K:V}` | yes | yes | yes | yes | no | yes | yes |
 | `iter<T>` | no | yes (sync) | no | no | no | no | no |
 
 How each family crosses the boundary is in the [C ABI contract](abi.md#families-and-slots).
@@ -166,7 +174,7 @@ class, struct, or record type; no per-struct C functions exist.
 | `fields` | array of Field (required, non-empty) | Each with `name`, `type`, optional `doc` |
 
 ```yaml
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: geometry
     structs:
@@ -197,14 +205,13 @@ An enum is a fixed set of variants, each with an explicit `i32` `value`.
 | `variants` | array of Variant (required, non-empty) | Each with `name`, `value`, optional `doc` and `fields` |
 
 When no variant has `fields`, the enum is **C-style**: it crosses as an
-`int32_t`, may be a map key, and may be returned from a callback method.
-When any variant has `fields`, the enum is **rich** (a sum type): it crosses
+`int32_t` and may be a map key. When any variant has `fields`, the enum is **rich** (a sum type): it crosses
 as a value buffer holding the variant's `value` as a tag followed by its
 fields, and bindings map it to a Swift enum with associated values, a sealed
 class hierarchy, a tagged union, and so on. Unit and data variants may mix.
 
 ```yaml
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: shapes
     enums:
@@ -258,13 +265,15 @@ static that returns the interface.
 
 An interface may appear in every position except a map key: parameters,
 returns, optionals, lists, map values, record and variant fields, error
-payloads, iterator elements, async results, and callback parameters. `Store?`
+payloads, iterator elements, async results, and callback parameters and
+returns. A map keyed by an interface reports both `InvalidMapKey` and
+`InterfaceInInvalidPosition`. `Store?`
 at the top level of a parameter or return is a nullable pointer. Every
 position transfers or borrows references by the rules in
 [Errors and Memory](../guides/errors-and-memory.md#objects).
 
 ```yaml
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: kv
     errors:
@@ -308,8 +317,8 @@ modules:
 ```
 
 ```yaml
-# rejected: InterfaceInInvalidPosition
-version: "0.10.0"
+# rejected: InvalidMapKey, InterfaceInInvalidPosition
+version: "0.11.0"
 modules:
   - name: kv
     interfaces:
@@ -347,22 +356,34 @@ for as long as it holds the implementation.
 | `doc`, `deprecated` | string | Documentation, deprecation message |
 | `methods` | array of Function (required, non-empty) | In vtable order |
 
-Methods are restricted, each enforced as `InvalidCallbackMethod`:
+Methods are restricted:
 
-- synchronous: no `async`, no `cancellable`;
-- no `throws`: a consumer failure is reported as the runtime code `-4`;
-- return nothing or a direct value (an integer, float, `bool`, or C-style
-  enum), because no consumer allocation can flow back to the producer;
-- parameters may be any type except a callback interface or an iterator;
-  an object parameter transfers one reference to the consumer.
+- synchronous: no `async`, no `cancellable` (`InvalidCallbackMethod`);
+- return nothing or any type except an iterator (`InvalidCallbackMethod`)
+  or a callback interface (`CallbackInterfaceInInvalidPosition`); a string,
+  bytes, or buffered return is a run the consumer allocates with
+  `{prefix}_alloc` and the producer adopts, and an object return transfers
+  one reference to the producer;
+- parameters may be any type except an iterator
+  (`IteratorInInvalidPosition`) or a callback interface
+  (`CallbackInterfaceInInvalidPosition`); an object parameter transfers one
+  reference to the consumer.
+
+A method may set `throws: true` when an error domain is in scope for its
+module (otherwise it's `ThrowsWithoutErrorDomain`). Its consumer may then
+fail with one of the domain's codes, with the code's fields (which can't
+include objects), and the producer receives the typed error. Any other
+consumer failure, and every failure of a method without `throws`, reaches
+the producer as the runtime code `-4`.
 
 A callback interface is valid only as a top-level parameter of a function,
-constructor, method, or static. Anything else is
+constructor, method, or static, passed bare (`Listener`) or optional
+(`Listener?`, where none is a null vtable). Anything else is
 `CallbackInterfaceInInvalidPosition`:
 
 ```yaml
 # rejected: CallbackInterfaceInInvalidPosition
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: events
     callback_interfaces:
@@ -375,7 +396,7 @@ modules:
 ```
 
 ```yaml
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: events
     enums:
@@ -398,6 +419,8 @@ modules:
           - name: on_message
             params:
               - { name: message, type: Message }
+          - name: name
+            return: string
     interfaces:
       - name: EventBus
         constructors:
@@ -409,18 +432,27 @@ modules:
             return: i64
 ```
 
-A callback interface lowers to a vtable type with one entry per method and a
-trailing `free`; a parameter lowers to a `ctx` pointer plus the vtable. From
-the `kitchen_sink` fixture:
+A callback interface lowers to a vtable type that starts with a header (the
+vtable's `size`, reserved `flags`, and the `free` release hook) followed by
+one entry per method in declaration order; a parameter lowers to a `ctx`
+pointer plus the vtable. From the `kitchen_sink` fixture, whose `label`
+returns a `string` and throws, `latest` returns an `Item?`, and `favorite`
+returns a `Gadget`:
 
 ```c
 typedef struct kitchen_sink_kitchen_ReadyListener_vtable {
+    uint32_t size;
+    uint32_t flags;
+    void (*free)(void* ctx);
     void (*on_ready)(void* ctx, int32_t code, const uint8_t* msg_ptr, size_t msg_len, kitchen_sink_error* out_err);
     bool (*on_item)(void* ctx, const uint8_t* item_ptr, size_t item_len, kitchen_sink_kitchen_Gadget* gadget, kitchen_sink_error* out_err);
-    void (*free)(void* ctx);
+    void (*label)(void* ctx, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err);
+    void (*latest)(void* ctx, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err);
+    kitchen_sink_kitchen_Gadget* (*favorite)(void* ctx, kitchen_sink_error* out_err);
 } kitchen_sink_kitchen_ReadyListener_vtable;
 
 int32_t kitchen_sink_kitchen_subscribe(void* listener_ctx, const kitchen_sink_kitchen_ReadyListener_vtable* listener_vtable, kitchen_sink_error* out_err);
+bool kitchen_sink_kitchen_maybe_subscribe(void* listener_ctx, const kitchen_sink_kitchen_ReadyListener_vtable* listener_vtable, kitchen_sink_error* out_err);
 ```
 
 ## Error domains
@@ -435,13 +467,13 @@ names you declared.
 | `name` | string (required) | Domain type name (`KvError`) |
 | `codes` | array of Code (required) | The codes |
 
-Each code has a `name` (PascalCase by convention), a positive `code`, a
-default `message`, an optional `doc`, and optional `fields`: a structured
-payload with the same shape as struct fields, delivered as properties of the
-raised error.
+Each code has a required `name` (PascalCase by convention), positive `code`,
+and default `message`, plus an optional `doc` and optional `fields`: a
+structured payload with the same shape as struct fields, delivered as
+properties of the raised error.
 
 ```yaml
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: kv
     errors:
@@ -473,7 +505,7 @@ A domain is in scope for its module and every module nested in it, and
 
 ```yaml
 # rejected: ThrowsWithoutErrorDomain
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: contacts
     functions:
@@ -498,7 +530,7 @@ Constructors can't be async, and `cancellable` requires `async`:
 
 ```yaml
 # rejected: CancellableNotAsync
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: net
     functions:
@@ -509,29 +541,36 @@ modules:
 callback interface propagates its message to every binding's native
 deprecation marker.
 
-## Modules and type references
+## Modules and names
 
 Modules nest to any depth. A nested module shares the validation rules of a
 top-level one, and an error domain declared on a parent serves the subtree.
-C symbols join the path with underscores: a function `get_record` in module
-`app.data` is `{prefix}_app_data_get_record`.
 
-Every resolved type is identified by its **absolute path**: the declaring
-module's path plus the name (`kv.Store`, `app.data.Record`). A reference
-spells it one of two ways:
+**Names are global.** Modules group declarations and namespace their C
+symbols, but they don't scope names:
 
-- **Bare** (`Store`): resolves through the API-wide type namespace. Struct,
-  enum, interface, callback interface, and error domain names are unique
-  across the whole API (`DuplicateTypeName`), so a bare name is never
-  ambiguous.
-- **Qualified** (`kv.Store`): the qualifier must match the declaring module's
-  path exactly; `stats.Store` for a `Store` declared in `kv` is an
-  `UnknownTypeRef`.
+- Struct, enum, interface, callback interface, and error domain names are
+  unique across the whole API (`DuplicateTypeName`).
+- Free-function names are unique across the whole API
+  (`DuplicateFunctionName`), because several targets flatten every module's
+  functions into one namespace. A free function also can't share its name
+  with an error domain (`NameCollisionWithErrorDomain`).
+- Error code names are unique across every domain (`DuplicateErrorCodeName`).
 
-A reference to a name nothing declares is always an `UnknownTypeRef`.
+Members are scoped to their owner: parameters to their callable, fields to
+their record or variant, variants to their enum, and constructors, methods,
+and statics to their interface. Sibling modules need distinct names
+(`DuplicateModuleName`), but modules in different subtrees may share one.
+
+Because every type name identifies one declaration, a reference is always the
+bare name, wherever the type is declared. A reference to a name nothing
+declares is an `UnknownTypeRef`. C symbols join the declaring module's path
+with underscores: a function `get_record` in module `app.data` is
+`{prefix}_app_data_get_record`, and a record `Record` declared there is
+`{prefix}_app_data_Record`.
 
 ```yaml
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: kv
     interfaces:
@@ -549,8 +588,24 @@ modules:
         functions:
           - name: get_stats
             params:
-              - { name: store, type: kv.Store }
+              - { name: store, type: Store }
             return: Stats
+```
+
+```yaml
+# rejected: DuplicateFunctionName, QualifiedTypeRef
+version: "0.11.0"
+modules:
+  - name: kv
+    interfaces:
+      - name: Store
+        constructors:
+          - { name: open, params: [{ name: path, type: string }] }
+    functions:
+      - { name: stats, params: [{ name: store, type: kv.Store }], return: i64 }
+  - name: metrics
+    functions:
+      - { name: stats, return: i64 }
 ```
 
 ## Documentation comments
@@ -565,9 +620,10 @@ block strings (`|`) are preserved. An absent `doc:` emits nothing.
 
 `weaveffi validate` (and every generating command) runs every rule and
 reports every violation in one pass, each with a message, a suggestion, and a
-source span when one can be located. `--format json` emits the same
-diagnostics with a `code` field naming the variant; `--warn` adds advisory
-warnings.
+source span located within the enclosing declaration when one can be found.
+`--format json` emits the same diagnostics, each with a `code` field naming
+the variant alongside the variant's own fields (`name`, `module`, and so
+on); `--warn` adds advisory warnings.
 
 The rules in brief:
 
@@ -575,20 +631,25 @@ The rules in brief:
   `_`) and not one of `if`, `else`, `for`, `while`, `loop`, `match`, `type`,
   `return`, `async`, `await`, `break`, `continue`, `fn`, `struct`, `enum`,
   `mod`, `use`. Generators escape other languages' keywords themselves.
-- Names are unique in their scope; type names and error code names are
-  unique across the whole API.
+- Type names, free-function names, and error code names are unique across
+  the whole API; every other name is unique in its scope (see
+  [Modules and names](#modules-and-names)).
 - Structs, enums, interfaces, and callback interfaces aren't empty.
-- Types resolve, and appear only in the positions in the table above.
+- Types are bare names that resolve, and appear only in the positions in the
+  table above.
 - `throws` needs a domain in scope; `cancellable` needs `async`.
-- Codes are positive and unique; a domain's name doesn't collide with a
-  function in the same module.
+- Codes are positive and their values unique within a domain; no free
+  function shares a domain's name.
 - **No two declarations lower to the same C symbol.** Every symbol is the
   prefix plus the underscore-joined module path plus the declaration name,
-  so `m.x_y`, `m.x.y`, and `m_x.y` collide; so do a free function
-  `Store_get` and a `get` method on interface `Store`, a function named
-  `Store_clone` and `Store`'s implicit `_clone`, and a function named
-  `foo_callback` and the completion type of an async `foo`. The full symbol
-  table is in the [C ABI contract](abi.md#symbol-names).
+  so a function `x_y` in module `m` collides with a function `y` in module
+  `m.x` or `m_x`; so do a free function `Store_get` and a `get` method on
+  interface `Store`, a function named `Store_clone` and `Store`'s implicit
+  `_clone`, and a function named `foo_callback` and the completion type of
+  an async `foo`. Symbols that fall in a family the C value-buffer helpers
+  reserve (`{prefix}_list_*`, `{prefix}_map_*`, and so on, which covers
+  everything in a top-level module named `list`) collide too. The full
+  symbol table is in the [C ABI contract](abi.md#symbol-names).
 
 A document with an unsupported `version` reports only
 `UnsupportedSchemaVersion`.
@@ -597,47 +658,44 @@ A document with an unsupported `version` reports only
 
 | Code | Reported when |
 |------|---------------|
-| `UnsupportedSchemaVersion` | `version` isn't `0.10.0` |
+| `UnsupportedSchemaVersion` | `version` isn't `0.11.0` |
 | `NoModuleName` | a module has no name |
 | `InvalidModuleName` | a module name isn't an identifier or is reserved |
 | `DuplicateModuleName` | two sibling modules share a name |
 | `InvalidIdentifier` | a name isn't a valid identifier |
 | `ReservedKeyword` | a name is a reserved word |
-| `DuplicateFunctionName` | two functions in a module share a name |
+| `DuplicateFunctionName` | two free functions anywhere in the API share a name |
 | `DuplicateParamName` | two parameters of a callable share a name |
-| `NameCollisionWithErrorDomain` | a function and the module's error domain share a name |
-| `DuplicateStructName` | two structs in a module share a name |
+| `NameCollisionWithErrorDomain` | a free function and an error domain share a name |
 | `DuplicateStructField` | two fields of a struct share a name |
 | `EmptyStruct` | a struct has no fields |
-| `DuplicateEnumName` | two enums in a module share a name |
 | `EmptyEnum` | an enum has no variants |
 | `DuplicateEnumVariant` | two variants of an enum share a name |
 | `DuplicateEnumValue` | two variants of an enum share a value |
 | `DuplicateEnumVariantField` | two fields of a rich-enum variant share a name |
-| `DuplicateInterfaceName` | two interfaces in a module share a name |
 | `DuplicateInterfaceMember` | two members of an interface share a name |
 | `EmptyInterface` | an interface has no members |
 | `ConstructorHasReturn` | a constructor declares `return` |
 | `AsyncConstructor` | a constructor is `async` |
 | `InterfaceInInvalidPosition` | an interface is used as a map key |
-| `DuplicateCallbackInterfaceName` | two callback interfaces in a module share a name |
 | `EmptyCallbackInterface` | a callback interface has no methods |
 | `DuplicateCallbackMethod` | two methods of a callback interface share a name |
-| `InvalidCallbackMethod` | a callback method is async, cancellable, throwing, or returns a non-direct type |
-| `CallbackInterfaceInInvalidPosition` | a callback interface appears other than as a top-level parameter |
-| `DuplicateTypeName` | two types anywhere in the API share a bare name |
-| `UnknownTypeRef` | a reference names no declaration, or its qualifier doesn't match the declaring module |
+| `InvalidCallbackMethod` | a callback method is async or cancellable, or returns an iterator |
+| `CallbackInterfaceInInvalidPosition` | a callback interface appears other than as a top-level parameter (bare or `Cb?`) |
+| `DuplicateTypeName` | two types (including error domains) anywhere in the API share a name |
+| `UnknownTypeRef` | a reference names no declaration |
+| `QualifiedTypeRef` | a reference is a dotted, module-qualified name |
+| `UnsupportedPrimitive` | a reference names `usize`, `isize`, `u128`, `i128`, or `char` |
 | `InvalidMapKey` | a map key isn't an integer, `bool`, `string`, or C-style enum |
 | `IteratorInInvalidPosition` | `iter<T>` appears other than as an outermost return |
 | `AsyncIteratorReturn` | an async function returns `iter<T>` |
 | `CancellableNotAsync` | a synchronous callable is `cancellable` |
-| `ThrowsWithoutErrorDomain` | `throws: true` with no error domain in scope |
+| `ThrowsWithoutErrorDomain` | `throws: true` on a callable or callback method with no error domain in scope |
 | `ErrorDomainMissingName` | an error domain has no name |
-| `DuplicateErrorName` | two codes in a domain share a name |
 | `DuplicateErrorCode` | two codes in a domain share a value |
-| `DuplicateErrorCodeName` | two domains declare a code with the same name |
+| `DuplicateErrorCodeName` | two codes anywhere in the API share a name |
 | `InvalidErrorCode` | a code is zero or negative |
-| `SymbolCollision` | two declarations lower to the same C identifier |
+| `SymbolCollision` | two declarations lower to the same C identifier, or one falls in a reserved helper family |
 
 ### Warnings
 
@@ -653,11 +711,11 @@ Warnings never fail validation.
 
 ## Complete example
 
-A trimmed version of the `contacts` sample, combining an enum, a record, an
-error domain, an interface, and a nested module that uses its parent's types:
+An address book combining an enum, a record, an error domain, an interface,
+and a nested module that uses its parent's types:
 
 ```yaml
-version: "0.10.0"
+version: "0.11.0"
 modules:
   - name: contacts
     doc: An in-memory address book.

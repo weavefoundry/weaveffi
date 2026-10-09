@@ -1,44 +1,52 @@
-// Conformance consumer: calculator sample, C++ target.
+// Conformance consumer: calculator sample, C++ target (ABI revision 4).
 //
-// Covers the smallest surface: direct scalars, a throwing function whose
-// typed DivisionByZeroError derives from CalcError and Error, a string round
-// trip through `std::string_view` (including an interior NUL, which the
-// pointer-and-length ABI preserves), and the explicit library check.
+// The getting-started surface: the load-time check, a direct-value call
+// (wrapping), a throwing call whose typed DivisionByZeroError derives from
+// CalcError and Error, and a string in and out through `std::string_view`
+// (non-ASCII text, an astral character, and an interior NUL survive the
+// pointer-and-length ABI). Invalid UTF-8 is a producer-side marshalling
+// failure on a call that declares no errors, so it throws InternalError.
 // Ends by asserting the producer's leak counters are all zero.
 
+#include <climits>
 #include <cstdio>
 #include <string>
 
 #include "calculator.hpp"
 #include "check.hpp"
 
-using namespace calculator;
 namespace calc = ::calculator::calculator;
+using calculator::CalcError;
+using calculator::DivisionByZeroError;
+using calculator::Error;
+using calculator::InternalError;
 
 static void run() {
-    check_library();
+    calculator::check_library();
 
     CHECK(calc::add(2, 3) == 5);
-    CHECK(calc::mul(-4, 6) == -24);
-    CHECK(calc::div(17, 5) == 3);
+    CHECK(calc::add(-7, 7) == 0);
+    CHECK(calc::add(INT32_MAX, 1) == INT32_MIN);
 
-    bool caught = false;
-    try {
-        calc::div(1, 0);
-    } catch (const DivisionByZeroError& e) {
-        caught = e.code() == 1 && std::string(e.what()) == "division by zero";
-        CHECK(dynamic_cast<const CalcError*>(&e) != nullptr);
-        CHECK(dynamic_cast<const Error*>(&e) != nullptr);
-    }
-    CHECK(caught);
+    CHECK(calc::divide(10, 2) == 5);
+    CHECK(calc::divide(-7, 2) == -3);
+    CHECK(calc::divide(INT32_MIN, -1) == INT32_MIN);
 
-    CHECK(calc::echo("hello") == "hello");
-    CHECK(calc::echo("").empty());
-    CHECK(calc::echo("héllo ✓") == "héllo ✓");
-    const std::string with_nul("a\0b\0", 4);
-    const std::string echoed = calc::echo(with_nul);
-    CHECK(echoed.size() == 4);
-    CHECK(echoed == with_nul);
+    DivisionByZeroError e = expect_throw<DivisionByZeroError>([] { calc::divide(1, 0); }, "divide(1, 0)");
+    CHECK(e.code() == 1);
+    CHECK(std::string(e.what()) == "division by zero");
+    CHECK(dynamic_cast<const CalcError*>(&e) != nullptr);
+    CHECK(dynamic_cast<const Error*>(&e) != nullptr);
+
+    CHECK(calc::greet("World") == "Hello, World!");
+    CHECK(calc::greet("") == "Hello, !");
+    CHECK(calc::greet("W\xc3\xb6rld \xf0\x9f\xa6\x80") == "Hello, W\xc3\xb6rld \xf0\x9f\xa6\x80!");
+    const std::string with_nul("a\0b", 3);
+    const std::string greeted = calc::greet(with_nul);
+    CHECK(greeted == std::string("Hello, a\0b!", 11));
+
+    InternalError bad = expect_throw<InternalError>([] { calc::greet("\xc3\x28"); }, "greet(non-UTF-8)");
+    CHECK(bad.code() == -3);
 }
 
 int main() {

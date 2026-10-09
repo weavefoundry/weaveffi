@@ -21,9 +21,10 @@ wasm/
 └── README.md
 ```
 
-The package name defaults to the library identity's name; set
-`package_name` under `[generators.wasm]` to override it. `weaveffi package`
-adds the prebuilt module as `{library}.wasm`.
+The package name defaults to the package identity's `name`; set `name` under
+`[generators.wasm]` to override it. `weaveffi package` writes the npm tarball
+`wasm/{package}-{version}.tgz` with the module `weaveffi build` linked for
+`wasm32` as `{library}.wasm`.
 
 ## Build the module
 
@@ -36,12 +37,18 @@ RUSTFLAGS="-C link-arg=--export-table -C link-arg=--growable-table" \
   cargo build --release --target wasm32-unknown-unknown
 ```
 
+`weaveffi build --platforms wasm32` passes those flags itself and writes the
+module to `target/weaveffi/wasm32/{library}.wasm`.
+
 ## Load
 
 `init()` loads the module and checks the contract before any other export
-works: the module must implement ABI revision 3, and each top-level module's
-checksum must match the bindings. Until the promise resolves, every other
-call throws.
+works: the module must implement ABI revision 4, and each top-level module's
+contract table must hold every declaration the bindings were generated with
+(see the [Node.js page](node.md#load-time-checks)). A failed check rejects
+with an `Error` naming the declaration (`kvstore: kv.Store.put changed
+since these bindings were generated`). Until the promise resolves, every
+other call throws.
 
 ```js
 import { init, kv } from 'kvstore';
@@ -50,10 +57,12 @@ await init();
 const store = kv.Store.open('/tmp/data');
 ```
 
-Without an argument, `init()` loads `{library}.wasm` from next to `index.js`
-(by `fetch` in a browser, from disk on Node.js), or, on Node.js, the file
-named by the `{PREFIX}_LIBRARY` environment variable. It also takes a URL, a
-path, bytes, a `Response`, or a compiled `WebAssembly.Module`:
+Without an argument, `init()` reads the file named by the `{PREFIX}_LIBRARY`
+environment variable (`KVSTORE_LIBRARY`) when it's set on Node.js, and
+otherwise loads `{library}.wasm` from next to `index.js` (by `fetch` in a
+browser, from disk on Node.js). It also takes a URL, a path (resolved
+against `index.js`), bytes, a `Response`, or a compiled
+`WebAssembly.Module`:
 
 ```ts
 export declare function init(
@@ -84,8 +93,14 @@ returned strings and buffers out before releasing them:
     },
 ```
 
-One error slot, one `out_len` slot, and one iterator item slot are allocated
-at load and reused by every call. Object handles are linear-memory addresses.
+Staged arguments are runs from `{prefix}_alloc`, released with
+`{prefix}_free_bytes` once the call returns. Runs have alignment 1, so the
+glue reads and writes multi-byte values through a `DataView`. One error
+slot, one `out_len` slot, and one iterator item slot are reused by every
+call; they and the callback vtables live in 8-byte-aligned blocks carved
+from arenas the glue allocates once and never frees. `__debugLive(4)`
+leaves those arenas out of its count of byte runs. Object handles are
+linear-memory addresses.
 
 Async completions and callback-interface methods are JavaScript functions
 installed in the module's function table. The glue uses
@@ -99,24 +114,36 @@ The mapping is the Node.js target's: 64-bit integers are `bigint`, `bytes` is
 `Uint8Array`, records are plain objects, rich enums are tagged unions,
 C-style enums are frozen objects, interfaces are classes with `close()` and
 `[Symbol.dispose]()`, optionals are `T | null`, lists are arrays, maps are
-`Record<K, V>`, and `iter<T>` is a lazy `IterableIterator<T>`.
+`Record` objects (a `Map` is accepted as an argument), and `iter<T>` is a
+lazy `IterableIterator<T>`.
 
 ## Async and cancellation
 
 Async functions return a `Promise`, and cancellable ones take an optional
 `{ signal }` last argument, exactly as on Node.js. The module is
-single-threaded and the default executor runs a future to completion inside
-its launcher, so an async call has usually completed by the time the
-`Promise` is returned; only a signal aborted before the call can cancel it.
-A cancelled call rejects with `CancelledError` (code -5).
+single-threaded, and on `wasm32` the default executor polls a future inline
+until it completes, inside its launcher, so an async call has completed by
+the time the `Promise` is returned; only a signal aborted before the call
+can cancel it. A future that's still pending once nothing can wake it (it
+awaits something only another thread or a reactor would complete) fails
+with code -1 instead (`async function suspended with no executor on
+wasm32`). A cancelled call rejects with `CancelledError` (code -5).
 
 ## Callbacks and errors
 
-A callback runs only while a call into the module is on the stack, on the
-calling thread. An implementation that throws fails the call with code -4,
-as on Node.js. Because `wasm32-unknown-unknown` aborts on a panic, a producer
-panic traps the module; the trap surfaces as the package's root error with
-code -2, and the module may be unusable afterward.
+Callback interfaces work as on Node.js: returns of every family (a
+string, bytes, or buffer return is copied into a run from `{prefix}_alloc`
+that the producer adopts, and an object return is a new reference), domain
+errors from methods declared `throws` with their fields, and `null` for an
+optional callback (`Cb?`), which passes a null vtable. The vtable starts
+with its `size`, `flags`, and `free` entries, like any consumer's.
+
+There are no threads, so a callback runs only while a call into the module
+is on the stack, on the calling thread, and the Node.js addon's threading
+rules don't arise. An implementation that throws fails the call with code
+-4, as on Node.js. Because `wasm32-unknown-unknown` aborts on a panic, a
+producer panic traps the module; the trap surfaces as the package's root
+error with code -2, and the module may be unusable afterward.
 
 ## Emscripten
 
@@ -126,8 +153,9 @@ returns), binds its underscore-prefixed exports, reads memory through
 `HEAPU8`, and installs table functions with `addFunction`. Link the module
 with `-sALLOW_TABLE_GROWTH`, `-sWASM_BIGINT`, and
 `-sEXPORTED_RUNTIME_METHODS=addFunction,HEAPU8`, and export the library's C
-symbols, including `{prefix}_alloc` and `{prefix}_dealloc`. The packaged
-layout then ships glue only.
+symbols, including the runtime surface (`{prefix}_alloc`,
+`{prefix}_free_bytes`, `{prefix}_error_set_payload`, and the rest) and each
+`{prefix}_{module}_contract`. The packaged layout then ships glue only.
 
 ```ts
 export declare function init(module: object | Promise<object>): Promise<void>;
@@ -137,7 +165,8 @@ export declare function init(module: object | Promise<object>): Promise<void>;
 
 - The module must export its function table and allow it to grow.
 - An async call can't be cancelled once launched, since it completes before
-  its launcher returns.
+  its launcher returns, and a future that waits on another thread or an
+  external event fails with code -1.
 - A producer panic traps rather than unwinding, which can leave the module's
   state inconsistent.
 - Emscripten mode isn't covered by the conformance suite.

@@ -1,385 +1,515 @@
-"""Conformance consumer: kvstore sample, Python target.
+"""Conformance consumer: kvstore sample, Python target (ABI revision 4).
 
-Full-surface drive of the generated ctypes wrapper against ABI 3: the
-reference-counted `Store` interface (fallible `open` factory, `with`
-statement, idempotent `close()`, use after close rejected, the
-`default_capacity` static, the deprecated `legacy_put`), typed `KvError`
-subclasses raised by throwing callables, the optional-record return
-(`Entry | None`) decoded from a value buffer, buffered `i64?` and `string?`
-parameters, the iterator-backed `list_keys`, the cross-module `get_stats`,
-the `EvictionListener` callback interface implemented by subclassing the
-generated ABC (fired on delete and on expired reads, detached by returning
-False, replaced and cleared, a raising listener surfacing as
-`FOREIGN_ERROR_CODE`), objects in every buffered position (`share()` as a
-second wrapper over the same object, `fork()`, `larger(None)` and
-`larger(other)`, `describe().store`, `open_many`, `total_count` with a
-locally built `StoreInfo`), the asyncio-bridged cancellable `compact`
-coroutine, and wrappers that stay usable while another thread closes them
-mid-call. Ends with the leak check (see harness.py).
+Drives the feature-complete producer through the generated package:
+
+  * the load-time checks (importing checked the ABI revision and both
+    modules' contract tables; a doctored table is refused by name);
+  * the `Store` interface: fallible and infallible constructors, methods,
+    statics, the deprecated `size`, records (`Entry`, `StoreInfo`), the
+    `EntryKind` enum, maps and optionals, and the logical clock;
+  * `KvError` codes with their payload fields (`KeyNotFound`, `Expired`,
+    `StoreFull`, `Rejected`) and runtime codes on throwing calls;
+  * lazy iterators of strings (throwing), records, and objects;
+  * three callback interfaces implemented by subclassing the generated
+    ABCs: a `Listener` (retained, filtered by `accepts`, told about every
+    `Change`, detached when it raises, and notified from a producer thread
+    during compaction), a `Policy` (a record return, a typed `KvError` raised
+    back through `put` with its fields, an object parameter and object
+    return), and a `Loader` passed as an optional callback (string, bytes,
+    and optional-object returns; typed errors decoded by the producer or
+    passed through);
+  * `Store` objects in every position, compared by native identity;
+  * coroutines: an async free function returning an object, a cancellable
+    method cancelled mid-pause, an async list, an async function in the
+    nested `kv.stats` module, and concurrent calls;
+  * the nested `kv.stats` module and the sibling `report` root.
+
+Ends with every callback released and the leak check (see harness.py).
 """
 import asyncio
-import gc
 import threading
+import time
 import warnings
-import weakref
+from typing import List, Optional
 
-import kvstore as wv
+import kvstore as kv
 from harness import Consumer
 
-PATH = "/tmp/conformance-kvstore-py"
-consumer = Consumer("kvstore")
+consumer = Consumer("kvstore", kv)
 check = consumer.check
+raises = consumer.raises
+impl = consumer.impl
+
+MAIN_THREAD = threading.get_ident()
+P = kv.EntryKind.Persistent
+V = kv.EntryKind.Volatile
+E = kv.EntryKind.Encrypted
 
 
-class Listener(wv.EvictionListener):
-    """Records `(key, reason)` pairs; detaches itself after `keep` events and
-    raises when it sees `poison` as the evicted key."""
-
-    def __init__(self, keep: int = 1 << 30, poison: str = "") -> None:
-        self.keep = keep
-        self.poison = poison
-        self.seen: list[tuple[str, wv.EvictionReason]] = []
-        self.entries: list[wv.Entry] = []
-
-    def on_evict(self, entry: wv.Entry, reason: wv.EvictionReason) -> bool:
-        if entry.key == self.poison:
-            raise RuntimeError(f"listener refused {entry.key}")
-        self.seen.append((entry.key, reason))
-        self.entries.append(entry)
-        return len(self.seen) < self.keep
+def held_callbacks() -> int:
+    """How many callback implementations the producer currently holds."""
+    return len(impl._callbacks)
 
 
-def expect_kv_error(fn, cls, code: int, what: str) -> wv.KvError:
+def put(store: kv.Store, key: str, value: str, kind: kv.EntryKind = P,
+        ttl: Optional[int] = None) -> kv.Entry:
+    return store.put(key, value.encode(), kind, ttl)
+
+
+def expect_key_not_found(fn, key: str, what: str) -> kv.KeyNotFound:
+    exc = raises(kv.KvError.KeyNotFound, fn, what)
+    check(exc.code == 1001 and exc.key == key, f"{what}: KeyNotFound {exc.key!r}")
+    return exc
+
+
+def load_checks() -> None:
+    # A table entry the library lacks, or one whose signature changed, is
+    # refused by its path.
+    saved = dict(impl._CONTRACTS)
+    symbol, entries = next(iter(saved.items()))
     try:
-        fn()
-    except cls as exc:
-        check(exc.code == code and exc.CODE == code, f"{what}: code {exc.code}")
-        check(isinstance(exc, wv.KvError) and isinstance(exc, wv.Error),
-              f"{what}: hierarchy")
-        return exc
-    check(False, f"{what}: expected {cls.__name__}")
-    raise AssertionError  # unreachable
+        impl._CONTRACTS[symbol] = entries + [(1, 2, "kv.Store.vanished")]
+        exc = raises(ImportError, impl._check_contract, "missing entry")
+        check(str(exc).startswith("kv.Store.vanished is missing from the library"), str(exc))
+        entry_id, entry_hash, path = entries[0]
+        impl._CONTRACTS[symbol] = [(entry_id, entry_hash ^ 1, path)]
+        exc = raises(ImportError, impl._check_contract, "changed entry")
+        check(str(exc).startswith(f"{path} changed since these bindings were generated"),
+              str(exc))
+    finally:
+        impl._CONTRACTS.clear()
+        impl._CONTRACTS.update(saved)
+    impl._check_contract()
+
+
+def constructors() -> None:
+    exc = raises(kv.KvError.InvalidPath, lambda: kv.Store.open(""), "open('')")
+    check(exc.code == 1004 and exc.message == "invalid path", f"InvalidPath {exc!r}")
+    check(isinstance(exc, kv.KvError) and isinstance(exc, kv.Error), "error hierarchy")
+
+    with kv.Store() as s:
+        check(s.path() == "memory", "Store() path")
+        check(s.capacity() == kv.Store.default_capacity() == 1_000_000, "capacity")
+    raises(ValueError, s.path, "use after close")
+
+    async def run() -> None:
+        opened = await kv.open_store("/async")
+        check(opened.path() == "/async", "open_store path")
+        opened.close()
+        try:
+            await kv.open_store("")
+            check(False, "open_store('') returned")
+        except kv.InvalidPath as exc:
+            check(exc.code == 1004 and exc.message == "invalid path", f"open_store {exc!r}")
+
+    asyncio.run(run())
 
 
 def basics() -> None:
-    # Fallible constructor: an empty path reports the IoError domain code.
-    expect_kv_error(lambda: wv.Store.open(""), wv.KvError.IoError, 1004, "open('')")
-    check(wv.IoError is wv.KvError.IoError, "bare IoError is the scoped alias")
-    try:
-        wv.Store()
-        check(False, "Store() must not construct")
-    except TypeError:
-        pass
+    s = kv.Store.open("/basics")
+    e = put(s, "alpha", "one")
+    check(e == kv.Entry(key="alpha", value=b"one", kind=P, version=1, expires_at=None, tags=[],
+                        metadata={}), f"first put {e!r}")
+    e = put(s, "alpha", "two", V)
+    check(e.version == 2 and e.kind is V, "second put")
+    check(s.get("alpha").value == b"two", "get")
+    exc = expect_key_not_found(lambda: s.get("nope"), "nope", "get('nope')")
+    check(exc.message == "key not found: nope", f"message {exc.message!r}")
+    found = s.find("alpha")
+    check(found is not None and found.version == 2, "find present")
+    check(s.find("nope") is None, "find absent")
 
-    check(wv.Store.default_capacity() == 1_000_000, "default_capacity static")
+    # TTLs follow the logical clock; an expired get reports when.
+    check(put(s, "ttl", "x", V, 10).expires_at == 10, "expires_at")
+    check(s.now() == 0, "now")
+    check(s.tick(9) == 9 and s.count() == 2, "tick 9")
+    check(s.tick(1) == 10 and s.count() == 1, "tick 1")
+    exc = raises(kv.Expired, lambda: s.get("ttl"), "get expired")
+    check(exc.code == 1002 and exc.key == "ttl" and exc.expired_at == 10, f"Expired {exc!r}")
+    expect_key_not_found(lambda: s.get("ttl"), "ttl", "the expired read removed it")
 
-    with wv.Store.open(PATH) as store:
-        payload = b"\x01\x02\x03"
-        check(store.put("alpha", payload, wv.EntryKind.Persistent, None) is True, "put alpha")
-        check(store.put("beta", payload, wv.EntryKind.Volatile, 3600) is True, "put beta")
-        check(store.count() == 2, "count after two puts")
+    # Capacity: a new key past it is StoreFull { capacity }.
+    s.set_capacity(1)
+    check(s.capacity() == 1, "set_capacity")
+    put(s, "alpha", "three")
+    exc = raises(kv.StoreFull, lambda: put(s, "beta", "b"), "StoreFull")
+    check(exc.capacity == 1, "StoreFull payload")
+    s.set_capacity(100)
 
-        # Iterator-backed list-of-string return with an absent and a present
-        # buffered `string?` prefix.
-        check(list(store.list_keys(None)) == ["alpha", "beta"], "list_keys(None)")
-        check(list(store.list_keys("al")) == ["alpha"], "list_keys('al')")
-        it = store.list_keys(None)
-        check(next(it) == "alpha", "manual next on key iterator")
-        it.close()
-        it.close()
+    # An undeclared enum value is a marshalling failure, raised as the root
+    # error on a call that declares errors.
+    exc = raises(kv.Error, lambda: s.put("k", b"v", 9, None), "undeclared EntryKind")
+    check(exc.code == kv.Error.MARSHAL_ERROR_CODE and not isinstance(exc, kv.KvError),
+          f"marshal error {exc!r}")
 
-        # Optional-record return decoded into an Entry dataclass.
-        alpha = store.get("alpha")
-        check(alpha is not None and alpha.id > 0 and alpha.key == "alpha", f"alpha {alpha}")
-        check(alpha.value == payload and alpha.expires_at is None, "alpha payload / no expiry")
-        check(alpha.tags == [] and alpha.metadata == {}, "alpha empty tags / metadata")
-        beta = store.get("beta")
-        check(beta is not None and beta.expires_at is not None
-              and beta.expires_at > beta.created_at, "beta expiry set")
-
-        # Typed errors carry stable codes and the class hierarchy.
-        exc = expect_kv_error(lambda: store.get("missing"), wv.KvError.KeyNotFound, 1001,
-                              "get missing")
-        check(exc.message == "key not found", f"KeyNotFound message {exc.message!r}")
-        check(wv.KeyNotFound is wv.KvError.KeyNotFound, "bare KeyNotFound is the scoped alias")
-        check(store.put("gone", b"x", wv.EntryKind.Volatile, -1) is True, "put expired")
-        expect_kv_error(lambda: store.get("gone"), wv.KvError.Expired, 1002, "get expired")
-        check(store.count() == 2, "expired entry evicted on read")
-
-        # Deprecated method still works but warns.
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            check(store.legacy_put("legacy", b"zz") is True, "legacy_put")
-        check(any(issubclass(w.category, DeprecationWarning) for w in caught),
-              "legacy_put warns DeprecationWarning")
-        check(store.delete("legacy") is True, "delete legacy")
-        check(store.delete("legacy") is False, "delete missing is False")
-
-        # Records are plain value types with native list/map/optional fields.
-        built = wv.Entry(id=7, key="built", value=payload, created_at=1000, expires_at=None,
-                         tags=["hot", "fast"], metadata={"source": "test", "env": "prod"})
-        check(built == wv.Entry(7, "built", payload, 1000, None, ["hot", "fast"],
-                                {"source": "test", "env": "prod"}), "Entry value equality")
-
-        # Cross-module call: kv.stats.get_stats takes the parent's Store.
-        stats = wv.get_stats(store)
-        check(stats == wv.Stats(total_entries=2, total_bytes=6, expired_entries=0),
-              f"stats {stats}")
-
-        # Async: an immediately expired entry gives compact 3 bytes to reclaim.
-        check(store.put("doomed", payload, wv.EntryKind.Volatile, 0) is True, "put doomed")
-        check(store.count() == 2, "doomed is already expired")
-        reclaimed = asyncio.run(store.compact())
-        check(reclaimed == 3, f"compact reclaimed {reclaimed}")
-        check(asyncio.run(store.compact()) == 0, "second compact reclaims nothing")
-        store.clear()
-        check(store.count() == 0, "clear empties the store")
-        closed = store
-    # __exit__ closed the wrapper; every further use is rejected, and both
-    # a second close and the eventual __del__ are no-ops.
-    closed.close()
-    try:
-        closed.count()
-        check(False, "expected use-after-close error")
-    except wv.Error as exc:
-        check("after close" in exc.message, f"use-after-close message {exc.message!r}")
-    try:
-        wv.get_stats(closed)
-        check(False, "expected use-after-close error as a parameter")
-    except wv.Error:
-        pass
-
-
-def eviction_listener() -> None:
-    store = wv.Store.open(PATH)
-    store.put("a", b"1", wv.EntryKind.Persistent, None)
-    store.put("b", b"22", wv.EntryKind.Persistent, None)
-    store.put("old", b"333", wv.EntryKind.Volatile, -5)
-
-    # Delete fires the trampoline synchronously with the removed Entry.
-    first = Listener(keep=2)
-    first_ref = weakref.ref(first)
-    store.set_eviction_listener(first)
-    check(store.delete("a") is True, "delete a")
-    check(first.seen == [("a", wv.EvictionReason.Deleted)], f"first saw {first.seen}")
-    check(first.entries[0].value == b"1" and first.entries[0].id > 0, "evicted Entry decoded")
-
-    # An expired read evicts with reason Expired; that was the second event,
-    # so the listener asked to detach and the store freed it.
-    expect_kv_error(lambda: store.get("old"), wv.KvError.Expired, 1002, "expired read")
-    check(first.seen == [("a", wv.EvictionReason.Deleted), ("old", wv.EvictionReason.Expired)],
-          f"first saw {first.seen}")
-    del first
-    gc.collect()
-    check(first_ref() is None, "detached listener was freed by the producer")
-    check(store.delete("b") is True, "delete b with no listener")
-
-    # Replacing a listener frees the previous one; clearing frees the current.
-    second = Listener()
-    second_ref = weakref.ref(second)
-    store.set_eviction_listener(second)
-    third = Listener()
-    third_ref = weakref.ref(third)
-    store.set_eviction_listener(third)
-    del second
-    gc.collect()
-    check(second_ref() is None, "replaced listener was freed")
-    store.put("c", b"3", wv.EntryKind.Persistent, None)
-    check(store.delete("c") is True, "delete c")
-    check(third.seen == [("c", wv.EvictionReason.Deleted)], f"third saw {third.seen}")
-    store.clear_eviction_listener()
-    del third
-    gc.collect()
-    check(third_ref() is None, "cleared listener was freed")
-
-    # A listener that raises aborts the delete with the foreign error code;
-    # the entry is gone regardless and the store stays usable.
-    angry = Listener(poison="bad")
-    store.set_eviction_listener(angry)
-    store.put("bad", b"!", wv.EntryKind.Persistent, None)
-    store.put("fine", b"?", wv.EntryKind.Persistent, None)
-    try:
-        store.delete("bad")
-        check(False, "expected Error from a raising listener")
-    except wv.KvError:
-        check(False, "a foreign error is not a KvError")
-    except wv.Error as exc:
-        check(exc.code == wv.Error.FOREIGN_ERROR_CODE == -4,
-              f"foreign error code {exc.code}")
-        check("listener refused bad" in exc.message, f"foreign message {exc.message!r}")
-    check(store.count() == 1, "entry removed despite the listener raising")
-    check(store.delete("fine") is True, "delete after foreign error")
-    check(angry.seen == [("fine", wv.EvictionReason.Deleted)], f"angry saw {angry.seen}")
-
-    # Destroying the store frees the listener it still holds.
-    angry_ref = weakref.ref(angry)
-    del angry
-    gc.collect()
-    check(angry_ref() is not None, "attached listener kept alive by the store")
-    store.close()
-    gc.collect()
-    check(angry_ref() is None, "closing the store freed its listener")
-
-
-def object_graph() -> None:
-    store = wv.Store.open(PATH)
-    store.put("k", b"v", wv.EntryKind.Persistent, None)
-
-    # share(): a second wrapper over the same object.
-    shared = store.share()
-    check(isinstance(shared, wv.Store) and shared is not store, "share returns a new wrapper")
-    check(shared.put("k2", b"vv", wv.EntryKind.Persistent, None) is True, "put via shared")
-    check(store.count() == 2, "mutation through share visible through the original")
-    store.close()
-    check(shared.count() == 2, "object alive through the shared wrapper")
-
-    # fork(): an independent copy.
-    forked = shared.fork()
-    check(forked.count() == 2, "fork copies live entries")
-    forked.put("only-forked", b"x", wv.EntryKind.Persistent, None)
-    check(forked.count() == 3 and shared.count() == 2, "fork is independent")
-
-    # larger(): Store? in both directions.
-    empty = wv.Store.open(PATH)
-    check(empty.larger(None) is None, "larger(None) on an empty store is None")
-    own = shared.larger(None)
-    check(own is not None and own.count() == 2, "larger(None) on a populated store is itself")
-    own.put("k3", b"3", wv.EntryKind.Persistent, None)
-    check(shared.count() == 3, "larger(None) returned the same object")
-    own.close()
-    bigger = empty.larger(forked)
-    check(bigger is not None and bigger.count() == 3, "larger(other) picks the bigger")
-    bigger.put("k4", b"4", wv.EntryKind.Persistent, None)
-    check(forked.count() == 4, "larger(other) returned the other object")
-    bigger.close()
-    check(shared.larger(empty).count() == 3, "larger prefers self over a smaller other")
-
-    # describe(): a record carrying the object (and an optional second one).
-    info = shared.describe("primary", None)
-    check(isinstance(info, wv.StoreInfo), "describe returns StoreInfo")
-    check(info.label == "primary" and info.count == 3 and info.mirror is None, f"info {info}")
-    check(isinstance(info.store, wv.Store) and info.store is not shared,
-          "record object field is a wrapper")
-    info.store.put("k5", b"5", wv.EntryKind.Persistent, None)
-    check(shared.count() == 4, "record object field refers to the same store")
-    mirrored = shared.describe("mirrored", forked)
-    check(mirrored.mirror is not None and mirrored.mirror.count() == 4, "mirror present")
-    mirrored.mirror.put("k6", b"6", wv.EntryKind.Persistent, None)
-    check(forked.count() == 5, "mirror refers to the other store")
-
-    # open_many(): a list of objects as a return, and its throwing path.
-    many = wv.Store.open_many(["/a", "/b", "/c"])
-    check(len(many) == 3 and all(isinstance(s, wv.Store) for s in many), "open_many list")
-    check([s.count() for s in many] == [0, 0, 0], "open_many stores are empty")
-    many[0].put("m", b"1", wv.EntryKind.Persistent, None)
-    many[2].put("n", b"2", wv.EntryKind.Persistent, None)
-    check([s.count() for s in many] == [1, 0, 1], "open_many stores are distinct")
-    expect_kv_error(lambda: wv.Store.open_many(["/ok", ""]), wv.KvError.IoError, 1004,
-                    "open_many with an empty path")
-    check(wv.Store.open_many([]) == [], "open_many([])")
-
-    # total_count(): list of objects and an object inside an optional record
-    # as parameters. Encoding clones each object; the wrappers stay usable.
-    check(wv.Store.total_count(many, None) == 2, "total_count without extra")
-    check(wv.Store.total_count([], None) == 0, "total_count of nothing")
-    extra = wv.StoreInfo(label="extra", store=shared, mirror=forked, count=-1)
-    check(wv.Store.total_count(many, extra) == 2 + 4, "total_count with a local StoreInfo")
-    check(wv.Store.total_count(many + [shared, forked], info) == 2 + 4 + 5 + 4,
-          "total_count with duplicates and a producer-built StoreInfo")
-    check(shared.count() == 4 and forked.count() == 5 and many[0].count() == 1,
-          "wrappers usable after being encoded")
-    # A closed store in a buffered position is rejected before any reference
-    # is minted, so the live store beside it leaks nothing.
-    try:
-        wv.Store.total_count([empty, closed_store()], None)
-        check(False, "expected error encoding a closed store")
-    except wv.Error as exc:
-        check("Store used after close" in exc.message, f"closed store in list {exc.message!r}")
-    try:
-        wv.Store.total_count([], wv.StoreInfo("x", empty, closed_store(), 0))
-        check(False, "expected error encoding a closed mirror")
-    except wv.Error as exc:
-        check("Store used after close" in exc.message, f"closed mirror {exc.message!r}")
-    check(empty.count() == 0, "live store usable after a rejected encoding")
-
-    # Release everything, twice where it is cheap to prove idempotence.
-    for s in [shared, forked, empty, info.store, mirrored.store, mirrored.mirror] + many:
-        s.close()
-        s.close()
-    for s in [shared, forked, empty] + many:
-        try:
-            s.count()
-            check(False, "closed store still usable")
-        except wv.Error:
-            pass
-
-
-def closed_store() -> wv.Store:
-    s = wv.Store.open(PATH)
+    put(s, "beta", "b")
+    check(s.delete("beta") is True and s.delete("beta") is False, "delete")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        check(s.size() == s.count() == 1, "size")
+    check([w.category for w in caught] == [DeprecationWarning], "size warns")
+    check(s.clear() == 1 and s.count() == 0, "clear")
     s.close()
-    return s
+    s.close()
 
 
-class Blocking(wv.EvictionListener):
-    """A listener that blocks inside the producer's `delete` until released,
-    so the test can act while that call is in flight."""
+def iterators() -> None:
+    s = kv.Store.open("/iter")
+    put(s, "user.bob", "b")
+    put(s, "user.alice", "a")
+    put(s, "sys.x", "xx")
 
-    def __init__(self) -> None:
-        self.entered = threading.Event()
-        self.release = threading.Event()
+    check(list(s.keys(None)) == ["sys.x", "user.alice", "user.bob"], "keys(None)")
+    expect_key_not_found(lambda: s.keys("zzz"), "zzz", "keys('zzz')")
 
-    def on_evict(self, entry: wv.Entry, reason: wv.EvictionReason) -> bool:
-        self.entered.set()
-        self.release.wait(10)
-        return True
+    # Abandoning an iterator part-way releases it.
+    it = s.keys("user.")
+    check(next(it) == "user.alice", "first key")
+    check(impl._debug_live(2) == 1, "one live iterator")
+    it.close()  # type: ignore[attr-defined]
+    check(impl._debug_live(2) == 0, "abandoned iterator released")
+    check(list(it) == [], "a closed iterator is exhausted")
 
+    entries = list(s.entries("sys."))
+    check(len(entries) == 1 and entries[0].key == "sys.x" and entries[0].value == b"xx",
+          f"entries('sys.') {entries!r}")
 
-def close_during_call() -> None:
-    # close() from another thread while a call is in flight defers the
-    # native release until the call returns, instead of freeing the store
-    # out from under it.
-    store = wv.Store.open(PATH)
-    listener = Blocking()
-    store.set_eviction_listener(listener)
-    store.put("k", b"v", wv.EntryKind.Persistent, None)
-    result = []
-    worker = threading.Thread(target=lambda: result.append(store.delete("k")))
-    worker.start()
-    check(listener.entered.wait(10), "listener entered")
-    store.close()
-    try:
-        store.count()
-        check(False, "a closing wrapper rejects new calls")
-    except wv.Error as exc:
-        check("after close" in exc.message, f"closing message {exc.message!r}")
-    listener.release.set()
-    worker.join(10)
-    check(result == [True], f"in-flight delete completed: {result}")
+    prefixes = ["user.", "sys.", "none."]
+    parts = list(s.partition(prefixes))
+    check(len(parts) == 3 and len(set(parts)) == 3 and s not in parts, "distinct stores")
+    check([p.count() for p in parts] == [2, 1, 0], "partition counts")
+    check([p.path() for p in parts] == prefixes, "partition paths")
+    for p in parts:
+        p.close()
+    s.close()
 
 
-async def cancel_compact() -> None:
-    # compact is cancellable: cancelling the awaiting task cancels the native
-    # token, and the coroutine raises CancelledError (or, when compaction
-    # already finished, the task simply completes).
-    store = wv.Store.open(PATH)
-    task = asyncio.ensure_future(store.compact())
+class Listener(kv.Listener):
+    """Records every change; `accepts` says no to `skip` and raises on
+    `fail_on`."""
+
+    def __init__(self, skip: str = "", fail_on: str = "") -> None:
+        self.skip = skip
+        self.fail_on = fail_on
+        self.changes: List[kv.Change] = []
+        self.threads: List[int] = []
+
+    def accepts(self, key: str) -> bool:
+        if key == self.fail_on:
+            raise RuntimeError("listener refused")
+        return key != self.skip
+
+    def on_change(self, change: kv.Change) -> None:
+        self.threads.append(threading.get_ident())
+        self.changes.append(change)
+
+    def of(self, cls: type) -> List[kv.Change]:
+        return [c for c in self.changes if isinstance(c, cls)]
+
+
+def listeners() -> None:
+    s = kv.Store.open("/listen")
+    base = held_callbacks()
+    listener = Listener(skip="quiet")
+    sub = s.subscribe(listener)
+    check(sub > 0 and s.listener_count() == 1 and held_callbacks() == base + 1, "subscribe")
+
+    put(s, "a", "1")
+    last = listener.changes[-1]
+    check(isinstance(last, kv.ChangePut) and last.entry.version == 1 and not last.replaced,
+          f"first Put {last!r}")
+    put(s, "a", "2")
+    last = listener.changes[-1]
+    check(isinstance(last, kv.ChangePut) and last.entry.version == 2 and last.replaced,
+          "second Put")
+    put(s, "quiet", "x")
+    check(len(listener.of(kv.ChangePut)) == 2, "accepts() filtered quiet")
+    check(s.delete("a"), "delete a")
+    check(listener.changes[-1] == kv.ChangeRemoved(key="a", expired=False), "Removed")
+
+    # An expired read removes the entry and says so.
+    put(s, "short", "x", V, 1)
+    s.tick(1)
+    raises(kv.Expired, lambda: s.get("short"), "get short")
+    check(listener.changes[-1] == kv.ChangeRemoved(key="short", expired=True), "expired Removed")
+    check(s.clear() == 1, "clear")
+    check(listener.changes[-1] == kv.ChangeCleared(count=1), "Cleared")
+    check(listener.changes[-1].tag is kv.Change.Tag.Cleared, "Change tag")
+    check(set(listener.threads) == {MAIN_THREAD}, "synchronous calls notify inline")
+
+    # Unsubscribing releases the listener once.
+    check(s.unsubscribe(sub) is True and held_callbacks() == base, "unsubscribe releases")
+    check(s.unsubscribe(sub) is False and s.listener_count() == 0, "unsubscribe again")
+
+    # A listener that raises is detached (and released); the put succeeds.
+    failing = Listener(fail_on="boom")
+    s.subscribe(failing)
+    put(s, "fine", "1")
+    check(len(failing.of(kv.ChangePut)) == 1, "failing listener saw fine")
+    put(s, "boom", "1")
+    check(s.count() == 2 and s.listener_count() == 0, "failing listener detached")
+    check(held_callbacks() == base, "failing listener released")
+
+    # A listener of the wrong type is rejected before the call.
+    raises(TypeError, lambda: s.subscribe(object()), "subscribe(object())")
+    check(held_callbacks() == base, "nothing registered")
+
+    # Destroying the store releases the listeners it still holds.
+    s.subscribe(Listener())
+    s.subscribe(Listener())
+    check(s.listener_count() == 2 and held_callbacks() == base + 2, "two held")
+    s.close()
+    check(held_callbacks() == base, "closing the store released its listeners")
+
+
+class Policy(kv.Policy):
+    """Tags and encrypts admitted entries, routes `b/` keys to `other`, and
+    fails in various ways for some keys."""
+
+    def __init__(self, other: kv.Store) -> None:
+        self.other = other
+        self.admitted = 0
+
+    def admit(self, entry: kv.Entry) -> kv.Entry:
+        self.admitted += 1
+        check(entry.version == 0, "the store assigns the version after admission")
+        if entry.key.startswith("secret"):
+            raise kv.KvError.Rejected(key=entry.key, reason="no secrets",
+                                      message="secrets are not stored")
+        if entry.key.startswith("boom"):
+            raise RuntimeError("policy exploded")
+        entry.tags = ["admitted"]
+        entry.kind = E
+        entry.key = "renamed"  # ignored by the store
+        return entry
+
+    def route(self, key: str, home: kv.Store) -> kv.Store:
+        if key.startswith("b/"):
+            return self.other
+        if key.startswith("null/"):
+            return None  # type: ignore[return-value]
+        return home
+
+
+def policies() -> None:
+    s = kv.Store.open("/policy")
+    other = kv.Store.open("/other")
+    base = held_callbacks()
+    policy = Policy(other)
+    s.set_policy(policy)
+    check(s.has_policy() and held_callbacks() == base + 1, "set_policy")
+
+    e = put(s, "a", "1", V)
+    check(e.key == "a" and e.version == 1 and e.kind is E and e.tags == ["admitted"],
+          f"admitted entry {e!r}")
+
+    put(s, "b/x", "2", V)
+    check(s.count() == 1 and other.count() == 1, "route redirected the write")
+
+    exc = raises(kv.Rejected, lambda: put(s, "secret", "3", V), "Rejected")
+    check(exc.code == 1005 and exc.key == "secret" and exc.reason == "no secrets",
+          f"Rejected payload {exc!r}")
+    check(exc.message == "secrets are not stored", f"Rejected message {exc.message!r}")
+
+    exc = raises(kv.Error, lambda: put(s, "boom", "4", V), "non-domain failure")
+    check(exc.code == kv.Error.FOREIGN_ERROR_CODE and exc.message == "policy exploded",
+          f"foreign error {exc!r}")
+    check(not isinstance(exc, kv.KvError), "a foreign error isn't a domain error")
+
+    # A None where an object is required is the implementation's failure.
+    exc = raises(kv.Error, lambda: put(s, "null/x", "6", V), "None route")
+    check(exc.code == kv.Error.FOREIGN_ERROR_CODE, f"None route {exc!r}")
+    check(s.count() == 1 and other.count() == 1, "failed puts stored nothing")
+    check(policy.admitted == 5, f"admitted {policy.admitted}")
+
+    # Replacing the policy releases the old one; None removes it.
+    s.set_policy(Policy(other))
+    check(held_callbacks() == base + 1, "replacing released the old policy")
+    s.set_policy(None)
+    check(not s.has_policy() and held_callbacks() == base, "set_policy(None) released it")
+    put(s, "secret", "now allowed")
+    check(s.count() == 2, "no policy")
+    other.close()
+    s.close()
+
+
+class Loader(kv.Loader):
+    def __init__(self, fallback: Optional[kv.Store] = None) -> None:
+        self.backup = fallback
+
+    def name(self) -> str:
+        return "py-loader"
+
+    def fallback(self, key: str) -> Optional[kv.Store]:
+        return self.backup if key == "fb" else None
+
+    def load(self, key: str) -> bytes:
+        if key == "missing":
+            raise kv.KeyNotFound(key="missing", message="not in the loader")
+        if key == "elsewhere":
+            raise kv.KeyNotFound(key="other", message="not in the loader")
+        if key == "broken":
+            raise RuntimeError("loader is broken")
+        return f"loaded:{key}".encode()
+
+
+def loaders() -> None:
+    s = kv.Store.open("/load")
+    base = held_callbacks()
+    check(s.get_or_load("k", None) is None, "no loader")
+
+    e = s.get_or_load("k", Loader())
+    check(e is not None and e.value == b"loaded:k" and e.kind is V
+          and e.metadata == {"source": "py-loader"}, f"loaded {e!r}")
+    check(held_callbacks() == base, "a loader is released after the call")
+    check(s.count() == 1, "the loaded entry is stored")
+    e = s.get_or_load("k", Loader())
+    check(e is not None and e.version == 1, "a hit doesn't consult the loader")
+
+    with kv.Store.open("/backup") as backup:
+        put(backup, "fb", "from backup")
+        e = s.get_or_load("fb", Loader(backup))
+        check(e is not None and e.value == b"from backup" and e.kind is P, f"fallback {e!r}")
+
+    check(s.get_or_load("missing", Loader()) is None, "KeyNotFound for this key")
+    exc = expect_key_not_found(lambda: s.get_or_load("elsewhere", Loader()), "other",
+                               "KeyNotFound for another key")
+    check(exc.message == "not in the loader", f"passed-through message {exc.message!r}")
+    exc = raises(kv.Error, lambda: s.get_or_load("broken", Loader()), "broken loader")
+    check(exc.code == kv.Error.FOREIGN_ERROR_CODE and exc.message == "loader is broken",
+          f"broken loader {exc!r}")
+    check(held_callbacks() == base, "every loader released")
+    s.close()
+
+
+async def async_calls() -> None:
+    s = kv.Store.open("/async-calls")
+    listener = Listener()
+    s.subscribe(listener)
+    put(s, "old1", "x", V, 1)
+    put(s, "old2", "x", V, 1)
+    put(s, "keep", "x")
+    s.tick(5)
+
+    # compact runs on a producer thread and notifies listeners there.
+    check(await s.compact(0) == 2, "compact(0)")
+    removed = listener.of(kv.ChangeRemoved)
+    check(len(removed) == 2 and all(c.expired for c in removed), f"compact notified {removed!r}")
+    threads = listener.threads[-2:]
+    check(MAIN_THREAD not in threads, "notified from a producer thread")
+    check(s.count() == 1, "compacted")
+
+    check(await s.compact(5) == 0, "compact(5)")
+
+    # Cancel mid-pause: the call stops at once, and the background pause
+    # notices the token and stops.
+    task = asyncio.ensure_future(s.compact(60000))
+    await asyncio.sleep(0.02)
+    check(not task.done() and kv.Store.active_jobs() >= 1, "compact(60000) running")
+    started = time.monotonic()
     task.cancel()
     try:
         await task
+        check(False, "a cancelled compact returned")
     except asyncio.CancelledError:
         pass
-    check(task.cancelled() or task.result() == 0, "cancelled compact")
-    check(await store.compact() == 0, "compact still works after a cancellation")
-    store.close()
+    check(time.monotonic() - started < 1.0, "cancelled promptly")
+    deadline = time.monotonic() + 2.0
+    while kv.Store.active_jobs() and time.monotonic() < deadline:
+        await asyncio.sleep(0.001)
+    check(kv.Store.active_jobs() == 0, "the cancelled pause stopped cooperatively")
+
+    # get_many: an async list of optional records, launched concurrently.
+    results = await asyncio.gather(*(s.get_many(["keep", "gone", "keep"]) for _ in range(32)))
+    for got in results:
+        check(len(got) == 3 and got[1] is None and got[0] is not None and got[2] is not None
+              and got[2].key == "keep", f"get_many {got!r}")
+
+    other = kv.Store.open("/other")
+    put(other, "a", "123")
+    stats = await kv.summarize_all([s, other])
+    check(stats == kv.Stats(entries=2, bytes=4, by_kind={P: 2}), f"summarize_all {stats!r}")
+    other.close()
+    s.close()
+
+
+def object_graph() -> None:
+    s = kv.Store.open("/graph")
+    put(s, "k", "v")
+
+    # share(): the same object behind a new wrapper.
+    shared = s.share()
+    check(shared == s and shared is not s and hash(shared) == hash(s), "share is the same object")
+    s.close()
+    check(shared.count() == 1, "alive through the shared reference")
+    s = shared
+
+    fork = s.fork()
+    check(fork != s and fork.count() == 1 and fork.path() == "/graph", "fork")
+    put(fork, "k2", "v")
+    check(fork.count() == 2 and s.count() == 1, "fork is a copy")
+
+    empty = kv.Store.open("/empty")
+    check(empty.larger(None) is None, "larger(None) on an empty store")
+    check(empty.larger(fork) == fork, "larger(fork)")
+    check(s.larger(None) == s, "larger(None) on a non-empty store is self")
+
+    info = s.describe("main", fork)
+    check(info == kv.StoreInfo(label="main", store=s, mirror=fork, count=1), f"describe {info!r}")
+    check(info.mirror is not None and info.mirror.count() == 2, "mirror usable")
+
+    many = kv.Store.open_many(["/a", "/b"])
+    check([m.path() for m in many] == ["/a", "/b"], "open_many")
+    raises(kv.InvalidPath, lambda: kv.Store.open_many(["/a", ""]), "open_many with ''")
+
+    named = kv.Store.by_label([info, kv.StoreInfo(label="first", store=many[0], mirror=None,
+                                                  count=0)])
+    check(named == {"main": s, "first": many[0]}, f"by_label {named!r}")
+
+    put(many[0], "m", "1")
+    check(kv.Store.total_count([many[0], many[1], fork], named, info) == 6, "total_count")
+    check(kv.Store.total_count([many[0], many[1], fork], named, None) == 5, "total_count None")
+    check(s.count() == 1 and fork.count() == 2 and many[0].count() == 1, "all still usable")
+
+    for obj in [*many, *named.values(), info.store, empty, fork, s]:
+        obj.close()
+    check(info.mirror is not None, "a record keeps its wrappers")
+    info.mirror.close()
+
+
+def stats_and_report() -> None:
+    s = kv.Store.open("/stats")
+    put(s, "b", "12")
+    put(s, "a", "1")
+    put(s, "a", "123")
+    put(s, "c", "x", E)
+
+    stats = kv.summarize(s, None)
+    check(stats == kv.Stats(entries=3, bytes=6, by_kind={P: 2, E: 1}), f"summarize {stats!r}")
+    expect_key_not_found(lambda: kv.summarize(s, "q"), "q", "summarize('q')")
+
+    lines = kv.render_report(list(s.entries(None)))
+    check(lines == ["a: 3 bytes, Persistent, v2", "b: 2 bytes, Persistent",
+                    "c: 1 bytes, Encrypted"], f"render_report {lines!r}")
+    exc = raises(kv.ReportError.NothingToReport, lambda: kv.render_report([]), "empty report")
+    check(exc.code == 2001 and exc.message == "nothing to report", f"NothingToReport {exc!r}")
+    check(isinstance(exc, kv.ReportError) and not isinstance(exc, kv.KvError), "report domain")
+    s.close()
 
 
 def main() -> None:
+    load_checks()
+    constructors()
     basics()
-    eviction_listener()
+    iterators()
+    listeners()
+    policies()
+    loaders()
+    asyncio.run(async_calls())
     object_graph()
-    close_during_call()
-    asyncio.run(cancel_compact())
-    consumer.finish(wv)
+    stats_and_report()
+    check(held_callbacks() == 0, "every callback implementation released")
+    consumer.finish()
 
 
 main()

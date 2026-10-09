@@ -3,6 +3,8 @@
 # ships, as C++17 with warnings as errors. The translation unit includes the
 # wrapper and then the C header directly, so including both must compile.
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+require "${CXX:-clang++}"
 dir=$1
 hpp=$(ls "$dir"/cpp/*.hpp | head -1)
 h=$(ls "$dir"/cpp/*.h | head -1)

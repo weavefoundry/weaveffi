@@ -5,6 +5,7 @@
 # one generated gem and runs one consumer against it, which must exit 0.
 set -uo pipefail
 . "$(dirname "$0")/../lib.sh"
+require_tools ruby ruby gem
 
 # Build the sample's generated gem with `gem build`, install it into a
 # private gem home, and run the consumer against the installed gem. The
@@ -25,22 +26,11 @@ rb_consumer() {
 }
 
 ruby_calculator() { rb_consumer calculator calculator.rb; }
-
-ruby_contacts()   { rb_consumer contacts contacts.rb; }
-
-ruby_events()     { rb_consumer events events.rb; }
-
-ruby_kvstore()    { rb_consumer kvstore kvstore.rb; }
-
-ruby_async_demo() { rb_consumer async-demo async_demo.rb; }
-
-ruby_codec()      { rb_consumer codec codec.rb; }
+ruby_codec() { rb_consumer codec codec.rb; }
+ruby_kvstore() { rb_consumer kvstore kvstore.rb; }
 
 lane ruby-calculator ruby_calculator
-lane ruby-contacts ruby_contacts
-lane ruby-events ruby_events
-lane ruby-kvstore ruby_kvstore
-lane ruby-async-demo ruby_async_demo
 lane ruby-codec ruby_codec
+lane ruby-kvstore ruby_kvstore
 
 finish_lanes

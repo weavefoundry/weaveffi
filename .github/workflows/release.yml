@@ -14,6 +14,7 @@ jobs:
   release-pr:
     name: Release PR
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: ${{ github.repository_owner == 'weavefoundry' }}
     concurrency:
       group: release-pr
@@ -38,6 +39,7 @@ jobs:
   release:
     name: Publish
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     if: ${{ github.repository_owner == 'weavefoundry' }}
     concurrency:
       group: release

@@ -5,12 +5,12 @@
 //! paths for whole call shapes, features skipped without a word. These tests
 //! make that class of regression a build failure:
 //!
-//! 1. Generator and model crate sources must not contain `unimplemented!(` / `todo!(`.
+//! 1. Generator and model sources must not contain `unimplemented!(` / `todo!(`.
 //!    (`unreachable!` stays allowed: it documents genuinely impossible states.)
 //! 2. The full generated output for the feature-complete sample IDLs must not
-//!    contain stub markers. A target that cannot support a feature must either
-//!    fail generation loudly (the capability gate) or emit an *explicit*
-//!    "not supported by this target" surface, never a fake implementation.
+//!    contain stub markers. A target that cannot support a feature in some
+//!    mode must emit an *explicit* "not supported by this target" surface,
+//!    never a fake implementation.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,7 +33,7 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Generator crate sources must not punt with panicking placeholder macros.
+/// Generator and model sources must not punt with panicking placeholder macros.
 #[test]
 fn generator_sources_ban_unimplemented_and_todo() {
     let crates_dir = workspace_root().join("crates");
@@ -43,10 +43,10 @@ fn generator_sources_ban_unimplemented_and_todo() {
     for entry in fs::read_dir(&crates_dir).expect("read crates/") {
         let path = entry.expect("dir entry").path();
         let name = path.file_name().unwrap().to_string_lossy().to_string();
-        // Only the generator and model crates (the code that produces
-        // consumer bindings) are in scope; test helpers and the CLI are free
-        // to use placeholder macros.
-        if !(name == "weaveffi-gen" || name == "weaveffi-model") {
+        // Only the CLI (which holds the generators) and the model crate (the
+        // code that produces consumer bindings) are in scope; test helpers
+        // are free to use placeholder macros.
+        if !(name == "weaveffi-cli" || name == "weaveffi-model") {
             continue;
         }
         let src = path.join("src");
@@ -77,9 +77,8 @@ fn generator_sources_ban_unimplemented_and_todo() {
     );
     assert!(
         violations.is_empty(),
-        "panicking placeholder macros in generator crates (implement the path, \
-         fail generation via the capability gate, or use unreachable! for \
-         impossible states):\n{}",
+        "panicking placeholder macros in generator sources (implement the path \
+         or use unreachable! for impossible states):\n{}",
         violations.join("\n")
     );
 }
@@ -87,10 +86,13 @@ fn generator_sources_ban_unimplemented_and_todo() {
 /// The Ruby callback-interface mixin's abstract-method default, which is the
 /// one legitimate "not implemented" in generated output (see the exemption in
 /// [`generated_output_has_no_stub_markers`]).
-fn is_abstract_callback_default(line: &str) -> bool {
+fn is_exempt_idiom(line: &str) -> bool {
     let t = line.trim_start();
     t.starts_with("raise NotImplementedError, \"#{self.class}#")
         || (t.starts_with('#') && t.contains("NotImplementedError"))
+        // Python's rich-comparison protocol: `__eq__` returns the
+        // `NotImplemented` singleton for foreign types.
+        || t == "return NotImplemented"
 }
 
 /// Every file generated for the feature-complete samples (structs, builders,
@@ -100,22 +102,16 @@ fn is_abstract_callback_default(line: &str) -> bool {
 #[test]
 fn generated_output_has_no_stub_markers() {
     let root = workspace_root();
-    let samples = [
-        root.join("samples/contacts/src/lib.rs"),
-        root.join("samples/events/src/lib.rs"),
-        root.join("samples/kvstore/src/lib.rs"),
-        root.join("samples/codec/src/lib.rs"),
-    ];
+    let samples = [root.join("samples/kvstore"), root.join("samples/codec")];
 
     // Case-insensitive marker list. Bare "not supported" is deliberately
     // absent: an explicit, permanently declared unsupported-feature surface
     // (e.g. wasm async/listener stubs in Emscripten mode, which throw "is
     // not supported in Emscripten mode") is the *correct* loud behavior. The
-    // "yet" in "not yet supported" is what distinguishes capability drift: a
-    // target that declares a feature `true` (so the gate lets generation
-    // through) but then emits a runtime-throwing TODO stub for it. That is
-    // exactly the Kotlin `iter<T>` regression the capability gate exists to
-    // prevent, so it must stay a hard build failure.
+    // "yet" in "not yet supported" is what marks a runtime-throwing TODO stub
+    // for a feature the target claims to implement, the Kotlin `iter<T>`
+    // regression this test exists to prevent, so it must stay a hard build
+    // failure.
     let banned = [
         "unimplemented",
         "notimplemented",
@@ -138,7 +134,6 @@ fn generated_output_has_no_stub_markers() {
                 idl.to_str().unwrap(),
                 "-o",
                 out.to_str().unwrap(),
-                "--force",
             ])
             .assert()
             .success();
@@ -163,7 +158,7 @@ fn generated_output_has_no_stub_markers() {
             // stub, so those lines are exempt from the scan.
             let lower: String = text
                 .lines()
-                .filter(|l| !is_abstract_callback_default(l))
+                .filter(|l| !is_exempt_idiom(l))
                 .map(str::to_lowercase)
                 .collect::<Vec<_>>()
                 .join("\n");

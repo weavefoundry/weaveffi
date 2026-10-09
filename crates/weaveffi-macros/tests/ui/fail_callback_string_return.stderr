@@ -1,5 +1,0 @@
-error: weaveffi: a callback interface method can only return a number, `bool`, or C-style enum (or nothing)
- --> tests/ui/fail_callback_string_return.rs:5:27
-  |
-5 |         fn name(&self) -> String;
-  |                           ^^^^^^

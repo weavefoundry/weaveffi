@@ -1,0 +1,303 @@
+package {{PACKAGE}}
+
+/*
+#include "{{HEADER}}"
+*/
+import "C"
+
+import (
+	"encoding/binary"
+	"math"
+	"unicode/utf8"
+)
+
+// wvEncode encodes v with write into a new value buffer.
+func wvEncode[T any](v T, write func(*wvWriter, T)) []byte {
+	var w wvWriter
+	write(&w, v)
+	return w.buf
+}
+
+// wvDecode decodes one value from a returned value buffer, checks that
+// nothing trails it, and releases the native allocation.
+func wvDecode[T any](ptr *C.uint8_t, n C.size_t, read func(*wvReader) T) T {
+	return wvDecodeBytes(wvTakeBytes(ptr, n), read)
+}
+
+// wvDecodeBorrowed is wvDecode for a buffer the native library only lends
+// (a callback argument).
+func wvDecodeBorrowed[T any](ptr *C.uint8_t, n C.size_t, read func(*wvReader) T) T {
+	return wvDecodeBytes(wvBorrowBytes(ptr, n), read)
+}
+
+func wvDecodeBytes[T any](b []byte, read func(*wvReader) T) T {
+	r := wvReader{buf: b}
+	v := read(&r)
+	r.expectEnd()
+	return v
+}
+
+// wvWriteList writes a u32 count, then each element.
+func wvWriteList[T any](w *wvWriter, v []T, elem func(*wvWriter, T)) {
+	w.writeLen(len(v))
+	for _, e := range v {
+		elem(w, e)
+	}
+}
+
+// wvReadList reads a u32 count, then that many elements.
+func wvReadList[T any](r *wvReader, elem func(*wvReader) T) []T {
+	n := r.readLen()
+	v := make([]T, 0, r.capHint(n))
+	for range n {
+		v = append(v, elem(r))
+	}
+	return v
+}
+
+// wvWriteMap writes a u32 count, then each key and value. Entry order
+// carries no meaning.
+func wvWriteMap[K comparable, V any](w *wvWriter, v map[K]V, key func(*wvWriter, K), val func(*wvWriter, V)) {
+	w.writeLen(len(v))
+	for k, e := range v {
+		key(w, k)
+		val(w, e)
+	}
+}
+
+// wvReadMap reads a u32 count, then that many keys and values. A repeated
+// key is a malformed buffer.
+func wvReadMap[K comparable, V any](r *wvReader, key func(*wvReader) K, val func(*wvReader) V) map[K]V {
+	n := r.readLen()
+	v := make(map[K]V, r.capHint(n))
+	for range n {
+		k := key(r)
+		if _, dup := v[k]; dup {
+			wvMalformed("repeated map key")
+		}
+		v[k] = val(r)
+	}
+	return v
+}
+
+// wvWriteOptional writes an optional held as a pointer: a presence flag,
+// then the value when present.
+func wvWriteOptional[T any](w *wvWriter, v *T, elem func(*wvWriter, T)) {
+	w.writeBool(v != nil)
+	if v != nil {
+		elem(w, *v)
+	}
+}
+
+// wvReadOptional reads an optional held as a pointer.
+func wvReadOptional[T any](r *wvReader, elem func(*wvReader) T) *T {
+	if !r.readOptionFlag() {
+		return nil
+	}
+	v := elem(r)
+	return &v
+}
+
+// wvWriteNilable writes an optional whose Go type is already nil-able (a
+// slice, map, interface, or wrapper pointer): present says it isn't nil.
+func wvWriteNilable[T any](w *wvWriter, v T, present bool, elem func(*wvWriter, T)) {
+	w.writeBool(present)
+	if present {
+		elem(w, v)
+	}
+}
+
+// wvReadNilable reads an optional whose Go type is already nil-able; absent
+// is the zero value (nil).
+func wvReadNilable[T any](r *wvReader, elem func(*wvReader) T) T {
+	if !r.readOptionFlag() {
+		var zero T
+		return zero
+	}
+	return elem(r)
+}
+
+// wvWriter serializes values into the value-buffer format: little-endian,
+// packed, u32 length prefixes.
+type wvWriter struct {
+	buf []byte
+}
+
+func (w *wvWriter) writeBool(v bool) {
+	if v {
+		w.buf = append(w.buf, 1)
+	} else {
+		w.buf = append(w.buf, 0)
+	}
+}
+
+func (w *wvWriter) writeI8(v int8) {
+	w.buf = append(w.buf, byte(v))
+}
+
+func (w *wvWriter) writeU8(v uint8) {
+	w.buf = append(w.buf, v)
+}
+
+func (w *wvWriter) writeI16(v int16) {
+	w.buf = binary.LittleEndian.AppendUint16(w.buf, uint16(v))
+}
+
+func (w *wvWriter) writeU16(v uint16) {
+	w.buf = binary.LittleEndian.AppendUint16(w.buf, v)
+}
+
+func (w *wvWriter) writeI32(v int32) {
+	w.buf = binary.LittleEndian.AppendUint32(w.buf, uint32(v))
+}
+
+func (w *wvWriter) writeU32(v uint32) {
+	w.buf = binary.LittleEndian.AppendUint32(w.buf, v)
+}
+
+func (w *wvWriter) writeI64(v int64) {
+	w.buf = binary.LittleEndian.AppendUint64(w.buf, uint64(v))
+}
+
+func (w *wvWriter) writeU64(v uint64) {
+	w.buf = binary.LittleEndian.AppendUint64(w.buf, v)
+}
+
+func (w *wvWriter) writeF32(v float32) {
+	w.writeU32(math.Float32bits(v))
+}
+
+func (w *wvWriter) writeF64(v float64) {
+	w.writeU64(math.Float64bits(v))
+}
+
+func (w *wvWriter) writeLen(n int) {
+	if n < 0 || uint64(n) > math.MaxUint32 {
+		panic("{{PACKAGE}}: value-buffer length exceeds u32 range")
+	}
+	w.writeU32(uint32(n))
+}
+
+func (w *wvWriter) writeString(v string) {
+	w.writeLen(len(v))
+	w.buf = append(w.buf, v...)
+}
+
+func (w *wvWriter) writeBytes(v []byte) {
+	w.writeLen(len(v))
+	w.buf = append(w.buf, v...)
+}
+
+// wvReader decodes values from the value-buffer format. A malformed buffer
+// is a producer/consumer contract violation, so every read panics instead of
+// returning a typed domain error.
+type wvReader struct {
+	buf []byte
+	pos int
+}
+
+func wvMalformed(context string) {
+	panic("{{PACKAGE}}: malformed value buffer: " + context)
+}
+
+func (r *wvReader) take(n int, context string) []byte {
+	if n < 0 || len(r.buf)-r.pos < n {
+		wvMalformed(context)
+	}
+	b := r.buf[r.pos : r.pos+n]
+	r.pos += n
+	return b
+}
+
+func (r *wvReader) readBool() bool {
+	switch r.take(1, "bool")[0] {
+	case 0:
+		return false
+	case 1:
+		return true
+	}
+	wvMalformed("bool byte out of range")
+	return false
+}
+
+func (r *wvReader) readI8() int8 {
+	return int8(r.take(1, "i8")[0])
+}
+
+func (r *wvReader) readU8() uint8 {
+	return r.take(1, "u8")[0]
+}
+
+func (r *wvReader) readI16() int16 {
+	return int16(binary.LittleEndian.Uint16(r.take(2, "i16")))
+}
+
+func (r *wvReader) readU16() uint16 {
+	return binary.LittleEndian.Uint16(r.take(2, "u16"))
+}
+
+func (r *wvReader) readI32() int32 {
+	return int32(binary.LittleEndian.Uint32(r.take(4, "i32")))
+}
+
+func (r *wvReader) readU32() uint32 {
+	return binary.LittleEndian.Uint32(r.take(4, "u32"))
+}
+
+func (r *wvReader) readI64() int64 {
+	return int64(binary.LittleEndian.Uint64(r.take(8, "i64")))
+}
+
+func (r *wvReader) readU64() uint64 {
+	return binary.LittleEndian.Uint64(r.take(8, "u64"))
+}
+
+func (r *wvReader) readF32() float32 {
+	return math.Float32frombits(r.readU32())
+}
+
+func (r *wvReader) readF64() float64 {
+	return math.Float64frombits(r.readU64())
+}
+
+// readLen reads a u32 element count. Elements may encode to zero bytes, so
+// the count isn't checked against the remaining buffer; callers cap their
+// preallocation with capHint instead.
+func (r *wvReader) readLen() int {
+	return int(r.readU32())
+}
+
+// capHint bounds a preallocation for n decoded elements by the bytes left in
+// the buffer, so a corrupt count can't force a huge allocation.
+func (r *wvReader) capHint(n int) int {
+	return min(n, len(r.buf)-r.pos)
+}
+
+func (r *wvReader) readString() string {
+	b := r.take(r.readLen(), "string bytes")
+	if !utf8.Valid(b) {
+		wvMalformed("string is not valid UTF-8")
+	}
+	return string(b)
+}
+
+func (r *wvReader) readBytes() []byte {
+	return append([]byte{}, r.take(r.readLen(), "byte buffer")...)
+}
+
+func (r *wvReader) readOptionFlag() bool {
+	switch r.take(1, "option flag")[0] {
+	case 0:
+		return false
+	case 1:
+		return true
+	}
+	wvMalformed("option flag byte out of range")
+	return false
+}
+
+func (r *wvReader) expectEnd() {
+	if r.pos != len(r.buf) {
+		wvMalformed("trailing bytes after value")
+	}
+}

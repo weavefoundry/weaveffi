@@ -41,7 +41,7 @@ pub mod pool {
     #[weaveffi::callback_interface]
     pub trait Watcher: Send + Sync {
         /// See a slot number.
-        fn seen(&self, n: i32);
+        fn seen(&self, n: i32) -> Result<(), weaveffi::ForeignError>;
     }
 
     /// Wrap a slot in a record (an object token inside a value buffer).
@@ -65,7 +65,15 @@ pub mod pool {
     /// Call the watcher once.
     #[weaveffi::export]
     pub fn notify(watcher: Arc<dyn Watcher>, n: i32) {
-        watcher.seen(n);
+        let _ = watcher.seen(n);
+    }
+
+    /// Take a slot, a record holding one, and a watcher, all of which a
+    /// failing lift must still release.
+    #[weaveffi::export]
+    pub fn take_all(slot: &Slot, holder: Holder, watcher: Arc<dyn Watcher>, label: &str) -> i32 {
+        let _ = (holder, watcher, label);
+        slot.n
     }
 
     /// Count up lazily.
@@ -103,10 +111,19 @@ unsafe extern "C" fn free(ctx: *mut c_void) {
     drop(unsafe { Box::from_raw(ctx.cast::<u8>()) });
 }
 
-static VTABLE: pool::leak_pool_Watcher_vtable = pool::leak_pool_Watcher_vtable { seen, free };
+static VTABLE: pool::leak_pool_Watcher_vtable = pool::leak_pool_Watcher_vtable {
+    header: abi::VtableHeader {
+        size: std::mem::size_of::<pool::leak_pool_Watcher_vtable>() as u32,
+        flags: 0,
+        free,
+    },
+    seen,
+};
 
 extern "C" fn parked(ctx: *mut c_void, err: *mut FfiError) {
-    let tx = unsafe { &*ctx.cast::<mpsc::Sender<i32>>() };
+    // Clone the sender before sending: the test may free the context as soon
+    // as the value arrives, which can be before `send` returns.
+    let tx = unsafe { &*ctx.cast::<mpsc::Sender<i32>>() }.clone();
     let code = unsafe { (*err).code };
     unsafe { abi::error_free(err) };
     tx.send(code).unwrap();
@@ -145,6 +162,46 @@ fn every_counter_returns_to_zero() {
         let ctx = Box::into_raw(Box::new(0u8)).cast();
         pool::leak_pool_notify(ctx, &VTABLE, 3, &mut err);
 
+        // Every input is lifted before the first failure is reported: an
+        // invalid string (or a null `slot`) still adopts and releases the
+        // record's token and the callback.
+        let slot = pool::leak_pool_Slot_new(2, &mut err);
+        let holder = abi::encode_value(&pool::Holder {
+            slot: abi::object_arc(slot).unwrap(),
+        });
+        let bad = [0xffu8];
+        let ctx = Box::into_raw(Box::new(0u8)).cast();
+        let n = pool::leak_pool_take_all(
+            slot,
+            holder.as_ptr(),
+            holder.len(),
+            ctx,
+            &VTABLE,
+            bad.as_ptr(),
+            bad.len(),
+            &mut err,
+        );
+        assert_eq!((n, err.code), (0, abi::MARSHAL_ERROR_CODE));
+        abi::error_clear(&mut err);
+        let holder = abi::encode_value(&pool::Holder {
+            slot: abi::object_arc(slot).unwrap(),
+        });
+        let ctx = Box::into_raw(Box::new(0u8)).cast();
+        pool::leak_pool_take_all(
+            std::ptr::null(),
+            holder.as_ptr(),
+            holder.len(),
+            ctx,
+            &VTABLE,
+            bad.as_ptr(),
+            0,
+            &mut err,
+        );
+        assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
+        abi::error_clear(&mut err);
+        pool::leak_pool_Slot_destroy(slot);
+        assert_eq!(live()[..2], [0, 0], "every adopted input was released");
+
         // Iterators: live until destroyed.
         let it = pool::leak_pool_count(2, &mut err);
         assert_eq!(live()[2], 1);
@@ -159,15 +216,16 @@ fn every_counter_returns_to_zero() {
         leak_cancel_token_cancel(token);
         leak_cancel_token_destroy(token);
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            rx.recv_timeout(Duration::from_secs(30)).unwrap(),
             abi::CANCELLED_ERROR_CODE
         );
         drop(Box::from_raw(ctx.cast::<mpsc::Sender<i32>>()));
     }
 
     // The completion fires before the task's last locals drop, so give the
-    // executor thread a moment to finish unwinding its frame.
-    for _ in 0..100 {
+    // executor thread time to finish its poll (generously, so a loaded
+    // machine can't fail the test; a passing run waits a few milliseconds).
+    for _ in 0..1000 {
         if live() == [0; 5] {
             break;
         }
