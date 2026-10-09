@@ -104,7 +104,9 @@ def load_failures() -> None:
         check(False, f"loading {path} succeeded")
         raise AssertionError  # unreachable
 
-    missing = "/nonexistent/libkvstore.dylib"
+    # Not `libkvstore.dylib`: dyld searches DYLD_LIBRARY_PATH by leaf name
+    # even for an absolute path, and would find the real library.
+    missing = "/nonexistent/libkvstore-missing.dylib"
     exc = load(missing)
     check(str(exc).startswith(f"cannot load the kvstore native library from {var}='{missing}'"),
           str(exc))

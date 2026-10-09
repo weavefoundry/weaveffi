@@ -46,7 +46,9 @@ kotlin_consumer() {
 }
 
 # A failed load is catchable: the calculator bindings pointed at a library
-# that doesn't exist (run after kotlin_consumer, whose jars it reuses).
+# that doesn't exist (run after kotlin_consumer, whose jars it reuses). The
+# leaf name differs from the real library's: dyld searches DYLD_LIBRARY_PATH
+# by leaf name even for an absolute path.
 kotlin_load_failure() {
     local b="$OUT/kotlin-calculator"
     local kc real coro kstdlib
@@ -59,7 +61,7 @@ kotlin_load_failure() {
     kotlinc "$ROOT/conformance/kotlin/common.kt" "$ROOT/conformance/kotlin/load_failure.kt" \
         -cp "$b/bindings.jar:$coro" -d "$b/load_failure.jar" 2>"$b/kotlinc.log" \
         || { cat "$b/kotlinc.log" >&2; echo "kotlinc failed on load_failure.kt" >&2; return 1; }
-    env "$(library_env calculator)=$b/does-not-exist/libcalculator.$EXT" \
+    env "$(library_env calculator)=$b/does-not-exist/libcalculator-missing.$EXT" \
         java -Djava.library.path="$b/shim" -cp "$b/load_failure.jar:$b/bindings.jar:$coro:$kstdlib" LoadFailure
 }
 

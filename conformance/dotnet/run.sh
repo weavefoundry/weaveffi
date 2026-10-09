@@ -45,7 +45,7 @@ EOF
 dotnet_calculator() {
     dotnet_consumer calculator Calculator.cs || return 1
     ( cd "$OUT/dotnet-calculator" \
-        && env EXPECT_LOAD_FAILURE=1 "$(library_env calculator)=$OUT/missing/libcalculator.$EXT" \
+        && env EXPECT_LOAD_FAILURE=1 "$(library_env calculator)=$OUT/missing/libcalculator-missing.$EXT" \
            dotnet run -c Release --no-build --nologo -v quiet 2>&1 )
 }
 dotnet_codec() { dotnet_consumer codec Codec.cs; }

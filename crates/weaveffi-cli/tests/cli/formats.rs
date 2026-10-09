@@ -64,7 +64,9 @@ fn toml_idl_is_rejected() {
     assert!(!output.status.success());
     let stderr = crate::stderr(&output);
     assert!(
-        stderr.contains("calculator.toml (.toml)") && stderr.contains("yml|yaml|json"),
+        // miette may wrap anywhere in the message, so compare without spaces.
+        stderr.replace(' ', "").contains("calculator.toml(.toml)")
+            && stderr.replace(' ', "").contains("yml|yaml|json"),
         "{stderr}"
     );
 }

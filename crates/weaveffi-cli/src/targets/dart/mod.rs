@@ -117,16 +117,21 @@ impl From<DartConfig> for DartGenerator {
 /// A top-level module named `runtime` is `src/runtime_.dart`, so its
 /// submodules can't land among the runtime sections.
 fn module_part(module: &ModuleBinding) -> Utf8PathBuf {
-    let mut path = Utf8PathBuf::from("src");
-    for (i, segment) in module.segments.iter().enumerate() {
-        if i == 0 && segment == "runtime" {
-            path.push("runtime_");
-        } else {
-            path.push(segment);
-        }
-    }
-    path.set_extension("dart");
-    path
+    // Dart `part` URIs always use `/`, so the path is built as a string
+    // rather than with platform-dependent joins.
+    let segments: Vec<&str> = module
+        .segments
+        .iter()
+        .enumerate()
+        .map(|(i, segment)| {
+            if i == 0 && segment == "runtime" {
+                "runtime_"
+            } else {
+                segment.as_str()
+            }
+        })
+        .collect();
+    Utf8PathBuf::from(format!("src/{}.dart", segments.join("/")))
 }
 
 /// Wrap a part's body: the prelude, the analyzer ignores, the `part of`
@@ -215,7 +220,7 @@ fn declares_anything(m: &ModuleBinding) -> bool {
 fn render_library(model: &Model, package: &str, bundle: &Bundle) -> Vec<(Utf8PathBuf, String)> {
     let mut parts: Vec<(Utf8PathBuf, String)> = Vec::new();
     for (file, body) in runtime_parts(model, package, bundle) {
-        parts.push((Utf8PathBuf::from("src/runtime").join(file), body));
+        parts.push((Utf8PathBuf::from(format!("src/runtime/{file}")), body));
     }
     let mut codecs = CodeWriter::two_space();
     render_codecs(&mut codecs, model);
@@ -246,7 +251,7 @@ fn render_library(model: &Model, package: &str, bundle: &Bundle) -> Vec<(Utf8Pat
         .iter()
         .map(|(rel, body)| {
             (
-                Utf8PathBuf::from("lib").join(rel),
+                Utf8PathBuf::from(format!("lib/{rel}")),
                 part_file(package, rel, body),
             )
         })
