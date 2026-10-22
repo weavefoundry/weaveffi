@@ -102,8 +102,9 @@ exactly one strong reference, in either direction.
 A zero token is invalid in a non-optional position; `Interface?` inside a
 buffer uses the optional flag byte followed by the token.
 
-A callback method's error payload can't carry object tokens: an error code
-whose fields include an interface can't be reported from a callback, and a
+An error payload never carries object tokens: validation rejects an error
+code whose fields reach an interface (`ObjectInErrorPayload`), because a
+consumer that doesn't know a code discards its payload undecoded, and a
 Rust producer decodes a callback's payload with a reader that refuses every
 token. That reader (`BufferReader::token_free`) is also why decoding is
 otherwise `unsafe` in the Rust runtime: only a reader that refuses tokens can

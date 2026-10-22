@@ -28,8 +28,9 @@
 //! Error domains and callback interfaces are **open**: each code and each
 //! callback method is its own entry, so adding a code or a method never
 //! breaks a deployed binding (a consumer maps a positive code it doesn't
-//! know to the domain's base error type, and a vtable may grow; its `size`
-//! header is still checked).
+//! know to the domain's base error type, and a vtable may grow at its end;
+//! its `size` header is still checked). Inserting a method anywhere else, or
+//! reordering methods, moves slots and breaks the binding.
 //!
 //! The canonical strings are:
 //!
@@ -40,7 +41,7 @@
 //! | record | `{module}.{Record}` | `record {name} {{type}, ...}` (field types only, in order) |
 //! | enum | `{module}.{Enum}` | `enum {name} {{Variant} = {value}, ...}`, a variant with fields followed by ` {{type}, ...}` |
 //! | callback interface | `{module}.{Callback}` | `callback {name}` |
-//! | callback method | `{module}.{Callback}.{method}` | `callback_method {name}({type}, ...) -> {type or void}`, then ` throws {Domain}` or ` throws any` when set |
+//! | callback method | `{module}.{Callback}.{method}` | `callback_method #{slot} {name}({type}, ...) -> {type or void}` (`slot` is the method's zero-based vtable position), then ` throws {Domain}` or ` throws any` when set |
 //! | error domain | `{module}.{Domain}` | `errors {name}` |
 //! | error code | `{module}.{Domain}.{Code}` | `code {Code} = {value}`, a code with fields followed by ` {{type}, ...}` |
 
@@ -147,10 +148,13 @@ fn module_entries(m: &ModuleBinding, out: &mut Vec<ContractEntry>) {
     for c in &m.callback_interfaces {
         let owner = format!("{dot}.{}", c.name);
         out.push(entry(owner.clone(), format!("callback {}", c.name)));
-        for cm in &c.methods {
+        for (slot, cm) in c.methods.iter().enumerate() {
             let types: Vec<String> = cm.params.iter().map(|p| p.ty.to_string()).collect();
+            // The slot is the method's position in the vtable: reordering
+            // methods, or inserting one before others, must fail the check,
+            // while appending one leaves every existing slot unchanged.
             let mut sig = format!(
-                "callback_method {}({}) -> {}",
+                "callback_method #{slot} {}({}) -> {}",
                 cm.name,
                 types.join(", "),
                 cm.ret
@@ -333,9 +337,12 @@ modules:
             ("kv.Listener", "callback Listener"),
             (
                 "kv.Listener.on_put",
-                "callback_method on_put(Entry) -> string throws KvError",
+                "callback_method #0 on_put(Entry) -> string throws KvError",
             ),
-            ("kv.Listener.on_clear", "callback_method on_clear() -> void"),
+            (
+                "kv.Listener.on_clear",
+                "callback_method #1 on_clear() -> void",
+            ),
             ("kv.KvError", "errors KvError"),
             ("kv.KvError.NotFound", "code NotFound = 1 {string}"),
             ("kv.KvError.Full", "code Full = 2"),
@@ -388,6 +395,33 @@ modules:
             assert!(grown_table.contains(&e), "{} changed", e.path);
         }
         assert_eq!(grown_table.len(), table(&a).len() + 2);
+    }
+
+    #[test]
+    fn moving_a_callback_method_changes_its_slot() {
+        // A vtable is laid out in declaration order, so swapping two
+        // methods (even with identical signatures) or inserting one before
+        // another must fail the check for every method whose slot moved.
+        let a = model(KV);
+        let swapped = model(&KV.replace(
+            "- { name: on_put, params: [{ name: entry, type: Entry }], return: string, throws: KvError }\n          - { name: on_clear, params: [] }",
+            "- { name: on_clear, params: [] }\n          - { name: on_put, params: [{ name: entry, type: Entry }], return: string, throws: KvError }",
+        ));
+        for path in ["kv.Listener.on_put", "kv.Listener.on_clear"] {
+            assert_ne!(signature(&a, path), signature(&swapped, path), "{path}");
+        }
+        let inserted = model(&KV.replace(
+            "- { name: on_clear, params: [] }",
+            "- { name: on_open, params: [] }\n          - { name: on_clear, params: [] }",
+        ));
+        assert_eq!(
+            signature(&a, "kv.Listener.on_put"),
+            signature(&inserted, "kv.Listener.on_put")
+        );
+        assert_ne!(
+            signature(&a, "kv.Listener.on_clear"),
+            signature(&inserted, "kv.Listener.on_clear")
+        );
     }
 
     #[test]

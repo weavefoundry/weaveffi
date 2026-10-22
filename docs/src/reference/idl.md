@@ -274,10 +274,10 @@ constructor where the target has one (Swift `init`, Python `__init__`);
 others become static factories. For an async factory, declare an `async`
 static that returns the interface.
 
-An interface may appear in every position except a map key: parameters,
-returns, optionals, lists, map values, record and variant fields, error
-payloads, iterator elements, async results, and callback parameters and
-returns. A map keyed by an interface reports both `InvalidMapKey` and
+An interface may appear in every position except a map key and an error
+payload: parameters, returns, optionals, lists, map values, record and
+variant fields, iterator elements, async results, and callback parameters
+and returns. A map keyed by an interface reports both `InvalidMapKey` and
 `InterfaceInInvalidPosition`. `Store?`
 at the top level of a parameter or return is a nullable pointer. Every
 position transfers or borrows references by the rules in
@@ -386,8 +386,9 @@ consumer may fail with one of the domain's codes, with the code's fields
 with `throws: any` a consumer failure reaches the producer as an untyped
 error with its message. Every failure of a method without `throws`, and a
 code its domain doesn't declare, reaches the producer as the runtime code
-`-4`. Each callback method is its own contract entry, so adding a method to
-a callback interface doesn't break a deployed binding.
+`-4`. Each callback method is its own contract entry, so appending a method
+to a callback interface doesn't break a deployed binding; reordering methods
+or inserting one before others moves vtable slots and does.
 
 A callback interface is valid only as a top-level parameter of a function,
 constructor, method, or static, passed bare (`Listener`) or optional
@@ -483,7 +484,10 @@ module may declare any number of domains in its `errors:` list.
 Each code has a required `name` (PascalCase by convention), positive `code`,
 and default `message`, plus an optional `doc` and optional `fields`: a
 structured payload with the same shape as struct fields, delivered as
-properties of the raised error.
+properties of the raised error. Payload fields are plain data: a field may
+not reach an interface, directly or through a record or rich enum
+(`ObjectInErrorPayload`), because a consumer generated before a code existed
+discards its payload without decoding it.
 
 ```yaml
 version: "0.12.0"
@@ -729,6 +733,7 @@ A document with an unsupported `version` reports only
 | `ConstructorHasReturn` | a constructor declares `return` |
 | `AsyncConstructor` | a constructor is `async` |
 | `InterfaceInInvalidPosition` | an interface is used as a map key |
+| `ObjectInErrorPayload` | an error code's field reaches an interface, directly or through a record or rich enum |
 | `EmptyCallbackInterface` | a callback interface has no methods |
 | `DuplicateCallbackMethod` | two methods of a callback interface share a name |
 | `InvalidCallbackMethod` | a callback method is async or cancellable, or returns an iterator |

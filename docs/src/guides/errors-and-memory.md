@@ -408,7 +408,7 @@ the method's strategy:
 
 - A method that throws a domain (`throws: KvError`) may report a positive
   code of that domain, attaching the code's fields encoded as a value buffer
-  with `{prefix}_error_set_payload` (they may not include objects). Any
+  with `{prefix}_error_set_payload`. Any
   other failure it reports as `-1` with a message.
 - A method that throws `any` reports `-1` with a message.
 - A method that declares no errors reports `-4` with a message. (In Swift

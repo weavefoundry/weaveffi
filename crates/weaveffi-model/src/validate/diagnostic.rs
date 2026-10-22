@@ -200,7 +200,8 @@ impl ValidationError {
             | Self::UnsupportedPrimitive { name }
             | Self::ErrorDomainAsType { name }
             | Self::InterfaceInInvalidPosition { name, .. }
-            | Self::CallbackInterfaceInInvalidPosition { name, .. } => Text(name),
+            | Self::CallbackInterfaceInInvalidPosition { name, .. }
+            | Self::ObjectInErrorPayload { name, .. } => Text(name),
             Self::InvalidMapKey { key_type } => Text(key_type),
             Self::IteratorInInvalidPosition { .. } => Text("iter"),
             Self::NoModuleName

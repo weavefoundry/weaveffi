@@ -132,7 +132,7 @@ modules:
         );
         assert_eq!(
             row("kv.Listener.on_put").signature,
-            "callback_method on_put(string) -> void"
+            "callback_method #0 on_put(string) -> void"
         );
         assert_eq!(
             row("kv.get").signature,

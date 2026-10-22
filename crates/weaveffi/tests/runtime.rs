@@ -1049,7 +1049,7 @@ fn contract_tables_follow_cfg() {
         .unwrap();
     assert_eq!(
         method.hash,
-        fnv("callback_method lookup(string) -> i64 throws LookupError")
+        fnv("callback_method #5 lookup(string) -> i64 throws LookupError")
     );
 }
 

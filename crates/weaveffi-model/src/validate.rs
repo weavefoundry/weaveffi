@@ -595,8 +595,8 @@ pub enum ValidationError {
     #[cfg_attr(
         feature = "idl",
         diagnostic(help(
-            "interface objects may appear anywhere except as map keys; key a map by a scalar, \
-         string, or C-style enum instead"
+            "interface objects may appear anywhere except as map keys (and in error payloads); key \
+         a map by a scalar, string, or C-style enum instead"
         ))
     )]
     InterfaceInInvalidPosition {
@@ -619,6 +619,23 @@ pub enum ValidationError {
     )]
     CallbackInterfaceInInvalidPosition {
         /// The referenced callback interface name.
+        name: String,
+        /// Position where the reference appeared.
+        location: String,
+    },
+    /// An error code's payload field carries an interface object, directly or
+    /// through a record or rich enum.
+    #[error("error payloads can't carry objects, but {location} reaches '{name}'")]
+    #[cfg_attr(
+        feature = "idl",
+        diagnostic(help(
+            "error payloads are plain data: error domains are open, so a consumer generated \
+         before a code existed discards its payload without decoding it, and an object inside \
+         would never be released; carry an identifier or a record of plain data instead"
+        ))
+    )]
+    ObjectInErrorPayload {
+        /// The interface, or the record or rich enum that carries one.
         name: String,
         /// Position where the reference appeared.
         location: String,

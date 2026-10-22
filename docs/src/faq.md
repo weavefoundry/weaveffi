@@ -75,7 +75,8 @@ catchable one, in every language) naming the declaration that's missing or
 changed. The hashes cover declaration names, types, and flags, but not
 parameter or field names, documentation, or declaration order, so editing doc
 comments or renaming a parameter never breaks a deployed binding, and neither
-does adding a function, method, type, error code, or callback method.
+does adding a function, method, type, or error code, or appending a callback
+method to its interface.
 In CI, `weaveffi generate --check` catches stale committed bindings before they
 ship.
 

@@ -634,6 +634,31 @@ modules:
 "#,
         ),
         (
+            "ObjectInErrorPayload",
+            r#"
+modules:
+  - name: m
+    interfaces: [{ name: I, methods: [{ name: a, params: [] }] }]
+    errors:
+      - name: E
+        codes: [{ name: C, code: 1, message: c, fields: [{ name: o, type: "[I?]" }] }]
+"#,
+        ),
+        (
+            "ObjectInErrorPayload",
+            r#"
+modules:
+  - name: m
+    interfaces: [{ name: I, methods: [{ name: a, params: [] }] }]
+    structs:
+      - { name: Outer, fields: [{ name: inner, type: Inner }] }
+      - { name: Inner, fields: [{ name: o, type: I }] }
+    errors:
+      - name: E
+        codes: [{ name: C, code: 1, message: c, fields: [{ name: r, type: Outer }] }]
+"#,
+        ),
+        (
             "UnknownTypeRef",
             "modules: [{ name: m, functions: [{ name: f, params: [], return: Nope }] }]",
         ),

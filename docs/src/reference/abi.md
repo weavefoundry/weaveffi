@@ -89,13 +89,21 @@ alone.
 | record | `record {name} {{type}, ...}`: field types only, in order |
 | enum | `enum {name} {{Variant} = {value}, ...}`, a variant with fields followed by ` {{type}, ...}` |
 | callback interface | `callback {name}` (each method has its own entry) |
-| callback method | `callback_method {name}({type}, ...) -> {type}`, a missing return being `void`, followed by ` throws {Domain}` or ` throws any` when set |
+| callback method | `callback_method #{slot} {name}({type}, ...) -> {type}`, where `slot` is the method's zero-based position in the vtable and a missing return is `void`, followed by ` throws {Domain}` or ` throws any` when set |
 | error domain | `errors {name}` (each code has its own entry) |
 | error code | `code {Code} = {value}`, a code with fields followed by ` {{type}, ...}` |
 
 Variant and code names stay in their signatures because they're values a
 consumer sees; parameter and field names don't affect the encoding, so
-renaming one is ABI-neutral.
+renaming one is ABI-neutral. The flip side is that swapping two parameters or
+fields of the same type passes the check too, and the values then reach the
+swapped names; treat that as a breaking change even though the check can't
+see it.
+
+A callback method's slot is part of its signature because the vtable is laid
+out in declaration order: reordering methods, or inserting one before
+another, moves slots and fails the check for every method that moved, while
+appending a method leaves every existing slot, and hash, unchanged.
 
 For example, the `kvstore` sample's `fn get(&self, key: String) ->
 Result<Entry, KvError>` on interface `Store` in module `kv` has the id
@@ -118,7 +126,8 @@ static inline uint64_t {p}_{m}_contract_check(void);  /* first failing id, or 0 
 A consumer passes when **every entry it was generated with** is present in
 the producer's table with an equal hash. Entries the producer has and the
 consumer doesn't are fine, so adding a declaration (a function, a method, a
-record, a callback method, an error code) never breaks a deployed binding.
+record, an error code, or a callback method at the end of its interface)
+never breaks a deployed binding.
 A missing entry fails with "`kv.Store.get` is missing from the library"; a
 different hash fails with "`kv.Store.get` changed since these bindings were
 generated". `{M}` is the module name uppercased. The macro and the CLI
@@ -231,7 +240,10 @@ What a callable may report depends on its `throws`:
   **Domains are open**: a consumer that receives a positive code it wasn't
   generated with (the producer gained a code since) maps it to the domain's
   base error type with the code and message preserved, never to a crash or
-  a generic failure.
+  a generic failure. It discards that code's payload without decoding it,
+  which is why an error code's fields never carry an object (validation
+  reports `ObjectInErrorPayload`): an undecoded object token would never be
+  released.
 - **`throws: any`.** Code `-1` with a message, plus runtime codes; never a
   positive code.
 
@@ -436,8 +448,8 @@ borrowed message with the producer's allocator; it never writes the
 message itself. What it reports follows the method's `throws`:
 
 - `throws: {Domain}`: a positive code of that domain, attaching the code's
-  fields encoded as a value buffer with `{p}_error_set_payload` (they may
-  not include objects), which reaches the producer as that typed error; or
+  fields encoded as a value buffer with `{p}_error_set_payload`, which
+  reaches the producer as that typed error; or
   `-1` with a message for any other failure.
 - `throws: any`: `-1` with a message.
 - No `throws`: `-4` with a message (any non-zero code is accepted).

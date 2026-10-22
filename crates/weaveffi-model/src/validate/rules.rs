@@ -48,7 +48,12 @@ fn within(scope: &[String], names: &[&str]) -> Vec<String> {
 
 /// Run every rule over `api`, whose declarations `types` indexes.
 pub(super) fn check(api: &Api, types: &TypeIndex, found: &mut Vec<Found>) {
-    let mut cx = Cx { types, found };
+    let carriers = object_carriers(&api.modules, types);
+    let mut cx = Cx {
+        types,
+        carriers: &carriers,
+        found,
+    };
     let mut names = BTreeSet::new();
     for m in &api.modules {
         if !names.insert(m.name.as_str()) {
@@ -168,6 +173,9 @@ fn check_global_names(modules: &[Module], found: &mut Vec<Found>) {
 /// The rule context: the type index and the violation sink.
 struct Cx<'a> {
     types: &'a TypeIndex,
+    /// Records and rich enums that carry an interface object somewhere in
+    /// their fields (see [`object_carriers`]).
+    carriers: &'a BTreeSet<String>,
     found: &'a mut Vec<Found>,
 }
 
@@ -655,6 +663,35 @@ impl Cx<'_> {
         }
     }
 
+    /// Reject an error-code field that carries an interface object, directly
+    /// or through a record or rich enum. Error domains are open: a consumer
+    /// generated before the code existed discards its payload undecoded, so
+    /// an object token inside it would never be released.
+    fn no_object_in_payload(
+        &mut self,
+        scope: &[String],
+        f: &StructField,
+        location: &dyn Fn() -> String,
+    ) {
+        let mut names = Vec::new();
+        f.ty.walk(&mut |t| {
+            if let TypeRef::Named(name) = t {
+                names.push(name.clone());
+            }
+        });
+        for name in names {
+            if self.kind(&name) == Some(TypeKind::Interface) || self.carriers.contains(&name) {
+                self.push(
+                    &within(scope, &[&f.name]),
+                    ValidationError::ObjectInErrorPayload {
+                        name,
+                        location: location(),
+                    },
+                );
+            }
+        }
+    }
+
     /// Reject any callback-interface reference reachable from `ty`. Callers
     /// that permit a bare top-level callback interface unwrap it first.
     fn no_callback_interface(
@@ -791,7 +828,52 @@ impl Cx<'_> {
                     )
                 };
                 self.buffered_field(&code, f, &location);
+                self.no_object_in_payload(&code, f, &location);
             }
+        }
+    }
+}
+
+/// Every record and rich enum whose fields reach an interface object, directly
+/// or through other records and rich enums (a fixed point over the whole API,
+/// since types may reference each other in any order).
+fn object_carriers(modules: &[Module], types: &TypeIndex) -> BTreeSet<String> {
+    fn collect<'a>(modules: &'a [Module], out: &mut Vec<(&'a str, Vec<&'a TypeRef>)>) {
+        for m in modules {
+            for s in &m.structs {
+                out.push((&s.name, s.fields.iter().map(|f| &f.ty).collect()));
+            }
+            for e in &m.enums {
+                let fields = e.variants.iter().flat_map(|v| &v.fields);
+                out.push((&e.name, fields.map(|f| &f.ty).collect()));
+            }
+            collect(&m.modules, out);
+        }
+    }
+    let mut decls = Vec::new();
+    collect(modules, &mut decls);
+    let mut carriers = BTreeSet::new();
+    loop {
+        let before = carriers.len();
+        for (name, fields) in &decls {
+            if carriers.contains(*name) {
+                continue;
+            }
+            let mut carries = false;
+            for ty in fields {
+                ty.walk(&mut |t| {
+                    if let TypeRef::Named(n) = t {
+                        carries |=
+                            types.kind(n) == Some(TypeKind::Interface) || carriers.contains(n);
+                    }
+                });
+            }
+            if carries {
+                carriers.insert((*name).to_string());
+            }
+        }
+        if carriers.len() == before {
+            return carriers;
         }
     }
 }

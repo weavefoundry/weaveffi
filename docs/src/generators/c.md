@@ -77,8 +77,8 @@ declaration's dotted path and canonical signature), their count as
 `0` when every expected entry is in the library's table with an equal hash,
 and otherwise the id of the first one that's missing or changed, which you
 can look up in the macro to name the declaration. A library with extra
-entries passes, so adding a declaration, a callback method, or an error
-code doesn't break existing consumers.
+entries passes, so adding a declaration or an error code, or appending a
+callback method, doesn't break existing consumers.
 See [load-time checks](../reference/abi.md#load-time-checks).
 
 ## Type mapping

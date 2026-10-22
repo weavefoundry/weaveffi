@@ -626,16 +626,16 @@ fn contract_tables_carry_per_method_and_per_code_entries() {
     assert_eq!(
         hash("fam.Probe.reading"),
         Some(fnv(
-            "callback_method reading(f64?) -> f64? throws ProbeError"
+            "callback_method #0 reading(f64?) -> f64? throws ProbeError"
         ))
     );
     assert_eq!(
         hash("fam.Probe.samples"),
-        Some(fnv("callback_method samples([f32]) -> [f32] throws any"))
+        Some(fnv("callback_method #1 samples([f32]) -> [f32] throws any"))
     );
     assert_eq!(
         hash("fam.Probe.ping"),
-        Some(fnv("callback_method ping(u64) -> void throws any"))
+        Some(fnv("callback_method #3 ping(u64) -> void throws any"))
     );
     assert_eq!(hash("fam.ProbeError"), Some(fnv("errors ProbeError")));
     assert_eq!(
