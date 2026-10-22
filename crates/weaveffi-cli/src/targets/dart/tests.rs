@@ -53,7 +53,7 @@ modules:
 "#;
 
 fn model_of(yaml: &str, name: &str) -> Model {
-    let api: Api = serde_yaml_ng::from_str(yaml).unwrap();
+    let api: Api = serde_saphyr::from_str(yaml).unwrap();
     validate(&api, &Identity::named(name), None).unwrap()
 }
 

@@ -17,13 +17,13 @@ fn registry() -> BTreeSet<String> {
 
 /// The values of the `target` and `lang` matrix keys of one job, from a
 /// plain list or from `include` entries.
-fn matrix_values(matrix: &serde_yaml_ng::Value) -> BTreeSet<String> {
+fn matrix_values(matrix: &serde_json::Value) -> BTreeSet<String> {
     let mut values = BTreeSet::new();
     for key in ["target", "lang"] {
-        if let Some(list) = matrix.get(key).and_then(|v| v.as_sequence()) {
+        if let Some(list) = matrix.get(key).and_then(|v| v.as_array()) {
             values.extend(list.iter().filter_map(|v| v.as_str()).map(str::to_string));
         }
-        if let Some(include) = matrix.get("include").and_then(|v| v.as_sequence()) {
+        if let Some(include) = matrix.get("include").and_then(|v| v.as_array()) {
             values.extend(
                 include
                     .iter()
@@ -48,8 +48,8 @@ fn workflow_matrices_list_every_target() {
             continue;
         }
         let text = std::fs::read_to_string(&path).unwrap();
-        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).unwrap();
-        let Some(jobs) = doc.get("jobs").and_then(|j| j.as_mapping()) else {
+        let doc: serde_json::Value = serde_saphyr::from_str(&text).unwrap();
+        let Some(jobs) = doc.get("jobs").and_then(|j| j.as_object()) else {
             continue;
         };
         for (name, job) in jobs {
@@ -62,7 +62,7 @@ fn workflow_matrices_list_every_target() {
                     values,
                     registry,
                     "the {:?} matrix in {} must list exactly the registered targets",
-                    name.as_str().unwrap_or_default(),
+                    name,
                     path.display()
                 );
                 checked += 1;

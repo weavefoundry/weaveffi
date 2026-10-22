@@ -47,7 +47,7 @@ modules:
 "#;
 
 fn fixture() -> Model {
-    let api: Api = serde_yaml_ng::from_str(FIXTURE).expect("fixture parses");
+    let api: Api = serde_saphyr::from_str(FIXTURE).expect("fixture parses");
     validate(&api, &Identity::named("bus-lib"), None).expect("fixture validates")
 }
 

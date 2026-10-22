@@ -39,7 +39,7 @@ pub fn cmd_extract(
     definition.validate().map_err(Report::new)?;
     let api = &definition.api;
     let serialized = match format {
-        IdlFormat::Yaml => serde_yaml_ng::to_string(api)
+        IdlFormat::Yaml => serde_saphyr::to_string(api)
             .into_diagnostic()
             .wrap_err("failed to serialize API as YAML")?,
         IdlFormat::Json => {

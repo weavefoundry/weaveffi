@@ -1,4 +1,4 @@
-version: 0.12.0
+version: "0.12.0"
 modules:
 - name: receipt
   doc: Receipts, in a sibling tree that uses the shop's record.
@@ -55,7 +55,7 @@ modules:
       params:
       - name: item
         type: Item
-      doc: '`item` was added.'
+      doc: "`item` was added."
       throws: any
   structs:
   - name: Item

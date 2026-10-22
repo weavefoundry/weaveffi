@@ -988,7 +988,7 @@ modules:
         functions:
           - { name: ping, params: [], return: string, throws: any }
 "#;
-        let api: Api = serde_yaml_ng::from_str(yaml).unwrap();
+        let api: Api = serde_saphyr::from_str(yaml).unwrap();
         assert_eq!(api.version, CURRENT_SCHEMA_VERSION);
         let m = &api.modules[0];
         assert_eq!(m.doc.as_deref(), Some("Address book"));
@@ -1020,8 +1020,8 @@ modules:
         assert!(json.contains(r#""throws":"any""#), "{json}");
         let back: Api = serde_json::from_str(&json).unwrap();
         assert_eq!(back, api);
-        let yaml2 = serde_yaml_ng::to_string(&api).unwrap();
-        let back2: Api = serde_yaml_ng::from_str(&yaml2).unwrap();
+        let yaml2 = serde_saphyr::to_string(&api).unwrap();
+        let back2: Api = serde_saphyr::from_str(&yaml2).unwrap();
         assert_eq!(back2, api);
     }
 
@@ -1033,7 +1033,7 @@ modules:
   - name: m
     functions: [{ name: f, throws: true }]
 "#;
-        let err = serde_yaml_ng::from_str::<Api>(yaml).unwrap_err();
+        let err = serde_saphyr::from_str::<Api>(yaml).unwrap_err();
         assert!(err.to_string().contains("throws: KvError"), "{err}");
     }
 
@@ -1047,7 +1047,7 @@ modules:
     functions:
       - { name: f, params: [{ name: x, type: "{string:Elsewhere?}" }], return: Local }
 "#;
-        let api: Api = serde_yaml_ng::from_str(yaml).unwrap();
+        let api: Api = serde_saphyr::from_str(yaml).unwrap();
         let names: Vec<String> = api.undeclared_type_names().into_iter().collect();
         assert_eq!(names, ["Elsewhere", "Remote"]);
     }
@@ -1077,7 +1077,7 @@ modules:
                 modules: vec![],
             }],
         };
-        let yaml = serde_yaml_ng::to_string(&api).unwrap();
+        let yaml = serde_saphyr::to_string(&api).unwrap();
         for noise in [
             "null", "[]", "false", "async", "throws", "doc", "params", "errors",
         ] {

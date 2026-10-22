@@ -92,7 +92,7 @@ fn extract_formats_and_a_library_alone() {
             .output()
             .unwrap(),
     );
-    let api: weaveffi_model::ir::Api = serde_yaml_ng::from_str(&yaml).unwrap();
+    let api: weaveffi_model::ir::Api = serde_saphyr::from_str(&yaml).unwrap();
     let json = stdout_of(
         &weaveffi()
             .args(["-q", "extract", "-f", "json"])

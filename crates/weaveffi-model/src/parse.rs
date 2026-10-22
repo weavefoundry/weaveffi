@@ -99,10 +99,15 @@ pub fn line_col_to_offset(src: &str, line: usize, col: usize) -> usize {
 /// doesn't match the schema.
 pub fn parse_api_str(s: &str, format: &str) -> Result<Api, ParseError> {
     match format {
-        "yaml" | "yml" => serde_yaml_ng::from_str(s).map_err(|e| {
+        "yaml" | "yml" => serde_saphyr::from_str(s).map_err(|e| {
             let (line, column) = e
                 .location()
-                .map(|m| (m.line(), m.column()))
+                .map(|m| {
+                    (
+                        usize::try_from(m.line()).unwrap_or(0),
+                        usize::try_from(m.column()).unwrap_or(0),
+                    )
+                })
                 .unwrap_or((0, 0));
             let span = if line > 0 && column > 0 {
                 Some(SourceSpan::new(

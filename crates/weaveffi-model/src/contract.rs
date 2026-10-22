@@ -230,7 +230,7 @@ mod tests {
     use crate::pkg::Identity;
 
     fn model(yaml: &str) -> Model {
-        let api: Api = serde_yaml_ng::from_str(yaml).unwrap();
+        let api: Api = serde_saphyr::from_str(yaml).unwrap();
         crate::validate::validate(&api, &Identity::named("kv"), None).unwrap()
     }
 

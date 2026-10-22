@@ -57,7 +57,7 @@ modules:
 "#;
 
 fn model() -> Model {
-    let api: Api = serde_yaml_ng::from_str(FIXTURE).unwrap();
+    let api: Api = serde_saphyr::from_str(FIXTURE).unwrap();
     validate(&api, &Identity::named("shop_kit"), None).unwrap()
 }
 

@@ -2,7 +2,9 @@
 
 An IDL document describes an API: its modules, types, and functions. YAML
 and JSON are accepted (TOML is only for [`weaveffi.toml`](../guides/config.md),
-never for an IDL); this page uses YAML. It documents schema version
+never for an IDL); this page uses YAML, read as YAML 1.2, so a name YAML
+reads as null (`null`, `~`) has to be quoted (`name: "null"`). It
+documents schema version
 `0.12.0`, the only version the current tools accept. A Rust producer
 never writes one by hand (the macro embeds the API in the built library, and
 [`weaveffi extract`](../guides/extract.md) prints it as an IDL), but the

@@ -94,7 +94,7 @@ modules:
           - { name: lambda, type: i32 }
           - { name: yield, type: i32 }
           - { name: nil, type: i32 }
-          - { name: null, type: i32 }
+          - { name: "null", type: i32 }
           - { name: begin, type: i32 }
           - { name: rescue, type: i32 }
           - { name: module, type: i32 }
