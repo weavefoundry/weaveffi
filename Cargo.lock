@@ -1886,7 +1886,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "proptest",
  "tokio",
@@ -1896,7 +1896,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-cli"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "assert_cmd",
  "camino",
@@ -1926,7 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-fuzz"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "libfuzzer-sys",
  "weaveffi",
@@ -1935,7 +1935,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-macros"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1947,7 +1947,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-model"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "heck",
  "miette",
