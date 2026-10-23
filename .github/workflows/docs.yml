@@ -1,26 +1,82 @@
 name: docs
 
+# Publishes the book (and the Rust API docs) to the `gh-pages` branch, which
+# GitHub Pages serves at weaveffi.com:
+#
+#   * a push to `main` deploys under `/dev/`;
+#   * a release (`v{major}.{minor}.{patch}`) deploys under
+#     `/v{major}.{minor}/` and as the site root.
+#
+# Every deploy keeps the files already on the branch, so each release's
+# book stays published at its own path. Each build sets the book's title to
+# the version it documents, so every page says which one it is.
 on:
   push:
     branches: [main]
+    tags: ['v*']
+  # release-plz creates the release; a tag pushed with a token that can't
+  # trigger workflows still produces this event.
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish again (for example v0.26.0); empty publishes main
+        required: false
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write
 
+# Deploys push to one branch, so they run one at a time, oldest first.
 concurrency:
-  group: pages
-  cancel-in-progress: true
+  group: docs-deploy
+  cancel-in-progress: false
 
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Resolve the version
+        id: version
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          elif [ -n "$RELEASE_TAG" ]; then
+            tag="$RELEASE_TAG"
+          elif [ "$REF_TYPE" = tag ]; then
+            tag="$REF_NAME"
+          else
+            tag=""
+          fi
+          if [ -z "$tag" ]; then
+            {
+              echo "ref=${{ github.sha }}"
+              echo "dir=dev"
+              echo "title=WeaveFFI (dev)"
+              echo "release=false"
+            } >> "$GITHUB_OUTPUT"
+          elif [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+            minor="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+            {
+              echo "ref=refs/tags/$tag"
+              echo "dir=$minor"
+              echo "title=WeaveFFI $minor"
+              echo "release=true"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::$tag isn't a release tag (v{major}.{minor}.{patch})"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
-      - uses: actions/configure-pages@v5
+        with:
+          ref: ${{ steps.version.outputs.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -34,34 +90,54 @@ jobs:
         with:
           tool: mdbook,mdbook-linkcheck2
 
-      - name: Build mdBook
-        run: mdbook build docs
-
       - name: Build Rust API docs
-        run: cargo doc --workspace --all-features --no-deps
+        # The examples are the book's, not part of the API.
+        run: >-
+          cargo doc --workspace --all-features --no-deps
+          --exclude mathlib --exclude macro-tour --exclude idl-examples
 
-      - name: Assemble site
+      # `assemble <site-url> <dir>` builds the book for one location (the
+      # site URL only affects the 404 page's links) and adds the API docs
+      # and the IDL schema next to it.
+      - name: Build the site
+        env:
+          MDBOOK_BOOK__TITLE: ${{ steps.version.outputs.title }}
+          DIR: ${{ steps.version.outputs.dir }}
+          RELEASE: ${{ steps.version.outputs.release }}
         run: |
-          mkdir -p site
-          cp -r docs/book/html/* site/
-          mkdir -p site/api/rust
-          cp -r target/doc/* site/api/rust/
-          cp weaveffi.schema.json site/
-          touch site/.nojekyll
-          printf "weaveffi.com" > site/CNAME
+          assemble() {
+            MDBOOK_OUTPUT__HTML__SITE_URL="$1" mdbook build docs --dest-dir "$PWD/build/book"
+            rm -rf "$2"
+            mkdir -p "$2/api/rust"
+            cp -r build/book/html/. "$2/"
+            cp -r target/doc/. "$2/api/rust/"
+            cp weaveffi.schema.json "$2/"
+            rm -rf build/book
+          }
+          assemble "/$DIR/" "site/versioned"
+          if [ "$RELEASE" = true ]; then
+            assemble "/" "site/root"
+          fi
 
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+      - name: Deploy under /${{ steps.version.outputs.dir }}/
+        uses: peaceiris/actions-gh-pages@v4
         with:
-          path: site
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: site/versioned
+          destination_dir: ${{ steps.version.outputs.dir }}
+          keep_files: true
+          cname: weaveffi.com
+          commit_message: "docs: deploy ${{ steps.version.outputs.dir }}"
 
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Deploy as the site root
+        if: steps.version.outputs.release == 'true'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: site/root
+          # Keeps /dev/ and every /v{major}.{minor}/ next to the root.
+          keep_files: true
+          cname: weaveffi.com
+          commit_message: "docs: deploy ${{ steps.version.outputs.dir }} as the root"

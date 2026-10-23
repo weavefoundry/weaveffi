@@ -48,6 +48,13 @@ doc = false
 required-features = ["fuzzing"]
 
 [[bin]]
+name = "fuzz_meta_frames"
+path = "fuzz_targets/meta_frames.rs"
+test = false
+doc = false
+required-features = ["fuzzing"]
+
+[[bin]]
 name = "fuzz_value_buffer"
 path = "fuzz_targets/value_buffer.rs"
 test = false

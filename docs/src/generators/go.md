@@ -1,11 +1,11 @@
 # Go
 
-The Go target emits a self-contained cgo module that binds the library's C
-ABI (revision 5). Records and rich enums are plain Go values, interfaces are
-reference-counted wrappers with `Close`, calls that declare errors return
-`error` values you match with `errors.As`, async functions block on a
-`context.Context`, and `iter<T>` returns standard-library `iter.Seq`
-sequences. The module requires Go 1.24 or later.
+The Go target emits a self-contained cgo module that binds the library's
+[C ABI](../reference/abi.md). Records and rich enums are plain Go values,
+interfaces are reference-counted wrappers with `Close`, calls that declare
+errors return `error` values you match with `errors.As`, async functions
+block on a `context.Context`, and `iter<T>` returns standard-library
+`iter.Seq` sequences. The module requires Go 1.24 or later.
 
 Go is a [Tier 2](../stability.md#target-tiers) target: it may lag behind a
 new ABI revision for a while, but it runs the same conformance suite as
@@ -21,7 +21,7 @@ go/
   README.md
   kvstore.h     a copy of the C header
   bindings.go   the API: types, wrappers, trampolines, load-time checks
-  runtime.go    Check, errors, strings, typed arrays, objects, callbacks,
+  runtime.go    Check, errors, runs, optional scalars, objects, callbacks,
                 iterators, async
   codec.go      the value-buffer writer and reader
 ```
@@ -47,13 +47,13 @@ package = "kvstore"
 
 A package name that's a Go keyword gains a trailing underscore.
 
-All modules render into one Go package, and Go spells every exported name
-in PascalCase with Go's initialisms (`user_id` is `UserID`, `ttl_seconds`
-is `TTLSeconds`):
+A library is one namespace, so it renders into one Go package, and Go
+spells every exported name in PascalCase with Go's initialisms (`user_id`
+is `UserID`, `ttl_seconds` is `TTLSeconds`):
 
 | Declaration | Go name |
 |-------------|---------|
-| function `kv.stats.summarize` | `Summarize` |
+| function `summarize` | `Summarize` |
 | interface `Store` | `*Store` |
 | constructor `Store.open` | `OpenStore` (and `new` is `NewStore`) |
 | method `Store.get_or_load` | `(*Store).GetOrLoad` |
@@ -63,13 +63,13 @@ is `TTLSeconds`):
 | error domain `KvError`, code `KeyNotFound` | `KvError`, `*KeyNotFoundError` |
 | error domain `KitchenErrors` | `KitchenError` (one `Error` suffix, never doubled) |
 
-A free function whose bare name would clash with a type, an enum
-constant, a constructor, a static, an error type, the runtime's `Check`,
-`Error`, or `DebugLive`, or another free function's bare name is prefixed
-with its module path: the kvstore sample's async `kv.open_store` sits beside
-the `OpenStore` constructor, so it's `KvOpenStore` (and a function in module
-`kv.stats` would get a `KvStats` prefix). Methods never clash this way,
-since each lives on its own type.
+A free function whose name would clash with a type, an enum constant, a
+constructor, a static, an error type, or the runtime's `Check`, `Error`,
+or `DebugLive` gains a trailing underscore: the kvstore sample's async
+`open_store` sits beside the `OpenStore` constructor, so it's `OpenStore_`,
+and the codec sample's `vector` function sits beside its `Vector` type, so
+it's `Vector_`. Methods never clash this way, since each lives on its own
+type.
 
 Doc comments are the IDL's docs. A package-level declaration's comment
 starts with its name, as Go convention asks, so a doc that doesn't is
@@ -128,15 +128,15 @@ directory to the module path's repository; see
 
 ## Load-time checks
 
-`Check() error` checks the library's ABI revision and then, for every
-top-level module, the library's
-[contract table](../reference/abi.md#load-time-checks) against the rows
-the bindings were generated with, including one row per error code and per
-callback method:
+`Check() error` checks the library's ABI revision and then
+[the contract](../reference/abi.md#the-contract) of every declaration the
+bindings were generated with, including each error code and callback
+method: it calls the declaration's `{p}_contract_{id}` function and compares
+the hash with the one embedded in `bindings.go`.
 
 ```go
 if err := kvstore.Check(); err != nil {
-	log.Fatal(err) // kvstore: kv.Store.put changed since these bindings were generated
+	log.Fatal(err) // kvstore: Store.put changed since these bindings were generated
 }
 ```
 
@@ -145,45 +145,49 @@ package, and `Check` returns the same result from then on. Importing the
 package never panics. A function called after a failed check panics with
 the error `Check` returns, so call `Check` at startup when you'd rather
 handle a mismatched library as an error. The error names the first
-declaration that fails: `kvstore: kv.Store.put is missing from the library`
-or `kvstore: kv.Store.put changed since these bindings were generated`.
-Rows the library has and the bindings don't are fine, so a library that
-only adds functions, error codes, or callback methods keeps working with
-older bindings.
+declaration whose hash differs. Because the bindings link the library, one
+that lacks a declaration fails to link (or, with a shared library swapped
+in later, to start) rather than failing the check. Declarations the library
+has and the bindings don't are fine, so a library that only adds functions,
+error codes, or callback methods keeps working with older bindings.
 
 ## Type mapping
+
+Every value crosses as one C value, whatever its position:
 
 | IDL type | Go type | Crosses the ABI as |
 |----------|---------|--------------------|
 | `i8` to `i64`, `u8` to `u64` | `int8` to `int64`, `uint8` to `uint64` | the C integer |
 | `f32`, `f64` | `float32`, `float64` | `float`, `double` |
 | `bool` | `bool` | C `bool` |
-| `string` | `string` | borrowed `(ptr, len)` UTF-8; returns are copied and freed |
-| `bytes` | `[]byte` | borrowed `(ptr, len)`; returns are copied and freed |
+| `string` | `string` | a `{p}_run` of UTF-8 |
+| `bytes` | `[]byte` | a `{p}_run` of the bytes |
 | C-style enum | `type E int32` plus `E{Variant}` constants | `int32_t` |
-| rich enum | sealed `interface` plus one struct per variant | value buffer |
-| record | plain struct with exported fields | value buffer |
-| scalar `T?` (integer, float, `bool`, C-style enum) | `*T` | a presence flag and the value |
-| other `T?` | `*T`; a slice, map, rich enum, `[]byte`, or wrapper stays as it is and nil is none | value buffer |
-| numeric `[T]` (`i8` to `i64`, `u16` to `u64`, `f32`, `f64`) | `[]T` | a typed array (pointer and element count) |
-| other `[T]`, `{K: V}` | `[]T`, `map[K]V` | value buffer |
+| rich enum | sealed `interface` plus one struct per variant | a value buffer in a `{p}_run` |
+| record | plain struct with exported fields | a value buffer in a `{p}_run` |
+| scalar `T?` (integer, float, `bool`, C-style enum) | `*T` | a `{p}_opt_{prim}` struct (`{p}_opt_i32` for an enum) |
+| other `T?` | `*T`; a slice, map, rich enum, `[]byte`, or wrapper stays as it is and nil is none | a value buffer in a `{p}_run` |
+| numeric `[T]` (`i8` to `i64`, `u16` to `u64`, `f32`, `f64`) | `[]T` | a `{p}_run` of the packed elements |
+| other `[T]`, `{K: V}` | `[]T`, `map[K]V` | a value buffer in a `{p}_run` |
 | interface | `*Iface` | object pointer |
 | `Iface?` | `*Iface` (nil is none) | object pointer or null |
-| callback interface | a Go `interface` you implement | handle plus a static vtable |
-| `Cb?` | the same interface (nil is none) | handle plus a vtable, or null |
+| callback interface | a Go `interface` you implement | a `{p}_{Cb}` struct of a handle and a static vtable |
+| `Cb?` | the same interface (nil is none) | the same struct with a null vtable for none |
 | `iter<T>` | `iter.Seq[T]` or `iter.Seq2[T, error]` | iterator handle |
 
-Strings pass a view of Go memory with no copy and no NUL terminator, so
-they may contain `\x00`. A Go string can hold bytes that aren't UTF-8; the
-library rejects them as a marshalling failure (`-3`).
+A string, byte slice, or numeric slice parameter lends its own memory for
+the call, with no copy and no encoding: the run points into the Go string
+or the slice's backing array (a sub-slice passes its own window), cgo keeps
+it in place until the call returns, and the library only reads it. Strings
+carry no NUL terminator, so they may contain `\x00`. A Go string can hold
+bytes that aren't UTF-8; the library rejects them as a marshalling failure
+(`-3`).
 
-A numeric slice parameter passes the slice's own backing array for the
-call, with no copy and no encoding; cgo keeps it in place until the call
-returns, and the library only reads it. A returned array is copied into a
-new slice and the library's run is freed. An empty result is an empty,
-non-nil slice. Inside a record, list, or map, numeric lists and optional
-scalars use the value-buffer encoding like everything else; the Go types
-are the same either way.
+A returned run is copied into Go memory and released with `{p}_run_free`.
+An empty string, byte slice, or numeric slice result is empty and non-nil.
+Inside a record, list, or map, numeric lists and optional scalars use the
+value-buffer encoding like everything else; the Go types are the same
+either way.
 
 Each type that crosses inside a value buffer has one codec pair, shared by
 every parameter, result, field, and callback argument of that type. A
@@ -207,14 +211,12 @@ pointer for its duration:
 func (s *Store) Get(key string) (Entry, error) {
 	cSelf := s.native()
 	defer s.release()
-	cKeyPtr, cKeyLen := wvStr(key)
-	var cRetLen C.size_t
 	var cErr C.kvstore_error
-	cRet := C.kvstore_kv_Store_get(cSelf, cKeyPtr, cKeyLen, &cRetLen, &cErr)
+	cRet := C.kvstore_Store_get(cSelf, wvStrRun(key), &cErr)
 	if cErr.code != 0 {
 		return Entry{}, wvKvError(wvTakeError(&cErr))
 	}
-	return wvDecode(cRet, cRetLen, wvReadEntry), nil
+	return wvDecode(cRet, wvReadEntry), nil
 }
 ```
 
@@ -252,7 +254,7 @@ if errors.As(err, &missing) {
 }
 var kvErr kvstore.KvError
 if errors.As(err, &kvErr) {
-	// any code of the kv domain
+	// any code of the domain
 }
 ```
 
@@ -296,14 +298,16 @@ if errors.Is(err, context.DeadlineExceeded) {
 
 Any other async function returns `ctx.Err()` as soon as the context is done
 and discards the native result when it arrives. A context that's already
-done never launches the call. An optional scalar result is a `*T` and a
-numeric list result a `[]T`, as in a sync call.
+done never launches the call. The result is one C value like a sync
+return, so an optional scalar result is a `*T` and a numeric list result a
+`[]T`.
 
 ## Callbacks
 
 A callback interface is a Go interface. Passing an implementation stores it
-in a handle table and hands the library the address of one static vtable
-per interface: the header's `size` and `flags` (0: Go may run a method on
+in a handle table and hands the library the interface's argument struct:
+the handle as the context, and the address of one static vtable per
+interface, with the header's `size` and `flags` (0: Go may run a method on
 any thread), the `free` entry that deletes the handle once the library is
 done, and one `//export` trampoline per method. The library may call
 methods from any thread, and `free` may run on any thread too.
@@ -321,18 +325,18 @@ type Policy interface {
 }
 ```
 
-- **Arguments.** Strings, bytes, typed arrays, and buffered values are
-  copied or decoded for the call, and an optional scalar is a `*T`. An
-  object argument (`home` above) is a new wrapper that owns its own
-  reference: keep it, return it, or `Close` it.
+- **Arguments.** Strings, bytes, typed arrays, and buffered values are lent
+  for the call, so they're copied or decoded into Go values, and an
+  optional scalar is a `*T`. An object argument (`home` above) is a new
+  wrapper that owns its own reference: keep it, return it, or `Close` it.
 - **Returns.** A method may return any type but an iterator or a callback
-  interface. A direct value returns by value, an optional scalar as its
-  flag and value; a string, `[]byte`, typed array, or buffered value is
-  copied into a run allocated with the library's allocator; an object
-  returns a fresh reference to the wrapper's object (the wrapper stays
-  yours). Returning nil for a required object, or a value the library can't
-  read (text that isn't UTF-8, an undeclared enum value), fails the call in
-  progress.
+  interface. A scalar returns by value and an optional scalar as its C
+  struct; a string, `[]byte`, typed array, or buffered value is copied
+  into a run allocated with the library's allocator, which the library
+  adopts; an object returns a fresh reference to the wrapper's object (the
+  wrapper stays yours). Returning nil for a required object, or a value the
+  library can't read (text that isn't UTF-8, an undeclared enum value),
+  fails the call in progress.
 - **Errors.** A method that declares `throws` returns `(T, error)` or
   `error`. Returning one of its domain's code types (for example
   `&kvstore.RejectedError{Key: k, Reason: "no secrets"}`) reports that code
@@ -344,9 +348,10 @@ type Policy interface {
   message from its fields, and the kvstore sample turns every other
   callback failure into `KvError.CallbackFailed`.
 - **Nil implementations.** A `Cb?` parameter accepts nil, which passes no
-  callback; so does a typed nil (an interface holding a nil pointer, map,
-  slice, func, or channel), which would otherwise reach the library as an
-  implementation whose every call panics. A required one panics on either.
+  callback (a null vtable); so does a typed nil (an interface holding a nil
+  pointer, map, slice, func, or channel), which would otherwise reach the
+  library as an implementation whose every call panics. A required one
+  panics on either.
 
 ## Iterators
 
@@ -365,24 +370,21 @@ for key, err := range store.Keys(nil) {
 }
 ```
 
-Elements may be optional scalars (`iter.Seq[*int64]`) or numeric lists
-(`iter.Seq[[]int32]`), which cross as a flag and a value or as a typed
-array.
+Each element is one C value, so elements may be optional scalars
+(`iter.Seq[*int64]`), numeric lists (`iter.Seq[[]int32]`), records, or
+objects, each received like a return.
 
 ## Leak checks
 
 `DebugLive(kind)` reports the library's live objects (0), callbacks (1),
-iterators (2), cancel tokens (3), and byte runs (4), and `DebugLive(-1)` is
-1 when the library counts at all. Every count is 0 unless the library was
+iterators (2), cancel tokens (3), and runs (4), and `DebugLive(-1)` is 1
+when the library counts at all. Every count is 0 unless the library was
 built with the `leak-check` feature. Wrappers you don't close are released
 by cleanups, so run `runtime.GC()` (and give the cleanups a moment) before
 reading the counts.
 
 ## Limitations
 
-- All modules share one Go package, which the global naming rules make
-  safe; only a free function whose Go name collides gains its module path
-  (see [What's generated](#whats-generated)).
 - The library is bound at link time, so there's no run-time override of
   which library file loads beyond the platform loader's search path, and
   `Check` reports a mismatched library only after the program has linked

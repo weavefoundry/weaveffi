@@ -1,6 +1,7 @@
 //! Target-specific tests: names derived from the identity and the config,
-//! escaping, and the generated-file markers. The `kitchen_sink` snapshot pins
-//! the rendered bindings themselves.
+//! escaping, the one-C-value marshalling, the contract rows, and the
+//! generated-file markers. The `kitchen_sink` snapshot pins the rendered
+//! bindings themselves.
 
 use weaveffi_model::model::Model;
 use weaveffi_model::pkg::Identity;
@@ -9,22 +10,32 @@ use weaveffi_model::validate::validate;
 use super::{render_files, GoConfig};
 
 const FIXTURE: &str = r#"
-version: "0.12.0"
-modules:
-  - name: shop
-    errors:
-      - name: ShopErrors
-        codes:
-          - { name: out_of_stock, code: 1, message: "out of stock", fields: [{ name: message, type: string }] }
-    interfaces:
-      - name: Cart
-        constructors: [{ name: new, params: [{ name: range, type: string }] }]
-        methods:
-          - { name: close, params: [] }
-          - { name: add, params: [{ name: s, type: i32 }] }
-    functions:
-      - { name: open_cart, params: [], return: Cart }
-      - { name: check, params: [{ name: context, type: i32 }], throws: ShopErrors }
+version: "0.13.0"
+errors:
+  - name: ShopErrors
+    codes:
+      - { name: out_of_stock, code: 1, message: "out of stock", fields: [{ name: message, type: string }] }
+records:
+  - name: Line
+    fields: [{ name: sku, type: string }, { name: qty, type: "u32?" }]
+callbacks:
+  - name: Pricer
+    methods:
+      - { name: price, params: [{ name: line, type: Line }, { name: cart, type: Cart }], return: "f64?" }
+      - { name: label, params: [{ name: weights, type: "[f32]" }], return: string, throws: ShopErrors }
+interfaces:
+  - name: Cart
+    constructors: [{ name: new, params: [{ name: range, type: string }] }]
+    methods:
+      - { name: close, params: [] }
+      - { name: add, params: [{ name: s, type: i32 }] }
+      - { name: lines, params: [], return: "iter<Line>" }
+functions:
+  - { name: new_cart, params: [], return: Cart }
+  - { name: check, params: [{ name: err, type: "Cart?" }], throws: ShopErrors }
+  - { name: totals, params: [{ name: xs, type: "[i64]" }, { name: n, type: "i32?" }], return: "[f64]" }
+  - { name: priced, params: [{ name: pricer, type: "Pricer?" }, { name: line, type: Line }], return: "Line?" }
+  - { name: later, params: [{ name: n, type: u32 }], return: "u16?", async: true, cancellable: true }
 "#;
 
 fn model() -> Model {
@@ -123,18 +134,105 @@ fn identifiers_avoid_keywords_and_generated_names() {
     let files = render(GoConfig::default());
     let src = file(&files, "bindings.go");
     // A method named like the wrapper's Close, parameters named like Go
-    // keywords or body locals, and a function named like the runtime's
-    // Check.
+    // keywords or body locals, and functions named like the runtime's Check
+    // or a constructor's factory.
     assert_has(src, "func (s *Cart) Close_() {");
     assert_has(src, "func (s *Cart) Add(s_ int32) {");
     assert_has(src, "func NewCart(range_ string) *Cart {");
-    assert_has(src, "func ShopCheck(context_ int32) error {");
+    assert_has(src, "func NewCart_() *Cart {");
+    assert_has(src, "func Check_(err_ *Cart) error {");
     // A payload field named like the error's Message field.
     assert_has(src, "\tMessage_ string\n");
     // The domain takes the shared name; its unknown codes have their own type.
     assert_has(src, "type ShopError interface {");
     assert_has(src, "type UnknownShopError struct {");
     assert_has(src, "type OutOfStockError struct {");
+}
+
+#[test]
+fn every_value_crosses_as_one_c_value() {
+    let files = render(GoConfig::default());
+    let src = file(&files, "bindings.go");
+    // Parameters: a string and a typed array lend Go memory as runs, an
+    // optional scalar is its C struct, and a buffered record is encoded.
+    assert_has(src, "C.shop_kit_Cart_new(wvStrRun(range_), &cErr)");
+    assert_has(
+        src,
+        "C.shop_kit_totals(wvSliceRun(xs), wvOptInI32(n), &cErr)",
+    );
+    // An optional object borrows its pointer, or passes null.
+    assert_has(src, "var cErr_ *C.shop_kit_Cart\n");
+    // An optional callback is its argument struct, with a null vtable for
+    // nil, staged after the values beside it.
+    assert_has(
+        src,
+        "\tcLine := wvBytesRun(wvEncode(line, wvWriteLine))\n\
+         \tcPricerCtx, cPricerVtable := wvOptionalCallback(pricer, C.wvVtablePtr_shop_kit_Pricer_vtable())\n",
+    );
+    assert_has(
+        src,
+        "C.shop_kit_priced(C.shop_kit_Pricer{ctx: cPricerCtx, vtable: cPricerVtable}, cLine, &cErr)",
+    );
+    // Returns: a run is copied and released, a buffer decoded.
+    assert_has(src, "return wvTakeSlice[float64](cRet)\n");
+    assert_has(src, "return wvDecode(cRet, wvRead_opt_Line)\n");
+    // An iterator item is one C value too.
+    assert_has(src, "var cItem C.shop_kit_run\n");
+    assert_has(
+        src,
+        "if C.shop_kit_Cart_LinesIterator_next(it, &cItem, cErr) == 0 {",
+    );
+    // An async result is one C value.
+    assert_has(
+        src,
+        "func goWv_shop_kit_later_callback(context_ unsafe.Pointer, err_ *C.shop_kit_error, result C.shop_kit_opt_u16) {",
+    );
+    assert_has(src, "return wvOptOutU16(result)\n");
+}
+
+#[test]
+fn callback_trampolines_take_and_return_one_c_value() {
+    let files = render(GoConfig::default());
+    let src = file(&files, "bindings.go");
+    // The vtable entries match the exported prototypes exactly.
+    assert_has(
+        src,
+        "extern shop_kit_opt_f64 goWv_shop_kit_Pricer_price(void* ctx, shop_kit_run line, shop_kit_Cart* cart, shop_kit_error* out_err);",
+    );
+    assert_has(src, ".price = goWv_shop_kit_Pricer_price,\n");
+    // Arguments are borrowed (an object moves a reference), and returns are
+    // handed over.
+    assert_has(
+        src,
+        "ret := wvCallback[Pricer](ctx).Price(wvDecodeBorrowed(line, wvReadLine), wvAdoptCart(cart))",
+    );
+    assert_has(src, "return wvOptInF64(ret)\n");
+    assert_has(
+        src,
+        "ret, err := wvCallback[Pricer](ctx).Label(wvBorrowSlice[float32](weights))",
+    );
+    assert_has(src, "wvCallbackFailed[ShopError](out_err, err)");
+    assert_has(src, "return wvAllocString(ret)\n");
+}
+
+#[test]
+fn the_contract_rows_are_checked_at_load() {
+    let files = render(GoConfig::default());
+    let src = file(&files, "bindings.go");
+    let model = model();
+    for row in crate::codegen::contract::rows(&model) {
+        assert_has(
+            src,
+            &format!(
+                "{{uint64(C.{}()), 0x{:016x}, \"{}\"}},",
+                row.symbol, row.hash, row.path
+            ),
+        );
+    }
+    assert_has(
+        file(&files, "runtime.go"),
+        "changed since these bindings were generated",
+    );
 }
 
 #[test]

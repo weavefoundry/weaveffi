@@ -1,25 +1,21 @@
-//! Call rendering: sync, async, and iterator wrappers and the argument and
-//! result marshalling they share.
+//! Call rendering: sync, async, and iterator wrappers and the parameter
+//! marshalling they share.
 //!
-//! Marshalling reads the model's stored contracts: each parameter's
-//! [`ArgPass`], and the result's [`RetPass`] (sync), [`ResultPass`] (async
-//! completion), or [`ItemPass`] (iterator element), so this module only
-//! spells those contracts in Go. How a failure surfaces comes from the
-//! callable's
-//! [`ErrorStrategy`](weaveffi_model::plan::ErrorStrategy).
+//! Each value crosses as one C value (see [`values`](super::values)), so a
+//! wrapper lends each parameter, passes `&cErr` (sync calls and iterators)
+//! or the completion and its context (async calls), and receives the one
+//! result. How a failure surfaces comes from the callable's
+//! [`ErrorStrategy`](weaveffi_model::model::ErrorStrategy).
 
 use crate::codegen::CodeWriter;
-use weaveffi_model::abi::CType;
-use weaveffi_model::model::{AsyncBinding, CallShape, FnBinding, IteratorBinding, ParamBinding};
-use weaveffi_model::plan::{ArgPass, ItemPass, ResultPass, RetPass};
-use weaveffi_model::ty::{Prim, RetTy, Ty};
+use weaveffi_model::abi::Position;
+use weaveffi_model::model::{AsyncBinding, FnBinding, IteratorBinding, Shape};
+use weaveffi_model::ty::{ParamTy, Ty};
 
-use crate::targets::go::codec::{read_fn, write_fn};
 use crate::targets::go::docs::GoDoc;
 use crate::targets::go::names::{self, pascal};
-use crate::targets::go::types::{
-    cgo_pointee, cgo_type, go_type, go_zero, param_type, prim_type, ret_type, strip_const,
-};
+use crate::targets::go::types::{cgo_type, go_type, go_zero, param_type, ret_type};
+use crate::targets::go::values::{cgo_value, lend, take};
 use crate::targets::go::Ctx;
 
 /// The wrapper type a method is declared on.
@@ -38,55 +34,14 @@ pub(crate) fn render_function(
     go_name: &str,
     recv: Option<Receiver>,
 ) {
-    match (&f.shape, f.iterator()) {
-        (CallShape::Async(ab), _) => render_async(w, ctx, f, ab, go_name, recv),
-        (CallShape::Sync, Some(it)) => render_iterator(w, ctx, f, it, go_name, recv),
-        (CallShape::Sync, None) => render_sync(w, ctx, f, go_name, recv),
+    match &f.shape {
+        Shape::Async(ab) => render_async(w, ctx, f, ab, go_name, recv),
+        Shape::Iterator(it) => render_iterator(w, ctx, f, it, go_name, recv),
+        Shape::Sync => render_sync(w, ctx, f, go_name, recv),
     }
 }
 
 // ── Shared pieces ──
-
-/// How a value the native library hands over arrives, whatever the
-/// position: the shape of its slots, independent of the slot names.
-enum Received<'a> {
-    /// A scalar or C-style enum by value.
-    Direct,
-    /// A presence flag and a scalar.
-    OptDirect,
-    /// A typed array of the primitive (pointer and element count).
-    Slice(Prim),
-    /// A UTF-8 run.
-    String,
-    /// A byte run.
-    Bytes,
-    /// A value buffer.
-    Buffer,
-    /// An owned object reference of the interface.
-    Object(&'a str),
-}
-
-/// The Go expression receiving one value of type `ty` the native library
-/// hands over in the slots `a` (and `b`, the length or value slot), taking
-/// ownership: a direct value converted, an optional scalar joined, a typed
-/// array, string, or bytes copied and released, a buffer decoded and
-/// released, an object adopted (a null `Interface?` adopts to nil).
-fn receive(ty: &Ty, how: &Received, a: &str, b: &str) -> String {
-    match how {
-        Received::Direct => format!("{}({a})", go_type(ty)),
-        Received::OptDirect => {
-            let Ty::Optional(inner) = ty else {
-                unreachable!("an optional scalar has an optional type")
-            };
-            format!("wvOptional(bool({a}), {}({b}))", go_type(inner))
-        }
-        Received::Slice(p) => format!("wvTakeSlice[{}]({a}, {b})", prim_type(*p)),
-        Received::String => format!("wvTakeString({a}, {b})"),
-        Received::Bytes => format!("wvTakeBytes({a}, {b})"),
-        Received::Buffer => format!("wvDecode({a}, {b}, {})", read_fn(ty)),
-        Received::Object(i) => format!("wvAdopt{}({a})", pascal(i)),
-    }
-}
 
 /// The wrapper's signature line.
 fn header(recv: Option<Receiver>, go_name: &str, params: &[String], ret_sig: &str) -> String {
@@ -126,98 +81,70 @@ fn emit_prologue(w: &mut CodeWriter, recv: Option<Receiver>, args: &mut Vec<Stri
     }
 }
 
-/// The C type's cgo spelling with `const` dropped.
-fn cgo(ct: &CType, ctx: &Ctx) -> String {
-    cgo_type(&strip_const(ct), ctx.prefix)
+/// The local a parameter's C value is staged in: `c` and the Go parameter
+/// name, capitalized (`other` is `cOther`, `err_` is `cErr_`).
+fn staging(go_param: &str) -> String {
+    let mut chars = go_param.chars();
+    let first: String = chars
+        .next()
+        .map(|c| c.to_ascii_uppercase())
+        .into_iter()
+        .collect();
+    format!("c{first}{}", chars.as_str())
 }
 
-/// Emit the staging statements for one parameter and push its C argument
-/// expressions, per its [`ArgPass`].
+/// Emit the staging for every parameter of `f` and push one C argument per
+/// parameter, in order.
 ///
-/// Strings, bytes, and typed arrays pass a borrowed view of the Go memory
-/// (cgo keeps it in place for the call); a buffered value is encoded first,
-/// and an optional scalar splits into its flag and value. An object
-/// parameter borrows the wrapper's pointer for the call, like a receiver,
-/// and a nil `Interface?` passes null. A callback implementation is kept in
-/// a handle table, passed as the context, beside the interface's static
-/// vtable; a nil `Cb?` (or a typed nil) passes no callback.
-fn emit_param(
-    w: &mut CodeWriter,
-    ctx: &Ctx,
-    args: &mut Vec<String>,
-    p: &ParamBinding,
-    f: &FnBinding,
-) {
-    let name = names::param(&p.name, f);
-    let c = format!("c{}", pascal(&p.name));
-    match &p.pass {
-        ArgPass::Direct { slot } => args.push(format!("{}({name})", cgo(&slot.ty, ctx))),
-        ArgPass::OptDirect { has, value, .. } => {
-            w.line(format!("{c}Has, {c} := wvPresent({name})"));
-            args.extend([
-                format!("{}({c}Has)", cgo(&has.ty, ctx)),
-                format!("{}({c})", cgo(&value.ty, ctx)),
-            ]);
-        }
-        ArgPass::Slice { ptr, .. } => {
-            w.line(format!(
-                "{c}Ptr, {c}Len := wvSliceIn[{}]({name})",
-                cgo_pointee(&ptr.ty, ctx.prefix)
-            ));
-            args.extend([format!("{c}Ptr"), format!("{c}Len")]);
-        }
-        ArgPass::String { .. } => {
-            w.line(format!("{c}Ptr, {c}Len := wvStr({name})"));
-            args.extend([format!("{c}Ptr"), format!("{c}Len")]);
-        }
-        ArgPass::Bytes { .. } => {
-            w.line(format!("{c}Ptr, {c}Len := wvBytes({name})"));
-            args.extend([format!("{c}Ptr"), format!("{c}Len")]);
-        }
-        ArgPass::Buffer { .. } => {
-            let ty = p.ty.value().expect("a buffered parameter is a value");
-            w.line(format!(
-                "{c}Ptr, {c}Len := wvBytes(wvEncode({name}, {}))",
-                write_fn(ty)
-            ));
-            args.extend([format!("{c}Ptr"), format!("{c}Len")]);
-        }
-        ArgPass::Object { slot, nullable, .. } => {
-            if *nullable {
-                w.line(format!("var {c} {}", cgo(&slot.ty, ctx)));
-                w.block(format!("if {name} != nil {{"), "}", |w| {
-                    w.line(format!("{c} = {name}.native()"));
-                    w.line(format!("defer {name}.release()"));
-                });
-            } else {
-                w.line(format!("{c} := {name}.native()"));
-                w.line(format!("defer {name}.release()"));
+/// Value parameters are lent (see [`lend`]). A callback implementation is
+/// kept in a handle table, passed as the argument struct's context beside
+/// its interface's static vtable; a nil `Cb?` (or a typed nil) passes a
+/// null vtable. Beside a callback, every value is staged first, so a value
+/// that panics while it's lent (a nil required object, a rich-enum value
+/// that's no variant) can't strand a callback's handle.
+fn emit_params(w: &mut CodeWriter, ctx: &Ctx, f: &FnBinding, args: &mut Vec<String>) {
+    let has_callbacks = f.params.iter().any(|p| p.ty.callback().is_some());
+    let mut slots: Vec<Option<String>> = vec![None; f.params.len()];
+    for (i, p) in f.params.iter().enumerate() {
+        if let ParamTy::Value(ty) = &p.ty {
+            let name = names::param(&p.name, f);
+            let c = staging(&name);
+            let mut arg = lend(w, ctx, ty, &name, &c);
+            if has_callbacks && arg != c {
+                w.line(format!("{c} := {arg}"));
+                arg = c;
             }
-            args.push(c);
-        }
-        ArgPass::Callback {
-            vtable,
-            nullable,
-            interface,
-            ..
-        } => {
-            let CType::Ptr { pointee, .. } = &vtable.ty else {
-                unreachable!("a callback vtable slot is a pointer")
-            };
-            let accessor = format!("C.{}()", vtable_accessor(&pointee.render_c(ctx.prefix)));
-            if *nullable {
-                w.line(format!(
-                    "{c}Ctx, {c}Vtable := wvOptionalCallback({name}, {accessor})"
-                ));
-                args.extend([format!("{c}Ctx"), format!("{c}Vtable")]);
-            } else {
-                args.extend([
-                    format!("wvNewCallback({name}, \"{}\")", pascal(interface)),
-                    accessor,
-                ]);
-            }
+            slots[i] = Some(arg);
         }
     }
+    for (i, p) in f.params.iter().enumerate() {
+        let ParamTy::Callback { name: cb, nullable } = &p.ty else {
+            continue;
+        };
+        let name = names::param(&p.name, f);
+        let tag = &ctx.model.callback(cb).c_tag;
+        let vtable = format!(
+            "C.{}()",
+            vtable_accessor(&ctx.model.callback(cb).vtable_tag)
+        );
+        slots[i] = Some(if *nullable {
+            let c = staging(&name);
+            w.line(format!(
+                "{c}Ctx, {c}Vtable := wvOptionalCallback({name}, {vtable})"
+            ));
+            format!("C.{tag}{{ctx: {c}Ctx, vtable: {c}Vtable}}")
+        } else {
+            format!(
+                "C.{tag}{{ctx: wvNewCallback({name}, \"{}\"), vtable: {vtable}}}",
+                pascal(cb)
+            )
+        });
+    }
+    args.extend(
+        slots
+            .into_iter()
+            .map(|s| s.expect("every parameter has a slot")),
+    );
 }
 
 /// The doc comment of a wrapper: its IDL doc and documented parameters,
@@ -235,19 +162,13 @@ fn wrapper_doc(ctx: &Ctx, f: &FnBinding, go_name: &str, extra: &[String]) -> GoD
     doc.deprecated(deprecated)
 }
 
-/// The value type a callable returns, if any (the element type for an
-/// iterator).
-fn ret_value(f: &FnBinding) -> Option<&Ty> {
-    f.ret.as_ref().map(RetTy::elem)
-}
-
 // ── Sync ──
 
-/// Render a sync callable: the Go wrapper marshalling the parameters,
-/// calling the C symbol, checking the error slot, and receiving the
-/// result. A callable that declares errors returns `(T, error)` (its
-/// domain's code types, or an `*Error` when it fails with any error); any
-/// other panics with an `*Error`.
+/// Render a sync callable: the Go wrapper lending the parameters, calling
+/// the C symbol, checking the error slot, and taking the result. A
+/// callable that declares errors returns `(T, error)` (its domain's code
+/// types, or an `*Error` when it fails with any error); any other panics
+/// with an `*Error`.
 fn render_sync(
     w: &mut CodeWriter,
     ctx: &Ctx,
@@ -256,7 +177,7 @@ fn render_sync(
     recv: Option<Receiver>,
 ) {
     let throws = f.error.throws();
-    let ret = ret_value(f);
+    let ret = f.ret_value();
     let ret_sig = match (ret, throws) {
         (Some(r), true) => format!(" ({}, error)", go_type(r)),
         (Some(r), false) => format!(" {}", go_type(r)),
@@ -267,35 +188,11 @@ fn render_sync(
     w.block(header(recv, go_name, &go_params(f), &ret_sig), "}", |w| {
         let mut args = Vec::new();
         emit_prologue(w, recv, &mut args);
-        for p in &f.params {
-            emit_param(w, ctx, &mut args, p, f);
-        }
-        let how = match &f.ret_pass {
-            RetPass::Void => None,
-            RetPass::Direct => Some((Received::Direct, "")),
-            RetPass::OptDirect { out_value } => {
-                w.line(format!(
-                    "var cOut {}",
-                    cgo_pointee(&out_value.ty, ctx.prefix)
-                ));
-                args.push("&cOut".into());
-                Some((Received::OptDirect, "cOut"))
-            }
-            RetPass::Slice { elem, .. } => Some((Received::Slice(*elem), "cRetLen")),
-            RetPass::String { .. } => Some((Received::String, "cRetLen")),
-            RetPass::Bytes { .. } => Some((Received::Bytes, "cRetLen")),
-            RetPass::Buffer { .. } => Some((Received::Buffer, "cRetLen")),
-            RetPass::Object { interface, .. } => Some((Received::Object(interface), "")),
-            RetPass::Iterator(_) => unreachable!("iterators render separately"),
-        };
-        if let Some((_, "cRetLen")) = &how {
-            w.line("var cRetLen C.size_t");
-            args.push("&cRetLen".into());
-        }
+        emit_params(w, ctx, f, &mut args);
         w.line(format!("var cErr C.{}_error", ctx.prefix));
         args.push("&cErr".into());
         let call = format!("C.{}({})", f.abi.symbol, args.join(", "));
-        match &how {
+        match ret {
             Some(_) => w.line(format!("cRet := {call}")),
             None => w.line(call),
         };
@@ -311,14 +208,14 @@ fn render_sync(
             w.line("wvTrap(&cErr)");
         }
         let ok = if throws { ", nil" } else { "" };
-        match (&how, ret) {
-            (Some((how, b)), Some(ty)) => {
-                w.line(format!("return {}{ok}", receive(ty, how, "cRet", b)));
+        match ret {
+            Some(ty) => {
+                w.line(format!("return {}{ok}", take(ty, "cRet")));
             }
-            _ if throws => {
+            None if throws => {
                 w.line("return nil");
             }
-            _ => {}
+            None => {}
         }
     });
     w.blank();
@@ -374,9 +271,7 @@ fn render_iterator(
                 if recv.is_some() {
                     emit_prologue(w, recv, &mut args);
                 }
-                for param in &f.params {
-                    emit_param(w, ctx, &mut args, param, f);
-                }
+                emit_params(w, ctx, f, &mut args);
                 args.push("cErr".into());
                 w.line(format!("it := C.{}({})", f.abi.symbol, args.join(", ")));
                 w.block(format!("return wvCursor[{elem_go}]{{"), "}", |w| {
@@ -397,66 +292,21 @@ fn render_iterator(
     w.blank();
 }
 
-/// The body of an iterator cursor's `next`: declare the item slots, call
-/// `_next`, and receive the element.
+/// The body of an iterator cursor's `next`: declare the item, call
+/// `_next`, and take the element.
 fn emit_next(w: &mut CodeWriter, ctx: &Ctx, it: &IteratorBinding, elem: &Ty) {
-    let pointee = |slot: &weaveffi_model::abi::AbiParam| cgo_pointee(&slot.ty, ctx.prefix);
-    let (how, slots): (Received, Vec<(&str, String)>) = match &it.item {
-        ItemPass::Direct { out_item } => (Received::Direct, vec![("cItem", pointee(out_item))]),
-        ItemPass::OptDirect { out_has, out_item } => (
-            Received::OptDirect,
-            vec![("cHas", pointee(out_has)), ("cItem", pointee(out_item))],
-        ),
-        ItemPass::Slice {
-            out_item,
-            out_len,
-            elem,
-        } => (
-            Received::Slice(*elem),
-            vec![("cItem", pointee(out_item)), ("cItemLen", pointee(out_len))],
-        ),
-        ItemPass::String { out_item, out_len } => (
-            Received::String,
-            vec![("cItem", pointee(out_item)), ("cItemLen", pointee(out_len))],
-        ),
-        ItemPass::Bytes { out_item, out_len } => (
-            Received::Bytes,
-            vec![("cItem", pointee(out_item)), ("cItemLen", pointee(out_len))],
-        ),
-        ItemPass::Buffer { out_item, out_len } => (
-            Received::Buffer,
-            vec![("cItem", pointee(out_item)), ("cItemLen", pointee(out_len))],
-        ),
-        ItemPass::Object {
-            out_item,
-            interface,
-            ..
-        } => (
-            Received::Object(interface),
-            vec![("cItem", pointee(out_item))],
-        ),
-    };
-    let mut args = vec!["it".to_string()];
-    for (name, ty) in &slots {
-        w.line(format!("var {name} {ty}"));
-        args.push(format!("&{name}"));
-    }
-    args.push("cErr".into());
+    w.line(format!(
+        "var cItem {}",
+        cgo_value(ctx, elem, Position::Transfer)
+    ));
     w.block(
-        format!("if C.{}({}) == 0 {{", it.next.symbol, args.join(", ")),
+        format!("if C.{}(it, &cItem, cErr) == 0 {{", it.next.symbol),
         "}",
         |w| {
             w.line(format!("return {}, false", go_zero(elem)));
         },
     );
-    let (a, b) = match slots.as_slice() {
-        [(a, _)] => (*a, ""),
-        [(a, _), (b, _)] => (*a, *b),
-        _ => unreachable!("an item has one or two slots"),
-    };
-    // An optional scalar's slots are (flag, value); `receive` wants them in
-    // that order too.
-    w.line(format!("return {}, true", receive(elem, &how, a, b)));
+    w.line(format!("return {}, true", take(elem, "cItem")));
 }
 
 // ── Async ──
@@ -475,8 +325,8 @@ pub(crate) fn vtable_accessor(vtable_tag: &str) -> String {
 }
 
 /// Render an async callable: the exported completion trampoline, which
-/// converts the result and delivers it on the call's channel, and a
-/// blocking wrapper taking a leading `context.Context`.
+/// takes the result and delivers it on the call's channel, and a blocking
+/// wrapper taking a leading `context.Context`.
 ///
 /// Every async wrapper returns an `error` and never panics on a failure:
 /// a function that declares a domain returns its code types, any other an
@@ -493,43 +343,19 @@ fn render_async(
     recv: Option<Receiver>,
 ) {
     let tramp = completion_trampoline(&ab.callback_type);
-    let ret = ret_value(f);
+    let ret = f.ret_value();
     let val_ty = ret.map_or_else(|| "struct{}".to_string(), go_type);
 
-    let formals: Vec<String> = ab
-        .callback_params
+    let params = &ab.callback.params;
+    let formals: Vec<String> = params
         .iter()
         .map(|s| format!("{} {}", names::slot(&s.name), cgo_type(&s.ty, ctx.prefix)))
         .collect();
-    let context = names::slot(&ab.callback_params[0].name);
-    let err_slot = names::slot(&ab.callback_params[1].name);
-    let slot = |s: &weaveffi_model::abi::AbiParam| names::slot(&s.name);
-    let value = match (&ab.result, ret) {
-        (ResultPass::Void, _) | (_, None) => "struct{}{}".to_string(),
-        (ResultPass::Direct { result }, Some(ty)) => {
-            receive(ty, &Received::Direct, &slot(result), "")
-        }
-        (ResultPass::OptDirect { has, value }, Some(ty)) => {
-            receive(ty, &Received::OptDirect, &slot(has), &slot(value))
-        }
-        (ResultPass::Slice { ptr, len, elem }, Some(ty)) => {
-            receive(ty, &Received::Slice(*elem), &slot(ptr), &slot(len))
-        }
-        (ResultPass::String { ptr, len }, Some(ty)) => {
-            receive(ty, &Received::String, &slot(ptr), &slot(len))
-        }
-        (ResultPass::Bytes { ptr, len }, Some(ty)) => {
-            receive(ty, &Received::Bytes, &slot(ptr), &slot(len))
-        }
-        (ResultPass::Buffer { ptr, len }, Some(ty)) => {
-            receive(ty, &Received::Buffer, &slot(ptr), &slot(len))
-        }
-        (
-            ResultPass::Object {
-                result, interface, ..
-            },
-            Some(ty),
-        ) => receive(ty, &Received::Object(interface), &slot(result), ""),
+    let context = names::slot(&params[0].name);
+    let err_slot = names::slot(&params[1].name);
+    let value = match (params.get(2), ret) {
+        (Some(result), Some(ty)) => take(ty, &names::slot(&result.name)),
+        _ => "struct{}{}".to_string(),
     };
     w.line(format!("//export {tramp}"));
     w.block(
@@ -578,10 +404,8 @@ fn render_async(
         if recv.is_some() {
             emit_prologue(w, recv, &mut args);
         }
-        for p in &f.params {
-            emit_param(w, ctx, &mut args, p, f);
-        }
-        let token = if ab.cancellable() {
+        emit_params(w, ctx, f, &mut args);
+        let token = if ab.cancellable {
             w.line(format!("token := C.{}_cancel_token_create()", ctx.prefix));
             w.line(format!(
                 "defer C.{}_cancel_token_destroy(token)",

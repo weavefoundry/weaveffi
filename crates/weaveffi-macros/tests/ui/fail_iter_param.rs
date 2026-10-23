@@ -1,9 +1,8 @@
-#[weaveffi::module]
-mod bad {
-    #[weaveffi::export]
-    pub fn drain(items: weaveffi::Iter<i32>) -> i64 {
-        items.map(i64::from).sum()
-    }
+//! An iterator is only a return type.
+
+#[weaveffi::export]
+pub fn drain(items: weaveffi::Iter<i32>) -> i64 {
+    items.map(i64::from).sum()
 }
 
 weaveffi::export_runtime!();

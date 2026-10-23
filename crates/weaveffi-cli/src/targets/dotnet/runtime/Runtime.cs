@@ -12,8 +12,8 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
-// Every native signature is blittable (`bool` slots are marshalled as one
-// byte by the source generator), so the runtime never marshals on its own.
+// Every native signature is blittable (a C `bool` is a `byte`), so the
+// runtime never marshals on its own.
 [assembly: DisableRuntimeMarshalling]
 
 namespace {{NAMESPACE}};
@@ -119,17 +119,17 @@ public sealed class {{LOAD_EXCEPTION}} : Exception
     }
 }
 
-/// <summary>The native <c>{{LIBRARY}}</c> library behind these
-/// bindings.</summary>
-public static class {{LIBRARY_CLASS}}
+/// <summary>The native <c>{{LIBRARY}}</c> library behind these bindings,
+/// and its free functions.</summary>
+public static partial class {{LIBRARY_CLASS}}
 {
     /// <summary>The C ABI revision these bindings were generated
     /// against.</summary>
     public const uint AbiVersion = {{ABI_VERSION}};
 
     /// <summary>Loads the native library and checks that it matches these
-    /// bindings: its ABI revision and the contract entry of every declaration
-    /// they use. Calling it is optional: the first call into the library runs
+    /// bindings: its ABI revision and the contract of every declaration they
+    /// were generated with. Calling it is optional: the first call into the library runs
     /// the same check and throws the same exception. Calling it again after
     /// a success does nothing.</summary>
     /// <exception cref="{{LOAD_EXCEPTION}}">The library can't be found or
@@ -151,13 +151,179 @@ internal unsafe struct FfiError
     public nuint PayloadLen;
 }
 
-/// <summary>The native <c>{{PREFIX}}_contract_entry</c>: one declaration's
-/// fingerprint in a module's contract table.</summary>
+/// <summary>The native <c>{{PREFIX}}_run</c>: a string's UTF-8, raw bytes, a
+/// typed array, or a value buffer, passed by value. <c>Len</c> counts bytes;
+/// a null pointer with length 0 is the empty run.</summary>
 [StructLayout(LayoutKind.Sequential)]
-internal struct FfiContractEntry
+internal unsafe struct FfiRun
 {
-    public ulong Id;
-    public ulong Hash;
+    public byte* Ptr;
+    public nuint Len;
+
+    internal FfiRun(byte* ptr, nuint len)
+    {
+        Ptr = ptr;
+        Len = len;
+    }
+}
+
+/// <summary>The native <c>{{PREFIX}}_{Cb}</c> argument of every callback
+/// interface: the implementation's <c>ctx</c> and its vtable, passed by
+/// value. A null vtable is none.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct FfiCallback
+{
+    public IntPtr Ctx;
+    public IntPtr Vtable;
+
+    internal FfiCallback(IntPtr ctx, IntPtr vtable)
+    {
+        Ctx = ctx;
+        Vtable = vtable;
+    }
+}
+
+/// <summary>The native <c>{{PREFIX}}_opt_bool</c>: an optional <c>bool</c>, a
+/// presence byte and the value (<c>0</c> when absent).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct FfiOptBool
+{
+    public byte Has;
+    public byte Value;
+
+    internal static FfiOptBool Of(bool? value) => value is { } v ? new FfiOptBool { Has = 1, Value = v ? (byte)1 : (byte)0 } : default;
+
+    internal bool? ToNullable() => Has != 0 ? Value != 0 : null;
+}
+
+/// <summary>The native <c>{{PREFIX}}_opt_i8</c>: an optional <c>sbyte</c>, a
+/// presence byte and the value (<c>0</c> when absent).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct FfiOptI8
+{
+    public byte Has;
+    public sbyte Value;
+
+    internal static FfiOptI8 Of(sbyte? value) => value is { } v ? new FfiOptI8 { Has = 1, Value = v } : default;
+
+    internal sbyte? ToNullable() => Has != 0 ? Value : null;
+}
+
+/// <summary>The native <c>{{PREFIX}}_opt_i16</c>: an optional <c>short</c>, a
+/// presence byte and the value (<c>0</c> when absent).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct FfiOptI16
+{
+    public byte Has;
+    public short Value;
+
+    internal static FfiOptI16 Of(short? value) => value is { } v ? new FfiOptI16 { Has = 1, Value = v } : default;
+
+    internal short? ToNullable() => Has != 0 ? Value : null;
+}
+
+/// <summary>The native <c>{{PREFIX}}_opt_i32</c>: an optional <c>int</c>, a
+/// presence byte and the value (<c>0</c> when absent).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct FfiOptI32
+{
+    public byte Has;
+    public int Value;
+
+    internal static FfiOptI32 Of(int? value) => value is { } v ? new FfiOptI32 { Has = 1, Value = v } : default;
+
+    internal int? ToNullable() => Has != 0 ? Value : null;
+}
+
+/// <summary>The native <c>{{PREFIX}}_opt_i64</c>: an optional <c>long</c>, a
+/// presence byte and the value (<c>0</c> when absent).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct FfiOptI64
+{
+    public byte Has;
+    public long Value;
+
+    internal static FfiOptI64 Of(long? value) => value is { } v ? new FfiOptI64 { Has = 1, Value = v } : default;
+
+    internal long? ToNullable() => Has != 0 ? Value : null;
+}
+
+/// <summary>The native <c>{{PREFIX}}_opt_u8</c>: an optional <c>byte</c>, a
+/// presence byte and the value (<c>0</c> when absent).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct FfiOptU8
+{
+    public byte Has;
+    public byte Value;
+
+    internal static FfiOptU8 Of(byte? value) => value is { } v ? new FfiOptU8 { Has = 1, Value = v } : default;
+
+    internal byte? ToNullable() => Has != 0 ? Value : null;
+}
+
+/// <summary>The native <c>{{PREFIX}}_opt_u16</c>: an optional <c>ushort</c>, a
+/// presence byte and the value (<c>0</c> when absent).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct FfiOptU16
+{
+    public byte Has;
+    public ushort Value;
+
+    internal static FfiOptU16 Of(ushort? value) => value is { } v ? new FfiOptU16 { Has = 1, Value = v } : default;
+
+    internal ushort? ToNullable() => Has != 0 ? Value : null;
+}
+
+/// <summary>The native <c>{{PREFIX}}_opt_u32</c>: an optional <c>uint</c>, a
+/// presence byte and the value (<c>0</c> when absent).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct FfiOptU32
+{
+    public byte Has;
+    public uint Value;
+
+    internal static FfiOptU32 Of(uint? value) => value is { } v ? new FfiOptU32 { Has = 1, Value = v } : default;
+
+    internal uint? ToNullable() => Has != 0 ? Value : null;
+}
+
+/// <summary>The native <c>{{PREFIX}}_opt_u64</c>: an optional <c>ulong</c>, a
+/// presence byte and the value (<c>0</c> when absent).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct FfiOptU64
+{
+    public byte Has;
+    public ulong Value;
+
+    internal static FfiOptU64 Of(ulong? value) => value is { } v ? new FfiOptU64 { Has = 1, Value = v } : default;
+
+    internal ulong? ToNullable() => Has != 0 ? Value : null;
+}
+
+/// <summary>The native <c>{{PREFIX}}_opt_f32</c>: an optional <c>float</c>, a
+/// presence byte and the value (<c>0</c> when absent).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct FfiOptF32
+{
+    public byte Has;
+    public float Value;
+
+    internal static FfiOptF32 Of(float? value) => value is { } v ? new FfiOptF32 { Has = 1, Value = v } : default;
+
+    internal float? ToNullable() => Has != 0 ? Value : null;
+}
+
+/// <summary>The native <c>{{PREFIX}}_opt_f64</c>: an optional <c>double</c>, a
+/// presence byte and the value (<c>0</c> when absent).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct FfiOptF64
+{
+    public byte Has;
+    public double Value;
+
+    internal static FfiOptF64 Of(double? value) => value is { } v ? new FfiOptF64 { Has = 1, Value = v } : default;
+
+    internal double? ToNullable() => Has != 0 ? Value : null;
 }
 
 /// <summary>The result type of an async call that returns nothing.</summary>
@@ -166,8 +332,8 @@ internal readonly struct FfiVoid
 }
 
 /// <summary>The UTF-8 bytes of a string argument, in a pooled buffer the
-/// native side borrows for the call as a (pointer, length) pair, so interior
-/// NULs survive. Pin it with <c>fixed</c>; dispose it after the call.</summary>
+/// native side borrows for the call as a run, so interior NULs survive. Pin
+/// it with <c>fixed</c>; dispose it after the call.</summary>
 internal readonly ref struct FfiUtf8
 {
     private readonly byte[] _bytes;
@@ -199,92 +365,95 @@ internal readonly ref struct FfiUtf8
 /// <summary>Marshalling helpers shared by every generated call.</summary>
 internal static unsafe class Ffi
 {
+    /// <summary>A C <c>bool</c>: one byte, <c>0</c> or <c>1</c>.</summary>
+    internal static byte Bool(bool value)
+    {
+        return value ? (byte)1 : (byte)0;
+    }
+
     /// <summary>Decodes a borrowed UTF-8 run; the native side keeps
     /// ownership.</summary>
-    internal static string ReadString(byte* ptr, nuint len)
+    internal static string ReadString(FfiRun run)
     {
-        return ptr == null || len == 0 ? "" : Encoding.UTF8.GetString(ptr, checked((int)len));
+        return run.Ptr == null || run.Len == 0 ? "" : Encoding.UTF8.GetString(run.Ptr, checked((int)run.Len));
     }
 
     /// <summary>Copies a borrowed byte run; the native side keeps
     /// ownership.</summary>
-    internal static byte[] ReadBytes(byte* ptr, nuint len)
+    internal static byte[] ReadBytes(FfiRun run)
     {
-        return ptr == null || len == 0 ? Array.Empty<byte>() : new ReadOnlySpan<byte>(ptr, checked((int)len)).ToArray();
+        return run.Ptr == null || run.Len == 0 ? Array.Empty<byte>() : new ReadOnlySpan<byte>(run.Ptr, checked((int)run.Len)).ToArray();
     }
 
     /// <summary>A borrowed typed array (or byte run) as a span, valid for the
-    /// duration of a callback. A zero-length run may have a dangling
-    /// pointer, which an empty span never reads.</summary>
-    internal static ReadOnlySpan<T> Borrow<T>(T* ptr, nuint len) where T : unmanaged
+    /// duration of a callback.</summary>
+    internal static ReadOnlySpan<T> Borrow<T>(FfiRun run) where T : unmanaged
     {
-        return len == 0 ? ReadOnlySpan<T>.Empty : new ReadOnlySpan<T>(ptr, checked((int)len));
+        return run.Ptr == null || run.Len == 0
+            ? ReadOnlySpan<T>.Empty
+            : new ReadOnlySpan<T>(run.Ptr, checked((int)(run.Len / (nuint)sizeof(T))));
     }
 
     /// <summary>Decodes a borrowed value buffer, which must hold exactly one
     /// value; the native side keeps ownership.</summary>
-    internal static T ReadBuffer<T>(byte* ptr, nuint len, Func<FfiBufferReader, T> read)
+    internal static T ReadBuffer<T>(FfiRun run, Func<FfiBufferReader, T> read)
     {
-        var reader = new FfiBufferReader(ptr, len);
+        var reader = new FfiBufferReader(run.Ptr, run.Len);
         var value = read(reader);
         reader.ExpectEnd();
         return value;
     }
 
     /// <summary>Decodes a returned UTF-8 string and releases it.</summary>
-    internal static string TakeString(byte* ptr, nuint len)
+    internal static string TakeString(FfiRun run)
     {
         try
         {
-            return ReadString(ptr, len);
+            return ReadString(run);
         }
         finally
         {
-            NativeMethods.FreeBytes(ptr, len);
+            NativeMethods.RunFree(run);
         }
     }
 
     /// <summary>Copies returned bytes and releases them.</summary>
-    internal static byte[] TakeBytes(byte* ptr, nuint len)
+    internal static byte[] TakeBytes(FfiRun run)
     {
         try
         {
-            return ReadBytes(ptr, len);
+            return ReadBytes(run);
         }
         finally
         {
-            NativeMethods.FreeBytes(ptr, len);
+            NativeMethods.RunFree(run);
         }
     }
 
-    /// <summary>Copies a returned typed array of <paramref name="len"/>
-    /// elements and releases its <c>len * sizeof(T)</c> bytes.</summary>
-    internal static T[] TakeArray<T>(T* ptr, nuint len) where T : unmanaged
+    /// <summary>Copies a returned typed array (its <c>Len</c> counts bytes)
+    /// and releases it.</summary>
+    internal static T[] TakeArray<T>(FfiRun run) where T : unmanaged
     {
-        if (ptr == null || len == 0)
-        {
-            return Array.Empty<T>();
-        }
         try
         {
-            return new ReadOnlySpan<T>(ptr, checked((int)len)).ToArray();
+            return Borrow<T>(run).ToArray();
         }
         finally
         {
-            NativeMethods.FreeBytes((byte*)ptr, len * (nuint)sizeof(T));
+            NativeMethods.RunFree(run);
         }
     }
 
     /// <summary>Decodes a returned value buffer and releases it.</summary>
-    internal static T TakeBuffer<T>(byte* ptr, nuint len, Func<FfiBufferReader, T> read)
+    internal static T TakeBuffer<T>(FfiRun run, Func<FfiBufferReader, T> read)
     {
         try
         {
-            return ReadBuffer(ptr, len, read);
+            return ReadBuffer(run, read);
         }
         finally
         {
-            NativeMethods.FreeBytes(ptr, len);
+            NativeMethods.RunFree(run);
         }
     }
 
@@ -318,7 +487,7 @@ internal static unsafe class Ffi
 
     private static Exception Describe(FfiError* err, delegate*<int, string, FfiBufferReader, Exception> map)
     {
-        var message = ReadString(err->MessagePtr, err->MessageLen);
+        var message = ReadString(new FfiRun(err->MessagePtr, err->MessageLen));
         return map(err->Code, message, new FfiBufferReader(err->PayloadPtr, err->PayloadLen));
     }
 
@@ -360,65 +529,53 @@ internal static unsafe class Ffi
         }
     }
 
-    /// <summary>Hands <paramref name="bytes"/> to the producer through a
-    /// callback method's out slots, as a run allocated with
-    /// <c>{{PREFIX}}_alloc</c> that the producer adopts.</summary>
-    private static void Return(ReadOnlySpan<byte> bytes, byte** outPtr, nuint* outLen)
+    /// <summary>Hands <paramref name="bytes"/> to the producer as a callback
+    /// method's return: a run allocated with <c>{{PREFIX}}_alloc</c>, which the
+    /// producer adopts.</summary>
+    private static FfiRun Return(ReadOnlySpan<byte> bytes)
     {
-        var run = bytes.Length == 0 ? null : NativeMethods.Alloc((nuint)bytes.Length);
-        if (run == null && bytes.Length > 0)
+        if (bytes.Length == 0)
+        {
+            return default;
+        }
+        var run = NativeMethods.Alloc((nuint)bytes.Length);
+        if (run == null)
         {
             throw new OutOfMemoryException("the native allocator returned null");
         }
         bytes.CopyTo(new Span<byte>(run, bytes.Length));
-        *outPtr = run;
-        *outLen = (nuint)bytes.Length;
+        return new FfiRun(run, (nuint)bytes.Length);
     }
 
     /// <summary>Returns a string from a callback method.</summary>
-    internal static void ReturnString(string value, byte** outPtr, nuint* outLen)
+    internal static FfiRun ReturnString(string value)
     {
         using var utf8 = new FfiUtf8(value);
         fixed (byte* ptr = utf8)
         {
-            Return(new ReadOnlySpan<byte>(ptr, (int)utf8.Length), outPtr, outLen);
+            return Return(new ReadOnlySpan<byte>(ptr, (int)utf8.Length));
         }
     }
 
     /// <summary>Returns bytes from a callback method.</summary>
-    internal static void ReturnBytes(byte[] value, byte** outPtr, nuint* outLen)
+    internal static FfiRun ReturnBytes(byte[] value)
     {
-        Return(value, outPtr, outLen);
+        return Return(value);
     }
 
     /// <summary>Returns a typed array from a callback method: a run of
-    /// <c>Length * sizeof(T)</c> bytes and the element count.</summary>
-    internal static void ReturnArray<T>(T[] value, T** outPtr, nuint* outLen) where T : unmanaged
+    /// <c>Length * sizeof(T)</c> bytes.</summary>
+    internal static FfiRun ReturnArray<T>(T[] value) where T : unmanaged
     {
-        nuint count;
-        Return(MemoryMarshal.AsBytes(value.AsSpan()), (byte**)outPtr, &count);
-        *outLen = (nuint)value.Length;
+        return Return(MemoryMarshal.AsBytes(value.AsSpan()));
     }
 
     /// <summary>Returns an encoded value from a callback method.</summary>
-    internal static void ReturnBuffer<T>(T value, Action<FfiBufferWriter, T> write, byte** outPtr, nuint* outLen)
+    internal static FfiRun ReturnBuffer<T>(T value, Action<FfiBufferWriter, T> write)
     {
         using var writer = new FfiBufferWriter();
         write(writer, value);
-        Return(writer.Written, outPtr, outLen);
-    }
-
-    /// <summary>Returns an optional scalar from a callback method: the
-    /// presence as the C return, the value through
-    /// <paramref name="outValue"/>.</summary>
-    internal static bool ReturnOptional<T>(T? value, T* outValue) where T : unmanaged
-    {
-        if (value is { } present)
-        {
-            *outValue = present;
-            return true;
-        }
-        return false;
+        return Return(writer.Written);
     }
 
     /// <summary>Pins a callback-interface implementation for the producer and
@@ -671,32 +828,21 @@ internal static unsafe partial class NativeMethods
 
     static partial void VerifyContracts(IntPtr library);
 
-    /// <summary>Fails the load unless the library's contract table
-    /// <paramref name="symbol"/> carries every <paramref name="expected"/>
-    /// declaration with an unchanged signature hash. Declarations the library
-    /// has and these bindings don't are fine.</summary>
-    private static void VerifyContract(IntPtr library, string symbol, (ulong Id, ulong Hash, string Path)[] expected)
+    /// <summary>Fails the load unless the library exports every
+    /// <paramref name="expected"/> declaration's contract function and it
+    /// returns the signature hash these bindings were generated with.
+    /// Declarations the library has and these bindings don't are
+    /// fine.</summary>
+    private static void VerifyContract(IntPtr library, (string Symbol, ulong Hash, string Path)[] expected)
     {
-        if (!NativeLibrary.TryGetExport(library, symbol, out var table))
+        foreach (var (symbol, hash, path) in expected)
         {
-            throw new {{LOAD_EXCEPTION}}(
-                $"the loaded {LibName} library doesn't export {symbol}; regenerate the bindings or rebuild the library");
-        }
-        nuint len = 0;
-        var entries = ((delegate* unmanaged[Cdecl]<nuint*, FfiContractEntry*>)table)(&len);
-        var hashes = new Dictionary<ulong, ulong>(checked((int)len));
-        for (nuint i = 0; i < len; i++)
-        {
-            hashes[entries[i].Id] = entries[i].Hash;
-        }
-        foreach (var (id, hash, path) in expected)
-        {
-            if (!hashes.TryGetValue(id, out var actual))
+            if (!NativeLibrary.TryGetExport(library, symbol, out var contract))
             {
                 throw new {{LOAD_EXCEPTION}}(
                     $"{path} is missing from the library {LibName}; regenerate the bindings or rebuild the library");
             }
-            if (actual != hash)
+            if (((delegate* unmanaged[Cdecl]<ulong>)contract)() != hash)
             {
                 throw new {{LOAD_EXCEPTION}}(
                     $"{path} changed since these bindings were generated; regenerate the bindings or rebuild the library {LibName}");
@@ -724,9 +870,9 @@ internal static unsafe partial class NativeMethods
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
     internal static partial byte* Alloc(nuint len);
 
-    [LibraryImport(LibName, EntryPoint = "{{PREFIX}}_free_bytes")]
+    [LibraryImport(LibName, EntryPoint = "{{PREFIX}}_run_free")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial void FreeBytes(byte* ptr, nuint len);
+    internal static partial void RunFree(FfiRun run);
 
     [LibraryImport(LibName, EntryPoint = "{{PREFIX}}_cancel_token_create")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]

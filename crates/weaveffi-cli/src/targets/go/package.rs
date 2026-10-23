@@ -96,12 +96,12 @@ Go 1.24 or newer is required.
 
 - Call `Check()` at startup: it returns an error when the linked library
   isn't the one these bindings were generated for (a different ABI revision,
-  or a declaration that's missing or changed). The first call into the
-  package runs the same checks, and every call after a failed check panics
-  with that error.
+  or a declaration that changed; one that's missing fails to link). The
+  first call into the package runs the same checks, and every call after a
+  failed check panics with that error.
 - Records are plain structs and rich enums are sealed interfaces; both cross
-  the boundary by value. Optional scalars are pointers, and numeric lists
-  pass the slice's own storage.
+  the boundary by value. Optional scalars are pointers, and strings, byte
+  slices, and numeric slices lend their own storage for the call.
 - Interfaces are reference-counted objects. Call `Close` when you're done
   with one (an unreachable wrapper is released eventually otherwise); it's
   safe to call twice or while a call is in flight.

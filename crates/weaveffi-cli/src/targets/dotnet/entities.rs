@@ -2,7 +2,7 @@
 //! interface wrapper classes.
 
 use weaveffi_model::model::{
-    CallShape, EnumBinding, FieldBinding, InterfaceBinding, Model, StructBinding,
+    EnumBinding, FieldBinding, InterfaceBinding, Model, RecordBinding, Shape,
 };
 
 use crate::codegen::CodeWriter;
@@ -103,7 +103,7 @@ fn construct(cx: Cx<'_>, class: &str, fields: &[FieldBinding], indent: &str) -> 
 /// Render a record as a positional `sealed record` (value equality, `with`,
 /// deconstruction), plus the internal `WriteTo`/`ReadFrom` pair
 /// implementing its value-buffer encoding (fields in declaration order).
-pub(crate) fn render_record(w: &mut CodeWriter, cx: Cx<'_>, docs: &Docs, s: &StructBinding) {
+pub(crate) fn render_record(w: &mut CodeWriter, cx: Cx<'_>, docs: &Docs, s: &RecordBinding) {
     let name = &s.name;
     docs.summary(w, &s.doc);
     field_docs(w, docs, name, &s.fields);
@@ -266,7 +266,7 @@ pub(crate) fn render_interface(
         for c in &i.constructors {
             let err = ErrCtx::new(model, &c.error, cx);
             let method = cs_member(&c.name, name);
-            let receiver = if c.name == "new" && matches!(c.shape, CallShape::Sync) && c.iterator().is_none() {
+            let receiver = if c.name == "new" && c.shape == Shape::Sync {
                 Receiver::Constructor(name)
             } else {
                 Receiver::Static
@@ -275,11 +275,13 @@ pub(crate) fn render_interface(
         }
         for m in &i.methods {
             let err = ErrCtx::new(model, &m.error, cx);
-            render_callable(w, docs, m, &cs_member(&m.name, name), Receiver::Instance, &err, cx);
+            let method = cs_member(&m.name, name);
+            render_callable(w, docs, m, &method, Receiver::Instance, &err, cx);
         }
         for s in &i.statics {
             let err = ErrCtx::new(model, &s.error, cx);
-            render_callable(w, docs, s, &cs_member(&s.name, name), Receiver::Static, &err, cx);
+            let method = cs_member(&s.name, name);
+            render_callable(w, docs, s, &method, Receiver::Static, &err, cx);
         }
 
         w.line("/// <summary>Releases this wrapper's reference. The native object is");

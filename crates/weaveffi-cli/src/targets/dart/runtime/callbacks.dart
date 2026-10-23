@@ -87,16 +87,34 @@ final class _CallbackEntry {
 final Map<int, _CallbackEntry> _callbacks = <int, _CallbackEntry>{};
 int _nextCallbackKey = 1;
 
-/// Registers [impl] and returns the `ctx` the producer receives.
-Pointer<Void> _registerCallback(Object impl, _CallbackDispatch dispatch) {
+/// The C `{{PREFIX}}_{Cb}` argument every callback interface passes by
+/// value: the registration's `ctx` and the interface's vtable (null for
+/// none).
+final class _CallbackArg extends Struct {
+  external Pointer<Void> ctx;
+  external Pointer<Void> vtable;
+}
+
+/// Registers [impl] and returns the argument the producer receives: its
+/// `ctx` and [vtable]. The producer adopts it, and releases it through the
+/// vtable's `free`, whether or not the call succeeds.
+_CallbackArg _registerCallback(
+    Object impl, _CallbackDispatch dispatch, Pointer<Void> vtable) {
   final key = _nextCallbackKey++;
   final context = calloc<_CallbackContext>();
   context.ref
     ..key = key
     ..post = _callbackPost;
   _callbacks[key] = _CallbackEntry(impl, dispatch, context);
-  return context.cast();
+  return Struct.create<_CallbackArg>()
+    ..ctx = context.cast()
+    ..vtable = vtable;
 }
+
+/// The argument of an absent optional callback interface: a null vtable.
+_CallbackArg _noCallback() => Struct.create<_CallbackArg>()
+  ..ctx = nullptr
+  ..vtable = nullptr;
 
 /// The implementation registered under [ctx].
 Object _callbackTarget(Pointer<Void> ctx) {
@@ -205,17 +223,17 @@ final class _CallbackMessage {
 
   void maybeFloat64(bool present, double v) => present ? float64(v) : none();
 
-  /// A borrowed byte run; posting copies it.
-  void bytes(Pointer<Uint8> ptr, int len) => typedData(ptr, len, typedUint8);
+  /// A borrowed run's bytes; posting copies them.
+  void run(_Run run) => array(run, 1, typedUint8);
 
-  /// A borrowed array of [count] elements of the typed-data [type]; posting
-  /// copies it. A run of length 0 is never read.
-  void typedData(Pointer<NativeType> ptr, int count, int type) {
+  /// A borrowed run of [size]-byte elements of the typed-data [type];
+  /// posting copies it. A run of length 0 is never read.
+  void array(_Run run, int size, int type) {
     final data = _next(_kTypedData).value.asTypedData;
     data
       ..type = type
-      ..length = count
-      ..values = count == 0 ? nullptr : ptr.cast();
+      ..length = run.len ~/ size
+      ..values = run.len == 0 ? nullptr : run.ptr;
   }
 
   void send() {
@@ -290,15 +308,4 @@ void _reportCallbackError(Pointer<_Error> outErr, int code, Object error) {
   } catch (_) {
     _errorSet(outErr, code, nullptr, 0);
   }
-}
-
-/// Hands [bytes] to the producer through a method's `out_ptr`/`out_len`
-/// slots as a run allocated with `{{PREFIX}}_alloc`, which the producer
-/// adopts and frees. An empty run is null with length 0.
-void _handOver(
-    List<int> bytes, Pointer<Pointer<Uint8>> outPtr, Pointer<Size> outLen) {
-  final run = bytes.isEmpty ? nullptr : _alloc(bytes.length);
-  if (run != nullptr) run.asTypedList(bytes.length).setAll(0, bytes);
-  outPtr.value = run;
-  outLen.value = run == nullptr ? 0 : bytes.length;
 }

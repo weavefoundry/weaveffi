@@ -1,5 +1,7 @@
-error: weaveffi: #[weaveffi::custom] needs `lower`; write #[weaveffi::custom(repr = String, lift = parse_fn, lower = format_fn)]
- --> tests/ui/fail_custom_missing_lower.rs:5:5
+error: weaveffi: `#[weaveffi::custom]` needs `lower`: `#[weaveffi::custom(repr = R, lift = f, lower = g)]`
+ --> tests/ui/fail_custom_missing_lower.rs:3:1
   |
-5 |     #[weaveffi::custom(repr = String, lift = str::parse)]
-  |     ^
+3 | #[weaveffi::custom(repr = String, lift = parse_port)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `weaveffi::custom` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -1,0 +1,4 @@
+# rejected: CancellableNotAsync
+version: "0.13.0"
+functions:
+  - { name: ping, return: bool, cancellable: true }

@@ -16,7 +16,7 @@ pub(crate) fn render_c_header_from_model(model: &Model, filename: &str) -> Strin
     let prefix = model.prefix();
     let guard = format!("{}_H", prefix.to_uppercase());
     let decls = Decls::new(model);
-    let mut out = String::with_capacity(2048 + model.modules.len() * 4096);
+    let mut out = String::with_capacity(4096 + model.callables().count() * 512);
     out.push_str(&render_prelude(CommentStyle::DoubleSlash));
     let _ = write!(out, "#ifndef {guard}\n#define {guard}\n\n");
     out.push_str("#include <stdint.h>\n");
@@ -32,31 +32,21 @@ pub(crate) fn render_c_header_from_model(model: &Model, filename: &str) -> Strin
     let _ = write!(
         out,
         "/*\n \
-         * How values cross. A parameter `v` becomes, by its type:\n \
-         *   integer, float, bool, C-style enum   T v\n \
-         *   optional of one of those (T?)       bool has_v, T v (v is 0 and ignored\n \
-         *                                       when has_v is false)\n \
-         *   [i8] [i16] [i32] [i64] [u16] [u32]  const T* v_ptr, size_t v_len\n \
-         *   [u64] [f32] [f64] (typed arrays)    (v_len counts elements; v_ptr is\n \
-         *                                       aligned for T, NULL when v_len is 0)\n \
-         *   string, bytes, and every other      const uint8_t* v_ptr, size_t v_len\n \
-         *   record, enum, list, map, optional\n \
-         *   interface                           const Tag* v (borrowed; NULL for an\n \
-         *                                       absent optional)\n \
-         *   callback interface                  void* v_ctx, const Tag_vtable* v_vtable\n \
+         * How values cross. Every value is one C value in every position\n \
+         * (parameter, return, async result, iterator item, callback argument):\n \
+         *   integer, float, bool, C-style enum   the value (an enum is int32_t)\n \
+         *   optional of one of those (T?)       {prefix}_opt_T: {{ bool has; T value; }}\n \
+         *   string, bytes, [i8] .. [f64]        {prefix}_run: {{ ptr, len }}, len in bytes\n \
+         *   (typed arrays), and every record,   (typed arrays are aligned for their\n \
+         *   rich enum, list, map, optional      element); the rest is a value buffer\n \
+         *   interface                           const Tag* as a parameter (borrowed),\n \
+         *                                       Tag* elsewhere (one reference moves)\n \
+         *   callback interface                  {prefix}_Cb: {{ ctx, vtable }}\n \
          * Strings are UTF-8 without a NUL terminator; NULL with length 0 is the\n \
-         * empty value. Everything in the (ptr, len) row past bytes is a value\n \
-         * buffer in the little-endian format; when generated, {helper}\n \
-         * declares a C struct and codec for each such type.\n \
-         *\n \
-         * A return of type T is the C return, except: T? returns `bool` (present)\n \
-         * with the value in a trailing `T* out_value`; a typed array returns `T*`\n \
-         * with its element count in `size_t* out_len`, released with\n \
-         * {prefix}_free_bytes((uint8_t*)ptr, len * sizeof(T)); a string, bytes, or\n \
-         * buffer returns `const uint8_t*` with `size_t* out_len`, released with\n \
-         * {prefix}_free_bytes(ptr, len); an interface returns an owned reference,\n \
-         * released with its `_destroy`. Every producer run is 8-aligned. Every\n \
-         * sync call ends with `{prefix}_error* out_err`.\n \
+         * empty run. When generated, {helper} declares a C struct and codec for\n \
+         * every value-buffer type. A run the producer returns is released with\n \
+         * {prefix}_run_free, and every one it allocates is 8-aligned. Every sync\n \
+         * call ends with `{prefix}_error* out_err`, which it overwrites.\n \
          */\n\n"
     );
     decls.declarations(&mut out);

@@ -1,7 +1,7 @@
 # Swift
 
 The Swift target emits a standalone SwiftPM package that wraps the
-[C ABI](../reference/abi.md) (revision 5) in idiomatic Swift: `throws` with
+[C ABI](../reference/abi.md) (revision 6) in idiomatic Swift: `throws` with
 typed `Error` enums for declared errors, plain `Hashable` structs and enums
 for values, ARC-managed `final class` wrappers for objects, class-bound
 protocols for callback interfaces, `async` functions with task cancellation
@@ -33,29 +33,23 @@ The C symbol prefix and the native library name come from the package
 identity. `WeaveFFIRuntime.swift` depends only on those names, so it changes
 only when they do.
 
-Types (records, enums, error domains, interfaces, and callback protocols)
-sit at file scope, since type names are unique across an API. Each IDL
-module's free functions become `static func`s of a caseless namespace `enum`
-named after the module in PascalCase, a submodule's enum nests inside its
-parent's, and the module's doc comment documents its enum:
+A library is one namespace, and so is its Swift module. Records, enums,
+error domains, interfaces, and callback protocols sit at file scope, and
+each free function is a top-level `public func`. A consumer calls one
+unqualified, or qualified with the module name when another module declares
+the same name:
 
 ```swift
-/// An embedded key-value store with listeners, policies, read-through
-/// loaders, iteration, and async compaction.
-public enum Kv {
-    public static func openStore(path: String) async throws -> Store { ... }
+import Kvstore
 
-    /// Aggregate statistics, namespaced under `kv.stats`: ...
-    public enum Stats {
-        public static func summarize(store: Store, prefix: String?) throws -> Kvstore.Stats { ... }
-    }
-}
+let store = try await Kvstore.openStore(path: "/data")
+let stats = try summarize(store: store, prefix: nil)
 ```
 
 Parameters, methods, record fields, and enum cases are lowerCamelCase
 (`expiresAt`, `.keyNotFound`), and every argument is labeled
-(`Kv.Stats.summarize(store: store, prefix: nil)`). Doc comments carry over,
-with backticked API names in their Swift spelling (`` `new_op` `` becomes
+(`summarize(store: store, prefix: nil)`). Doc comments carry over, with
+backticked API names in their Swift spelling (`` `new_op` `` becomes
 `` `newOp` ``), and deprecated declarations get
 `@available(*, deprecated, message:)`.
 
@@ -87,7 +81,8 @@ swift build -Xlinker -L/path/to/lib
 Swift binds the library at link time, so at run time the dynamic loader finds
 it the usual way (its install name, an rpath, or `DYLD_LIBRARY_PATH` and
 `LD_LIBRARY_PATH`). The `{PREFIX}_LIBRARY` variable other targets honor
-doesn't apply.
+doesn't apply. There's no generated glue: the Swift module calls the C
+header's functions directly.
 
 When a `CKvstore.xcframework` sits next to `Package.swift`, the manifest uses
 it as a binary target instead of the system library, so apps link without
@@ -105,42 +100,39 @@ and publish the package; apps on any Apple platform then link with no flags
 
 Before the first call (the first constructor, static, or free function), the
 bindings check, once per process, that the library implements C ABI
-revision 5 and that every declaration they were generated with is in its
-top-level module's [contract table](../reference/abi.md#load-time-checks)
-with the same signature. The expected rows are embedded in the wrapper, one
-per function, member, type, callback method, error domain, and error code:
+revision 6 and that every declaration they were generated with has the same
+[contract](../reference/abi.md#the-contract): each declaration's contract
+function must return the hash of the signature the bindings saw. The rows
+are embedded in the wrapper, one per function, interface, member, record,
+enum, callback interface, callback method, error domain, and error code:
 
 ```swift
 func wvCheckContracts() -> KvstoreLibrary.LoadError? {
-    if let failure = wvCheckContract(kvstore_kv_contract, [
-        (0x0969575bfbb012d7, 0xebd38766e3532c4f, "kv.Store.fork"),
-        // ...one row per declaration in `kv` and its submodules
-    ]) {
-        return failure
-    }
-    return wvCheckContract(kvstore_report_contract, [
-        // ...
+    wvCheckContract([
+        (kvstore_contract_7b4181d5fd2958e8, 0x8d469dd20baca093, "Store.open"),
+        // ...one row per declaration
     ])
 }
 ```
 
-Declarations, error codes, and callback methods the library adds are fine.
-To handle a mismatch, call `{Module}Library.check()` at startup. It runs the
-checks (or returns their cached result) and throws a `LoadError` naming the
-first mismatch:
+The contract functions are linked like every other symbol, so a library
+that lacks a declaration fails to link. Declarations, error codes, and
+callback methods the library adds are fine. To handle a mismatch, call
+`{Module}Library.check()` at startup. It runs the checks (or returns their
+cached result) and throws a `LoadError` naming the first mismatch:
 
 ```swift
 do {
     try KvstoreLibrary.check()
 } catch let error as KvstoreLibrary.LoadError {
-    // .abiMismatch(found:expected:), .missing(declaration:), or .changed(declaration:)
+    // .abiMismatch(found:expected:) or .changed(declaration:)
     print(error.localizedDescription)
 }
 ```
 
 ```text
-Kvstore: kv.Store.put is missing from the library 'kvstore'; regenerate the bindings or rebuild the library
-Kvstore: kv.Store.put changed since these bindings were generated; regenerate the bindings or rebuild the library 'kvstore'
+Kvstore: the native library 'kvstore' implements C ABI revision 5, but these bindings need revision 6
+Kvstore: Store.put changed since these bindings were generated; regenerate the bindings or rebuild the library 'kvstore'
 ```
 
 A call made while the library doesn't match stops the process with the same
@@ -150,35 +142,51 @@ need.
 
 ## Type mapping
 
+Every value crosses the C ABI as one C value, by value, in every position: a
+parameter, a return, an async result, an iterator item, and a callback
+method's argument and return.
+
 | IDL type | Swift type | At the ABI |
 |---|---|---|
-| `i8` to `i64`, `u8` to `u64` | `Int8` to `Int64`, `UInt8` to `UInt64` | Direct |
-| `f32`, `f64` | `Float`, `Double` | Direct |
+| `i8` to `i64`, `u8` to `u64` | `Int8` to `Int64`, `UInt8` to `UInt64` | The scalar |
+| `f32`, `f64` | `Float`, `Double` | The scalar |
 | `bool` | `Bool` | C `bool` |
-| `string` | `String` | UTF-8 pointer and length |
-| `bytes` | `Data` | Pointer and length |
+| `string` | `String` | A run of UTF-8 |
+| `bytes` | `Data` | A run of bytes |
 | C-style enum | `enum E: Int32, CaseIterable, Sendable` | `int32_t` |
-| Record | `struct`, `Hashable` and `Sendable` | Value buffer |
-| Rich enum | `enum` with associated values, `Hashable` and `Sendable` | Value buffer |
-| `T?` of a number, `bool`, or C-style enum | `T?` | Presence flag and value |
-| `[T]` of a number other than `u8` | `[T]` | Typed array: pointer and element count |
-| Any other `T?`, `[T]`, `{K: V}` | `T?`, `[T]`, `[K: V]` | Value buffer |
+| Record | `struct`, `Hashable` and `Sendable` | A run holding a value buffer |
+| Rich enum | `enum` with associated values, `Hashable` and `Sendable` | A run holding a value buffer |
+| `T?` of a number, `bool`, or C-style enum | `T?` | A `{prefix}_opt_{prim}` struct |
+| `[T]` of a number other than `u8` | `[T]` | A run holding the packed elements (a typed array) |
+| Any other `T?`, `[T]`, `{K: V}` | `T?`, `[T]`, `[K: V]` | A run holding a value buffer |
 | Interface | `final class`, `Hashable` by identity, `@unchecked Sendable` | Object pointer |
 | `Interface?` | optional wrapper | Nullable pointer |
-| Callback interface | `any P`, where `protocol P: AnyObject, Sendable` | Context and vtable |
-| `Callback?` | `(any P)?` | Context and nullable vtable |
+| Callback interface | `any P`, where `protocol P: AnyObject, Sendable` | A `{prefix}_{P}` struct of a context and a vtable |
+| `Callback?` | `(any P)?` | The same struct, with a null vtable for `nil` |
 | `iter<T>` | `NativeSequence<T>` | Iterator handle |
 
-An optional scalar (`Int64?`, `Bool?`, `Priority?`) crosses as a flag and a
-value in every position, never through a buffer. A numeric array parameter
-lends the array's own storage for the call (`withUnsafeBufferPointer`, no
-copy); a returned array is copied once out of the library's run, which is
-then released. Strings cross as pointer and length in both directions, so
-interior NULs survive. Value buffers decode in place from the library's
-memory before it's released. Floats round-trip bit for bit, including NaN
-and `-0.0`. `usize` and `isize` in a Rust producer are `u64` and `i64`
-(`UInt64`, `Int64`); a `char` and a custom type cross as their IDL type
-(usually `String`).
+A run is the C header's `{prefix}_run`, `{ ptr, len }` with `len` in bytes,
+which the runtime calls `WvRun`. A parameter lends the Swift value's own
+storage for the call (`withUTF8`, `withUnsafeBytes`), or its encoding for a
+value buffer, with no copy; a returned run is copied once (or decoded in
+place) and then released with `{prefix}_run_free`. Strings cross as their
+UTF-8 bytes with a length, so interior NULs survive. An optional scalar
+(`Int64?`, `Bool?`, `Priority?`) crosses as its `{prefix}_opt_{prim}`
+struct (`has` and `value`) in every position, never through a buffer.
+Floats round-trip bit for bit, including NaN and `-0.0`. `usize` and
+`isize` in a Rust producer are `u64` and `i64` (`UInt64`, `Int64`); a
+`char` and a custom type cross as their IDL type (usually `String`).
+
+```swift
+public func get(key: String) throws -> Entry {
+    var err = WvError()
+    let rv: WvRun = wvWithUTF8(key) { key_run in
+        kvstore_Store_get(self.ptr, key_run, &err)
+    }
+    try wvCheck(&err, KvError.self)
+    return wvTakeBuffer(rv, as: Entry.self)
+}
+```
 
 Every type that crosses inside a value buffer conforms to the internal
 `WvCodable` protocol: the primitives in the runtime, `Optional`, `Array`, and
@@ -215,11 +223,11 @@ public final class Gadget: WvObject, Hashable, @unchecked Sendable {
     }
 
     deinit {
-        kitchen_sink_kitchen_Gadget_destroy(ptr)
+        kitchen_sink_Gadget_destroy(ptr)
     }
 
     func clonePtr() -> OpaquePointer {
-        wvNonNull(kitchen_sink_kitchen_Gadget_clone(ptr))
+        wvNonNull(kitchen_sink_Gadget_clone(ptr))
     }
 
     /// Whether two wrappers hold the same native object.
@@ -235,7 +243,7 @@ public final class Gadget: WvObject, Hashable, @unchecked Sendable {
     public init(id: Int64) {
         wvLoad()
         var err = WvError()
-        let rv = kitchen_sink_kitchen_Gadget_new(id, &err)
+        let rv = kitchen_sink_Gadget_new(id, &err)
         wvTrap(&err)
         self.ptr = wvNonNull(rv)
     }
@@ -243,10 +251,9 @@ public final class Gadget: WvObject, Hashable, @unchecked Sendable {
     /// Render the gadget as a human-readable string
     public func describe() -> String {
         var err = WvError()
-        var outLen = 0
-        let rv = kitchen_sink_kitchen_Gadget_describe(self.ptr, &outLen, &err)
+        let rv = kitchen_sink_Gadget_describe(self.ptr, &err)
         wvTrap(&err)
-        return wvTakeString(rv, outLen)
+        return wvTakeString(rv)
     }
 }
 ```
@@ -269,10 +276,10 @@ names](../reference/naming.md#identifiers-in-generated-code)).
 Each error domain becomes an `enum` conforming to `Error`, `LocalizedError`,
 `Hashable`, and `Sendable`, named through the shared naming rule: the
 domain's name with one `Error` suffix (`KvError` stays `KvError`,
-`KitchenErrors` becomes `KitchenError`, `Failure` becomes `FailureError`). A
-module may declare several. Each code is a case carrying the message (the
-code's documented message when the library sends none) and the code's
-fields; `errorCode` and `message` read them back:
+`KitchenErrors` becomes `KitchenError`, `Failure` becomes `FailureError`).
+Each code is a case carrying the message (the code's documented message when
+the library sends none) and the code's fields; `errorCode` and `message`
+read them back:
 
 ```swift
 public enum KvError: Error, LocalizedError, Hashable, Sendable {
@@ -321,11 +328,11 @@ Kvstore.count() failed with code -2: <the producer's panic message>
 ## Async and cancellation
 
 An async function becomes an `async` function over a checked continuation;
-the library's completion callback resumes it exactly once, from any thread.
-It's marked `throws` only when the IDL function declares errors or is
-cancellable; otherwise a failure follows the trap policy
-(`Kv.Stats.summarizeAll(stores:)` is `async -> Kvstore.Stats`). Optional
-scalars and numeric arrays arrive directly here too
+the library's completion callback resumes it exactly once, from any thread,
+with the result as one C value. It's marked `throws` only when the IDL
+function declares errors or is cancellable; otherwise a failure follows the
+trap policy (`summarizeAll(stores:)` is `async -> Stats`). Optional scalars
+and typed arrays arrive the same way as from a synchronous call
 (`versionOf(key:) async -> UInt32?`, `versions(keys:) async -> [UInt32]`). A
 cancellable function runs inside `withTaskCancellationHandler`: it creates a
 native cancel token, passes it to the launch, and cancels it when the calling
@@ -333,20 +340,20 @@ task is cancelled. A cancelled call (code `-5`) throws `CancellationError`,
 even when the task was cancelled before the call started:
 
 ```swift
-public static func doCancellable(input: String) async throws -> String {
+public func doCancellable(input: String) async throws -> String {
     wvLoad()
     let token = WvCancelToken()
     return try await withTaskCancellationHandler {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
             let context = Unmanaged.passRetained(WvContinuation(continuation)).toOpaque()
-            wvWithUTF8(input) { input_ptr, input_len in
-                kitchen_sink_kitchen_do_cancellable(input_ptr, input_len, token.raw, { context, err, result_ptr, result_len in
+            wvWithUTF8(input) { input_run in
+                kitchen_sink_do_cancellable(input_run, token.raw, { context, err, result in
                     let cont = Unmanaged<WvContinuation<String, Error>>.fromOpaque(context!).takeRetainedValue().value
                     if let err = err {
                         cont.resume(throwing: wvTakeCancellation(err))
                         return
                     }
-                    cont.resume(returning: wvTakeString(result_ptr, result_len))
+                    cont.resume(returning: wvTakeString(result))
                 }, context)
             }
         }
@@ -356,8 +363,9 @@ public static func doCancellable(input: String) async throws -> String {
 }
 ```
 
-The token is released when the wrapper returns; the library holds its own
-reference for the call's duration.
+The launcher copies its arguments before it returns, so lending them for the
+launch is enough. The token is released when the wrapper returns; the
+library holds its own reference for the call's duration.
 
 ## Callback interfaces
 
@@ -392,23 +400,45 @@ public protocol Loader: AnyObject, Sendable {
 Implement it with a class and pass an instance (`any Loader`) where the API
 expects one. The library may call it from any thread, which is why the
 protocol requires `Sendable`; a class guarding its own state can declare
-`@unchecked Sendable`. (The Swift vtables leave the thread-affine flag clear.)
-Passing an implementation retains it until the library calls the vtable's
-`free`, which may happen on any library thread, and releases it then. An
-optional parameter (`loader: (any Loader)?`) passes a null vtable for `nil`.
+`@unchecked Sendable`.
+
+The argument crosses as the `{prefix}_{Loader}` struct: a context that
+retains the implementation until the library calls the vtable's `free`
+(which may happen on any library thread), and a pointer to one process-wide
+vtable per protocol. An optional parameter (`loader: (any Loader)?`) passes
+the zero struct, whose null vtable means none, for `nil`. The vtable sets
+`size` to its own size, so a newer library that appended a method knows this
+binding lacks it (that call fails with `-4`), and leaves the thread-affine
+flag clear. Each entry is a `@convention(c)` trampoline:
+
+```swift
+enum WvLoaderVtable {
+    static let shared = WvVtable(kvstore_Loader_vtable(
+        size: UInt32(MemoryLayout<kvstore_Loader_vtable>.size),
+        flags: 0,
+        free: { ctx in wvRelease(ctx, as: (any Loader).self) },
+        // ...
+        load: { ctx, a0, outErr in
+            wvInvoke(ctx, outErr, as: (any Loader).self, throwing: KvError.self, fallback: WvRun()) { wvImpl in
+                try wvHandOverBytes(wvImpl.load(key: wvBorrowString(a0)))
+            }
+        }
+    ))
+}
+```
 
 Arguments and returns follow the [ABI](../reference/abi.md#callback-interfaces):
 
-- Strings, bytes, numeric arrays, and value buffers arrive as copies; an
-  optional scalar arrives as `T?`; an object argument arrives as a wrapper
-  that adopted the reference the library passed, which the implementation
-  may keep.
+- Strings, bytes, typed arrays, and value buffers arrive as copies of the
+  library's borrowed runs; an optional scalar arrives as `T?`; an object
+  argument arrives as a wrapper that adopted the reference the library
+  passed, which the implementation may keep.
 - A returned number, `Bool`, or C-style enum crosses by value, and an
-  optional one as a presence flag plus the value; a returned object (`Store`
-  or `Store?`) as a fresh reference the library adopts; and a returned
-  string, `Data`, numeric array, or value buffer (a record, a rich enum, an
-  optional, a list, or a map) as a run allocated with `{prefix}_alloc`,
-  which the library adopts.
+  optional one as its `{prefix}_opt_{prim}` struct; a returned object
+  (`Store` or `Store?`) as a fresh reference the library adopts; and a
+  returned string, `Data`, typed array, or value buffer (a record, a rich
+  enum, an optional, a list, or a map) as a run allocated with
+  `{prefix}_alloc`, which the library adopts.
 - A requirement declared `throws: KvError` may throw that enum: the library
   receives its code, message, and fields as the payload, exactly as if the
   producer had raised it (a Rust producer then renders the message from the
@@ -439,12 +469,12 @@ let entry = try store.getOrLoad(key: "settings", loader: FileLoader())
 
 An `iter<T>` return is a `NativeSequence<T>`, one generic class (a
 `Sequence` and its own `IteratorProtocol`) for every iterator in the API.
-Each `next()` pulls exactly one element from the library; the native
-iterator is released as soon as the stream ends, or from `deinit` when
-iteration stops early. The sequence is single-pass. `next()` can't throw, so
-for a throwing function an error reported mid-stream ends iteration and is
-kept in the sequence's `error` property; `collect()` pulls the rest and
-throws it instead:
+Each `next()` pulls exactly one element from the library, received as one C
+value like a return of the same type; the native iterator is released as
+soon as the stream ends, or from `deinit` when iteration stops early. The
+sequence is single-pass. `next()` can't throw, so for a throwing function an
+error reported mid-stream ends iteration and is kept in the sequence's
+`error` property; `collect()` pulls the rest and throws it instead:
 
 ```swift
 for key in try store.keys(prefix: "user.") { print(key) }
@@ -456,17 +486,16 @@ let expirations: [Int64?] = try store.expirations().collect()
 
 - The library is linked at build time, so `{PREFIX}_LIBRARY` isn't honored and
   library paths come from the linker and loader. A library the dynamic
-  loader can't find stops the process before `main`, before `check()` can
-  report anything.
+  loader can't find, or one that lacks a declaration, stops the process
+  before `main`, before `check()` can report anything.
 - Calls made while the library doesn't match (whether or not `check()` ran),
   malformed value buffers, and failures of non-throwing calls stop the
   process instead of throwing.
-- A type that shares its name with a module's namespace `enum` (the `Stats`
-  record beside the `kv.stats` module's `Kv.Stats`) is qualified with the
-  Swift module name where the two would clash (`Kvstore.Stats`).
 - The runtime declares the public types `{Module}Library`,
   `{Module}RuntimeError`, and `NativeSequence`; an IDL type with one of
-  those names doesn't compile.
+  those names doesn't compile. Qualifying a free function with the module
+  name (`Kvstore.openStore`) works only while no type in scope shares the
+  module's name.
 - The manifest stays at `swift-tools-version:5.9` for Xcode 15 users, so
   SwiftPM compiles the package in the Swift 5 language mode even under a
   Swift 6 toolchain.

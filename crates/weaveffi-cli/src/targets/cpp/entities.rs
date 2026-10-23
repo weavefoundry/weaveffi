@@ -10,7 +10,7 @@ use crate::codegen::errors::ErrorTable;
 use crate::codegen::CodeWriter;
 use crate::lang;
 use weaveffi_model::model::{
-    CallShape, EnumBinding, FieldBinding, FnBinding, InterfaceBinding, ModuleBinding, StructBinding,
+    EnumBinding, FieldBinding, FnBinding, InterfaceBinding, Model, RecordBinding, Shape,
 };
 use weaveffi_model::ty::Ty;
 
@@ -42,10 +42,10 @@ fn field_doc(ctx: &Ctx<'_>, doc: &Option<String>) -> Option<String> {
 
 // ── Enums ──
 
-/// Append one module's C-style enums as `enum class {Name} : int32_t`. Rich
-/// enums are value types, rendered with the records.
-pub(crate) fn render_cpp_enums(w: &mut CodeWriter, ctx: &Ctx<'_>, module: &ModuleBinding) {
-    for e in module.enums.iter().filter(|e| !e.is_rich()) {
+/// Append every C-style enum as `enum class {Name} : int32_t`. Rich enums
+/// are value types, rendered with the records.
+pub(crate) fn render_cpp_enums(w: &mut CodeWriter, ctx: &Ctx<'_>) {
+    for e in ctx.model.enums.iter().filter(|e| !e.is_rich()) {
         w.doc(
             &type_doc(ctx, &e.doc, &e.deprecated),
             DocCommentStyle::Javadoc,
@@ -67,7 +67,7 @@ pub(crate) fn render_cpp_enums(w: &mut CodeWriter, ctx: &Ctx<'_>, module: &Modul
 /// together so a by-value member's type is complete before its holder.
 pub(crate) enum ValueDef<'a> {
     /// A record: a plain struct with typed members.
-    Record(&'a StructBinding),
+    Record(&'a RecordBinding),
     /// A rich enum: a `std::variant`-backed sum type.
     Rich(&'a EnumBinding),
 }
@@ -125,16 +125,14 @@ fn collect_value_deps(ty: &Ty, deps: &mut Vec<String>) {
 
 /// Every record and rich enum, ordered so anything a type holds is defined
 /// before it (depth-first post-order, declaration order breaking ties).
-pub(crate) fn value_types_in_order(modules: &[ModuleBinding]) -> Vec<ValueDef<'_>> {
-    let mut defs: Vec<Option<ValueDef<'_>>> = modules
+pub(crate) fn value_types_in_order(model: &Model) -> Vec<ValueDef<'_>> {
+    let records = model.records.iter().map(ValueDef::Record);
+    let rich = model
+        .enums
         .iter()
-        .flat_map(|m| {
-            let records = m.structs.iter().map(ValueDef::Record);
-            let rich = m.enums.iter().filter(|e| e.is_rich()).map(ValueDef::Rich);
-            records.chain(rich)
-        })
-        .map(Some)
-        .collect();
+        .filter(|e| e.is_rich())
+        .map(ValueDef::Rich);
+    let mut defs: Vec<Option<ValueDef<'_>>> = records.chain(rich).map(Some).collect();
     let deps: Vec<Vec<String>> = defs.iter().flatten().map(ValueDef::deps).collect();
     let index: HashMap<String, usize> = defs
         .iter()
@@ -242,7 +240,7 @@ fn render_equality(w: &mut CodeWriter, name: &str, fields: &[FieldBinding]) {
 /// equality. An interface-typed member is the RAII wrapper held by value,
 /// so copying the record shares the object and destroying it releases one
 /// reference.
-fn render_cpp_record(w: &mut CodeWriter, ctx: &Ctx<'_>, s: &StructBinding) {
+fn render_cpp_record(w: &mut CodeWriter, ctx: &Ctx<'_>, s: &RecordBinding) {
     w.doc(
         &type_doc(ctx, &s.doc, &s.deprecated),
         DocCommentStyle::Javadoc,
@@ -344,8 +342,8 @@ pub(crate) fn render_domain_error(w: &mut CodeWriter, ctx: &Ctx<'_>, table: &Err
     let domain = &table.type_name;
     let prefix = ctx.prefix;
     w.line(format!(
-        "/** The `{}` error domain of module `{}`: catch a code's class or this. */",
-        table.domain.name, table.module.dot_path
+        "/** The `{}` error domain: catch a code's class or this. */",
+        table.domain.name
     ));
     w.line(format!("class {domain} : public Error {{"));
     w.line("public:");
@@ -492,7 +490,7 @@ fn member_kinds(i: &InterfaceBinding) -> Vec<(&FnBinding, String, FnKind<'_>)> {
     let class = i.name.as_str();
     let mut members = Vec::new();
     for c in &i.constructors {
-        if c.name == "new" && matches!(c.shape, CallShape::Sync) && c.iterator().is_none() {
+        if c.name == "new" && matches!(c.shape, Shape::Sync) {
             members.push((c, class.to_string(), FnKind::Ctor { class }));
         } else {
             members.push((c, cpp_member_name(&c.name), FnKind::Static { class }));

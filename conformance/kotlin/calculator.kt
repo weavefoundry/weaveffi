@@ -1,4 +1,4 @@
-// Conformance consumer: calculator sample, Kotlin (JVM via JNI) target.
+// Conformance consumer: calculator sample, Kotlin (JVM over JNA) target.
 //
 // The getting-started surface through the generated `Calculator` object: a
 // direct-value call (wrapping at the `Int` edges), a throwing call that
@@ -8,22 +8,24 @@
 // an untyped `throws: any` failure (`FfiException` code -1), an optional
 // scalar return (`Double?`), and typed arrays in and out. Open domains: an
 // unknown positive code maps to the domain's base exception. Loading the
-// bindings checks the ABI revision and the `calculator` contract (see
+// bindings checks the ABI revision and every contract row (see
 // load_failure.kt for a failed load). Ends by asserting the producer's leak
-// counters are zero.
+// counters are zero. Compiled with `-Xfriend-paths`, so the bindings'
+// `internal` library handle and error factory are reachable.
 @file:JvmName("Main")
 
 import calculator.CalcException
 import calculator.Calculator
 import calculator.FfiException
-import calculator.JniBridge
+import calculator.Lib
 import calculator.NativeLibrary
 import calculator.ParseException
+import calculator.nativeError
 
 fun main() {
     NativeLibrary.load()
     NativeLibrary.load() // loading twice is a no-op
-    expect(JniBridge.debug_live(-1) == 1L, "the sample counts live allocations")
+    expect(Lib.c.calculator_debug_live(-1) == 1L, "the sample counts live allocations")
 
     expect(Calculator.add(2, 3) == 5, "add(2, 3)")
     expect(Calculator.add(-7, 7) == 0, "add(-7, 7)")
@@ -81,18 +83,18 @@ fun main() {
     // Open domains: a code these bindings don't know maps to the domain's
     // base exception with its code and message (domains 2 and 3 are
     // CalcError and ParseError, in declaration order).
-    val unknown = JniBridge.error(2, 77, "from the future".toByteArray(), null)
+    val unknown = nativeError(2, 77, "from the future", null)
     expect(
         unknown is CalcException && unknown !is CalcException.DivisionByZero && unknown.code == 77,
         "an unknown CalcError code is a plain CalcException (got $unknown)",
     )
     expect(unknown.message == "from the future", "the unknown code keeps its message")
-    val unknownParse = JniBridge.error(3, 1, "no payload".toByteArray(), null)
+    val unknownParse = nativeError(3, 1, "no payload", null)
     expect(
         unknownParse is ParseException && unknownParse !is ParseException.NotANumber,
         "a payload-less NotANumber falls back to the base ParseException (got $unknownParse)",
     )
 
-    expectNoLeaks(JniBridge::debug_live)
+    expectNoLeaks(Lib.c::calculator_debug_live)
     println("kotlin/calculator: OK")
 }

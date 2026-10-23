@@ -1,15 +1,15 @@
-"""Conformance consumer: calculator sample, Python target (ABI revision 5).
+"""Conformance consumer: calculator sample, Python target (ABI revision 6).
 
 The getting-started surface: direct `i32` arguments and returns (with
 wrapping, and range-checked before ctypes could truncate them), two error
-domains in one module whose codes share a value (`CalcError.DivisionByZero`
-and `ParseError.NotANumber` are both 1, told apart by the callable's
-domain), a `throws: any` function raising the root error with code -1, a
-string round trip (non-ASCII and astral text and an interior NUL survive,
-since strings cross as pointer + length), an optional `f64` return (crossing
-as a flag plus a value), and typed arrays in both directions (any sequence
-of numbers in; a list out). Importing the package already checked the ABI
-revision and the `calculator` contract table. Ends with the leak check (see
+domains whose codes share a value (`CalcError.DivisionByZero` and
+`ParseError.NotANumber` are both 1, told apart by the callable's domain), a
+`throws: any` function raising the root error with code -1, a string round
+trip (non-ASCII and astral text and an interior NUL survive, since strings
+cross as a run with a length), an optional `f64` return (crossing as an
+`_OptF64` structure), and typed arrays in both directions (any sequence of
+numbers in; a list out). Importing the package already checked the ABI
+revision and every declaration's contract. Ends with the leak check (see
 harness.py).
 """
 import array
@@ -107,14 +107,17 @@ def slices() -> None:
     raises(TypeError, lambda: calc.running_total(b"\x01\x02"), "bytes")
     raises(TypeError, lambda: calc.mean("12"), "str")  # type: ignore[arg-type]
 
-    # A typed array that isn't aligned for its element type is -3.
+    # A typed array that isn't aligned for its element type is -3, and so is
+    # one whose byte length isn't a multiple of the element size.
     raw = (ctypes.c_uint8 * 16)()
-    has = ctypes.c_double()
-    err = impl._ErrorStruct()
-    present = impl._c_calculator_mean(ctypes.addressof(raw) + 1, 1, ctypes.byref(has),
-                                      ctypes.byref(err))
-    code, message, _ = impl._read_error(err)
-    check(not present and code == -3, f"misaligned array: {code} {message!r}")
+    for ptr, length, what in [
+        (ctypes.addressof(raw) + 1, 8, "misaligned array"),
+        (ctypes.addressof(raw), 12, "ragged array"),
+    ]:
+        err = impl._ErrorStruct()
+        got = impl._c_mean(impl._Run(ptr, length), ctypes.byref(err))
+        code, message, _ = impl._read_error(err)
+        check(not got.has and code == -3, f"{what}: {code} {message!r}")
 
 
 def main() -> None:

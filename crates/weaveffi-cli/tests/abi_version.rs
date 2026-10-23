@@ -6,7 +6,7 @@
 #[test]
 fn runtime_and_generator_abi_revisions_agree() {
     assert_eq!(
-        weaveffi::abi::ABI_VERSION,
+        weaveffi::__rt::ABI_VERSION,
         weaveffi_model::model::ABI_VERSION
     );
 }

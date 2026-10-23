@@ -1,7 +1,8 @@
 //! Property tests for the value-buffer codec.
 //!
-//! Every `BufferValue` implementation must satisfy two laws that the
-//! generated thunks and every language runtime rely on:
+//! Every type's value-buffer encoding (`FfiType::write` and `read`) must
+//! satisfy two laws that the generated thunks and every language runtime
+//! rely on:
 //!
 //! 1. **Round trip**: `decode(encode(v)) == v` for every well-typed value.
 //! 2. **Self-delimiting**: a value's encoding is consumed exactly, so two
@@ -10,25 +11,38 @@
 //!    than silently ignoring them.
 //!
 //! A third family checks that arbitrary byte soup never panics the reader:
-//! it either decodes or returns `BufferDecodeError`.
+//! it either decodes or returns an error.
 
 #![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
-use weaveffi::abi::{encode_value, BufferDecodeError, BufferReader, BufferValue, BufferWriter};
+use weaveffi::__rt::{
+    self as rt, BufferDecodeError, BufferReader, BufferWriter, Codec, FfiType, Name, Run,
+};
 
-/// Decode a buffer of a type without object tokens, which no input can make
-/// unsound.
-fn decode_value<T: BufferValue>(data: &[u8]) -> Result<T, BufferDecodeError> {
-    // SAFETY: the types these tests decode carry no object tokens.
-    unsafe { weaveffi::abi::decode_value(data) }
+/// The tag these tests implement the codec under: any type works for the
+/// built-in types, and a local one for the hand-rolled record.
+type Tag = ();
+
+/// The value-buffer encoding of `value`.
+fn encode_value<T: FfiType<Tag>>(value: &T) -> Vec<u8> {
+    rt::encode(|w| value.write(w))
+}
+
+/// Decode a whole buffer of a type without object tokens, which no input
+/// can make unsound.
+fn decode_value<T: FfiType<Tag>>(data: &[u8]) -> Result<T, String> {
+    // SAFETY: the types these tests decode carry no object tokens, and the
+    // run borrows `data` for the call.
+    unsafe { rt::decode_run(Run::borrowing(data), |r| T::read(r)) }
+        .map_err(|e| unsafe { e.message_str() }.unwrap_or_default().to_string())
 }
 
 /// A hand-rolled record covering every scalar, the two byte-oriented shapes,
-/// and the three containers, nested two deep. Mirrors what
-/// `#[weaveffi::record]` expands to, without depending on the macro crate.
+/// and the three containers, nested two deep: what `#[weaveffi::record]`
+/// expands to, without depending on the macro crate.
 #[derive(Debug, Clone, PartialEq)]
 struct Composite {
     flag: bool,
@@ -49,99 +63,63 @@ struct Composite {
     map: BTreeMap<String, i32>,
     nested: Vec<Option<Vec<u8>>>,
     deep: BTreeMap<i64, Vec<Option<String>>>,
+    floats: Vec<f64>,
 }
 
-impl BufferValue for Composite {
-    fn write_value(&self, w: &mut BufferWriter) {
-        self.flag.write_value(w);
-        self.tiny.write_value(w);
-        self.byte.write_value(w);
-        self.short.write_value(w);
-        self.ushort.write_value(w);
-        self.int.write_value(w);
-        self.uint.write_value(w);
-        self.long.write_value(w);
-        self.ulong.write_value(w);
-        self.single.write_value(w);
-        self.double.write_value(w);
-        self.text.write_value(w);
-        w.write_bytes(&self.blob);
-        self.maybe.write_value(w);
-        self.list.write_value(w);
-        self.map.write_value(w);
-        w.write_len(self.nested.len());
-        for item in &self.nested {
-            match item {
-                Some(b) => {
-                    w.write_option_flag(true);
-                    w.write_bytes(b);
-                }
-                None => w.write_option_flag(false),
-            }
-        }
-        self.deep.write_value(w);
+impl Codec<Tag> for Composite {
+    const NAME: Name = Name::new("Composite");
+
+    fn encode(&self, w: &mut BufferWriter) {
+        FfiType::<Tag>::write(&self.flag, w);
+        FfiType::<Tag>::write(&self.tiny, w);
+        FfiType::<Tag>::write(&self.byte, w);
+        FfiType::<Tag>::write(&self.short, w);
+        FfiType::<Tag>::write(&self.ushort, w);
+        FfiType::<Tag>::write(&self.int, w);
+        FfiType::<Tag>::write(&self.uint, w);
+        FfiType::<Tag>::write(&self.long, w);
+        FfiType::<Tag>::write(&self.ulong, w);
+        FfiType::<Tag>::write(&self.single, w);
+        FfiType::<Tag>::write(&self.double, w);
+        FfiType::<Tag>::write(&self.text, w);
+        FfiType::<Tag>::write(&self.blob, w);
+        FfiType::<Tag>::write(&self.maybe, w);
+        FfiType::<Tag>::write(&self.list, w);
+        FfiType::<Tag>::write(&self.map, w);
+        FfiType::<Tag>::write(&self.nested, w);
+        FfiType::<Tag>::write(&self.deep, w);
+        FfiType::<Tag>::write(&self.floats, w);
     }
 
-    unsafe fn read_value(
-        r: &mut BufferReader<'_>,
-    ) -> Result<Self, weaveffi::abi::BufferDecodeError> {
+    unsafe fn decode(r: &mut BufferReader<'_>) -> Result<Self, BufferDecodeError> {
         // SAFETY: none of these types carries an object token.
-        unsafe { Self::read_fields(r) }
+        unsafe {
+            Ok(Self {
+                flag: FfiType::<Tag>::read(r)?,
+                tiny: FfiType::<Tag>::read(r)?,
+                byte: FfiType::<Tag>::read(r)?,
+                short: FfiType::<Tag>::read(r)?,
+                ushort: FfiType::<Tag>::read(r)?,
+                int: FfiType::<Tag>::read(r)?,
+                uint: FfiType::<Tag>::read(r)?,
+                long: FfiType::<Tag>::read(r)?,
+                ulong: FfiType::<Tag>::read(r)?,
+                single: FfiType::<Tag>::read(r)?,
+                double: FfiType::<Tag>::read(r)?,
+                text: FfiType::<Tag>::read(r)?,
+                blob: FfiType::<Tag>::read(r)?,
+                maybe: FfiType::<Tag>::read(r)?,
+                list: FfiType::<Tag>::read(r)?,
+                map: FfiType::<Tag>::read(r)?,
+                nested: FfiType::<Tag>::read(r)?,
+                deep: FfiType::<Tag>::read(r)?,
+                floats: FfiType::<Tag>::read(r)?,
+            })
+        }
     }
 }
 
-impl Composite {
-    unsafe fn read_fields(
-        r: &mut BufferReader<'_>,
-    ) -> Result<Self, weaveffi::abi::BufferDecodeError> {
-        let flag = bool::read_value(r)?;
-        let tiny = i8::read_value(r)?;
-        let byte = u8::read_value(r)?;
-        let short = i16::read_value(r)?;
-        let ushort = u16::read_value(r)?;
-        let int = i32::read_value(r)?;
-        let uint = u32::read_value(r)?;
-        let long = i64::read_value(r)?;
-        let ulong = u64::read_value(r)?;
-        let single = f32::read_value(r)?;
-        let double = f64::read_value(r)?;
-        let text = String::read_value(r)?;
-        let blob = r.read_bytes()?;
-        let maybe = Option::<i64>::read_value(r)?;
-        let list = Vec::<String>::read_value(r)?;
-        let map = BTreeMap::<String, i32>::read_value(r)?;
-        let count = r.read_len()?;
-        let mut nested = Vec::with_capacity(count.min(r.remaining()));
-        for _ in 0..count {
-            nested.push(if r.read_option_flag()? {
-                Some(r.read_bytes()?)
-            } else {
-                None
-            });
-        }
-        let deep = BTreeMap::<i64, Vec<Option<String>>>::read_value(r)?;
-        Ok(Self {
-            flag,
-            tiny,
-            byte,
-            short,
-            ushort,
-            int,
-            uint,
-            long,
-            ulong,
-            single,
-            double,
-            text,
-            blob,
-            maybe,
-            list,
-            map,
-            nested,
-            deep,
-        })
-    }
-}
+weaveffi::__weaveffi_buffered!(Tag, Composite);
 
 /// Floats are compared bitwise so NaN payloads survive the round trip too.
 fn finite_or_special_f32() -> impl Strategy<Value = f32> {
@@ -194,12 +172,13 @@ fn composite() -> impl Strategy<Value = Composite> {
                 proptest::collection::vec(proptest::option::of(".{0,6}"), 0..4),
                 0..4,
             ),
+            proptest::collection::vec(finite_or_special_f64(), 0..8),
         ),
     )
         .prop_map(
             |(
                 (flag, tiny, byte, short, ushort, int, uint, long, ulong, single, double),
-                (text, blob, maybe, list, map, nested, deep),
+                (text, blob, maybe, list, map, nested, deep, floats),
             )| Composite {
                 flag,
                 tiny,
@@ -219,6 +198,7 @@ fn composite() -> impl Strategy<Value = Composite> {
                 map,
                 nested,
                 deep,
+                floats,
             },
         )
 }
@@ -243,6 +223,11 @@ fn same_composite(a: &Composite, b: &Composite) -> bool {
         && a.map == b.map
         && a.nested == b.nested
         && a.deep == b.deep
+        && a.floats.len() == b.floats.len()
+        && a.floats
+            .iter()
+            .zip(&b.floats)
+            .all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 proptest! {
@@ -261,11 +246,36 @@ proptest! {
         bytes.extend(encode_value(&b));
         let mut r = BufferReader::new(&bytes);
         // SAFETY: `Composite` carries no object tokens.
-        let first = unsafe { Composite::read_value(&mut r) }.expect("first");
-        let second = unsafe { Composite::read_value(&mut r) }.expect("second");
+        let first = unsafe { <Composite as FfiType<Tag>>::read(&mut r) }.expect("first");
+        let second = unsafe { <Composite as FfiType<Tag>>::read(&mut r) }.expect("second");
         r.expect_end().expect("exactly two values");
         prop_assert!(same_composite(&a, &first));
         prop_assert!(same_composite(&b, &second));
+    }
+
+    #[test]
+    fn values_lower_to_a_run_and_lift_back(value in composite()) {
+        // The path a record return takes: lowered into one 8-aligned run,
+        // which the receiver decodes and releases.
+        let run = <Composite as FfiType<Tag>>::lower(value.clone());
+        prop_assert_eq!(run.ptr as usize % 8, 0);
+        prop_assert_eq!(unsafe { run.bytes() }.unwrap(), &encode_value(&value)[..]);
+        let back = unsafe { <Composite as FfiType<Tag>>::adopt(run) }.unwrap();
+        prop_assert!(same_composite(&value, &back));
+    }
+
+    #[test]
+    fn numeric_lists_are_packed_little_endian(xs in proptest::collection::vec(any::<i64>(), 0..32)) {
+        let packed: Vec<u8> = xs.iter().flat_map(|x| x.to_le_bytes()).collect();
+        // As a value, a typed array: the packed elements, `len` in bytes.
+        let run = <Vec<i64> as FfiType<Tag>>::lower(xs.clone());
+        prop_assert_eq!(run.len, packed.len());
+        prop_assert_eq!(unsafe { run.bytes() }.unwrap(), &packed[..]);
+        prop_assert_eq!(unsafe { <Vec<i64> as FfiType<Tag>>::adopt(run) }.unwrap(), xs.clone());
+        // Inside a buffer: a `u32` count, then the packed elements.
+        let mut expected = (xs.len() as u32).to_le_bytes().to_vec();
+        expected.extend(packed);
+        prop_assert_eq!(encode_value(&xs), expected);
     }
 
     #[test]

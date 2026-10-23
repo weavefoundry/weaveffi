@@ -55,9 +55,25 @@ static inline void {{p}}_bytes_free({{p}}_bytes* b) {
     b->len = 0;
 }
 
+/* A string view as a run to pass to a call (borrowed for the call). */
+static inline {{p}}_run {{p}}_str_run({{p}}_str s) {
+    {{p}}_run r;
+    r.ptr = (const uint8_t*)s.ptr;
+    r.len = s.len;
+    return r;
+}
+
+/* A byte string view as a run to pass to a call (borrowed for the call). */
+static inline {{p}}_run {{p}}_bytes_run({{p}}_bytes b) {
+    {{p}}_run r;
+    r.ptr = b.ptr;
+    r.len = b.len;
+    return r;
+}
+
 /* A growable output buffer. Zero-initialize it, write values, pass
-   `ptr`/`len` to the call, then release it with {{p}}_writer_free. An
-   allocation failure sets `failed` and turns later writes into no-ops. */
+   {{p}}_writer_run(&w) to the call, then release it with {{p}}_writer_free.
+   An allocation failure sets `failed` and turns later writes into no-ops. */
 typedef struct {{p}}_writer {
     uint8_t* ptr;
     size_t len;
@@ -71,6 +87,14 @@ static inline void {{p}}_writer_free({{p}}_writer* w) {
     w->len = 0;
     w->cap = 0;
     w->failed = false;
+}
+
+/* The bytes written so far, as a run borrowed for one call. */
+static inline {{p}}_run {{p}}_writer_run(const {{p}}_writer* w) {
+    {{p}}_run r;
+    r.ptr = w->ptr;
+    r.len = w->len;
+    return r;
 }
 
 static inline void {{p}}_writer_put_raw({{p}}_writer* w, const void* data, size_t n) {

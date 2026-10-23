@@ -9,6 +9,10 @@ members = [
     "samples/codec",
     "crates/weaveffi-cli/tests/fixtures/producer",
     "crates/weaveffi-fuzz",
+    "xtask",
+    "examples/getting-started",
+    "examples/macro-tour",
+    "examples/idl",
 ]
 resolver = "2"
 
@@ -39,7 +43,7 @@ clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 camino = { version = "1.1", features = ["serde1"] }
 heck = "0.5"
-syn = { version = "2.0", features = ["full", "parsing", "visit"] }
+syn = { version = "2.0", features = ["full", "parsing", "visit", "visit-mut"] }
 quote = "1.0"
 similar = "2.0"
 tempfile = "3"

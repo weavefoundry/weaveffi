@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Shared environment and helpers for the per-language conformance scripts.
 #
-# conformance/run.sh exports ROOT, TARGET_DIR, LIBDIR, GENROOT, OUT, EXT, and
-# RESULTS before invoking each conformance/<lang>/run.sh; a language script can
-# also be run directly after a full run has built the producers and generated
-# the bindings once.
+# `cargo xtask conformance` (conformance/run.sh) exports ROOT, TARGET_DIR,
+# LIBDIR, GENROOT, OUT, EXT, and RESULTS before invoking each
+# conformance/<lang>/run.sh; a language script can also be run directly after
+# a full run has built the producers and generated the bindings once.
 #
 # Each lane runs under a timeout (LANE_TIMEOUT seconds, default 300) so one
 # deadlocked consumer fails its lane instead of hanging the whole run.

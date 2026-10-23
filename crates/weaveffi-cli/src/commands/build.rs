@@ -1,6 +1,6 @@
-//! `weaveffi build`: cross-compile the Rust producer for each platform and
-//! prebuild the per-language C glue, laying everything out in
-//! `{target_dir}/weaveffi/<platform>/` for `weaveffi package`.
+//! `weaveffi build`: cross-compile the Rust producer for each platform,
+//! laying the libraries out in `{target_dir}/weaveffi/<platform>/` for
+//! `weaveffi package`.
 
 use std::process::ExitCode;
 
@@ -9,12 +9,10 @@ use miette::{bail, miette, Result};
 use weaveffi_model::model::Model;
 
 use super::Locate;
-use crate::build::glue::{self, one_line};
-use crate::build::{BuildSettings, Builder};
+use crate::build::{one_line, BuildSettings, Builder};
 use crate::package::Skips;
 use crate::platform::{BinarySet, Platform};
 use crate::project::{Project, Source};
-use crate::targets::Target;
 
 /// Options for [`cmd_build`].
 pub struct BuildArgs<'a> {
@@ -22,8 +20,6 @@ pub struct BuildArgs<'a> {
     pub locate: Locate<'a>,
     /// `--platforms`.
     pub platforms: Option<&'a str>,
-    /// `--target`.
-    pub targets: Option<&'a [String]>,
     /// `--manifest-path`.
     pub manifest_path: Option<&'a str>,
     /// `--warn`.
@@ -35,13 +31,14 @@ pub struct BuildArgs<'a> {
 /// Run `weaveffi build`.
 pub fn cmd_build(args: &BuildArgs<'_>) -> Result<ExitCode> {
     let project = args.locate.project()?;
-    let targets = project.config.targets(args.targets)?;
     let platforms = resolve_platforms(args.platforms, &project)?;
-    let settings = project.config.build.settings(args.locate.profile);
+    let settings = project
+        .config
+        .build
+        .settings(args.locate.profile, args.locate.features);
     let skips = Skips::default();
     let built = build_project(
         &project,
-        &targets,
         &platforms,
         &settings,
         args.manifest_path,
@@ -52,7 +49,7 @@ pub fn cmd_build(args: &BuildArgs<'_>) -> Result<ExitCode> {
         println!("Built `{}` into {}", built.binaries.lib_name, built.dir);
         for nb in &built.binaries.binaries {
             let mut files = vec![nb.library.file_name().unwrap_or_default().to_string()];
-            for extra in [&nb.staticlib, &nb.node_addon, &nb.jni_shim]
+            for extra in [&nb.staticlib, &nb.import_library]
                 .into_iter()
                 .flatten()
                 .filter(|p| **p != nb.library)
@@ -122,16 +119,12 @@ pub(crate) fn model_from_binaries(
     super::load_model(&project.clone().library(first.library.clone())?, warn)
 }
 
-/// Build the project's producer for every platform, then prebuild the
-/// [`glue`](Target::glue) of the selected targets. Every platform is
+/// Build the project's producer for every platform. Every platform is
 /// checked before anything compiles; one this machine can't build (a
-/// missing rustup target or NDK) is skipped and recorded in `skips`, and so
-/// is glue the host can't compile (the packages then fall back to compiling
-/// it at install or build time). A Rust producer's API is read from the
-/// first library built.
+/// missing rustup target or NDK) is skipped and recorded in `skips`. A Rust
+/// producer's API is read from the first library built.
 pub(crate) fn build_project(
     project: &Project,
-    targets: &[Box<dyn Target>],
     platforms: &[Platform],
     settings: &BuildSettings,
     manifest: Option<&str>,
@@ -180,15 +173,9 @@ pub(crate) fn build_project(
         None => model_from_binaries(project, &binaries, warn)?,
     };
 
-    let dir = krate.weaveffi_dir();
-    for target in targets {
-        if let Some(g) = target.glue(&model) {
-            glue::prebuild(&g, &dir, &mut binaries, &builder, settings, skips)?;
-        }
-    }
     Ok(Built {
         binaries,
-        dir,
+        dir: krate.weaveffi_dir(),
         model,
     })
 }

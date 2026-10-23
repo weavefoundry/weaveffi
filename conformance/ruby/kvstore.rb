@@ -6,7 +6,7 @@
 # The `Store` class (a throwing factory, the `new` constructor, methods,
 # statics, the deprecated `size`, close), typed `KvError`s with their
 # payload fields, records with bytes, optional, list, and map fields, lazy
-# iterators of strings, records, and objects, three callback interfaces
+# iterators of strings, records, and objects, four callback interfaces
 # implemented in Ruby (a `Listener` that is retained, filtered, detached
 # when it raises, and called from a producer thread during compaction; a
 # `Policy` with an optional-scalar parameter and return, a record return, a
@@ -17,10 +17,11 @@
 # arrays), objects in every buffered position, blocking async calls with
 # `cancel:` tokens (also under a Fiber scheduler, where the waits overlap),
 # optional scalars and typed arrays as returns, async results, and iterator
-# elements, a `throws: any` method, the nested `kv.stats` module, the
-# sibling `report` root, and leak-free teardown (including an external
-# enumeration abandoned midway, released at GC). `debug_live(1)` (live
-# callbacks) shows when the producer released an implementation.
+# elements, a `throws: any` method, the declarations from the sample's
+# `stats` and `report` Rust modules (one namespace), and leak-free teardown
+# (including an external enumeration abandoned midway, released at GC).
+# `debug_live(1)` (live callbacks) shows when the producer released an
+# implementation.
 
 require_relative 'support'
 require 'kvstore'
@@ -531,8 +532,8 @@ class Sizer
   end
 end
 
-def abi5_shapes
-  s = Store.open('/abi5')
+def direct_families
+  s = Store.open('/direct')
   put(s, 'b', '12')
   put(s, 'a', "\x01\x02\x03", EntryKind::VOLATILE, 7)
   expect(s.count == 2, 'two entries')
@@ -588,7 +589,7 @@ end
 
 run_and_check_leaks(Kvstore) do
   main = Thread.current
-  expect(Kvstore::ABI_VERSION == 5, 'bindings target ABI revision 5')
+  expect(Kvstore::ABI_VERSION == 6, 'bindings target ABI revision 6')
   constructors
   basics
   iterators
@@ -598,7 +599,7 @@ run_and_check_leaks(Kvstore) do
   async_calls(main)
   object_graph
   stats_and_report
-  abi5_shapes
+  direct_families
   fibers
   expect(callbacks.zero?, 'every callback implementation was released')
 end

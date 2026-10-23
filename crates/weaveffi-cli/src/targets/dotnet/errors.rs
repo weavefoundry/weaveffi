@@ -3,8 +3,7 @@
 
 use heck::ToLowerCamelCase;
 use weaveffi_model::errors::pascal;
-use weaveffi_model::model::{FieldBinding, Model};
-use weaveffi_model::plan::ErrorStrategy;
+use weaveffi_model::model::{ErrorCodeBinding, ErrorStrategy, FieldBinding, Model};
 
 use crate::codegen::errors::{tables, ErrorTable};
 use crate::codegen::CodeWriter;
@@ -97,8 +96,8 @@ fn render_domain(w: &mut CodeWriter, table: &ErrorTable<'_>, docs: &Docs, cx: Cx
     let exc = &table.type_name;
     let base = cx.base;
     w.line(format!(
-        "/// <summary>The errors of the <c>{}</c> domain, declared by module <c>{}</c>.",
-        table.domain.name, table.module.dot_path
+        "/// <summary>The errors of the <c>{}</c> domain.",
+        table.domain.name
     ));
     w.line("/// Catch a nested class for one code, or this class for any of them. A code");
     w.line("/// these bindings don't know (one the library added later) surfaces as this");
@@ -120,7 +119,7 @@ fn render_domain(w: &mut CodeWriter, table: &ErrorTable<'_>, docs: &Docs, cx: Cx
             } else {
                 w.line(format!("/// <summary>{}</summary>", xml_text(&row.code.message)));
             }
-            render_code_class(w, exc, &class, row.code.value, &row.code.message, &row.code.fields, docs);
+            render_code_class(w, exc, &class, row.code, docs);
         }
         w.line("/// <summary>The exception for a raw code and its payload: a typed code");
         w.line("/// class, this class for a code it doesn't know (or a payload that doesn't");
@@ -179,11 +178,10 @@ fn render_code_class(
     w: &mut CodeWriter,
     exc: &str,
     class: &str,
-    value: i32,
-    message: &str,
-    fields: &[FieldBinding],
+    code: &ErrorCodeBinding,
     docs: &Docs,
 ) {
+    let (value, message, fields) = (code.value, &code.message, &code.fields);
     w.line(format!("public sealed class {class} : {exc}"));
     w.block("{", "}", |w| {
         w.line(format!(
@@ -215,9 +213,9 @@ fn render_code_class(
             xml_text(message)
         ));
         w.line(format!(
-            "public {class}({}) : base(ErrorCode, message ?? \"{}\")",
+            "public {class}({}) : base(ErrorCode, message ?? {})",
             params.join(", "),
-            cs_str(message)
+            default_message(message, fields)
         ));
         w.block("{", "}", |w| {
             for f in fields {
@@ -242,6 +240,41 @@ fn render_code_class(
     w.blank();
 }
 
+/// The C# expression of a code's default message: the IDL message as a
+/// string literal, or, when it names the code's fields (`key not found:
+/// {key}`), an interpolated string filling them from the constructor's
+/// parameters.
+fn default_message(message: &str, fields: &[FieldBinding]) -> String {
+    let mut out = String::new();
+    let mut interpolated = false;
+    let mut rest = message;
+    while let Some(open) = rest.find('{') {
+        let (before, after) = rest.split_at(open);
+        out.push_str(&cs_str(before).replace('}', "}}"));
+        let field = after[1..]
+            .find('}')
+            .map(|close| &after[1..=close])
+            .and_then(|name| fields.iter().find(|f| f.name == name));
+        match field {
+            Some(f) => {
+                out.push_str(&format!("{{{}}}", param_name(f)));
+                rest = &after[f.name.len() + 2..];
+                interpolated = true;
+            }
+            None => {
+                out.push_str("{{");
+                rest = &after[1..];
+            }
+        }
+    }
+    out.push_str(&cs_str(rest).replace('}', "}}"));
+    if interpolated {
+        format!("$\"{out}\"")
+    } else {
+        format!("\"{}\"", cs_str(message))
+    }
+}
+
 /// A code field's constructor parameter.
 fn param_name(f: &FieldBinding) -> String {
     let name = f.name.to_lower_camel_case();
@@ -249,5 +282,34 @@ fn param_name(f: &FieldBinding) -> String {
         "message_".into()
     } else {
         safe_cs_name(&name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use weaveffi_model::ty::{Prim, Ty};
+
+    #[test]
+    fn default_messages_fill_in_their_fields() {
+        let field = |name: &str| FieldBinding {
+            name: name.into(),
+            doc: None,
+            ty: Ty::Prim(Prim::String),
+        };
+        let fields = [field("key"), field("class")];
+        assert_eq!(
+            default_message("plain \"x\"", &fields),
+            "\"plain \\\"x\\\"\""
+        );
+        assert_eq!(
+            default_message("key not found: {key}", &fields),
+            "$\"key not found: {key}\""
+        );
+        assert_eq!(
+            default_message("{class} in {other} }", &fields),
+            "$\"{@class} in {{other}} }}\""
+        );
+        assert_eq!(default_message("{other}", &fields), "\"{other}\"");
     }
 }

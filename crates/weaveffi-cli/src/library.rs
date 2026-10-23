@@ -1,8 +1,7 @@
 //! Reading a Rust producer's API out of its built library.
 //!
-//! The `#[weaveffi::module]` macro embeds one metadata
-//! [`Frame`] per declaration in the producer's
-//! library. [`read_frames`] finds them with the `object` crate: in a native
+//! The producer macros embed one metadata [`Frame`] per declaration in the
+//! producer's library. [`read_frames`] finds them with the `object` crate: in a native
 //! library (ELF, Mach-O, or PE, or every member of a static archive) by
 //! walking the symbol tables for the `{PREFIX}_META_{HASH16}` statics and
 //! reading each one's bytes from the section that holds it; in a `.wasm`

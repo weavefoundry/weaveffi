@@ -12,38 +12,42 @@ use weaveffi_model::validate::validate;
 
 use crate::targets::dotnet::{DotnetConfig, DotnetGenerator};
 
-/// A `bus` module whose names collide with what the generated C# declares
-/// or reserves: a record field spelled like its record and like synthesized
+/// An API whose names collide with what the generated C# declares or
+/// reserves: a record field spelled like its record and like synthesized
 /// record members, keyword parameters, an interface member spelled like the
-/// wrapper's `Dispose`, a code field spelled like `Exception.Message`, and a
-/// record named like the runtime's root exception.
+/// wrapper's `Dispose`, a code field spelled like `Exception.Message`, a
+/// record named like the runtime's root exception, and a function spelled
+/// like the library class's `Check`.
 const FIXTURE: &str = r#"
-version: "0.12.0"
-modules:
-  - name: bus
-    errors:
-      - name: BusError
-        codes:
-          - { name: Closed, code: 1, message: "bus \"closed\"" }
-          - { name: Full, code: 2, message: "bus full", fields: [{ name: message, type: string }] }
-    structs:
-      - name: Token
-        fields:
-          - { name: token, type: i64 }
-          - { name: to_string, type: string }
-          - { name: tags, type: "[string]" }
-      - name: NativeException
-        fields:
-          - { name: code, type: i32 }
-    interfaces:
-      - name: Ticker
-        constructors:
-          - { name: new, params: [{ name: start, type: i32 }] }
-        methods:
-          - { name: dispose, params: [{ name: class, type: bool }] }
-          - { name: ticker, return: i32 }
-    functions:
-      - { name: send, params: [{ name: event, type: string }, { name: in, type: "i32?" }], return: Token, throws: BusError }
+version: "0.13.0"
+errors:
+  - name: BusError
+    codes:
+      - { name: Closed, code: 1, message: "bus \"closed\"" }
+      - { name: Full, code: 2, message: "bus full", fields: [{ name: message, type: string }] }
+records:
+  - name: Token
+    fields:
+      - { name: token, type: i64 }
+      - { name: to_string, type: string }
+      - { name: tags, type: "[string]" }
+  - name: NativeException
+    fields:
+      - { name: code, type: i32 }
+interfaces:
+  - name: Ticker
+    constructors:
+      - { name: new, params: [{ name: start, type: i32 }] }
+    methods:
+      - { name: dispose, params: [{ name: class, type: bool }] }
+      - { name: ticker, return: i32 }
+callbacks:
+  - name: Watcher
+    methods:
+      - { name: seen, params: [{ name: ok, type: bool }, { name: at, type: "u64?" }, { name: data, type: "[f32]" }], return: "bool?" }
+functions:
+  - { name: send, params: [{ name: event, type: string }, { name: in, type: "i32?" }], return: Token, throws: BusError }
+  - { name: check, params: [{ name: watcher, type: "Watcher?" }, { name: flags, type: "[u16]" }], return: "[u16]" }
 "#;
 
 fn fixture() -> Model {
@@ -95,8 +99,8 @@ fn names_come_from_the_identity() {
         "internal const string LibraryEnvVar = \"BUS_LIB_LIBRARY\";",
     );
     assert_has(&runtime, "\"bus_lib_abi_version\"");
-    assert_has(&runtime, "public static class BusLibLibrary");
-    assert_has(&runtime, "public const uint AbiVersion = 5;");
+    assert_has(&runtime, "public static partial class BusLibLibrary");
+    assert_has(&runtime, "public const uint AbiVersion = 6;");
     assert!(
         !runtime.contains("{{"),
         "unreplaced placeholder:\n{runtime}"
@@ -132,7 +136,11 @@ fn configured_namespace_wins() {
     // The library class takes the namespace's last segment.
     assert_has(
         &file(&files, "Runtime.cs"),
-        "public static class BusLibrary",
+        "public static partial class BusLibrary",
+    );
+    assert_has(
+        &file(&files, "Acme.Bus.cs"),
+        "public static unsafe partial class BusLibrary",
     );
 }
 
@@ -159,6 +167,11 @@ fn identifiers_are_escaped() {
     // Keywords are verbatim identifiers; locals derive from the bare name.
     assert_has(&api, "public static Token Send(string @event, int? @in)");
     assert_has(&api, "using var eventUtf8 = new FfiUtf8(@event);");
+    // A free function spelled like the library class's `Check`.
+    assert_has(
+        &api,
+        "public static ushort[] Check_(IWatcher? watcher, ReadOnlySpan<ushort> flags)",
+    );
     assert_has(&api, "public void Dispose_(bool @class)");
     assert_has(&api, "public int Ticker_()");
     // A code field spelled like `Exception.Message` and a quoted message.
@@ -168,6 +181,47 @@ fn identifiers_are_escaped() {
         "public Full(string message_, string? message = null) : base(ErrorCode, message ?? \"bus full\")",
     );
     assert_has(&api, "message ?? \"bus \\\"closed\\\"\"");
+}
+
+#[test]
+fn every_value_crosses_as_one_c_value() {
+    let api = file(&render_files(&DotnetConfig::default()), "BusLib.cs");
+    // A string is a run over pooled UTF-8, an optional scalar its opt
+    // struct, and a C `bool` one byte, never C#'s `bool`.
+    assert_has(
+        &api,
+        "new FfiRun(eventPtr, eventUtf8.Length), FfiOptI32.Of(@in), &ffiErr",
+    );
+    assert_has(
+        &api,
+        "internal static partial FfiRun bus_lib_send(FfiRun @event, FfiOptI32 @in, FfiError* out_err);",
+    );
+    assert_has(
+        &api,
+        "internal static partial void bus_lib_Ticker_dispose(global::BusLib.Ticker.NativeHandle self, byte @class, FfiError* out_err);",
+    );
+    assert_has(&api, "Ffi.Bool(@class)");
+    // A typed array is pinned in place, its length in bytes, and comes back
+    // as an array; a callback interface is one by-value struct.
+    assert_has(&api, "fixed (ushort* flagsPtr = flags)");
+    assert_has(
+        &api,
+        "new FfiCallback(watcherCtx, watcher == null ? IntPtr.Zero : FfiWatcherVtable.Pointer), \
+         new FfiRun((byte*)flagsPtr, (nuint)flags.Length * 2), &ffiErr",
+    );
+    assert_has(&api, "return Ffi.TakeArray<ushort>(ffiResult);");
+    // A callback method receives and returns one C value per value.
+    assert_has(
+        &api,
+        "public delegate* unmanaged[Cdecl]<IntPtr, byte, FfiOptU64, FfiRun, FfiError*, FfiOptBool> seen;",
+    );
+    assert_has(
+        &api,
+        "return FfiOptBool.Of(Ffi.Target<IWatcher>(ffi_ctx).Seen(ffi_ok != 0, ffi_at.ToNullable(), Ffi.Borrow<float>(ffi_data)));",
+    );
+    // The contract: one row per declaration.
+    assert_has(&api, "(\"bus_lib_contract_");
+    assert_has(&api, "\"Ticker.dispose\"), // method dispose(bool) -> void");
 }
 
 #[test]

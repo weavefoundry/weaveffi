@@ -1,0 +1,19 @@
+version: "0.13.0"
+imports:
+  - units.yml
+records:
+  - name: Shape
+    doc: A shape, in units, with its measured detail.
+    fields:
+      - { name: sides, type: i32 }
+      - { name: unit, type: Unit, doc: An enum from the next import }
+      - { name: detail, type: Detail, doc: A record from the importing file }
+functions:
+  - name: make_shape
+    doc: Construct a Shape.
+    params:
+      - { name: sides, type: i32 }
+    return: Shape
+  - name: describe
+    doc: A function in an import returning a record of the importing file.
+    return: Canvas

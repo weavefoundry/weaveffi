@@ -159,12 +159,10 @@ fn inline_package_block_in_idl_is_an_error() {
     fs::write(
         &idl,
         concat!(
-            "version: \"0.12.0\"\n",
+            "version: \"0.13.0\"\n",
             "package:\n",
             "  name: legacy\n",
-            "modules:\n",
-            "  - name: m\n",
-            "    functions: []\n",
+            "functions: []\n",
         ),
     )
     .unwrap();
@@ -234,12 +232,10 @@ fn idl_c_prefix_reaches_every_target() {
     fs::write(
         &idl,
         concat!(
-            "version: \"0.12.0\"\n",
-            "modules:\n",
-            "  - name: calculator\n",
-            "    functions:\n",
-            "      - { name: add, params: [{ name: a, type: i32 }, { name: b, type: i32 }], return: i32 }\n",
-            "      - { name: echo, params: [{ name: s, type: string }], return: string }\n",
+            "version: \"0.13.0\"\n",
+            "functions:\n",
+            "  - { name: add, params: [{ name: a, type: i32 }, { name: b, type: i32 }], return: i32 }\n",
+            "  - { name: echo, params: [{ name: s, type: string }], return: string }\n",
         ),
     )
     .unwrap();
@@ -254,7 +250,7 @@ fn idl_c_prefix_reaches_every_target() {
     for target in all_targets() {
         let tree = read_tree(&out.join(target));
         assert!(
-            tree.contains("myffi_calculator_add"),
+            tree.contains("myffi_add"),
             "target `{target}` did not use the identity's C prefix"
         );
         assert!(

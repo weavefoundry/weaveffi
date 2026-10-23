@@ -77,7 +77,7 @@ fn generating_from_the_library_matches_generating_from_its_idl() {
     let header = "c/producer_fixture.h";
     let a = std::fs::read_to_string(from_library.join(header)).unwrap();
     let b = std::fs::read_to_string(from_idl.join(header)).unwrap();
-    assert!(a.contains("producer_fixture_shop_Cart_total"), "{a}");
+    assert!(a.contains("producer_fixture_Cart_total"), "{a}");
     assert_eq!(a, b);
 }
 
@@ -143,4 +143,25 @@ fn extract_explains_what_it_cannot_read() {
     assert!(!output.status.success());
     let err = crate::stderr(&output);
     assert!(err.contains("pass the crate"), "{err}");
+}
+
+/// The Cargo feature flags reach the build the API is read from: with
+/// `--features extra`, the `#[cfg(feature = "extra")]` function, `impl`
+/// block, and module are in the API and the `cfg(not(...))` one isn't.
+#[test]
+fn feature_flags_reach_the_library_build() {
+    let yaml = stdout_of(
+        &weaveffi()
+            .args(["-q", "extract", "--features", "extra"])
+            .arg(fixture())
+            .output()
+            .unwrap(),
+    );
+    for name in ["discount", "clear", "code"] {
+        assert!(
+            yaml.contains(&format!("name: {name}\n")),
+            "no {name}:\n{yaml}"
+        );
+    }
+    assert!(!yaml.contains("list_price"), "{yaml}");
 }

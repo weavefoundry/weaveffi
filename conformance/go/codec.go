@@ -1,4 +1,4 @@
-// Conformance consumer: codec sample, Go target (ABI revision 5).
+// Conformance consumer: codec sample, Go target (ABI revision 6).
 //
 // The shared-vector loop: for every vector the library serves, decode it
 // through the generated bindings, hand it back to CheckVector (which must
@@ -8,7 +8,7 @@
 // spot checks of decoded fields, the typed *OutOfRangeError and its payload,
 // malformed input rejected (an undeclared enum value, text that isn't UTF-8,
 // a nil sum-type value the encoder refuses), and object identity and
-// reference counting through buffers. Then the ABI 5 shapes: optional
+// reference counting through buffers. Then the direct shapes: optional
 // scalars (*int32, *float64, *bool, *Color) and typed arrays ([]float64,
 // []int32, []uint64) in and out, a usize, a char and a custom type crossing
 // as strings (and rejected as -3), and an iterator of typed arrays. Ends by
@@ -29,7 +29,7 @@ func sameF32(a, b float32) bool { return math.Float32bits(a) == math.Float32bits
 func sameF64(a, b float64) bool { return math.Float64bits(a) == math.Float64bits(b) }
 
 func fetch(i uint32) codec.Vector {
-	v, err := codec.CodecVector(i)
+	v, err := codec.Vector_(i)
 	expect(err == nil && v != nil, fmt.Sprintf("vector(%d): %v", i, err))
 	return v
 }
@@ -224,7 +224,9 @@ func spotChecks(n uint32) {
 }
 
 func outOfRange(n uint32) {
-	v, err := codec.CodecVector(n)
+	// The function `vector` shares the type Vector's name, so its Go name
+	// gains an underscore.
+	v, err := codec.Vector_(n)
 	expect(v == nil, "a failed vector call returns nil")
 	e := expectAs[*codec.OutOfRangeError](err, "vector(n)")
 	expect(e.Index == n && e.Count == n, fmt.Sprintf("payload index %d count %d", e.Index, e.Count))
@@ -311,13 +313,13 @@ func main() {
 	outOfRange(n)
 	malformed()
 	objects(n)
-	abi5()
+	directShapes()
 
 	expectNoLeaks(codec.DebugLive)
 	fmt.Printf("go/codec: OK (%d vectors)\n", n)
 }
 
-func abi5() {
+func directShapes() {
 	// Optional scalars cross as a flag and a value.
 	expect(codec.EchoOptI32(nil) == nil, "echo_opt_i32(absent)")
 	for _, v := range []int32{math.MinInt32, 0} {
@@ -375,10 +377,11 @@ func abi5() {
 	for _, c := range []string{"\U0001F980", "é", "a"} {
 		expect(codec.EchoChar(c) == c, fmt.Sprintf("echo_char(%q)", c))
 	}
-	expectMarshalMessage("echo_char(ab)", "value: \"ab\" is not a valid char", func() { codec.EchoChar("ab") })
-	expectMarshalMessage("echo_char()", "value: \"\" is not a valid char", func() { codec.EchoChar("") })
+	expectMarshalMessage("echo_char(ab)", `value: "ab" is not a valid char`, func() { codec.EchoChar("ab") })
+	expectMarshalMessage("echo_char()", `value: "" is not a valid char`, func() { codec.EchoChar("") })
 
-	// A custom type crossing as a string, normalized by the producer.
+	// A custom type crossing as a string, normalized by the producer; a
+	// rejected one carries the parse failure's message.
 	for in, want := range map[string]string{"ff": "ff", "00FF": "ff", "0": "0"} {
 		expect(codec.EchoHex(in) == want, fmt.Sprintf("echo_hex(%q)", in))
 	}

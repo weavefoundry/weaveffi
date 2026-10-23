@@ -13,6 +13,9 @@ public:
     /** Number of encoded bytes. */
     size_t size() const noexcept { return buf_.size(); }
 
+    /** The encoded bytes as a borrowed run, valid while the writer is unchanged. */
+    run view() const noexcept { return run{buf_.data(), buf_.size()}; }
+
     /** Appends one byte. */
     void byte(uint8_t v) { buf_.push_back(v); }
 
@@ -288,17 +291,21 @@ T decode(const uint8_t* ptr, size_t len) {
     return value;
 }
 
-/** Decodes one complete `T` from a producer-returned buffer, then releases the buffer. */
+/** Decodes one complete `T` from a borrowed buffer run. */
 template <typename T>
-T take(const uint8_t* ptr, size_t len) {
-    Run run{ptr, len};
-    return decode<T>(ptr, len);
+T decode(run r) {
+    return decode<T>(r.ptr, r.len);
+}
+
+/** Decodes one complete `T` from a producer-returned buffer run, then releases the run. */
+template <typename T>
+T take(run r) {
+    OwnedRun owned{r};
+    return decode<T>(r.ptr, r.len);
 }
 
 /** Hands a callback's buffered return to the producer as a {{PREFIX}}_alloc run. */
-inline void give(const BufferWriter& value, uint8_t** out_ptr, size_t* out_len) {
-    give_run(value.data(), value.size(), out_ptr, out_len);
-}
+inline run give_buffer(const BufferWriter& value) { return give_run(value.data(), value.size()); }
 
 /** Throws the error class `E` of a domain code with fields, decoding them from the error's payload. */
 template <typename E, typename... Fields>

@@ -1,11 +1,11 @@
 //! Swift type spellings and identifier policy: how model types, user-chosen
-//! names, and doc text render in Swift source.
-
-use std::collections::HashSet;
+//! names, and doc text render in Swift source, and how each value's one C
+//! value is spelled on the Swift side of the C module.
 
 use crate::codegen::docs::{ApiNames, Doc, IdentKind};
+use crate::codegen::values::Crossing;
 use crate::lang;
-use heck::{ToLowerCamelCase, ToUpperCamelCase};
+use heck::ToLowerCamelCase;
 use weaveffi_model::errors::type_name;
 use weaveffi_model::model::Model;
 use weaveffi_model::ty::{ParamTy, Prim, RetTy, Ty};
@@ -69,52 +69,32 @@ pub(crate) fn prim_swift_type(p: Prim) -> &'static str {
 }
 
 /// Facts about the whole API that spellings consult: the generated
-/// package's names, namespace collisions, and every declared identifier
-/// (for doc text).
+/// package's names and every declared identifier (for doc text).
 pub(crate) struct SwiftCtx<'a> {
     /// The model being rendered.
     pub(crate) model: &'a Model,
-    /// SwiftPM module name (e.g. `Kvstore`).
-    pub(crate) swift_module: &'a str,
+    /// The C symbol prefix, which names the run and optional-scalar
+    /// structs the C module declares.
+    pub(crate) prefix: &'a str,
     /// The error type for failures outside any declared domain
     /// (`KvstoreRuntimeError`).
     pub(crate) runtime_error: String,
     /// The namespace type of the library itself (`KvstoreLibrary`), which
     /// carries `check()`.
     pub(crate) library_type: String,
-    /// Every module name in the API, PascalCased: the namespace `enum`
-    /// names a wrapper-type reference can be shadowed by.
-    module_names: HashSet<String>,
     /// Every declared identifier, for rewriting doc text.
     names: ApiNames,
 }
 
 impl<'a> SwiftCtx<'a> {
     /// Collect the API-wide facts from the model.
-    pub(crate) fn new(model: &'a Model, swift_module: &'a str) -> SwiftCtx<'a> {
+    pub(crate) fn new(model: &'a Model, swift_module: &str) -> SwiftCtx<'a> {
         SwiftCtx {
             model,
-            swift_module,
+            prefix: model.prefix(),
             runtime_error: runtime_error_name(swift_module),
             library_type: library_type_name(swift_module),
-            module_names: model
-                .modules
-                .iter()
-                .map(|m| m.name.to_upper_camel_case())
-                .collect(),
             names: ApiNames::new(model),
-        }
-    }
-
-    /// Qualify a top-level wrapper type name with the Swift module when its
-    /// name collides with a namespace `enum`. Inside `enum Kv { enum Stats {
-    /// ... } }` the bare name `Stats` resolves to the namespace, not the
-    /// top-level type; `Kvstore.Stats` forces the type.
-    pub(crate) fn ty_name(&self, local: &str) -> String {
-        if self.module_names.contains(local) {
-            format!("{}.{}", self.swift_module, local)
-        } else {
-            local.to_string()
         }
     }
 
@@ -123,7 +103,7 @@ impl<'a> SwiftCtx<'a> {
         match t {
             Ty::Prim(p) => prim_swift_type(*p).to_string(),
             Ty::Enum(name) | Ty::Record(name) | Ty::RichEnum(name) | Ty::Interface(name) => {
-                self.ty_name(name)
+                name.clone()
             }
             Ty::Optional(inner) => format!("{}?", self.swift_type(inner)),
             Ty::List(inner) => format!("[{}]", self.swift_type(inner)),
@@ -137,11 +117,10 @@ impl<'a> SwiftCtx<'a> {
         match t {
             ParamTy::Value(t) => self.swift_type(t),
             ParamTy::Callback { name, nullable } => {
-                let ty = format!("any {}", self.ty_name(name));
                 if *nullable {
-                    format!("({ty})?")
+                    format!("(any {name})?")
                 } else {
-                    ty
+                    format!("any {name}")
                 }
             }
         }
@@ -153,6 +132,35 @@ impl<'a> SwiftCtx<'a> {
         match t {
             RetTy::Value(t) => self.swift_type(t),
             RetTy::Iterator(elem) => format!("NativeSequence<{}>", self.swift_type(elem)),
+        }
+    }
+
+    /// The Swift spelling of the one C value a value crosses as, as the C
+    /// module imports it: the scalar (`Int32` for a C-style enum, whose C
+    /// type is an `int32_t` typedef), the `{p}_opt_{prim}` or `{p}_run`
+    /// struct, or a nullable `OpaquePointer` for an object.
+    pub(crate) fn c_value_type(&self, crossing: &Crossing) -> String {
+        match crossing {
+            Crossing::Scalar(p) => prim_swift_type(*p).to_string(),
+            Crossing::Enum(_) => "Int32".to_string(),
+            Crossing::OptScalar(p) => format!("{}_opt_{}", self.prefix, p.snake()),
+            Crossing::OptEnum(_) => format!("{}_opt_i32", self.prefix),
+            Crossing::Utf8 | Crossing::Bytes | Crossing::Slice(_) | Crossing::Buffer(_) => {
+                "WvRun".to_string()
+            }
+            Crossing::Object { .. } => "OpaquePointer?".to_string(),
+        }
+    }
+
+    /// The zero value of [`c_value_type`](Self::c_value_type): what a
+    /// callback method returns when it fails, and what an iterator's item
+    /// slot starts as.
+    pub(crate) fn c_zero(&self, crossing: &Crossing) -> String {
+        match crossing {
+            Crossing::Scalar(Prim::Bool) => "false".to_string(),
+            Crossing::Scalar(_) | Crossing::Enum(_) => "0".to_string(),
+            Crossing::Object { .. } => "nil".to_string(),
+            other => format!("{}()", self.c_value_type(other)),
         }
     }
 
@@ -171,7 +179,6 @@ impl<'a> SwiftCtx<'a> {
             | IdentKind::Variant
             | IdentKind::ErrorCode => Some(swift_ident(ident)),
             IdentKind::ErrorDomain => Some(type_name(ident, "Error")),
-            IdentKind::Module => Some(ident.to_upper_camel_case()),
             IdentKind::Type => None,
         }
     }
@@ -192,6 +199,11 @@ impl<'a> SwiftCtx<'a> {
                     swift_str(&msg)
                 )
             })
+    }
+
+    /// The Swift type of the error domain named `domain`.
+    pub(crate) fn domain_type(&self, domain: &str) -> String {
+        self.model.error_domain(domain).type_name.clone()
     }
 }
 

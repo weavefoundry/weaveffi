@@ -1,0 +1,5 @@
+error: weaveffi: export an interface's inherent `impl` block, not a trait impl
+  --> tests/ui/fail_export_trait_impl.rs:12:1
+   |
+12 | impl Named for Widget {
+   | ^^^^

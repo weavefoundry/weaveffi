@@ -1,24 +1,26 @@
 //! The fixed Dart runtime every generated library ships, kept as real Dart
 //! source under `runtime/` and spliced in with `{{PLACEHOLDER}}`
 //! substitution: the loader and load-time checks, the error, call-frame,
-//! and memory helpers, the object base class, the value-buffer codec, the
-//! typed-array helpers, async and cancellation glue, the callback-interface
-//! machinery, and the iterator anchor. Each section is one part file under
-//! `lib/src/runtime/`, and sections an API doesn't use are left out. The
-//! contract tables the loader checks are rendered from the model into
-//! `contracts.dart`.
+//! and run helpers, the optional-scalar structs, the object base class, the
+//! value-buffer codec, the typed-array helpers, async and cancellation glue,
+//! the callback-interface machinery, and the iterator anchor. Each section
+//! is one part file under `lib/src/runtime/`, and sections an API doesn't
+//! use are left out. The contract rows the loader checks are rendered from
+//! the model into `contracts.dart`.
 
-use crate::codegen::contract::{hex, tables};
+use crate::codegen::contract::{hex, rows};
+use crate::codegen::values::{crossing, Crossing};
 use crate::codegen::CodeWriter;
 use crate::platform::{Arch, Os, Platform};
 use weaveffi_model::model::{Model, ABI_VERSION};
-use weaveffi_model::plan::{ArgPass, CallbackRetPass, ItemPass, ResultPass, RetPass};
+use weaveffi_model::ty::Ty;
 
 use crate::targets::dart::types::dart_str_literal;
 
 const LOADER: &str = include_str!("runtime/loader.dart");
 const BUNDLED: &str = include_str!("runtime/bundled.dart");
 const CORE: &str = include_str!("runtime/core.dart");
+const OPTIONS: &str = include_str!("runtime/options.dart");
 const OBJECT: &str = include_str!("runtime/object.dart");
 const CODEC: &str = include_str!("runtime/codec.dart");
 const ARRAYS: &str = include_str!("runtime/arrays.dart");
@@ -72,29 +74,28 @@ fn fill(template: &str, vars: &[(&str, &str)]) -> String {
     out
 }
 
-/// Whether any value in `model` crosses as a typed array (the Slice
-/// transport), in any position.
-fn uses_arrays(model: &Model) -> bool {
-    let callables = model.callables().any(|(_, f)| {
+/// Every value type that crosses a call boundary in `model`: parameters,
+/// returns, async results, iterator elements, and callback method
+/// parameters and returns.
+fn boundary_types(model: &Model) -> impl Iterator<Item = &Ty> {
+    let callables = model.callables().flat_map(|f| {
         f.params
             .iter()
-            .any(|p| matches!(p.pass, ArgPass::Slice { .. }))
-            || matches!(f.ret_pass, RetPass::Slice { .. })
-            || f.async_binding()
-                .is_some_and(|a| matches!(a.result, ResultPass::Slice { .. }))
-            || f.iterator()
-                .is_some_and(|it| matches!(it.item, ItemPass::Slice { .. }))
+            .filter_map(|p| p.ty.value())
+            .chain(f.ret.as_ref().map(|r| r.elem()))
     });
     let methods = model
-        .callback_interfaces()
-        .flat_map(|(_, cb)| &cb.methods)
-        .any(|m| {
-            m.params
-                .iter()
-                .any(|p| matches!(p.pass, ArgPass::Slice { .. }))
-                || matches!(m.ret_pass, CallbackRetPass::Slice { .. })
-        });
-    callables || methods
+        .callbacks
+        .iter()
+        .flat_map(|cb| &cb.methods)
+        .flat_map(|m| m.params.iter().map(|p| &p.ty).chain(&m.ret));
+    callables.chain(methods)
+}
+
+/// Whether any value in `model` crosses as `crossing` says, in any
+/// position.
+fn crosses(model: &Model, test: impl Fn(Crossing) -> bool) -> bool {
+    boundary_types(model).any(|ty| test(crossing(ty)))
 }
 
 /// The runtime sections `model` needs, as `(file name, source)` pairs in
@@ -163,15 +164,19 @@ pub(crate) fn runtime_parts(
         parts.push(("bundled.dart".into(), fill(BUNDLED, &vars)));
     }
 
-    let cancellable = model.callables().any(|(_, f)| f.cancellable());
+    let options = crosses(model, |c| {
+        matches!(c, Crossing::OptScalar(_) | Crossing::OptEnum(_))
+    });
+    let arrays = crosses(model, |c| matches!(c, Crossing::Slice(_)));
     let sections = [
         (true, "core.dart", CORE),
-        (model.has_interfaces(), "object.dart", OBJECT),
+        (options, "options.dart", OPTIONS),
+        (!model.interfaces.is_empty(), "object.dart", OBJECT),
         (model.has_buffers(), "codec.dart", CODEC),
-        (uses_arrays(model), "arrays.dart", ARRAYS),
+        (arrays, "arrays.dart", ARRAYS),
         (model.has_async(), "async.dart", ASYNC),
-        (cancellable, "cancel.dart", CANCEL),
-        (model.has_callback_interfaces(), "callbacks.dart", CALLBACKS),
+        (model.has_cancellable(), "cancel.dart", CANCEL),
+        (!model.callbacks.is_empty(), "callbacks.dart", CALLBACKS),
         (model.has_iterators(), "iterator.dart", ITERATOR),
     ];
     for (_, file, source) in sections.iter().filter(|(used, ..)| *used) {
@@ -180,31 +185,25 @@ pub(crate) fn runtime_parts(
     parts
 }
 
-/// The contract tables the loader checks: for every top-level module, its
-/// contract symbol and each declaration these bindings were generated with,
-/// with its canonical signature as a comment.
+/// The contract rows the loader checks: each declaration these bindings
+/// were generated with, as its contract function, the hash it must return,
+/// and its path, with its canonical signature as a comment.
 fn render_contracts(model: &Model) -> String {
     let mut w = CodeWriter::two_space();
-    w.line("// ── Contract tables ──");
+    w.line("// ── Contract ──");
     w.blank();
-    w.line("/// Each top-level module's contract-table symbol and the declarations");
-    w.line("/// these bindings were generated with: (id, signature hash, path).");
-    w.line("const List<(String, List<(int, int, String)>)> _contracts = [");
+    w.line("/// Every declaration these bindings were generated with: its contract");
+    w.line("/// function, the hash of its canonical signature, and its path.");
+    w.line("const List<(String, int, String)> _contracts = [");
     w.scope(|w| {
-        for table in tables(model) {
-            w.line(format!("('{}', [", table.symbol));
-            w.scope(|w| {
-                for row in &table.rows {
-                    w.line(format!("// {}", row.signature));
-                    w.line(format!(
-                        "({}, {}, '{}'),",
-                        hex(row.id),
-                        hex(row.hash),
-                        dart_str_literal(&row.path)
-                    ));
-                }
-            });
-            w.line("]),");
+        for row in rows(model) {
+            w.line(format!("// {}", row.signature));
+            w.line(format!(
+                "('{}', {}, '{}'),",
+                row.symbol,
+                hex(row.hash),
+                dart_str_literal(&row.path)
+            ));
         }
     });
     w.line("];");

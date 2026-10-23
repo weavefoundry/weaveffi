@@ -1,6 +1,4 @@
-version: "0.12.0"
-modules:
-  - name: m
-    functions:
-      - name: noop
-        params: []
+version: "0.13.0"
+functions:
+  - name: noop
+    params: []

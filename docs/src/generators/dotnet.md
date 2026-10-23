@@ -1,7 +1,7 @@
 # .NET
 
 The .NET target emits a standalone C# class library over the C ABI
-(revision 5). Native calls go through source-generated
+(revision 6). Native calls go through source-generated
 [`[LibraryImport]`](https://learn.microsoft.com/en-us/dotnet/standard/native-interop/pinvoke-source-generation)
 declarations whose slots are all blittable, with runtime marshalling
 disabled for the assembly (`[assembly: DisableRuntimeMarshalling]`), and
@@ -32,12 +32,24 @@ PascalCase (`my-kv` becomes `MyKv`). Set `name` to override all three:
 name = "Acme.Storage"
 ```
 
-Each module becomes a static class named by its full path (`kv` is `Kv`,
-`kv.stats` is `KvStats`); records, enums, interfaces, callback interfaces,
-and exceptions sit directly in the namespace, since every type name is
-unique across the API. The project generates an XML documentation file, so
-the IDL's docs show up in IntelliSense; backticked identifiers in them
-(`` `new_op` ``) are rewritten to their C# spelling (`NewOp`).
+The whole library is one namespace. Records, enums, interfaces, callback
+interfaces, and exceptions sit directly in it, and the free functions are
+static methods of the library class, `{Namespace}Library` (from the
+namespace's last segment), which also holds `Check()` and `AbiVersion`:
+
+```csharp
+using Kvstore;
+
+using var store = await KvstoreLibrary.OpenStore("/data");
+var stats = KvstoreLibrary.Summarize(store, null);
+```
+
+`using static Kvstore.KvstoreLibrary;` brings the functions into scope
+unqualified. A function spelled like a member the class already has
+(`Check`, `AbiVersion`, `Equals`, `ReferenceEquals`) or like the class
+itself gains a trailing `_`. The project generates an XML documentation
+file, so the IDL's docs show up in IntelliSense; backticked identifiers in
+them (`` `new_op` ``) are rewritten to their C# spelling (`NewOp`).
 
 ## Build and load
 
@@ -64,35 +76,35 @@ package is skipped with a warning). See [Packaging](../guides/packaging.md).
 ## Load-time checks
 
 Every import resolves through the generated resolver, which loads the
-library once, checks `{prefix}_abi_version()` against 5, and then checks
-every top-level module's
-[contract table](../reference/abi.md#load-time-checks). The bindings embed
-the `(id, hash, path)` entry of every declaration they were generated with,
-including one per error code and one per callback-interface method:
+library once, checks `{prefix}_abi_version()` against 6, and then checks
+[the contract](../reference/abi.md#the-contract): for every declaration the
+bindings were generated with (each function, interface, member, record,
+enum, callback interface and method, error domain, and error code), it
+resolves the declaration's contract function by name, calls it, and
+compares the hash it returns with the embedded one:
 
 ```csharp
 static partial void VerifyContracts(IntPtr library)
 {
-    VerifyContract(library, "kvstore_kv_contract", new (ulong, ulong, string)[]
+    VerifyContract(library, new (string, ulong, string)[]
     {
-        (0x...UL, 0x...UL, "kv.Store.put"), // method put(string, bytes, EntryKind, i64?) -> Entry throws KvError
-        // ... one entry per declaration in `kv` and its submodules
+        ("kvstore_contract_2bef5883c0f5eed1", 0xe3faf8ccf74791cfUL, "Store.put"), // method put(string, bytes, EntryKind, i64?) -> Entry throws KvError
+        // ... one row per declaration
     });
 }
 ```
 
-Each entry must be in the library's table with an equal hash; entries the
-library has and the bindings don't are fine, so a library that only adds
-declarations (new functions, error codes, or callback methods) keeps working
-with older bindings.
+Declarations the library has and the bindings don't are fine, so a library
+that only adds declarations (new functions, error codes, or callback
+methods) keeps working with older bindings.
 
 A library that can't be found or loaded, or that doesn't match, throws
 `NativeLoadException`, a catchable exception naming the problem (`couldn't
-find the kvstore native library ...`, `kv.Store.put is missing from the
-library kvstore`, `kv.Store.put changed since these bindings were
+find the kvstore native library ...`, `Store.put is missing from the
+library kvstore`, `Store.put changed since these bindings were
 generated`). The failure is remembered: every later call throws the same
 exception, before any call can misread memory. To check at startup instead
-of on the first call, call the generated library class:
+of on the first call, call the library class:
 
 ```csharp
 try
@@ -105,28 +117,36 @@ catch (NativeLoadException e)
 }
 ```
 
-`KvstoreLibrary` (`{Namespace}Library`, from the namespace's last segment)
-also exposes `AbiVersion`.
-
 ## Type mapping
+
+Every value crosses as one C value in every position: a parameter, a
+return, an async result, an iterator item, and a callback method's argument
+and return.
 
 | IDL type | C# type | Crosses the ABI as |
 |---|---|---|
 | `i8` ... `u64`, `f32`, `f64` | `sbyte` ... `ulong`, `float`, `double` | by value |
-| `bool` | `bool` | one byte |
-| `string` | `string` | UTF-8 `(ptr, len)`, encoded into a pooled buffer; interior NULs survive |
-| `bytes` | `ReadOnlySpan<byte>` as a parameter, `byte[]` otherwise | `(ptr, len)`, a parameter pinned in place |
+| `bool` | `bool` | one `byte`, `0` or `1` (never the four-byte Win32 `BOOL`) |
+| `string` | `string` | an `FfiRun` (`{prefix}_run`) of UTF-8, encoded into a pooled buffer; interior NULs survive |
+| `bytes` | `ReadOnlySpan<byte>` as a parameter, `byte[]` otherwise | an `FfiRun`, a parameter pinned in place |
 | C-style enum | `enum` with the IDL discriminants | `int32_t` |
-| record | positional `sealed record` | value buffer |
-| rich enum | `abstract record` with one nested `sealed record` per variant | value buffer |
-| `T?` of a scalar, `bool`, or C-style enum | `T?` (`int?`, `Color?`) | a presence flag plus the value, no buffer |
-| other `T?` | `T?` | value buffer (`Iface?` is a nullable pointer, `Cb?` a null vtable) |
-| `[P]` of `i8` ... `u64` (not `u8`), `f32`, `f64` | `ReadOnlySpan<P>` as a parameter, `P[]` as a result | a typed array: a parameter is pinned in place, a result is copied once |
-| other `[T]` | `IReadOnlyList<T>` | value buffer |
-| `{K: V}` | `IReadOnlyDictionary<K, V>` | value buffer |
+| record | positional `sealed record` | an `FfiRun` holding a value buffer |
+| rich enum | `abstract record` with one nested `sealed record` per variant | an `FfiRun` holding a value buffer |
+| `T?` of a scalar, `bool`, or C-style enum | `T?` (`int?`, `Color?`) | an `FfiOpt*` struct (`{prefix}_opt_{prim}`): a presence byte and the value |
+| other `T?` | `T?` | a value buffer (`Iface?` is a nullable pointer, `Cb?` a null vtable) |
+| `[P]` of `i8` ... `u64` (not `u8`), `f32`, `f64` | `ReadOnlySpan<P>` as a parameter, `P[]` otherwise | an `FfiRun` of packed elements, its length in bytes; a parameter is pinned in place, a result is copied once |
+| other `[T]` | `IReadOnlyList<T>` | a value buffer |
+| `{K: V}` | `IReadOnlyDictionary<K, V>` | a value buffer |
 | interface | `sealed class : IDisposable` | object pointer |
-| callback interface | `interface I{Name}` | `ctx` plus a static vtable |
+| callback interface | `interface I{Name}` | an `FfiCallback` (`{prefix}_{Cb}`): the `ctx` and a static vtable, by value |
 | `iter<T>` | `IEnumerable<T>` | iterator handle |
+
+The runtime declares these structs once, all blittable and passed by value
+(`[StructLayout(LayoutKind.Sequential)]`): `FfiRun` (`byte* Ptr; nuint
+Len`), one `FfiOpt*` per scalar (`byte Has` then the value, a `byte` again
+for `FfiOptBool`), and `FfiCallback` (`IntPtr Ctx; IntPtr Vtable`). No
+native signature mentions C#'s `bool`, so nothing depends on how the runtime
+would marshal one.
 
 A typed-array or bytes parameter is a span, so an array, a slice of one
 (`values.AsSpan(1, 3)`), or stack memory passes without a copy; it must be
@@ -136,7 +156,7 @@ field, a list element) the same types are ordinary lists:
 `IReadOnlyList<double>`.
 
 Returned strings, bytes, typed arrays, and buffers are copied and released
-with `{prefix}_free_bytes`. Records and rich enums encode themselves
+with `{prefix}_run_free`. Records and rich enums encode themselves
 (`WriteTo` and `ReadFrom`); optionals, lists, and maps go through the
 runtime's generic codec (`WriteList`, `ReadMap`, ...), handed a static lambda
 per element, so no code is generated per collection shape.
@@ -230,7 +250,7 @@ public class KvException : NativeException
 
         public string Key { get; }
 
-        public KeyNotFound(string key, string? message = null) : base(ErrorCode, message ?? "key not found")
+        public KeyNotFound(string key, string? message = null) : base(ErrorCode, message ?? $"key not found: {key}")
         {
             Key = key;
         }
@@ -253,20 +273,23 @@ catch (KvException.KeyNotFound e)
 
 The message is the producer's (a Rust producer's `Display` output, empty
 messages arriving as the IDL default); a code class constructed in C#
-defaults to the IDL message. A code field named `message` (or `code`) is
-`Message_` (or `Code_`), since `Exception` already has the property. If the
-API declares a type named like a runtime class (`NativeException`,
-`NativeBugException`, `NativeLoadException`), the runtime class takes the
-namespace's last segment as a prefix (`KvstoreNativeException`).
+defaults to the IDL message, with the code's fields filled in where the
+message names them (`key not found: {key}`). A code field named `message`
+(or `code`) is `Message_` (or `Code_`), since `Exception` already has the
+property. If the API declares a type named like a runtime class
+(`NativeException`, `NativeBugException`, `NativeLoadException`), the
+runtime class takes the namespace's last segment as a prefix
+(`KvstoreNativeException`), and a type named like the library class moves
+it to `{Namespace}NativeLibrary`.
 
 ## Async and cancellation
 
 An async function returns `Task` or `Task<T>`, and every one takes an
 optional `CancellationToken`. The launcher receives an
 `[UnmanagedCallersOnly]` completion and a `GCHandle` to the pending call;
-the completion runs on a producer thread, decodes the result, releases
-everything the call owned, and completes the task (continuations run
-asynchronously).
+the completion runs on a producer thread, receives the result as its one C
+value, decodes it, releases everything the call owned, and completes the
+task (continuations run asynchronously).
 
 ```csharp
 public Task<uint?> VersionOf(string key, CancellationToken cancellationToken = default)
@@ -309,28 +332,32 @@ public interface IScorer
 ```
 
 Passing an implementation pins it in a `GCHandle` (the `ctx`) and hands the
-producer one process-wide vtable of `[UnmanagedCallersOnly]` trampolines,
-which starts with the `{size, flags, free}` header (`size` is the vtable's
-real size as C# lays it out, `flags` is 0: methods may run on any thread).
-The `free` entry releases the handle when the producer drops its last
-reference, possibly on another thread. An optional callback parameter
+producer an `FfiCallback` of that `ctx` and one process-wide vtable of
+`[UnmanagedCallersOnly]` trampolines, by value. The vtable is allocated once
+in native memory and never freed, so it outlives every use; it starts with
+the `{size, flags, free}` header (`size` is the vtable's real size as C#
+lays it out, `flags` is 0: methods may run on any thread), then one function
+pointer per method in declaration order. The `free` entry releases the
+handle when the producer drops its last reference, possibly on another
+thread; the producer takes over the registration as soon as the call
+reaches it, even when the call then fails. An optional callback parameter
 (`ILoader? loader`) passes a null vtable for `null`.
 
-Trampolines run on whatever thread the producer calls from. String and
-buffer arguments are decoded; typed-array and bytes arguments are
-`ReadOnlySpan<T>`s over the producer's memory, valid only during the call
-(copy with `ToArray()` to keep them); object arguments are adopted, each a
-new wrapper the implementation owns. Return values go back to the producer
-by family:
+Trampolines run on whatever thread the producer calls from. Each argument
+is one C value: string and buffer arguments are decoded, typed-array and
+bytes arguments are `ReadOnlySpan<T>`s over the producer's memory, valid
+only during the call (copy with `ToArray()` to keep them), and object
+arguments are adopted, each a new wrapper the implementation owns. The
+return is one C value too:
 
-- a scalar, `bool`, or C-style enum is the C return, and an optional one is
-  a presence flag plus an out slot;
+- a scalar, `bool` (one byte), or C-style enum is returned as is, and an
+  optional one as its `FfiOpt*` struct;
 - an object is a fresh reference the producer adopts (`CloneHandle()`); a
   `null` for a required object reaches the producer as null, which it
   rejects as a marshalling failure;
 - a string, bytes, typed array, record, rich enum, optional, list, or map is
-  written into a run allocated with `{prefix}_alloc` and handed over through
-  the method's out slots, which the producer adopts and frees.
+  written into a run allocated with `{prefix}_alloc` and returned as an
+  `FfiRun`, which the producer adopts and frees.
 
 An exception thrown by an implementation never unwinds into native code.
 A method declared `throws: SomeDomain` that throws that domain's exception
@@ -357,20 +384,17 @@ the producer's decision; the `kvstore` sample turns it into
 ## Iterators
 
 An `iter<T>` function returns an `IEnumerable<T>` that streams lazily, one
-native call per item. It's re-enumerable: each enumeration (each
-`GetEnumerator`, so each `foreach` or LINQ pass) launches a new native
-iterator, so a failure to start throws from `GetEnumerator`, at the start
-of the loop, rather than from the call. The enumerator owns its native
-iterator as a `SafeHandle`, destroyed when enumeration ends, when the
-enumerator is disposed (`foreach` does this on early exit), or by its
-finalizer. Span parameters of an iterator function are copied once, since
-the sequence outlives the call.
+native call per item, each item arriving as its one C value. It's
+re-enumerable: each enumeration (each `GetEnumerator`, so each `foreach` or
+LINQ pass) launches a new native iterator, so a failure to start throws
+from `GetEnumerator`, at the start of the loop, rather than from the call.
+The enumerator owns its native iterator as a `SafeHandle`, destroyed when
+enumeration ends, when the enumerator is disposed (`foreach` does this on
+early exit), or by its finalizer. Span parameters of an iterator function
+are copied once, since the sequence outlives the call.
 
 ## Known limitations
 
-- A module class whose name equals the namespace (a `calculator` module in
-  the `Calculator` package) must be reached as `Calculator.Calculator` or
-  through `using static`.
 - Only one `DllImportResolver` can exist per assembly. If you compile the
   generated sources into an assembly that already has one, the
   `{PREFIX}_LIBRARY` override and the implicit load-time check are skipped;

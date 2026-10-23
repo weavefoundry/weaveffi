@@ -1,20 +1,21 @@
 # Python
 
 The Python target produces a pip-installable package of pure-Python
-`ctypes` bindings over the C ABI (revision 5). There's no compilation step,
+`ctypes` bindings over the C ABI (revision 6). There's no compilation step,
 no native extension, and no third-party runtime dependency; the package
 works on any Python 3.10+ interpreter that can load the producer library.
 The implementation module is fully annotated and the package ships
 `py.typed`, so type checkers read the bindings themselves (there's no
-separate stub to drift out of date) and the generated code passes
-`mypy --strict`.
+separate stub to drift out of date), and the generated code is written to
+pass `mypy --strict`.
 
-Records and rich enums are frozen dataclasses that cross the boundary as
-value buffers. Optional scalars and numeric lists cross directly (a flag
-plus a value, and typed arrays). Interfaces are reference-counted wrapper
-classes. Callback interfaces are abstract base classes the consumer
-subclasses. Async functions are coroutines whose cancellation cancels the
-native call, and `iter<T>` returns are lazy `NativeIterator[T]` objects.
+Every value crosses the boundary as one C value. Records and rich enums
+are frozen dataclasses that cross as value buffers. Interfaces are
+reference-counted wrapper classes with a context manager. Error domains
+are exception classes. Callback interfaces are abstract base classes the
+consumer subclasses. Async functions are coroutines whose cancellation
+cancels the native call, and `iter<T>` returns are lazy
+`NativeIterator[T]` objects.
 
 Python is a [Tier 1](../stability.md#target-tiers) target: it tracks every
 ABI revision as it lands and runs the full conformance suite in CI.
@@ -44,7 +45,10 @@ import_name = "kvstore_py"   # import package (default: C prefix)
 requires_python = ">=3.12"   # default ">=3.10"
 ```
 
-The module lists its public names in `__all__` (the error classes,
+A library is one namespace, and so is the package: every record, enum,
+error class, interface, callback interface, and free function is exported
+from the package itself under its IDL name (functions in snake case). The
+module lists its public names in `__all__` (the error classes,
 `LibraryLoadError`, `NativeIterator`, every type, and the free functions),
 so `from kvstore import *` and the package's `__init__.py` export the API
 and none of the runtime's helpers. Annotations use builtin generics and
@@ -61,26 +65,23 @@ At import, the module loads the producer library from the first of:
 
 1. the path in `{PREFIX}_LIBRARY` (for example `KVSTORE_LIBRARY`),
 2. a library bundled inside the package directory (what `weaveffi package`
-   produces, and where `weaveffi dev` copies the debug build), and
+   produces, and where `weaveffi generate --dev` copies the debug build), and
 3. the system loader's search path, by platform file name
    (`libkvstore.dylib`, `libkvstore.so`, or `kvstore.dll`).
 
 It then makes the two [load-time checks](../reference/abi.md#load-time-checks)
 before binding anything else. `kvstore_abi_version()` must report revision
-5, and every top-level module's contract table must contain each
-declaration the bindings were generated with, with an equal hash. The
-expected rows are embedded in the module, one `(id, hash, path)` per
-declaration (every function, member, type, error code, and callback
-method), each with its canonical signature:
+6, and every declaration the bindings were generated with (every function,
+interface member, type, error code, and callback method) must have its
+contract function in the library, returning the hash the bindings embed.
+The module holds one row per declaration: the contract function, the
+hash, and the declaration's path, with its canonical signature:
 
 ```python
-_CONTRACTS: dict[str, list[tuple[int, int, str]]] = {
-    "kvstore_kv_contract": [
-        (0x00f1b5c049a1cd69, 0x36b344095a0f5bf9, "kv.Store.rank"),  # method rank(Scorer) -> [string] throws KvError
-        ...
-    ],
-    "kvstore_report_contract": [...],
-}
+_CONTRACT: list[tuple[str, int, str]] = [
+    ("kvstore_contract_c6c5d9ee1b7cfa9e", 0x36b344095a0f5bf9, "Store.rank"),  # method rank(Scorer) -> [string] throws KvError
+    ...
+]
 ```
 
 When the library can't be loaded, or a check fails, the import raises
@@ -88,10 +89,10 @@ When the library can't be loaded, or a check fails, the import raises
 wrong and whose `path` names the library:
 
 ```text
-kvstore.kvstore.LibraryLoadError: kv.Store.put changed since these bindings were generated (/opt/lib/libkvstore.dylib)
+kvstore.kvstore.LibraryLoadError: Store.put changed since these bindings were generated (/opt/lib/libkvstore.dylib)
 ```
 
-The other messages are `kv.Store.put is missing from the library`, a C ABI
+The other messages are `Store.put is missing from the library`, a C ABI
 mismatch naming both revisions, a library that doesn't export
 `kvstore_abi_version`, and the loader's own error with a hint to set
 `KVSTORE_LIBRARY`. A stale binding never misreads a buffer at runtime.
@@ -103,7 +104,7 @@ around the `import` statement.
 Every C prototype is then bound once, in a module-level table:
 
 ```python
-_c_kv_Store_count = _bind("kvstore_kv_Store_count", ctypes.c_uint64, ctypes.c_void_p, ctypes.POINTER(_ErrorStruct))
+_c_Store_count = _bind("kvstore_Store_count", ctypes.c_uint64, ctypes.c_void_p, ctypes.POINTER(_ErrorStruct))
 ```
 
 On macOS, the system `python3` strips `DYLD_LIBRARY_PATH`, so prefer
@@ -112,26 +113,31 @@ On macOS, the system `python3` strips `DYLD_LIBRARY_PATH`, so prefer
 ## Type mapping
 
 Parameters accept abstract containers (any `Sequence` or `Mapping`) and
-returns hand out concrete ones (`list`, `dict`).
+returns hand out concrete ones (`list`, `dict`). Every value is one C value
+in every position (a parameter, a return, an async result, an iterator
+item, and a callback method's arguments and return), and the runtime
+mirrors the C structures as `ctypes.Structure` subclasses passed and
+returned by value: `_Run` for `{prefix}_run` (a pointer and a byte length)
+and `_OptI32`, `_OptF64`, and so on for each `{prefix}_opt_{prim}` (a
+presence flag and a value).
 
 | IDL type | Python type | Crosses the ABI as |
 |---|---|---|
 | `i8` to `u64` | `int` | `c_int8` to `c_uint64`, range-checked |
 | `f32`, `f64` | `float` | `c_float`, `c_double` |
 | `bool` | `bool` | `c_bool` |
-| `string` | `str` | UTF-8 bytes plus length (`c_char_p`, `c_size_t`) |
-| `bytes` | `bytes` | pointer plus length |
 | C-style enum | `IntEnum` subclass | `c_int32` |
-| record | frozen `@dataclass` | value buffer |
-| rich enum | base class plus one frozen `@dataclass` per variant | value buffer |
-| scalar or enum `T?` | `T \| None` | `bool` flag plus the value |
-| other `T?` | `T \| None` | value buffer |
-| `[i8]` to `[u64]`, `[f32]`, `[f64]` | `Sequence[int]` or `Sequence[float]` in, `list` out | typed array (pointer plus element count) |
-| other `[T]`, `{K:V}` | `Sequence[T]`, `Mapping[K, V]` in; `list[T]`, `dict[K, V]` out | value buffer |
+| scalar or enum `T?` | `T \| None` | `_Opt{Prim}` (an enum's is `_OptI32`) |
+| `string` | `str` | `_Run` of UTF-8 |
+| `bytes` | `bytes` | `_Run` of the bytes |
+| `[i8]` to `[u64]`, `[f32]`, `[f64]` | `Sequence[int]` or `Sequence[float]` in, `list` out | `_Run` of the packed elements (a typed array) |
+| record | frozen `@dataclass` | `_Run` holding a value buffer |
+| rich enum | base class plus one frozen `@dataclass` per variant | `_Run` holding a value buffer |
+| other `T?`, `[T]`, `{K:V}` | `T \| None`, `Sequence[T]`, `Mapping[K, V]` in; `T \| None`, `list[T]`, `dict[K, V]` out | `_Run` holding a value buffer |
 | interface | wrapper class | `c_void_p` |
-| interface `?` | `... \| None` | `c_void_p`, NULL for `None` |
-| callback interface | subclass of the generated ABC | context key plus vtable |
-| callback interface `?` | `... \| None` | context key plus vtable, NULL for `None` |
+| interface `?` | `... \| None` | `c_void_p`, null for `None` |
+| callback interface | subclass of the generated ABC | `_{Name}Arg` (a context and a vtable) |
+| callback interface `?` | `... \| None` | `_{Name}Arg` with a null vtable for `None` |
 | `iter<T>` | `NativeIterator[T]` | iterator handle |
 
 `ctypes` truncates an out-of-range integer to the parameter's C width
@@ -142,18 +148,19 @@ range raises `OverflowError` naming the parameter
 call, so a failed check leaks nothing.
 
 An optional scalar (`i64?`, `bool?`, `Priority?`) never touches a value
-buffer: `None` passes a false flag, and a returned flag says whether the
-out value is present. A numeric list parameter accepts any sequence or
+buffer: `None` passes an absent `_Opt{Prim}`, and a returned one becomes
+the value or `None`. A numeric list parameter accepts any sequence or
 iterable of numbers (a `list`, a `tuple`, a `range`, a generator); it's
-packed into an `array.array` with range checks and lent to the call, and an
-`array.array` of the matching type code is lent as is, without a copy. A
-`str` or `bytes` argument is refused rather than reinterpreted. Returned
-typed arrays are copied into a `list` and released.
+packed into an `array.array` with range checks, whose buffer Python aligns
+for every element type, and lent to the call. An `array.array` of the
+matching type code is lent as is, without a copy. A `str` or `bytes`
+argument is refused rather than reinterpreted. Returned typed arrays are
+copied into a `list` and released.
 
 Strings and bytes pass without per-byte loops: a `str` is encoded once and
-its bytes are lent to the call, so interior NUL characters survive.
-Returned strings, bytes, and buffers are copied with `ctypes.string_at` and
-released with `{prefix}_free_bytes`.
+its bytes are lent to the call as a run, so interior NUL characters
+survive. Returned strings, bytes, typed arrays, and buffers are copied with
+`ctypes.string_at` and released with `{prefix}_run_free`.
 
 Every record and rich enum has one writer and one reader function
 (`_write_Entry`, `_read_Entry`), and so does every distinct composite type
@@ -185,13 +192,10 @@ match change:
         print("removed", key)
 ```
 
-All modules share one Python namespace. Nested modules' declarations are
-exported next to their parents' under their bare names (`summarize`, not
-`kv_stats_summarize`), which global names keep unique. The module starts
-with `from __future__ import annotations`, so annotations name types
-declared later in the file without quotes. Backticked identifiers in IDL
-docs and deprecation messages are rewritten to their Python spellings in
-docstrings and `DeprecationWarning`s.
+The module starts with `from __future__ import annotations`, so
+annotations name types declared later in the file without quotes.
+Backticked identifiers in IDL docs and deprecation messages are rewritten
+to their Python spellings in docstrings and `DeprecationWarning`s.
 
 ## Objects and lifetime
 
@@ -212,9 +216,8 @@ A constructor named `new` becomes `__init__`; other constructors are
 ```python
     @classmethod
     def open(cls, path: str) -> Store:
-        _path_b = path.encode("utf-8")
         _err = _ErrorStruct()
-        _ret = _c_kv_Store_open(_path_b, len(_path_b), ctypes.byref(_err))
+        _ret = _c_Store_open(_run_in(path.encode("utf-8")), ctypes.byref(_err))
         if _err.code:
             raise _kv_error_from(*_read_error(_err))
         return cls._adopt(_required(_ret))
@@ -231,14 +234,13 @@ Every declared error derives from the package's root `Error` (named
 `{PascalName}Error` if the API declares its own `Error` type), which
 carries `code` and `message`. Each error domain is a subclass named by the
 shared rule (`KvError` stays `KvError`, `KitchenErrors` becomes
-`KitchenError`, `Failure` becomes `FailureError`), and a module may declare
-several. Each code is a subclass of its domain named `{Code}Error`
-(`KeyNotFoundError`), also reachable as `KvError.KeyNotFound`, carrying its
-stable `CODE`. When `{Code}Error` would shadow a Python builtin
-(`TimeoutError`) or another declaration, it's qualified with the domain's
-stem (`KvTimeoutError`). A code's payload fields are constructor arguments
-and attributes; a field named like an exception attribute (`message`,
-`code`, `args`) gets a trailing `_`:
+`KitchenError`, `Failure` becomes `FailureError`). Each code is a subclass
+of its domain named `{Code}Error` (`KeyNotFoundError`), also reachable as
+`KvError.KeyNotFound`, carrying its stable `CODE`. When `{Code}Error` would
+shadow a Python builtin (`TimeoutError`) or another declaration, it's
+qualified with the domain's stem (`KvTimeoutError`). A code's payload
+fields are constructor arguments and attributes; a field named like an
+exception attribute (`message`, `code`, `args`) gets a trailing `_`:
 
 ```python
 try:
@@ -266,22 +268,23 @@ hierarchy whose message names the code and the producer's message
 (`InternalError: (-3) ...`). A cancelled async call (-5) raises
 `asyncio.CancelledError` instead.
 
-Error messages cross as UTF-8 bytes plus a length, so they may contain any
+Each call passes a fresh error slot, which the producer overwrites. Error
+messages cross as UTF-8 bytes plus a length, so they may contain any
 character; an empty message is `""`.
 
 ## Async and cancellation
 
 An async function is an `async def` that must run on an `asyncio` event
 loop. The launcher receives a static completion trampoline and an integer
-key; the trampoline takes ownership of the result on the producer's thread
-and settles the future through `call_soon_threadsafe`:
+key; the trampoline takes ownership of the result (one C value, like a
+sync return) on the producer's thread and settles the future through
+`call_soon_threadsafe`:
 
 ```python
 async def open_store(path: str) -> Store:
-    _path_b = path.encode("utf-8")
     _call, _future = _async_begin()
     try:
-        _c_kv_open_store(_path_b, len(_path_b), _kv_open_store_completion, _call)
+        _c_open_store(_run_in(path.encode("utf-8")), _open_store_completion, _call)
     except BaseException:
         _async_abandon(_call)
         raise
@@ -289,8 +292,8 @@ async def open_store(path: str) -> Store:
     return _result
 ```
 
-Optional scalar and typed-array results arrive directly (`int | None`,
-`list[int]`), like sync returns.
+The launcher copies everything it needs before it returns, so the
+arguments' memory needn't outlive the call.
 
 For a `cancellable` function, each call owns a native cancel token.
 Cancelling the awaiting task (directly, through `asyncio.wait_for`, or by
@@ -303,36 +306,45 @@ native call runs to completion and its result is dropped.
 
 A callback interface is an `abc.ABC` with one abstract method per IDL
 method. Passing an instance registers it in a handle table under an integer
-key, which the producer receives as `ctx` along with the address of the
-interface's one static vtable; `None` for an optional callback parameter
-passes a null vtable. The vtable starts with the revision 5 header (its
-`size`, `flags`, and the shared `free` entry), and the producer's
-`free(ctx)` removes the table entry, so an implementation lives exactly as
-long as the producer holds it. `flags` is 0: the producer may call any
-method from any thread.
+key, and the call passes the producer a `_{Name}Arg` structure holding that
+key as `ctx` and the address of the interface's one vtable; `None` for an
+optional callback parameter passes a null vtable. The vtable is built the
+first time an implementation is passed and kept for the process lifetime.
+It starts with the header (its `size`, `flags`, and the shared `free`
+entry), and the producer's `free(ctx)` removes the table entry, so an
+implementation lives exactly as long as the producer holds it. `flags` is
+0: the producer may call any method from any thread.
+
+Each method's vtable entry is a trampoline that takes the method's C
+arguments and returns its one C value. A `ctypes` callback can't return a
+structure, so a method returning a `_Run` (a string, bytes, typed array, or
+buffered value) or an `_Opt{Prim}` is a libffi closure the runtime builds
+directly, through the libffi `ctypes` itself runs on; every other method is
+a plain `ctypes` callback.
 
 Trampolines run on whichever thread the producer calls from; `ctypes`
 acquires the GIL first. A trampoline adopts the object arguments first,
 converts the rest (an optional scalar arrives as `T | None`, a typed array
-as a `list`), calls the method, and hands the return back:
+as a `list`, and a run is copied, since it's only lent), calls the method,
+and returns:
 
-- a number, `bool`, or enum as the C return value, checked for its type
-  and range inside the trampoline (so a wrong return is reported as a
-  failure rather than truncated);
-- an optional scalar through the `out_value` slot, with the C return
-  saying whether it's present;
+- a number, `bool`, or enum, checked for its type and range inside the
+  trampoline (so a wrong return is reported as a failure rather than
+  truncated);
+- an optional scalar as its `_Opt{Prim}`;
 - an object as a fresh strong reference the producer adopts (`None` is
   allowed only for `I?`);
-- a `str`, `bytes`, typed array, record, or other buffered value through
-  the `out_ptr`/`out_len` slots, in a run allocated with `{prefix}_alloc`
-  that the producer adopts and frees.
+- a `str`, `bytes`, typed array, record, or other buffered value as a run
+  allocated with `{prefix}_alloc`, which the producer adopts and frees.
 
 ```python
-def _Loader_load(ctx: int | None, key_ptr: int | None, key_len: int, out_ptr: Any, out_len: Any, out_err: Any) -> None:
+def _Loader_load(ctx: int | None, key: _Run, out_err: int | None) -> _Run:
     try:
-        _callback_return_bytes(out_ptr, out_len, bytes(_callback_get(ctx).load(_peek_bytes(key_ptr, key_len).decode("utf-8"))))
+        _ret = _callback_get(ctx).load(_peek_str(key))
+        return _alloc_run(bytes(_ret))
     except BaseException as exc:
         _callback_fail(out_err, exc, _GENERIC, KvError)
+        return _Run()
 ```
 
 Nothing unwinds through C. A method that throws a domain may raise that
@@ -361,9 +373,10 @@ the kvstore sample turns into `KvError.CallbackFailed`.
 ## Iterators
 
 An `iter<T>` return is a `NativeIterator[T]`, a lazy iterator: each
-`next()` makes one native `next` call through the pre-bound function, and
-the handle is released on exhaustion, `close()`, the end of a `with` block,
-or garbage collection. A closed iterator is exhausted.
+`next()` makes one native `next` call through the pre-bound function,
+receiving the item in one out slot of its C type, and the handle is
+released on exhaustion, `close()`, the end of a `with` block, or garbage
+collection. A closed iterator is exhausted.
 
 ```python
 for key in store.keys(None):
@@ -390,16 +403,21 @@ no wheel platform and are skipped. See [Packaging](../guides/packaging.md).
 - `ctypes` dispatch costs more per call than a compiled extension; hot
   loops that cross the boundary per element will feel it. The bindings
   keep the per-call work small (prototypes and vtable addresses are
-  resolved at import, and the error check is inline), but each call still
+  resolved once, and the error check is inline), but each call still
   allocates its error slot, and each integer argument costs a range check.
+- A callback method that returns a structure needs libffi, which the
+  runtime finds through the `_ctypes` extension or by name
+  (`ctypes.util.find_library("ffi")`). A Python whose `ctypes` links libffi
+  statically and hides its symbols, with no libffi installed, raises
+  `OSError` the first time an implementation of such an interface is
+  passed. The closures are built for the 64-bit platforms wheels target.
 - A typed-array parameter is copied into an `array.array` unless it already
   is one of the matching type code; a NumPy array is copied element by
   element.
-- All modules share one namespace (see "Type mapping"), which also holds
-  the typing names the module imports (`Any`, `Callable`, `ClassVar`,
-  `Iterable`, `Iterator`, `Mapping`, `Sequence`): a declared type with one
-  of those names still works at run time, but type checkers reject the
-  module.
+- The package's namespace also holds the typing names the module imports
+  (`Any`, `Callable`, `ClassVar`, `Iterable`, `Iterator`, `Mapping`,
+  `Sequence`): a declared type with one of those names still works at run
+  time, but type checkers reject the module.
 - A long-running callback stalls the producer thread that called it, and a
   callback that waits for the thread blocked in the calling Python code
   deadlocks.

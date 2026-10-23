@@ -3,29 +3,35 @@
 //! the C signature the generated header declares, and behaves as specified.
 
 #![allow(unsafe_code)]
+// The `extern` block names the runtime's opaque cancel token behind a
+// pointer, as the C header names an incomplete struct.
+#![allow(improper_ctypes)]
 
 use std::ptr;
 
-use weaveffi::abi::{self, FfiCancelToken, FfiError};
+use weaveffi::__rt::{self as abi, BufferReader, FfiCancelToken, FfiError, Run};
 
 weaveffi::export_runtime!();
 
+// The runtime symbols as a C consumer declares them.
+unsafe extern "C" {
+    fn export_runtime_abi_version() -> u32;
+    fn export_runtime_error_set(err: *mut FfiError, code: i32, ptr: *const u8, len: usize);
+    fn export_runtime_error_set_payload(err: *mut FfiError, ptr: *const u8, len: usize);
+    fn export_runtime_error_clear(err: *mut FfiError);
+    fn export_runtime_error_free(err: *mut FfiError);
+    fn export_runtime_alloc(len: usize) -> *mut u8;
+    fn export_runtime_run_free(run: Run);
+    fn export_runtime_cancel_token_create() -> *mut FfiCancelToken;
+    fn export_runtime_cancel_token_cancel(token: *mut FfiCancelToken);
+    fn export_runtime_cancel_token_is_cancelled(token: *const FfiCancelToken) -> bool;
+    fn export_runtime_cancel_token_destroy(token: *mut FfiCancelToken);
+    fn export_runtime_debug_live(kind: i32) -> u64;
+}
+
 #[test]
-fn every_runtime_symbol_has_its_c_signature() {
-    let _: extern "C" fn() -> u32 = export_runtime_abi_version;
-    let _: unsafe extern "C" fn(*mut FfiError, i32, *const u8, usize) = export_runtime_error_set;
-    let _: unsafe extern "C" fn(*mut FfiError, *const u8, usize) = export_runtime_error_set_payload;
-    let _: extern "C" fn(usize) -> *mut u8 = export_runtime_alloc;
-    let _: unsafe extern "C" fn(*mut FfiError) = export_runtime_error_clear;
-    let _: unsafe extern "C" fn(*mut FfiError) = export_runtime_error_free;
-    let _: unsafe extern "C" fn(*mut u8, usize) = export_runtime_free_bytes;
-    let _: extern "C" fn() -> *mut FfiCancelToken = export_runtime_cancel_token_create;
-    let _: unsafe extern "C" fn(*mut FfiCancelToken) = export_runtime_cancel_token_cancel;
-    let _: unsafe extern "C" fn(*const FfiCancelToken) -> bool =
-        export_runtime_cancel_token_is_cancelled;
-    let _: unsafe extern "C" fn(*mut FfiCancelToken) = export_runtime_cancel_token_destroy;
-    let _: extern "C" fn(i32) -> u64 = export_runtime_debug_live;
-    assert_eq!(export_runtime_abi_version(), 5);
+fn the_runtime_reports_its_revision() {
+    assert_eq!(unsafe { export_runtime_abi_version() }, 6);
 }
 
 #[test]
@@ -38,11 +44,7 @@ fn error_set_copies_and_clear_frees() {
     drop(backing);
     assert_eq!(err.code, abi::FOREIGN_ERROR_CODE);
     assert_eq!(err.message_len, 16);
-    assert_eq!(
-        err.message_ptr as usize % abi::RUN_ALIGN,
-        0,
-        "an 8-aligned run"
-    );
+    assert_eq!(err.message_ptr as usize % 8, 0, "an 8-aligned run");
     assert_eq!(unsafe { err.message_str() }, Some("consumer\0failure"));
     unsafe { export_runtime_error_clear(&mut err) };
     assert_eq!(err.code, 0);
@@ -56,41 +58,57 @@ fn error_set_copies_and_clear_frees() {
 }
 
 #[test]
+fn error_set_replaces_what_the_slot_held() {
+    let mut err = FfiError::default();
+    unsafe {
+        export_runtime_error_set(&mut err, 1, b"first".as_ptr(), 5);
+        export_runtime_error_set(&mut err, 2, b"second".as_ptr(), 6);
+    }
+    assert_eq!(
+        (err.code, unsafe { err.message_str() }),
+        (2, Some("second"))
+    );
+    unsafe { export_runtime_error_clear(&mut err) };
+}
+
+#[test]
 fn error_set_payload_copies_the_run() {
     let mut err = FfiError::default();
-    let fields = abi::encode_value(&"key".to_string());
+    let fields = abi::encode(|w| w.write_string("key"));
     unsafe {
         export_runtime_error_set(&mut err, 1, ptr::null(), 0);
         export_runtime_error_set_payload(&mut err, fields.as_ptr(), fields.len());
     }
     drop(fields);
-    assert_eq!(
-        unsafe { abi::decode_value::<String>(err.payload()) }.unwrap(),
-        "key"
-    );
+    let mut r = BufferReader::new(err.payload());
+    assert_eq!(r.read_string().unwrap(), "key");
     unsafe { export_runtime_error_clear(&mut err) };
     assert!(err.payload_ptr.is_null());
 }
 
 #[test]
-fn free_bytes_releases_returned_and_allocated_runs() {
-    let (p, len) = abi::bytes_into_raw(&[1, 2, 3]);
-    let staged = export_runtime_alloc(16);
+fn run_free_releases_returned_and_allocated_runs() {
+    let returned = Run::copy_of(&[1, 2, 3]);
+    assert_eq!(returned.ptr as usize % 8, 0, "an 8-aligned run");
+    let staged = unsafe { export_runtime_alloc(16) };
     assert!(!staged.is_null());
-    assert_eq!(staged as usize % abi::RUN_ALIGN, 0, "an 8-aligned run");
-    assert!(export_runtime_alloc(0).is_null());
+    assert_eq!(staged as usize % 8, 0, "an 8-aligned run");
+    assert!(unsafe { export_runtime_alloc(0) }.is_null());
     unsafe {
-        export_runtime_free_bytes(p.cast_mut(), len);
-        export_runtime_free_bytes(staged, 16);
-        export_runtime_free_bytes(ptr::null_mut(), 0);
+        export_runtime_run_free(returned);
+        export_runtime_run_free(Run {
+            ptr: staged,
+            len: 16,
+        });
+        export_runtime_run_free(Run::EMPTY);
     }
 }
 
 #[test]
 fn cancel_tokens_round_trip() {
-    let tok = export_runtime_cancel_token_create();
-    assert!(!tok.is_null());
     unsafe {
+        let tok = export_runtime_cancel_token_create();
+        assert!(!tok.is_null());
         assert!(!export_runtime_cancel_token_is_cancelled(tok));
         export_runtime_cancel_token_cancel(tok);
         export_runtime_cancel_token_cancel(tok);
@@ -106,7 +124,9 @@ fn cancel_tokens_round_trip() {
 #[test]
 fn debug_live_reports_whether_it_counts() {
     // This crate's tests enable `leak-check`, so kind -1 reads 1.
-    assert_eq!(export_runtime_debug_live(-1), 1);
-    assert_eq!(export_runtime_debug_live(-2), 0);
-    assert_eq!(export_runtime_debug_live(99), 0);
+    unsafe {
+        assert_eq!(export_runtime_debug_live(-1), 1);
+        assert_eq!(export_runtime_debug_live(-2), 0);
+        assert_eq!(export_runtime_debug_live(99), 0);
+    }
 }

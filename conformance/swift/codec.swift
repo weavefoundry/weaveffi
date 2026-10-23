@@ -1,11 +1,11 @@
-// Conformance consumer: codec sample, Swift target (ABI revision 5).
+// Conformance consumer: codec sample, Swift target (ABI revision 6).
 //
 // The shared-vector loop through the generated `Codec` module: every vector
 // the producer serves is decoded by the Swift codec, re-encoded on the way
 // back into `checkVector` (which must accept it, and reject it for the
 // neighboring index), and, for primitive vectors, pushed through the
-// matching direct-family `echo*`, optional-scalar `echoOpt*`, and
-// typed-array `echo*s`. Then vectors built from Swift literals (so a
+// matching scalar `echo*`, optional-scalar `echoOpt*`, and typed-array
+// `echo*s`. Then vectors built from Swift literals (so a
 // symmetric encode/decode bug can't hide), spot checks of decoded values,
 // the typed `CodecError.outOfRange` with its payload, optional scalars and
 // typed arrays at their edges (NaN, -0.0, extremes, empty), `usize`, `char`,
@@ -71,7 +71,7 @@ func vectorIndex(_ n: UInt32) -> [String: UInt32] {
     return names
 }
 
-/// Push a primitive vector's value through its direct-family echo, and,
+/// Push a primitive vector's value through its scalar echo, and,
 /// where one exists, its optional-scalar and typed-array echoes.
 func echo(_ v: Vector) {
     switch v {
@@ -228,12 +228,17 @@ func outOfRange(_ n: UInt32) {
     expect(!Codec.checkVector(index: n, value: .blank), "checkVector past the end is false")
 }
 
+/// The run lending `bytes` for one raw C call.
+func withRun<R>(_ bytes: [UInt8], _ body: (codec_run) -> R) -> R {
+    bytes.withUnsafeBufferPointer { body(codec_run(ptr: $0.baseAddress, len: $0.count)) }
+}
+
 /// Hand `bytes` to `check_vector` through the raw C entry point: the Swift
 /// encoder never produces a malformed buffer, but the producer must reject
 /// one with a marshalling failure (-3).
 func reject(_ bytes: [UInt8], _ what: String) {
     var err = codec_error()
-    let ok = bytes.withUnsafeBufferPointer { codec_codec_check_vector(0, $0.baseAddress, $0.count, &err) }
+    let ok = withRun(bytes) { codec_check_vector(0, $0, &err) }
     expect(!ok && err.code == -3, "\(what) is rejected with -3 (got \(err.code))")
     codec_error_clear(&err)
 }
@@ -253,16 +258,14 @@ func malformed() {
     reject(le(countsTag) + le(UInt32(2)) + a + le(Int64(1)) + a + le(Int64(2)), "a repeated map key")
     reject(le(textTag) + le(UInt32(2)) + [0xC3, 0x28], "a string that isn't UTF-8")
 
-    // Direct families: an undeclared enum value (which Swift's `Color` can't
+    // Scalars and runs: an undeclared enum value (which Swift's `Color` can't
     // even spell) and invalid UTF-8.
     var err = codec_error()
-    _ = codec_codec_echo_color(3, &err)
+    _ = codec_echo_color(3, &err)
     expect(err.code == -3, "echo_color(3) is rejected (got \(err.code))")
     codec_error_clear(&err)
-    var len = 0
-    let bad: [UInt8] = [0xC3, 0x28]
-    let out = bad.withUnsafeBufferPointer { codec_codec_echo_text($0.baseAddress, $0.count, &len, &err) }
-    expect(out == nil && err.code == -3, "echo_text(invalid UTF-8) is rejected")
+    let out = withRun([0xC3, 0x28]) { codec_echo_text($0, &err) }
+    expect(out.ptr == nil && out.len == 0 && err.code == -3, "echo_text(invalid UTF-8) is rejected")
     codec_error_clear(&err)
 }
 
@@ -310,10 +313,11 @@ func optScalars() {
     // A present raw value Swift's `Color` can't spell is rejected; an
     // absent one is ignored.
     var err = codec_error()
-    var out: Int32 = 0
-    expect(!codec_codec_echo_opt_color(true, 3, &out, &err) && err.code == -3, "echo_opt_color(3) is rejected (got \(err.code))")
+    var out = codec_echo_opt_color(codec_opt_i32(has: true, value: 3), &err)
+    expect(!out.has && err.code == -3, "echo_opt_color(3) is rejected (got \(err.code))")
     codec_error_clear(&err)
-    expect(!codec_codec_echo_opt_color(false, 3, &out, &err) && err.code == 0, "an absent color is ignored")
+    out = codec_echo_opt_color(codec_opt_i32(has: false, value: 0), &err)
+    expect(!out.has && err.code == 0, "an absent color is absent")
 }
 
 func typedArrays() {
@@ -329,16 +333,18 @@ func typedArrays() {
     let wide: [UInt64] = [7, 8, 9]
     expect(Codec.echoU64s(values: Array(wide.dropFirst())) == [8, 9], "echoU64s of a slice")
 
-    // A null array with a length, and one not aligned for its element.
+    // A null run with a length, one not aligned for its element, and one
+    // whose length isn't a whole number of elements.
     var err = codec_error()
-    var len = 0
-    expect(codec_codec_echo_u64s(nil, 2, &len, &err) == nil && err.code == -3, "a null array with a length is rejected")
+    expect(codec_echo_u64s(codec_run(ptr: nil, len: 16), &err).ptr == nil && err.code == -3, "a null run with a length is rejected")
     codec_error_clear(&err)
     let raw = UnsafeMutableRawPointer.allocate(byteCount: 24, alignment: 8)
     defer { raw.deallocate() }
     raw.initializeMemory(as: UInt8.self, repeating: 0, count: 24)
-    let misaligned = UnsafePointer<UInt64>(OpaquePointer(raw + 4))
-    expect(codec_codec_echo_u64s(misaligned, 2, &len, &err) == nil && err.code == -3, "a misaligned array is rejected")
+    let bytes = raw.assumingMemoryBound(to: UInt8.self)
+    expect(codec_echo_u64s(codec_run(ptr: bytes + 4, len: 16), &err).ptr == nil && err.code == -3, "a misaligned array is rejected")
+    codec_error_clear(&err)
+    expect(codec_echo_u64s(codec_run(ptr: bytes, len: 12), &err).ptr == nil && err.code == -3, "a ragged array is rejected")
     codec_error_clear(&err)
 }
 
@@ -367,15 +373,13 @@ func chunks() {
 
 /// Echo `input` through the raw C `f`, expecting a -3 with `message`.
 func rejected(
-    _ f: (UnsafePointer<UInt8>?, Int, UnsafeMutablePointer<Int>?, UnsafeMutablePointer<codec_error>?) -> UnsafePointer<UInt8>?,
+    _ f: (codec_run, UnsafeMutablePointer<codec_error>?) -> codec_run,
     _ input: String, _ message: String
 ) {
     var err = codec_error()
-    var len = 0
-    let bytes = Array(input.utf8)
-    let out = bytes.withUnsafeBufferPointer { f($0.baseAddress, $0.count, &len, &err) }
+    let out = withRun(Array(input.utf8)) { f($0, &err) }
     let got = err.message_ptr.map { String(decoding: UnsafeBufferPointer(start: $0, count: err.message_len), as: UTF8.self) } ?? ""
-    expect(out == nil && err.code == -3 && got == message, "\(input.debugDescription) rejected with \(err.code) \(got.debugDescription)")
+    expect(out.ptr == nil && err.code == -3 && got == message, "\(input.debugDescription) rejected with \(err.code) \(got.debugDescription)")
     codec_error_clear(&err)
 }
 
@@ -386,15 +390,15 @@ func conversions() {
     for c in ["🦀", "é", "a"] {
         expect(same(Codec.echoChar(value: c), c), "echoChar(\(c))")
     }
-    rejected(codec_codec_echo_char, "ab", "value: \"ab\" is not a valid char")
-    rejected(codec_codec_echo_char, "", "value: \"\" is not a valid char")
+    rejected(codec_echo_char, "ab", "value: \"ab\" is not a valid char")
+    rejected(codec_echo_char, "", "value: \"\" is not a valid char")
 
     expect(Codec.echoHex(value: "ff") == "ff", "echoHex(ff)")
     expect(Codec.echoHex(value: "00FF") == "ff", "echoHex(00FF) normalizes")
     expect(Codec.echoHex(value: "0") == "0", "echoHex(0)")
-    rejected(codec_codec_echo_hex, "xyz", "value: invalid digit found in string")
-    rejected(codec_codec_echo_hex, "", "value: cannot parse integer from empty string")
-    rejected(codec_codec_echo_hex, "100000000", "value: number too large to fit in target type")
+    rejected(codec_echo_hex, "xyz", "value: invalid digit found in string")
+    rejected(codec_echo_hex, "", "value: cannot parse integer from empty string")
+    rejected(codec_echo_hex, "100000000", "value: number too large to fit in target type")
 }
 
 func run() {
@@ -421,7 +425,7 @@ func run() {
 }
 
 run()
-expect(codec_abi_version() == 5, "ABI revision 5")
+expect(codec_abi_version() == 6, "ABI revision 6")
 expect(codec_debug_live(-1) == 1, "the sample counts live resources")
 assertNoLeaks()
 print("swift/codec: OK")

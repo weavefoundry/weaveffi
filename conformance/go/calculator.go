@@ -1,10 +1,10 @@
-// Conformance consumer: calculator sample, Go target (ABI revision 5).
+// Conformance consumer: calculator sample, Go target (ABI revision 6).
 //
-// The getting-started surface: Check (the ABI revision and the contract
-// table), a direct-value call (wrapping on overflow), a throwing call that
-// returns the typed *DivisionByZeroError, and a string in and out
-// (non-ASCII and astral text and an interior NUL byte survive). Then the
-// ABI 5 shapes: a second error domain whose code value 1 is also CalcError's
+// The getting-started surface: Check (the ABI revision and every
+// declaration's contract), a direct-value call (wrapping on overflow), a
+// throwing call that returns the typed *DivisionByZeroError, and a string in
+// and out (non-ASCII and astral text and an interior NUL byte survive). Then
+// the other shapes: a second error domain whose code value 1 is also CalcError's
 // (dispatched by the function's domain), a payload field, a function that
 // fails with any error (*Error, code -1), an optional scalar return, and
 // typed arrays in and out. Ends by asserting the library's leak counters are
@@ -54,13 +54,13 @@ func main() {
 		expect(got == want, fmt.Sprintf("greet(%q) = %q", name, got))
 	}
 
-	abi5()
+	moreShapes()
 
 	expectNoLeaks(calc.DebugLive)
 	fmt.Println("go/calculator: OK")
 }
 
-func abi5() {
+func moreShapes() {
 	// A second domain: ParseError's code 1 is not CalcError's code 1.
 	for _, text := range []string{"42", " 42 "} {
 		n, err := calc.Parse(text)

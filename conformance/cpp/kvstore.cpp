@@ -1,9 +1,9 @@
-// Conformance consumer: kvstore sample, C++ target (ABI revision 5).
+// Conformance consumer: kvstore sample, C++ target (ABI revision 6).
 //
 // Drives the feature-complete producer through the generated header:
 //
-//   * the load-time check (ABI revision and both modules' contract tables;
-//     a doctored table is refused by name);
+//   * the load-time check (the ABI revision and every declaration's
+//     contract hash; a doctored row is refused by its path);
 //   * the `Store` RAII class: fallible and infallible constructors, methods,
 //     statics, the deprecated `size`, records (`Entry`, `StoreInfo`), the
 //     `EntryKind` enum, maps and optionals, and the logical clock;
@@ -25,12 +25,15 @@
 //     a `Scorer` taking and returning typed arrays;
 //   * `Store` objects in every position, compared by identity (`==`);
 //   * futures: an async free function returning an object, a cancellable
-//     method cancelled mid-pause, an async list, an async function in the
-//     nested `kv.stats` module, and concurrent calls;
-//   * the nested `kv.stats` module and the sibling `report` root;
-//   * the ABI 5 shapes: an optional scalar return, iterator item, and async
-//     result; typed arrays as a return and an async result; a `usize`
-//     return; and a `throws: any` method failing with the root `Error` (-1).
+//     method cancelled mid-pause, an async list, an async free function
+//     taking a list of objects, and concurrent calls;
+//   * free functions declared in the sample's other Rust modules (`stats`,
+//     `report`, with its own `ReportError` domain), which share the one
+//     namespace;
+//   * the values that cross without a buffer: an optional scalar return,
+//     iterator item, and async result; typed arrays as a return and an
+//     async result; a `usize` return; and a `throws: any` method failing
+//     with the root `Error` (-1).
 //
 // Ends by asserting every callback implementation was released and the
 // producer's leak counters are all zero.
@@ -56,7 +59,6 @@
 #include "kvstore.hpp"
 
 using namespace kvstore;
-namespace stats = ::kvstore::kv::stats;
 
 static const std::thread::id g_main_thread = std::this_thread::get_id();
 static std::atomic<int> g_listeners_freed{0};
@@ -87,17 +89,13 @@ static KeyNotFoundError expect_key_not_found(F&& fn, const std::string& key, con
 static void load_checks() {
     check_library();
 
-    // A table entry the library lacks, or one whose signature changed, is
-    // refused by its path.
-    const detail::ContractEntry missing[] = {{1, 2, "kv.Store.vanished"}};
-    CHECK(detail::contract_mismatch(kvstore_kv_contract, missing) ==
-          "kv.Store.vanished is missing from the library");
-    const detail::ContractEntry& first = detail::kv_contract[0];
-    const detail::ContractEntry changed[] = {{first.id, first.hash ^ 1, first.path}};
-    CHECK(detail::contract_mismatch(kvstore_kv_contract, changed) ==
+    // A row whose hash the library doesn't return is refused by its path.
+    // (A declaration the library lacks fails to link instead.)
+    const detail::ContractRow& first = detail::contract_rows[0];
+    const detail::ContractRow changed[] = {{first.hash, first.expected ^ 1, first.path}};
+    CHECK(detail::contract_mismatch(changed) ==
           std::string(first.path) + " changed since these bindings were generated");
-    CHECK(detail::contract_mismatch(kvstore_kv_contract, detail::kv_contract).empty());
-    CHECK(detail::contract_mismatch(kvstore_report_contract, detail::report_contract).empty());
+    CHECK(detail::contract_mismatch(detail::contract_rows).empty());
 }
 
 // ── constructors ────────────────────────────────────────────────────────────
@@ -111,9 +109,9 @@ static void constructors() {
     CHECK(s.path() == "memory");
     CHECK(s.capacity() == Store::default_capacity() && s.capacity() == 1000000);
 
-    Store opened = kv::open_store("/async").get();
+    Store opened = open_store("/async").get();
     CHECK(opened.path() == "/async");
-    std::future<Store> failing = kv::open_store("");
+    std::future<Store> failing = open_store("");
     e = expect_throw<InvalidPathError>([&] { failing.get(); }, "open_store('')");
     CHECK(e.code() == 1004 && std::string(e.what()) == "invalid path");
 }
@@ -528,11 +526,10 @@ static void async_calls() {
         CHECK(got[2].has_value() && got[2]->key == "keep");
     }
 
-    // The nested module's async free function: objects in a list in, a
-    // record out.
+    // An async free function: objects in a list in, a record out.
     Store other = Store::open("/other");
     put(other, "a", "123");
-    Stats st = stats::summarize_all({s, other}).get();
+    Stats st = summarize_all({s, other}).get();
     CHECK(st.entries == 2 && st.bytes == 4);
     CHECK(st.by_kind.size() == 1 && st.by_kind.at(EntryKind::Persistent) == 2);
 }
@@ -593,24 +590,24 @@ static void stats_and_report() {
     put(s, "a", "123");
     put(s, "c", "x", EntryKind::Encrypted);
 
-    Stats st = stats::summarize(s, std::nullopt);
+    Stats st = summarize(s, std::nullopt);
     CHECK(st.entries == 3 && st.bytes == 6 && st.by_kind.size() == 2);
     CHECK(st.by_kind.at(EntryKind::Persistent) == 2 && st.by_kind.at(EntryKind::Encrypted) == 1);
-    expect_key_not_found([&] { stats::summarize(s, std::string("q")); }, "q", "summarize('q')");
+    expect_key_not_found([&] { summarize(s, std::string("q")); }, "q", "summarize('q')");
 
     std::vector<Entry> entries;
     for (Entry& e : s.entries(std::nullopt)) entries.push_back(std::move(e));
-    std::vector<std::string> lines = report::render_report(entries);
+    std::vector<std::string> lines = render_report(entries);
     CHECK((lines == std::vector<std::string>{"a: 3 bytes, Persistent, v2", "b: 2 bytes, Persistent",
                                              "c: 1 bytes, Encrypted"}));
     NothingToReportError none =
-        expect_throw<NothingToReportError>([] { report::render_report({}); }, "empty report");
+        expect_throw<NothingToReportError>([] { render_report({}); }, "empty report");
     CHECK(none.code() == 2001 && std::string(none.what()) == "nothing to report");
     CHECK(dynamic_cast<const ReportError*>(&none) != nullptr);
     CHECK(dynamic_cast<const KvError*>(&none) == nullptr);
 }
 
-// ── scorer and the ABI 5 shapes ─────────────────────────────────────────────
+// ── scorer and the direct shapes ─────────────────────────────────────────────
 
 enum class ScoreMode { Sizes, Fail, Short };
 
@@ -633,8 +630,8 @@ public:
     }
 };
 
-static void abi5_shapes() {
-    Store s = Store::open("/abi5");
+static void direct_shapes() {
+    Store s = Store::open("/direct");
     put(s, "b", "12");
     put(s, "a", "\x01\x02\x03", EntryKind::Volatile, 7);
     CHECK(s.count() == 2);
@@ -693,7 +690,7 @@ int main() {
     async_calls();
     object_graph();
     stats_and_report();
-    abi5_shapes();
+    direct_shapes();
 
     CHECK(kvstore_debug_live(1) == 0);
     check_no_leaks(kvstore_debug_live, "kvstore");

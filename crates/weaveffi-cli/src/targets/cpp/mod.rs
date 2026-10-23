@@ -3,19 +3,20 @@
 //! Produces an idiomatic header-only C++17 library over the C ABI: the C
 //! header `{library}.h` (the same file the [`c`](super::c) target emits), a
 //! wrapper header `{library}.hpp` that includes it, a `CMakeLists.txt`
-//! exporting an INTERFACE target, and a README. Everything lives in
-//! `namespace {prefix}` by default.
+//! exporting an INTERFACE target, and a README. A library is one namespace,
+//! so every declaration lives in one C++ namespace: the configured `name`,
+//! else the library name.
 //!
-//! The generated surface follows C ABI revision 5, reading every transport
-//! decision from the model's passing contracts:
+//! The generated surface follows C ABI revision 6, in which every value
+//! crosses as one C value; the wrapper marshals each value by its
+//! [`Crossing`](crate::codegen::values::Crossing):
 //!
-//! * Strings cross as a UTF-8 pointer and length: parameters are
-//!   `std::string_view`, returns are `std::string` copied out of the
-//!   producer's run and released with `{prefix}_free_bytes`.
-//! * Optional scalars and enums (OptDirect) are `std::optional<T>` passed
-//!   as a presence flag and a value; numeric lists (Slice) are
-//!   `std::vector<T>` whose storage is passed as is, and returned typed
-//!   arrays are copied into a vector.
+//! * Strings, bytes, and typed arrays cross as a `{prefix}_run` over the
+//!   argument's own storage: parameters are `std::string_view` and
+//!   `const std::vector<T>&`, and a returned run is copied into a
+//!   `std::string` or `std::vector` and released with `{prefix}_run_free`.
+//! * Optional scalars and enums are `std::optional<T>`, crossing as their
+//!   `{prefix}_opt_*` struct.
 //! * Records are aggregates with default member initializers and memberwise
 //!   `operator==`; rich enums are `std::variant`-backed sum types. Both
 //!   cross as value buffers through one `detail::write` and `detail::read`
@@ -24,10 +25,11 @@
 //! * Interfaces are classes holding a Rule-of-Zero `detail::Handle` (one
 //!   strong reference: copies `_clone`, destruction `_destroy`), compared
 //!   by identity.
-//! * Callback interfaces are abstract classes passed as `std::shared_ptr`.
-//!   A `detail::Callbacks<I>` specialization holds the trampolines and the
-//!   static vtable (flags 0); each method reports exceptions per its own
-//!   error strategy.
+//! * Callback interfaces are abstract classes passed as `std::shared_ptr`,
+//!   crossing as the `{prefix}_{Cb}` struct of a boxed pointer and a static
+//!   vtable. A `detail::Callbacks<I>` specialization holds the trampolines
+//!   and the vtable (its own `size`, flags 0); each method reports
+//!   exceptions per its own error strategy.
 //! * Every exception derives from `{namespace}::Error`: an error domain's
 //!   class and its codes' classes (an unknown positive code is the domain
 //!   class: domains are open), `Error` itself for `throws: any` and runtime
@@ -37,10 +39,10 @@
 //! * An `iter<T>` callable returns the generic lazy `Range<T>`; async
 //!   callables return `std::future<T>`, and a cancellable one takes a
 //!   trailing `const CancelToken&`.
-//! * `check_library()` verifies the producer's ABI revision and every
-//!   top-level module's contract table once, and throws `LoadError` naming
-//!   the first declaration the library lacks or changed. Every free
-//!   function, constructor, and static member calls it.
+//! * `check_library()` verifies the producer's ABI revision and calls every
+//!   declaration's contract function once, and throws `LoadError` naming
+//!   the first declaration the library changed (one it lacks fails to
+//!   link). Every free function, constructor, and static member calls it.
 
 mod callbacks;
 mod calls;
@@ -65,7 +67,7 @@ use weaveffi_model::pkg::Identity;
 
 use crate::codegen::errors;
 use crate::targets::cpp::callbacks::render_callback_interface;
-use crate::targets::cpp::calls::render_cpp_module_ns;
+use crate::targets::cpp::calls::{render_definition, FnKind};
 use crate::targets::cpp::codec::render_codecs;
 use crate::targets::cpp::entities::{
     render_cpp_enums, render_cpp_interface_class, render_cpp_interface_members,
@@ -75,14 +77,14 @@ use crate::targets::cpp::package::{
     render_cmake, render_packaged_cmake, render_packaged_readme, render_readme, CmakeNames,
 };
 use crate::targets::cpp::runtime::{render_buffer_runtime, render_prelude_runtime};
-use crate::targets::cpp::types::Ctx;
+use crate::targets::cpp::types::{cpp_free_fn_name, Ctx};
 
 /// Per-target configuration for [`CppGenerator`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CppConfig {
     /// The C++ namespace holding every generated declaration (default: the
-    /// package's C prefix).
+    /// library name).
     pub name: Option<String>,
     /// Filename of the wrapper header (default `{library}.hpp`).
     pub header_name: Option<String>,
@@ -92,10 +94,12 @@ pub struct CppConfig {
 }
 
 impl CppConfig {
-    /// Returns the configured C++ namespace, falling back to the identity's
-    /// C prefix.
+    /// Returns the configured C++ namespace, falling back to the library
+    /// name.
     pub fn namespace(&self, identity: &Identity) -> String {
-        self.name.clone().unwrap_or_else(|| identity.prefix.clone())
+        self.name
+            .clone()
+            .unwrap_or_else(|| identity.library.clone())
     }
 
     /// Returns the wrapper header's filename, falling back to
@@ -230,8 +234,8 @@ impl Target for CppGenerator {
 /// complete before it's held by value or marshalled:
 ///
 /// 1. the runtime: exceptions, the generic `detail` machinery, `Range`,
-///    `CancelToken`, `check_library()` with the expected contract tables,
-///    and the value-buffer codecs (when any value crosses as a buffer);
+///    `CancelToken`, `check_library()` with the contract rows, and the
+///    value-buffer codecs (when any value crosses as a buffer);
 /// 2. C-style enums;
 /// 3. forward declarations of every value type, interface class, and
 ///    callback-interface class;
@@ -242,7 +246,7 @@ impl Target for CppGenerator {
 /// 7. error domains and their `detail::Errors` policies;
 /// 8. callback-interface abstract classes and their `detail::Callbacks`;
 /// 9. the out-of-line definitions of every interface member; and
-/// 10. one nested namespace per module holding its free functions.
+/// 10. the free functions.
 pub(crate) fn render_cpp_header(
     model: &Model,
     namespace: &str,
@@ -270,11 +274,7 @@ pub(crate) fn render_cpp_header(
     if model.has_buffers() {
         includes.push("unordered_map");
     }
-    if model
-        .modules
-        .iter()
-        .any(|m| m.enums.iter().any(EnumBinding::is_rich))
-    {
+    if model.enums.iter().any(EnumBinding::is_rich) {
         includes.push("variant");
     }
     includes.sort_unstable();
@@ -298,41 +298,45 @@ pub(crate) fn render_cpp_header(
         w.blank();
     }
 
-    for module in &model.modules {
-        render_cpp_enums(&mut w, &ctx, module);
-    }
+    render_cpp_enums(&mut w, &ctx);
 
     // Forward declarations let member declarations name any type before its
     // definition.
-    let mut forward = false;
-    for module in &model.modules {
-        for s in &module.structs {
-            w.line(format!("struct {};", s.name));
-            forward = true;
-        }
-        for e in module.enums.iter().filter(|e| e.is_rich()) {
-            w.line(format!("struct {};", e.name));
-            forward = true;
-        }
-        for i in &module.interfaces {
-            w.line(format!("class {};", i.name));
-            forward = true;
-        }
-        for cb in &module.callback_interfaces {
-            w.line(format!("class {};", cb.name));
-            forward = true;
-        }
+    let forward: Vec<String> = model
+        .records
+        .iter()
+        .map(|r| format!("struct {};", r.name))
+        .chain(
+            model
+                .enums
+                .iter()
+                .filter(|e| e.is_rich())
+                .map(|e| format!("struct {};", e.name)),
+        )
+        .chain(
+            model
+                .interfaces
+                .iter()
+                .map(|i| format!("class {};", i.name)),
+        )
+        .chain(
+            model
+                .callbacks
+                .iter()
+                .map(|cb| format!("class {};", cb.name)),
+        )
+        .collect();
+    for line in &forward {
+        w.line(line);
     }
-    if forward {
+    if !forward.is_empty() {
         w.blank();
     }
 
-    for module in &model.modules {
-        for i in &module.interfaces {
-            render_cpp_interface_class(&mut w, &ctx, i);
-        }
+    for i in &model.interfaces {
+        render_cpp_interface_class(&mut w, &ctx, i);
     }
-    let values = value_types_in_order(&model.modules);
+    let values = value_types_in_order(model);
     for def in &values {
         def.render(&mut w, &ctx);
     }
@@ -340,16 +344,14 @@ pub(crate) fn render_cpp_header(
     for table in errors::tables(model, "Error") {
         render_domain_error(&mut w, &ctx, &table);
     }
-    for (_, cb) in model.callback_interfaces() {
+    for cb in &model.callbacks {
         render_callback_interface(&mut w, &ctx, cb);
     }
-    for module in &model.modules {
-        for i in &module.interfaces {
-            render_cpp_interface_members(&mut w, &ctx, i);
-        }
+    for i in &model.interfaces {
+        render_cpp_interface_members(&mut w, &ctx, i);
     }
-    for module in &model.modules {
-        render_cpp_module_ns(&mut w, &ctx, module);
+    for f in &model.functions {
+        render_definition(&mut w, &ctx, f, &cpp_free_fn_name(&f.name), FnKind::Free);
     }
     w.line(format!("}} // namespace {namespace}"));
     w.blank();

@@ -6,13 +6,13 @@
 use std::path::Path;
 
 use weaveffi_model::model::Model;
-use weaveffi_model::parse::parse_api_str;
+use weaveffi_model::parse::load_api;
 use weaveffi_model::validate::validate;
 
 const FIXTURES: [&str; 5] = [
     "kitchen_sink",
     "shapes",
-    "nested_modules",
+    "imports",
     "docs_everywhere",
     "edge_cases",
 ];
@@ -21,9 +21,13 @@ fn load(stem: &str) -> Model {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(format!("{stem}.yml"));
-    let contents = std::fs::read_to_string(&path).expect("read fixture");
-    let api = parse_api_str(&contents, "yaml").expect("parse fixture");
-    validate(&api, &weaveffi_model::pkg::Identity::named(stem), None).expect("validate fixture")
+    let (api, sources) = load_api(&path).expect("load fixture");
+    validate(
+        &api,
+        &weaveffi_model::pkg::Identity::named(stem),
+        Some(&sources),
+    )
+    .expect("validate fixture")
 }
 
 #[test]

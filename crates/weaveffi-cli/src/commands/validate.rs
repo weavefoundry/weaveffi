@@ -6,10 +6,25 @@ use std::process::ExitCode;
 use miette::{Report, Result};
 use weaveffi_model::validate::{ValidationError, ValidationWarning};
 
-/// Run `weaveffi validate`, printing one JSON object with `json_mode`.
+/// Run `weaveffi validate`, printing one JSON object with `json_mode`
+/// (also when the project can't be loaded at all).
 pub fn cmd_validate(locate: &super::Locate<'_>, warn: bool, json_mode: bool) -> Result<ExitCode> {
     let quiet = locate.quiet;
-    let definition = locate.project()?.definition()?;
+    let definition = match locate.project().and_then(|p| p.definition()) {
+        Ok(definition) => definition,
+        Err(report) if json_mode => {
+            let json = serde_json::json!({
+                "ok": false,
+                "errors": [{
+                    "code": report.code().map_or_else(|| "LoadError".to_string(), |c| c.to_string()),
+                    "message": format!("{report:#}"),
+                }],
+            });
+            println!("{json}");
+            return Ok(ExitCode::FAILURE);
+        }
+        Err(report) => return Err(report),
+    };
     match definition.validate() {
         Ok(_) => {
             let warnings = if warn {
@@ -17,14 +32,13 @@ pub fn cmd_validate(locate: &super::Locate<'_>, warn: bool, json_mode: bool) -> 
             } else {
                 Vec::new()
             };
-            let counts = Counts::of(&definition.api.modules);
+            let counts = Counts::of(&definition.api);
             if json_mode {
                 let json = serde_json::json!({
                     "ok": true,
-                    "modules": counts.modules,
                     "functions": counts.functions,
                     "interfaces": counts.interfaces,
-                    "callback_interfaces": counts.callback_interfaces,
+                    "callbacks": counts.callbacks,
                     "records": counts.records,
                     "enums": counts.enums,
                     "error_domains": counts.error_domains,
@@ -58,48 +72,34 @@ pub fn cmd_validate(locate: &super::Locate<'_>, warn: bool, json_mode: bool) -> 
     }
 }
 
-/// Declaration counts across a module tree, for the success summary.
+/// Declaration counts, for the success summary.
 #[derive(Default)]
 struct Counts {
-    modules: usize,
     functions: usize,
     interfaces: usize,
-    callback_interfaces: usize,
+    callbacks: usize,
     records: usize,
     enums: usize,
     error_domains: usize,
 }
 
 impl Counts {
-    fn of(modules: &[weaveffi_model::ir::Module]) -> Self {
-        let mut c = Self::default();
-        c.add(modules);
-        c
-    }
-
-    fn add(&mut self, modules: &[weaveffi_model::ir::Module]) {
-        for m in modules {
-            self.modules += 1;
-            self.functions += m.functions.len();
-            self.interfaces += m.interfaces.len();
-            self.callback_interfaces += m.callback_interfaces.len();
-            self.records += m.structs.len();
-            self.enums += m.enums.len();
-            self.error_domains += m.errors.len();
-            self.add(&m.modules);
+    fn of(api: &weaveffi_model::ir::Api) -> Self {
+        Self {
+            functions: api.functions.len(),
+            interfaces: api.interfaces.len(),
+            callbacks: api.callbacks.len(),
+            records: api.records.len(),
+            enums: api.enums.len(),
+            error_domains: api.errors.len(),
         }
     }
 
     fn summary(&self) -> String {
         let parts = [
-            (self.modules, "module", "modules"),
             (self.functions, "function", "functions"),
             (self.interfaces, "interface", "interfaces"),
-            (
-                self.callback_interfaces,
-                "callback interface",
-                "callback interfaces",
-            ),
+            (self.callbacks, "callback interface", "callback interfaces"),
             (self.records, "record", "records"),
             (self.enums, "enum", "enums"),
             (self.error_domains, "error domain", "error domains"),
@@ -129,26 +129,14 @@ fn validation_error_to_json(err: &ValidationError) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
-/// Convert a [`ValidationWarning`] into a JSON object of `{ code, location,
-/// message }`. Variants that do not carry an explicit `location` field
-/// synthesize one from the available identifiers (e.g. `module::function`).
+/// Convert a [`ValidationWarning`] into a JSON object: its serialized form
+/// (`code` and fields) plus `message`.
 fn warning_to_json(w: &ValidationWarning) -> serde_json::Value {
-    let (code, location) = match w {
-        ValidationWarning::LargeEnumVariantCount { enum_name, .. } => {
-            ("LargeEnumVariantCount", enum_name.clone())
-        }
-        ValidationWarning::DeepNesting { location, .. } => ("DeepNesting", location.clone()),
-        ValidationWarning::EmptyModuleDoc { module } => ("EmptyModuleDoc", module.clone()),
-        ValidationWarning::AsyncVoidFunction { module, function } => {
-            ("AsyncVoidFunction", format!("{module}::{function}"))
-        }
-        ValidationWarning::DeprecatedFunction {
-            module, function, ..
-        } => ("DeprecatedFunction", format!("{module}::{function}")),
+    let mut obj = match serde_json::to_value(w) {
+        Ok(serde_json::Value::Object(obj)) => obj,
+        _ => serde_json::Map::new(),
     };
-    serde_json::json!({
-        "code": code,
-        "location": location,
-        "message": w.to_string(),
-    })
+    obj.insert("code".into(), w.code().into());
+    obj.insert("message".into(), w.to_string().into());
+    serde_json::Value::Object(obj)
 }

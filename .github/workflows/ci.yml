@@ -33,6 +33,35 @@ jobs:
       - name: weaveffi-model builds without the IDL formats (as the proc macro uses it)
         run: cargo check -p weaveffi-model --no-default-features
 
+  msrv:
+    # `rust-version` in Cargo.toml is a promise to producers, whose builds
+    # compile the runtime and the macros.
+    name: MSRV (1.89)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked -p weaveffi -p weaveffi-macros -p weaveffi-model -p weaveffi-cli
+      - run: cargo test --locked -p calculator -p kvstore -p codec
+
+  miri:
+    # The runtime's unsafe core (runs, objects, callbacks, iterators,
+    # cancellation) under Miri's checks for undefined behavior.
+    name: Miri (runtime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo miri test -p weaveffi --lib
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -134,7 +163,7 @@ jobs:
       - uses: ./.github/actions/toolchains
         with:
           lang: ${{ matrix.target }}
-      - run: bash scripts/check-fixtures.sh ${{ matrix.target }}
+      - run: cargo xtask fixtures ${{ matrix.target }}
 
   conformance:
     # Behavioral gate: every consumer binds through the *generated* bindings
@@ -147,6 +176,15 @@ jobs:
       matrix:
         lang: [c, cpp, python, ruby, dart, go, swift, dotnet, node, kotlin, wasm]
         os: [ubuntu-latest, macos-latest]
+        # The targets whose consumers load the library at run time, on
+        # Windows (where the lane scripts run under Git Bash).
+        include:
+          - { lang: python, os: windows-latest }
+          - { lang: dotnet, os: windows-latest }
+          - { lang: node, os: windows-latest }
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -156,14 +194,29 @@ jobs:
       - uses: ./.github/actions/toolchains
         with:
           lang: ${{ matrix.lang }}
-      - run: bash conformance/run.sh
-        env:
-          ONLY: ${{ matrix.lang }}
+      - run: cargo xtask conformance --only ${{ matrix.lang }}
+
+  skew:
+    # Bindings against a library of a different version: older bindings
+    # load a newer library, a changed declaration is reported by its path,
+    # and a missing one fails to link.
+    name: Version skew (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask skew
 
   android:
-    # The Kotlin target's JNI shim must compile and link against a real
-    # producer built for Android.
-    name: Android (NDK link)
+    # `weaveffi build` cross-compiles a producer for Android with the NDK,
+    # with the soname the Kotlin package's jniLibs need (JNA loads it).
+    name: Android (NDK build)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -176,36 +229,20 @@ jobs:
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26d
-      - name: Build the kvstore producer for aarch64-linux-android
-        env:
-          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
-        run: cargo build -p kvstore --target aarch64-linux-android --release
-      - name: Generate and link the JNI shim against it
-        env:
-          NDK: ${{ steps.ndk.outputs.ndk-path }}
-        run: |
-          set -euxo pipefail
-          cargo run -q -p weaveffi-cli -- generate samples/kvstore -o generated --target c,kotlin \
-            --library target/aarch64-linux-android/release/libkvstore.so
-          CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
-          shim=$(ls generated/kotlin/src/main/cpp/*.c | head -1)
-          "$CLANG" -shared -fPIC -Werror -I generated/kotlin/src/main/cpp -I generated/c "$shim" \
-            -L target/aarch64-linux-android/release -lkvstore -o libkvstore_jni.so
-          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -d libkvstore_jni.so | grep 'libkvstore.so'
-      - name: weaveffi build cross-compiles the producer and prebuilds the shim
+      - name: weaveffi build cross-compiles the producer
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
           set -euxo pipefail
-          cargo run -q -p weaveffi-cli -- build samples/kvstore --platforms android-arm64 --target kotlin --strict
+          cargo run -q -p weaveffi-cli -- build samples/kvstore --platforms android-arm64 --strict
           readelf="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
           "$readelf" -d target/weaveffi/android-arm64/libkvstore.so | grep 'SONAME.*libkvstore.so'
-          "$readelf" -d target/weaveffi/android-arm64/libkvstore_jni.so | grep 'NEEDED.*libkvstore.so'
+          "$readelf" --dyn-syms target/weaveffi/android-arm64/libkvstore.so | grep -q 'kvstore_contract_'
 
   package-smoke:
     # `weaveffi package` must produce artifacts each ecosystem's own tool
     # installs with no compiler: the wheel into a venv, the npm tarballs into
-    # a throwaway project (using the prebuilt addon), and on macOS the
+    # a throwaway project (koffi loads the bundled library), and on macOS the
     # SwiftPM package over its XCFramework. GitHub sets CI=true, so a missing
     # tool fails the job instead of skipping a target.
     name: Package install smoke (${{ matrix.os }})

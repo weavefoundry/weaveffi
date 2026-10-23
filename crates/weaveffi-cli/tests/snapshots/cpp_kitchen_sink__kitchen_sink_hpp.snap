@@ -176,7 +176,7 @@ struct ErrorFree {
 /**
  * Settles the `std::promise<T>` an async call passed as `context`, exactly
  * once: with the `E` exception for a failure, else with `value()` (which
- * takes ownership of the result slots). Releases the boxed error. Runs on
+ * takes ownership of the result). Releases the boxed error. Runs on
  * a producer thread inside a C frame, so nothing unwinds out of it.
  */
 template <typename E, typename T, typename F>
@@ -211,89 +211,110 @@ auto callback(error* out_err, F&& body) noexcept -> decltype(body()) {
     if constexpr (!std::is_void_v<decltype(body())>) return decltype(body()){};
 }
 
-/** Releases a producer run (a string, bytes, value buffer, or typed array) on scope exit. */
-struct Run {
-    const void* ptr;
-    size_t len;
-    ~Run() {
-        if (ptr != nullptr) kitchen_sink_free_bytes(static_cast<uint8_t*>(const_cast<void*>(ptr)), len);
-    }
+/** The C value of a string, bytes, typed array, or value buffer: a run of bytes. */
+using run = kitchen_sink_run;
+
+/** Releases a run the producer returned (a string, bytes, typed array, or value buffer) on scope exit. */
+struct OwnedRun {
+    run value;
+    ~OwnedRun() { kitchen_sink_run_free(value); }
 };
 
-/** The byte size of `count` elements of `T`, failing with -3 when it overflows. */
+/** A borrowed run over a string argument's UTF-8 bytes (no terminator, so interior NULs survive). */
+inline run string_run(std::string_view s) noexcept {
+    return run{reinterpret_cast<const uint8_t*>(s.data()), s.size()};
+}
+
+/** A borrowed run over a bytes argument. */
+inline run bytes_run(const std::vector<uint8_t>& v) noexcept { return run{v.data(), v.size()}; }
+
+/** A borrowed run over a typed-array argument's storage: `len` counts bytes. */
 template <typename T>
-size_t byte_size(size_t count) {
-    if (count > SIZE_MAX / sizeof(T)) throw Error(-3, "array is too large");
-    return count * sizeof(T);
+run slice_run(const std::vector<T>& v) noexcept {
+    return run{reinterpret_cast<const uint8_t*>(v.data()), v.size() * sizeof(T)};
 }
 
-/** Copies a producer-returned UTF-8 run into a string, then releases it. */
-inline std::string take_string(const uint8_t* ptr, size_t len) {
-    Run run{ptr, len};
-    if (ptr == nullptr) return std::string();
-    return std::string(reinterpret_cast<const char*>(ptr), len);
-}
-
-/** Copies a producer-returned byte run into a vector, then releases it. */
-inline std::vector<uint8_t> take_bytes(const uint8_t* ptr, size_t len) {
-    Run run{ptr, len};
-    if (ptr == nullptr) return std::vector<uint8_t>();
-    return std::vector<uint8_t>(ptr, ptr + len);
-}
-
-/** Copies a producer-returned typed array of `len` elements into a vector, then releases it. */
-template <typename T>
-std::vector<T> take_slice(const T* ptr, size_t len) {
-    Run run{ptr, len * sizeof(T)};
-    if (ptr == nullptr) return std::vector<T>();
-    return std::vector<T>(ptr, ptr + len);
-}
-
-/** Views a borrowed UTF-8 run as a string_view (a zero-length run may be dangling). */
-inline std::string_view borrow_string(const uint8_t* ptr, size_t len) noexcept {
-    if (len == 0) return std::string_view();
-    return std::string_view(reinterpret_cast<const char*>(ptr), len);
+/** Views a borrowed UTF-8 run as a string_view, valid while the run is. */
+inline std::string_view borrow_string(run r) noexcept {
+    if (r.len == 0) return std::string_view();
+    return std::string_view(reinterpret_cast<const char*>(r.ptr), r.len);
 }
 
 /** Copies a borrowed byte run into a vector. */
-inline std::vector<uint8_t> borrow_bytes(const uint8_t* ptr, size_t len) {
-    if (len == 0) return std::vector<uint8_t>();
-    return std::vector<uint8_t>(ptr, ptr + len);
+inline std::vector<uint8_t> borrow_bytes(run r) {
+    if (r.len == 0) return std::vector<uint8_t>();
+    return std::vector<uint8_t>(r.ptr, r.ptr + r.len);
 }
 
-/** Copies a borrowed typed array of `len` elements into a vector. */
+/** Copies a borrowed typed array into a vector, failing with -3 when its length isn't a whole number of elements. */
 template <typename T>
-std::vector<T> borrow_slice(const T* ptr, size_t len) {
-    if (len == 0) return std::vector<T>();
-    return std::vector<T>(ptr, ptr + len);
+std::vector<T> borrow_slice(run r) {
+    if (r.len % sizeof(T) != 0) throw InternalError(-3, "typed array length is not a multiple of its element size");
+    std::vector<T> v(r.len / sizeof(T));
+    if (r.len != 0) std::memcpy(v.data(), r.ptr, r.len);
+    return v;
 }
 
-/** The data pointer of a string argument, as the C ABI expects it. */
-inline const uint8_t* utf8(std::string_view s) noexcept {
-    return reinterpret_cast<const uint8_t*>(s.data());
+/** Copies a producer-returned UTF-8 run into a string, then releases it. */
+inline std::string take_string(run r) {
+    OwnedRun owned{r};
+    return std::string(borrow_string(r));
 }
 
-/** The C value of a scalar or C-style enum: an enum crosses as its `int32_t` discriminant. */
+/** Copies a producer-returned byte run into a vector, then releases it. */
+inline std::vector<uint8_t> take_bytes(run r) {
+    OwnedRun owned{r};
+    return borrow_bytes(r);
+}
+
+/** Copies a producer-returned typed array into a vector, then releases it. */
 template <typename T>
-constexpr auto to_c(T value) noexcept {
-    if constexpr (std::is_enum_v<T>) {
-        return static_cast<std::underlying_type_t<T>>(value);
-    } else {
-        return value;
+std::vector<T> take_slice(run r) {
+    OwnedRun owned{r};
+    return borrow_slice<T>(r);
+}
+
+/**
+ * Hands `len` bytes from `data` to the producer as a callback method's
+ * return: copies them into a run from kitchen_sink_alloc, which the producer
+ * adopts and frees.
+ */
+inline run give_run(const void* data, size_t len) {
+    if (len == 0) return run{nullptr, 0};
+    uint8_t* ptr = kitchen_sink_alloc(len);
+    if (ptr == nullptr) throw std::bad_alloc();
+    std::memcpy(ptr, data, len);
+    return run{ptr, len};
+}
+
+/** Hands a callback's string return to the producer. */
+inline run give_string(std::string_view value) { return give_run(value.data(), value.size()); }
+
+/** Hands a callback's bytes return to the producer. */
+inline run give_bytes(const std::vector<uint8_t>& value) { return give_run(value.data(), value.size()); }
+
+/** Hands a callback's typed-array return to the producer. */
+template <typename T>
+run give_slice(const std::vector<T>& value) {
+    return give_run(value.data(), value.size() * sizeof(T));
+}
+
+/** The C value of an optional scalar or C-style enum (`O` is its `kitchen_sink_opt_*` struct). */
+template <typename O, typename T>
+O to_opt(const std::optional<T>& value) noexcept {
+    O out{};
+    if (value.has_value()) {
+        out.has = true;
+        out.value = static_cast<decltype(out.value)>(*value);
     }
+    return out;
 }
 
-/** The C value slot of an optional scalar or enum argument: its value, or zero when absent. */
-template <typename T>
-constexpr auto value_or_zero(const std::optional<T>& value) noexcept {
-    return to_c(value.has_value() ? *value : T{});
-}
-
-/** An optional scalar or enum from its C presence flag and value. */
-template <typename T, typename C>
-std::optional<T> lift_optional(bool present, C value) noexcept {
-    if (!present) return std::nullopt;
-    return std::optional<T>(static_cast<T>(value));
+/** An optional scalar or C-style enum from its `kitchen_sink_opt_*` struct. */
+template <typename T, typename O>
+std::optional<T> from_opt(const O& value) noexcept {
+    if (!value.has) return std::nullopt;
+    return std::optional<T>(static_cast<T>(value.value));
 }
 
 /** A wrapper adopting a returned object reference, or none for null. */
@@ -313,48 +334,6 @@ const typename T::raw_type* handle_of(const std::optional<T>& object) noexcept {
 template <typename T>
 typename T::raw_type* clone_of(const std::optional<T>& object) noexcept {
     return object.has_value() ? object->clone_handle() : nullptr;
-}
-
-/** Hands a callback's optional scalar or enum return to the producer: writes the value, returns presence. */
-template <typename T, typename C>
-bool give_optional(const std::optional<T>& value, C* out_value) noexcept {
-    if (!value.has_value()) return false;
-    *out_value = static_cast<C>(*value);
-    return true;
-}
-
-/**
- * Hands `len` bytes from `data` to the producer through a callback method's
- * out slots: copies them into a run from kitchen_sink_alloc, which the
- * producer adopts and frees.
- */
-template <typename T>
-void give_run(const void* data, size_t len, T** out_ptr, size_t* out_len) {
-    uint8_t* run = nullptr;
-    if (len > 0) {
-        run = kitchen_sink_alloc(len);
-        if (run == nullptr) throw std::bad_alloc();
-        std::memcpy(run, data, len);
-    }
-    *out_ptr = reinterpret_cast<T*>(run);
-    *out_len = len;
-}
-
-/** Hands a callback's string return to the producer. */
-inline void give(std::string_view value, uint8_t** out_ptr, size_t* out_len) {
-    give_run(value.data(), value.size(), out_ptr, out_len);
-}
-
-/** Hands a callback's bytes return to the producer. */
-inline void give(const std::vector<uint8_t>& value, uint8_t** out_ptr, size_t* out_len) {
-    give_run(value.data(), value.size(), out_ptr, out_len);
-}
-
-/** Hands a callback's typed-array return to the producer; `out_len` receives the element count. */
-template <typename T>
-void give_slice(const std::vector<T>& value, T** out_ptr, size_t* out_len) {
-    give_run(value.data(), byte_size<T>(value.size()), out_ptr, out_len);
-    *out_len = value.size();
 }
 
 /** The implementation a callback interface's `ctx` boxes. */
@@ -586,125 +565,107 @@ private:
 
 namespace detail {
 
-/** One declaration this header was generated with: its contract id and hash, and its dotted path. */
-struct ContractEntry {
-    /** FNV-1a 64 of the declaration's dotted path. */
-    uint64_t id;
-    /** FNV-1a 64 of the declaration's canonical signature. */
-    uint64_t hash;
-    /** The declaration's dotted path (`kv.Store.put`). */
+/**
+ * One declaration this header was generated with: the library's contract
+ * function for it, the hash of its canonical signature, and its dotted path.
+ */
+struct ContractRow {
+    /** The library's `kitchen_sink_contract_*` function, which returns the declaration's hash. */
+    uint64_t (*hash)();
+    /** FNV-1a 64 of the declaration's canonical signature, as generated. */
+    uint64_t expected;
+    /** The declaration's dotted path (`Store.put`). */
     const char* path;
 };
 
 /**
- * Why the contract table `contract` returns doesn't satisfy `expected`,
- * naming the first declaration it lacks or declares differently, or an empty
- * string when it has them all. Entries the producer has and `expected`
- * doesn't are fine.
+ * Why the linked library doesn't match `rows`, naming the first declaration
+ * it declares differently, or an empty string when it matches them all. A
+ * declaration the library lacks fails to link instead, and declarations it
+ * has beyond `rows` are fine.
  */
 template <size_t N>
-std::string contract_mismatch(const kitchen_sink_contract_entry* (*contract)(size_t*),
-                              const ContractEntry (&expected)[N]) {
-    size_t len = 0;
-    const kitchen_sink_contract_entry* table = contract(&len);
-    if (table == nullptr) len = 0;
-    for (const ContractEntry& want : expected) {
-        size_t lo = 0;
-        size_t hi = len;
-        while (lo < hi) {
-            size_t mid = lo + (hi - lo) / 2;
-            if (table[mid].id < want.id) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if (lo == len || table[lo].id != want.id) {
-            return std::string(want.path) + " is missing from the library";
-        }
-        if (table[lo].hash != want.hash) {
-            return std::string(want.path) + " changed since these bindings were generated";
+std::string contract_mismatch(const ContractRow (&rows)[N]) {
+    for (const ContractRow& row : rows) {
+        if (row.hash() != row.expected) {
+            return std::string(row.path) + " changed since these bindings were generated";
         }
     }
     return std::string();
 }
 
-/** The declarations of module `shared` this header was generated with. */
-inline constexpr ContractEntry shared_contract[] = {
-    {0x709e234caa962446ull, 0x3894f2ca452e9f98ull, "shared.ping"}, // function ping() -> string
-    {0xcfb306fa5801ee5bull, 0x18e9fc204a13df6full, "shared.Token"}, // record Token {i64, string}
-};
-
-/** The declarations of module `kitchen` this header was generated with. */
-inline constexpr ContractEntry kitchen_contract[] = {
-    {0x01d4f09bbddc986full, 0xffcf2bd3b04aa002ull, "kitchen.Gadget.new"}, // constructor new(i64) -> Gadget
-    {0x02bbd5f31c953704ull, 0x2cfa679ea1373e09ull, "kitchen.Sampler.samples"}, // callback_method #1 samples(u32?, [f64]) -> [i16] throws PantryError
-    {0x10472d8fe748c2eeull, 0xcc570a2649bbf7dcull, "kitchen.maybe_gadget"}, // function maybe_gadget(Gadget?) -> Gadget?
-    {0x11368eec07a74078ull, 0xfa049f78b77e146aull, "kitchen.gadgets"}, // function gadgets() -> [Gadget]
-    {0x137f08a29cde6021ull, 0xda8de7aeb2dbb8a3ull, "kitchen.stream_gadgets"}, // function stream_gadgets() -> iter<Gadget>
-    {0x184bfc4ab0e3fe45ull, 0xb64587477022696bull, "kitchen.ids_u64"}, // function ids_u64([u64]) -> [u64]
-    {0x2111b54980826dd7ull, 0x627bf01ab365b209ull, "kitchen.do_cancellable"}, // function do_cancellable(string) -> string async cancellable
-    {0x21c70f9371374d74ull, 0x25d5d88a30fe0a79ull, "kitchen.ReadyListener.favorite"}, // callback_method #4 favorite() -> Gadget
-    {0x23de5bd597372f46ull, 0xcf1bc6bb37872798ull, "kitchen.stream_chunks"}, // function stream_chunks() -> iter<[i32]>
-    {0x249f1ddaec6a6cbeull, 0x0710d6c9a4de93daull, "kitchen.take_from_pantry"}, // function take_from_pantry(string) -> i32 throws PantryError
-    {0x29dddbc60bf8d7dbull, 0x452a3e573d57f6dbull, "kitchen.Priority"}, // enum Priority {Low = 0, Normal = 1, High = 2}
-    {0x2b227003b74a0d16ull, 0x5dae036b8a6aed30ull, "kitchen.maybe_subscribe"}, // function maybe_subscribe(ReadyListener?) -> bool
-    {0x2dd66cb0064f0494ull, 0x74b131724dd0d867ull, "kitchen.Item"}, // record Item {i64, string, i32, bool, f64, u32, bytes, [string], {string:string}, i64?, Token, Priority, Gadget?}
-    {0x33c265bbf079b0e9ull, 0x97c32b764693f2cbull, "kitchen.u32_id"}, // function u32_id(u32) -> u32
-    {0x33e6381d01660dfeull, 0x05e35a563089bf7dull, "kitchen.KitchenErrors"}, // errors KitchenErrors
-    {0x3d969ae76db6cb23ull, 0x65a325cfc772296bull, "kitchen.ReadyListener.latest"}, // callback_method #3 latest() -> Item?
-    {0x3f5fc99d73504b76ull, 0x417e4a2acd3210b3ull, "kitchen.Gadget.poke"}, // method poke(i32) -> i32 throws KitchenErrors
-    {0x4082f0085db28781ull, 0x18848e701962912eull, "kitchen.Sampler"}, // callback Sampler
-    {0x4340a6b1e7ec8c50ull, 0xa59d0f32a66dc7a2ull, "kitchen.Sampler.describe"}, // callback_method #2 describe() -> string throws any
-    {0x4c5764cf109528d1ull, 0xb374accf14676d90ull, "kitchen.maybe_item"}, // function maybe_item(i64) -> Item? throws KitchenErrors
-    {0x4de17dfb93fd494dull, 0x78be3203bcd10727ull, "kitchen.i32_id"}, // function i32_id(i32) -> i32
-    {0x504e95b7f7e65570ull, 0x01b3e8e0c9a10e23ull, "kitchen.stream_items"}, // function stream_items() -> iter<Item>
-    {0x5dafabb7775fcb2dull, 0x6c4b78c7d3f858c1ull, "kitchen.PantryError.Spoiled"}, // code Spoiled = 2
-    {0x5e0a8f6be4b00600ull, 0x18ea1a42036c96a0ull, "kitchen.Sampler.threshold"}, // callback_method #0 threshold(u32?) -> f64?
-    {0x5ec0af1d4ecc6fedull, 0x6540bdb74246420cull, "kitchen.async_samples"}, // function async_samples(u32) -> [f32] async cancellable
-    {0x61a358b0571e0a4eull, 0x11a24c4b50d11996ull, "kitchen.async_maybe_count"}, // function async_maybe_count() -> i64? async
-    {0x68cdb9a4bd3e3dd5ull, 0xcde022fe6bc3b1bfull, "kitchen.bool_id"}, // function bool_id(bool) -> bool
-    {0x69e7cd703d16eb85ull, 0xb13cb8d39e702c79ull, "kitchen.do_async"}, // function do_async(string) -> string async
-    {0x70865079ce41be82ull, 0xbe3b69464672af46ull, "kitchen.Gadget.describe"}, // method describe() -> string
-    {0x71c5a1116cb7c49aull, 0x1506cfe6f548fac4ull, "kitchen.echo_bytes"}, // function echo_bytes(bytes) -> bytes
-    {0x735ee1e0049ee91aull, 0xa713dbd1be707752ull, "kitchen.echo_string"}, // function echo_string(string) -> string
-    {0x76d7fc58f4e41d84ull, 0x6bdb4ccea2841d5eull, "kitchen.i64_id"}, // function i64_id(i64) -> i64
-    {0x78d91fd617e162b8ull, 0xd88e2753503b36dfull, "kitchen.stream_maybe"}, // function stream_maybe() -> iter<i32?>
-    {0x79abfe1aa960fd6aull, 0xbca7a9e5eb26f3a6ull, "kitchen.nested.hello"}, // function hello() -> string
-    {0x7b3865b536da998cull, 0x1c4e79d60a20e74full, "kitchen.mixed_slices"}, // function mixed_slices([i8], [i16], [u16], [u32], [i64], [f32]) -> [u32]
-    {0x7ba266dc26a58989ull, 0x0f86001cac0c21e8ull, "kitchen.KitchenErrors.InvalidInput"}, // code InvalidInput = 2
-    {0x7d3dd7d5cf6749e3ull, 0xa192f5a7298adb39ull, "kitchen.new_op"}, // function new_op() -> i32
-    {0x81ded69adee0abf2ull, 0x8c71141a931906f6ull, "kitchen.scale_i32"}, // function scale_i32([i32], i32) -> [i32]
-    {0x81fa72769330fed6ull, 0x89681e305b55a4f4ull, "kitchen.ReadyListener.label"}, // callback_method #2 label() -> string throws KitchenErrors
-    {0x89a5e664bc25c67bull, 0x357fd9b65ad879a9ull, "kitchen.f64_id"}, // function f64_id(f64) -> f64
-    {0x8cfdbdcecac5f7f1ull, 0x07e272f09c41fffcull, "kitchen.Gadget.version"}, // static version() -> string
-    {0x8dc42397e47614b9ull, 0xcddf6fede09b2e7full, "kitchen.opt_priority"}, // function opt_priority(Priority?) -> Priority?
-    {0x92f060ef68961fc1ull, 0x4af6ce5b4f9fa508ull, "kitchen.ReadyListener.on_item"}, // callback_method #1 on_item(Item, Gadget) -> bool
-    {0x974b9f3e823c1738ull, 0xb81b91e975695f27ull, "kitchen.cross_module_token"}, // function cross_module_token() -> Token
-    {0x9f0f001aa85f97d5ull, 0x55815247f895bd45ull, "kitchen.sum_f64"}, // function sum_f64([f64]) -> f64
-    {0xab2a29fd1ef5458bull, 0x471a34aa4c09ae2bull, "kitchen.KitchenErrors.NotFound"}, // code NotFound = 1
-    {0xaca0655fac15d230ull, 0x11c4d2b28abe07bbull, "kitchen.list_items"}, // function list_items() -> [Item]
-    {0xb57c8e6ae3fb4383ull, 0x3f857851ab75366cull, "kitchen.PantryError"}, // errors PantryError
-    {0xbdc795b195edd428ull, 0x36127462f8b0969full, "kitchen.opt_mixed"}, // function opt_mixed(f64, f32?, i64?, string?) -> u16?
-    {0xbe4821ab3c340e71ull, 0xe1d32e38b766e623ull, "kitchen.ReadyListener.on_ready"}, // callback_method #0 on_ready(i32, string) -> void
-    {0xc2ad53f2a6a36323ull, 0x071e29abee823f17ull, "kitchen.opt_i32_id"}, // function opt_i32_id(i32?) -> i32?
-    {0xc7ab409554fd3d7bull, 0xfea12b6bc219fc46ull, "kitchen.parse_any"}, // function parse_any(string) -> i64 throws any
-    {0xc82a7f2d85f99f4eull, 0xa9bcb8bacedb036cull, "kitchen.sample_with"}, // function sample_with(Sampler, u32?) -> [i16] throws PantryError
-    {0xc883b4afae20543eull, 0xc40560e5411ff392ull, "kitchen.legacy_op"}, // function legacy_op() -> i32
-    {0xd180bf646bff59e2ull, 0xa4515a6d00d7c600ull, "kitchen.PantryError.OutOfStock"}, // code OutOfStock = 1 {string}
-    {0xe6778df0f5c1b82bull, 0x38eaafdb350559e1ull, "kitchen.opt_bool_id"}, // function opt_bool_id(bool?) -> bool?
-    {0xf2f7753e6e1dffc2ull, 0xc9047a95bdf49e93ull, "kitchen.get_attrs"}, // function get_attrs() -> {string:i32}
-    {0xfae25d3391922eadull, 0xcc034cf506cae182ull, "kitchen.subscribe"}, // function subscribe(ReadyListener) -> i32
-    {0xfd0059b05cb2fcfbull, 0x248bf8404a5823b4ull, "kitchen.Gadget"}, // interface Gadget
-    {0xfed9c551fb9fd2d6ull, 0xe1020573f084dc1dull, "kitchen.ReadyListener"}, // callback ReadyListener
-    {0xff3a99b52597dee2ull, 0x14c4ecac97bdfc9bull, "kitchen.Gadget.readings"}, // method readings(u32?) -> [f64] throws any
+/** The declarations this header was generated with. */
+inline const ContractRow contract_rows[] = {
+    {&kitchen_sink_contract_07055ed9d3ef8987, 0x6c4b78c7d3f858c1ull, "PantryError.Spoiled"}, // code Spoiled = 2
+    {&kitchen_sink_contract_093696260e3767ef, 0x18848e701962912eull, "Sampler"}, // callback Sampler
+    {&kitchen_sink_contract_15de761502d6b0f7, 0xb64587477022696bull, "ids_u64"}, // function ids_u64([u64]) -> [u64]
+    {&kitchen_sink_contract_1ab4ac8d3595af9e, 0x18ea1a42036c96a0ull, "Sampler.threshold"}, // callback_method #0 threshold(u32?) -> f64?
+    {&kitchen_sink_contract_1ad5b1c1cb5b7b0f, 0xe1d32e38b766e623ull, "ReadyListener.on_ready"}, // callback_method #0 on_ready(i32, string) -> void
+    {&kitchen_sink_contract_1b068c8d584a3666, 0x1c4e79d60a20e74full, "mixed_slices"}, // function mixed_slices([i8], [i16], [u16], [u32], [i64], [f32]) -> [u32]
+    {&kitchen_sink_contract_1c905aa8cc074ab9, 0x071e29abee823f17ull, "opt_i32_id"}, // function opt_i32_id(i32?) -> i32?
+    {&kitchen_sink_contract_2288b6ba9247f3fa, 0x01b3e8e0c9a10e23ull, "stream_items"}, // function stream_items() -> iter<Item>
+    {&kitchen_sink_contract_262973c2f9754366, 0x11c4d2b28abe07bbull, "list_items"}, // function list_items() -> [Item]
+    {&kitchen_sink_contract_29fb7143db10b460, 0xa9bcb8bacedb036cull, "sample_with"}, // function sample_with(Sampler, u32?) -> [i16] throws PantryError
+    {&kitchen_sink_contract_2a3cca9903035fc1, 0x38eaafdb350559e1ull, "opt_bool_id"}, // function opt_bool_id(bool?) -> bool?
+    {&kitchen_sink_contract_2b411bd19468fe38, 0x1506cfe6f548fac4ull, "echo_bytes"}, // function echo_bytes(bytes) -> bytes
+    {&kitchen_sink_contract_30d1f6e5606a39a1, 0xfea12b6bc219fc46ull, "parse_any"}, // function parse_any(string) -> i64 throws any
+    {&kitchen_sink_contract_3545d44146da2693, 0xb374accf14676d90ull, "maybe_item"}, // function maybe_item(i64) -> Item? throws KitchenErrors
+    {&kitchen_sink_contract_355964ddca795015, 0x65a325cfc772296bull, "ReadyListener.latest"}, // callback_method #3 latest() -> Item?
+    {&kitchen_sink_contract_3f36f640360df807, 0xcddf6fede09b2e7full, "opt_priority"}, // function opt_priority(Priority?) -> Priority?
+    {&kitchen_sink_contract_40306466cd73f71b, 0xcde022fe6bc3b1bfull, "bool_id"}, // function bool_id(bool) -> bool
+    {&kitchen_sink_contract_46a82538b4fd65b3, 0x0f86001cac0c21e8ull, "KitchenErrors.InvalidInput"}, // code InvalidInput = 2
+    {&kitchen_sink_contract_49db162e058b9fa4, 0xe1020573f084dc1dull, "ReadyListener"}, // callback ReadyListener
+    {&kitchen_sink_contract_4bae2c564d268fab, 0xda8de7aeb2dbb8a3ull, "stream_gadgets"}, // function stream_gadgets() -> iter<Gadget>
+    {&kitchen_sink_contract_4e03769b2b65f3ee, 0xa59d0f32a66dc7a2ull, "Sampler.describe"}, // callback_method #2 describe() -> string throws any
+    {&kitchen_sink_contract_52cfa1d198476806, 0x74b131724dd0d867ull, "Item"}, // record Item {i64, string, i32, bool, f64, u32, bytes, [string], {string:string}, i64?, Token, Priority, Gadget?}
+    {&kitchen_sink_contract_5cda1b5d810fe743, 0xcc034cf506cae182ull, "subscribe"}, // function subscribe(ReadyListener) -> i32
+    {&kitchen_sink_contract_5ec87ece39394738, 0x11a24c4b50d11996ull, "async_maybe_count"}, // function async_maybe_count() -> i64? async
+    {&kitchen_sink_contract_6084dc628fdb0d02, 0x25d5d88a30fe0a79ull, "ReadyListener.favorite"}, // callback_method #4 favorite() -> Gadget
+    {&kitchen_sink_contract_632ae5cd56d2f5fc, 0x5dae036b8a6aed30ull, "maybe_subscribe"}, // function maybe_subscribe(ReadyListener?) -> bool
+    {&kitchen_sink_contract_6b91c75a2b38364c, 0x14c4ecac97bdfc9bull, "Gadget.readings"}, // method readings(u32?) -> [f64] throws any
+    {&kitchen_sink_contract_6c14076d12124cfd, 0xa192f5a7298adb39ull, "new_op"}, // function new_op() -> i32
+    {&kitchen_sink_contract_777c1f6342492998, 0xcc570a2649bbf7dcull, "maybe_gadget"}, // function maybe_gadget(Gadget?) -> Gadget?
+    {&kitchen_sink_contract_77f7c86a80aa8b81, 0x3f857851ab75366cull, "PantryError"}, // errors PantryError
+    {&kitchen_sink_contract_784cfd093415f2b5, 0xffcf2bd3b04aa002ull, "Gadget.new"}, // constructor new(i64) -> Gadget
+    {&kitchen_sink_contract_7e1071dd9fa68834, 0x89681e305b55a4f4ull, "ReadyListener.label"}, // callback_method #2 label() -> string throws KitchenErrors
+    {&kitchen_sink_contract_7edf409e8ac33025, 0x2a3ae79e1a476b7aull, "make_token"}, // function make_token() -> Token
+    {&kitchen_sink_contract_8400c9a27c8c432b, 0xb13cb8d39e702c79ull, "do_async"}, // function do_async(string) -> string async
+    {&kitchen_sink_contract_87133f22c66bac36, 0x6bdb4ccea2841d5eull, "i64_id"}, // function i64_id(i64) -> i64
+    {&kitchen_sink_contract_878316bb56b5eacc, 0xa4515a6d00d7c600ull, "PantryError.OutOfStock"}, // code OutOfStock = 1 {string}
+    {&kitchen_sink_contract_8cbd66b05c30c00e, 0x2cfa679ea1373e09ull, "Sampler.samples"}, // callback_method #1 samples(u32?, [f64]) -> [i16] throws PantryError
+    {&kitchen_sink_contract_8e374aef14935b0d, 0x471a34aa4c09ae2bull, "KitchenErrors.NotFound"}, // code NotFound = 1
+    {&kitchen_sink_contract_94e2dad4408a7687, 0x4af6ce5b4f9fa508ull, "ReadyListener.on_item"}, // callback_method #1 on_item(Item, Gadget) -> bool
+    {&kitchen_sink_contract_996a3929498216f3, 0x78be3203bcd10727ull, "i32_id"}, // function i32_id(i32) -> i32
+    {&kitchen_sink_contract_9ab72c28265c60e4, 0x05e35a563089bf7dull, "KitchenErrors"}, // errors KitchenErrors
+    {&kitchen_sink_contract_a430d84680aabd0b, 0xbca7a9e5eb26f3a6ull, "hello"}, // function hello() -> string
+    {&kitchen_sink_contract_a4e407b3a0fe4669, 0x452a3e573d57f6dbull, "Priority"}, // enum Priority {Low = 0, Normal = 1, High = 2}
+    {&kitchen_sink_contract_a529e4a4e0e26d47, 0x97c32b764693f2cbull, "u32_id"}, // function u32_id(u32) -> u32
+    {&kitchen_sink_contract_a717c034ba23905d, 0x248bf8404a5823b4ull, "Gadget"}, // interface Gadget
+    {&kitchen_sink_contract_a9590de6f773a9a4, 0x8c71141a931906f6ull, "scale_i32"}, // function scale_i32([i32], i32) -> [i32]
+    {&kitchen_sink_contract_ac26813984c811d0, 0x417e4a2acd3210b3ull, "Gadget.poke"}, // method poke(i32) -> i32 throws KitchenErrors
+    {&kitchen_sink_contract_b08395f5e5678b0e, 0x36127462f8b0969full, "opt_mixed"}, // function opt_mixed(f64, f32?, i64?, string?) -> u16?
+    {&kitchen_sink_contract_b66eb0792245db7c, 0xa713dbd1be707752ull, "echo_string"}, // function echo_string(string) -> string
+    {&kitchen_sink_contract_b985fff5c1b5382c, 0xc40560e5411ff392ull, "legacy_op"}, // function legacy_op() -> i32
+    {&kitchen_sink_contract_bf30e00dc53307a9, 0x3894f2ca452e9f98ull, "ping"}, // function ping() -> string
+    {&kitchen_sink_contract_c1ceb5fe42730211, 0x357fd9b65ad879a9ull, "f64_id"}, // function f64_id(f64) -> f64
+    {&kitchen_sink_contract_c9e1d6b030b1f854, 0xbe3b69464672af46ull, "Gadget.describe"}, // method describe() -> string
+    {&kitchen_sink_contract_cea95e3a6107f209, 0x627bf01ab365b209ull, "do_cancellable"}, // function do_cancellable(string) -> string async cancellable
+    {&kitchen_sink_contract_d06c00826f2918d3, 0x6540bdb74246420cull, "async_samples"}, // function async_samples(u32) -> [f32] async cancellable
+    {&kitchen_sink_contract_da96f2dc9f83015b, 0x55815247f895bd45ull, "sum_f64"}, // function sum_f64([f64]) -> f64
+    {&kitchen_sink_contract_e68398e3c2c760b2, 0x18e9fc204a13df6full, "Token"}, // record Token {i64, string}
+    {&kitchen_sink_contract_ea2a5b33b86fb660, 0x0710d6c9a4de93daull, "take_from_pantry"}, // function take_from_pantry(string) -> i32 throws PantryError
+    {&kitchen_sink_contract_eb66fcdc777f75ca, 0xfa049f78b77e146aull, "gadgets"}, // function gadgets() -> [Gadget]
+    {&kitchen_sink_contract_eea763c41fa7d198, 0xcf1bc6bb37872798ull, "stream_chunks"}, // function stream_chunks() -> iter<[i32]>
+    {&kitchen_sink_contract_f24fd5a4569f91f3, 0x07e272f09c41fffcull, "Gadget.version"}, // static version() -> string
+    {&kitchen_sink_contract_fe26cde50070f9a2, 0xd88e2753503b36dfull, "stream_maybe"}, // function stream_maybe() -> iter<i32?>
+    {&kitchen_sink_contract_ff329711a0bd4978, 0xc9047a95bdf49e93ull, "get_attrs"}, // function get_attrs() -> {string:i32}
 };
 
 } // namespace detail
 
 /**
  * Verifies that the linked kitchen_sink library implements C ABI revision
- * 5 and every declaration this header was generated with, throwing
+ * 6 and every declaration this header was generated with, throwing
  * LoadError naming the first mismatch. The check runs once; every free
  * function, constructor, and static member calls this before its first
  * native call, so calling it at startup is optional.
@@ -716,10 +677,7 @@ inline void check_library() {
             return "kitchen_sink: C ABI revision mismatch (header " + std::to_string(KITCHEN_SINK_ABI_VERSION) +
                    ", library " + std::to_string(abi) + ")";
         }
-        if (std::string why = detail::contract_mismatch(kitchen_sink_shared_contract, detail::shared_contract); !why.empty()) {
-            return "kitchen_sink: " + why;
-        }
-        if (std::string why = detail::contract_mismatch(kitchen_sink_kitchen_contract, detail::kitchen_contract); !why.empty()) {
+        if (std::string why = detail::contract_mismatch(detail::contract_rows); !why.empty()) {
             return "kitchen_sink: " + why;
         }
         return std::string();
@@ -741,6 +699,9 @@ public:
 
     /** Number of encoded bytes. */
     size_t size() const noexcept { return buf_.size(); }
+
+    /** The encoded bytes as a borrowed run, valid while the writer is unchanged. */
+    run view() const noexcept { return run{buf_.data(), buf_.size()}; }
 
     /** Appends one byte. */
     void byte(uint8_t v) { buf_.push_back(v); }
@@ -1017,17 +978,21 @@ T decode(const uint8_t* ptr, size_t len) {
     return value;
 }
 
-/** Decodes one complete `T` from a producer-returned buffer, then releases the buffer. */
+/** Decodes one complete `T` from a borrowed buffer run. */
 template <typename T>
-T take(const uint8_t* ptr, size_t len) {
-    Run run{ptr, len};
-    return decode<T>(ptr, len);
+T decode(run r) {
+    return decode<T>(r.ptr, r.len);
+}
+
+/** Decodes one complete `T` from a producer-returned buffer run, then releases the run. */
+template <typename T>
+T take(run r) {
+    OwnedRun owned{r};
+    return decode<T>(r.ptr, r.len);
 }
 
 /** Hands a callback's buffered return to the producer as a kitchen_sink_alloc run. */
-inline void give(const BufferWriter& value, uint8_t** out_ptr, size_t* out_len) {
-    give_run(value.data(), value.size(), out_ptr, out_len);
-}
+inline run give_buffer(const BufferWriter& value) { return give_run(value.data(), value.size()); }
 
 /** Throws the error class `E` of a domain code with fields, decoding them from the error's payload. */
 template <typename E, typename... Fields>
@@ -1077,7 +1042,7 @@ class Sampler;
 class Gadget {
 public:
     /** The C type this class wraps. */
-    using raw_type = kitchen_sink_kitchen_Gadget;
+    using raw_type = kitchen_sink_Gadget;
 
     /** Adopts one strong reference to a producer object: `Gadget(adopt, raw)`. */
     explicit Gadget(adopt_t, raw_type* raw) noexcept : raw_(raw) {}
@@ -1117,15 +1082,15 @@ public:
 
 private:
     struct traits {
-        using raw_type = kitchen_sink_kitchen_Gadget;
-        static raw_type* clone(const raw_type* raw) noexcept { return kitchen_sink_kitchen_Gadget_clone(raw); }
-        static void destroy(raw_type* raw) noexcept { kitchen_sink_kitchen_Gadget_destroy(raw); }
+        using raw_type = kitchen_sink_Gadget;
+        static raw_type* clone(const raw_type* raw) noexcept { return kitchen_sink_Gadget_clone(raw); }
+        static void destroy(raw_type* raw) noexcept { kitchen_sink_Gadget_destroy(raw); }
     };
 
     detail::Handle<traits> raw_;
 };
 
-/** A reusable token referenced across modules */
+/** A reusable token referenced from several declarations */
 struct Token {
     int64_t id{};
     std::string label{};
@@ -1152,7 +1117,7 @@ struct Item {
     std::vector<std::string> tags{};
     std::unordered_map<std::string, std::string> attrs{};
     std::optional<int64_t> parent{};
-    /** Cross-module struct reference */
+    /** A record inside a record */
     Token token{};
     Priority priority{};
     /** An optional object inside a record */
@@ -1229,7 +1194,7 @@ inline Item read(BufferReader& r, type_tag<Item>) {
 
 } // namespace detail
 
-/** The `KitchenErrors` error domain of module `kitchen`: catch a code's class or this. */
+/** The `KitchenErrors` error domain: catch a code's class or this. */
 class KitchenError : public Error {
 public:
     /** Builds an error carrying one of the domain's `code`s and its `message`. */
@@ -1285,7 +1250,7 @@ struct Errors<KitchenError> {
 
 } // namespace detail
 
-/** The `PantryError` error domain of module `kitchen`: catch a code's class or this. */
+/** The `PantryError` error domain: catch a code's class or this. */
 class PantryError : public Error {
 public:
     /** Builds an error carrying one of the domain's `code`s and its `message`. */
@@ -1376,45 +1341,45 @@ public:
 
 namespace detail {
 
-/** Adapts a `ReadyListener` implementation to `kitchen_sink_kitchen_ReadyListener_vtable`. */
+/** Adapts a `ReadyListener` implementation to `kitchen_sink_ReadyListener_vtable`. */
 template <>
 struct Callbacks<ReadyListener> {
-    static void on_ready(void* ctx, int32_t code, const uint8_t* msg_ptr, size_t msg_len, kitchen_sink_error* out_err) {
+    static void on_ready(void* ctx, int32_t code, kitchen_sink_run msg, kitchen_sink_error* out_err) {
         callback<InternalError>(out_err, [&] {
-            implementation<ReadyListener>(ctx).on_ready(code, borrow_string(msg_ptr, msg_len));
+            implementation<ReadyListener>(ctx).on_ready(code, borrow_string(msg));
         });
     }
 
-    static bool on_item(void* ctx, const uint8_t* item_ptr, size_t item_len, kitchen_sink_kitchen_Gadget* gadget, kitchen_sink_error* out_err) {
+    static bool on_item(void* ctx, kitchen_sink_run item, kitchen_sink_Gadget* gadget, kitchen_sink_error* out_err) {
         Gadget gadget_arg(adopt, gadget);
         return callback<InternalError>(out_err, [&] {
-            auto item_arg = decode<Item>(item_ptr, item_len);
+            auto item_arg = decode<Item>(item);
             return implementation<ReadyListener>(ctx).on_item(std::move(item_arg), std::move(gadget_arg));
         });
     }
 
-    static void label(void* ctx, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err) {
-        callback<KitchenError>(out_err, [&] {
-            give(implementation<ReadyListener>(ctx).label(), out_ptr, out_len);
+    static kitchen_sink_run label(void* ctx, kitchen_sink_error* out_err) {
+        return callback<KitchenError>(out_err, [&] {
+            return give_string(implementation<ReadyListener>(ctx).label());
         });
     }
 
-    static void latest(void* ctx, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err) {
-        callback<InternalError>(out_err, [&] {
-            give(encode(implementation<ReadyListener>(ctx).latest()), out_ptr, out_len);
+    static kitchen_sink_run latest(void* ctx, kitchen_sink_error* out_err) {
+        return callback<InternalError>(out_err, [&] {
+            return give_buffer(encode(implementation<ReadyListener>(ctx).latest()));
         });
     }
 
-    static kitchen_sink_kitchen_Gadget* favorite(void* ctx, kitchen_sink_error* out_err) {
+    static kitchen_sink_Gadget* favorite(void* ctx, kitchen_sink_error* out_err) {
         return callback<InternalError>(out_err, [&] {
             return implementation<ReadyListener>(ctx).favorite().clone_handle();
         });
     }
 
     /** The vtable every `ReadyListener` implementation is passed with. */
-    static const kitchen_sink_kitchen_ReadyListener_vtable& vtable() noexcept {
-        static const kitchen_sink_kitchen_ReadyListener_vtable table = {
-            sizeof(kitchen_sink_kitchen_ReadyListener_vtable),
+    static const kitchen_sink_ReadyListener_vtable& vtable() noexcept {
+        static const kitchen_sink_ReadyListener_vtable table = {
+            sizeof(kitchen_sink_ReadyListener_vtable),
             0,
             &release<ReadyListener>,
             &on_ready,
@@ -1458,31 +1423,31 @@ public:
 
 namespace detail {
 
-/** Adapts a `Sampler` implementation to `kitchen_sink_kitchen_Sampler_vtable`. */
+/** Adapts a `Sampler` implementation to `kitchen_sink_Sampler_vtable`. */
 template <>
 struct Callbacks<Sampler> {
-    static bool threshold(void* ctx, bool has_level, uint32_t level, double* out_value, kitchen_sink_error* out_err) {
+    static kitchen_sink_opt_f64 threshold(void* ctx, kitchen_sink_opt_u32 level, kitchen_sink_error* out_err) {
         return callback<InternalError>(out_err, [&] {
-            return give_optional(implementation<Sampler>(ctx).threshold(lift_optional<uint32_t>(has_level, level)), out_value);
+            return to_opt<kitchen_sink_opt_f64>(implementation<Sampler>(ctx).threshold(from_opt<uint32_t>(level)));
         });
     }
 
-    static void samples(void* ctx, bool has_limit, uint32_t limit, const double* weights_ptr, size_t weights_len, int16_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err) {
-        callback<PantryError>(out_err, [&] {
-            give_slice(implementation<Sampler>(ctx).samples(lift_optional<uint32_t>(has_limit, limit), borrow_slice(weights_ptr, weights_len)), out_ptr, out_len);
+    static kitchen_sink_run samples(void* ctx, kitchen_sink_opt_u32 limit, kitchen_sink_run weights, kitchen_sink_error* out_err) {
+        return callback<PantryError>(out_err, [&] {
+            return give_slice(implementation<Sampler>(ctx).samples(from_opt<uint32_t>(limit), borrow_slice<double>(weights)));
         });
     }
 
-    static void describe(void* ctx, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err) {
-        callback<Error>(out_err, [&] {
-            give(implementation<Sampler>(ctx).describe(), out_ptr, out_len);
+    static kitchen_sink_run describe(void* ctx, kitchen_sink_error* out_err) {
+        return callback<Error>(out_err, [&] {
+            return give_string(implementation<Sampler>(ctx).describe());
         });
     }
 
     /** The vtable every `Sampler` implementation is passed with. */
-    static const kitchen_sink_kitchen_Sampler_vtable& vtable() noexcept {
-        static const kitchen_sink_kitchen_Sampler_vtable table = {
-            sizeof(kitchen_sink_kitchen_Sampler_vtable),
+    static const kitchen_sink_Sampler_vtable& vtable() noexcept {
+        static const kitchen_sink_Sampler_vtable table = {
+            sizeof(kitchen_sink_Sampler_vtable),
             0,
             &release<Sampler>,
             &threshold,
@@ -1498,64 +1463,54 @@ struct Callbacks<Sampler> {
 inline Gadget::Gadget(int64_t id) {
     check_library();
     kitchen_sink_error err{};
-    auto* result = kitchen_sink_kitchen_Gadget_new(id, &err);
+    auto* result = kitchen_sink_Gadget_new(id, &err);
     detail::check<InternalError>(err);
     raw_.reset(result);
 }
 
 inline std::string Gadget::describe() const {
     kitchen_sink_error err{};
-    size_t out_len{};
-    auto result = kitchen_sink_kitchen_Gadget_describe(raw_.get(), &out_len, &err);
+    auto result = kitchen_sink_Gadget_describe(raw_.get(), &err);
     detail::check<InternalError>(err);
-    return detail::take_string(result, out_len);
+    return detail::take_string(result);
 }
 
 inline int32_t Gadget::poke(int32_t times) const {
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_Gadget_poke(raw_.get(), times, &err);
+    auto result = kitchen_sink_Gadget_poke(raw_.get(), times, &err);
     detail::check<KitchenError>(err);
     return result;
 }
 
 inline std::vector<double> Gadget::readings(std::optional<uint32_t> limit) const {
     kitchen_sink_error err{};
-    size_t out_len{};
-    auto result = kitchen_sink_kitchen_Gadget_readings(raw_.get(), limit.has_value(), detail::value_or_zero(limit), &out_len, &err);
+    auto result = kitchen_sink_Gadget_readings(raw_.get(), detail::to_opt<kitchen_sink_opt_u32>(limit), &err);
     detail::check<Error>(err);
-    return detail::take_slice(result, out_len);
+    return detail::take_slice<double>(result);
 }
 
 inline std::string Gadget::version() {
     check_library();
     kitchen_sink_error err{};
-    size_t out_len{};
-    auto result = kitchen_sink_kitchen_Gadget_version(&out_len, &err);
+    auto result = kitchen_sink_Gadget_version(&err);
     detail::check<InternalError>(err);
-    return detail::take_string(result, out_len);
+    return detail::take_string(result);
 }
 
-namespace shared {
-
-/** Trivial cross-module helper */
+/** A trivial helper */
 inline std::string ping() {
     check_library();
     kitchen_sink_error err{};
-    size_t out_len{};
-    auto result = kitchen_sink_shared_ping(&out_len, &err);
+    auto result = kitchen_sink_ping(&err);
     detail::check<InternalError>(err);
-    return detail::take_string(result, out_len);
+    return detail::take_string(result);
 }
-
-} // namespace shared
-
-namespace kitchen {
 
 /** Identity for bool */
 inline bool bool_id(bool x) {
     check_library();
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_bool_id(x, &err);
+    auto result = kitchen_sink_bool_id(x, &err);
     detail::check<InternalError>(err);
     return result;
 }
@@ -1563,7 +1518,7 @@ inline bool bool_id(bool x) {
 inline int32_t i32_id(int32_t x) {
     check_library();
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_i32_id(x, &err);
+    auto result = kitchen_sink_i32_id(x, &err);
     detail::check<InternalError>(err);
     return result;
 }
@@ -1571,7 +1526,7 @@ inline int32_t i32_id(int32_t x) {
 inline uint32_t u32_id(uint32_t x) {
     check_library();
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_u32_id(x, &err);
+    auto result = kitchen_sink_u32_id(x, &err);
     detail::check<InternalError>(err);
     return result;
 }
@@ -1579,7 +1534,7 @@ inline uint32_t u32_id(uint32_t x) {
 inline int64_t i64_id(int64_t x) {
     check_library();
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_i64_id(x, &err);
+    auto result = kitchen_sink_i64_id(x, &err);
     detail::check<InternalError>(err);
     return result;
 }
@@ -1587,7 +1542,7 @@ inline int64_t i64_id(int64_t x) {
 inline double f64_id(double x) {
     check_library();
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_f64_id(x, &err);
+    auto result = kitchen_sink_f64_id(x, &err);
     detail::check<InternalError>(err);
     return result;
 }
@@ -1595,19 +1550,17 @@ inline double f64_id(double x) {
 inline std::string echo_string(std::string_view s) {
     check_library();
     kitchen_sink_error err{};
-    size_t out_len{};
-    auto result = kitchen_sink_kitchen_echo_string(detail::utf8(s), s.size(), &out_len, &err);
+    auto result = kitchen_sink_echo_string(detail::string_run(s), &err);
     detail::check<InternalError>(err);
-    return detail::take_string(result, out_len);
+    return detail::take_string(result);
 }
 
 inline std::vector<uint8_t> echo_bytes(const std::vector<uint8_t>& b) {
     check_library();
     kitchen_sink_error err{};
-    size_t out_len{};
-    auto result = kitchen_sink_kitchen_echo_bytes(b.data(), b.size(), &out_len, &err);
+    auto result = kitchen_sink_echo_bytes(detail::bytes_run(b), &err);
     detail::check<InternalError>(err);
-    return detail::take_bytes(result, out_len);
+    return detail::take_bytes(result);
 }
 
 /** Register a listener, returning how many are attached */
@@ -1615,7 +1568,7 @@ inline int32_t subscribe(std::shared_ptr<ReadyListener> listener) {
     check_library();
     auto listener_ctx = detail::lend_required(std::move(listener), "listener");
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_subscribe(listener_ctx.release(), &detail::Callbacks<ReadyListener>::vtable(), &err);
+    auto result = kitchen_sink_subscribe(kitchen_sink_ReadyListener{listener_ctx.release(), &detail::Callbacks<ReadyListener>::vtable()}, &err);
     detail::check<InternalError>(err);
     return result;
 }
@@ -1626,7 +1579,7 @@ inline bool maybe_subscribe(std::shared_ptr<ReadyListener> listener) {
     auto listener_ctx = detail::lend(std::move(listener));
     const auto* listener_vtable = listener_ctx ? &detail::Callbacks<ReadyListener>::vtable() : nullptr;
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_maybe_subscribe(listener_ctx.release(), listener_vtable, &err);
+    auto result = kitchen_sink_maybe_subscribe(kitchen_sink_ReadyListener{listener_ctx.release(), listener_vtable}, &err);
     detail::check<InternalError>(err);
     return result;
 }
@@ -1635,7 +1588,7 @@ inline bool maybe_subscribe(std::shared_ptr<ReadyListener> listener) {
 inline std::optional<Gadget> maybe_gadget(const std::optional<Gadget>& fallback) {
     check_library();
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_maybe_gadget(detail::handle_of(fallback), &err);
+    auto result = kitchen_sink_maybe_gadget(detail::handle_of(fallback), &err);
     detail::check<InternalError>(err);
     return detail::adopt_optional<Gadget>(result);
 }
@@ -1644,10 +1597,9 @@ inline std::optional<Gadget> maybe_gadget(const std::optional<Gadget>& fallback)
 inline std::vector<Gadget> gadgets() {
     check_library();
     kitchen_sink_error err{};
-    size_t out_len{};
-    auto result = kitchen_sink_kitchen_gadgets(&out_len, &err);
+    auto result = kitchen_sink_gadgets(&err);
     detail::check<InternalError>(err);
-    return detail::take<std::vector<Gadget>>(result, out_len);
+    return detail::take<std::vector<Gadget>>(result);
 }
 
 /**
@@ -1658,18 +1610,18 @@ inline std::vector<Gadget> gadgets() {
 inline Range<Gadget> stream_gadgets() {
     check_library();
     kitchen_sink_error err{};
-    kitchen_sink_kitchen_StreamGadgetsIterator* iter = kitchen_sink_kitchen_stream_gadgets(&err);
+    kitchen_sink_StreamGadgetsIterator* iter = kitchen_sink_stream_gadgets(&err);
     detail::check<InternalError>(err);
     return Range<Gadget>(adopt, iter, [](void* raw, std::optional<Gadget>& item) {
         kitchen_sink_error next_err{};
-        kitchen_sink_kitchen_Gadget* out_item{};
-        if (kitchen_sink_kitchen_StreamGadgetsIterator_next(static_cast<kitchen_sink_kitchen_StreamGadgetsIterator*>(raw), &out_item, &next_err) == 0) {
+        kitchen_sink_Gadget* out_item{};
+        if (kitchen_sink_StreamGadgetsIterator_next(static_cast<kitchen_sink_StreamGadgetsIterator*>(raw), &out_item, &next_err) == 0) {
             detail::check<InternalError>(next_err);
             return false;
         }
         item.emplace(Gadget(adopt, out_item));
         return true;
-    }, [](void* raw) { kitchen_sink_kitchen_StreamGadgetsIterator_destroy(static_cast<kitchen_sink_kitchen_StreamGadgetsIterator*>(raw)); });
+    }, [](void* raw) { kitchen_sink_StreamGadgetsIterator_destroy(static_cast<kitchen_sink_StreamGadgetsIterator*>(raw)); });
 }
 
 /**
@@ -1680,30 +1632,27 @@ inline Range<Gadget> stream_gadgets() {
 inline std::optional<Item> maybe_item(int64_t id) {
     check_library();
     kitchen_sink_error err{};
-    size_t out_len{};
-    auto result = kitchen_sink_kitchen_maybe_item(id, &out_len, &err);
+    auto result = kitchen_sink_maybe_item(id, &err);
     detail::check<KitchenError>(err);
-    return detail::take<std::optional<Item>>(result, out_len);
+    return detail::take<std::optional<Item>>(result);
 }
 
 /** List of structs */
 inline std::vector<Item> list_items() {
     check_library();
     kitchen_sink_error err{};
-    size_t out_len{};
-    auto result = kitchen_sink_kitchen_list_items(&out_len, &err);
+    auto result = kitchen_sink_list_items(&err);
     detail::check<InternalError>(err);
-    return detail::take<std::vector<Item>>(result, out_len);
+    return detail::take<std::vector<Item>>(result);
 }
 
 /** Map return type */
 inline std::unordered_map<std::string, int32_t> get_attrs() {
     check_library();
     kitchen_sink_error err{};
-    size_t out_len{};
-    auto result = kitchen_sink_kitchen_get_attrs(&out_len, &err);
+    auto result = kitchen_sink_get_attrs(&err);
     detail::check<InternalError>(err);
-    return detail::take<std::unordered_map<std::string, int32_t>>(result, out_len);
+    return detail::take<std::unordered_map<std::string, int32_t>>(result);
 }
 
 /**
@@ -1714,29 +1663,27 @@ inline std::unordered_map<std::string, int32_t> get_attrs() {
 inline Range<Item> stream_items() {
     check_library();
     kitchen_sink_error err{};
-    kitchen_sink_kitchen_StreamItemsIterator* iter = kitchen_sink_kitchen_stream_items(&err);
+    kitchen_sink_StreamItemsIterator* iter = kitchen_sink_stream_items(&err);
     detail::check<InternalError>(err);
     return Range<Item>(adopt, iter, [](void* raw, std::optional<Item>& item) {
         kitchen_sink_error next_err{};
-        const uint8_t* out_item{};
-        size_t out_len{};
-        if (kitchen_sink_kitchen_StreamItemsIterator_next(static_cast<kitchen_sink_kitchen_StreamItemsIterator*>(raw), &out_item, &out_len, &next_err) == 0) {
+        kitchen_sink_run out_item{};
+        if (kitchen_sink_StreamItemsIterator_next(static_cast<kitchen_sink_StreamItemsIterator*>(raw), &out_item, &next_err) == 0) {
             detail::check<InternalError>(next_err);
             return false;
         }
-        item.emplace(detail::take<Item>(out_item, out_len));
+        item.emplace(detail::take<Item>(out_item));
         return true;
-    }, [](void* raw) { kitchen_sink_kitchen_StreamItemsIterator_destroy(static_cast<kitchen_sink_kitchen_StreamItemsIterator*>(raw)); });
+    }, [](void* raw) { kitchen_sink_StreamItemsIterator_destroy(static_cast<kitchen_sink_StreamItemsIterator*>(raw)); });
 }
 
-/** Returns the shared Token type from another module */
-inline Token cross_module_token() {
+/** Returns the shared Token record */
+inline Token make_token() {
     check_library();
     kitchen_sink_error err{};
-    size_t out_len{};
-    auto result = kitchen_sink_kitchen_cross_module_token(&out_len, &err);
+    auto result = kitchen_sink_make_token(&err);
     detail::check<InternalError>(err);
-    return detail::take<Token>(result, out_len);
+    return detail::take<Token>(result);
 }
 
 /**
@@ -1748,8 +1695,8 @@ inline std::future<std::string> do_async(std::string_view input) {
     check_library();
     auto promise = std::make_unique<std::promise<std::string>>();
     auto future = promise->get_future();
-    kitchen_sink_kitchen_do_async(detail::utf8(input), input.size(), [](void* context, kitchen_sink_error* err, const uint8_t* result_ptr, size_t result_len) {
-        detail::settle<InternalError, std::string>(context, err, [&] { return detail::take_string(result_ptr, result_len); });
+    kitchen_sink_do_async(detail::string_run(input), [](void* context, kitchen_sink_error* err, kitchen_sink_run result) {
+        detail::settle<InternalError, std::string>(context, err, [&] { return detail::take_string(result); });
     }, promise.release());
     return future;
 }
@@ -1764,8 +1711,8 @@ inline std::future<std::string> do_cancellable(std::string_view input, const Can
     check_library();
     auto promise = std::make_unique<std::promise<std::string>>();
     auto future = promise->get_future();
-    kitchen_sink_kitchen_do_cancellable(detail::utf8(input), input.size(), cancel_token.handle(), [](void* context, kitchen_sink_error* err, const uint8_t* result_ptr, size_t result_len) {
-        detail::settle<InternalError, std::string>(context, err, [&] { return detail::take_string(result_ptr, result_len); });
+    kitchen_sink_do_cancellable(detail::string_run(input), cancel_token.handle(), [](void* context, kitchen_sink_error* err, kitchen_sink_run result) {
+        detail::settle<InternalError, std::string>(context, err, [&] { return detail::take_string(result); });
     }, promise.release());
     return future;
 }
@@ -1775,7 +1722,7 @@ inline std::future<std::string> do_cancellable(std::string_view input, const Can
 inline int32_t legacy_op() {
     check_library();
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_legacy_op(&err);
+    auto result = kitchen_sink_legacy_op(&err);
     detail::check<InternalError>(err);
     return result;
 }
@@ -1784,7 +1731,7 @@ inline int32_t legacy_op() {
 inline int32_t new_op() {
     check_library();
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_new_op(&err);
+    auto result = kitchen_sink_new_op(&err);
     detail::check<InternalError>(err);
     return result;
 }
@@ -1793,29 +1740,26 @@ inline int32_t new_op() {
 inline std::optional<int32_t> opt_i32_id(std::optional<int32_t> x) {
     check_library();
     kitchen_sink_error err{};
-    int32_t out_value{};
-    auto result = kitchen_sink_kitchen_opt_i32_id(x.has_value(), detail::value_or_zero(x), &out_value, &err);
+    auto result = kitchen_sink_opt_i32_id(detail::to_opt<kitchen_sink_opt_i32>(x), &err);
     detail::check<InternalError>(err);
-    return detail::lift_optional<int32_t>(result, out_value);
+    return detail::from_opt<int32_t>(result);
 }
 
 inline std::optional<bool> opt_bool_id(std::optional<bool> x) {
     check_library();
     kitchen_sink_error err{};
-    bool out_value{};
-    auto result = kitchen_sink_kitchen_opt_bool_id(x.has_value(), detail::value_or_zero(x), &out_value, &err);
+    auto result = kitchen_sink_opt_bool_id(detail::to_opt<kitchen_sink_opt_bool>(x), &err);
     detail::check<InternalError>(err);
-    return detail::lift_optional<bool>(result, out_value);
+    return detail::from_opt<bool>(result);
 }
 
 /** Optional C-style enum in both directions */
 inline std::optional<Priority> opt_priority(std::optional<Priority> p) {
     check_library();
     kitchen_sink_error err{};
-    kitchen_sink_kitchen_Priority out_value{};
-    auto result = kitchen_sink_kitchen_opt_priority(p.has_value(), detail::value_or_zero(p), &out_value, &err);
+    auto result = kitchen_sink_opt_priority(detail::to_opt<kitchen_sink_opt_i32>(p), &err);
     detail::check<InternalError>(err);
-    return detail::lift_optional<Priority>(result, out_value);
+    return detail::from_opt<Priority>(result);
 }
 
 /** Optional scalars next to ordinary parameters */
@@ -1823,17 +1767,16 @@ inline std::optional<uint16_t> opt_mixed(double base, std::optional<float> scale
     check_library();
     const auto label_buf = detail::encode(label);
     kitchen_sink_error err{};
-    uint16_t out_value{};
-    auto result = kitchen_sink_kitchen_opt_mixed(base, scale.has_value(), detail::value_or_zero(scale), offset.has_value(), detail::value_or_zero(offset), label_buf.data(), label_buf.size(), &out_value, &err);
+    auto result = kitchen_sink_opt_mixed(base, detail::to_opt<kitchen_sink_opt_f32>(scale), detail::to_opt<kitchen_sink_opt_i64>(offset), label_buf.view(), &err);
     detail::check<InternalError>(err);
-    return detail::lift_optional<uint16_t>(result, out_value);
+    return detail::from_opt<uint16_t>(result);
 }
 
 /** A typed-array parameter */
 inline double sum_f64(const std::vector<double>& xs) {
     check_library();
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_sum_f64(xs.data(), xs.size(), &err);
+    auto result = kitchen_sink_sum_f64(detail::slice_run(xs), &err);
     detail::check<InternalError>(err);
     return result;
 }
@@ -1842,29 +1785,26 @@ inline double sum_f64(const std::vector<double>& xs) {
 inline std::vector<int32_t> scale_i32(const std::vector<int32_t>& xs, int32_t factor) {
     check_library();
     kitchen_sink_error err{};
-    size_t out_len{};
-    auto result = kitchen_sink_kitchen_scale_i32(xs.data(), xs.size(), factor, &out_len, &err);
+    auto result = kitchen_sink_scale_i32(detail::slice_run(xs), factor, &err);
     detail::check<InternalError>(err);
-    return detail::take_slice(result, out_len);
+    return detail::take_slice<int32_t>(result);
 }
 
 inline std::vector<uint64_t> ids_u64(const std::vector<uint64_t>& ids) {
     check_library();
     kitchen_sink_error err{};
-    size_t out_len{};
-    auto result = kitchen_sink_kitchen_ids_u64(ids.data(), ids.size(), &out_len, &err);
+    auto result = kitchen_sink_ids_u64(detail::slice_run(ids), &err);
     detail::check<InternalError>(err);
-    return detail::take_slice(result, out_len);
+    return detail::take_slice<uint64_t>(result);
 }
 
 /** Every slice element type */
 inline std::vector<uint32_t> mixed_slices(const std::vector<int8_t>& a, const std::vector<int16_t>& b, const std::vector<uint16_t>& c, const std::vector<uint32_t>& d, const std::vector<int64_t>& e, const std::vector<float>& f) {
     check_library();
     kitchen_sink_error err{};
-    size_t out_len{};
-    auto result = kitchen_sink_kitchen_mixed_slices(a.data(), a.size(), b.data(), b.size(), c.data(), c.size(), d.data(), d.size(), e.data(), e.size(), f.data(), f.size(), &out_len, &err);
+    auto result = kitchen_sink_mixed_slices(detail::slice_run(a), detail::slice_run(b), detail::slice_run(c), detail::slice_run(d), detail::slice_run(e), detail::slice_run(f), &err);
     detail::check<InternalError>(err);
-    return detail::take_slice(result, out_len);
+    return detail::take_slice<uint32_t>(result);
 }
 
 /**
@@ -1876,8 +1816,8 @@ inline std::future<std::optional<int64_t>> async_maybe_count() {
     check_library();
     auto promise = std::make_unique<std::promise<std::optional<int64_t>>>();
     auto future = promise->get_future();
-    kitchen_sink_kitchen_async_maybe_count([](void* context, kitchen_sink_error* err, bool has_result, int64_t result) {
-        detail::settle<InternalError, std::optional<int64_t>>(context, err, [&] { return detail::lift_optional<int64_t>(has_result, result); });
+    kitchen_sink_async_maybe_count([](void* context, kitchen_sink_error* err, kitchen_sink_opt_i64 result) {
+        detail::settle<InternalError, std::optional<int64_t>>(context, err, [&] { return detail::from_opt<int64_t>(result); });
     }, promise.release());
     return future;
 }
@@ -1892,8 +1832,8 @@ inline std::future<std::vector<float>> async_samples(uint32_t n, const CancelTok
     check_library();
     auto promise = std::make_unique<std::promise<std::vector<float>>>();
     auto future = promise->get_future();
-    kitchen_sink_kitchen_async_samples(n, cancel_token.handle(), [](void* context, kitchen_sink_error* err, const float* result_ptr, size_t result_len) {
-        detail::settle<InternalError, std::vector<float>>(context, err, [&] { return detail::take_slice(result_ptr, result_len); });
+    kitchen_sink_async_samples(n, cancel_token.handle(), [](void* context, kitchen_sink_error* err, kitchen_sink_run result) {
+        detail::settle<InternalError, std::vector<float>>(context, err, [&] { return detail::take_slice<float>(result); });
     }, promise.release());
     return future;
 }
@@ -1906,19 +1846,18 @@ inline std::future<std::vector<float>> async_samples(uint32_t n, const CancelTok
 inline Range<std::optional<int32_t>> stream_maybe() {
     check_library();
     kitchen_sink_error err{};
-    kitchen_sink_kitchen_StreamMaybeIterator* iter = kitchen_sink_kitchen_stream_maybe(&err);
+    kitchen_sink_StreamMaybeIterator* iter = kitchen_sink_stream_maybe(&err);
     detail::check<InternalError>(err);
     return Range<std::optional<int32_t>>(adopt, iter, [](void* raw, std::optional<std::optional<int32_t>>& item) {
         kitchen_sink_error next_err{};
-        bool out_has_item{};
-        int32_t out_item{};
-        if (kitchen_sink_kitchen_StreamMaybeIterator_next(static_cast<kitchen_sink_kitchen_StreamMaybeIterator*>(raw), &out_has_item, &out_item, &next_err) == 0) {
+        kitchen_sink_opt_i32 out_item{};
+        if (kitchen_sink_StreamMaybeIterator_next(static_cast<kitchen_sink_StreamMaybeIterator*>(raw), &out_item, &next_err) == 0) {
             detail::check<InternalError>(next_err);
             return false;
         }
-        item.emplace(detail::lift_optional<int32_t>(out_has_item, out_item));
+        item.emplace(detail::from_opt<int32_t>(out_item));
         return true;
-    }, [](void* raw) { kitchen_sink_kitchen_StreamMaybeIterator_destroy(static_cast<kitchen_sink_kitchen_StreamMaybeIterator*>(raw)); });
+    }, [](void* raw) { kitchen_sink_StreamMaybeIterator_destroy(static_cast<kitchen_sink_StreamMaybeIterator*>(raw)); });
 }
 
 /**
@@ -1929,19 +1868,18 @@ inline Range<std::optional<int32_t>> stream_maybe() {
 inline Range<std::vector<int32_t>> stream_chunks() {
     check_library();
     kitchen_sink_error err{};
-    kitchen_sink_kitchen_StreamChunksIterator* iter = kitchen_sink_kitchen_stream_chunks(&err);
+    kitchen_sink_StreamChunksIterator* iter = kitchen_sink_stream_chunks(&err);
     detail::check<InternalError>(err);
     return Range<std::vector<int32_t>>(adopt, iter, [](void* raw, std::optional<std::vector<int32_t>>& item) {
         kitchen_sink_error next_err{};
-        int32_t* out_item{};
-        size_t out_len{};
-        if (kitchen_sink_kitchen_StreamChunksIterator_next(static_cast<kitchen_sink_kitchen_StreamChunksIterator*>(raw), &out_item, &out_len, &next_err) == 0) {
+        kitchen_sink_run out_item{};
+        if (kitchen_sink_StreamChunksIterator_next(static_cast<kitchen_sink_StreamChunksIterator*>(raw), &out_item, &next_err) == 0) {
             detail::check<InternalError>(next_err);
             return false;
         }
-        item.emplace(detail::take_slice(out_item, out_len));
+        item.emplace(detail::take_slice<int32_t>(out_item));
         return true;
-    }, [](void* raw) { kitchen_sink_kitchen_StreamChunksIterator_destroy(static_cast<kitchen_sink_kitchen_StreamChunksIterator*>(raw)); });
+    }, [](void* raw) { kitchen_sink_StreamChunksIterator_destroy(static_cast<kitchen_sink_StreamChunksIterator*>(raw)); });
 }
 
 /**
@@ -1953,10 +1891,9 @@ inline std::vector<int16_t> sample_with(std::shared_ptr<Sampler> sampler, std::o
     check_library();
     auto sampler_ctx = detail::lend_required(std::move(sampler), "sampler");
     kitchen_sink_error err{};
-    size_t out_len{};
-    auto result = kitchen_sink_kitchen_sample_with(sampler_ctx.release(), &detail::Callbacks<Sampler>::vtable(), level.has_value(), detail::value_or_zero(level), &out_len, &err);
+    auto result = kitchen_sink_sample_with(kitchen_sink_Sampler{sampler_ctx.release(), &detail::Callbacks<Sampler>::vtable()}, detail::to_opt<kitchen_sink_opt_u32>(level), &err);
     detail::check<PantryError>(err);
-    return detail::take_slice(result, out_len);
+    return detail::take_slice<int16_t>(result);
 }
 
 /**
@@ -1967,7 +1904,7 @@ inline std::vector<int16_t> sample_with(std::shared_ptr<Sampler> sampler, std::o
 inline int32_t take_from_pantry(std::string_view item) {
     check_library();
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_take_from_pantry(detail::utf8(item), item.size(), &err);
+    auto result = kitchen_sink_take_from_pantry(detail::string_run(item), &err);
     detail::check<PantryError>(err);
     return result;
 }
@@ -1980,26 +1917,19 @@ inline int32_t take_from_pantry(std::string_view item) {
 inline int64_t parse_any(std::string_view text) {
     check_library();
     kitchen_sink_error err{};
-    auto result = kitchen_sink_kitchen_parse_any(detail::utf8(text), text.size(), &err);
+    auto result = kitchen_sink_parse_any(detail::string_run(text), &err);
     detail::check<Error>(err);
     return result;
 }
 
-} // namespace kitchen
-
-namespace kitchen::nested {
-
-/** Trivial nested-module function */
+/** A trivial function returning a string */
 inline std::string hello() {
     check_library();
     kitchen_sink_error err{};
-    size_t out_len{};
-    auto result = kitchen_sink_kitchen_nested_hello(&out_len, &err);
+    auto result = kitchen_sink_hello(&err);
     detail::check<InternalError>(err);
-    return detail::take_string(result, out_len);
+    return detail::take_string(result);
 }
-
-} // namespace kitchen::nested
 
 } // namespace kitchen_sink
 

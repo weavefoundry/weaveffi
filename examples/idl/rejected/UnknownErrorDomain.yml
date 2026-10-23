@@ -1,0 +1,12 @@
+# rejected: UnknownErrorDomain
+version: "0.13.0"
+records:
+  - name: Contact
+    fields:
+      - { name: name, type: string }
+functions:
+  - name: get_contact
+    params:
+      - { name: id, type: u64 }
+    return: Contact
+    throws: Contact

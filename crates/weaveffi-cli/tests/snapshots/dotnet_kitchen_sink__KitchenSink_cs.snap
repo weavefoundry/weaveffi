@@ -16,7 +16,7 @@ using System.Threading.Tasks;
 
 namespace KitchenSink;
 
-/// <summary>The errors of the <c>KitchenErrors</c> domain, declared by module <c>kitchen</c>.
+/// <summary>The errors of the <c>KitchenErrors</c> domain.
 /// Catch a nested class for one code, or this class for any of them. A code
 /// these bindings don't know (one the library added later) surfaces as this
 /// class itself, with its <see cref="NativeException.Code"/> and message.</summary>
@@ -82,7 +82,7 @@ public class KitchenException : NativeException
     }
 }
 
-/// <summary>The errors of the <c>PantryError</c> domain, declared by module <c>kitchen</c>.
+/// <summary>The errors of the <c>PantryError</c> domain.
 /// Catch a nested class for one code, or this class for any of them. A code
 /// these bindings don't know (one the library added later) surfaces as this
 /// class itself, with its <see cref="NativeException.Code"/> and message.</summary>
@@ -156,7 +156,18 @@ public class PantryException : NativeException
     }
 }
 
-/// <summary>A reusable token referenced across modules</summary>
+/// <summary>Task priority levels</summary>
+public enum Priority
+{
+    /// <summary>Low priority</summary>
+    Low = 0,
+    /// <summary>Normal priority</summary>
+    Normal = 1,
+    /// <summary>High priority</summary>
+    High = 2,
+}
+
+/// <summary>A reusable token referenced from several declarations</summary>
 public sealed record Token(long Id, string Label)
 {
     internal void WriteTo(FfiBufferWriter writer)
@@ -173,24 +184,13 @@ public sealed record Token(long Id, string Label)
     }
 }
 
-/// <summary>Task priority levels</summary>
-public enum Priority
-{
-    /// <summary>Low priority</summary>
-    Low = 0,
-    /// <summary>Normal priority</summary>
-    Normal = 1,
-    /// <summary>High priority</summary>
-    High = 2,
-}
-
 /// <summary>Kitchen sink struct exercising every field feature</summary>
 /// <param name="Id">Stable identifier</param>
 /// <param name="Name">Display name</param>
 /// <param name="Count">Initial count</param>
 /// <param name="Enabled">Whether the item is enabled</param>
 /// <param name="Ratio">Scaling ratio</param>
-/// <param name="Token">Cross-module struct reference</param>
+/// <param name="Token">A record inside a record</param>
 /// <param name="Gadget">An optional object inside a record</param>
 public sealed record Item(long Id, string Name, int Count, bool Enabled, double Ratio, uint Nick, byte[] Payload, IReadOnlyList<string> Tags, IReadOnlyDictionary<string, string> Attrs, long? Parent, Token Token, Priority Priority, Gadget? Gadget)
 {
@@ -296,7 +296,7 @@ public interface IReadyListener
     Gadget Favorite();
 }
 
-/// <summary>The process-wide <c>kitchen_sink_kitchen_ReadyListener_vtable</c> and the trampolines behind it,
+/// <summary>The process-wide <c>kitchen_sink_ReadyListener_vtable</c> and the trampolines behind it,
 /// adapting an <see cref="IReadyListener"/> to the C ABI.</summary>
 internal static unsafe class FfiReadyListenerVtable
 {
@@ -306,10 +306,10 @@ internal static unsafe class FfiReadyListenerVtable
         public uint Size;
         public uint Flags;
         public delegate* unmanaged[Cdecl]<IntPtr, void> Free;
-        public delegate* unmanaged[Cdecl]<IntPtr, int, byte*, nuint, FfiError*, void> on_ready;
-        public delegate* unmanaged[Cdecl]<IntPtr, byte*, nuint, IntPtr, FfiError*, bool> on_item;
-        public delegate* unmanaged[Cdecl]<IntPtr, byte**, nuint*, FfiError*, void> label;
-        public delegate* unmanaged[Cdecl]<IntPtr, byte**, nuint*, FfiError*, void> latest;
+        public delegate* unmanaged[Cdecl]<IntPtr, int, FfiRun, FfiError*, void> on_ready;
+        public delegate* unmanaged[Cdecl]<IntPtr, FfiRun, IntPtr, FfiError*, byte> on_item;
+        public delegate* unmanaged[Cdecl]<IntPtr, FfiError*, FfiRun> label;
+        public delegate* unmanaged[Cdecl]<IntPtr, FfiError*, FfiRun> latest;
         public delegate* unmanaged[Cdecl]<IntPtr, FfiError*, IntPtr> favorite;
     }
 
@@ -322,7 +322,7 @@ internal static unsafe class FfiReadyListenerVtable
         vtable->Size = (uint)sizeof(Layout);
         // Not thread-affine: every method may be called from any thread.
         vtable->Flags = 0;
-        vtable->Free = &FreeTrampoline;
+        vtable->Free = &FfiFree;
         vtable->on_ready = &OnReadyTrampoline;
         vtable->on_item = &OnItemTrampoline;
         vtable->label = &LabelTrampoline;
@@ -332,78 +332,81 @@ internal static unsafe class FfiReadyListenerVtable
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static void FreeTrampoline(IntPtr ctx)
+    private static void FfiFree(IntPtr ctx)
     {
         Ffi.Unregister(ctx);
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static void OnReadyTrampoline(IntPtr ctx, int code, byte* msg_ptr, nuint msg_len, FfiError* out_err)
+    private static void OnReadyTrampoline(IntPtr ffi_ctx, int ffi_code, FfiRun ffi_msg, FfiError* ffi_out_err)
     {
         try
         {
-            Ffi.Target<IReadyListener>(ctx).OnReady(code, Ffi.ReadString(msg_ptr, msg_len));
+            Ffi.Target<IReadyListener>(ffi_ctx).OnReady(ffi_code, Ffi.ReadString(ffi_msg));
         }
         catch (Exception e)
         {
-            Ffi.Report(out_err, e, NativeException.ForeignErrorCode);
+            Ffi.Report(ffi_out_err, e, NativeException.ForeignErrorCode);
         }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static bool OnItemTrampoline(IntPtr ctx, byte* item_ptr, nuint item_len, IntPtr gadget, FfiError* out_err)
+    private static byte OnItemTrampoline(IntPtr ffi_ctx, FfiRun ffi_item, IntPtr ffi_gadget, FfiError* ffi_out_err)
     {
         try
         {
-            return Ffi.Target<IReadyListener>(ctx).OnItem(Ffi.ReadBuffer(item_ptr, item_len, static r0 => global::KitchenSink.Item.ReadFrom(r0)), global::KitchenSink.Gadget.Adopt(gadget));
+            return Ffi.Bool(Ffi.Target<IReadyListener>(ffi_ctx).OnItem(Ffi.ReadBuffer(ffi_item, static r0 => global::KitchenSink.Item.ReadFrom(r0)), global::KitchenSink.Gadget.Adopt(ffi_gadget)));
         }
         catch (Exception e)
         {
-            Ffi.Report(out_err, e, NativeException.ForeignErrorCode);
+            Ffi.Report(ffi_out_err, e, NativeException.ForeignErrorCode);
             return default;
         }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static void LabelTrampoline(IntPtr ctx, byte** out_ptr, nuint* out_len, FfiError* out_err)
+    private static FfiRun LabelTrampoline(IntPtr ffi_ctx, FfiError* ffi_out_err)
     {
         try
         {
-            Ffi.ReturnString(Ffi.Target<IReadyListener>(ctx).Label(), out_ptr, out_len);
+            return Ffi.ReturnString(Ffi.Target<IReadyListener>(ffi_ctx).Label());
         }
         catch (global::KitchenSink.KitchenException e)
         {
-            Ffi.ReportDomain(out_err, e);
+            Ffi.ReportDomain(ffi_out_err, e);
+            return default;
         }
         catch (Exception e)
         {
-            Ffi.Report(out_err, e, NativeException.GenericErrorCode);
+            Ffi.Report(ffi_out_err, e, NativeException.GenericErrorCode);
+            return default;
         }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static void LatestTrampoline(IntPtr ctx, byte** out_ptr, nuint* out_len, FfiError* out_err)
+    private static FfiRun LatestTrampoline(IntPtr ffi_ctx, FfiError* ffi_out_err)
     {
         try
         {
-            Ffi.ReturnBuffer(Ffi.Target<IReadyListener>(ctx).Latest(), static (w0, v0) => w0.WriteOptional(v0, static (w1, v1) => v1.WriteTo(w1)), out_ptr, out_len);
+            return Ffi.ReturnBuffer(Ffi.Target<IReadyListener>(ffi_ctx).Latest(), static (w0, v0) => w0.WriteOptional(v0, static (w1, v1) => v1.WriteTo(w1)));
         }
         catch (Exception e)
         {
-            Ffi.Report(out_err, e, NativeException.ForeignErrorCode);
+            Ffi.Report(ffi_out_err, e, NativeException.ForeignErrorCode);
+            return default;
         }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static IntPtr FavoriteTrampoline(IntPtr ctx, FfiError* out_err)
+    private static IntPtr FavoriteTrampoline(IntPtr ffi_ctx, FfiError* ffi_out_err)
     {
         try
         {
-            return Ffi.Target<IReadyListener>(ctx).Favorite()?.CloneHandle() ?? IntPtr.Zero;
+            return Ffi.Target<IReadyListener>(ffi_ctx).Favorite()?.CloneHandle() ?? IntPtr.Zero;
         }
         catch (Exception e)
         {
-            Ffi.Report(out_err, e, NativeException.ForeignErrorCode);
+            Ffi.Report(ffi_out_err, e, NativeException.ForeignErrorCode);
             return default;
         }
     }
@@ -429,7 +432,7 @@ public interface ISampler
     string Describe();
 }
 
-/// <summary>The process-wide <c>kitchen_sink_kitchen_Sampler_vtable</c> and the trampolines behind it,
+/// <summary>The process-wide <c>kitchen_sink_Sampler_vtable</c> and the trampolines behind it,
 /// adapting an <see cref="ISampler"/> to the C ABI.</summary>
 internal static unsafe class FfiSamplerVtable
 {
@@ -439,9 +442,9 @@ internal static unsafe class FfiSamplerVtable
         public uint Size;
         public uint Flags;
         public delegate* unmanaged[Cdecl]<IntPtr, void> Free;
-        public delegate* unmanaged[Cdecl]<IntPtr, bool, uint, double*, FfiError*, bool> threshold;
-        public delegate* unmanaged[Cdecl]<IntPtr, bool, uint, double*, nuint, short**, nuint*, FfiError*, void> samples;
-        public delegate* unmanaged[Cdecl]<IntPtr, byte**, nuint*, FfiError*, void> describe;
+        public delegate* unmanaged[Cdecl]<IntPtr, FfiOptU32, FfiError*, FfiOptF64> threshold;
+        public delegate* unmanaged[Cdecl]<IntPtr, FfiOptU32, FfiRun, FfiError*, FfiRun> samples;
+        public delegate* unmanaged[Cdecl]<IntPtr, FfiError*, FfiRun> describe;
     }
 
     /// <summary>The vtable's address, valid for the process lifetime.</summary>
@@ -453,7 +456,7 @@ internal static unsafe class FfiSamplerVtable
         vtable->Size = (uint)sizeof(Layout);
         // Not thread-affine: every method may be called from any thread.
         vtable->Flags = 0;
-        vtable->Free = &FreeTrampoline;
+        vtable->Free = &FfiFree;
         vtable->threshold = &ThresholdTrampoline;
         vtable->samples = &SamplesTrampoline;
         vtable->describe = &DescribeTrampoline;
@@ -461,52 +464,55 @@ internal static unsafe class FfiSamplerVtable
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static void FreeTrampoline(IntPtr ctx)
+    private static void FfiFree(IntPtr ctx)
     {
         Ffi.Unregister(ctx);
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static bool ThresholdTrampoline(IntPtr ctx, bool has_level, uint level, double* out_value, FfiError* out_err)
+    private static FfiOptF64 ThresholdTrampoline(IntPtr ffi_ctx, FfiOptU32 ffi_level, FfiError* ffi_out_err)
     {
         try
         {
-            return Ffi.ReturnOptional(Ffi.Target<ISampler>(ctx).Threshold(has_level ? level : null), out_value);
+            return FfiOptF64.Of(Ffi.Target<ISampler>(ffi_ctx).Threshold(ffi_level.ToNullable()));
         }
         catch (Exception e)
         {
-            Ffi.Report(out_err, e, NativeException.ForeignErrorCode);
+            Ffi.Report(ffi_out_err, e, NativeException.ForeignErrorCode);
             return default;
         }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static void SamplesTrampoline(IntPtr ctx, bool has_limit, uint limit, double* weights_ptr, nuint weights_len, short** out_ptr, nuint* out_len, FfiError* out_err)
+    private static FfiRun SamplesTrampoline(IntPtr ffi_ctx, FfiOptU32 ffi_limit, FfiRun ffi_weights, FfiError* ffi_out_err)
     {
         try
         {
-            Ffi.ReturnArray(Ffi.Target<ISampler>(ctx).Samples(has_limit ? limit : null, Ffi.Borrow(weights_ptr, weights_len)), out_ptr, out_len);
+            return Ffi.ReturnArray(Ffi.Target<ISampler>(ffi_ctx).Samples(ffi_limit.ToNullable(), Ffi.Borrow<double>(ffi_weights)));
         }
         catch (global::KitchenSink.PantryException e)
         {
-            Ffi.ReportDomain(out_err, e);
+            Ffi.ReportDomain(ffi_out_err, e);
+            return default;
         }
         catch (Exception e)
         {
-            Ffi.Report(out_err, e, NativeException.GenericErrorCode);
+            Ffi.Report(ffi_out_err, e, NativeException.GenericErrorCode);
+            return default;
         }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static void DescribeTrampoline(IntPtr ctx, byte** out_ptr, nuint* out_len, FfiError* out_err)
+    private static FfiRun DescribeTrampoline(IntPtr ffi_ctx, FfiError* ffi_out_err)
     {
         try
         {
-            Ffi.ReturnString(Ffi.Target<ISampler>(ctx).Describe(), out_ptr, out_len);
+            return Ffi.ReturnString(Ffi.Target<ISampler>(ffi_ctx).Describe());
         }
         catch (Exception e)
         {
-            Ffi.Report(out_err, e, NativeException.GenericErrorCode);
+            Ffi.Report(ffi_out_err, e, NativeException.GenericErrorCode);
+            return default;
         }
     }
 }
@@ -532,14 +538,14 @@ public sealed unsafe class Gadget : IDisposable, IEquatable<Gadget>
     /// object token in a value buffer requires.</summary>
     internal IntPtr CloneHandle()
     {
-        return NativeMethods.kitchen_sink_kitchen_Gadget_clone(Handle);
+        return NativeMethods.kitchen_sink_Gadget_clone(Handle);
     }
 
     /// <summary>Create a gadget with the given id</summary>
     public Gadget(long id)
     {
         var ffiErr = default(FfiError);
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_Gadget_new(id, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_Gadget_new(id, &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
         Handle = new NativeHandle(ffiResult);
     }
@@ -548,10 +554,9 @@ public sealed unsafe class Gadget : IDisposable, IEquatable<Gadget>
     public string Describe()
     {
         var ffiErr = default(FfiError);
-        nuint ffiOutLen = 0;
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_Gadget_describe(Handle, &ffiOutLen, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_Gadget_describe(Handle, &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-        return Ffi.TakeString(ffiResult, ffiOutLen);
+        return Ffi.TakeString(ffiResult);
     }
 
     /// <summary>Poke the gadget a number of times, failing on a negative count</summary>
@@ -559,7 +564,7 @@ public sealed unsafe class Gadget : IDisposable, IEquatable<Gadget>
     public int Poke(int times)
     {
         var ffiErr = default(FfiError);
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_Gadget_poke(Handle, times, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_Gadget_poke(Handle, times, &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.KitchenException.FromError);
         return ffiResult;
     }
@@ -569,20 +574,18 @@ public sealed unsafe class Gadget : IDisposable, IEquatable<Gadget>
     public double[] Readings(uint? limit)
     {
         var ffiErr = default(FfiError);
-        nuint ffiOutLen = 0;
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_Gadget_readings(Handle, limit.HasValue, limit.GetValueOrDefault(), &ffiOutLen, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_Gadget_readings(Handle, FfiOptU32.Of(limit), &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeException.FromError);
-        return Ffi.TakeArray(ffiResult, ffiOutLen);
+        return Ffi.TakeArray<double>(ffiResult);
     }
 
     /// <summary>The gadget subsystem version string</summary>
     public static string Version()
     {
         var ffiErr = default(FfiError);
-        nuint ffiOutLen = 0;
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_Gadget_version(&ffiOutLen, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_Gadget_version(&ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-        return Ffi.TakeString(ffiResult, ffiOutLen);
+        return Ffi.TakeString(ffiResult);
     }
 
     /// <summary>Releases this wrapper's reference. The native object is
@@ -612,7 +615,7 @@ public sealed unsafe class Gadget : IDisposable, IEquatable<Gadget>
     }
 
     /// <summary>One strong reference, released through
-    /// <c>kitchen_sink_kitchen_Gadget_destroy</c>.</summary>
+    /// <c>kitchen_sink_Gadget_destroy</c>.</summary>
     internal sealed class NativeHandle : SafeHandle
     {
         /// <summary>A null handle, passed for an absent optional object.</summary>
@@ -631,40 +634,36 @@ public sealed unsafe class Gadget : IDisposable, IEquatable<Gadget>
 
         protected override bool ReleaseHandle()
         {
-            NativeMethods.kitchen_sink_kitchen_Gadget_destroy(handle);
+            NativeMethods.kitchen_sink_Gadget_destroy(handle);
             return true;
         }
     }
 }
 
-public static unsafe class Shared
+public static unsafe partial class KitchenSinkLibrary
 {
-    /// <summary>Trivial cross-module helper</summary>
+    /// <summary>A trivial helper</summary>
     public static string Ping()
     {
         var ffiErr = default(FfiError);
-        nuint ffiOutLen = 0;
-        var ffiResult = NativeMethods.kitchen_sink_shared_ping(&ffiOutLen, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_ping(&ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-        return Ffi.TakeString(ffiResult, ffiOutLen);
+        return Ffi.TakeString(ffiResult);
     }
-}
 
-public static unsafe class Kitchen
-{
     /// <summary>Identity for bool</summary>
     public static bool BoolId(bool x)
     {
         var ffiErr = default(FfiError);
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_bool_id(x, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_bool_id(Ffi.Bool(x), &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-        return ffiResult;
+        return ffiResult != 0;
     }
 
     public static int I32Id(int x)
     {
         var ffiErr = default(FfiError);
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_i32_id(x, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_i32_id(x, &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
         return ffiResult;
     }
@@ -672,7 +671,7 @@ public static unsafe class Kitchen
     public static uint U32Id(uint x)
     {
         var ffiErr = default(FfiError);
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_u32_id(x, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_u32_id(x, &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
         return ffiResult;
     }
@@ -680,7 +679,7 @@ public static unsafe class Kitchen
     public static long I64Id(long x)
     {
         var ffiErr = default(FfiError);
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_i64_id(x, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_i64_id(x, &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
         return ffiResult;
     }
@@ -688,7 +687,7 @@ public static unsafe class Kitchen
     public static double F64Id(double x)
     {
         var ffiErr = default(FfiError);
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_f64_id(x, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_f64_id(x, &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
         return ffiResult;
     }
@@ -697,24 +696,22 @@ public static unsafe class Kitchen
     {
         using var sUtf8 = new FfiUtf8(s);
         var ffiErr = default(FfiError);
-        nuint ffiOutLen = 0;
         fixed (byte* sPtr = sUtf8)
         {
-            var ffiResult = NativeMethods.kitchen_sink_kitchen_echo_string(sPtr, sUtf8.Length, &ffiOutLen, &ffiErr);
+            var ffiResult = NativeMethods.kitchen_sink_echo_string(new FfiRun(sPtr, sUtf8.Length), &ffiErr);
             if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-            return Ffi.TakeString(ffiResult, ffiOutLen);
+            return Ffi.TakeString(ffiResult);
         }
     }
 
     public static byte[] EchoBytes(ReadOnlySpan<byte> b)
     {
         var ffiErr = default(FfiError);
-        nuint ffiOutLen = 0;
         fixed (byte* bPtr = b)
         {
-            var ffiResult = NativeMethods.kitchen_sink_kitchen_echo_bytes(bPtr, (nuint)b.Length, &ffiOutLen, &ffiErr);
+            var ffiResult = NativeMethods.kitchen_sink_echo_bytes(new FfiRun(bPtr, (nuint)b.Length), &ffiErr);
             if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-            return Ffi.TakeBytes(ffiResult, ffiOutLen);
+            return Ffi.TakeBytes(ffiResult);
         }
     }
 
@@ -726,7 +723,7 @@ public static unsafe class Kitchen
         int ffiResult;
         try
         {
-            ffiResult = NativeMethods.kitchen_sink_kitchen_subscribe(listenerCtx, FfiReadyListenerVtable.Pointer, &ffiErr);
+            ffiResult = NativeMethods.kitchen_sink_subscribe(new FfiCallback(listenerCtx, FfiReadyListenerVtable.Pointer), &ffiErr);
         }
         catch
         {
@@ -742,10 +739,10 @@ public static unsafe class Kitchen
     {
         var listenerCtx = Ffi.Register(listener);
         var ffiErr = default(FfiError);
-        bool ffiResult;
+        byte ffiResult;
         try
         {
-            ffiResult = NativeMethods.kitchen_sink_kitchen_maybe_subscribe(listenerCtx, listener == null ? IntPtr.Zero : FfiReadyListenerVtable.Pointer, &ffiErr);
+            ffiResult = NativeMethods.kitchen_sink_maybe_subscribe(new FfiCallback(listenerCtx, listener == null ? IntPtr.Zero : FfiReadyListenerVtable.Pointer), &ffiErr);
         }
         catch
         {
@@ -753,14 +750,14 @@ public static unsafe class Kitchen
             throw;
         }
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-        return ffiResult;
+        return ffiResult != 0;
     }
 
     /// <summary>Optional object in both directions</summary>
     public static Gadget? MaybeGadget(Gadget? fallback)
     {
         var ffiErr = default(FfiError);
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_maybe_gadget(fallback?.Handle ?? global::KitchenSink.Gadget.NativeHandle.Null, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_maybe_gadget(fallback?.Handle ?? global::KitchenSink.Gadget.NativeHandle.Null, &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
         return ffiResult == IntPtr.Zero ? null : global::KitchenSink.Gadget.Adopt(ffiResult);
     }
@@ -769,10 +766,9 @@ public static unsafe class Kitchen
     public static IReadOnlyList<Gadget> Gadgets()
     {
         var ffiErr = default(FfiError);
-        nuint ffiOutLen = 0;
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_gadgets(&ffiOutLen, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_gadgets(&ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-        return Ffi.TakeBuffer(ffiResult, ffiOutLen, static r0 => r0.ReadList(static r1 => global::KitchenSink.Gadget.Adopt(r1.ReadObject())));
+        return Ffi.TakeBuffer(ffiResult, static r0 => r0.ReadList(static r1 => global::KitchenSink.Gadget.Adopt(r1.ReadObject())));
     }
 
     /// <summary>An iterator over objects</summary>
@@ -782,22 +778,22 @@ public static unsafe class Kitchen
     /// (as <c>foreach</c> does) releases it.</remarks>
     public static IEnumerable<Gadget> StreamGadgets()
     {
-        return new FfiSequence<Gadget>(() => LaunchStreamGadgets(), &NextStreamGadgets);
+        return new FfiSequence<Gadget>(() => FfiLaunchStreamGadgets(), &FfiNextStreamGadgets);
     }
 
-    private static FfiIteratorHandle LaunchStreamGadgets()
+    private static FfiIteratorHandle FfiLaunchStreamGadgets()
     {
         var ffiErr = default(FfiError);
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_stream_gadgets(&ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_stream_gadgets(&ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-        return new FfiIteratorHandle(ffiResult, &NativeMethods.kitchen_sink_kitchen_StreamGadgetsIterator_destroy);
+        return new FfiIteratorHandle(ffiResult, &NativeMethods.kitchen_sink_StreamGadgetsIterator_destroy);
     }
 
-    private static bool NextStreamGadgets(FfiIteratorHandle iter, out Gadget item)
+    private static bool FfiNextStreamGadgets(FfiIteratorHandle iter, out Gadget item)
     {
-        IntPtr ffiItem = default;
+        var ffiItem = default(IntPtr);
         var ffiErr = default(FfiError);
-        var ffiMore = NativeMethods.kitchen_sink_kitchen_StreamGadgetsIterator_next(iter, &ffiItem, &ffiErr);
+        var ffiMore = NativeMethods.kitchen_sink_StreamGadgetsIterator_next(iter, &ffiItem, &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
         if (ffiMore == 0)
         {
@@ -813,30 +809,27 @@ public static unsafe class Kitchen
     public static Item? MaybeItem(long id)
     {
         var ffiErr = default(FfiError);
-        nuint ffiOutLen = 0;
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_maybe_item(id, &ffiOutLen, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_maybe_item(id, &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.KitchenException.FromError);
-        return Ffi.TakeBuffer(ffiResult, ffiOutLen, static r0 => r0.ReadOptional(static r1 => global::KitchenSink.Item.ReadFrom(r1)));
+        return Ffi.TakeBuffer(ffiResult, static r0 => r0.ReadOptional(static r1 => global::KitchenSink.Item.ReadFrom(r1)));
     }
 
     /// <summary>List of structs</summary>
     public static IReadOnlyList<Item> ListItems()
     {
         var ffiErr = default(FfiError);
-        nuint ffiOutLen = 0;
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_list_items(&ffiOutLen, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_list_items(&ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-        return Ffi.TakeBuffer(ffiResult, ffiOutLen, static r0 => r0.ReadList(static r1 => global::KitchenSink.Item.ReadFrom(r1)));
+        return Ffi.TakeBuffer(ffiResult, static r0 => r0.ReadList(static r1 => global::KitchenSink.Item.ReadFrom(r1)));
     }
 
     /// <summary>Map return type</summary>
     public static IReadOnlyDictionary<string, int> GetAttrs()
     {
         var ffiErr = default(FfiError);
-        nuint ffiOutLen = 0;
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_get_attrs(&ffiOutLen, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_get_attrs(&ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-        return Ffi.TakeBuffer(ffiResult, ffiOutLen, static r0 => r0.ReadMap<string, int>(static r1 => r1.ReadString(), static r1 => r1.ReadI32()));
+        return Ffi.TakeBuffer(ffiResult, static r0 => r0.ReadMap<string, int>(static r1 => r1.ReadString(), static r1 => r1.ReadI32()));
     }
 
     /// <summary>Iterator return type</summary>
@@ -846,41 +839,39 @@ public static unsafe class Kitchen
     /// (as <c>foreach</c> does) releases it.</remarks>
     public static IEnumerable<Item> StreamItems()
     {
-        return new FfiSequence<Item>(() => LaunchStreamItems(), &NextStreamItems);
+        return new FfiSequence<Item>(() => FfiLaunchStreamItems(), &FfiNextStreamItems);
     }
 
-    private static FfiIteratorHandle LaunchStreamItems()
+    private static FfiIteratorHandle FfiLaunchStreamItems()
     {
         var ffiErr = default(FfiError);
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_stream_items(&ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_stream_items(&ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-        return new FfiIteratorHandle(ffiResult, &NativeMethods.kitchen_sink_kitchen_StreamItemsIterator_destroy);
+        return new FfiIteratorHandle(ffiResult, &NativeMethods.kitchen_sink_StreamItemsIterator_destroy);
     }
 
-    private static bool NextStreamItems(FfiIteratorHandle iter, out Item item)
+    private static bool FfiNextStreamItems(FfiIteratorHandle iter, out Item item)
     {
-        byte* ffiItem = default;
-        nuint ffiLen = default;
+        var ffiItem = default(FfiRun);
         var ffiErr = default(FfiError);
-        var ffiMore = NativeMethods.kitchen_sink_kitchen_StreamItemsIterator_next(iter, &ffiItem, &ffiLen, &ffiErr);
+        var ffiMore = NativeMethods.kitchen_sink_StreamItemsIterator_next(iter, &ffiItem, &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
         if (ffiMore == 0)
         {
             item = default!;
             return false;
         }
-        item = Ffi.TakeBuffer(ffiItem, ffiLen, static r0 => global::KitchenSink.Item.ReadFrom(r0));
+        item = Ffi.TakeBuffer(ffiItem, static r0 => global::KitchenSink.Item.ReadFrom(r0));
         return true;
     }
 
-    /// <summary>Returns the shared Token type from another module</summary>
-    public static Token CrossModuleToken()
+    /// <summary>Returns the shared Token record</summary>
+    public static Token MakeToken()
     {
         var ffiErr = default(FfiError);
-        nuint ffiOutLen = 0;
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_cross_module_token(&ffiOutLen, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_make_token(&ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-        return Ffi.TakeBuffer(ffiResult, ffiOutLen, static r0 => global::KitchenSink.Token.ReadFrom(r0));
+        return Ffi.TakeBuffer(ffiResult, static r0 => global::KitchenSink.Token.ReadFrom(r0));
     }
 
     /// <summary>Async operation</summary>
@@ -899,7 +890,7 @@ public static unsafe class Kitchen
         {
             fixed (byte* inputPtr = inputUtf8)
             {
-                NativeMethods.kitchen_sink_kitchen_do_async(inputPtr, inputUtf8.Length, &CompleteDoAsync, ffiCall.Context);
+                NativeMethods.kitchen_sink_do_async(new FfiRun(inputPtr, inputUtf8.Length), &FfiCompleteDoAsync, ffiCall.Context);
             }
         }
         catch
@@ -911,7 +902,7 @@ public static unsafe class Kitchen
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static void CompleteDoAsync(IntPtr context, FfiError* err, byte* result_ptr, nuint result_len)
+    private static void FfiCompleteDoAsync(IntPtr context, FfiError* err, FfiRun result)
     {
         var ffiCall = FfiCall<string>.Complete(context);
         try
@@ -921,7 +912,7 @@ public static unsafe class Kitchen
                 ffiCall.SetError(err, &global::KitchenSink.NativeBugException.FromError);
                 return;
             }
-            ffiCall.SetResult(Ffi.TakeString(result_ptr, result_len));
+            ffiCall.SetResult(Ffi.TakeString(result));
         }
         catch (Exception e)
         {
@@ -944,7 +935,7 @@ public static unsafe class Kitchen
         {
             fixed (byte* inputPtr = inputUtf8)
             {
-                NativeMethods.kitchen_sink_kitchen_do_cancellable(inputPtr, inputUtf8.Length, ffiCall.CancelToken(), &CompleteDoCancellable, ffiCall.Context);
+                NativeMethods.kitchen_sink_do_cancellable(new FfiRun(inputPtr, inputUtf8.Length), ffiCall.CancelToken(), &FfiCompleteDoCancellable, ffiCall.Context);
             }
         }
         catch
@@ -956,7 +947,7 @@ public static unsafe class Kitchen
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static void CompleteDoCancellable(IntPtr context, FfiError* err, byte* result_ptr, nuint result_len)
+    private static void FfiCompleteDoCancellable(IntPtr context, FfiError* err, FfiRun result)
     {
         var ffiCall = FfiCall<string>.Complete(context);
         try
@@ -966,7 +957,7 @@ public static unsafe class Kitchen
                 ffiCall.SetError(err, &global::KitchenSink.NativeBugException.FromError);
                 return;
             }
-            ffiCall.SetResult(Ffi.TakeString(result_ptr, result_len));
+            ffiCall.SetResult(Ffi.TakeString(result));
         }
         catch (Exception e)
         {
@@ -979,7 +970,7 @@ public static unsafe class Kitchen
     public static int LegacyOp()
     {
         var ffiErr = default(FfiError);
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_legacy_op(&ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_legacy_op(&ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
         return ffiResult;
     }
@@ -988,7 +979,7 @@ public static unsafe class Kitchen
     public static int NewOp()
     {
         var ffiErr = default(FfiError);
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_new_op(&ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_new_op(&ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
         return ffiResult;
     }
@@ -997,29 +988,26 @@ public static unsafe class Kitchen
     public static int? OptI32Id(int? x)
     {
         var ffiErr = default(FfiError);
-        int ffiValue = default;
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_opt_i32_id(x.HasValue, x.GetValueOrDefault(), &ffiValue, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_opt_i32_id(FfiOptI32.Of(x), &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-        return ffiResult ? ffiValue : null;
+        return ffiResult.ToNullable();
     }
 
     public static bool? OptBoolId(bool? x)
     {
         var ffiErr = default(FfiError);
-        bool ffiValue = default;
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_opt_bool_id(x.HasValue, x.GetValueOrDefault(), &ffiValue, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_opt_bool_id(FfiOptBool.Of(x), &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-        return ffiResult ? ffiValue : null;
+        return ffiResult.ToNullable();
     }
 
     /// <summary>Optional C-style enum in both directions</summary>
     public static Priority? OptPriority(Priority? p)
     {
         var ffiErr = default(FfiError);
-        global::KitchenSink.Priority ffiValue = default;
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_opt_priority(p.HasValue, p.GetValueOrDefault(), &ffiValue, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_opt_priority(FfiOptI32.Of((int?)p), &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-        return ffiResult ? ffiValue : null;
+        return (global::KitchenSink.Priority?)ffiResult.ToNullable();
     }
 
     /// <summary>Optional scalars next to ordinary parameters</summary>
@@ -1028,12 +1016,11 @@ public static unsafe class Kitchen
         using var labelWriter = new FfiBufferWriter();
         labelWriter.WriteOptional(label, static (w0, v0) => w0.WriteString(v0));
         var ffiErr = default(FfiError);
-        ushort ffiValue = default;
         fixed (byte* labelPtr = labelWriter.Written)
         {
-            var ffiResult = NativeMethods.kitchen_sink_kitchen_opt_mixed(@base, scale.HasValue, scale.GetValueOrDefault(), offset.HasValue, offset.GetValueOrDefault(), labelPtr, (nuint)labelWriter.Length, &ffiValue, &ffiErr);
+            var ffiResult = NativeMethods.kitchen_sink_opt_mixed(@base, FfiOptF32.Of(scale), FfiOptI64.Of(offset), new FfiRun(labelPtr, (nuint)labelWriter.Length), &ffiErr);
             if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-            return ffiResult ? ffiValue : null;
+            return ffiResult.ToNullable();
         }
     }
 
@@ -1043,7 +1030,7 @@ public static unsafe class Kitchen
         var ffiErr = default(FfiError);
         fixed (double* xsPtr = xs)
         {
-            var ffiResult = NativeMethods.kitchen_sink_kitchen_sum_f64(xsPtr, (nuint)xs.Length, &ffiErr);
+            var ffiResult = NativeMethods.kitchen_sink_sum_f64(new FfiRun((byte*)xsPtr, (nuint)xs.Length * 8), &ffiErr);
             if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
             return ffiResult;
         }
@@ -1053,24 +1040,22 @@ public static unsafe class Kitchen
     public static int[] ScaleI32(ReadOnlySpan<int> xs, int factor)
     {
         var ffiErr = default(FfiError);
-        nuint ffiOutLen = 0;
         fixed (int* xsPtr = xs)
         {
-            var ffiResult = NativeMethods.kitchen_sink_kitchen_scale_i32(xsPtr, (nuint)xs.Length, factor, &ffiOutLen, &ffiErr);
+            var ffiResult = NativeMethods.kitchen_sink_scale_i32(new FfiRun((byte*)xsPtr, (nuint)xs.Length * 4), factor, &ffiErr);
             if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-            return Ffi.TakeArray(ffiResult, ffiOutLen);
+            return Ffi.TakeArray<int>(ffiResult);
         }
     }
 
     public static ulong[] IdsU64(ReadOnlySpan<ulong> ids)
     {
         var ffiErr = default(FfiError);
-        nuint ffiOutLen = 0;
         fixed (ulong* idsPtr = ids)
         {
-            var ffiResult = NativeMethods.kitchen_sink_kitchen_ids_u64(idsPtr, (nuint)ids.Length, &ffiOutLen, &ffiErr);
+            var ffiResult = NativeMethods.kitchen_sink_ids_u64(new FfiRun((byte*)idsPtr, (nuint)ids.Length * 8), &ffiErr);
             if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-            return Ffi.TakeArray(ffiResult, ffiOutLen);
+            return Ffi.TakeArray<ulong>(ffiResult);
         }
     }
 
@@ -1078,7 +1063,6 @@ public static unsafe class Kitchen
     public static uint[] MixedSlices(ReadOnlySpan<sbyte> a, ReadOnlySpan<short> b, ReadOnlySpan<ushort> c, ReadOnlySpan<uint> d, ReadOnlySpan<long> e, ReadOnlySpan<float> f)
     {
         var ffiErr = default(FfiError);
-        nuint ffiOutLen = 0;
         fixed (sbyte* aPtr = a)
         fixed (short* bPtr = b)
         fixed (ushort* cPtr = c)
@@ -1086,9 +1070,9 @@ public static unsafe class Kitchen
         fixed (long* ePtr = e)
         fixed (float* fPtr = f)
         {
-            var ffiResult = NativeMethods.kitchen_sink_kitchen_mixed_slices(aPtr, (nuint)a.Length, bPtr, (nuint)b.Length, cPtr, (nuint)c.Length, dPtr, (nuint)d.Length, ePtr, (nuint)e.Length, fPtr, (nuint)f.Length, &ffiOutLen, &ffiErr);
+            var ffiResult = NativeMethods.kitchen_sink_mixed_slices(new FfiRun((byte*)aPtr, (nuint)a.Length * 1), new FfiRun((byte*)bPtr, (nuint)b.Length * 2), new FfiRun((byte*)cPtr, (nuint)c.Length * 2), new FfiRun((byte*)dPtr, (nuint)d.Length * 4), new FfiRun((byte*)ePtr, (nuint)e.Length * 8), new FfiRun((byte*)fPtr, (nuint)f.Length * 4), &ffiErr);
             if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-            return Ffi.TakeArray(ffiResult, ffiOutLen);
+            return Ffi.TakeArray<uint>(ffiResult);
         }
     }
 
@@ -1105,7 +1089,7 @@ public static unsafe class Kitchen
         var ffiCall = new FfiCall<long?>(cancellationToken);
         try
         {
-            NativeMethods.kitchen_sink_kitchen_async_maybe_count(&CompleteAsyncMaybeCount, ffiCall.Context);
+            NativeMethods.kitchen_sink_async_maybe_count(&FfiCompleteAsyncMaybeCount, ffiCall.Context);
         }
         catch
         {
@@ -1116,7 +1100,7 @@ public static unsafe class Kitchen
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static void CompleteAsyncMaybeCount(IntPtr context, FfiError* err, bool has_result, long result)
+    private static void FfiCompleteAsyncMaybeCount(IntPtr context, FfiError* err, FfiOptI64 result)
     {
         var ffiCall = FfiCall<long?>.Complete(context);
         try
@@ -1126,7 +1110,7 @@ public static unsafe class Kitchen
                 ffiCall.SetError(err, &global::KitchenSink.NativeBugException.FromError);
                 return;
             }
-            ffiCall.SetResult(has_result ? result : null);
+            ffiCall.SetResult(result.ToNullable());
         }
         catch (Exception e)
         {
@@ -1146,7 +1130,7 @@ public static unsafe class Kitchen
         var ffiCall = new FfiCall<float[]>(cancellationToken);
         try
         {
-            NativeMethods.kitchen_sink_kitchen_async_samples(n, ffiCall.CancelToken(), &CompleteAsyncSamples, ffiCall.Context);
+            NativeMethods.kitchen_sink_async_samples(n, ffiCall.CancelToken(), &FfiCompleteAsyncSamples, ffiCall.Context);
         }
         catch
         {
@@ -1157,7 +1141,7 @@ public static unsafe class Kitchen
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static void CompleteAsyncSamples(IntPtr context, FfiError* err, float* result_ptr, nuint result_len)
+    private static void FfiCompleteAsyncSamples(IntPtr context, FfiError* err, FfiRun result)
     {
         var ffiCall = FfiCall<float[]>.Complete(context);
         try
@@ -1167,7 +1151,7 @@ public static unsafe class Kitchen
                 ffiCall.SetError(err, &global::KitchenSink.NativeBugException.FromError);
                 return;
             }
-            ffiCall.SetResult(Ffi.TakeArray(result_ptr, result_len));
+            ffiCall.SetResult(Ffi.TakeArray<float>(result));
         }
         catch (Exception e)
         {
@@ -1182,30 +1166,29 @@ public static unsafe class Kitchen
     /// (as <c>foreach</c> does) releases it.</remarks>
     public static IEnumerable<int?> StreamMaybe()
     {
-        return new FfiSequence<int?>(() => LaunchStreamMaybe(), &NextStreamMaybe);
+        return new FfiSequence<int?>(() => FfiLaunchStreamMaybe(), &FfiNextStreamMaybe);
     }
 
-    private static FfiIteratorHandle LaunchStreamMaybe()
+    private static FfiIteratorHandle FfiLaunchStreamMaybe()
     {
         var ffiErr = default(FfiError);
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_stream_maybe(&ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_stream_maybe(&ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-        return new FfiIteratorHandle(ffiResult, &NativeMethods.kitchen_sink_kitchen_StreamMaybeIterator_destroy);
+        return new FfiIteratorHandle(ffiResult, &NativeMethods.kitchen_sink_StreamMaybeIterator_destroy);
     }
 
-    private static bool NextStreamMaybe(FfiIteratorHandle iter, out int? item)
+    private static bool FfiNextStreamMaybe(FfiIteratorHandle iter, out int? item)
     {
-        bool ffiHas = default;
-        int ffiItem = default;
+        var ffiItem = default(FfiOptI32);
         var ffiErr = default(FfiError);
-        var ffiMore = NativeMethods.kitchen_sink_kitchen_StreamMaybeIterator_next(iter, &ffiHas, &ffiItem, &ffiErr);
+        var ffiMore = NativeMethods.kitchen_sink_StreamMaybeIterator_next(iter, &ffiItem, &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
         if (ffiMore == 0)
         {
             item = default!;
             return false;
         }
-        item = ffiHas ? ffiItem : null;
+        item = ffiItem.ToNullable();
         return true;
     }
 
@@ -1216,30 +1199,29 @@ public static unsafe class Kitchen
     /// (as <c>foreach</c> does) releases it.</remarks>
     public static IEnumerable<int[]> StreamChunks()
     {
-        return new FfiSequence<int[]>(() => LaunchStreamChunks(), &NextStreamChunks);
+        return new FfiSequence<int[]>(() => FfiLaunchStreamChunks(), &FfiNextStreamChunks);
     }
 
-    private static FfiIteratorHandle LaunchStreamChunks()
+    private static FfiIteratorHandle FfiLaunchStreamChunks()
     {
         var ffiErr = default(FfiError);
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_stream_chunks(&ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_stream_chunks(&ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-        return new FfiIteratorHandle(ffiResult, &NativeMethods.kitchen_sink_kitchen_StreamChunksIterator_destroy);
+        return new FfiIteratorHandle(ffiResult, &NativeMethods.kitchen_sink_StreamChunksIterator_destroy);
     }
 
-    private static bool NextStreamChunks(FfiIteratorHandle iter, out int[] item)
+    private static bool FfiNextStreamChunks(FfiIteratorHandle iter, out int[] item)
     {
-        int* ffiItem = default;
-        nuint ffiLen = default;
+        var ffiItem = default(FfiRun);
         var ffiErr = default(FfiError);
-        var ffiMore = NativeMethods.kitchen_sink_kitchen_StreamChunksIterator_next(iter, &ffiItem, &ffiLen, &ffiErr);
+        var ffiMore = NativeMethods.kitchen_sink_StreamChunksIterator_next(iter, &ffiItem, &ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
         if (ffiMore == 0)
         {
             item = default!;
             return false;
         }
-        item = Ffi.TakeArray(ffiItem, ffiLen);
+        item = Ffi.TakeArray<int>(ffiItem);
         return true;
     }
 
@@ -1249,11 +1231,10 @@ public static unsafe class Kitchen
     {
         var samplerCtx = Ffi.Register(sampler);
         var ffiErr = default(FfiError);
-        nuint ffiOutLen = 0;
-        short* ffiResult;
+        FfiRun ffiResult;
         try
         {
-            ffiResult = NativeMethods.kitchen_sink_kitchen_sample_with(samplerCtx, FfiSamplerVtable.Pointer, level.HasValue, level.GetValueOrDefault(), &ffiOutLen, &ffiErr);
+            ffiResult = NativeMethods.kitchen_sink_sample_with(new FfiCallback(samplerCtx, FfiSamplerVtable.Pointer), FfiOptU32.Of(level), &ffiErr);
         }
         catch
         {
@@ -1261,7 +1242,7 @@ public static unsafe class Kitchen
             throw;
         }
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.PantryException.FromError);
-        return Ffi.TakeArray(ffiResult, ffiOutLen);
+        return Ffi.TakeArray<short>(ffiResult);
     }
 
     /// <summary>Fails with the second domain</summary>
@@ -1272,7 +1253,7 @@ public static unsafe class Kitchen
         var ffiErr = default(FfiError);
         fixed (byte* itemPtr = itemUtf8)
         {
-            var ffiResult = NativeMethods.kitchen_sink_kitchen_take_from_pantry(itemPtr, itemUtf8.Length, &ffiErr);
+            var ffiResult = NativeMethods.kitchen_sink_take_from_pantry(new FfiRun(itemPtr, itemUtf8.Length), &ffiErr);
             if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.PantryException.FromError);
             return ffiResult;
         }
@@ -1286,23 +1267,19 @@ public static unsafe class Kitchen
         var ffiErr = default(FfiError);
         fixed (byte* textPtr = textUtf8)
         {
-            var ffiResult = NativeMethods.kitchen_sink_kitchen_parse_any(textPtr, textUtf8.Length, &ffiErr);
+            var ffiResult = NativeMethods.kitchen_sink_parse_any(new FfiRun(textPtr, textUtf8.Length), &ffiErr);
             if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeException.FromError);
             return ffiResult;
         }
     }
-}
 
-public static unsafe class KitchenNested
-{
-    /// <summary>Trivial nested-module function</summary>
+    /// <summary>A trivial function returning a string</summary>
     public static string Hello()
     {
         var ffiErr = default(FfiError);
-        nuint ffiOutLen = 0;
-        var ffiResult = NativeMethods.kitchen_sink_kitchen_nested_hello(&ffiOutLen, &ffiErr);
+        var ffiResult = NativeMethods.kitchen_sink_hello(&ffiErr);
         if (ffiErr.Code != 0) throw Ffi.TakeError(&ffiErr, &global::KitchenSink.NativeBugException.FromError);
-        return Ffi.TakeString(ffiResult, ffiOutLen);
+        return Ffi.TakeString(ffiResult);
     }
 }
 
@@ -1310,294 +1287,285 @@ internal static unsafe partial class NativeMethods
 {
     static partial void VerifyContracts(IntPtr library)
     {
-        VerifyContract(library, "kitchen_sink_shared_contract", new (ulong, ulong, string)[]
+        VerifyContract(library, new (string, ulong, string)[]
         {
-            (0x709e234caa962446UL, 0x3894f2ca452e9f98UL, "shared.ping"), // function ping() -> string
-            (0xcfb306fa5801ee5bUL, 0x18e9fc204a13df6fUL, "shared.Token"), // record Token {i64, string}
-        });
-        VerifyContract(library, "kitchen_sink_kitchen_contract", new (ulong, ulong, string)[]
-        {
-            (0x01d4f09bbddc986fUL, 0xffcf2bd3b04aa002UL, "kitchen.Gadget.new"), // constructor new(i64) -> Gadget
-            (0x02bbd5f31c953704UL, 0x2cfa679ea1373e09UL, "kitchen.Sampler.samples"), // callback_method #1 samples(u32?, [f64]) -> [i16] throws PantryError
-            (0x10472d8fe748c2eeUL, 0xcc570a2649bbf7dcUL, "kitchen.maybe_gadget"), // function maybe_gadget(Gadget?) -> Gadget?
-            (0x11368eec07a74078UL, 0xfa049f78b77e146aUL, "kitchen.gadgets"), // function gadgets() -> [Gadget]
-            (0x137f08a29cde6021UL, 0xda8de7aeb2dbb8a3UL, "kitchen.stream_gadgets"), // function stream_gadgets() -> iter<Gadget>
-            (0x184bfc4ab0e3fe45UL, 0xb64587477022696bUL, "kitchen.ids_u64"), // function ids_u64([u64]) -> [u64]
-            (0x2111b54980826dd7UL, 0x627bf01ab365b209UL, "kitchen.do_cancellable"), // function do_cancellable(string) -> string async cancellable
-            (0x21c70f9371374d74UL, 0x25d5d88a30fe0a79UL, "kitchen.ReadyListener.favorite"), // callback_method #4 favorite() -> Gadget
-            (0x23de5bd597372f46UL, 0xcf1bc6bb37872798UL, "kitchen.stream_chunks"), // function stream_chunks() -> iter<[i32]>
-            (0x249f1ddaec6a6cbeUL, 0x0710d6c9a4de93daUL, "kitchen.take_from_pantry"), // function take_from_pantry(string) -> i32 throws PantryError
-            (0x29dddbc60bf8d7dbUL, 0x452a3e573d57f6dbUL, "kitchen.Priority"), // enum Priority {Low = 0, Normal = 1, High = 2}
-            (0x2b227003b74a0d16UL, 0x5dae036b8a6aed30UL, "kitchen.maybe_subscribe"), // function maybe_subscribe(ReadyListener?) -> bool
-            (0x2dd66cb0064f0494UL, 0x74b131724dd0d867UL, "kitchen.Item"), // record Item {i64, string, i32, bool, f64, u32, bytes, [string], {string:string}, i64?, Token, Priority, Gadget?}
-            (0x33c265bbf079b0e9UL, 0x97c32b764693f2cbUL, "kitchen.u32_id"), // function u32_id(u32) -> u32
-            (0x33e6381d01660dfeUL, 0x05e35a563089bf7dUL, "kitchen.KitchenErrors"), // errors KitchenErrors
-            (0x3d969ae76db6cb23UL, 0x65a325cfc772296bUL, "kitchen.ReadyListener.latest"), // callback_method #3 latest() -> Item?
-            (0x3f5fc99d73504b76UL, 0x417e4a2acd3210b3UL, "kitchen.Gadget.poke"), // method poke(i32) -> i32 throws KitchenErrors
-            (0x4082f0085db28781UL, 0x18848e701962912eUL, "kitchen.Sampler"), // callback Sampler
-            (0x4340a6b1e7ec8c50UL, 0xa59d0f32a66dc7a2UL, "kitchen.Sampler.describe"), // callback_method #2 describe() -> string throws any
-            (0x4c5764cf109528d1UL, 0xb374accf14676d90UL, "kitchen.maybe_item"), // function maybe_item(i64) -> Item? throws KitchenErrors
-            (0x4de17dfb93fd494dUL, 0x78be3203bcd10727UL, "kitchen.i32_id"), // function i32_id(i32) -> i32
-            (0x504e95b7f7e65570UL, 0x01b3e8e0c9a10e23UL, "kitchen.stream_items"), // function stream_items() -> iter<Item>
-            (0x5dafabb7775fcb2dUL, 0x6c4b78c7d3f858c1UL, "kitchen.PantryError.Spoiled"), // code Spoiled = 2
-            (0x5e0a8f6be4b00600UL, 0x18ea1a42036c96a0UL, "kitchen.Sampler.threshold"), // callback_method #0 threshold(u32?) -> f64?
-            (0x5ec0af1d4ecc6fedUL, 0x6540bdb74246420cUL, "kitchen.async_samples"), // function async_samples(u32) -> [f32] async cancellable
-            (0x61a358b0571e0a4eUL, 0x11a24c4b50d11996UL, "kitchen.async_maybe_count"), // function async_maybe_count() -> i64? async
-            (0x68cdb9a4bd3e3dd5UL, 0xcde022fe6bc3b1bfUL, "kitchen.bool_id"), // function bool_id(bool) -> bool
-            (0x69e7cd703d16eb85UL, 0xb13cb8d39e702c79UL, "kitchen.do_async"), // function do_async(string) -> string async
-            (0x70865079ce41be82UL, 0xbe3b69464672af46UL, "kitchen.Gadget.describe"), // method describe() -> string
-            (0x71c5a1116cb7c49aUL, 0x1506cfe6f548fac4UL, "kitchen.echo_bytes"), // function echo_bytes(bytes) -> bytes
-            (0x735ee1e0049ee91aUL, 0xa713dbd1be707752UL, "kitchen.echo_string"), // function echo_string(string) -> string
-            (0x76d7fc58f4e41d84UL, 0x6bdb4ccea2841d5eUL, "kitchen.i64_id"), // function i64_id(i64) -> i64
-            (0x78d91fd617e162b8UL, 0xd88e2753503b36dfUL, "kitchen.stream_maybe"), // function stream_maybe() -> iter<i32?>
-            (0x79abfe1aa960fd6aUL, 0xbca7a9e5eb26f3a6UL, "kitchen.nested.hello"), // function hello() -> string
-            (0x7b3865b536da998cUL, 0x1c4e79d60a20e74fUL, "kitchen.mixed_slices"), // function mixed_slices([i8], [i16], [u16], [u32], [i64], [f32]) -> [u32]
-            (0x7ba266dc26a58989UL, 0x0f86001cac0c21e8UL, "kitchen.KitchenErrors.InvalidInput"), // code InvalidInput = 2
-            (0x7d3dd7d5cf6749e3UL, 0xa192f5a7298adb39UL, "kitchen.new_op"), // function new_op() -> i32
-            (0x81ded69adee0abf2UL, 0x8c71141a931906f6UL, "kitchen.scale_i32"), // function scale_i32([i32], i32) -> [i32]
-            (0x81fa72769330fed6UL, 0x89681e305b55a4f4UL, "kitchen.ReadyListener.label"), // callback_method #2 label() -> string throws KitchenErrors
-            (0x89a5e664bc25c67bUL, 0x357fd9b65ad879a9UL, "kitchen.f64_id"), // function f64_id(f64) -> f64
-            (0x8cfdbdcecac5f7f1UL, 0x07e272f09c41fffcUL, "kitchen.Gadget.version"), // static version() -> string
-            (0x8dc42397e47614b9UL, 0xcddf6fede09b2e7fUL, "kitchen.opt_priority"), // function opt_priority(Priority?) -> Priority?
-            (0x92f060ef68961fc1UL, 0x4af6ce5b4f9fa508UL, "kitchen.ReadyListener.on_item"), // callback_method #1 on_item(Item, Gadget) -> bool
-            (0x974b9f3e823c1738UL, 0xb81b91e975695f27UL, "kitchen.cross_module_token"), // function cross_module_token() -> Token
-            (0x9f0f001aa85f97d5UL, 0x55815247f895bd45UL, "kitchen.sum_f64"), // function sum_f64([f64]) -> f64
-            (0xab2a29fd1ef5458bUL, 0x471a34aa4c09ae2bUL, "kitchen.KitchenErrors.NotFound"), // code NotFound = 1
-            (0xaca0655fac15d230UL, 0x11c4d2b28abe07bbUL, "kitchen.list_items"), // function list_items() -> [Item]
-            (0xb57c8e6ae3fb4383UL, 0x3f857851ab75366cUL, "kitchen.PantryError"), // errors PantryError
-            (0xbdc795b195edd428UL, 0x36127462f8b0969fUL, "kitchen.opt_mixed"), // function opt_mixed(f64, f32?, i64?, string?) -> u16?
-            (0xbe4821ab3c340e71UL, 0xe1d32e38b766e623UL, "kitchen.ReadyListener.on_ready"), // callback_method #0 on_ready(i32, string) -> void
-            (0xc2ad53f2a6a36323UL, 0x071e29abee823f17UL, "kitchen.opt_i32_id"), // function opt_i32_id(i32?) -> i32?
-            (0xc7ab409554fd3d7bUL, 0xfea12b6bc219fc46UL, "kitchen.parse_any"), // function parse_any(string) -> i64 throws any
-            (0xc82a7f2d85f99f4eUL, 0xa9bcb8bacedb036cUL, "kitchen.sample_with"), // function sample_with(Sampler, u32?) -> [i16] throws PantryError
-            (0xc883b4afae20543eUL, 0xc40560e5411ff392UL, "kitchen.legacy_op"), // function legacy_op() -> i32
-            (0xd180bf646bff59e2UL, 0xa4515a6d00d7c600UL, "kitchen.PantryError.OutOfStock"), // code OutOfStock = 1 {string}
-            (0xe6778df0f5c1b82bUL, 0x38eaafdb350559e1UL, "kitchen.opt_bool_id"), // function opt_bool_id(bool?) -> bool?
-            (0xf2f7753e6e1dffc2UL, 0xc9047a95bdf49e93UL, "kitchen.get_attrs"), // function get_attrs() -> {string:i32}
-            (0xfae25d3391922eadUL, 0xcc034cf506cae182UL, "kitchen.subscribe"), // function subscribe(ReadyListener) -> i32
-            (0xfd0059b05cb2fcfbUL, 0x248bf8404a5823b4UL, "kitchen.Gadget"), // interface Gadget
-            (0xfed9c551fb9fd2d6UL, 0xe1020573f084dc1dUL, "kitchen.ReadyListener"), // callback ReadyListener
-            (0xff3a99b52597dee2UL, 0x14c4ecac97bdfc9bUL, "kitchen.Gadget.readings"), // method readings(u32?) -> [f64] throws any
+            ("kitchen_sink_contract_07055ed9d3ef8987", 0x6c4b78c7d3f858c1UL, "PantryError.Spoiled"), // code Spoiled = 2
+            ("kitchen_sink_contract_093696260e3767ef", 0x18848e701962912eUL, "Sampler"), // callback Sampler
+            ("kitchen_sink_contract_15de761502d6b0f7", 0xb64587477022696bUL, "ids_u64"), // function ids_u64([u64]) -> [u64]
+            ("kitchen_sink_contract_1ab4ac8d3595af9e", 0x18ea1a42036c96a0UL, "Sampler.threshold"), // callback_method #0 threshold(u32?) -> f64?
+            ("kitchen_sink_contract_1ad5b1c1cb5b7b0f", 0xe1d32e38b766e623UL, "ReadyListener.on_ready"), // callback_method #0 on_ready(i32, string) -> void
+            ("kitchen_sink_contract_1b068c8d584a3666", 0x1c4e79d60a20e74fUL, "mixed_slices"), // function mixed_slices([i8], [i16], [u16], [u32], [i64], [f32]) -> [u32]
+            ("kitchen_sink_contract_1c905aa8cc074ab9", 0x071e29abee823f17UL, "opt_i32_id"), // function opt_i32_id(i32?) -> i32?
+            ("kitchen_sink_contract_2288b6ba9247f3fa", 0x01b3e8e0c9a10e23UL, "stream_items"), // function stream_items() -> iter<Item>
+            ("kitchen_sink_contract_262973c2f9754366", 0x11c4d2b28abe07bbUL, "list_items"), // function list_items() -> [Item]
+            ("kitchen_sink_contract_29fb7143db10b460", 0xa9bcb8bacedb036cUL, "sample_with"), // function sample_with(Sampler, u32?) -> [i16] throws PantryError
+            ("kitchen_sink_contract_2a3cca9903035fc1", 0x38eaafdb350559e1UL, "opt_bool_id"), // function opt_bool_id(bool?) -> bool?
+            ("kitchen_sink_contract_2b411bd19468fe38", 0x1506cfe6f548fac4UL, "echo_bytes"), // function echo_bytes(bytes) -> bytes
+            ("kitchen_sink_contract_30d1f6e5606a39a1", 0xfea12b6bc219fc46UL, "parse_any"), // function parse_any(string) -> i64 throws any
+            ("kitchen_sink_contract_3545d44146da2693", 0xb374accf14676d90UL, "maybe_item"), // function maybe_item(i64) -> Item? throws KitchenErrors
+            ("kitchen_sink_contract_355964ddca795015", 0x65a325cfc772296bUL, "ReadyListener.latest"), // callback_method #3 latest() -> Item?
+            ("kitchen_sink_contract_3f36f640360df807", 0xcddf6fede09b2e7fUL, "opt_priority"), // function opt_priority(Priority?) -> Priority?
+            ("kitchen_sink_contract_40306466cd73f71b", 0xcde022fe6bc3b1bfUL, "bool_id"), // function bool_id(bool) -> bool
+            ("kitchen_sink_contract_46a82538b4fd65b3", 0x0f86001cac0c21e8UL, "KitchenErrors.InvalidInput"), // code InvalidInput = 2
+            ("kitchen_sink_contract_49db162e058b9fa4", 0xe1020573f084dc1dUL, "ReadyListener"), // callback ReadyListener
+            ("kitchen_sink_contract_4bae2c564d268fab", 0xda8de7aeb2dbb8a3UL, "stream_gadgets"), // function stream_gadgets() -> iter<Gadget>
+            ("kitchen_sink_contract_4e03769b2b65f3ee", 0xa59d0f32a66dc7a2UL, "Sampler.describe"), // callback_method #2 describe() -> string throws any
+            ("kitchen_sink_contract_52cfa1d198476806", 0x74b131724dd0d867UL, "Item"), // record Item {i64, string, i32, bool, f64, u32, bytes, [string], {string:string}, i64?, Token, Priority, Gadget?}
+            ("kitchen_sink_contract_5cda1b5d810fe743", 0xcc034cf506cae182UL, "subscribe"), // function subscribe(ReadyListener) -> i32
+            ("kitchen_sink_contract_5ec87ece39394738", 0x11a24c4b50d11996UL, "async_maybe_count"), // function async_maybe_count() -> i64? async
+            ("kitchen_sink_contract_6084dc628fdb0d02", 0x25d5d88a30fe0a79UL, "ReadyListener.favorite"), // callback_method #4 favorite() -> Gadget
+            ("kitchen_sink_contract_632ae5cd56d2f5fc", 0x5dae036b8a6aed30UL, "maybe_subscribe"), // function maybe_subscribe(ReadyListener?) -> bool
+            ("kitchen_sink_contract_6b91c75a2b38364c", 0x14c4ecac97bdfc9bUL, "Gadget.readings"), // method readings(u32?) -> [f64] throws any
+            ("kitchen_sink_contract_6c14076d12124cfd", 0xa192f5a7298adb39UL, "new_op"), // function new_op() -> i32
+            ("kitchen_sink_contract_777c1f6342492998", 0xcc570a2649bbf7dcUL, "maybe_gadget"), // function maybe_gadget(Gadget?) -> Gadget?
+            ("kitchen_sink_contract_77f7c86a80aa8b81", 0x3f857851ab75366cUL, "PantryError"), // errors PantryError
+            ("kitchen_sink_contract_784cfd093415f2b5", 0xffcf2bd3b04aa002UL, "Gadget.new"), // constructor new(i64) -> Gadget
+            ("kitchen_sink_contract_7e1071dd9fa68834", 0x89681e305b55a4f4UL, "ReadyListener.label"), // callback_method #2 label() -> string throws KitchenErrors
+            ("kitchen_sink_contract_7edf409e8ac33025", 0x2a3ae79e1a476b7aUL, "make_token"), // function make_token() -> Token
+            ("kitchen_sink_contract_8400c9a27c8c432b", 0xb13cb8d39e702c79UL, "do_async"), // function do_async(string) -> string async
+            ("kitchen_sink_contract_87133f22c66bac36", 0x6bdb4ccea2841d5eUL, "i64_id"), // function i64_id(i64) -> i64
+            ("kitchen_sink_contract_878316bb56b5eacc", 0xa4515a6d00d7c600UL, "PantryError.OutOfStock"), // code OutOfStock = 1 {string}
+            ("kitchen_sink_contract_8cbd66b05c30c00e", 0x2cfa679ea1373e09UL, "Sampler.samples"), // callback_method #1 samples(u32?, [f64]) -> [i16] throws PantryError
+            ("kitchen_sink_contract_8e374aef14935b0d", 0x471a34aa4c09ae2bUL, "KitchenErrors.NotFound"), // code NotFound = 1
+            ("kitchen_sink_contract_94e2dad4408a7687", 0x4af6ce5b4f9fa508UL, "ReadyListener.on_item"), // callback_method #1 on_item(Item, Gadget) -> bool
+            ("kitchen_sink_contract_996a3929498216f3", 0x78be3203bcd10727UL, "i32_id"), // function i32_id(i32) -> i32
+            ("kitchen_sink_contract_9ab72c28265c60e4", 0x05e35a563089bf7dUL, "KitchenErrors"), // errors KitchenErrors
+            ("kitchen_sink_contract_a430d84680aabd0b", 0xbca7a9e5eb26f3a6UL, "hello"), // function hello() -> string
+            ("kitchen_sink_contract_a4e407b3a0fe4669", 0x452a3e573d57f6dbUL, "Priority"), // enum Priority {Low = 0, Normal = 1, High = 2}
+            ("kitchen_sink_contract_a529e4a4e0e26d47", 0x97c32b764693f2cbUL, "u32_id"), // function u32_id(u32) -> u32
+            ("kitchen_sink_contract_a717c034ba23905d", 0x248bf8404a5823b4UL, "Gadget"), // interface Gadget
+            ("kitchen_sink_contract_a9590de6f773a9a4", 0x8c71141a931906f6UL, "scale_i32"), // function scale_i32([i32], i32) -> [i32]
+            ("kitchen_sink_contract_ac26813984c811d0", 0x417e4a2acd3210b3UL, "Gadget.poke"), // method poke(i32) -> i32 throws KitchenErrors
+            ("kitchen_sink_contract_b08395f5e5678b0e", 0x36127462f8b0969fUL, "opt_mixed"), // function opt_mixed(f64, f32?, i64?, string?) -> u16?
+            ("kitchen_sink_contract_b66eb0792245db7c", 0xa713dbd1be707752UL, "echo_string"), // function echo_string(string) -> string
+            ("kitchen_sink_contract_b985fff5c1b5382c", 0xc40560e5411ff392UL, "legacy_op"), // function legacy_op() -> i32
+            ("kitchen_sink_contract_bf30e00dc53307a9", 0x3894f2ca452e9f98UL, "ping"), // function ping() -> string
+            ("kitchen_sink_contract_c1ceb5fe42730211", 0x357fd9b65ad879a9UL, "f64_id"), // function f64_id(f64) -> f64
+            ("kitchen_sink_contract_c9e1d6b030b1f854", 0xbe3b69464672af46UL, "Gadget.describe"), // method describe() -> string
+            ("kitchen_sink_contract_cea95e3a6107f209", 0x627bf01ab365b209UL, "do_cancellable"), // function do_cancellable(string) -> string async cancellable
+            ("kitchen_sink_contract_d06c00826f2918d3", 0x6540bdb74246420cUL, "async_samples"), // function async_samples(u32) -> [f32] async cancellable
+            ("kitchen_sink_contract_da96f2dc9f83015b", 0x55815247f895bd45UL, "sum_f64"), // function sum_f64([f64]) -> f64
+            ("kitchen_sink_contract_e68398e3c2c760b2", 0x18e9fc204a13df6fUL, "Token"), // record Token {i64, string}
+            ("kitchen_sink_contract_ea2a5b33b86fb660", 0x0710d6c9a4de93daUL, "take_from_pantry"), // function take_from_pantry(string) -> i32 throws PantryError
+            ("kitchen_sink_contract_eb66fcdc777f75ca", 0xfa049f78b77e146aUL, "gadgets"), // function gadgets() -> [Gadget]
+            ("kitchen_sink_contract_eea763c41fa7d198", 0xcf1bc6bb37872798UL, "stream_chunks"), // function stream_chunks() -> iter<[i32]>
+            ("kitchen_sink_contract_f24fd5a4569f91f3", 0x07e272f09c41fffcUL, "Gadget.version"), // static version() -> string
+            ("kitchen_sink_contract_fe26cde50070f9a2", 0xd88e2753503b36dfUL, "stream_maybe"), // function stream_maybe() -> iter<i32?>
+            ("kitchen_sink_contract_ff329711a0bd4978", 0xc9047a95bdf49e93UL, "get_attrs"), // function get_attrs() -> {string:i32}
         });
     }
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_shared_ping")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_Gadget_clone")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial byte* kitchen_sink_shared_ping(nuint* out_len, FfiError* out_err);
+    internal static partial IntPtr kitchen_sink_Gadget_clone(global::KitchenSink.Gadget.NativeHandle self);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_Gadget_clone")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_Gadget_destroy")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial IntPtr kitchen_sink_kitchen_Gadget_clone(Gadget.NativeHandle self);
+    internal static partial void kitchen_sink_Gadget_destroy(IntPtr self);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_Gadget_destroy")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_Gadget_new")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial void kitchen_sink_kitchen_Gadget_destroy(IntPtr self);
+    internal static partial IntPtr kitchen_sink_Gadget_new(long id, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_Gadget_new")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_Gadget_describe")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial IntPtr kitchen_sink_kitchen_Gadget_new(long id, FfiError* out_err);
+    internal static partial FfiRun kitchen_sink_Gadget_describe(global::KitchenSink.Gadget.NativeHandle self, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_Gadget_describe")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_Gadget_poke")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial byte* kitchen_sink_kitchen_Gadget_describe(Gadget.NativeHandle self, nuint* out_len, FfiError* out_err);
+    internal static partial int kitchen_sink_Gadget_poke(global::KitchenSink.Gadget.NativeHandle self, int times, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_Gadget_poke")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_Gadget_readings")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial int kitchen_sink_kitchen_Gadget_poke(Gadget.NativeHandle self, int times, FfiError* out_err);
+    internal static partial FfiRun kitchen_sink_Gadget_readings(global::KitchenSink.Gadget.NativeHandle self, FfiOptU32 limit, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_Gadget_readings")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_Gadget_version")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial double* kitchen_sink_kitchen_Gadget_readings(Gadget.NativeHandle self, [MarshalAs(UnmanagedType.U1)] bool has_limit, uint limit, nuint* out_len, FfiError* out_err);
+    internal static partial FfiRun kitchen_sink_Gadget_version(FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_Gadget_version")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_ping")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial byte* kitchen_sink_kitchen_Gadget_version(nuint* out_len, FfiError* out_err);
+    internal static partial FfiRun kitchen_sink_ping(FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_bool_id")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_bool_id")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    [return: MarshalAs(UnmanagedType.U1)]
-    internal static partial bool kitchen_sink_kitchen_bool_id([MarshalAs(UnmanagedType.U1)] bool x, FfiError* out_err);
+    internal static partial byte kitchen_sink_bool_id(byte x, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_i32_id")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_i32_id")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial int kitchen_sink_kitchen_i32_id(int x, FfiError* out_err);
+    internal static partial int kitchen_sink_i32_id(int x, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_u32_id")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_u32_id")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial uint kitchen_sink_kitchen_u32_id(uint x, FfiError* out_err);
+    internal static partial uint kitchen_sink_u32_id(uint x, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_i64_id")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_i64_id")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial long kitchen_sink_kitchen_i64_id(long x, FfiError* out_err);
+    internal static partial long kitchen_sink_i64_id(long x, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_f64_id")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_f64_id")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial double kitchen_sink_kitchen_f64_id(double x, FfiError* out_err);
+    internal static partial double kitchen_sink_f64_id(double x, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_echo_string")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_echo_string")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial byte* kitchen_sink_kitchen_echo_string(byte* s_ptr, nuint s_len, nuint* out_len, FfiError* out_err);
+    internal static partial FfiRun kitchen_sink_echo_string(FfiRun s, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_echo_bytes")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_echo_bytes")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial byte* kitchen_sink_kitchen_echo_bytes(byte* b_ptr, nuint b_len, nuint* out_len, FfiError* out_err);
+    internal static partial FfiRun kitchen_sink_echo_bytes(FfiRun b, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_subscribe")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_subscribe")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial int kitchen_sink_kitchen_subscribe(IntPtr listener_ctx, IntPtr listener_vtable, FfiError* out_err);
+    internal static partial int kitchen_sink_subscribe(FfiCallback listener, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_maybe_subscribe")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_maybe_subscribe")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    [return: MarshalAs(UnmanagedType.U1)]
-    internal static partial bool kitchen_sink_kitchen_maybe_subscribe(IntPtr listener_ctx, IntPtr listener_vtable, FfiError* out_err);
+    internal static partial byte kitchen_sink_maybe_subscribe(FfiCallback listener, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_maybe_gadget")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_maybe_gadget")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial IntPtr kitchen_sink_kitchen_maybe_gadget(Gadget.NativeHandle fallback, FfiError* out_err);
+    internal static partial IntPtr kitchen_sink_maybe_gadget(global::KitchenSink.Gadget.NativeHandle fallback, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_gadgets")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_gadgets")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial byte* kitchen_sink_kitchen_gadgets(nuint* out_len, FfiError* out_err);
+    internal static partial FfiRun kitchen_sink_gadgets(FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_stream_gadgets")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_stream_gadgets")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial IntPtr kitchen_sink_kitchen_stream_gadgets(FfiError* out_err);
+    internal static partial IntPtr kitchen_sink_stream_gadgets(FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_StreamGadgetsIterator_next")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_StreamGadgetsIterator_next")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial int kitchen_sink_kitchen_StreamGadgetsIterator_next(FfiIteratorHandle iter, IntPtr* out_item, FfiError* out_err);
+    internal static partial int kitchen_sink_StreamGadgetsIterator_next(FfiIteratorHandle iter, IntPtr* out_item, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_StreamGadgetsIterator_destroy")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_StreamGadgetsIterator_destroy")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial void kitchen_sink_kitchen_StreamGadgetsIterator_destroy(IntPtr iter);
+    internal static partial void kitchen_sink_StreamGadgetsIterator_destroy(IntPtr iter);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_maybe_item")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_maybe_item")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial byte* kitchen_sink_kitchen_maybe_item(long id, nuint* out_len, FfiError* out_err);
+    internal static partial FfiRun kitchen_sink_maybe_item(long id, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_list_items")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_list_items")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial byte* kitchen_sink_kitchen_list_items(nuint* out_len, FfiError* out_err);
+    internal static partial FfiRun kitchen_sink_list_items(FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_get_attrs")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_get_attrs")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial byte* kitchen_sink_kitchen_get_attrs(nuint* out_len, FfiError* out_err);
+    internal static partial FfiRun kitchen_sink_get_attrs(FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_stream_items")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_stream_items")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial IntPtr kitchen_sink_kitchen_stream_items(FfiError* out_err);
+    internal static partial IntPtr kitchen_sink_stream_items(FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_StreamItemsIterator_next")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_StreamItemsIterator_next")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial int kitchen_sink_kitchen_StreamItemsIterator_next(FfiIteratorHandle iter, byte** out_item, nuint* out_len, FfiError* out_err);
+    internal static partial int kitchen_sink_StreamItemsIterator_next(FfiIteratorHandle iter, FfiRun* out_item, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_StreamItemsIterator_destroy")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_StreamItemsIterator_destroy")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial void kitchen_sink_kitchen_StreamItemsIterator_destroy(IntPtr iter);
+    internal static partial void kitchen_sink_StreamItemsIterator_destroy(IntPtr iter);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_cross_module_token")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_make_token")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial byte* kitchen_sink_kitchen_cross_module_token(nuint* out_len, FfiError* out_err);
+    internal static partial FfiRun kitchen_sink_make_token(FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_do_async")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_do_async")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial void kitchen_sink_kitchen_do_async(byte* input_ptr, nuint input_len, delegate* unmanaged[Cdecl]<IntPtr, FfiError*, byte*, nuint, void> callback, IntPtr context);
+    internal static partial void kitchen_sink_do_async(FfiRun input, delegate* unmanaged[Cdecl]<IntPtr, FfiError*, FfiRun, void> callback, IntPtr context);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_do_cancellable")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_do_cancellable")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial void kitchen_sink_kitchen_do_cancellable(byte* input_ptr, nuint input_len, IntPtr cancel_token, delegate* unmanaged[Cdecl]<IntPtr, FfiError*, byte*, nuint, void> callback, IntPtr context);
+    internal static partial void kitchen_sink_do_cancellable(FfiRun input, IntPtr cancel_token, delegate* unmanaged[Cdecl]<IntPtr, FfiError*, FfiRun, void> callback, IntPtr context);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_legacy_op")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_legacy_op")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial int kitchen_sink_kitchen_legacy_op(FfiError* out_err);
+    internal static partial int kitchen_sink_legacy_op(FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_new_op")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_new_op")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial int kitchen_sink_kitchen_new_op(FfiError* out_err);
+    internal static partial int kitchen_sink_new_op(FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_opt_i32_id")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_opt_i32_id")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    [return: MarshalAs(UnmanagedType.U1)]
-    internal static partial bool kitchen_sink_kitchen_opt_i32_id([MarshalAs(UnmanagedType.U1)] bool has_x, int x, int* out_value, FfiError* out_err);
+    internal static partial FfiOptI32 kitchen_sink_opt_i32_id(FfiOptI32 x, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_opt_bool_id")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_opt_bool_id")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    [return: MarshalAs(UnmanagedType.U1)]
-    internal static partial bool kitchen_sink_kitchen_opt_bool_id([MarshalAs(UnmanagedType.U1)] bool has_x, [MarshalAs(UnmanagedType.U1)] bool x, bool* out_value, FfiError* out_err);
+    internal static partial FfiOptBool kitchen_sink_opt_bool_id(FfiOptBool x, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_opt_priority")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_opt_priority")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    [return: MarshalAs(UnmanagedType.U1)]
-    internal static partial bool kitchen_sink_kitchen_opt_priority([MarshalAs(UnmanagedType.U1)] bool has_p, global::KitchenSink.Priority p, global::KitchenSink.Priority* out_value, FfiError* out_err);
+    internal static partial FfiOptI32 kitchen_sink_opt_priority(FfiOptI32 p, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_opt_mixed")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_opt_mixed")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    [return: MarshalAs(UnmanagedType.U1)]
-    internal static partial bool kitchen_sink_kitchen_opt_mixed(double @base, [MarshalAs(UnmanagedType.U1)] bool has_scale, float scale, [MarshalAs(UnmanagedType.U1)] bool has_offset, long offset, byte* label_ptr, nuint label_len, ushort* out_value, FfiError* out_err);
+    internal static partial FfiOptU16 kitchen_sink_opt_mixed(double @base, FfiOptF32 scale, FfiOptI64 offset, FfiRun label, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_sum_f64")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_sum_f64")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial double kitchen_sink_kitchen_sum_f64(double* xs_ptr, nuint xs_len, FfiError* out_err);
+    internal static partial double kitchen_sink_sum_f64(FfiRun xs, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_scale_i32")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_scale_i32")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial int* kitchen_sink_kitchen_scale_i32(int* xs_ptr, nuint xs_len, int factor, nuint* out_len, FfiError* out_err);
+    internal static partial FfiRun kitchen_sink_scale_i32(FfiRun xs, int factor, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_ids_u64")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_ids_u64")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial ulong* kitchen_sink_kitchen_ids_u64(ulong* ids_ptr, nuint ids_len, nuint* out_len, FfiError* out_err);
+    internal static partial FfiRun kitchen_sink_ids_u64(FfiRun ids, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_mixed_slices")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_mixed_slices")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial uint* kitchen_sink_kitchen_mixed_slices(sbyte* a_ptr, nuint a_len, short* b_ptr, nuint b_len, ushort* c_ptr, nuint c_len, uint* d_ptr, nuint d_len, long* e_ptr, nuint e_len, float* f_ptr, nuint f_len, nuint* out_len, FfiError* out_err);
+    internal static partial FfiRun kitchen_sink_mixed_slices(FfiRun a, FfiRun b, FfiRun c, FfiRun d, FfiRun e, FfiRun f, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_async_maybe_count")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_async_maybe_count")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial void kitchen_sink_kitchen_async_maybe_count(delegate* unmanaged[Cdecl]<IntPtr, FfiError*, bool, long, void> callback, IntPtr context);
+    internal static partial void kitchen_sink_async_maybe_count(delegate* unmanaged[Cdecl]<IntPtr, FfiError*, FfiOptI64, void> callback, IntPtr context);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_async_samples")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_async_samples")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial void kitchen_sink_kitchen_async_samples(uint n, IntPtr cancel_token, delegate* unmanaged[Cdecl]<IntPtr, FfiError*, float*, nuint, void> callback, IntPtr context);
+    internal static partial void kitchen_sink_async_samples(uint n, IntPtr cancel_token, delegate* unmanaged[Cdecl]<IntPtr, FfiError*, FfiRun, void> callback, IntPtr context);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_stream_maybe")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_stream_maybe")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial IntPtr kitchen_sink_kitchen_stream_maybe(FfiError* out_err);
+    internal static partial IntPtr kitchen_sink_stream_maybe(FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_StreamMaybeIterator_next")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_StreamMaybeIterator_next")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial int kitchen_sink_kitchen_StreamMaybeIterator_next(FfiIteratorHandle iter, bool* out_has_item, int* out_item, FfiError* out_err);
+    internal static partial int kitchen_sink_StreamMaybeIterator_next(FfiIteratorHandle iter, FfiOptI32* out_item, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_StreamMaybeIterator_destroy")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_StreamMaybeIterator_destroy")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial void kitchen_sink_kitchen_StreamMaybeIterator_destroy(IntPtr iter);
+    internal static partial void kitchen_sink_StreamMaybeIterator_destroy(IntPtr iter);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_stream_chunks")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_stream_chunks")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial IntPtr kitchen_sink_kitchen_stream_chunks(FfiError* out_err);
+    internal static partial IntPtr kitchen_sink_stream_chunks(FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_StreamChunksIterator_next")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_StreamChunksIterator_next")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial int kitchen_sink_kitchen_StreamChunksIterator_next(FfiIteratorHandle iter, int** out_item, nuint* out_len, FfiError* out_err);
+    internal static partial int kitchen_sink_StreamChunksIterator_next(FfiIteratorHandle iter, FfiRun* out_item, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_StreamChunksIterator_destroy")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_StreamChunksIterator_destroy")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial void kitchen_sink_kitchen_StreamChunksIterator_destroy(IntPtr iter);
+    internal static partial void kitchen_sink_StreamChunksIterator_destroy(IntPtr iter);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_sample_with")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_sample_with")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial short* kitchen_sink_kitchen_sample_with(IntPtr sampler_ctx, IntPtr sampler_vtable, [MarshalAs(UnmanagedType.U1)] bool has_level, uint level, nuint* out_len, FfiError* out_err);
+    internal static partial FfiRun kitchen_sink_sample_with(FfiCallback sampler, FfiOptU32 level, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_take_from_pantry")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_take_from_pantry")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial int kitchen_sink_kitchen_take_from_pantry(byte* item_ptr, nuint item_len, FfiError* out_err);
+    internal static partial int kitchen_sink_take_from_pantry(FfiRun item, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_parse_any")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_parse_any")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial long kitchen_sink_kitchen_parse_any(byte* text_ptr, nuint text_len, FfiError* out_err);
+    internal static partial long kitchen_sink_parse_any(FfiRun text, FfiError* out_err);
 
-    [LibraryImport(LibName, EntryPoint = "kitchen_sink_kitchen_nested_hello")]
+    [LibraryImport(LibName, EntryPoint = "kitchen_sink_hello")]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-    internal static partial byte* kitchen_sink_kitchen_nested_hello(nuint* out_len, FfiError* out_err);
+    internal static partial FfiRun kitchen_sink_hello(FfiError* out_err);
 }
 
 // END KitchenSink.cs

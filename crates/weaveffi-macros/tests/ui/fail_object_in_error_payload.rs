@@ -2,38 +2,28 @@
 //! through a record: a consumer that doesn't know the code discards its
 //! payload undecoded, so the object would never be released.
 
-#[weaveffi::module]
-mod bad {
-    use std::sync::Arc;
+use std::sync::Arc;
 
-    #[weaveffi::interface]
-    pub struct Store;
+#[weaveffi::interface]
+#[derive(Debug)]
+pub struct Store;
 
-    impl Store {
-        pub fn new() -> Store {
-            Store
-        }
-    }
+#[weaveffi::record]
+#[derive(Debug)]
+pub struct Holder {
+    pub store: Option<Arc<Store>>,
+}
 
-    #[weaveffi::record]
-    pub struct Holder {
-        pub store: Arc<Store>,
-    }
-
-    #[weaveffi::error]
-    #[repr(i32)]
-    #[derive(Debug)]
-    pub enum Oops {
-        /// The store is busy.
-        Busy { store: Arc<Store> } = 1,
-        /// The holder is busy.
-        Held { holder: Holder } = 2,
-    }
-
-    #[weaveffi::export]
-    pub fn risky() -> Result<i32, Oops> {
-        Ok(1)
-    }
+#[weaveffi::error]
+#[repr(i32)]
+#[derive(Debug)]
+pub enum Oops {
+    /// The store is busy.
+    Busy { store: Arc<Store> } = 1,
+    /// The holder is busy.
+    Held { holder: Vec<Holder> } = 2,
+    /// Fine: no object.
+    Plain { n: i32, names: Vec<String> } = 3,
 }
 
 weaveffi::export_runtime!();

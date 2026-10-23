@@ -16,6 +16,7 @@ use crate::codegen::CodeWriter;
 use weaveffi_model::model::Model;
 use weaveffi_model::ty::{Ty, WireType};
 
+use crate::targets::kotlin::calls::receiver;
 use crate::targets::kotlin::names::Names;
 
 /// The Kotlin statement writing `expr` (the public Kotlin value of `t`) into
@@ -30,8 +31,9 @@ pub(crate) fn write_expr(n: &Names, t: &Ty, w: &str, expr: &str) -> String {
         WireType::Prim(p) => format!("{w}.write{}({expr})", p.pascal()),
         WireType::Enum(_) => format!("{w}.writeI32({expr}.value)"),
         WireType::Object(name) => format!(
-            "{w}.writeObject({expr}.cloneHandle(), JniBridge::{})",
-            n.native(n.destroy_symbol(name))
+            "{w}.writeObject({}.cloneHandle(), Lib.c::{})",
+            receiver(expr),
+            n.object_symbols(name).1
         ),
         WireType::User(_) | WireType::Optional(_) | WireType::List(_) | WireType::Map(..) => {
             format!("pack_{}({w}, {expr})", codecs::stem(t))
@@ -59,10 +61,10 @@ pub(crate) fn encode_expr(n: &Names, t: &Ty, expr: &str) -> String {
     format!("encodeBuffer {{ _w -> {} }}", write_expr(n, t, "_w", expr))
 }
 
-/// The Kotlin expression decoding the value buffer `expr` into the public
-/// value of `t`.
-pub(crate) fn decode_expr(n: &Names, t: &Ty, expr: &str) -> String {
-    format!("decodeBuffer({expr}) {{ _r -> {} }}", read_expr(n, t, "_r"))
+/// The Kotlin expression decoding the run `run` (a value buffer) into the
+/// public value of `t`.
+pub(crate) fn decode_expr(n: &Names, t: &Ty, run: &str) -> String {
+    format!("{run}.decode {{ _r -> {} }}", read_expr(n, t, "_r"))
 }
 
 /// The body of `Codecs.kt` (after the package line), or `None` when no

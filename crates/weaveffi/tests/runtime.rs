@@ -1,29 +1,42 @@
-//! End-to-end runtime tests for the `#[weaveffi::module]` expansion.
+//! End-to-end runtime tests for the producer macros.
 //!
-//! Each test defines a module with the macro, then calls the generated
-//! `extern "C"` thunks directly (by their Rust path) and checks that
-//! arguments lift, results lower, and errors flow through `out_err` the way
-//! the C ABI promises. This is the executable proof that the generated glue
-//! matches the calling convention every language binding expects. This test
-//! crate is named `runtime`, so that's the prefix of every symbol.
+//! Each Rust module below declares part of one library with the attributes
+//! (a library is one namespace, so the modules only organize the Rust code),
+//! and the tests call the exported C symbols the way a C consumer does,
+//! through `extern "C"` declarations, checking that arguments lift, results
+//! lower, and errors flow through `out_err` as the C ABI (revision 6)
+//! promises. This test crate is named `runtime`, so that's the prefix of
+//! every symbol.
 
 #![allow(unsafe_code)]
+// The `extern` blocks name the runtime's opaque types (objects, iterators,
+// cancel tokens) behind pointers, as the C header names incomplete structs.
+#![allow(improper_ctypes)]
 
+use std::mem::MaybeUninit;
 use std::os::raw::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use weaveffi::abi::{self, FfiError};
+use weaveffi::__rt::{
+    self as rt, BufferWriter, CallbackArg, FfiCancelToken, FfiError, FfiType, IterHandle, Opt, Run,
+    VtableHeader,
+};
+
+weaveffi::export_runtime!();
+
+/// The crate's tag, under which every exported type implements its traits.
+type Tag = __weaveffi::Tag;
 
 /// How long a test waits for an async completion. Generous, so a loaded
 /// machine can't turn a slow completion into a failure; a passing run never
 /// waits this long.
 const WAIT: Duration = Duration::from_secs(30);
 
-#[weaveffi::module]
 pub mod demo {
-    /// The demo module's error domain.
+    /// The demo error domain.
     #[weaveffi::error]
     #[derive(Debug)]
     pub enum DemoError {
@@ -32,9 +45,8 @@ pub mod demo {
         DivisionByZero = 100,
     }
 
-    /// A C-style enum that crosses the ABI as its `i32` discriminant.
+    /// A C-style enum that crosses the ABI as its `int32_t` discriminant.
     #[weaveffi::enumeration]
-    #[repr(i32)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Color {
         /// Red.
@@ -47,7 +59,7 @@ pub mod demo {
 
     /// A by-value record with scalar, string, optional, and enum fields.
     #[weaveffi::record]
-    #[derive(Clone)]
+    #[derive(Clone, Debug, PartialEq)]
     pub struct Point {
         /// The x coordinate.
         pub x: i32,
@@ -82,21 +94,27 @@ pub mod demo {
 
     /// Borrow a string slice and report its length in characters.
     #[weaveffi::export]
-    pub fn str_len(text: &str) -> i32 {
+    pub fn char_count(text: &str) -> i32 {
         text.chars().count() as i32
     }
 
     /// The address of a borrowed string's first byte, proving the thunk lent
     /// the caller's bytes instead of copying them.
     #[weaveffi::export]
-    pub fn str_addr(text: &str) -> u64 {
+    pub fn text_addr(text: &str) -> u64 {
         text.as_ptr() as u64
     }
 
     /// The address of a borrowed byte slice's first byte.
     #[weaveffi::export]
-    pub fn bytes_addr(data: &[u8]) -> u64 {
+    pub fn blob_addr(data: &[u8]) -> u64 {
         data.as_ptr() as u64
+    }
+
+    /// The address of a borrowed typed array's first element.
+    #[weaveffi::export]
+    pub fn words_addr(words: &[i64]) -> u64 {
+        words.as_ptr() as u64
     }
 
     /// Return an optional string depending on the flag.
@@ -123,7 +141,7 @@ pub mod demo {
         data.len() as i32
     }
 
-    /// Build a point by value (returned as a serialized value buffer).
+    /// Build a point by value (returned as a value buffer).
     #[weaveffi::export]
     pub fn make_point(x: i32) -> Point {
         Point {
@@ -145,13 +163,36 @@ pub mod demo {
     pub fn echo_color(c: Color) -> Color {
         c
     }
+
+    /// Negate a flag (a C `bool` in and out).
+    #[weaveffi::export]
+    pub fn negate(flag: bool) -> bool {
+        !flag
+    }
+
+    /// Negate an optional flag.
+    #[weaveffi::export]
+    pub fn negate_opt(flag: Option<bool>) -> Option<bool> {
+        flag.map(|f| !f)
+    }
+
+    /// The next color, if any (an optional enum in and out).
+    #[weaveffi::export]
+    pub fn next_color(color: Option<Color>) -> Option<Color> {
+        color.map(|c| match c {
+            Color::Red => Color::Green,
+            Color::Green => Color::Blue,
+            Color::Blue => Color::Red,
+        })
+    }
 }
 
-#[weaveffi::module]
+/// A record declared in one Rust module and used by functions in another:
+/// rustc resolves every type through its traits, wherever it's declared.
 pub mod warehouse {
     /// A record owned by the `warehouse` module.
     #[weaveffi::record]
-    #[derive(Clone)]
+    #[derive(Clone, Debug, PartialEq)]
     pub struct Crate {
         /// Stable identifier.
         pub id: i64,
@@ -166,30 +207,32 @@ pub mod warehouse {
     }
 }
 
-#[weaveffi::module]
 pub mod dispatch {
-    // A record declared in a *sibling* top-level module. The macro expands
-    // each tree in isolation, lowers the unresolved name as a value buffer,
-    // and asserts at compile time that `Crate` really is a by-value type.
+    use super::demo::Color;
     use super::warehouse::Crate;
 
-    /// Read a sibling-module record's id (record parameter by value).
+    /// Read another module's record's id (record parameter by value).
     #[weaveffi::export]
     pub fn crate_id(item: Crate) -> i64 {
         item.id
     }
 
-    /// Return a relabeled copy (sibling-module record in and out).
+    /// Return a relabeled copy (another module's record in and out).
     #[weaveffi::export]
     pub fn relabel(item: Crate, label: String) -> super::warehouse::Crate {
         Crate { id: item.id, label }
     }
+
+    /// Another module's C-style enum crosses as its discriminant, too.
+    #[weaveffi::export]
+    pub fn is_red(color: Color) -> bool {
+        color == Color::Red
+    }
 }
 
 /// Callback interfaces at full width: returns of every family adopted from
-/// the consumer, a `throws` method decoded into the domain's typed error,
+/// the consumer, a method that throws a domain decoded into its typed error,
 /// optional callback parameters, a type alias, and `#[cfg]`'d items.
-#[weaveffi::module]
 pub mod rich {
     use std::sync::Arc;
 
@@ -228,7 +271,7 @@ pub mod rich {
         }
     }
 
-    /// A key, spelled through an alias the macro substitutes.
+    /// A key, spelled through an alias rustc resolves.
     pub type Key = String;
 
     /// A record a callback returns.
@@ -247,6 +290,7 @@ pub mod rich {
         n: i64,
     }
 
+    #[weaveffi::export]
     impl Token {
         /// Create a token.
         pub fn new(n: i64) -> Self {
@@ -258,8 +302,10 @@ pub mod rich {
         }
     }
 
-    // Compiled out: neither the member thunk nor its contract entry exist.
+    // Compiled out: there's no member thunk or contract function (the
+    // generated code calls `hidden`, so a stray thunk wouldn't compile).
     #[cfg(not(test))]
+    #[weaveffi::export]
     impl Token {
         /// Never exported.
         pub fn hidden(&self) -> i64 {
@@ -286,7 +332,7 @@ pub mod rich {
 
     /// Call every value-returning method and describe the results.
     #[weaveffi::export]
-    pub fn describe(source: Arc<dyn Source>) -> Result<String, ForeignError> {
+    pub fn describe_source(source: Arc<dyn Source>) -> Result<String, ForeignError> {
         let card = source.card("k")?;
         let token = source.token()?;
         Ok(format!(
@@ -322,24 +368,14 @@ pub mod rich {
         1
     }
 
-    /// Present in no build: no thunk, no contract entry.
+    /// Present in no build: no thunk, no contract function.
     #[cfg(not(test))]
     #[weaveffi::export]
     pub fn never() -> i32 {
         0
     }
-
-    /// A submodule present in no build.
-    #[cfg(not(test))]
-    #[weaveffi::module]
-    pub mod gone {
-        /// Never exported.
-        #[weaveffi::export]
-        pub fn vanished() {}
-    }
 }
 
-#[weaveffi::module]
 pub mod maps {
     use std::collections::BTreeMap;
 
@@ -351,12 +387,11 @@ pub mod maps {
 
     /// Sum a map's values (map parameter, scalar return).
     #[weaveffi::export]
-    pub fn total(scores: BTreeMap<String, i32>) -> i32 {
+    pub fn total_scores(scores: BTreeMap<String, i32>) -> i32 {
         scores.values().sum()
     }
 }
 
-#[weaveffi::module]
 pub mod build {
     /// A record whose fields exercise strings, scalars, and optionals in the
     /// value-buffer encoding.
@@ -372,7 +407,6 @@ pub mod build {
     }
 }
 
-#[weaveffi::module]
 pub mod geom {
     /// An algebraic shape: variants carry associated data, so it crosses the
     /// ABI as a value buffer (an `i32` tag followed by the active variant's
@@ -398,7 +432,7 @@ pub mod geom {
 
     /// Describe a shape (rich enum borrowed in, owned string out).
     #[weaveffi::export]
-    pub fn describe(shape: &Shape) -> String {
+    pub fn describe_shape(shape: &Shape) -> String {
         match shape {
             Shape::Empty => "empty".to_string(),
             Shape::Circle { radius } => format!("circle({radius})"),
@@ -407,9 +441,12 @@ pub mod geom {
     }
 }
 
-#[weaveffi::module]
 pub mod stream {
-    /// Yield `count` greetings lazily as an `iter<String>`.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use weaveffi::__rt::{FfiError, IterHandle};
+
+    /// Yield `count` greetings lazily as an `iter<string>`.
     #[weaveffi::export]
     pub fn greetings(count: i32) -> weaveffi::Iter<String> {
         weaveffi::Iter::new((0..count).map(|i| format!("hi {i}")))
@@ -423,20 +460,19 @@ pub mod stream {
 
     /// The handle `reentrant`'s iterator advances from inside its own
     /// `next` (set by the test once the launcher returns it).
-    pub static REENTRANT_HANDLE: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    pub static REENTRANT_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
     /// Yield three elements, each the error code a nested `_next` on the
     /// same handle reported from inside the producer's `next`.
     #[weaveffi::export]
     pub fn reentrant() -> weaveffi::Iter<i32> {
         weaveffi::Iter::new((0..3).map(|_| {
-            let handle = REENTRANT_HANDLE.load(std::sync::atomic::Ordering::SeqCst);
-            let mut err = weaveffi::abi::FfiError::default();
+            let handle = REENTRANT_HANDLE.load(Ordering::SeqCst);
+            let mut err = FfiError::default();
             let mut item = 0;
             unsafe {
-                runtime_stream_ReentrantIterator_next(
-                    handle as *const weaveffi::abi::IterHandle<i32>,
+                super::runtime_ReentrantIterator_next(
+                    handle as *mut IterHandle<i32>,
                     &mut item,
                     &mut err,
                 )
@@ -446,24 +482,13 @@ pub mod stream {
     }
 }
 
-#[weaveffi::module]
 pub mod bus {
     use std::sync::{Arc, Mutex, PoisonError};
 
     use weaveffi::ForeignError;
 
-    /// The bus's error domain. A subscriber failure propagates with its own
-    /// code; the domain lets the bus's calls throw.
-    #[weaveffi::error]
-    #[derive(Debug)]
-    pub enum BusError {
-        /// the bus is closed
-        Closed = 1,
-    }
-
     /// A message priority (a C-style enum crossing a callback boundary).
     #[weaveffi::enumeration]
-    #[repr(i32)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Priority {
         /// Routine.
@@ -494,7 +519,7 @@ pub mod bus {
         ) -> Result<i64, ForeignError>;
         /// Ask the subscriber how urgent it considers `weight`.
         fn classify(&self, weight: i32) -> Result<Priority, ForeignError>;
-        /// Inspect a shared object without retaining it.
+        /// Inspect a shared object, given one reference to each.
         fn on_ticker(
             &self,
             ticker: Arc<Ticker>,
@@ -510,6 +535,7 @@ pub mod bus {
         value: i64,
     }
 
+    #[weaveffi::export]
     impl Ticker {
         /// Create a ticker.
         pub fn new(value: i64) -> Self {
@@ -527,6 +553,7 @@ pub mod bus {
         subs: Mutex<Vec<Arc<dyn Subscriber>>>,
     }
 
+    #[weaveffi::export]
     impl Bus {
         /// Create an empty bus.
         pub fn new() -> Arc<Self> {
@@ -544,9 +571,8 @@ pub mod bus {
         }
 
         /// Publish to every subscriber, returning the sum of their totals. A
-        /// subscriber failure fails the call with the subscriber's code and
-        /// message. The list is snapshotted so no lock is held while a
-        /// callback runs.
+        /// subscriber failure fails the call with the subscriber's message.
+        /// The list is snapshotted so no lock is held while a callback runs.
         pub fn publish(&self, text: &str, weight: i32) -> Result<i64, ForeignError> {
             let env = Envelope {
                 seq: 1,
@@ -585,16 +611,34 @@ pub mod bus {
         subscriber.classify(weight)
     }
 
-    /// Hand the subscriber a ticker object.
+    /// Hand the subscriber a ticker object, alone and then with an `alt`.
     #[weaveffi::export]
-    pub fn tick(subscriber: &Arc<dyn Subscriber>, value: i64) -> Result<bool, ForeignError> {
+    pub fn tick(subscriber: Arc<dyn Subscriber>, value: i64) -> Result<bool, ForeignError> {
         let ticker = Arc::new(Ticker::new(value));
         Ok(subscriber.on_ticker(ticker.clone(), None)?
             && subscriber.on_ticker(ticker.clone(), Some(ticker))?)
     }
 
-    /// Weigh through the subscriber and describe the outcome, handling a
+    /// Classify through the subscriber and describe the outcome, handling a
     /// consumer failure as an ordinary value.
+    #[weaveffi::export]
+    pub fn classify_or_explain(subscriber: Arc<dyn Subscriber>, weight: i32) -> String {
+        match subscriber.classify(weight) {
+            Ok(p) => format!("ok {p:?}"),
+            Err(e) => format!("err {}: {}", e.code, e.message),
+        }
+    }
+
+    /// Hand the subscriber a ticker and describe the outcome.
+    #[weaveffi::export]
+    pub fn tick_or_explain(subscriber: Arc<dyn Subscriber>, value: i64) -> String {
+        match subscriber.on_ticker(Arc::new(Ticker::new(value)), None) {
+            Ok(b) => format!("ok {b}"),
+            Err(e) => format!("err {}: {}", e.code, e.message),
+        }
+    }
+
+    /// Weigh through the subscriber and describe the outcome.
     #[weaveffi::export]
     pub fn weigh_or_explain(subscriber: Arc<dyn Subscriber>, weight: i32) -> String {
         match subscriber.weigh(weight) {
@@ -604,7 +648,6 @@ pub mod bus {
     }
 }
 
-#[weaveffi::module]
 pub mod tasks {
     /// A tag for the thread running the call, to observe the executor.
     #[weaveffi::export]
@@ -613,7 +656,7 @@ pub mod tasks {
         format!("{:?} {}", t.id(), t.name().unwrap_or(""))
     }
 
-    /// The task module's error domain.
+    /// The task error domain.
     #[weaveffi::error]
     #[derive(Debug)]
     pub enum TaskError {
@@ -623,7 +666,7 @@ pub mod tasks {
 
     /// The by-value result an async task completes with.
     #[weaveffi::record]
-    #[derive(Clone)]
+    #[derive(Clone, Debug, PartialEq)]
     pub struct TaskResult {
         /// The assigned task id.
         pub id: i64,
@@ -640,7 +683,7 @@ pub mod tasks {
         }
     }
 
-    /// Echo a string asynchronously (a `(result_ptr, result_len)` result).
+    /// Shout a borrowed string asynchronously (a run in, a run out).
     #[weaveffi::export]
     pub async fn shout(text: &str) -> String {
         text.to_uppercase()
@@ -654,1025 +697,25 @@ pub mod tasks {
 
     /// Never finish on its own: only cancellation completes this call.
     #[weaveffi::export]
-    #[weaveffi::cancellable]
     pub async fn wait_forever(cancel: weaveffi::CancelToken) -> i32 {
         let _keep = cancel;
         std::future::pending::<()>().await;
         0
     }
-}
 
-fn ok_err() -> FfiError {
-    FfiError::default()
-}
-
-/// The message in `err`, or `""`.
-fn message(err: &FfiError) -> String {
-    unsafe { err.message_str() }.unwrap_or_default().to_string()
-}
-
-/// Decode a buffered return `(ptr, out_len)` into an owned value and release
-/// the producer-allocated buffer, mirroring what every generated binding does.
-fn decode_ret<T: abi::BufferValue>(ptr: *const u8, len: usize) -> T {
-    assert!(
-        !ptr.is_null(),
-        "buffered return must not be null on success"
-    );
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    // SAFETY: a producer's return; its tokens are ours to adopt, once.
-    let value = unsafe { abi::decode_value(bytes) }.expect("well-formed value buffer");
-    unsafe { abi::free_bytes(ptr.cast_mut(), len) };
-    value
-}
-
-/// Copy a returned `(ptr, len)` string and release it.
-fn take_string(ptr: *const u8, len: usize) -> String {
-    let s = unsafe { abi::lift_string(ptr, len) }.expect("valid UTF-8");
-    unsafe { abi::free_bytes(ptr.cast_mut(), len) };
-    s
-}
-
-/// Copy a consumer-owned async error and release it.
-fn take_async_err(err: *mut FfiError) -> (i32, String) {
-    if err.is_null() {
-        return (0, String::new());
-    }
-    let out = unsafe { ((*err).code, message(&*err)) };
-    unsafe { abi::error_free(err) };
-    out
-}
-
-#[test]
-fn scalar_call_sets_ok() {
-    let mut err = ok_err();
-    let r = unsafe { demo::runtime_demo_add(2, 40, &mut err) };
-    assert_eq!(r, 42);
-    assert_eq!(err.code, 0);
-    assert!(err.message_ptr.is_null());
-}
-
-#[test]
-fn fallible_ok_and_err_paths_use_display_for_the_message() {
-    let mut err = ok_err();
-    assert_eq!(
-        unsafe { demo::runtime_demo_checked_div(10, 2, &mut err) },
-        5
-    );
-    assert_eq!(err.code, 0);
-
-    let r = unsafe { demo::runtime_demo_checked_div(1, 0, &mut err) };
-    assert_eq!(r, 0, "error path returns the zero sentinel");
-    assert_eq!(
-        err.code, 100,
-        "domain code from the #[weaveffi::error] enum"
-    );
-    assert_eq!(message(&err), "cannot divide by zero", "the Display output");
-
-    // The next successful call resets the slot.
-    assert_eq!(unsafe { demo::runtime_demo_add(1, 1, &mut err) }, 2);
-    assert_eq!(err.code, 0);
-    assert!(err.message_ptr.is_null());
-}
-
-#[test]
-fn owned_string_roundtrip() {
-    let mut err = ok_err();
-    let input = "alice";
-    let mut out_len = 0usize;
-    let out =
-        unsafe { demo::runtime_demo_greet(input.as_ptr(), input.len(), &mut out_len, &mut err) };
-    assert_eq!(err.code, 0);
-    assert_eq!(take_string(out, out_len), "hi alice");
-}
-
-#[test]
-fn interior_nul_in_a_returned_string_round_trips() {
-    let mut err = ok_err();
-    let input = "a\0b";
-    let mut out_len = 0usize;
-    let out =
-        unsafe { demo::runtime_demo_greet(input.as_ptr(), input.len(), &mut out_len, &mut err) };
-    assert_eq!(out_len, 6);
-    assert_eq!(take_string(out, out_len), "hi a\0b");
-}
-
-#[test]
-fn borrowed_str_param_is_not_copied() {
-    let mut err = ok_err();
-    // A slice of a larger buffer: not NUL-terminated, and borrowed in place.
-    let backing = "héllo world";
-    let text = &backing[..6];
-    assert_eq!(
-        unsafe { demo::runtime_demo_str_len(text.as_ptr(), text.len(), &mut err) },
-        5
-    );
-    let addr = unsafe { demo::runtime_demo_str_addr(text.as_ptr(), text.len(), &mut err) };
-    assert_eq!(
-        addr,
-        text.as_ptr() as u64,
-        "the thunk lent the caller's bytes"
-    );
-
-    let data = [1u8, 2, 3];
-    let addr = unsafe { demo::runtime_demo_bytes_addr(data.as_ptr(), data.len(), &mut err) };
-    assert_eq!(addr, data.as_ptr() as u64);
-
-    // An empty string may be passed as (NULL, 0).
-    assert_eq!(
-        unsafe { demo::runtime_demo_str_len(std::ptr::null(), 0, &mut err) },
-        0
-    );
-    assert_eq!(err.code, 0);
-}
-
-#[test]
-fn invalid_string_params_are_marshalling_errors() {
-    let mut err = ok_err();
-    let bad = [0xFFu8, 0xFE];
-    let r = unsafe { demo::runtime_demo_str_len(bad.as_ptr(), bad.len(), &mut err) };
-    assert_eq!(r, 0);
-    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
-
-    let r = unsafe { demo::runtime_demo_str_len(std::ptr::null(), 3, &mut err) };
-    assert_eq!(r, 0);
-    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
-}
-
-#[test]
-fn optional_string_return_is_buffered() {
-    let mut err = ok_err();
-    let mut out_len: usize = 0;
-    let some = unsafe { demo::runtime_demo_maybe_name(true, &mut out_len, &mut err) };
-    assert_eq!(
-        decode_ret::<Option<String>>(some, out_len),
-        Some("present".to_string())
-    );
-
-    let none = unsafe { demo::runtime_demo_maybe_name(false, &mut out_len, &mut err) };
-    assert_eq!(decode_ret::<Option<String>>(none, out_len), None);
-}
-
-#[test]
-fn scalar_list_param_is_a_typed_array() {
-    let mut err = ok_err();
-    let xs = [3i32, 4, 5];
-    let total = unsafe { demo::runtime_demo_sum(xs.as_ptr(), xs.len(), &mut err) };
-    assert_eq!(total, 12);
-    assert_eq!(
-        unsafe { demo::runtime_demo_sum(std::ptr::null(), 0, &mut err) },
-        0
-    );
-    assert_eq!(err.code, 0);
-    assert_eq!(
-        unsafe { demo::runtime_demo_sum(std::ptr::null(), 2, &mut err) },
-        0
-    );
-    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
-}
-
-#[test]
-fn string_list_param_is_buffered() {
-    let mut err = ok_err();
-    let parts = abi::encode_value(&vec!["a".to_string(), "b".to_string(), "c".to_string()]);
-    let mut out_len = 0usize;
-    let out =
-        unsafe { demo::runtime_demo_join(parts.as_ptr(), parts.len(), &mut out_len, &mut err) };
-    assert_eq!(take_string(out, out_len), "a,b,c");
-}
-
-#[test]
-fn malformed_buffer_param_reports_error() {
-    let mut err = ok_err();
-    // A truncated encoding (count with no elements) must be rejected through
-    // `out_err`, never decoded partially.
-    let bad = [9u8, 0, 0, 0];
-    let mut out_len = 0usize;
-    let joined =
-        unsafe { demo::runtime_demo_join(bad.as_ptr(), bad.len(), &mut out_len, &mut err) };
-    assert!(joined.is_null(), "error path returns the zero sentinel");
-    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
-}
-
-#[test]
-fn byte_buffer_param() {
-    let mut err = ok_err();
-    let data = [1u8, 2, 3, 4, 5];
-    assert_eq!(
-        unsafe { demo::runtime_demo_byte_count(data.as_ptr(), data.len(), &mut err) },
-        5
-    );
-}
-
-#[test]
-fn c_style_enum_in_and_out() {
-    let mut err = ok_err();
-    assert_eq!(unsafe { demo::runtime_demo_echo_color(2, &mut err) }, 2);
-    assert_eq!(err.code, 0);
-    assert_eq!(unsafe { demo::runtime_demo_echo_color(9, &mut err) }, 0);
-    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
-}
-
-#[test]
-fn record_buffer_round_trip() {
-    // A record is a value type: its whole generated surface is the
-    // `BufferValue` impl, so encoding and decoding must round-trip every
-    // field (including the optional and enum fields).
-    let original = demo::Point {
-        x: 7,
-        label: "corner".to_string(),
-        nickname: Some("nw".to_string()),
-        color: demo::Color::Blue,
-    };
-    let bytes = abi::encode_value(&original);
-    assert_eq!(bytes.len(), abi::BufferValue::encoded_len(&original));
-    let back: demo::Point = unsafe { abi::decode_value(&bytes) }.expect("round-trip");
-    assert_eq!(back.x, 7);
-    assert_eq!(back.label, "corner");
-    assert_eq!(back.nickname.as_deref(), Some("nw"));
-    assert_eq!(back.color, demo::Color::Blue);
-}
-
-#[test]
-fn record_param_is_buffered() {
-    let mut err = ok_err();
-    let p = demo::Point {
-        x: 41,
-        label: "in".to_string(),
-        nickname: None,
-        color: demo::Color::Red,
-    };
-    let bytes = abi::encode_value(&p);
-    let x = unsafe { demo::runtime_demo_point_x(bytes.as_ptr(), bytes.len(), &mut err) };
-    assert_eq!(err.code, 0);
-    assert_eq!(x, 41);
-}
-
-#[test]
-fn struct_return_is_buffered() {
-    let mut err = ok_err();
-    let mut out_len: usize = 0;
-    let ptr = unsafe { demo::runtime_demo_make_point(99, &mut out_len, &mut err) };
-    assert_eq!(err.code, 0);
-    let p: demo::Point = decode_ret(ptr, out_len);
-    assert_eq!(p.x, 99);
-    assert_eq!(p.label, "origin");
-    assert_eq!(p.nickname, None);
-    assert_eq!(p.color, demo::Color::Green);
-}
-
-#[test]
-fn sibling_module_record_param_and_return() {
-    let mut err = ok_err();
-    let label = "widget";
-    let mut out_len: usize = 0;
-    let ptr = unsafe {
-        warehouse::runtime_warehouse_make_crate(
-            7,
-            label.as_ptr(),
-            label.len(),
-            &mut out_len,
-            &mut err,
-        )
-    };
-    assert_eq!(err.code, 0);
-    let c: warehouse::Crate = decode_ret(ptr, out_len);
-    assert_eq!(c.id, 7);
-    assert_eq!(c.label, "widget");
-
-    // `dispatch::crate_id` accepts `warehouse::Crate` as a value buffer.
-    let bytes = abi::encode_value(&c);
-    let id = unsafe { dispatch::runtime_dispatch_crate_id(bytes.as_ptr(), bytes.len(), &mut err) };
-    assert_eq!(id, 7);
-    assert_eq!(err.code, 0);
-
-    let new_label = "gadget";
-    let ptr2 = unsafe {
-        dispatch::runtime_dispatch_relabel(
-            bytes.as_ptr(),
-            bytes.len(),
-            new_label.as_ptr(),
-            new_label.len(),
-            &mut out_len,
-            &mut err,
-        )
-    };
-    let c2: warehouse::Crate = decode_ret(ptr2, out_len);
-    assert_eq!(c2.id, 7);
-    assert_eq!(c2.label, "gadget");
-}
-
-/// FNV-1a 64, the contract table's hash.
-fn fnv(data: &str) -> u64 {
-    data.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
-}
-
-/// A top-level module's contract table, as a consumer reads it.
-fn contract(
-    f: unsafe extern "C" fn(*mut usize) -> *const abi::ContractEntry,
-) -> Vec<abi::ContractEntry> {
-    let mut len = 0usize;
-    let ptr = unsafe { f(&mut len) };
-    if len == 0 {
-        return Vec::new();
-    }
-    unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
-}
-
-#[test]
-fn contract_tables_hold_one_sorted_entry_per_declaration() {
-    let table = contract(demo::runtime_demo_contract);
-    assert!(table.windows(2).all(|w| w[0].id < w[1].id), "sorted by id");
-    // demo: the error domain and its code, Color, Point, and thirteen
-    // functions.
-    assert_eq!(table.len(), 17);
-    let add = table.iter().find(|e| e.id == fnv("demo.add")).unwrap();
-    assert_eq!(add.hash, fnv("function add(i32, i32) -> i32"));
-    let point = table.iter().find(|e| e.id == fnv("demo.Point")).unwrap();
-    assert_eq!(
-        point.hash,
-        fnv("record Point {i32, string, string?, Color}")
-    );
-    let div = table
-        .iter()
-        .find(|e| e.id == fnv("demo.checked_div"))
-        .unwrap();
-    assert_eq!(
-        div.hash,
-        fnv("function checked_div(i32, i32) -> i32 throws DemoError")
-    );
-    let code = table
-        .iter()
-        .find(|e| e.id == fnv("demo.DemoError.DivisionByZero"))
-        .unwrap();
-    assert_eq!(code.hash, fnv("code DivisionByZero = 100"));
-
-    // Nested modules and interface members are in their root's table.
-    let outer = contract(outer::runtime_outer_contract);
-    for path in [
-        "outer.Session",
-        "outer.Session.open",
-        "outer.inner.summarize",
-    ] {
-        assert!(outer.iter().any(|e| e.id == fnv(path)), "{path}");
-    }
-}
-
-#[test]
-fn contract_tables_follow_cfg() {
-    let table = contract(rich::runtime_rich_contract);
-    let has = |path: &str| table.iter().any(|e| e.id == fnv(path));
-    assert!(has("rich.always"));
-    assert!(has("rich.Token.n"));
-    assert!(!has("rich.never"), "a cfg'd-out function has no entry");
-    assert!(
-        !has("rich.Token.hidden"),
-        "nor a member of a cfg'd-out impl"
-    );
-    assert!(
-        !has("rich.gone.vanished"),
-        "nor anything in a cfg'd-out module"
-    );
-    let lookup = table
-        .iter()
-        .find(|e| e.id == fnv("rich.lookup_via"))
-        .unwrap();
-    assert_eq!(
-        lookup.hash,
-        fnv("function lookup_via(Source, string) -> string"),
-        "the alias resolved to its target"
-    );
-    let method = table
-        .iter()
-        .find(|e| e.id == fnv("rich.Source.lookup"))
-        .unwrap();
-    assert_eq!(
-        method.hash,
-        fnv("callback_method #5 lookup(string) -> i64 throws LookupError")
-    );
-}
-
-#[test]
-fn map_param_and_return_are_buffered() {
-    use std::collections::BTreeMap;
-    let mut err = ok_err();
-    let mut scores = BTreeMap::new();
-    scores.insert("a".to_string(), 2i32);
-    scores.insert("b".to_string(), 1i32);
-    let bytes = abi::encode_value(&scores);
-
-    let mut out_len: usize = 0;
-    let ptr = unsafe {
-        maps::runtime_maps_double_scores(bytes.as_ptr(), bytes.len(), &mut out_len, &mut err)
-    };
-    assert_eq!(err.code, 0);
-    let doubled: BTreeMap<String, i32> = decode_ret(ptr, out_len);
-    assert_eq!(doubled.get("a"), Some(&4));
-    assert_eq!(doubled.get("b"), Some(&2));
-
-    let total = unsafe { maps::runtime_maps_total(bytes.as_ptr(), bytes.len(), &mut err) };
-    assert_eq!(total, 3);
-}
-
-#[test]
-fn widget_optional_field_round_trips() {
-    for w in [
-        build::Widget {
-            name: "bolt".to_string(),
-            qty: 7,
-            note: Some("aisle 4".to_string()),
-        },
-        build::Widget {
-            name: "nut".to_string(),
-            qty: 1,
-            note: None,
-        },
-    ] {
-        let back: build::Widget = unsafe { abi::decode_value(&abi::encode_value(&w)) }.unwrap();
-        assert_eq!(back, w);
-    }
-}
-
-#[test]
-fn rich_enum_encodes_tag_then_fields() {
-    // The wire format leads with the i32 tag (declaration order: Empty = 0,
-    // Circle = 1, Labeled = 2), then the active variant's fields.
-    let empty = abi::encode_value(&geom::Shape::Empty);
-    assert_eq!(empty, [0, 0, 0, 0]);
-
-    let circle = abi::encode_value(&geom::Shape::Circle { radius: 2.5 });
-    assert_eq!(&circle[..4], [1, 0, 0, 0]);
-    assert_eq!(circle.len(), 4 + 8, "tag + f64 radius");
-
-    let labeled = geom::Shape::Labeled {
-        label: "hex".to_string(),
-        count: 6,
-    };
-    let bytes = abi::encode_value(&labeled);
-    assert_eq!(&bytes[..4], [2, 0, 0, 0]);
-    let back: geom::Shape = unsafe { abi::decode_value(&bytes) }.unwrap();
-    assert_eq!(back, labeled);
-
-    // An out-of-range tag is a decode error, not a silent default.
-    assert!(unsafe { abi::decode_value::<geom::Shape>(&[9, 0, 0, 0]) }.is_err());
-}
-
-#[test]
-fn rich_enum_param_is_buffered() {
-    let mut err = ok_err();
-    let circle = abi::encode_value(&geom::Shape::Circle { radius: 2.5 });
-    let mut out_len = 0usize;
-    let d = unsafe {
-        geom::runtime_geom_describe(circle.as_ptr(), circle.len(), &mut out_len, &mut err)
-    };
-    assert_eq!(err.code, 0);
-    assert_eq!(take_string(d, out_len), "circle(2.5)");
-}
-
-#[test]
-fn iterator_string_elements() {
-    let mut err = ok_err();
-    let iter = unsafe { stream::runtime_stream_greetings(3, &mut err) };
-    assert_eq!(err.code, 0);
-    assert!(!iter.is_null());
-
-    let mut got = Vec::new();
-    loop {
-        let mut item: *const u8 = std::ptr::null();
-        let mut len = 0usize;
-        let has = unsafe {
-            stream::runtime_stream_GreetingsIterator_next(iter, &mut item, &mut len, &mut err)
-        };
-        assert_eq!(err.code, 0);
-        if has == 0 {
-            break;
-        }
-        got.push(take_string(item, len));
-    }
-    unsafe { stream::runtime_stream_GreetingsIterator_destroy(iter) };
-    assert_eq!(got, vec!["hi 0", "hi 1", "hi 2"]);
-}
-
-#[test]
-fn iterator_scalar_elements() {
-    let mut err = ok_err();
-    let iter = unsafe { stream::runtime_stream_squares(4, &mut err) };
-    let mut got = Vec::new();
-    loop {
-        let mut item: i32 = 0;
-        if unsafe { stream::runtime_stream_SquaresIterator_next(iter, &mut item, &mut err) } == 0 {
-            break;
-        }
-        got.push(item);
-    }
-    unsafe { stream::runtime_stream_SquaresIterator_destroy(iter) };
-    assert_eq!(got, vec![0, 1, 4, 9]);
-}
-
-#[test]
-fn concurrent_iterator_next_yields_each_element_once_or_reports_busy() {
-    const N: i32 = 2000;
-    let mut err = ok_err();
-    let iter = unsafe { stream::runtime_stream_squares(N, &mut err) };
-    let addr = iter as usize;
-    let threads: Vec<_> = (0..8)
-        .map(|_| {
-            std::thread::spawn(move || {
-                let iter = addr as *mut abi::IterHandle<i32>;
-                let mut err = FfiError::default();
-                let mut got = Vec::new();
-                loop {
-                    let mut item = 0i32;
-                    let has = unsafe {
-                        stream::runtime_stream_SquaresIterator_next(iter, &mut item, &mut err)
-                    };
-                    // A `_next` racing another fails instead of blocking.
-                    if err.code == abi::MARSHAL_ERROR_CODE {
-                        std::thread::yield_now();
-                        continue;
-                    }
-                    assert_eq!(err.code, 0);
-                    if has == 0 {
-                        break got;
-                    }
-                    got.push(item);
-                }
-            })
-        })
-        .collect();
-    let mut all: Vec<i32> = threads
-        .into_iter()
-        .flat_map(|t| t.join().unwrap())
-        .collect();
-    all.sort_unstable();
-    assert_eq!(all, (0..N).map(|i| i * i).collect::<Vec<_>>());
-    unsafe { stream::runtime_stream_SquaresIterator_destroy(iter) };
-}
-
-#[test]
-fn a_reentrant_next_fails_instead_of_deadlocking() {
-    let mut err = ok_err();
-    let iter = unsafe { stream::runtime_stream_reentrant(&mut err) };
-    stream::REENTRANT_HANDLE.store(iter as usize, std::sync::atomic::Ordering::SeqCst);
-    let mut got = Vec::new();
-    loop {
-        let mut item = 0i32;
-        if unsafe { stream::runtime_stream_ReentrantIterator_next(iter, &mut item, &mut err) } == 0
-        {
-            break;
-        }
-        assert_eq!(err.code, 0);
-        got.push(item);
-    }
-    unsafe { stream::runtime_stream_ReentrantIterator_destroy(iter) };
-    assert_eq!(got, vec![abi::MARSHAL_ERROR_CODE; 3]);
-}
-
-#[test]
-fn duplicate_map_keys_are_marshalling_errors() {
-    let mut err = ok_err();
-    let mut w = abi::BufferWriter::new();
-    w.write_len(2);
-    for v in [1i32, 2] {
-        w.write_string("same");
-        w.write_i32(v);
-    }
-    let bytes = w.finish();
-    let total = unsafe { maps::runtime_maps_total(bytes.as_ptr(), bytes.len(), &mut err) };
-    assert_eq!(total, 0);
-    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
-    assert!(
-        message(&err).contains("duplicate map key"),
-        "{}",
-        message(&err)
-    );
-}
-
-/// A consumer-side `Subscriber` implementation: the context is a heap-allocated
-/// `SubState`, the vtable is a process-wide static, exactly as a generated
-/// binding would do it.
-mod consumer_subscriber {
-    use super::*;
-    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-
-    pub struct SubState {
-        pub total: AtomicI64,
-        pub fail_at: i32,
-        pub last_topic: std::sync::Mutex<Option<String>>,
-        pub freed: Arc<AtomicUsize>,
-    }
-
-    unsafe extern "C" fn on_message(
-        ctx: *mut c_void,
-        text_ptr: *const u8,
-        text_len: usize,
-        weight: i32,
-        envelope_ptr: *const u8,
-        envelope_len: usize,
-        out_err: *mut FfiError,
-    ) -> i64 {
-        let state = unsafe { &*(ctx as *const SubState) };
-        let text = unsafe { abi::lift_str(text_ptr, text_len) }.unwrap();
-        let env: bus::Envelope =
-            unsafe { abi::decode_value(std::slice::from_raw_parts(envelope_ptr, envelope_len)) }
-                .unwrap();
-        *state.last_topic.lock().unwrap() = env.topic.clone();
-        if weight == state.fail_at {
-            let msg = format!("subscriber rejected {text}");
-            // Consumers report through the exported `{prefix}_error_set`.
-            unsafe { super::runtime_error_set(out_err, -1, msg.as_ptr(), msg.len()) };
-            return 0;
-        }
-        state.total.fetch_add(weight as i64, Ordering::Relaxed) + weight as i64
-    }
-
-    unsafe extern "C" fn classify(_ctx: *mut c_void, weight: i32, _err: *mut FfiError) -> i32 {
-        i32::from(weight > 5)
-    }
-
-    unsafe extern "C" fn on_ticker(
-        _ctx: *mut c_void,
-        ticker: *mut bus::Ticker,
-        alt: *mut bus::Ticker,
-        _err: *mut FfiError,
-    ) -> bool {
-        // Object arguments transfer one strong reference: the consumer adopts
-        // each non-null pointer and owes exactly one `_destroy`.
-        let mut err = FfiError::default();
-        unsafe {
-            let v = bus::runtime_bus_Ticker_value(ticker, &mut err);
-            bus::runtime_bus_Ticker_destroy(ticker);
-            let alt_ok = if alt.is_null() {
-                true
-            } else {
-                let same = bus::runtime_bus_Ticker_value(alt, &mut err) == v;
-                bus::runtime_bus_Ticker_destroy(alt);
-                same
-            };
-            v == 42 && alt_ok
-        }
-    }
-
-    unsafe extern "C" fn weigh(ctx: *mut c_void, weight: i32, out_err: *mut FfiError) -> i64 {
-        let state = unsafe { &*(ctx as *const SubState) };
-        if weight == state.fail_at {
-            unsafe { abi::error_set(out_err, abi::FOREIGN_ERROR_CODE, "too heavy") };
-            return 0;
-        }
-        i64::from(weight) * 10
-    }
-
-    unsafe extern "C" fn free(ctx: *mut c_void) {
-        let state = unsafe { Box::from_raw(ctx as *mut SubState) };
-        state.freed.fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub static VTABLE: bus::runtime_bus_Subscriber_vtable = bus::runtime_bus_Subscriber_vtable {
-        header: abi::VtableHeader {
-            size: std::mem::size_of::<bus::runtime_bus_Subscriber_vtable>() as u32,
-            flags: 0,
-            free,
-        },
-        on_message,
-        classify,
-        on_ticker,
-        weigh,
-    };
-
-    /// A vtable whose `size` claims only the header: a consumer built from
-    /// an older contract.
-    pub static SHORT_VTABLE: bus::runtime_bus_Subscriber_vtable =
-        bus::runtime_bus_Subscriber_vtable {
-            header: abi::VtableHeader {
-                size: std::mem::size_of::<abi::VtableHeader>() as u32,
-                flags: 0,
-                free,
-            },
-            on_message,
-            classify,
-            on_ticker,
-            weigh,
-        };
-
-    pub fn new_ctx(fail_at: i32, freed: &Arc<AtomicUsize>) -> *mut c_void {
-        Box::into_raw(Box::new(SubState {
-            total: AtomicI64::new(0),
-            fail_at,
-            last_topic: std::sync::Mutex::new(None),
-            freed: Arc::clone(freed),
-        })) as *mut c_void
-    }
-}
-
-weaveffi::export_runtime!();
-
-#[test]
-fn callback_interface_sync_paths() {
-    use consumer_subscriber::{new_ctx, VTABLE};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let freed = Arc::new(AtomicUsize::new(0));
-    let mut err = ok_err();
-
-    // Direct-family return through a non-retained callback: `free` runs as soon
-    // as the thunk drops its `Arc<dyn Subscriber>`.
-    let ctx = new_ctx(-1, &freed);
-    assert_eq!(
-        unsafe { bus::runtime_bus_classify_once(ctx, &VTABLE, 9, &mut err) },
-        1
-    );
-    assert_eq!(err.code, 0);
-    assert_eq!(freed.load(Ordering::SeqCst), 1);
-
-    // Objects flow producer -> consumer as owned references; a
-    // `&Arc<dyn Trait>` spelling lends the lifted callback.
-    let ctx = new_ctx(-1, &freed);
-    assert!(unsafe { bus::runtime_bus_tick(ctx, &VTABLE, 42, &mut err) });
-    assert_eq!(err.code, 0);
-    assert_eq!(freed.load(Ordering::SeqCst), 2);
-
-    // A null vtable is a marshalling error, not a crash.
-    let r = unsafe {
-        bus::runtime_bus_classify_once(std::ptr::null_mut(), std::ptr::null(), 1, &mut err)
-    };
-    assert_eq!(r, 0);
-    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
-}
-
-#[test]
-fn a_vtable_smaller_than_the_producers_is_rejected_and_released() {
-    use consumer_subscriber::{new_ctx, SHORT_VTABLE};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let freed = Arc::new(AtomicUsize::new(0));
-    let mut err = ok_err();
-    let r =
-        unsafe { bus::runtime_bus_classify_once(new_ctx(-1, &freed), &SHORT_VTABLE, 9, &mut err) };
-    assert_eq!(r, 0);
-    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
-    assert!(
-        message(&err).contains("regenerate the bindings"),
-        "{}",
-        message(&err)
-    );
-    assert_eq!(freed.load(Ordering::SeqCst), 1, "the context was released");
-}
-
-#[test]
-fn callback_result_methods_return_failures_as_values() {
-    use consumer_subscriber::{new_ctx, VTABLE};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let freed = Arc::new(AtomicUsize::new(0));
-    let mut err = ok_err();
-    let mut len = 0usize;
-
-    let ptr = unsafe {
-        bus::runtime_bus_weigh_or_explain(new_ctx(3, &freed), &VTABLE, 2, &mut len, &mut err)
-    };
-    assert_eq!(err.code, 0);
-    assert_eq!(take_string(ptr, len), "ok 20");
-
-    // The consumer fails, the producer sees an `Err`, and the call itself
-    // succeeds: nothing unwound.
-    let ptr = unsafe {
-        bus::runtime_bus_weigh_or_explain(new_ctx(3, &freed), &VTABLE, 3, &mut len, &mut err)
-    };
-    assert_eq!(err.code, 0);
-    assert_eq!(take_string(ptr, len), "err -4: too heavy");
-    assert_eq!(freed.load(Ordering::SeqCst), 2);
-}
-
-#[test]
-fn callback_interface_retained_and_foreign_error() {
-    use consumer_subscriber::{new_ctx, VTABLE};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let freed = Arc::new(AtomicUsize::new(0));
-    let mut err = ok_err();
-
-    let b = unsafe { bus::runtime_bus_Bus_new(&mut err) };
-    assert!(!b.is_null());
-    unsafe {
-        bus::runtime_bus_Bus_subscribe(b, new_ctx(7, &freed), &VTABLE, &mut err);
-        bus::runtime_bus_Bus_subscribe(b, new_ctx(-1, &freed), &VTABLE, &mut err);
-    }
-    assert_eq!(err.code, 0);
-    assert_eq!(freed.load(Ordering::SeqCst), 0, "retained by the bus");
-
-    let text = "hi";
-    let publish = |weight: i32, err: &mut FfiError| unsafe {
-        bus::runtime_bus_Bus_publish(b, text.as_ptr(), text.len(), weight, err)
-    };
-    assert_eq!(publish(3, &mut err), 6);
-    assert_eq!(err.code, 0);
-    assert_eq!(publish(5, &mut err), 16);
-
-    // The first subscriber fails on weight 7: the producer call is aborted and
-    // the consumer's own message comes back. `publish` throws `any`
-    // (`ForeignError` isn't a domain), so the code is the generic one.
-    assert_eq!(publish(7, &mut err), 0);
-    assert_eq!(err.code, abi::GENERIC_ERROR_CODE);
-    assert_eq!(message(&err), "subscriber rejected hi");
-
-    // The bus is still usable afterwards.
-    assert_eq!(publish(1, &mut err), 18);
-    assert_eq!(err.code, 0);
-
-    unsafe { bus::runtime_bus_Bus_clear(b, &mut err) };
-    assert_eq!(freed.load(Ordering::SeqCst), 2, "free runs once each");
-    unsafe { bus::runtime_bus_Bus_destroy(b) };
-}
-
-type Completion<T> = mpsc::Sender<(i32, String, T)>;
-
-/// Box a sender as an async `context`; reclaim it with [`drop_ctx`].
-fn new_ctx<T>(tx: Completion<T>) -> *mut c_void {
-    Box::into_raw(Box::new(tx)).cast()
-}
-
-fn drop_ctx<T>(ctx: *mut c_void) {
-    drop(unsafe { Box::from_raw(ctx.cast::<Completion<T>>()) });
-}
-
-fn send<T>(ctx: *mut c_void, err: *mut FfiError, value: T) {
-    // Clone the sender before sending: the test may free the context as soon
-    // as the value arrives, which can be before `send` returns.
-    let tx = unsafe { &*ctx.cast::<Completion<T>>() }.clone();
-    let (code, msg) = take_async_err(err);
-    tx.send((code, msg, value)).unwrap();
-}
-
-extern "C" fn on_i64(ctx: *mut c_void, err: *mut FfiError, result: i64) {
-    send(ctx, err, result);
-}
-
-extern "C" fn on_i32(ctx: *mut c_void, err: *mut FfiError, result: i32) {
-    send(ctx, err, result);
-}
-
-extern "C" fn on_string(ctx: *mut c_void, err: *mut FfiError, ptr: *const u8, len: usize) {
-    let value = if ptr.is_null() {
-        String::new()
-    } else {
-        take_string(ptr, len)
-    };
-    send(ctx, err, value);
-}
-
-#[test]
-fn callback_interface_from_async_method() {
-    use consumer_subscriber::{new_ctx as sub_ctx, VTABLE};
-
-    let mut err = ok_err();
-    let b = unsafe { bus::runtime_bus_Bus_new(&mut err) };
-    let freed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    unsafe { bus::runtime_bus_Bus_subscribe(b, sub_ctx(4, &freed), &VTABLE, &mut err) };
-
-    let (tx, rx) = mpsc::channel();
-    let ctx = new_ctx::<i64>(tx);
-    let text = "async";
-
-    unsafe { bus::runtime_bus_Bus_publish_later(b, text.as_ptr(), text.len(), 2, on_i64, ctx) };
-    assert_eq!(rx.recv_timeout(WAIT).unwrap(), (0, String::new(), 2));
-
-    // A foreign failure inside the future is delivered through the callback.
-    unsafe { bus::runtime_bus_Bus_publish_later(b, text.as_ptr(), text.len(), 4, on_i64, ctx) };
-    let (code, msg, result) = rx.recv_timeout(WAIT).unwrap();
-    assert_eq!(code, abi::GENERIC_ERROR_CODE);
-    assert_eq!(msg, "subscriber rejected async");
-    assert_eq!(result, 0);
-
-    // The receiver was retained across the spawn: releasing the consumer's
-    // reference while a call is in flight is safe.
-    unsafe {
-        bus::runtime_bus_Bus_publish_later(b, text.as_ptr(), text.len(), 1, on_i64, ctx);
-        bus::runtime_bus_Bus_destroy(b);
-    }
-    assert_eq!(rx.recv_timeout(WAIT).unwrap(), (0, String::new(), 3));
-    drop_ctx::<i64>(ctx);
-}
-
-#[test]
-fn async_struct_result_completes_via_callback() {
-    type Msg = (i32, String, Option<(i64, String)>);
-    // The buffered result is owned by the consumer: decode it, then release
-    // the producer allocation with `free_bytes`.
-    extern "C" fn cb(ctx: *mut c_void, err: *mut FfiError, ptr: *const u8, len: usize) {
-        // Clone the sender before sending: the test may free the context as soon
-        // as the value arrives, which can be before `send` returns.
-        let tx = unsafe { &*ctx.cast::<mpsc::Sender<Msg>>() }.clone();
-        let (code, msg) = take_async_err(err);
-        let value = (!ptr.is_null()).then(|| {
-            let r: tasks::TaskResult = decode_ret(ptr, len);
-            (r.id, r.value)
-        });
-        tx.send((code, msg, value)).unwrap();
-    }
-
-    let (tx, rx) = mpsc::channel::<Msg>();
-    let ctx: *mut c_void = Box::into_raw(Box::new(tx)).cast();
-    let name = "alpha";
-    unsafe { tasks::runtime_tasks_run_task(name.as_ptr(), name.len(), cb, ctx) };
-    let (code, _, value) = rx.recv_timeout(WAIT).unwrap();
-    drop(unsafe { Box::from_raw(ctx.cast::<mpsc::Sender<Msg>>()) });
-    assert_eq!(code, 0);
-    assert_eq!(value, Some((7, "done: alpha".to_string())));
-}
-
-#[test]
-fn async_string_result_is_ptr_and_len() {
-    let (tx, rx) = mpsc::channel();
-    let ctx = new_ctx::<String>(tx);
-    let text = "quiet\0please";
-    unsafe { tasks::runtime_tasks_shout(text.as_ptr(), text.len(), on_string, ctx) };
-    assert_eq!(
-        rx.recv_timeout(WAIT).unwrap(),
-        (0, String::new(), "QUIET\0PLEASE".into())
-    );
-    drop_ctx::<String>(ctx);
-}
-
-#[test]
-fn async_result_ok_and_err_paths() {
-    let (tx, rx) = mpsc::channel();
-    let ctx = new_ctx::<i32>(tx);
-
-    unsafe { tasks::runtime_tasks_checked_add(2, 3, on_i32, ctx) };
-    assert_eq!(rx.recv_timeout(WAIT).unwrap(), (0, String::new(), 5));
-
-    unsafe { tasks::runtime_tasks_checked_add(i32::MAX, 1, on_i32, ctx) };
-    let (code, msg, result) = rx.recv_timeout(WAIT).unwrap();
-    assert_eq!((code, msg.as_str(), result), (1, "arithmetic overflow", 0));
-
-    drop_ctx::<i32>(ctx);
-}
-
-#[test]
-fn cancelling_completes_with_the_cancelled_code_exactly_once() {
-    let (tx, rx) = mpsc::channel();
-    let ctx = new_ctx::<i32>(tx);
-    let token = runtime_cancel_token_create();
-    unsafe { tasks::runtime_tasks_wait_forever(token, on_i32, ctx) };
-    assert!(
-        rx.recv_timeout(Duration::from_millis(50)).is_err(),
-        "not complete until cancelled"
-    );
-    unsafe {
-        runtime_cancel_token_cancel(token);
-        assert!(runtime_cancel_token_is_cancelled(token));
-        runtime_cancel_token_destroy(token);
-    }
-    let (code, msg, result) = rx.recv_timeout(WAIT).unwrap();
-    assert_eq!(
-        (code, msg.as_str(), result),
-        (abi::CANCELLED_ERROR_CODE, "cancelled", 0)
-    );
-    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
-    drop_ctx::<i32>(ctx);
-}
-
-#[test]
-fn cancel_then_destroy_races_the_launch_safely() {
-    const RUNS: usize = 200;
-    let (tx, rx) = mpsc::channel();
-    let ctx = new_ctx::<i32>(tx);
-    for i in 0..RUNS {
-        let token = runtime_cancel_token_create();
-        if i % 2 == 0 {
-            // The launcher takes its own reference before returning, so the
-            // consumer may then cancel and destroy its reference from another
-            // thread while the spawned future starts running. (Destroying the
-            // token before handing it to a launcher would break the contract:
-            // the launcher would adopt a freed token.)
-            unsafe { tasks::runtime_tasks_wait_forever(token, on_i32, ctx) };
-            let raw = token as usize;
-            let canceller = std::thread::spawn(move || unsafe {
-                runtime_cancel_token_cancel(raw as *mut abi::FfiCancelToken);
-                runtime_cancel_token_destroy(raw as *mut abi::FfiCancelToken);
-            });
-            canceller.join().unwrap();
+    /// Complete with nothing (a completion without a result slot).
+    #[weaveffi::export]
+    pub async fn tidy(fail: bool) -> Result<(), TaskError> {
+        if fail {
+            Err(TaskError::Overflow)
         } else {
-            // Cancel and destroy before the spawned future is ever polled.
-            unsafe {
-                tasks::runtime_tasks_wait_forever(token, on_i32, ctx);
-                runtime_cancel_token_cancel(token);
-                runtime_cancel_token_destroy(token);
-            }
+            Ok(())
         }
     }
-    for _ in 0..RUNS {
-        let (code, _, _) = rx.recv_timeout(WAIT).unwrap();
-        assert_eq!(code, abi::CANCELLED_ERROR_CODE);
-    }
-    assert!(
-        rx.recv_timeout(Duration::from_millis(100)).is_err(),
-        "each call completed exactly once"
-    );
-    drop_ctx::<i32>(ctx);
 }
 
-/// Exercises nested-module codegen: the inner module's symbols carry the
-/// joined `outer_inner` path, and a nested function may reference an
-/// interface declared in its parent module via `super::`.
-#[weaveffi::module]
+/// An interface, a C-style enum, and a record declared in one Rust module
+/// and used from another.
 pub mod outer {
     use std::sync::Arc;
 
@@ -1683,6 +726,7 @@ pub mod outer {
         pub id: i64,
     }
 
+    #[weaveffi::export]
     impl Session {
         /// Open a session.
         pub fn open(id: i64) -> Self {
@@ -1692,7 +736,6 @@ pub mod outer {
 
     /// A C-style enum declared in the parent module.
     #[weaveffi::enumeration]
-    #[repr(i32)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Level {
         /// Low.
@@ -1701,14 +744,12 @@ pub mod outer {
         High = 2,
     }
 
-    /// Return the same session (an `Arc<Self>`-typed parameter and return).
+    /// Return the same session (an `Arc`-typed parameter and return).
     #[weaveffi::export]
     pub fn share(session: Arc<Session>) -> Arc<Session> {
         session
     }
 
-    /// The nested sub-module: its symbols use the `outer_inner` path.
-    #[weaveffi::module]
     pub mod inner {
         use std::sync::Arc;
 
@@ -1718,7 +759,8 @@ pub mod outer {
         pub struct Report {
             /// Ten times the session id.
             pub score: i64,
-            /// The session the report is about (an object token in the buffer).
+            /// The session the report is about (an object token in the
+            /// buffer).
             pub session: Option<Arc<super::Session>>,
         }
 
@@ -1755,110 +797,8 @@ pub mod outer {
     }
 }
 
-#[test]
-fn nested_module_symbols_and_parent_type_reference() {
-    let mut err = ok_err();
-    let session = unsafe { outer::runtime_outer_Session_open(7, &mut err) };
-    assert_eq!(err.code, 0);
-    assert!(!session.is_null());
-
-    let mut out_len: usize = 0;
-    let ptr = unsafe {
-        outer::inner::runtime_outer_inner_summarize(
-            session,
-            std::ptr::null(),
-            &mut out_len,
-            &mut err,
-        )
-    };
-    assert_eq!(err.code, 0);
-    let report: outer::inner::Report = decode_ret(ptr, out_len);
-    assert_eq!(report.score, 70);
-    assert!(report.session.is_none());
-
-    let ptr = unsafe {
-        outer::inner::runtime_outer_inner_summarize(session, session, &mut out_len, &mut err)
-    };
-    let report: outer::inner::Report = decode_ret(ptr, out_len);
-    assert_eq!(report.score, 77);
-
-    assert_eq!(
-        unsafe { outer::inner::runtime_outer_inner_raise(1, &mut err) },
-        2
-    );
-    unsafe { outer::runtime_outer_Session_destroy(session) };
-}
-
-#[test]
-fn object_reference_counting() {
-    let mut err = ok_err();
-    unsafe {
-        let s = outer::runtime_outer_Session_open(3, &mut err);
-
-        // `share` retains through `Arc<Session>` in and hands back a new
-        // strong reference; the pointer identity is the same allocation.
-        let again = outer::runtime_outer_share(s, &mut err);
-        assert_eq!(err.code, 0);
-        assert_eq!(again, s, "the same object, one more reference");
-        let third = outer::runtime_outer_Session_clone(s);
-        assert_eq!(third, s);
-
-        outer::runtime_outer_Session_destroy(s);
-        outer::runtime_outer_Session_destroy(again);
-        // Still alive through `third`.
-        let mut out_len: usize = 0;
-        let ptr = outer::inner::runtime_outer_inner_summarize(
-            third,
-            std::ptr::null(),
-            &mut out_len,
-            &mut err,
-        );
-        assert_eq!(err.code, 0);
-        let report: outer::inner::Report = decode_ret(ptr, out_len);
-        assert_eq!(report.score, 30);
-        outer::runtime_outer_Session_destroy(third);
-        outer::runtime_outer_Session_destroy(std::ptr::null_mut());
-        assert!(outer::runtime_outer_Session_clone(std::ptr::null()).is_null());
-    }
-}
-
-#[test]
-fn objects_inside_value_buffers_carry_a_reference() {
-    let mut err = ok_err();
-    unsafe {
-        let s = outer::runtime_outer_Session_open(5, &mut err);
-
-        // `attach` retains the session inside the returned record: the
-        // buffer's object token is one strong reference the consumer adopts.
-        let mut out_len: usize = 0;
-        let ptr = outer::inner::runtime_outer_inner_attach(s, &mut out_len, &mut err);
-        assert_eq!(err.code, 0);
-        let bytes = std::slice::from_raw_parts(ptr, out_len).to_vec();
-        abi::free_bytes(ptr.cast_mut(), out_len);
-        outer::runtime_outer_Session_destroy(s);
-
-        // Sending the buffer back transfers the token's reference to the
-        // producer, which returns it as the optional object result.
-        let back =
-            outer::inner::runtime_outer_inner_session_of(bytes.as_ptr(), bytes.len(), &mut err);
-        assert_eq!(err.code, 0);
-        assert_eq!(back, s, "same allocation, still alive");
-        outer::runtime_outer_Session_destroy(back);
-
-        let none = abi::encode_value(&outer::inner::Report {
-            score: 0,
-            session: None,
-        });
-        let back =
-            outer::inner::runtime_outer_inner_session_of(none.as_ptr(), none.len(), &mut err);
-        assert!(back.is_null());
-        assert_eq!(err.code, 0);
-    }
-}
-
-/// A producer module with a declared domain whose message interpolates a
-/// field, and a function whose error type isn't a domain (`throws any`).
-#[weaveffi::module]
+/// A declared domain whose message interpolates a field, and functions
+/// whose error type isn't a domain (`throws any`).
 pub mod vault {
     /// The vault's declared error domain: the codes consumers can match on.
     #[weaveffi::error]
@@ -1886,6 +826,8 @@ pub mod vault {
         }
     }
 
+    impl std::error::Error for VaultFailure {}
+
     /// Fetch a doubled value, failing with a domain code for invalid keys.
     #[weaveffi::export]
     pub fn fetch(key: i64) -> Result<i64, VaultError> {
@@ -1898,61 +840,32 @@ pub mod vault {
         }
     }
 
-    /// Fetch, failing with an untyped error.
+    /// Fetch, failing with an untyped error converted with `?`.
     #[weaveffi::export]
-    pub fn fetch_any(key: i64) -> Result<i64, VaultFailure> {
+    pub fn fetch_any(key: i64) -> Result<i64, weaveffi::Error> {
         if key == 0 {
-            return Err(VaultFailure("no key".to_string()));
+            return Err(VaultFailure("no key".to_string()).into());
         }
         Ok(key)
     }
 
-    /// Parse an integer: a std error type works as `throws any` too.
+    /// Parse an integer: any std error converts into `weaveffi::Error`.
     #[weaveffi::export]
-    pub fn parse(text: &str) -> Result<i64, std::num::ParseIntError> {
-        text.parse()
+    pub fn parse_int(text: &str) -> Result<i64, weaveffi::Error> {
+        Ok(text.parse()?)
+    }
+
+    /// Fail with a `String` message (`throws any`).
+    #[weaveffi::export]
+    pub fn refuse(why: String) -> Result<(), String> {
+        Err(why)
     }
 }
 
-#[test]
-fn fallible_with_domain_error_codes() {
-    let mut err = ok_err();
-    assert_eq!(unsafe { vault::runtime_vault_fetch(21, &mut err) }, 42);
-    assert_eq!(err.code, 0);
-
-    let r = unsafe { vault::runtime_vault_fetch(0, &mut err) };
-    assert_eq!(r, 0, "error path returns the zero sentinel");
-    assert_eq!(err.code, 2001);
-    assert_eq!(message(&err), "entry not found");
-
-    let r = unsafe { vault::runtime_vault_fetch(-1, &mut err) };
-    assert_eq!(r, 0);
-    assert_eq!(err.code, 2002);
-    assert_eq!(message(&err), "vault sealed: negative key");
-}
-
-#[test]
-fn untyped_errors_report_the_generic_code_and_display() {
-    let mut err = ok_err();
-    assert_eq!(unsafe { vault::runtime_vault_fetch_any(5, &mut err) }, 5);
-    assert_eq!(unsafe { vault::runtime_vault_fetch_any(0, &mut err) }, 0);
-    assert_eq!(err.code, abi::GENERIC_ERROR_CODE);
-    assert_eq!(message(&err), "vault failure: no key");
-    assert!(err.payload_ptr.is_null());
-    let text = "x1";
-    assert_eq!(
-        unsafe { vault::runtime_vault_parse(text.as_ptr(), text.len(), &mut err) },
-        0
-    );
-    assert_eq!(err.code, abi::GENERIC_ERROR_CODE);
-    assert_eq!(message(&err), "invalid digit found in string");
-}
-
-/// A producer module that exports a `#[deprecated]` function. The generated
-/// thunk must still *call* the deprecated function, so it carries an
-/// `#[allow(deprecated)]` of its own; this module compiling under the
-/// workspace's `-D warnings` policy is the proof.
-#[weaveffi::module]
+/// A `#[deprecated]` export. The generated thunk must still *call* the
+/// deprecated function, so it carries an `#[allow(deprecated)]` of its own;
+/// this module compiling under the workspace's `-D warnings` policy is the
+/// proof.
 pub mod legacy {
     /// The modern entry point.
     #[weaveffi::export]
@@ -1968,9 +881,7 @@ pub mod legacy {
     }
 }
 
-/// A producer module built around an interface: an opaque object with
-/// constructors, methods, statics, and a destructor.
-#[weaveffi::module]
+/// An interface with constructors, methods, statics, and a destructor.
 pub mod counters {
     use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::Arc;
@@ -1991,6 +902,7 @@ pub mod counters {
         step: i64,
     }
 
+    #[weaveffi::export]
     impl Counter {
         /// Create a counter starting at `start`, stepping by 1.
         pub fn new(start: i64) -> Self {
@@ -2034,8 +946,8 @@ pub mod counters {
             }
         }
 
-        /// Return a new reference to this same counter (`Arc<Self>` receiver
-        /// and return).
+        /// Return a new reference to this same counter (`Arc<Self>`
+        /// receiver and return).
         pub fn share(self: Arc<Self>) -> Arc<Self> {
             self
         }
@@ -2055,10 +967,11 @@ pub mod counters {
             }
         }
 
-        /// Yield `n` fresh counters lazily (interface elements in an iterator).
+        /// Yield `n` fresh counters lazily (interface elements in an
+        /// iterator).
         pub fn fan_out(&self, n: i32) -> weaveffi::Iter<Arc<Counter>> {
             let base = self.value();
-            weaveffi::Iter::new((0..n as i64).map(move |i| Arc::new(Counter::new(base + i))))
+            weaveffi::Iter::new((0..i64::from(n)).map(move |i| Arc::new(Counter::new(base + i))))
         }
 
         /// Read the value asynchronously (an async method retains `self`).
@@ -2066,7 +979,7 @@ pub mod counters {
             self.value()
         }
 
-        /// Return the same counter asynchronously (async object result).
+        /// Return the same counter asynchronously (an async object result).
         pub async fn snapshot_later(self: Arc<Self>) -> Arc<Counter> {
             self
         }
@@ -2076,14 +989,26 @@ pub mod counters {
             panic!("counter exploded");
         }
 
-        /// The default start value (a static under the interface namespace).
+        /// The default start value (a static under the interface).
         pub fn default_start() -> i64 {
             0
         }
 
+        /// Create a counter asynchronously: an async factory is a static
+        /// (constructors are synchronous) that returns the interface.
+        pub async fn start_later(start: i64) -> Self {
+            Self::new(start)
+        }
+
+        /// Skipped: not exported, though public.
+        #[weaveffi(skip)]
+        pub fn internal(&self) -> Box<dyn Fn() -> i64> {
+            Box::new(|| -1)
+        }
+
         // A private helper: not exported.
         #[allow(dead_code)]
-        fn internal(&self) -> i64 {
+        fn private(&self) -> i64 {
             -1
         }
     }
@@ -2095,229 +1020,9 @@ pub mod counters {
     }
 }
 
-#[test]
-fn interface_constructor_methods_destroy() {
-    let mut err = ok_err();
-    unsafe {
-        let c = counters::runtime_counters_Counter_new(10, &mut err);
-        assert_eq!(err.code, 0);
-        assert!(!c.is_null());
-
-        assert_eq!(
-            counters::runtime_counters_Counter_increment(c, &mut err),
-            11
-        );
-        assert_eq!(
-            counters::runtime_counters_Counter_increment(c, &mut err),
-            12
-        );
-        assert_eq!(counters::runtime_counters_Counter_value(c, &mut err), 12);
-        assert_eq!(err.code, 0);
-
-        let prefix = "n=";
-        let mut len = 0usize;
-        let label = counters::runtime_counters_Counter_label(
-            c,
-            prefix.as_ptr(),
-            prefix.len(),
-            &mut len,
-            &mut err,
-        );
-        assert_eq!(take_string(label, len), "n=12");
-
-        counters::runtime_counters_Counter_destroy(c);
-    }
-}
-
-#[test]
-fn interface_fallible_constructor() {
-    let mut err = ok_err();
-    unsafe {
-        let ok = counters::runtime_counters_Counter_with_step(0, 5, &mut err);
-        assert_eq!(err.code, 0);
-        assert!(!ok.is_null());
-        assert_eq!(
-            counters::runtime_counters_Counter_increment(ok, &mut err),
-            5
-        );
-        counters::runtime_counters_Counter_destroy(ok);
-
-        let bad = counters::runtime_counters_Counter_with_step(0, 0, &mut err);
-        assert!(bad.is_null());
-        assert_eq!(err.code, 1, "domain code from the #[weaveffi::error] enum");
-        assert_eq!(message(&err), "step must be positive");
-    }
-}
-
-#[test]
-fn interface_returning_method_and_static() {
-    let mut err = ok_err();
-    unsafe {
-        assert_eq!(
-            counters::runtime_counters_Counter_default_start(&mut err),
-            0
-        );
-
-        let c = counters::runtime_counters_Counter_new(3, &mut err);
-        let snap = counters::runtime_counters_Counter_snapshot(c, &mut err);
-        assert!(!snap.is_null());
-        counters::runtime_counters_Counter_increment(c, &mut err);
-        assert_eq!(counters::runtime_counters_Counter_value(c, &mut err), 4);
-        assert_eq!(
-            counters::runtime_counters_Counter_value(snap, &mut err),
-            3,
-            "the snapshot is an independent object"
-        );
-        counters::runtime_counters_Counter_destroy(snap);
-        counters::runtime_counters_Counter_destroy(c);
-    }
-}
-
-#[test]
-fn interface_as_free_function_parameter() {
-    let mut err = ok_err();
-    unsafe {
-        let c = counters::runtime_counters_Counter_new(21, &mut err);
-        assert_eq!(counters::runtime_counters_read_twice(c, &mut err), 42);
-        counters::runtime_counters_Counter_destroy(c);
-    }
-}
-
-#[test]
-fn arc_self_receiver_and_optional_objects() {
-    let mut err = ok_err();
-    unsafe {
-        let c = counters::runtime_counters_Counter_new(10, &mut err);
-        let shared = counters::runtime_counters_Counter_share(c, &mut err);
-        assert_eq!(err.code, 0);
-        assert_eq!(shared, c, "`self: Arc<Self>` returns the same object");
-        counters::runtime_counters_Counter_destroy(shared);
-
-        let other = counters::runtime_counters_Counter_new(20, &mut err);
-        let bigger = counters::runtime_counters_Counter_larger(c, other, 0, &mut err);
-        assert_eq!(err.code, 0);
-        assert_eq!(
-            counters::runtime_counters_Counter_value(bigger, &mut err),
-            20
-        );
-        counters::runtime_counters_Counter_destroy(bigger);
-
-        let mine = counters::runtime_counters_Counter_larger(c, std::ptr::null(), 0, &mut err);
-        assert_eq!(counters::runtime_counters_Counter_value(mine, &mut err), 10);
-        counters::runtime_counters_Counter_destroy(mine);
-
-        let none = counters::runtime_counters_Counter_larger(c, other, 100, &mut err);
-        assert!(none.is_null());
-        assert_eq!(err.code, 0, "a null optional object return is not an error");
-
-        counters::runtime_counters_Counter_destroy(other);
-        counters::runtime_counters_Counter_destroy(c);
-    }
-}
-
-#[test]
-fn iterator_of_objects() {
-    let mut err = ok_err();
-    let mut values = Vec::new();
-    unsafe {
-        let c = counters::runtime_counters_Counter_new(5, &mut err);
-        let iter = counters::runtime_counters_Counter_fan_out(c, 3, &mut err);
-        assert_eq!(err.code, 0);
-        loop {
-            let mut item: *mut counters::Counter = std::ptr::null_mut();
-            if counters::runtime_counters_Counter_FanOutIterator_next(iter, &mut item, &mut err)
-                == 0
-            {
-                break;
-            }
-            values.push(counters::runtime_counters_Counter_value(item, &mut err));
-            counters::runtime_counters_Counter_destroy(item);
-        }
-        counters::runtime_counters_Counter_FanOutIterator_destroy(iter);
-        counters::runtime_counters_Counter_destroy(c);
-    }
-    assert_eq!(values, vec![5, 6, 7]);
-}
-
-#[test]
-fn async_methods_retain_the_receiver() {
-    extern "C" fn on_obj(ctx: *mut c_void, err: *mut FfiError, result: *mut counters::Counter) {
-        let mut e = FfiError::default();
-        let v = unsafe {
-            let v = counters::runtime_counters_Counter_value(result, &mut e);
-            counters::runtime_counters_Counter_destroy(result);
-            v
-        };
-        send(ctx, err, v);
-    }
-
-    let mut err = ok_err();
-    let (tx, rx) = mpsc::channel();
-    let ctx = new_ctx::<i64>(tx);
-
-    unsafe {
-        let c = counters::runtime_counters_Counter_new(8, &mut err);
-        counters::runtime_counters_Counter_value_later(c, on_i64, ctx);
-        counters::runtime_counters_Counter_snapshot_later(c, on_obj, ctx);
-        // Releasing the consumer's reference while calls are in flight is
-        // safe: each launcher retained its own.
-        counters::runtime_counters_Counter_destroy(c);
-    }
-    let mut got = vec![
-        rx.recv_timeout(WAIT).unwrap().2,
-        rx.recv_timeout(WAIT).unwrap().2,
-    ];
-    got.sort_unstable();
-    assert_eq!(got, vec![8, 8]);
-
-    // A null receiver still completes (with a marshalling error).
-    unsafe { counters::runtime_counters_Counter_value_later(std::ptr::null(), on_i64, ctx) };
-    let (code, _, result) = rx.recv_timeout(WAIT).unwrap();
-    assert_eq!((code, result), (abi::MARSHAL_ERROR_CODE, 0));
-    drop_ctx::<i64>(ctx);
-}
-
-#[test]
-fn interface_null_self_reports_error() {
-    let mut err = ok_err();
-    let r = unsafe { counters::runtime_counters_Counter_value(std::ptr::null(), &mut err) };
-    assert_eq!(r, 0);
-    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
-}
-
-#[test]
-fn producer_panic_reports_panic_code() {
-    let mut err = ok_err();
-    unsafe {
-        let c = counters::runtime_counters_Counter_new(0, &mut err);
-
-        counters::runtime_counters_Counter_explode(c, &mut err);
-        assert_eq!(err.code, abi::PANIC_ERROR_CODE);
-        assert!(message(&err).contains("counter exploded"));
-
-        // The object is still usable and the error slot resets on the next call.
-        assert_eq!(counters::runtime_counters_Counter_value(c, &mut err), 0);
-        assert_eq!(err.code, 0);
-        counters::runtime_counters_Counter_destroy(c);
-    }
-}
-
-#[test]
-fn deprecated_export_thunk_compiles_and_runs() {
-    let mut err = ok_err();
-    assert_eq!(unsafe { legacy::runtime_legacy_add_one(41, &mut err) }, 42);
-    assert_eq!(err.code, 0);
-
-    #[allow(deprecated)]
-    let bumped = unsafe { legacy::runtime_legacy_bump(41, &mut err) };
-    assert_eq!(bumped, 42);
-    assert_eq!(err.code, 0);
-}
-
-/// A producer module whose error domain carries structured payload fields:
-/// the variant's named fields travel through the error slot's
-/// `payload_ptr`/`payload_len` serialized in the value-buffer format.
-#[weaveffi::module]
+/// An error domain whose code carries structured payload fields: the
+/// variant's named fields travel through the error's `payload_ptr` and
+/// `payload_len`, encoded as a value buffer.
 pub mod quota {
     /// The quota error domain. `Exceeded` carries a structured payload.
     #[weaveffi::error]
@@ -2350,116 +1055,1261 @@ pub mod quota {
     }
 }
 
+// ── The C declarations, as a consumer writes them ──────────────────────
+
+/// A completion that receives a result.
+type Done<R> = unsafe extern "C" fn(*mut c_void, *mut FfiError, R);
+/// A completion of a function that returns nothing.
+type DoneUnit = unsafe extern "C" fn(*mut c_void, *mut FfiError);
+
+unsafe extern "C" {
+    // The runtime surface.
+    fn runtime_error_set(err: *mut FfiError, code: i32, ptr: *const u8, len: usize);
+    fn runtime_error_set_payload(err: *mut FfiError, ptr: *const u8, len: usize);
+    fn runtime_error_clear(err: *mut FfiError);
+    fn runtime_error_free(err: *mut FfiError);
+    fn runtime_alloc(len: usize) -> *mut u8;
+    fn runtime_run_free(run: Run);
+    fn runtime_cancel_token_create() -> *mut FfiCancelToken;
+    fn runtime_cancel_token_cancel(token: *mut FfiCancelToken);
+    fn runtime_cancel_token_is_cancelled(token: *const FfiCancelToken) -> bool;
+    fn runtime_cancel_token_destroy(token: *mut FfiCancelToken);
+
+    // demo
+    fn runtime_add(a: i32, b: i32, err: *mut FfiError) -> i32;
+    fn runtime_checked_div(a: i32, b: i32, err: *mut FfiError) -> i32;
+    fn runtime_greet(name: Run, err: *mut FfiError) -> Run;
+    fn runtime_char_count(text: Run, err: *mut FfiError) -> i32;
+    fn runtime_text_addr(text: Run, err: *mut FfiError) -> u64;
+    fn runtime_blob_addr(data: Run, err: *mut FfiError) -> u64;
+    fn runtime_words_addr(words: Run, err: *mut FfiError) -> u64;
+    fn runtime_maybe_name(present: u8, err: *mut FfiError) -> Run;
+    fn runtime_sum(xs: Run, err: *mut FfiError) -> i32;
+    fn runtime_join(parts: Run, err: *mut FfiError) -> Run;
+    fn runtime_byte_count(data: Run, err: *mut FfiError) -> i32;
+    fn runtime_make_point(x: i32, err: *mut FfiError) -> Run;
+    fn runtime_point_x(p: Run, err: *mut FfiError) -> i32;
+    fn runtime_echo_color(c: i32, err: *mut FfiError) -> i32;
+    fn runtime_negate(flag: u8, err: *mut FfiError) -> u8;
+    fn runtime_negate_opt(flag: Opt<u8>, err: *mut FfiError) -> Opt<u8>;
+    fn runtime_next_color(color: Opt<i32>, err: *mut FfiError) -> Opt<i32>;
+
+    // warehouse and dispatch
+    fn runtime_make_crate(id: i64, label: Run, err: *mut FfiError) -> Run;
+    fn runtime_crate_id(item: Run, err: *mut FfiError) -> i64;
+    fn runtime_relabel(item: Run, label: Run, err: *mut FfiError) -> Run;
+    fn runtime_is_red(color: i32, err: *mut FfiError) -> u8;
+
+    // rich
+    fn runtime_Token_new(n: i64, err: *mut FfiError) -> *const rich::Token;
+    fn runtime_describe_source(source: CallbackArg<SourceVtable>, err: *mut FfiError) -> Run;
+    fn runtime_lookup_via(source: CallbackArg<SourceVtable>, key: Run, err: *mut FfiError) -> Run;
+    fn runtime_has_source(source: CallbackArg<SourceVtable>, label: Run, err: *mut FfiError)
+        -> Run;
+    fn runtime_always(err: *mut FfiError) -> i32;
+
+    // maps
+    fn runtime_double_scores(scores: Run, err: *mut FfiError) -> Run;
+    fn runtime_total_scores(scores: Run, err: *mut FfiError) -> i32;
+
+    // geom
+    fn runtime_describe_shape(shape: Run, err: *mut FfiError) -> Run;
+
+    // stream
+    fn runtime_greetings(count: i32, err: *mut FfiError) -> *mut IterHandle<String>;
+    fn runtime_GreetingsIterator_next(
+        iter: *mut IterHandle<String>,
+        out_item: *mut Run,
+        err: *mut FfiError,
+    ) -> i32;
+    fn runtime_GreetingsIterator_destroy(iter: *mut IterHandle<String>);
+    fn runtime_squares(count: i32, err: *mut FfiError) -> *mut IterHandle<i32>;
+    fn runtime_SquaresIterator_next(
+        iter: *mut IterHandle<i32>,
+        out_item: *mut i32,
+        err: *mut FfiError,
+    ) -> i32;
+    fn runtime_SquaresIterator_destroy(iter: *mut IterHandle<i32>);
+    fn runtime_reentrant(err: *mut FfiError) -> *mut IterHandle<i32>;
+    fn runtime_ReentrantIterator_next(
+        iter: *mut IterHandle<i32>,
+        out_item: *mut i32,
+        err: *mut FfiError,
+    ) -> i32;
+    fn runtime_ReentrantIterator_destroy(iter: *mut IterHandle<i32>);
+
+    // bus
+    fn runtime_Ticker_value(this: *const bus::Ticker, err: *mut FfiError) -> i64;
+    fn runtime_Ticker_destroy(this: *mut bus::Ticker);
+    fn runtime_Bus_new(err: *mut FfiError) -> *const bus::Bus;
+    fn runtime_Bus_subscribe(
+        this: *const bus::Bus,
+        subscriber: CallbackArg<SubscriberVtable>,
+        err: *mut FfiError,
+    );
+    fn runtime_Bus_publish(
+        this: *const bus::Bus,
+        text: Run,
+        weight: i32,
+        err: *mut FfiError,
+    ) -> i64;
+    fn runtime_Bus_publish_later(
+        this: *const bus::Bus,
+        text: Run,
+        weight: i32,
+        callback: Option<Done<i64>>,
+        context: *mut c_void,
+    );
+    fn runtime_Bus_clear(this: *const bus::Bus, err: *mut FfiError);
+    fn runtime_Bus_destroy(this: *mut bus::Bus);
+    fn runtime_classify_once(
+        subscriber: CallbackArg<SubscriberVtable>,
+        weight: i32,
+        err: *mut FfiError,
+    ) -> i32;
+    fn runtime_tick(
+        subscriber: CallbackArg<SubscriberVtable>,
+        value: i64,
+        err: *mut FfiError,
+    ) -> u8;
+    fn runtime_classify_or_explain(
+        subscriber: CallbackArg<SubscriberVtable>,
+        weight: i32,
+        err: *mut FfiError,
+    ) -> Run;
+    fn runtime_tick_or_explain(
+        subscriber: CallbackArg<SubscriberVtable>,
+        value: i64,
+        err: *mut FfiError,
+    ) -> Run;
+    fn runtime_weigh_or_explain(
+        subscriber: CallbackArg<SubscriberVtable>,
+        weight: i32,
+        err: *mut FfiError,
+    ) -> Run;
+
+    // tasks
+    fn runtime_thread_tag(callback: Option<Done<Run>>, context: *mut c_void);
+    fn runtime_run_task(name: Run, callback: Option<Done<Run>>, context: *mut c_void);
+    fn runtime_shout(text: Run, callback: Option<Done<Run>>, context: *mut c_void);
+    fn runtime_checked_add(a: i32, b: i32, callback: Option<Done<i32>>, context: *mut c_void);
+    fn runtime_wait_forever(
+        cancel_token: *const FfiCancelToken,
+        callback: Option<Done<i32>>,
+        context: *mut c_void,
+    );
+    fn runtime_tidy(fail: u8, callback: Option<DoneUnit>, context: *mut c_void);
+
+    // outer
+    fn runtime_Session_open(id: i64, err: *mut FfiError) -> *const outer::Session;
+    fn runtime_Session_clone(this: *const outer::Session) -> *const outer::Session;
+    fn runtime_Session_destroy(this: *mut outer::Session);
+    fn runtime_share(session: *const outer::Session, err: *mut FfiError) -> *const outer::Session;
+    fn runtime_summarize(
+        session: *const outer::Session,
+        keep: *const outer::Session,
+        err: *mut FfiError,
+    ) -> Run;
+    fn runtime_attach(session: *const outer::Session, err: *mut FfiError) -> Run;
+    fn runtime_session_of(report: Run, err: *mut FfiError) -> *const outer::Session;
+    fn runtime_raise(level: i32, err: *mut FfiError) -> i32;
+
+    // vault
+    fn runtime_fetch(key: i64, err: *mut FfiError) -> i64;
+    fn runtime_fetch_any(key: i64, err: *mut FfiError) -> i64;
+    fn runtime_parse_int(text: Run, err: *mut FfiError) -> i64;
+    fn runtime_refuse(why: Run, err: *mut FfiError);
+
+    // legacy
+    fn runtime_add_one(value: i64, err: *mut FfiError) -> i64;
+    fn runtime_bump(value: i64, err: *mut FfiError) -> i64;
+
+    // counters
+    fn runtime_Counter_new(start: i64, err: *mut FfiError) -> *const counters::Counter;
+    fn runtime_Counter_with_step(
+        start: i64,
+        step: i64,
+        err: *mut FfiError,
+    ) -> *const counters::Counter;
+    fn runtime_Counter_increment(this: *const counters::Counter, err: *mut FfiError) -> i64;
+    fn runtime_Counter_value(this: *const counters::Counter, err: *mut FfiError) -> i64;
+    fn runtime_Counter_label(
+        this: *const counters::Counter,
+        prefix: Run,
+        err: *mut FfiError,
+    ) -> Run;
+    fn runtime_Counter_snapshot(
+        this: *const counters::Counter,
+        err: *mut FfiError,
+    ) -> *const counters::Counter;
+    fn runtime_Counter_share(
+        this: *const counters::Counter,
+        err: *mut FfiError,
+    ) -> *const counters::Counter;
+    fn runtime_Counter_larger(
+        this: *const counters::Counter,
+        other: *const counters::Counter,
+        floor: i64,
+        err: *mut FfiError,
+    ) -> *const counters::Counter;
+    fn runtime_Counter_fan_out(
+        this: *const counters::Counter,
+        n: i32,
+        err: *mut FfiError,
+    ) -> *mut IterHandle<Arc<counters::Counter>>;
+    fn runtime_Counter_FanOutIterator_next(
+        iter: *mut IterHandle<Arc<counters::Counter>>,
+        out_item: *mut *const counters::Counter,
+        err: *mut FfiError,
+    ) -> i32;
+    fn runtime_Counter_FanOutIterator_destroy(iter: *mut IterHandle<Arc<counters::Counter>>);
+    fn runtime_Counter_value_later(
+        this: *const counters::Counter,
+        callback: Option<Done<i64>>,
+        context: *mut c_void,
+    );
+    fn runtime_Counter_snapshot_later(
+        this: *const counters::Counter,
+        callback: Option<Done<*const counters::Counter>>,
+        context: *mut c_void,
+    );
+    fn runtime_Counter_explode(this: *const counters::Counter, err: *mut FfiError);
+    fn runtime_Counter_default_start(err: *mut FfiError) -> i64;
+    fn runtime_Counter_start_later(
+        start: i64,
+        callback: Option<Done<*const counters::Counter>>,
+        context: *mut c_void,
+    );
+    fn runtime_Counter_clone(this: *const counters::Counter) -> *const counters::Counter;
+    fn runtime_Counter_destroy(this: *mut counters::Counter);
+    fn runtime_read_twice(counter: *const counters::Counter, err: *mut FfiError) -> i64;
+
+    // quota
+    fn runtime_consume(amount: i64, err: *mut FfiError) -> i64;
+}
+
+// ── Consumer helpers ────────────────────────────────────────────────────
+
+/// An error slot full of garbage: a call overwrites `out_err` without
+/// reading it, so a consumer may pass uninitialized memory.
+fn garbage_err() -> MaybeUninit<FfiError> {
+    let mut slot = MaybeUninit::<FfiError>::uninit();
+    unsafe { std::ptr::write_bytes(slot.as_mut_ptr(), 0xA5, 1) };
+    slot
+}
+
+/// The message in `err`, or `""`.
+fn message(err: &FfiError) -> String {
+    unsafe { err.message_str() }.unwrap_or_default().to_string()
+}
+
+/// Read a failure's code and message, then release it, as a binding does.
+fn take_failure(err: &mut FfiError) -> (i32, String) {
+    let out = (err.code, message(err));
+    unsafe { runtime_error_clear(err) };
+    out
+}
+
+/// A borrowed string argument.
+fn text(s: &str) -> Run {
+    Run::borrowing(s.as_bytes())
+}
+
+/// A borrowed typed-array argument.
+fn array<T: Copy>(values: &[T]) -> Run {
+    Run::borrowing(unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values))
+    })
+}
+
+/// The value-buffer encoding of `value`.
+fn encode<T: FfiType<Tag>>(value: &T) -> Vec<u8> {
+    rt::encode(|w| value.write(w))
+}
+
+/// Copy a returned string and release its run.
+fn take_string(run: Run) -> String {
+    assert_eq!(run.ptr as usize % 8, 0, "every run is 8-aligned");
+    let s = unsafe { run.text() }.expect("valid UTF-8").to_string();
+    unsafe { runtime_run_free(run) };
+    s
+}
+
+/// Decode a returned value buffer and release its run.
+fn take<T: FfiType<Tag>>(run: Run) -> T {
+    assert!(!run.ptr.is_null(), "a returned buffer is never empty");
+    // SAFETY: a producer's return; its object tokens are ours to adopt, once.
+    let value = unsafe { rt::decode_run(run, |r| T::read(r)) }.expect("a well-formed buffer");
+    unsafe { runtime_run_free(run) };
+    value
+}
+
+/// A run the consumer allocates with `{prefix}_alloc` and hands to the
+/// producer, which adopts it (a callback method's return).
+fn give(bytes: &[u8]) -> Run {
+    if bytes.is_empty() {
+        return Run::EMPTY;
+    }
+    let ptr = unsafe { runtime_alloc(bytes.len()) };
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+    Run {
+        ptr,
+        len: bytes.len(),
+    }
+}
+
+/// Report a consumer failure through the exported `{prefix}_error_set`.
+fn fail(err: *mut FfiError, code: i32, msg: &str) {
+    unsafe { runtime_error_set(err, code, msg.as_ptr(), msg.len()) };
+}
+
+// ── Plain calls ─────────────────────────────────────────────────────────
+
 #[test]
-fn error_payload_fields_cross_the_abi() {
-    let mut err = ok_err();
-
-    // Success leaves the payload slots empty.
-    assert_eq!(unsafe { quota::runtime_quota_consume(30, &mut err) }, 70);
+fn scalar_call_sets_ok() {
+    let mut err = FfiError::default();
+    assert_eq!(unsafe { runtime_add(2, 40, &mut err) }, 42);
     assert_eq!(err.code, 0);
-    assert!(err.payload_ptr.is_null());
+    assert!(err.message_ptr.is_null());
+}
 
-    // A payload-carrying variant serializes its fields in declaration order.
-    let r = unsafe { quota::runtime_quota_consume(250, &mut err) };
-    assert_eq!(r, 0, "error path returns the zero sentinel");
-    assert_eq!(err.code, 3001);
-    assert_eq!(message(&err), "used 250 of 100");
+#[test]
+fn fallible_ok_and_err_paths_use_display_for_the_message() {
+    let mut err = FfiError::default();
+    assert_eq!(unsafe { runtime_checked_div(10, 2, &mut err) }, 5);
+    assert_eq!(err.code, 0);
+
+    let r = unsafe { runtime_checked_div(1, 0, &mut err) };
+    assert_eq!(r, 0, "a failure returns the zero value");
+    assert_eq!(
+        take_failure(&mut err),
+        (100, "cannot divide by zero".to_string()),
+        "the domain code and its Display output"
+    );
+    assert!(err.message_ptr.is_null(), "clear releases the message");
+}
+
+#[test]
+fn out_err_is_overwritten_never_read() {
+    // Success stores a cleared error over the garbage.
+    let mut slot = garbage_err();
+    assert_eq!(unsafe { runtime_add(1, 2, slot.as_mut_ptr()) }, 3);
+    let err = unsafe { slot.assume_init() };
+    assert_eq!(err.code, 0);
+    assert!(err.message_ptr.is_null() && err.payload_ptr.is_null());
+    assert_eq!((err.message_len, err.payload_len), (0, 0));
+
+    // A failure stores its code and message over the garbage, too.
+    let mut slot = garbage_err();
+    assert_eq!(unsafe { runtime_checked_div(1, 0, slot.as_mut_ptr()) }, 0);
+    let mut err = unsafe { slot.assume_init() };
+    assert_eq!(take_failure(&mut err).0, 100);
+
+    // A failure with a payload, and a marshalling failure.
+    let mut slot = garbage_err();
+    unsafe { runtime_consume(500, slot.as_mut_ptr()) };
+    let mut err = unsafe { slot.assume_init() };
     assert!(!err.payload_ptr.is_null());
-    let payload = unsafe { std::slice::from_raw_parts(err.payload_ptr, err.payload_len) };
-    let mut reader = abi::BufferReader::new(payload);
-    assert_eq!(reader.read_i64().unwrap(), 100, "limit field");
-    assert_eq!(reader.read_i64().unwrap(), 250, "used field");
-    reader.expect_end().unwrap();
-    unsafe { runtime_error_clear(&mut err) };
-    assert!(err.payload_ptr.is_null(), "clear releases the payload");
+    assert_eq!(take_failure(&mut err).0, 3001);
+    let mut slot = garbage_err();
+    unsafe { runtime_char_count(Run::borrowing(&[0xff]), slot.as_mut_ptr()) };
+    let mut err = unsafe { slot.assume_init() };
+    assert_eq!(take_failure(&mut err).0, rt::MARSHAL_ERROR_CODE);
 
-    // A unit variant reports code and message with no payload.
-    let r = unsafe { quota::runtime_quota_consume(-1, &mut err) };
-    assert_eq!(r, 0);
-    assert_eq!(err.code, 3002);
-    assert!(err.payload_ptr.is_null());
+    // So a struct reused across calls needs a clear only after a failure.
+    let mut err = FfiError::default();
+    for _ in 0..3 {
+        unsafe { runtime_checked_div(1, 0, &mut err) };
+        assert_eq!(take_failure(&mut err).0, 100);
+        assert_eq!(unsafe { runtime_add(1, 1, &mut err) }, 2);
+        assert_eq!(err.code, 0);
+    }
+}
+
+#[test]
+fn owned_string_round_trip() {
+    let mut err = FfiError::default();
+    let out = unsafe { runtime_greet(text("alice"), &mut err) };
+    assert_eq!(err.code, 0);
+    assert_eq!(take_string(out), "hi alice");
+}
+
+#[test]
+fn interior_nul_in_a_returned_string_round_trips() {
+    let mut err = FfiError::default();
+    let out = unsafe { runtime_greet(text("a\0b"), &mut err) };
+    assert_eq!(out.len, 6);
+    assert_eq!(take_string(out), "hi a\0b");
+}
+
+#[test]
+fn borrowed_params_are_not_copied() {
+    let mut err = FfiError::default();
+    // A slice of a larger buffer: not NUL-terminated, and borrowed in place.
+    let backing = "héllo world";
+    let slice = &backing[..6];
+    assert_eq!(unsafe { runtime_char_count(text(slice), &mut err) }, 5);
+    let addr = unsafe { runtime_text_addr(text(slice), &mut err) };
+    assert_eq!(
+        addr,
+        slice.as_ptr() as u64,
+        "the thunk lent the caller's bytes"
+    );
+
+    let data = [1u8, 2, 3];
+    let addr = unsafe { runtime_blob_addr(Run::borrowing(&data), &mut err) };
+    assert_eq!(addr, data.as_ptr() as u64);
+
+    let words = [1i64, 2, 3];
+    let addr = unsafe { runtime_words_addr(array(&words), &mut err) };
+    assert_eq!(addr, words.as_ptr() as u64, "a typed array is lent, too");
+
+    // An empty string may be passed as the empty run.
+    assert_eq!(unsafe { runtime_char_count(Run::EMPTY, &mut err) }, 0);
+    assert_eq!(err.code, 0);
+}
+
+#[test]
+fn malformed_runs_are_marshalling_errors() {
+    let mut err = FfiError::default();
+    let bad = [0xFFu8, 0xFE];
+    assert_eq!(
+        unsafe { runtime_char_count(Run::borrowing(&bad), &mut err) },
+        0
+    );
+    assert_eq!(take_failure(&mut err).0, rt::MARSHAL_ERROR_CODE);
+
+    let null_with_len = Run {
+        ptr: std::ptr::null(),
+        len: 3,
+    };
+    assert_eq!(unsafe { runtime_char_count(null_with_len, &mut err) }, 0);
+    let (code, msg) = take_failure(&mut err);
+    assert_eq!(code, rt::MARSHAL_ERROR_CODE);
+    assert!(msg.contains("null run"), "{msg}");
+
+    // A typed array whose length isn't a multiple of its element size, or
+    // that isn't aligned for it.
+    let words = [1i64, 2];
+    let ragged = Run {
+        len: 12,
+        ..array(&words)
+    };
+    assert_eq!(unsafe { runtime_words_addr(ragged, &mut err) }, 0);
+    assert_eq!(take_failure(&mut err).0, rt::MARSHAL_ERROR_CODE);
+    let shifted = Run {
+        ptr: unsafe { array(&words).ptr.add(4) },
+        len: 8,
+    };
+    assert_eq!(unsafe { runtime_words_addr(shifted, &mut err) }, 0);
+    let (code, msg) = take_failure(&mut err);
+    assert_eq!(code, rt::MARSHAL_ERROR_CODE);
+    assert!(msg.contains("aligned"), "{msg}");
+}
+
+#[test]
+fn optional_string_return_is_a_value_buffer() {
+    let mut err = FfiError::default();
+    let some = unsafe { runtime_maybe_name(1, &mut err) };
+    assert_eq!(take::<Option<String>>(some), Some("present".to_string()));
+    let none = unsafe { runtime_maybe_name(0, &mut err) };
+    assert_eq!(take::<Option<String>>(none), None);
+}
+
+#[test]
+fn scalar_list_param_is_a_typed_array() {
+    let mut err = FfiError::default();
+    assert_eq!(unsafe { runtime_sum(array(&[3i32, 4, 5]), &mut err) }, 12);
+    assert_eq!(unsafe { runtime_sum(Run::EMPTY, &mut err) }, 0);
+    assert_eq!(err.code, 0);
+    let null_with_len = Run {
+        ptr: std::ptr::null(),
+        len: 8,
+    };
+    assert_eq!(unsafe { runtime_sum(null_with_len, &mut err) }, 0);
+    assert_eq!(take_failure(&mut err).0, rt::MARSHAL_ERROR_CODE);
+}
+
+#[test]
+fn string_list_param_is_a_value_buffer() {
+    let mut err = FfiError::default();
+    let parts = encode(&vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    let out = unsafe { runtime_join(Run::borrowing(&parts), &mut err) };
+    assert_eq!(take_string(out), "a,b,c");
+}
+
+#[test]
+fn malformed_buffer_param_reports_an_error() {
+    let mut err = FfiError::default();
+    // A truncated encoding (a count with no elements) is rejected through
+    // `out_err`, never decoded partially.
+    let bad = [9u8, 0, 0, 0];
+    let joined = unsafe { runtime_join(Run::borrowing(&bad), &mut err) };
+    assert_eq!(joined, Run::EMPTY, "a failure returns the empty run");
+    assert_eq!(take_failure(&mut err).0, rt::MARSHAL_ERROR_CODE);
+
+    // Trailing bytes are malformed, too.
+    let mut parts = encode(&vec!["a".to_string()]);
+    parts.push(0);
+    unsafe { runtime_join(Run::borrowing(&parts), &mut err) };
+    assert_eq!(take_failure(&mut err).0, rt::MARSHAL_ERROR_CODE);
+}
+
+#[test]
+fn bytes_param() {
+    let mut err = FfiError::default();
+    let data = [1u8, 2, 3, 4, 5];
+    assert_eq!(
+        unsafe { runtime_byte_count(Run::borrowing(&data), &mut err) },
+        5
+    );
+}
+
+#[test]
+fn c_style_enum_in_and_out() {
+    let mut err = FfiError::default();
+    assert_eq!(unsafe { runtime_echo_color(2, &mut err) }, 2);
+    assert_eq!(err.code, 0);
+    assert_eq!(unsafe { runtime_echo_color(9, &mut err) }, 0);
+    let (code, msg) = take_failure(&mut err);
+    assert_eq!(code, rt::MARSHAL_ERROR_CODE);
+    assert_eq!(
+        msg, "c: 9 is not a valid Color",
+        "the parameter and its value"
+    );
+}
+
+#[test]
+fn bools_are_checked_bytes() {
+    let mut err = FfiError::default();
+    assert_eq!(unsafe { runtime_negate(1, &mut err) }, 0);
+    assert_eq!(unsafe { runtime_negate(0, &mut err) }, 1);
+    assert_eq!(err.code, 0);
+    // A byte other than 0 or 1 is a marshalling failure, not undefined
+    // behavior.
+    assert_eq!(unsafe { runtime_negate(2, &mut err) }, 0);
+    let (code, msg) = take_failure(&mut err);
+    assert_eq!(code, rt::MARSHAL_ERROR_CODE);
+    assert_eq!(msg, "flag: 2 is not a valid bool");
+    assert_eq!(unsafe { runtime_maybe_name(0xff, &mut err) }, Run::EMPTY);
+    assert_eq!(take_failure(&mut err).0, rt::MARSHAL_ERROR_CODE);
+
+    // An optional's `has` and an optional bool's value are checked too.
+    let r = unsafe { runtime_negate_opt(Opt::some(1), &mut err) };
+    assert_eq!((r.has, r.value), (1, 0));
+    let r = unsafe { runtime_negate_opt(Opt { has: 0, value: 0 }, &mut err) };
+    assert_eq!((r.has, r.value), (0, 0), "an absent value is 0");
+    for bad in [Opt { has: 2, value: 0 }, Opt { has: 1, value: 7 }] {
+        let r = unsafe { runtime_negate_opt(bad, &mut err) };
+        assert_eq!((r.has, r.value), (0, 0));
+        assert_eq!(take_failure(&mut err).0, rt::MARSHAL_ERROR_CODE);
+    }
+    let r = unsafe { runtime_next_color(Opt { has: 3, value: 0 }, &mut err) };
+    assert_eq!(r.has, 0);
+    assert_eq!(take_failure(&mut err).0, rt::MARSHAL_ERROR_CODE);
+}
+
+#[test]
+fn optional_enums_are_opt_i32() {
+    let mut err = FfiError::default();
+    let r = unsafe { runtime_next_color(Opt::some(2), &mut err) };
+    assert_eq!((r.has, r.value), (1, 0));
+    let r = unsafe { runtime_next_color(Opt { has: 0, value: 0 }, &mut err) };
+    assert_eq!((r.has, r.value), (0, 0));
+    // A present value is checked; an absent one is ignored.
+    let r = unsafe { runtime_next_color(Opt::some(7), &mut err) };
+    assert_eq!(r.has, 0);
+    assert_eq!(take_failure(&mut err).0, rt::MARSHAL_ERROR_CODE);
+    let r = unsafe { runtime_next_color(Opt { has: 0, value: 7 }, &mut err) };
+    assert_eq!((r.has, err.code), (0, 0));
+}
+
+#[test]
+fn record_buffer_round_trip() {
+    // A record is a value type: encoding and decoding must round-trip every
+    // field, including the optional and enum fields.
+    let original = demo::Point {
+        x: 7,
+        label: "corner".to_string(),
+        nickname: Some("nw".to_string()),
+        color: demo::Color::Blue,
+    };
+    let bytes = encode(&original);
+    let back: demo::Point =
+        unsafe { rt::decode_run(Run::borrowing(&bytes), |r| FfiType::<Tag>::read(r)) }.unwrap();
+    assert_eq!(back, original);
+}
+
+#[test]
+fn record_param_and_return_are_value_buffers() {
+    let mut err = FfiError::default();
+    let p = demo::Point {
+        x: 41,
+        label: "in".to_string(),
+        nickname: None,
+        color: demo::Color::Red,
+    };
+    let bytes = encode(&p);
+    assert_eq!(
+        unsafe { runtime_point_x(Run::borrowing(&bytes), &mut err) },
+        41
+    );
+    assert_eq!(err.code, 0);
+
+    let p: demo::Point = take(unsafe { runtime_make_point(99, &mut err) });
+    assert_eq!(err.code, 0);
+    assert_eq!(
+        p,
+        demo::Point {
+            x: 99,
+            label: "origin".to_string(),
+            nickname: None,
+            color: demo::Color::Green,
+        }
+    );
+}
+
+#[test]
+fn types_from_other_rust_modules_cross_by_their_own_family() {
+    let mut err = FfiError::default();
+    let c: warehouse::Crate = take(unsafe { runtime_make_crate(7, text("widget"), &mut err) });
+    assert_eq!(
+        c,
+        warehouse::Crate {
+            id: 7,
+            label: "widget".to_string()
+        }
+    );
+
+    // `dispatch` takes `warehouse::Crate` as a value buffer.
+    let bytes = encode(&c);
+    assert_eq!(
+        unsafe { runtime_crate_id(Run::borrowing(&bytes), &mut err) },
+        7
+    );
+    let c2: warehouse::Crate =
+        take(unsafe { runtime_relabel(Run::borrowing(&bytes), text("gadget"), &mut err) });
+    assert_eq!((c2.id, c2.label.as_str()), (7, "gadget"));
+
+    // ...and `demo::Color` as its discriminant: a C-style enum crosses
+    // directly wherever it's declared.
+    assert_eq!(unsafe { runtime_is_red(0, &mut err) }, 1);
+    assert_eq!(unsafe { runtime_is_red(2, &mut err) }, 0);
+    assert_eq!(unsafe { runtime_is_red(5, &mut err) }, 0);
+    assert_eq!(take_failure(&mut err).0, rt::MARSHAL_ERROR_CODE);
+}
+
+#[test]
+fn map_param_and_return_are_value_buffers() {
+    use std::collections::BTreeMap;
+    let mut err = FfiError::default();
+    let scores = BTreeMap::from([("a".to_string(), 2i32), ("b".to_string(), 1)]);
+    let bytes = encode(&scores);
+
+    let doubled: BTreeMap<String, i32> =
+        take(unsafe { runtime_double_scores(Run::borrowing(&bytes), &mut err) });
+    assert_eq!(err.code, 0);
+    assert_eq!(
+        doubled,
+        BTreeMap::from([("a".to_string(), 4), ("b".to_string(), 2)])
+    );
+    assert_eq!(
+        unsafe { runtime_total_scores(Run::borrowing(&bytes), &mut err) },
+        3
+    );
+}
+
+#[test]
+fn duplicate_map_keys_are_marshalling_errors() {
+    let mut err = FfiError::default();
+    let mut w = BufferWriter::new();
+    w.write_len(2);
+    for v in [1i32, 2] {
+        w.write_string("same");
+        w.write_i32(v);
+    }
+    let bytes = w.finish();
+    assert_eq!(
+        unsafe { runtime_total_scores(Run::borrowing(&bytes), &mut err) },
+        0
+    );
+    let (code, msg) = take_failure(&mut err);
+    assert_eq!(code, rt::MARSHAL_ERROR_CODE);
+    assert!(msg.contains("duplicate map key"), "{msg}");
+}
+
+#[test]
+fn record_optional_field_round_trips() {
+    for w in [
+        build::Widget {
+            name: "bolt".to_string(),
+            qty: 7,
+            note: Some("aisle 4".to_string()),
+        },
+        build::Widget {
+            name: "nut".to_string(),
+            qty: 1,
+            note: None,
+        },
+    ] {
+        let bytes = encode(&w);
+        let back: build::Widget =
+            unsafe { rt::decode_run(Run::borrowing(&bytes), |r| FfiType::<Tag>::read(r)) }.unwrap();
+        assert_eq!(back, w);
+    }
+}
+
+#[test]
+fn rich_enum_encodes_tag_then_fields() {
+    // The encoding leads with the i32 tag (declaration order: Empty = 0,
+    // Circle = 1, Labeled = 2), then the active variant's fields.
+    assert_eq!(encode(&geom::Shape::Empty), [0, 0, 0, 0]);
+
+    let circle = encode(&geom::Shape::Circle { radius: 2.5 });
+    assert_eq!(&circle[..4], [1, 0, 0, 0]);
+    assert_eq!(circle.len(), 4 + 8, "tag + f64 radius");
+
+    let labeled = geom::Shape::Labeled {
+        label: "hex".to_string(),
+        count: 6,
+    };
+    let bytes = encode(&labeled);
+    assert_eq!(&bytes[..4], [2, 0, 0, 0]);
+    let back: geom::Shape =
+        unsafe { rt::decode_run(Run::borrowing(&bytes), |r| FfiType::<Tag>::read(r)) }.unwrap();
+    assert_eq!(back, labeled);
+
+    // An out-of-range tag is a decode error, not a silent default.
+    let bad = [9u8, 0, 0, 0];
+    let r = unsafe {
+        rt::decode_run(Run::borrowing(&bad), |r| {
+            <geom::Shape as FfiType<Tag>>::read(r)
+        })
+    };
+    assert!(r.is_err());
+}
+
+#[test]
+fn rich_enum_param_is_a_value_buffer() {
+    let mut err = FfiError::default();
+    let circle = encode(&geom::Shape::Circle { radius: 2.5 });
+    let d = unsafe { runtime_describe_shape(Run::borrowing(&circle), &mut err) };
+    assert_eq!(err.code, 0);
+    assert_eq!(take_string(d), "circle(2.5)");
+    let bad = [9u8, 0, 0, 0];
+    unsafe { runtime_describe_shape(Run::borrowing(&bad), &mut err) };
+    assert_eq!(take_failure(&mut err).0, rt::MARSHAL_ERROR_CODE);
+}
+
+// ── Iterators ───────────────────────────────────────────────────────────
+
+#[test]
+fn iterator_string_elements() {
+    let mut err = FfiError::default();
+    let iter = unsafe { runtime_greetings(3, &mut err) };
+    assert_eq!(err.code, 0);
+    assert!(!iter.is_null());
+
+    let mut got = Vec::new();
+    loop {
+        let mut item = Run::EMPTY;
+        let has = unsafe { runtime_GreetingsIterator_next(iter, &mut item, &mut err) };
+        assert_eq!(err.code, 0);
+        if has == 0 {
+            break;
+        }
+        assert_eq!(has, 1);
+        got.push(take_string(item));
+    }
+    // Exhausted stays exhausted.
+    let mut item = Run::EMPTY;
+    assert_eq!(
+        unsafe { runtime_GreetingsIterator_next(iter, &mut item, &mut err) },
+        0
+    );
+    unsafe { runtime_GreetingsIterator_destroy(iter) };
+    assert_eq!(got, ["hi 0", "hi 1", "hi 2"]);
+}
+
+#[test]
+fn iterator_scalar_elements() {
+    let mut err = FfiError::default();
+    let iter = unsafe { runtime_squares(4, &mut err) };
+    let mut got = Vec::new();
+    let mut item = 0i32;
+    while unsafe { runtime_SquaresIterator_next(iter, &mut item, &mut err) } == 1 {
+        got.push(item);
+    }
+    assert_eq!(err.code, 0);
+    unsafe { runtime_SquaresIterator_destroy(iter) };
+    assert_eq!(got, [0, 1, 4, 9]);
+}
+
+#[test]
+fn iterator_next_checks_its_arguments_before_pulling() {
+    let mut err = FfiError::default();
+    let iter = unsafe { runtime_squares(2, &mut err) };
+    // A null `out_item` fails before an element is pulled, so none is lost.
+    let r = unsafe { runtime_SquaresIterator_next(iter, std::ptr::null_mut(), &mut err) };
+    assert_eq!((r, take_failure(&mut err).0), (0, rt::MARSHAL_ERROR_CODE));
+    let mut item = -1;
+    assert_eq!(
+        unsafe { runtime_SquaresIterator_next(iter, &mut item, &mut err) },
+        1
+    );
+    assert_eq!(item, 0, "the first element is still there");
+    unsafe { runtime_SquaresIterator_destroy(iter) };
+
+    // A null iterator is a marshalling failure, and destroying null a no-op.
+    let r = unsafe { runtime_SquaresIterator_next(std::ptr::null_mut(), &mut item, &mut err) };
+    assert_eq!((r, take_failure(&mut err).0), (0, rt::MARSHAL_ERROR_CODE));
+    unsafe { runtime_SquaresIterator_destroy(std::ptr::null_mut()) };
+}
+
+#[test]
+fn concurrent_iterator_next_yields_each_element_once_or_reports_busy() {
+    const N: i32 = 2000;
+    let mut err = FfiError::default();
+    let iter = unsafe { runtime_squares(N, &mut err) };
+    let addr = iter as usize;
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(move || {
+                let iter = addr as *mut IterHandle<i32>;
+                let mut err = FfiError::default();
+                let mut got = Vec::new();
+                loop {
+                    let mut item = 0i32;
+                    let has = unsafe { runtime_SquaresIterator_next(iter, &mut item, &mut err) };
+                    // A `_next` racing another fails instead of blocking.
+                    if err.code == rt::MARSHAL_ERROR_CODE {
+                        unsafe { runtime_error_clear(&mut err) };
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    assert_eq!(err.code, 0);
+                    if has == 0 {
+                        break got;
+                    }
+                    got.push(item);
+                }
+            })
+        })
+        .collect();
+    let mut all: Vec<i32> = threads
+        .into_iter()
+        .flat_map(|t| t.join().unwrap())
+        .collect();
+    all.sort_unstable();
+    assert_eq!(all, (0..N).map(|i| i * i).collect::<Vec<_>>());
+    unsafe { runtime_SquaresIterator_destroy(iter) };
+}
+
+#[test]
+fn a_reentrant_next_fails_instead_of_deadlocking() {
+    let mut err = FfiError::default();
+    let iter = unsafe { runtime_reentrant(&mut err) };
+    stream::REENTRANT_HANDLE.store(iter as usize, Ordering::SeqCst);
+    let mut got = Vec::new();
+    let mut item = 0i32;
+    while unsafe { runtime_ReentrantIterator_next(iter, &mut item, &mut err) } == 1 {
+        assert_eq!(err.code, 0);
+        got.push(item);
+    }
+    unsafe { runtime_ReentrantIterator_destroy(iter) };
+    assert_eq!(got, vec![rt::MARSHAL_ERROR_CODE; 3]);
+}
+
+// ── Callback interfaces ─────────────────────────────────────────────────
+
+/// The consumer's `Subscriber` vtable, laid out as the generated header
+/// declares it: the header, then one nullable entry per method.
+#[repr(C)]
+pub struct SubscriberVtable {
+    header: VtableHeader,
+    on_message: Option<unsafe extern "C" fn(*mut c_void, Run, i32, Run, *mut FfiError) -> i64>,
+    classify: Option<unsafe extern "C" fn(*mut c_void, i32, *mut FfiError) -> i32>,
+    on_ticker: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *const bus::Ticker,
+            *const bus::Ticker,
+            *mut FfiError,
+        ) -> u8,
+    >,
+    weigh: Option<unsafe extern "C" fn(*mut c_void, i32, *mut FfiError) -> i64>,
+}
+
+/// A consumer-side `Subscriber`: the context is a heap-allocated `SubState`
+/// and the vtable a process-wide static, exactly as a binding does it.
+mod consumer_subscriber {
+    use super::*;
+    use std::sync::atomic::AtomicI64;
+
+    pub struct SubState {
+        pub total: AtomicI64,
+        pub fail_at: i32,
+        pub last_topic: std::sync::Mutex<Option<String>>,
+        pub freed: Arc<AtomicUsize>,
+    }
+
+    unsafe extern "C" fn on_message(
+        ctx: *mut c_void,
+        text: Run,
+        weight: i32,
+        envelope: Run,
+        out_err: *mut FfiError,
+    ) -> i64 {
+        let state = unsafe { &*ctx.cast::<SubState>() };
+        // Arguments are lent for the call: read them, don't free them.
+        let text = unsafe { text.text() }.unwrap();
+        let env: bus::Envelope =
+            unsafe { rt::decode_run(envelope, |r| FfiType::<Tag>::read(r)) }.unwrap();
+        *state.last_topic.lock().unwrap() = env.topic.clone();
+        if weight == state.fail_at {
+            fail(out_err, -1, &format!("subscriber rejected {text}"));
+            return 0;
+        }
+        state.total.fetch_add(i64::from(weight), Ordering::Relaxed) + i64::from(weight)
+    }
+
+    unsafe extern "C" fn classify(_ctx: *mut c_void, weight: i32, _err: *mut FfiError) -> i32 {
+        match weight {
+            // An out-of-range return the producer can't accept.
+            99 => 42,
+            w => i32::from(w > 5),
+        }
+    }
+
+    unsafe extern "C" fn on_ticker(
+        _ctx: *mut c_void,
+        ticker: *const bus::Ticker,
+        alt: *const bus::Ticker,
+        _err: *mut FfiError,
+    ) -> u8 {
+        // Object arguments move one strong reference: the consumer adopts
+        // each non-null pointer and owes exactly one `_destroy`.
+        let mut err = FfiError::default();
+        unsafe {
+            let v = runtime_Ticker_value(ticker, &mut err);
+            runtime_Ticker_destroy(ticker.cast_mut());
+            let alt_ok = if alt.is_null() {
+                true
+            } else {
+                let same = runtime_Ticker_value(alt, &mut err) == v;
+                runtime_Ticker_destroy(alt.cast_mut());
+                same
+            };
+            match v {
+                // A bool byte the producer can't accept.
+                7 => 2,
+                v => u8::from(v == 42 && alt_ok),
+            }
+        }
+    }
+
+    unsafe extern "C" fn weigh(ctx: *mut c_void, weight: i32, out_err: *mut FfiError) -> i64 {
+        let state = unsafe { &*ctx.cast::<SubState>() };
+        if weight == state.fail_at {
+            fail(out_err, rt::FOREIGN_ERROR_CODE, "too heavy");
+            return 0;
+        }
+        i64::from(weight) * 10
+    }
+
+    unsafe extern "C" fn free(ctx: *mut c_void) {
+        let state = unsafe { Box::from_raw(ctx.cast::<SubState>()) };
+        state.freed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    const fn vtable(size: usize) -> SubscriberVtable {
+        SubscriberVtable {
+            header: VtableHeader {
+                size: size as u32,
+                flags: 0,
+                free: Some(free),
+            },
+            on_message: Some(on_message),
+            classify: Some(classify),
+            on_ticker: Some(on_ticker),
+            weigh: Some(weigh),
+        }
+    }
+
+    pub static VTABLE: SubscriberVtable = vtable(std::mem::size_of::<SubscriberVtable>());
+
+    /// A binding generated when the interface had only `on_message`: its
+    /// `size` ends after that entry.
+    pub static SHORT_VTABLE: SubscriberVtable = vtable(
+        std::mem::offset_of!(SubscriberVtable, on_message)
+            + std::mem::size_of::<Option<unsafe extern "C" fn()>>(),
+    );
+
+    /// A binding that leaves `weigh` unimplemented (null).
+    pub static NULL_SLOT_VTABLE: SubscriberVtable = SubscriberVtable {
+        weigh: None,
+        ..vtable(std::mem::size_of::<SubscriberVtable>())
+    };
+
+    /// A vtable whose `size` doesn't even cover its header.
+    pub static TRUNCATED_VTABLE: SubscriberVtable = vtable(8);
+
+    pub fn arg(
+        vtable: &'static SubscriberVtable,
+        fail_at: i32,
+        freed: &Arc<AtomicUsize>,
+    ) -> CallbackArg<SubscriberVtable> {
+        CallbackArg {
+            ctx: Box::into_raw(Box::new(SubState {
+                total: AtomicI64::new(0),
+                fail_at,
+                last_topic: std::sync::Mutex::new(None),
+                freed: Arc::clone(freed),
+            }))
+            .cast(),
+            vtable,
+        }
+    }
+
+    pub fn sub(fail_at: i32, freed: &Arc<AtomicUsize>) -> CallbackArg<SubscriberVtable> {
+        arg(&VTABLE, fail_at, freed)
+    }
+}
+
+#[test]
+fn callback_interface_sync_paths() {
+    use consumer_subscriber::sub;
+    let freed = Arc::new(AtomicUsize::new(0));
+    let mut err = FfiError::default();
+
+    // An enum return through a callback the call doesn't retain: `free` runs
+    // as soon as the thunk drops its `Arc<dyn Subscriber>`.
+    assert_eq!(
+        unsafe { runtime_classify_once(sub(-1, &freed), 9, &mut err) },
+        1
+    );
+    assert_eq!(err.code, 0);
+    assert_eq!(freed.load(Ordering::SeqCst), 1);
+
+    // Objects move producer to consumer as owned references.
+    assert_eq!(unsafe { runtime_tick(sub(-1, &freed), 42, &mut err) }, 1);
+    assert_eq!(err.code, 0);
+    assert_eq!(freed.load(Ordering::SeqCst), 2);
+
+    // A null vtable is a marshalling error, not a crash.
+    let none = CallbackArg::<SubscriberVtable> {
+        ctx: std::ptr::null_mut(),
+        vtable: std::ptr::null(),
+    };
+    assert_eq!(unsafe { runtime_classify_once(none, 1, &mut err) }, 0);
+    let (code, msg) = take_failure(&mut err);
+    assert_eq!(code, rt::MARSHAL_ERROR_CODE);
+    assert!(msg.contains("null"), "{msg}");
+}
+
+#[test]
+fn callback_returns_the_producer_cant_accept_are_marshalling_failures() {
+    use consumer_subscriber::sub;
+    let freed = Arc::new(AtomicUsize::new(0));
+    let mut err = FfiError::default();
+
+    // A bool return byte other than 0 or 1.
+    let out = unsafe { runtime_tick_or_explain(sub(-1, &freed), 7, &mut err) };
+    assert_eq!(
+        take_string(out),
+        "err -3: a callback interface returned an invalid value: 2 is not a valid bool"
+    );
+    // An enum return that names no variant.
+    let out = unsafe { runtime_classify_or_explain(sub(-1, &freed), 99, &mut err) };
+    assert_eq!(
+        take_string(out),
+        "err -3: a callback interface returned an invalid value: 42 is not a valid Priority"
+    );
+    assert_eq!(err.code, 0);
+    assert_eq!(freed.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_short_vtable_is_accepted_and_its_missing_methods_fail_with_minus_4() {
+    use consumer_subscriber::{arg, NULL_SLOT_VTABLE, SHORT_VTABLE};
+    let freed = Arc::new(AtomicUsize::new(0));
+    let mut err = FfiError::default();
+
+    // A method past the consumer's `size` fails without being called, and
+    // the message names it.
+    let out = unsafe { runtime_classify_or_explain(arg(&SHORT_VTABLE, -1, &freed), 9, &mut err) };
+    assert_eq!(
+        take_string(out),
+        "err -4: the binding doesn't implement callback method `classify`; regenerate it"
+    );
+    let out = unsafe { runtime_weigh_or_explain(arg(&SHORT_VTABLE, -1, &freed), 9, &mut err) };
+    assert!(take_string(out).contains("`weigh`"));
+
+    // The methods the short vtable has still work.
+    let b = unsafe { runtime_Bus_new(&mut err) };
+    unsafe { runtime_Bus_subscribe(b, arg(&SHORT_VTABLE, -1, &freed), &mut err) };
+    assert_eq!(unsafe { runtime_Bus_publish(b, text("x"), 4, &mut err) }, 4);
+    assert_eq!(err.code, 0);
+    unsafe { runtime_Bus_destroy(b.cast_mut()) };
+
+    // A null entry is a method the binding doesn't implement, too.
+    let out = unsafe { runtime_weigh_or_explain(arg(&NULL_SLOT_VTABLE, -1, &freed), 9, &mut err) };
+    assert_eq!(
+        take_string(out),
+        "err -4: the binding doesn't implement callback method `weigh`; regenerate it"
+    );
+
+    // Propagated with `?`, the failure fails the producer's call.
+    assert_eq!(
+        unsafe { runtime_classify_once(arg(&SHORT_VTABLE, -1, &freed), 9, &mut err) },
+        0
+    );
+    let (code, msg) = take_failure(&mut err);
+    assert_eq!(code, rt::GENERIC_ERROR_CODE, "`ForeignError` throws any");
+    assert!(msg.contains("`classify`"), "{msg}");
+
+    assert_eq!(
+        freed.load(Ordering::SeqCst),
+        5,
+        "every context was released"
+    );
+}
+
+#[test]
+fn a_vtable_shorter_than_its_header_fails_the_call_with_minus_3() {
+    use consumer_subscriber::{arg, TRUNCATED_VTABLE};
+    let freed = Arc::new(AtomicUsize::new(0));
+    let mut err = FfiError::default();
+    let cb = arg(&TRUNCATED_VTABLE, -1, &freed);
+    assert_eq!(unsafe { runtime_classify_once(cb, 9, &mut err) }, 0);
+    let (code, msg) = take_failure(&mut err);
+    assert_eq!(code, rt::MARSHAL_ERROR_CODE);
+    assert_eq!(
+        msg,
+        "subscriber: a callback vtable is 8 bytes, shorter than its header"
+    );
+    // The header (and its `free`) couldn't be read, so the context is still
+    // the consumer's.
+    assert_eq!(freed.load(Ordering::SeqCst), 0);
+    drop(unsafe { Box::from_raw(cb.ctx.cast::<consumer_subscriber::SubState>()) });
+}
+
+#[test]
+fn callback_failures_return_as_values() {
+    use consumer_subscriber::sub;
+    let freed = Arc::new(AtomicUsize::new(0));
+    let mut err = FfiError::default();
+
+    let out = unsafe { runtime_weigh_or_explain(sub(3, &freed), 2, &mut err) };
+    assert_eq!(err.code, 0);
+    assert_eq!(take_string(out), "ok 20");
+
+    // The consumer fails, the producer sees an `Err`, and the call itself
+    // succeeds: nothing unwound.
+    let out = unsafe { runtime_weigh_or_explain(sub(3, &freed), 3, &mut err) };
+    assert_eq!(err.code, 0);
+    assert_eq!(take_string(out), "err -4: too heavy");
+    assert_eq!(freed.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn callback_interface_retained_and_foreign_error() {
+    use consumer_subscriber::sub;
+    let freed = Arc::new(AtomicUsize::new(0));
+    let mut err = FfiError::default();
+
+    let b = unsafe { runtime_Bus_new(&mut err) };
+    assert!(!b.is_null());
+    unsafe {
+        runtime_Bus_subscribe(b, sub(7, &freed), &mut err);
+        runtime_Bus_subscribe(b, sub(-1, &freed), &mut err);
+    }
+    assert_eq!(err.code, 0);
+    assert_eq!(freed.load(Ordering::SeqCst), 0, "retained by the bus");
+
+    let publish = |weight: i32, err: &mut FfiError| unsafe {
+        runtime_Bus_publish(b, text("hi"), weight, err)
+    };
+    assert_eq!(publish(3, &mut err), 6);
+    assert_eq!(err.code, 0);
+    assert_eq!(publish(5, &mut err), 16);
+
+    // The first subscriber fails on weight 7: the producer call is aborted
+    // and the consumer's own message comes back. `publish` throws `any`
+    // (`ForeignError` isn't a domain), so the code is the generic one.
+    assert_eq!(publish(7, &mut err), 0);
+    assert_eq!(
+        take_failure(&mut err),
+        (rt::GENERIC_ERROR_CODE, "subscriber rejected hi".to_string())
+    );
+
+    // The bus is still usable afterwards.
+    assert_eq!(publish(1, &mut err), 18);
+    assert_eq!(err.code, 0);
+
+    unsafe { runtime_Bus_clear(b, &mut err) };
+    assert_eq!(freed.load(Ordering::SeqCst), 2, "free runs once each");
+    unsafe { runtime_Bus_destroy(b.cast_mut()) };
+}
+
+/// The consumer's `Source` vtable.
+#[repr(C)]
+pub struct SourceVtable {
+    header: VtableHeader,
+    name: Option<unsafe extern "C" fn(*mut c_void, *mut FfiError) -> Run>,
+    blob: Option<unsafe extern "C" fn(*mut c_void, *mut FfiError) -> Run>,
+    card: Option<unsafe extern "C" fn(*mut c_void, Run, *mut FfiError) -> Run>,
+    token: Option<unsafe extern "C" fn(*mut c_void, *mut FfiError) -> *const rich::Token>,
+    maybe_token: Option<unsafe extern "C" fn(*mut c_void, *mut FfiError) -> *const rich::Token>,
+    lookup: Option<unsafe extern "C" fn(*mut c_void, Run, *mut FfiError) -> i64>,
 }
 
 /// A consumer-side `Source`: returns of every family, allocated with the
 /// exported `{prefix}_alloc`, and typed failures with a payload.
 mod consumer_source {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    unsafe fn give(bytes: &[u8], out_ptr: *mut *mut u8, out_len: *mut usize) {
-        let run = super::runtime_alloc(bytes.len());
-        unsafe {
-            if !bytes.is_empty() {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), run, bytes.len());
-            }
-            *out_ptr = run;
-            *out_len = bytes.len();
-        }
+    unsafe extern "C" fn name(_ctx: *mut c_void, _err: *mut FfiError) -> Run {
+        give(b"src")
     }
 
-    unsafe extern "C" fn name(
-        _ctx: *mut c_void,
-        out_ptr: *mut *mut u8,
-        out_len: *mut usize,
-        _err: *mut FfiError,
-    ) {
-        unsafe { give(b"src", out_ptr, out_len) };
+    unsafe extern "C" fn blob(_ctx: *mut c_void, _err: *mut FfiError) -> Run {
+        give(&[1, 2])
     }
 
-    unsafe extern "C" fn blob(
-        _ctx: *mut c_void,
-        out_ptr: *mut *mut u8,
-        out_len: *mut usize,
-        _err: *mut FfiError,
-    ) {
-        unsafe { give(&[1, 2], out_ptr, out_len) };
-    }
-
-    unsafe extern "C" fn card(
-        _ctx: *mut c_void,
-        key_ptr: *const u8,
-        key_len: usize,
-        out_ptr: *mut *mut u8,
-        out_len: *mut usize,
-        _err: *mut FfiError,
-    ) {
-        let key = unsafe { abi::lift_string(key_ptr, key_len) }.unwrap();
-        let card = rich::Card {
+    unsafe extern "C" fn card(_ctx: *mut c_void, key: Run, _err: *mut FfiError) -> Run {
+        let key = unsafe { key.text() }.unwrap();
+        give(&encode(&rich::Card {
             name: format!("card-{key}"),
             tags: vec!["t".into()],
-        };
-        unsafe { give(&abi::encode_value(&card), out_ptr, out_len) };
+        }))
     }
 
-    unsafe extern "C" fn token(_ctx: *mut c_void, _err: *mut FfiError) -> *mut rich::Token {
+    unsafe extern "C" fn token(_ctx: *mut c_void, _err: *mut FfiError) -> *const rich::Token {
         let mut err = FfiError::default();
-        unsafe { rich::runtime_rich_Token_new(5, &mut err) }
+        unsafe { runtime_Token_new(5, &mut err) }
     }
 
-    unsafe extern "C" fn maybe_token(_ctx: *mut c_void, _err: *mut FfiError) -> *mut rich::Token {
-        std::ptr::null_mut()
+    unsafe extern "C" fn maybe_token(_ctx: *mut c_void, _err: *mut FfiError) -> *const rich::Token {
+        std::ptr::null()
     }
 
-    unsafe extern "C" fn lookup(
-        _ctx: *mut c_void,
-        key_ptr: *const u8,
-        key_len: usize,
-        out_err: *mut FfiError,
-    ) -> i64 {
-        let key = unsafe { abi::lift_string(key_ptr, key_len) }.unwrap();
-        let fail = |code: i32, payload: Option<&str>| unsafe {
-            let msg = format!("failed {key}");
-            super::runtime_error_set(out_err, code, msg.as_ptr(), msg.len());
+    unsafe extern "C" fn lookup(_ctx: *mut c_void, key: Run, out_err: *mut FfiError) -> i64 {
+        let key = unsafe { key.text() }.unwrap();
+        let fail_with = |code: i32, payload: Option<&str>| {
+            fail(out_err, code, &format!("failed {key}"));
             if let Some(p) = payload {
-                let fields = abi::encode_value(&p.to_string());
-                super::runtime_error_set_payload(out_err, fields.as_ptr(), fields.len());
+                let fields = encode(&p.to_string());
+                unsafe { runtime_error_set_payload(out_err, fields.as_ptr(), fields.len()) };
             }
         };
-        match key.as_str() {
-            "missing" => fail(1, Some("missing")),
-            "busy" => fail(2, None),
-            "bogus" => fail(99, None),
-            "trap" => fail(-1, None),
+        match key {
+            "missing" => fail_with(1, Some("missing")),
+            "busy" => fail_with(2, None),
+            // A declared code whose payload doesn't decode.
+            "garbled" => fail_with(1, None),
+            "bogus" => fail_with(99, None),
+            "trap" => fail_with(-1, None),
             _ => return 42,
         }
         0
@@ -2471,54 +2321,43 @@ mod consumer_source {
         FREED.fetch_add(1, Ordering::SeqCst);
     }
 
-    pub static VTABLE: rich::runtime_rich_Source_vtable = rich::runtime_rich_Source_vtable {
-        header: abi::VtableHeader {
-            size: std::mem::size_of::<rich::runtime_rich_Source_vtable>() as u32,
+    pub static VTABLE: SourceVtable = SourceVtable {
+        header: VtableHeader {
+            size: std::mem::size_of::<SourceVtable>() as u32,
             flags: 0,
-            free,
+            free: Some(free),
         },
-        name,
-        blob,
-        card,
-        token,
-        maybe_token,
-        lookup,
+        name: Some(name),
+        blob: Some(blob),
+        card: Some(card),
+        token: Some(token),
+        maybe_token: Some(maybe_token),
+        lookup: Some(lookup),
     };
+
+    pub fn arg() -> CallbackArg<SourceVtable> {
+        CallbackArg {
+            ctx: std::ptr::null_mut(),
+            vtable: &VTABLE,
+        }
+    }
 }
 
 #[test]
 fn callback_returns_of_every_family_are_adopted() {
-    let mut err = ok_err();
-    let mut len = 0usize;
-    let ptr = unsafe {
-        rich::runtime_rich_describe(
-            std::ptr::null_mut(),
-            &consumer_source::VTABLE,
-            &mut len,
-            &mut err,
-        )
-    };
+    let mut err = FfiError::default();
+    let out = unsafe { runtime_describe_source(consumer_source::arg(), &mut err) };
     assert_eq!(err.code, 0, "{}", message(&err));
-    assert_eq!(take_string(ptr, len), r#"src [1, 2] card-k:["t"] 5 false"#);
+    assert_eq!(take_string(out), r#"src [1, 2] card-k:["t"] 5 false"#);
 }
 
 #[test]
 fn throwing_callbacks_report_typed_domain_errors() {
     let lookup = |key: &str| {
-        let mut err = ok_err();
-        let mut len = 0usize;
-        let ptr = unsafe {
-            rich::runtime_rich_lookup_via(
-                std::ptr::null_mut(),
-                &consumer_source::VTABLE,
-                key.as_ptr(),
-                key.len(),
-                &mut len,
-                &mut err,
-            )
-        };
+        let mut err = FfiError::default();
+        let out = unsafe { runtime_lookup_via(consumer_source::arg(), text(key), &mut err) };
         assert_eq!(err.code, 0);
-        take_string(ptr, len)
+        take_string(out)
     };
     assert_eq!(lookup("a"), "ok 42");
     assert_eq!(
@@ -2527,52 +2366,290 @@ fn throwing_callbacks_report_typed_domain_errors() {
         "code 1 with its payload"
     );
     assert_eq!(lookup("busy"), "busy");
-    // An undeclared positive code, or any negative one, is a foreign failure.
+    // A declared code without its payload, an undeclared positive code, or
+    // any negative one is a foreign failure.
+    assert_eq!(lookup("garbled"), "foreign -4: failed garbled");
     assert_eq!(lookup("bogus"), "foreign -4: failed bogus");
     assert_eq!(lookup("trap"), "foreign -4: failed trap");
 }
 
 #[test]
 fn optional_callback_parameters_accept_null() {
-    let label = "x";
-    let mut err = ok_err();
-    let mut len = 0usize;
-    let none = unsafe {
-        rich::runtime_rich_has_source(
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            label.as_ptr(),
-            label.len(),
-            &mut len,
-            &mut err,
-        )
+    let mut err = FfiError::default();
+    let none = CallbackArg::<SourceVtable> {
+        ctx: std::ptr::null_mut(),
+        vtable: std::ptr::null(),
     };
-    assert_eq!(take_string(none, len), "x:false");
-    let some = unsafe {
-        rich::runtime_rich_has_source(
-            std::ptr::null_mut(),
-            &consumer_source::VTABLE,
-            label.as_ptr(),
-            label.len(),
-            &mut len,
-            &mut err,
-        )
+    assert_eq!(
+        take_string(unsafe { runtime_has_source(none, text("x"), &mut err) }),
+        "x:false"
+    );
+    assert_eq!(
+        take_string(unsafe { runtime_has_source(consumer_source::arg(), text("x"), &mut err) }),
+        "x:true"
+    );
+    assert_eq!(unsafe { runtime_always(&mut err) }, 1);
+}
+
+// ── Async ───────────────────────────────────────────────────────────────
+
+type Completion<T> = mpsc::Sender<(i32, String, T)>;
+
+/// Box a sender as an async `context`; reclaim it with [`drop_ctx`].
+fn new_ctx<T>(tx: Completion<T>) -> *mut c_void {
+    Box::into_raw(Box::new(tx)).cast()
+}
+
+fn drop_ctx<T>(ctx: *mut c_void) {
+    drop(unsafe { Box::from_raw(ctx.cast::<Completion<T>>()) });
+}
+
+/// Copy a consumer-owned async error and release it with `error_free`.
+fn take_async_err(err: *mut FfiError) -> (i32, String) {
+    if err.is_null() {
+        return (0, String::new());
+    }
+    let out = unsafe { ((*err).code, message(&*err)) };
+    unsafe { runtime_error_free(err) };
+    out
+}
+
+fn send<T>(ctx: *mut c_void, err: *mut FfiError, value: T) {
+    // Clone the sender before sending: the test may free the context as
+    // soon as the value arrives, which can be before `send` returns.
+    let tx = unsafe { &*ctx.cast::<Completion<T>>() }.clone();
+    let (code, msg) = take_async_err(err);
+    tx.send((code, msg, value)).unwrap();
+}
+
+unsafe extern "C" fn on_i64(ctx: *mut c_void, err: *mut FfiError, result: i64) {
+    send(ctx, err, result);
+}
+
+unsafe extern "C" fn on_i32(ctx: *mut c_void, err: *mut FfiError, result: i32) {
+    send(ctx, err, result);
+}
+
+unsafe extern "C" fn on_string(ctx: *mut c_void, err: *mut FfiError, result: Run) {
+    let value = if result.ptr.is_null() {
+        String::new()
+    } else {
+        take_string(result)
     };
-    assert_eq!(take_string(some, len), "x:true");
-    assert_eq!(unsafe { rich::runtime_rich_always(&mut err) }, 1);
+    send(ctx, err, value);
+}
+
+unsafe extern "C" fn on_unit(ctx: *mut c_void, err: *mut FfiError) {
+    send(ctx, err, ());
+}
+
+#[test]
+fn callback_interface_from_an_async_method() {
+    use consumer_subscriber::sub;
+    let mut err = FfiError::default();
+    let b = unsafe { runtime_Bus_new(&mut err) };
+    let freed = Arc::new(AtomicUsize::new(0));
+    unsafe { runtime_Bus_subscribe(b, sub(4, &freed), &mut err) };
+
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<i64>(tx);
+    unsafe { runtime_Bus_publish_later(b, text("async"), 2, Some(on_i64), ctx) };
+    assert_eq!(rx.recv_timeout(WAIT).unwrap(), (0, String::new(), 2));
+
+    // A foreign failure inside the future is delivered through the
+    // completion, with the zero result.
+    unsafe { runtime_Bus_publish_later(b, text("async"), 4, Some(on_i64), ctx) };
+    assert_eq!(
+        rx.recv_timeout(WAIT).unwrap(),
+        (
+            rt::GENERIC_ERROR_CODE,
+            "subscriber rejected async".to_string(),
+            0
+        )
+    );
+
+    // The receiver was retained by the launcher: releasing the consumer's
+    // reference while a call is in flight is safe.
+    unsafe {
+        runtime_Bus_publish_later(b, text("async"), 1, Some(on_i64), ctx);
+        runtime_Bus_destroy(b.cast_mut());
+    }
+    assert_eq!(rx.recv_timeout(WAIT).unwrap(), (0, String::new(), 3));
+    drop_ctx::<i64>(ctx);
+}
+
+#[test]
+fn async_record_result_completes_via_the_callback() {
+    unsafe extern "C" fn on_task(ctx: *mut c_void, err: *mut FfiError, result: Run) {
+        let value = (!result.ptr.is_null()).then(|| take::<tasks::TaskResult>(result));
+        send(ctx, err, value);
+    }
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<Option<tasks::TaskResult>>(tx);
+    unsafe { runtime_run_task(text("alpha"), Some(on_task), ctx) };
+    let (code, _, value) = rx.recv_timeout(WAIT).unwrap();
+    drop_ctx::<Option<tasks::TaskResult>>(ctx);
+    assert_eq!(code, 0);
+    assert_eq!(
+        value,
+        Some(tasks::TaskResult {
+            id: 7,
+            value: "done: alpha".to_string()
+        })
+    );
+}
+
+#[test]
+fn async_string_result_is_one_run() {
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<String>(tx);
+    // The launcher copies the borrowed argument before returning, so the
+    // consumer may release it right away.
+    let arg = "quiet\0please".to_string();
+    unsafe { runtime_shout(text(&arg), Some(on_string), ctx) };
+    drop(arg);
+    assert_eq!(
+        rx.recv_timeout(WAIT).unwrap(),
+        (0, String::new(), "QUIET\0PLEASE".into())
+    );
+
+    // An argument that doesn't lift is reported through the completion.
+    unsafe { runtime_shout(Run::borrowing(&[0xff]), Some(on_string), ctx) };
+    let (code, _, value) = rx.recv_timeout(WAIT).unwrap();
+    assert_eq!((code, value.as_str()), (rt::MARSHAL_ERROR_CODE, ""));
+    drop_ctx::<String>(ctx);
+}
+
+#[test]
+fn async_result_ok_and_err_paths() {
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<i32>(tx);
+    unsafe { runtime_checked_add(2, 3, Some(on_i32), ctx) };
+    assert_eq!(rx.recv_timeout(WAIT).unwrap(), (0, String::new(), 5));
+    unsafe { runtime_checked_add(i32::MAX, 1, Some(on_i32), ctx) };
+    assert_eq!(
+        rx.recv_timeout(WAIT).unwrap(),
+        (1, "arithmetic overflow".to_string(), 0)
+    );
+    drop_ctx::<i32>(ctx);
+}
+
+#[test]
+fn async_unit_completion_has_no_result_slot() {
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<()>(tx);
+    unsafe { runtime_tidy(0, Some(on_unit), ctx) };
+    assert_eq!(rx.recv_timeout(WAIT).unwrap(), (0, String::new(), ()));
+    unsafe { runtime_tidy(1, Some(on_unit), ctx) };
+    assert_eq!(rx.recv_timeout(WAIT).unwrap().0, 1);
+    unsafe { runtime_tidy(2, Some(on_unit), ctx) };
+    assert_eq!(
+        rx.recv_timeout(WAIT).unwrap().0,
+        rt::MARSHAL_ERROR_CODE,
+        "a bad bool"
+    );
+    drop_ctx::<()>(ctx);
+}
+
+#[test]
+fn a_null_completion_discards_the_result() {
+    unsafe {
+        runtime_checked_add(1, 2, None, std::ptr::null_mut());
+        runtime_checked_add(i32::MAX, 1, None, std::ptr::null_mut());
+        runtime_shout(text("x"), None, std::ptr::null_mut());
+    }
+    // Nothing to observe but that nothing crashed or leaked (see `leak.rs`);
+    // make sure the executor ran them before the binary exits.
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<i32>(tx);
+    unsafe { runtime_checked_add(0, 0, Some(on_i32), ctx) };
+    rx.recv_timeout(WAIT).unwrap();
+    drop_ctx::<i32>(ctx);
+}
+
+#[test]
+fn cancelling_completes_with_the_cancelled_code_exactly_once() {
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<i32>(tx);
+    let token = unsafe { runtime_cancel_token_create() };
+    unsafe { runtime_wait_forever(token, Some(on_i32), ctx) };
+    assert!(
+        rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "not complete until cancelled"
+    );
+    unsafe {
+        runtime_cancel_token_cancel(token);
+        assert!(runtime_cancel_token_is_cancelled(token));
+        runtime_cancel_token_destroy(token);
+    }
+    assert_eq!(
+        rx.recv_timeout(WAIT).unwrap(),
+        (rt::CANCELLED_ERROR_CODE, "cancelled".to_string(), 0)
+    );
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    drop_ctx::<i32>(ctx);
+}
+
+#[test]
+fn cancel_then_destroy_races_the_launch_safely() {
+    const RUNS: usize = 200;
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<i32>(tx);
+    for i in 0..RUNS {
+        let token = unsafe { runtime_cancel_token_create() };
+        if i % 2 == 0 {
+            // The launcher takes its own reference before returning, so the
+            // consumer may then cancel and destroy its reference from
+            // another thread while the spawned future starts running.
+            unsafe { runtime_wait_forever(token, Some(on_i32), ctx) };
+            let raw = token as usize;
+            std::thread::spawn(move || unsafe {
+                runtime_cancel_token_cancel(raw as *mut FfiCancelToken);
+                runtime_cancel_token_destroy(raw as *mut FfiCancelToken);
+            })
+            .join()
+            .unwrap();
+        } else {
+            // Cancel and destroy before the spawned future is ever polled.
+            unsafe {
+                runtime_wait_forever(token, Some(on_i32), ctx);
+                runtime_cancel_token_cancel(token);
+                runtime_cancel_token_destroy(token);
+            }
+        }
+    }
+    for _ in 0..RUNS {
+        assert_eq!(rx.recv_timeout(WAIT).unwrap().0, rt::CANCELLED_ERROR_CODE);
+    }
+    assert!(
+        rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "each call completed exactly once"
+    );
+    drop_ctx::<i32>(ctx);
+}
+
+#[test]
+fn a_cancelled_token_cancels_at_launch_and_a_null_one_never_does() {
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<i32>(tx);
+    let token = unsafe { runtime_cancel_token_create() };
+    unsafe {
+        runtime_cancel_token_cancel(token);
+        runtime_wait_forever(token, Some(on_i32), ctx);
+        runtime_cancel_token_destroy(token);
+    }
+    assert_eq!(rx.recv_timeout(WAIT).unwrap().0, rt::CANCELLED_ERROR_CODE);
+    drop_ctx::<i32>(ctx);
 }
 
 #[cfg(feature = "tokio")]
 #[test]
 fn many_concurrent_launches_share_a_few_executor_threads() {
-    extern "C" fn on_tag(ctx: *mut c_void, err: *mut FfiError, ptr: *const u8, len: usize) {
-        on_string(ctx, err, ptr, len);
-    }
     const CALLS: usize = 64;
     let (tx, rx) = mpsc::channel();
     let ctx = new_ctx::<String>(tx);
     for _ in 0..CALLS {
-        unsafe { tasks::runtime_tasks_thread_tag(on_tag, ctx) };
+        unsafe { runtime_thread_tag(Some(on_string), ctx) };
     }
     let mut threads = std::collections::BTreeSet::new();
     for _ in 0..CALLS {
@@ -2592,19 +2669,16 @@ fn many_concurrent_launches_share_a_few_executor_threads() {
     );
 }
 
-/// Without Tokio (`default-features = false`), each call runs on a thread of
-/// its own.
+/// Without Tokio (`default-features = false`), each call runs on a thread
+/// of its own.
 #[cfg(not(feature = "tokio"))]
 #[test]
 fn without_tokio_each_launch_gets_its_own_thread() {
-    extern "C" fn on_tag(ctx: *mut c_void, err: *mut FfiError, ptr: *const u8, len: usize) {
-        on_string(ctx, err, ptr, len);
-    }
     const CALLS: usize = 16;
     let (tx, rx) = mpsc::channel();
     let ctx = new_ctx::<String>(tx);
     for _ in 0..CALLS {
-        unsafe { tasks::runtime_tasks_thread_tag(on_tag, ctx) };
+        unsafe { runtime_thread_tag(Some(on_string), ctx) };
     }
     let mut threads = std::collections::BTreeSet::new();
     for _ in 0..CALLS {
@@ -2615,4 +2689,686 @@ fn without_tokio_each_launch_gets_its_own_thread() {
     }
     drop_ctx::<String>(ctx);
     assert_eq!(threads.len(), CALLS, "one thread per call");
+}
+
+// ── Objects ─────────────────────────────────────────────────────────────
+
+#[test]
+fn borrowed_and_optional_objects_from_another_module() {
+    let mut err = FfiError::default();
+    let session = unsafe { runtime_Session_open(7, &mut err) };
+    assert_eq!(err.code, 0);
+    assert!(!session.is_null());
+
+    let report: outer::inner::Report =
+        take(unsafe { runtime_summarize(session, std::ptr::null(), &mut err) });
+    assert_eq!(err.code, 0);
+    assert_eq!(report.score, 70);
+    assert!(report.session.is_none());
+    let report: outer::inner::Report =
+        take(unsafe { runtime_summarize(session, session, &mut err) });
+    assert_eq!(report.score, 77);
+
+    // A null required object is a marshalling failure.
+    let out = unsafe { runtime_summarize(std::ptr::null(), session, &mut err) };
+    assert_eq!(out, Run::EMPTY);
+    assert_eq!(take_failure(&mut err).0, rt::MARSHAL_ERROR_CODE);
+
+    assert_eq!(unsafe { runtime_raise(1, &mut err) }, 2);
+    unsafe { runtime_Session_destroy(session.cast_mut()) };
+}
+
+#[test]
+fn object_reference_counting() {
+    let mut err = FfiError::default();
+    unsafe {
+        let s = runtime_Session_open(3, &mut err);
+
+        // `share` retains through `Arc<Session>` in and hands back a new
+        // strong reference to the same allocation.
+        let again = runtime_share(s, &mut err);
+        assert_eq!(err.code, 0);
+        assert_eq!(again, s, "the same object, one more reference");
+        let third = runtime_Session_clone(s);
+        assert_eq!(third, s);
+
+        runtime_Session_destroy(s.cast_mut());
+        runtime_Session_destroy(again.cast_mut());
+        // Still alive through `third`.
+        let report: outer::inner::Report =
+            take(runtime_summarize(third, std::ptr::null(), &mut err));
+        assert_eq!(report.score, 30);
+        runtime_Session_destroy(third.cast_mut());
+        runtime_Session_destroy(std::ptr::null_mut());
+        assert!(runtime_Session_clone(std::ptr::null()).is_null());
+    }
+}
+
+#[test]
+fn objects_inside_value_buffers_carry_a_reference() {
+    let mut err = FfiError::default();
+    unsafe {
+        let s = runtime_Session_open(5, &mut err);
+
+        // `attach` retains the session inside the returned record: the
+        // buffer's object token is one strong reference the consumer owns.
+        let run = runtime_attach(s, &mut err);
+        assert_eq!(err.code, 0);
+        let bytes = std::slice::from_raw_parts(run.ptr, run.len).to_vec();
+        runtime_run_free(run);
+        runtime_Session_destroy(s.cast_mut());
+
+        // Sending the buffer back moves the token's reference to the
+        // producer, which returns it as the optional object result.
+        let back = runtime_session_of(Run::borrowing(&bytes), &mut err);
+        assert_eq!(err.code, 0);
+        assert_eq!(back, s, "same allocation, still alive");
+        runtime_Session_destroy(back.cast_mut());
+
+        let none = encode(&outer::inner::Report {
+            score: 0,
+            session: None,
+        });
+        let back = runtime_session_of(Run::borrowing(&none), &mut err);
+        assert!(back.is_null());
+        assert_eq!(err.code, 0, "a null optional object return isn't an error");
+    }
+}
+
+#[test]
+fn interface_constructor_methods_destroy() {
+    let mut err = FfiError::default();
+    unsafe {
+        let c = runtime_Counter_new(10, &mut err);
+        assert_eq!(err.code, 0);
+        assert!(!c.is_null());
+        assert_eq!(runtime_Counter_increment(c, &mut err), 11);
+        assert_eq!(runtime_Counter_increment(c, &mut err), 12);
+        assert_eq!(runtime_Counter_value(c, &mut err), 12);
+        assert_eq!(err.code, 0);
+        assert_eq!(
+            take_string(runtime_Counter_label(c, text("n="), &mut err)),
+            "n=12"
+        );
+        runtime_Counter_destroy(c.cast_mut());
+    }
+}
+
+#[test]
+fn interface_fallible_constructor() {
+    let mut err = FfiError::default();
+    unsafe {
+        let ok = runtime_Counter_with_step(0, 5, &mut err);
+        assert_eq!(err.code, 0);
+        assert!(!ok.is_null());
+        assert_eq!(runtime_Counter_increment(ok, &mut err), 5);
+        runtime_Counter_destroy(ok.cast_mut());
+
+        let bad = runtime_Counter_with_step(0, 0, &mut err);
+        assert!(bad.is_null());
+        assert_eq!(
+            take_failure(&mut err),
+            (1, "step must be positive".to_string())
+        );
+    }
+}
+
+#[test]
+fn interface_returning_method_and_static() {
+    let mut err = FfiError::default();
+    unsafe {
+        assert_eq!(runtime_Counter_default_start(&mut err), 0);
+        let c = runtime_Counter_new(3, &mut err);
+        let snap = runtime_Counter_snapshot(c, &mut err);
+        assert!(!snap.is_null());
+        runtime_Counter_increment(c, &mut err);
+        assert_eq!(runtime_Counter_value(c, &mut err), 4);
+        assert_eq!(
+            runtime_Counter_value(snap, &mut err),
+            3,
+            "the snapshot is an independent object"
+        );
+        runtime_Counter_destroy(snap.cast_mut());
+        runtime_Counter_destroy(c.cast_mut());
+    }
+}
+
+#[test]
+fn interface_as_free_function_parameter() {
+    let mut err = FfiError::default();
+    unsafe {
+        let c = runtime_Counter_new(21, &mut err);
+        assert_eq!(runtime_read_twice(c, &mut err), 42);
+        runtime_Counter_destroy(c.cast_mut());
+    }
+}
+
+#[test]
+fn arc_self_receiver_and_optional_objects() {
+    let mut err = FfiError::default();
+    unsafe {
+        let c = runtime_Counter_new(10, &mut err);
+        let shared = runtime_Counter_share(c, &mut err);
+        assert_eq!(err.code, 0);
+        assert_eq!(shared, c, "`self: Arc<Self>` returns the same object");
+        let third = runtime_Counter_clone(c);
+        runtime_Counter_destroy(shared.cast_mut());
+        runtime_Counter_destroy(third.cast_mut());
+
+        let other = runtime_Counter_new(20, &mut err);
+        let bigger = runtime_Counter_larger(c, other, 0, &mut err);
+        assert_eq!(err.code, 0);
+        assert_eq!(runtime_Counter_value(bigger, &mut err), 20);
+        runtime_Counter_destroy(bigger.cast_mut());
+
+        let mine = runtime_Counter_larger(c, std::ptr::null(), 0, &mut err);
+        assert_eq!(runtime_Counter_value(mine, &mut err), 10);
+        runtime_Counter_destroy(mine.cast_mut());
+
+        let none = runtime_Counter_larger(c, other, 100, &mut err);
+        assert!(none.is_null());
+        assert_eq!(err.code, 0, "a null optional object return isn't an error");
+
+        runtime_Counter_destroy(other.cast_mut());
+        runtime_Counter_destroy(c.cast_mut());
+    }
+}
+
+#[test]
+fn iterator_of_objects() {
+    let mut err = FfiError::default();
+    let mut values = Vec::new();
+    unsafe {
+        let c = runtime_Counter_new(5, &mut err);
+        let iter = runtime_Counter_fan_out(c, 3, &mut err);
+        assert_eq!(err.code, 0);
+        let mut item: *const counters::Counter = std::ptr::null();
+        while runtime_Counter_FanOutIterator_next(iter, &mut item, &mut err) == 1 {
+            values.push(runtime_Counter_value(item, &mut err));
+            runtime_Counter_destroy(item.cast_mut());
+        }
+        runtime_Counter_FanOutIterator_destroy(iter);
+        runtime_Counter_destroy(c.cast_mut());
+    }
+    assert_eq!(values, [5, 6, 7]);
+}
+
+#[test]
+fn async_methods_retain_the_receiver() {
+    unsafe extern "C" fn on_obj(
+        ctx: *mut c_void,
+        err: *mut FfiError,
+        result: *const counters::Counter,
+    ) {
+        let mut e = FfiError::default();
+        let v = unsafe {
+            let v = runtime_Counter_value(result, &mut e);
+            runtime_Counter_destroy(result.cast_mut());
+            v
+        };
+        send(ctx, err, v);
+    }
+
+    let mut err = FfiError::default();
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<i64>(tx);
+    unsafe {
+        let c = runtime_Counter_new(8, &mut err);
+        runtime_Counter_value_later(c, Some(on_i64), ctx);
+        runtime_Counter_snapshot_later(c, Some(on_obj), ctx);
+        // Releasing the consumer's reference while calls are in flight is
+        // safe: each launcher retained its own.
+        runtime_Counter_destroy(c.cast_mut());
+    }
+    let mut got = [
+        rx.recv_timeout(WAIT).unwrap().2,
+        rx.recv_timeout(WAIT).unwrap().2,
+    ];
+    got.sort_unstable();
+    assert_eq!(got, [8, 8]);
+
+    // A null receiver still completes (with a marshalling error).
+    unsafe { runtime_Counter_value_later(std::ptr::null(), Some(on_i64), ctx) };
+    let (code, _, result) = rx.recv_timeout(WAIT).unwrap();
+    assert_eq!((code, result), (rt::MARSHAL_ERROR_CODE, 0));
+    drop_ctx::<i64>(ctx);
+}
+
+#[test]
+fn an_async_factory_completes_with_a_new_object() {
+    unsafe extern "C" fn on_obj(
+        ctx: *mut c_void,
+        err: *mut FfiError,
+        result: *const counters::Counter,
+    ) {
+        let mut e = FfiError::default();
+        let v = unsafe {
+            let v = runtime_Counter_value(result, &mut e);
+            runtime_Counter_destroy(result.cast_mut());
+            v
+        };
+        send(ctx, err, v);
+    }
+    let (tx, rx) = mpsc::channel();
+    let ctx = new_ctx::<i64>(tx);
+    unsafe { runtime_Counter_start_later(12, Some(on_obj), ctx) };
+    assert_eq!(rx.recv_timeout(WAIT).unwrap(), (0, String::new(), 12));
+    drop_ctx::<i64>(ctx);
+}
+
+#[test]
+fn interface_null_self_reports_an_error() {
+    let mut err = FfiError::default();
+    assert_eq!(
+        unsafe { runtime_Counter_value(std::ptr::null(), &mut err) },
+        0
+    );
+    let (code, msg) = take_failure(&mut err);
+    assert_eq!(code, rt::MARSHAL_ERROR_CODE);
+    assert_eq!(msg, "self: an object is null");
+}
+
+#[test]
+fn producer_panic_reports_the_panic_code() {
+    let mut err = FfiError::default();
+    unsafe {
+        let c = runtime_Counter_new(0, &mut err);
+        runtime_Counter_explode(c, &mut err);
+        let (code, msg) = take_failure(&mut err);
+        assert_eq!(code, rt::PANIC_ERROR_CODE);
+        assert!(msg.contains("counter exploded"), "{msg}");
+
+        // The object is still usable.
+        assert_eq!(runtime_Counter_value(c, &mut err), 0);
+        assert_eq!(err.code, 0);
+        runtime_Counter_destroy(c.cast_mut());
+    }
+}
+
+#[test]
+fn skipped_and_private_members_are_ordinary_rust() {
+    let c = counters::Counter::new(1);
+    assert_eq!(c.internal()(), -1);
+}
+
+// ── Errors ──────────────────────────────────────────────────────────────
+
+#[test]
+fn fallible_with_domain_error_codes() {
+    let mut err = FfiError::default();
+    assert_eq!(unsafe { runtime_fetch(21, &mut err) }, 42);
+    assert_eq!(err.code, 0);
+
+    assert_eq!(unsafe { runtime_fetch(0, &mut err) }, 0);
+    assert_eq!(
+        take_failure(&mut err),
+        (2001, "entry not found".to_string())
+    );
+
+    assert_eq!(unsafe { runtime_fetch(-1, &mut err) }, 0);
+    assert_eq!(err.payload(), encode(&"negative key".to_string()));
+    assert_eq!(
+        take_failure(&mut err),
+        (2002, "vault sealed: negative key".to_string())
+    );
+}
+
+#[test]
+fn untyped_errors_report_the_generic_code_and_display() {
+    let mut err = FfiError::default();
+    assert_eq!(unsafe { runtime_fetch_any(5, &mut err) }, 5);
+    assert_eq!(unsafe { runtime_fetch_any(0, &mut err) }, 0);
+    assert!(err.payload_ptr.is_null());
+    assert_eq!(
+        take_failure(&mut err),
+        (rt::GENERIC_ERROR_CODE, "vault failure: no key".to_string())
+    );
+    assert_eq!(unsafe { runtime_parse_int(text("x1"), &mut err) }, 0);
+    assert_eq!(
+        take_failure(&mut err),
+        (
+            rt::GENERIC_ERROR_CODE,
+            "invalid digit found in string".to_string()
+        )
+    );
+    unsafe { runtime_refuse(text("no"), &mut err) };
+    assert_eq!(
+        take_failure(&mut err),
+        (rt::GENERIC_ERROR_CODE, "no".to_string())
+    );
+}
+
+#[test]
+fn error_payload_fields_cross_the_abi() {
+    let mut err = FfiError::default();
+
+    // Success leaves the payload slots empty.
+    assert_eq!(unsafe { runtime_consume(30, &mut err) }, 70);
+    assert_eq!(err.code, 0);
+    assert!(err.payload_ptr.is_null());
+
+    // A payload-carrying code encodes its fields in declaration order.
+    assert_eq!(unsafe { runtime_consume(250, &mut err) }, 0);
+    assert_eq!(err.code, 3001);
+    assert_eq!(message(&err), "used 250 of 100");
+    let mut reader = rt::BufferReader::new(err.payload());
+    assert_eq!(reader.read_i64().unwrap(), 100, "limit field");
+    assert_eq!(reader.read_i64().unwrap(), 250, "used field");
+    reader.expect_end().unwrap();
+    unsafe { runtime_error_clear(&mut err) };
+    assert!(err.payload_ptr.is_null(), "clear releases the payload");
+
+    // A unit code reports a code and message with no payload.
+    assert_eq!(unsafe { runtime_consume(-1, &mut err) }, 0);
+    assert!(err.payload_ptr.is_null());
+    assert_eq!(take_failure(&mut err).0, 3002);
+}
+
+#[test]
+fn deprecated_export_thunk_compiles_and_runs() {
+    let mut err = FfiError::default();
+    assert_eq!(unsafe { runtime_add_one(41, &mut err) }, 42);
+    assert_eq!(unsafe { runtime_bump(41, &mut err) }, 42);
+    assert_eq!(err.code, 0);
+}
+
+// ── The contract ────────────────────────────────────────────────────────
+
+/// Declare each contract function by its symbol and list it with the
+/// declaration path whose id the symbol encodes.
+macro_rules! contracts {
+    ($($path:literal => $symbol:ident;)*) => {
+        unsafe extern "C" {
+            $(fn $symbol() -> u64;)*
+        }
+
+        /// Every contract function this test checks: its path, its symbol,
+        /// and the function.
+        const CONTRACTS: &[(&str, &str, unsafe extern "C" fn() -> u64)] =
+            &[$(($path, stringify!($symbol), $symbol),)*];
+    };
+}
+
+contracts! {
+    "add" => runtime_contract_e70bc3190530e654;
+    "checked_div" => runtime_contract_23bafa60563adf2e;
+    "greet" => runtime_contract_0f40ea29637fe28a;
+    "char_count" => runtime_contract_888e76bc7ab24475;
+    "maybe_name" => runtime_contract_206c57294840c577;
+    "sum" => runtime_contract_82719e195d0fc4a8;
+    "join" => runtime_contract_41def2de29651139;
+    "byte_count" => runtime_contract_8906c210ed6818ef;
+    "make_point" => runtime_contract_1283be904bcc1566;
+    "point_x" => runtime_contract_5baaad07b623a796;
+    "echo_color" => runtime_contract_a1a734a46207b124;
+    "negate_opt" => runtime_contract_2411cd574dabd4cd;
+    "next_color" => runtime_contract_35fb39dea4228f08;
+    "describe_shape" => runtime_contract_69e6b706387abcd6;
+    "double_scores" => runtime_contract_fd74192e01224262;
+    "greetings" => runtime_contract_4c3c384e13d73fff;
+    "lookup_via" => runtime_contract_1bfa4634e400debc;
+    "has_source" => runtime_contract_39242963ed799e71;
+    "checked_add" => runtime_contract_f87d3f603dc27d4e;
+    "wait_forever" => runtime_contract_87213461b41707e0;
+    "tidy" => runtime_contract_1e6b95ef2eb28d95;
+    "shout" => runtime_contract_f6a25348f7903d22;
+    "fetch_any" => runtime_contract_79c8f5129aec9e3e;
+    "summarize" => runtime_contract_20ea7db5ad4182da;
+    "DemoError" => runtime_contract_ddabffd3b2836960;
+    "DemoError.DivisionByZero" => runtime_contract_ad05ffc62f5172f6;
+    "Color" => runtime_contract_344ea8f4939cdc98;
+    "Point" => runtime_contract_8a439296ced9ed11;
+    "Shape" => runtime_contract_2de969afacdaa7a6;
+    "Card" => runtime_contract_dfef4f9ce9ebb93f;
+    "Token" => runtime_contract_e68398e3c2c760b2;
+    "Token.new" => runtime_contract_19f363a91a374252;
+    "Token.n" => runtime_contract_5fbf85bfbdd17a4e;
+    "Source" => runtime_contract_5f43af3669b1e098;
+    "Source.name" => runtime_contract_099a038fbbc6a0c9;
+    "Source.blob" => runtime_contract_be2e792aacbbe789;
+    "Source.card" => runtime_contract_6e086a3672527db8;
+    "Source.token" => runtime_contract_4a0d3e3776320b37;
+    "Source.maybe_token" => runtime_contract_5e5727760cdeadb0;
+    "Source.lookup" => runtime_contract_f81e191ed9aa28e4;
+    "LookupError" => runtime_contract_4bb33b369eb5bfb3;
+    "LookupError.Missing" => runtime_contract_77d77b01e74db5e5;
+    "LookupError.Busy" => runtime_contract_0408a315f2eb68ea;
+    "LookupError.Foreign" => runtime_contract_e4757f97fe182aa5;
+    "Counter" => runtime_contract_9d1c372fe94004c3;
+    "Counter.new" => runtime_contract_b183fbbf6b26d7d7;
+    "Counter.with_step" => runtime_contract_53d4008d5e865122;
+    "Counter.increment" => runtime_contract_9c7999dc7298c42c;
+    "Counter.value" => runtime_contract_7f1ac9b2a453892c;
+    "Counter.label" => runtime_contract_5fecc32bfb44a1af;
+    "Counter.snapshot" => runtime_contract_f0445856c125fccf;
+    "Counter.share" => runtime_contract_a97f3234ad78ef4e;
+    "Counter.larger" => runtime_contract_08023540153f2b40;
+    "Counter.fan_out" => runtime_contract_15af951b2b8296bf;
+    "Counter.value_later" => runtime_contract_258121755f9bd75d;
+    "Counter.snapshot_later" => runtime_contract_99fe96b5a27dd3fa;
+    "Counter.explode" => runtime_contract_6f4108f7392032a8;
+    "Counter.default_start" => runtime_contract_0dce532b6a3460d7;
+    "Counter.start_later" => runtime_contract_ecc43c00e61c8c58;
+    "CounterError" => runtime_contract_863c2982fa2e56cb;
+    "CounterError.OutOfRange" => runtime_contract_9b4a1aa0d9e3e959;
+    "Session" => runtime_contract_62278f512692e037;
+    "Session.open" => runtime_contract_150044d742122907;
+    "Report" => runtime_contract_9b6b1422027158eb;
+    "TaskError" => runtime_contract_958a5b3ae3901fba;
+    "TaskError.Overflow" => runtime_contract_3cfe66cdbc5f7eca;
+    "QuotaError" => runtime_contract_55e719d8930b2933;
+    "QuotaError.Exceeded" => runtime_contract_0d6e025b63a2f0ca;
+    "QuotaError.Unavailable" => runtime_contract_4700d6d1c46ed573;
+}
+
+/// The checked part of this library's API in the IDL: what `weaveffi
+/// generate` assembles from the metadata the attributes embed.
+const IDL: &str = r#"
+version: "0.13.0"
+errors:
+  - name: DemoError
+    codes:
+      - { name: DivisionByZero, code: 100, message: "cannot divide by zero" }
+  - name: LookupError
+    codes:
+      - { name: Missing, code: 1, message: "missing {key}", fields: [{ name: key, type: string }] }
+      - { name: Busy, code: 2, message: busy }
+      - name: Foreign
+        code: 3
+        message: "foreign {code}: {message}"
+        fields: [{ name: code, type: i32 }, { name: message, type: string }]
+  - name: CounterError
+    codes:
+      - { name: OutOfRange, code: 1, message: "step must be positive" }
+  - name: TaskError
+    codes:
+      - { name: Overflow, code: 1, message: "arithmetic overflow" }
+  - name: QuotaError
+    codes:
+      - name: Exceeded
+        code: 3001
+        message: "used {used} of {limit}"
+        fields: [{ name: limit, type: i64 }, { name: used, type: i64 }]
+      - { name: Unavailable, code: 3002, message: "quota service unavailable" }
+enums:
+  - name: Color
+    variants: [{ name: Red, value: 0 }, { name: Green, value: 1 }, { name: Blue, value: 2 }]
+  - name: Shape
+    variants:
+      - { name: Empty, value: 0 }
+      - { name: Circle, value: 1, fields: [{ name: radius, type: f64 }] }
+      - { name: Labeled, value: 2, fields: [{ name: label, type: string }, { name: count, type: u8 }] }
+records:
+  - name: Point
+    fields:
+      - { name: x, type: i32 }
+      - { name: label, type: string }
+      - { name: nickname, type: "string?" }
+      - { name: color, type: Color }
+  - name: Card
+    fields: [{ name: name, type: string }, { name: tags, type: "[string]" }]
+  - name: Report
+    fields: [{ name: score, type: i64 }, { name: session, type: "Session?" }]
+interfaces:
+  - name: Token
+    constructors: [{ name: new, params: [{ name: n, type: i64 }] }]
+    methods: [{ name: n, return: i64 }]
+  - name: Counter
+    constructors:
+      - { name: new, params: [{ name: start, type: i64 }] }
+      - name: with_step
+        params: [{ name: start, type: i64 }, { name: step, type: i64 }]
+        throws: CounterError
+    methods:
+      - { name: increment, return: i64 }
+      - { name: value, return: i64 }
+      - { name: label, params: [{ name: prefix, type: string }], return: string }
+      - { name: snapshot, return: Counter }
+      - { name: share, return: Counter }
+      - name: larger
+        params: [{ name: other, type: "Counter?" }, { name: floor, type: i64 }]
+        return: "Counter?"
+      - { name: fan_out, params: [{ name: n, type: i32 }], return: "iter<Counter>" }
+      - { name: value_later, return: i64, async: true }
+      - { name: snapshot_later, return: Counter, async: true }
+      - { name: explode }
+    statics:
+      - { name: default_start, return: i64 }
+      - { name: start_later, params: [{ name: start, type: i64 }], return: Counter, async: true }
+  - name: Session
+    constructors: [{ name: open, params: [{ name: id, type: i64 }] }]
+callbacks:
+  - name: Source
+    methods:
+      - { name: name, return: string, throws: any }
+      - { name: blob, return: bytes, throws: any }
+      - { name: card, params: [{ name: key, type: string }], return: Card, throws: any }
+      - { name: token, return: Token, throws: any }
+      - { name: maybe_token, return: "Token?", throws: any }
+      - { name: lookup, params: [{ name: key, type: string }], return: i64, throws: LookupError }
+functions:
+  - { name: add, params: [{ name: a, type: i32 }, { name: b, type: i32 }], return: i32 }
+  - name: checked_div
+    params: [{ name: a, type: i32 }, { name: b, type: i32 }]
+    return: i32
+    throws: DemoError
+  - { name: greet, params: [{ name: name, type: string }], return: string }
+  - { name: char_count, params: [{ name: text, type: string }], return: i32 }
+  - { name: maybe_name, params: [{ name: present, type: bool }], return: "string?" }
+  - { name: sum, params: [{ name: xs, type: "[i32]" }], return: i32 }
+  - { name: join, params: [{ name: parts, type: "[string]" }], return: string }
+  - { name: byte_count, params: [{ name: data, type: bytes }], return: i32 }
+  - { name: make_point, params: [{ name: x, type: i32 }], return: Point }
+  - { name: point_x, params: [{ name: p, type: Point }], return: i32 }
+  - { name: echo_color, params: [{ name: c, type: Color }], return: Color }
+  - { name: negate_opt, params: [{ name: flag, type: "bool?" }], return: "bool?" }
+  - { name: next_color, params: [{ name: color, type: "Color?" }], return: "Color?" }
+  - { name: describe_shape, params: [{ name: shape, type: Shape }], return: string }
+  - name: double_scores
+    params: [{ name: scores, type: "{string:i32}" }]
+    return: "{string:i32}"
+  - { name: greetings, params: [{ name: count, type: i32 }], return: "iter<string>" }
+  - { name: lookup_via, params: [{ name: source, type: Source }, { name: key, type: string }], return: string }
+  - name: has_source
+    params: [{ name: source, type: "Source?" }, { name: label, type: string }]
+    return: string
+  - name: checked_add
+    params: [{ name: a, type: i32 }, { name: b, type: i32 }]
+    return: i32
+    throws: TaskError
+    async: true
+  - { name: wait_forever, return: i32, async: true, cancellable: true }
+  - { name: tidy, params: [{ name: fail, type: bool }], throws: TaskError, async: true }
+  - { name: shout, params: [{ name: text, type: string }], return: string, async: true }
+  - { name: fetch_any, params: [{ name: key, type: i64 }], return: i64, throws: any }
+  - name: summarize
+    params: [{ name: session, type: Session }, { name: keep, type: "Session?" }]
+    return: Report
+"#;
+
+#[test]
+fn every_declaration_exports_the_contract_the_model_computes() {
+    use weaveffi_model::contract;
+
+    let api = weaveffi_model::parse::parse_api_str(IDL, "yaml").expect("the IDL parses");
+    let model = weaveffi_model::validate::validate(
+        &api,
+        &weaveffi_model::pkg::Identity::named("runtime"),
+        None,
+    )
+    .expect("the IDL validates");
+    let entries = contract::entries(&model);
+    assert_eq!(
+        entries.len(),
+        CONTRACTS.len(),
+        "the table checks every entry"
+    );
+    for entry in &entries {
+        let (_, symbol, f) = CONTRACTS
+            .iter()
+            .find(|(path, ..)| *path == entry.path)
+            .unwrap_or_else(|| panic!("no contract function listed for `{}`", entry.path));
+        assert_eq!(
+            *symbol, entry.symbol,
+            "`{}` is exported under its id",
+            entry.path
+        );
+        assert_eq!(
+            unsafe { f() },
+            entry.hash,
+            "`{}`: the producer's signature differs from `{}`",
+            entry.path,
+            entry.signature
+        );
+    }
+}
+
+#[test]
+fn contract_signatures_are_the_canonical_strings() {
+    // A few spelled out by hand, so the test above can't pass by the model
+    // and the macros agreeing on a wrong spelling.
+    let hash = |path: &str| {
+        let (.., f) = CONTRACTS.iter().find(|(p, ..)| *p == path).unwrap();
+        unsafe { f() }
+    };
+    let fnv = |s: &str| weaveffi_model::contract::fnv1a64(s.as_bytes());
+    assert_eq!(hash("add"), fnv("function add(i32, i32) -> i32"));
+    assert_eq!(
+        hash("lookup_via"),
+        fnv("function lookup_via(Source, string) -> string"),
+        "the alias resolved to its target"
+    );
+    assert_eq!(
+        hash("wait_forever"),
+        fnv("function wait_forever() -> i32 async cancellable")
+    );
+    assert_eq!(
+        hash("Point"),
+        fnv("record Point {i32, string, string?, Color}")
+    );
+    assert_eq!(
+        hash("Shape"),
+        fnv("enum Shape {Empty = 0, Circle = 1 {f64}, Labeled = 2 {string, u8}}")
+    );
+    assert_eq!(
+        hash("Source.lookup"),
+        fnv("callback_method #5 lookup(string) -> i64 throws LookupError")
+    );
+    assert_eq!(
+        hash("Counter.with_step"),
+        fnv("constructor with_step(i64, i64) -> Counter throws CounterError")
+    );
+    assert_eq!(
+        hash("Counter.fan_out"),
+        fnv("method fan_out(i32) -> iter<Counter>")
+    );
+    assert_eq!(
+        hash("QuotaError.Exceeded"),
+        fnv("code Exceeded = 3001 {i64, i64}")
+    );
+    assert_eq!(hash("Counter"), fnv("interface Counter"));
+    assert_eq!(
+        hash("Counter.start_later"),
+        fnv("static start_later(i64) -> Counter async")
+    );
 }

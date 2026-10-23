@@ -1,5 +1,40 @@
-error: weaveffi: unsupported primitive type 'u128'; use `u64`, `i64`, `usize`, or `isize` (which cross as `u64` and `i64`), or a #[weaveffi::custom] type with a `String` repr for wider integers
- --> tests/ui/fail_unsupported_primitive.rs:6:21
+error[E0277]: `u128` can't cross the WeaveFFI C ABI
+ --> tests/ui/fail_unsupported_primitive.rs:4:17
   |
-6 |     pub fn count(n: u128) -> i64 {
-  |                     ^^^^
+4 | pub fn count(n: u128) -> i64 {
+  |                 ^^^^ not a WeaveFFI value type
+  |
+  = help: the trait `weaveffi::rt::types::FfiType<Tag>` is not implemented for `u128`
+  = note: a value is a scalar (`i32`, `f64`, `bool`, `usize`, ...), `char`, `String`, `Vec<T>`, `Option<T>`, a `HashMap` or `BTreeMap`, a `#[weaveffi::record]`, a `#[weaveffi::enumeration]`, a `#[weaveffi::custom]` type, or a `#[weaveffi::interface]` as `Arc<T>`
+  = note: a parameter may also be borrowed (`&str`, `&[T]`, `&T`), and only a whole return may be a `weaveffi::Iter<T>`
+  = help: the following other types implement trait `weaveffi::rt::types::FfiType<UT>`:
+            f32
+            f64
+            i16
+            i32
+            i64
+            i8
+            isize
+            u16
+          and $N others
+
+error[E0277]: `u128` can't cross the WeaveFFI C ABI
+ --> tests/ui/fail_unsupported_primitive.rs:3:1
+  |
+3 | #[weaveffi::export]
+  | ^^^^^^^^^^^^^^^^^^^ not a WeaveFFI value type
+  |
+  = help: the trait `weaveffi::rt::types::FfiType<Tag>` is not implemented for `u128`
+  = note: a value is a scalar (`i32`, `f64`, `bool`, `usize`, ...), `char`, `String`, `Vec<T>`, `Option<T>`, a `HashMap` or `BTreeMap`, a `#[weaveffi::record]`, a `#[weaveffi::enumeration]`, a `#[weaveffi::custom]` type, or a `#[weaveffi::interface]` as `Arc<T>`
+  = note: a parameter may also be borrowed (`&str`, `&[T]`, `&T`), and only a whole return may be a `weaveffi::Iter<T>`
+  = help: the following other types implement trait `weaveffi::rt::types::FfiType<UT>`:
+            f32
+            f64
+            i16
+            i32
+            i64
+            i8
+            isize
+            u16
+          and $N others
+  = note: this error originates in the attribute macro `weaveffi::export` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -68,7 +68,8 @@ class LibraryLoadError(ImportError):
 
 
 class _ErrorStruct(ctypes.Structure):
-    """The C `{{PREFIX}}_error` out-parameter every call reports through."""
+    """The C `{{PREFIX}}_error` slot every synchronous call reports
+    through. A call overwrites it without reading it."""
 
     _fields_ = [
         ("code", ctypes.c_int32),
@@ -77,6 +78,84 @@ class _ErrorStruct(ctypes.Structure):
         ("payload_ptr", ctypes.c_void_p),
         ("payload_len", ctypes.c_size_t),
     ]
+
+
+class _Run(ctypes.Structure):
+    """The C `{{PREFIX}}_run`, passed and returned by value: `len` bytes at
+    `ptr` holding a string's UTF-8, bytes, a typed array's packed elements,
+    or a value buffer. Null with length 0 is the empty run."""
+
+    _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+    # The Python object whose memory a lent run points into, kept alive with
+    # the run for the call.
+    _keep: Any
+
+
+class _OptBool(ctypes.Structure):
+    """The C `{{PREFIX}}_opt_bool`: an optional `bool`, by value."""
+
+    _fields_ = [("has", ctypes.c_bool), ("value", ctypes.c_bool)]
+
+
+class _OptI8(ctypes.Structure):
+    """The C `{{PREFIX}}_opt_i8`: an optional `i8`, by value."""
+
+    _fields_ = [("has", ctypes.c_bool), ("value", ctypes.c_int8)]
+
+
+class _OptI16(ctypes.Structure):
+    """The C `{{PREFIX}}_opt_i16`: an optional `i16`, by value."""
+
+    _fields_ = [("has", ctypes.c_bool), ("value", ctypes.c_int16)]
+
+
+class _OptI32(ctypes.Structure):
+    """The C `{{PREFIX}}_opt_i32`: an optional `i32` or C-style enum, by
+    value."""
+
+    _fields_ = [("has", ctypes.c_bool), ("value", ctypes.c_int32)]
+
+
+class _OptI64(ctypes.Structure):
+    """The C `{{PREFIX}}_opt_i64`: an optional `i64`, by value."""
+
+    _fields_ = [("has", ctypes.c_bool), ("value", ctypes.c_int64)]
+
+
+class _OptU8(ctypes.Structure):
+    """The C `{{PREFIX}}_opt_u8`: an optional `u8`, by value."""
+
+    _fields_ = [("has", ctypes.c_bool), ("value", ctypes.c_uint8)]
+
+
+class _OptU16(ctypes.Structure):
+    """The C `{{PREFIX}}_opt_u16`: an optional `u16`, by value."""
+
+    _fields_ = [("has", ctypes.c_bool), ("value", ctypes.c_uint16)]
+
+
+class _OptU32(ctypes.Structure):
+    """The C `{{PREFIX}}_opt_u32`: an optional `u32`, by value."""
+
+    _fields_ = [("has", ctypes.c_bool), ("value", ctypes.c_uint32)]
+
+
+class _OptU64(ctypes.Structure):
+    """The C `{{PREFIX}}_opt_u64`: an optional `u64`, by value."""
+
+    _fields_ = [("has", ctypes.c_bool), ("value", ctypes.c_uint64)]
+
+
+class _OptF32(ctypes.Structure):
+    """The C `{{PREFIX}}_opt_f32`: an optional `f32`, by value."""
+
+    _fields_ = [("has", ctypes.c_bool), ("value", ctypes.c_float)]
+
+
+class _OptF64(ctypes.Structure):
+    """The C `{{PREFIX}}_opt_f64`: an optional `f64`, by value."""
+
+    _fields_ = [("has", ctypes.c_bool), ("value", ctypes.c_double)]
 
 
 def _open(path: str, what: str) -> ctypes.CDLL:
@@ -123,19 +202,13 @@ def _bind(name: str, restype: Any, *argtypes: Any) -> Any:
     return fn
 
 
-class _ContractEntry(ctypes.Structure):
-    """The C `{{PREFIX}}_contract_entry`: one declaration's id and hash."""
-
-    _fields_ = [("id", ctypes.c_uint64), ("hash", ctypes.c_uint64)]
-
-
-# The C ABI revision these bindings were generated against and, per
-# top-level module's contract symbol, the declarations they rely on:
-# (id, hash, dotted path), with each declaration's canonical signature.
+# The C ABI revision these bindings were generated against, and every
+# declaration they rely on: the producer's contract function, the hash of
+# the declaration's canonical signature, and its path, with the signature.
 _ABI_VERSION = {{ABI_VERSION}}
-_CONTRACTS: dict[str, list[tuple[int, int, str]]] = {
-{{CONTRACTS}}
-}
+_CONTRACT: list[tuple[str, int, str]] = [
+{{CONTRACT}}
+]
 
 
 def _refuse(message: str) -> LibraryLoadError:
@@ -145,7 +218,8 @@ def _refuse(message: str) -> LibraryLoadError:
 def _check_contract() -> None:
     """Refuse to load a library built for another ABI revision, or one that
     lacks or changed a declaration these bindings use, before any other
-    symbol is bound."""
+    symbol is bound. Declarations the library has and these bindings don't
+    are fine."""
     try:
         abi_version = _bind("{{PREFIX}}_abi_version", ctypes.c_uint32)
     except AttributeError:
@@ -160,52 +234,43 @@ def _check_contract() -> None:
             f"library reports revision {found}; regenerate the bindings or rebuild "
             "the library"
         )
-    for symbol, expected in _CONTRACTS.items():
+    for symbol, expected, path in _CONTRACT:
         try:
-            contract = _bind(
-                symbol, ctypes.POINTER(_ContractEntry), ctypes.POINTER(ctypes.c_size_t)
-            )
+            contract = _bind(symbol, ctypes.c_uint64)
         except AttributeError:
-            raise _refuse(f"the library doesn't export {symbol}") from None
-        length = ctypes.c_size_t()
-        table = contract(ctypes.byref(length))
-        hashes = {table[i].id: table[i].hash for i in range(length.value)} if table else {}
-        for entry_id, entry_hash, path in expected:
-            actual = hashes.get(entry_id)
-            if actual is None:
-                raise _refuse(f"{path} is missing from the library")
-            if actual != entry_hash:
-                raise _refuse(f"{path} changed since these bindings were generated")
+            raise _refuse(f"{path} is missing from the library") from None
+        if contract() != expected:
+            raise _refuse(f"{path} changed since these bindings were generated")
 
 
 _check_contract()
 
 _error_clear = _bind("{{PREFIX}}_error_clear", None, ctypes.POINTER(_ErrorStruct))
-_free_bytes = _bind("{{PREFIX}}_free_bytes", None, ctypes.c_void_p, ctypes.c_size_t)
+_run_free = _bind("{{PREFIX}}_run_free", None, _Run)
 _debug_live_fn = _bind("{{PREFIX}}_debug_live", ctypes.c_uint64, ctypes.c_int32)
 
 
 def _debug_live(kind: int) -> int:
     """The producer's live-resource counter `kind` (0 objects, 1 callbacks,
-    2 iterators, 3 cancel tokens, 4 byte runs; -1 is 1 when the producer
-    counts at all). Always 0 unless the producer was built with its leak
-    counters enabled."""
+    2 iterators, 3 cancel tokens, 4 runs; -1 is 1 when the producer counts
+    at all). Always 0 unless the producer was built with its leak counters
+    enabled."""
     live: int = _debug_live_fn(kind)
     return live
 
 
-def _peek_bytes(ptr: int | None, length: int) -> bytes:
-    """Copy a byte run the producer only lends (a zero-length run's pointer
-    is never read)."""
+def _peek(ptr: int | None, length: int) -> bytes:
+    """Copy `length` bytes the producer only lends (a zero-length run's
+    pointer is never read)."""
     return ctypes.string_at(ptr, length) if ptr and length else b""
 
 
 def _read_error(err: _ErrorStruct) -> tuple[int, str, bytes]:
-    """Copy a filled out-err slot's code, message, and payload, then release
+    """Copy a filled error slot's code, message, and payload, then release
     them."""
     code = err.code
-    message = _peek_bytes(err.message_ptr, err.message_len).decode("utf-8", "replace")
-    payload = _peek_bytes(err.payload_ptr, err.payload_len)
+    message = _peek(err.message_ptr, err.message_len).decode("utf-8", "replace")
+    payload = _peek(err.payload_ptr, err.payload_len)
     _error_clear(ctypes.byref(err))
     return code, message, payload
 
@@ -227,24 +292,72 @@ def _unknown_code(domain: type[{{ERROR}}], code: int, message: str) -> {{ERROR}}
     return domain(code, message) if code > 0 else {{ERROR}}(code, message)
 
 
-def _take_bytes(ptr: int | None, length: int) -> bytes:
-    """Copy a producer-owned byte run (a string, bytes, or value buffer) and
-    release it with {{PREFIX}}_free_bytes."""
-    if not ptr:
+# Runs into the producer. A parameter's run is lent for the call: it points
+# into a Python object the run keeps alive.
+
+
+def _run_in(data: bytes) -> _Run:
+    """Lend `data` (a string's UTF-8, bytes, or a value buffer) to one call,
+    without copying it."""
+    ptr = ctypes.cast(ctypes.c_char_p(data), ctypes.c_void_p).value if data else None
+    run = _Run(ptr, len(data))
+    run._keep = data
+    return run
+
+
+# Runs out of the producer: a returned run is the consumer's to release
+# with {{PREFIX}}_run_free; a callback argument's is only lent.
+
+
+def _take_bytes(run: _Run) -> bytes:
+    """Copy a run the producer handed over, then release it."""
+    if not run.ptr:
         return b""
     try:
-        return ctypes.string_at(ptr, length)
+        return ctypes.string_at(run.ptr, run.len)
     finally:
-        _free_bytes(ptr, length)
+        _run_free(run)
 
 
-def _take_str(ptr: int | None, length: int) -> str:
-    """Copy and release a producer-owned UTF-8 string."""
-    return _take_bytes(ptr, length).decode("utf-8")
+def _take_str(run: _Run) -> str:
+    """Copy and release a string the producer handed over."""
+    return _take_bytes(run).decode("utf-8")
+
+
+def _peek_bytes(run: _Run) -> bytes:
+    """Copy a run the producer only lends."""
+    return _peek(run.ptr, run.len)
+
+
+def _peek_str(run: _Run) -> str:
+    """Copy a string the producer only lends."""
+    return _peek(run.ptr, run.len).decode("utf-8")
+
+
+# Optional scalars out of the producer.
+
+
+def _opt_int(opt: Any) -> int | None:
+    return int(opt.value) if opt.has else None
+
+
+def _opt_float(opt: Any) -> float | None:
+    return float(opt.value) if opt.has else None
+
+
+def _opt_bool(opt: Any) -> bool | None:
+    return bool(opt.value) if opt.has else None
+
+
+_E = TypeVar("_E", bound=IntEnum)
+
+
+def _opt_enum(opt: Any, cls: type[_E]) -> _E | None:
+    return cls(opt.value) if opt.has else None
 
 
 # Range checks. ctypes truncates an out-of-range integer argument to the C
-# width silently, so every integer crossing directly is checked first.
+# width silently, so every integer crossing as a scalar is checked first.
 
 
 def _int_check(kind: str, lo: int, hi: int) -> Callable[[int, str], int]:
@@ -277,8 +390,8 @@ def _float(value: float, what: str) -> float:
     raise TypeError(f"{what}: expected a number, got {type(value).__name__}")
 
 
-# Typed arrays: numeric lists crossing directly. Each element kind's
-# `array` typecode and ctypes element type.
+# Typed arrays: numeric lists crossing as a run of packed elements. Each
+# element kind's `array` typecode and ctypes element type.
 _ARRAY_TYPES: dict[str, tuple[str, Any]] = {
     "i8": ("b", ctypes.c_int8),
     "i16": ("h", ctypes.c_int16),
@@ -293,9 +406,8 @@ _ARRAY_TYPES: dict[str, tuple[str, Any]] = {
 
 
 def _array(values: Iterable[Any], kind: str, what: str) -> array.array[Any]:
-    """Pack a sequence of numbers into a range-checked typed array whose
-    buffer is lent to one call. An `array.array` of the matching typecode
-    is lent as is, without a copy."""
+    """Pack a sequence of numbers into a range-checked typed array. An
+    `array.array` of the matching typecode is used as is, without a copy."""
     code = _ARRAY_TYPES[kind][0]
     if isinstance(values, array.array) and values.typecode == code:
         return values
@@ -309,25 +421,33 @@ def _array(values: Iterable[Any], kind: str, what: str) -> array.array[Any]:
         raise TypeError(f"{what}: {exc}") from None
 
 
-def _peek_array(ptr: int | None, count: int, kind: str) -> list[Any]:
+def _array_in(values: Iterable[Any], kind: str, what: str) -> _Run:
+    """Lend a typed array to one call. Its buffer is allocated by Python,
+    which aligns it for every element type."""
+    data = _array(values, kind, what)
+    size = len(data) * data.itemsize
+    run = _Run(data.buffer_info()[0] if size else None, size)
+    run._keep = data
+    return run
+
+
+def _peek_array(run: _Run, kind: str) -> list[Any]:
     """Copy a typed array the producer only lends."""
-    if not ptr or not count:
+    if not run.ptr or not run.len:
         return []
-    values: list[Any] = (_ARRAY_TYPES[kind][1] * count).from_address(ptr)[:]
+    ctype = _ARRAY_TYPES[kind][1]
+    values: list[Any] = (ctype * (run.len // ctypes.sizeof(ctype))).from_address(run.ptr)[:]
     return values
 
 
-def _take_array(ptr: int | None, count: int, kind: str) -> list[Any]:
-    """Copy a producer-owned typed array and release it with
-    {{PREFIX}}_free_bytes."""
-    if not ptr:
+def _take_array(run: _Run, kind: str) -> list[Any]:
+    """Copy a typed array the producer handed over, then release it."""
+    if not run.ptr:
         return []
-    ctype = _ARRAY_TYPES[kind][1]
     try:
-        values: list[Any] = (ctype * count).from_address(ptr)[:]
-        return values
+        return _peek_array(run, kind)
     finally:
-        _free_bytes(ptr, count * ctypes.sizeof(ctype))
+        _run_free(run)
 
 
 _H = TypeVar("_H", bound="_Handle")
@@ -521,8 +641,6 @@ _S_I64 = struct.Struct("<q")
 _S_U64 = struct.Struct("<Q")
 _S_F32 = struct.Struct("<f")
 _S_F64 = struct.Struct("<d")
-
-_E = TypeVar("_E", bound=IntEnum)
 
 
 def _malformed(what: str) -> {{TRAP}}:

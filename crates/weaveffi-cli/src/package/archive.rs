@@ -11,7 +11,7 @@
 use std::borrow::Cow;
 use std::io::Write as _;
 
-use miette::{bail, IntoDiagnostic, Result, WrapErr};
+use miette::{IntoDiagnostic, Result, WrapErr};
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::package::PackagedFile;
@@ -20,10 +20,6 @@ use crate::package::PackagedFile;
 /// fixed timestamp `npm pack` uses.
 const MTIME: u64 = 499_162_500;
 
-/// [`MTIME`] as an MS-DOS date and time, for zip entries.
-const DOS_DATE: u16 = ((1985 - 1980) << 9) | (10 << 5) | 26;
-const DOS_TIME: u16 = (8 << 11) | (15 << 5);
-
 /// One file inside an archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry<'a> {
@@ -31,13 +27,13 @@ pub struct Entry<'a> {
     pub path: String,
     /// The file's bytes.
     pub data: Cow<'a, [u8]>,
-    /// Whether the file is executable (native libraries and addons are).
+    /// Whether the file is executable (native libraries are).
     pub executable: bool,
 }
 
 impl<'a> Entry<'a> {
     /// An entry at `path` holding `data`, executable when its name looks like
-    /// a native library or addon.
+    /// a native library.
     pub fn new(path: impl Into<String>, data: impl Into<Cow<'a, [u8]>>) -> Self {
         let path = path.into();
         let executable = is_native(&path);
@@ -57,11 +53,10 @@ impl<'a> Entry<'a> {
     }
 }
 
-/// Whether `path` names a native library or addon, which archives mark
-/// executable.
+/// Whether `path` names a native library, which archives mark executable.
 fn is_native(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
-    [".so", ".dylib", ".dll", ".node", ".a"]
+    [".so", ".dylib", ".dll", ".a"]
         .iter()
         .any(|ext| name.ends_with(ext))
 }
@@ -135,79 +130,30 @@ pub fn gzip(bytes: &[u8]) -> Result<Vec<u8>> {
 ///
 /// # Errors
 ///
-/// Returns an error when an entry is too large for a non-Zip64 archive or
-/// compression fails.
+/// Returns an error when writing an entry or compressing it fails.
 pub fn zip(entries: &[Entry<'_>]) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut central = Vec::new();
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for entry in entries {
-        let mut encoder =
-            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder
-            .write_all(&entry.data)
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .last_modified_time(zip_mtime())
+            .unix_permissions(entry.mode());
+        writer
+            .start_file(entry.path.as_str(), options)
+            .and_then(|()| writer.write_all(&entry.data).map_err(Into::into))
             .into_diagnostic()
-            .wrap_err("failed to deflate")?;
-        let compressed = encoder
-            .finish()
-            .into_diagnostic()
-            .wrap_err("failed to deflate")?;
-        let crc = crc32fast::hash(&entry.data);
-        let (Ok(size), Ok(packed), Ok(offset), Ok(name_len)) = (
-            u32::try_from(entry.data.len()),
-            u32::try_from(compressed.len()),
-            u32::try_from(out.len()),
-            u16::try_from(entry.path.len()),
-        ) else {
-            bail!("{} is too large for a zip archive", entry.path);
-        };
-        // Local file header: version 2.0, UTF-8 names, deflate.
-        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
-        out.extend_from_slice(&20u16.to_le_bytes());
-        out.extend_from_slice(&0x0800u16.to_le_bytes());
-        out.extend_from_slice(&8u16.to_le_bytes());
-        out.extend_from_slice(&DOS_TIME.to_le_bytes());
-        out.extend_from_slice(&DOS_DATE.to_le_bytes());
-        out.extend_from_slice(&crc.to_le_bytes());
-        out.extend_from_slice(&packed.to_le_bytes());
-        out.extend_from_slice(&size.to_le_bytes());
-        out.extend_from_slice(&name_len.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(entry.path.as_bytes());
-        out.extend_from_slice(&compressed);
-        // Central directory record: made by Unix (3) so the external
-        // attributes carry the file mode.
-        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
-        central.extend_from_slice(&((3u16 << 8) | 20).to_le_bytes());
-        central.extend_from_slice(&20u16.to_le_bytes());
-        central.extend_from_slice(&0x0800u16.to_le_bytes());
-        central.extend_from_slice(&8u16.to_le_bytes());
-        central.extend_from_slice(&DOS_TIME.to_le_bytes());
-        central.extend_from_slice(&DOS_DATE.to_le_bytes());
-        central.extend_from_slice(&crc.to_le_bytes());
-        central.extend_from_slice(&packed.to_le_bytes());
-        central.extend_from_slice(&size.to_le_bytes());
-        central.extend_from_slice(&name_len.to_le_bytes());
-        central.extend_from_slice(&[0; 8]);
-        central.extend_from_slice(&((0o100_000 | entry.mode()) << 16).to_le_bytes());
-        central.extend_from_slice(&offset.to_le_bytes());
-        central.extend_from_slice(entry.path.as_bytes());
+            .wrap_err_with(|| format!("failed to zip {}", entry.path))?;
     }
-    let (Ok(count), Ok(central_len), Ok(central_offset)) = (
-        u16::try_from(entries.len()),
-        u32::try_from(central.len()),
-        u32::try_from(out.len()),
-    ) else {
-        bail!("too many entries for a zip archive");
-    };
-    out.extend_from_slice(&central);
-    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
-    out.extend_from_slice(&[0; 4]);
-    out.extend_from_slice(&count.to_le_bytes());
-    out.extend_from_slice(&count.to_le_bytes());
-    out.extend_from_slice(&central_len.to_le_bytes());
-    out.extend_from_slice(&central_offset.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes());
-    Ok(out)
+    writer
+        .finish()
+        .map(std::io::Cursor::into_inner)
+        .into_diagnostic()
+        .wrap_err("failed to finish the zip archive")
+}
+
+/// [`MTIME`] as a zip timestamp.
+fn zip_mtime() -> zip::DateTime {
+    zip::DateTime::from_date_and_time(1985, 10, 26, 8, 15, 0).unwrap_or_default()
 }
 
 /// The lowercase hexadecimal SHA-256 of `bytes`.
@@ -223,18 +169,8 @@ fn hex(bytes: &[u8]) -> String {
 /// URL-safe base64 without padding, the digest encoding of a wheel's
 /// `RECORD`.
 fn base64_url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
-        for i in 0..=chunk.len() {
-            out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
-        }
-    }
-    out
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// The metadata of a Python wheel. The writer renders the `.dist-info`
@@ -536,34 +472,17 @@ mod tests {
     use std::io::Read as _;
 
     /// Parse a zip written by [`zip`] back into `(name, mode, bytes)`
-    /// triples by walking its central directory.
+    /// triples, in order.
     fn unzip(bytes: &[u8]) -> Vec<(String, u32, Vec<u8>)> {
-        let u16_at = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
-        let u32_at = |at: usize| {
-            u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
-        };
-        let eocd = bytes.len() - 22;
-        assert_eq!(u32_at(eocd), 0x0605_4b50);
-        let count = u16_at(eocd + 10);
-        let mut at = u32_at(eocd + 16) as usize;
-        let mut out = Vec::new();
-        for _ in 0..count {
-            assert_eq!(u32_at(at), 0x0201_4b50);
-            let packed = u32_at(at + 20) as usize;
-            let name_len = u16_at(at + 28);
-            let mode = u32_at(at + 38) >> 16;
-            let offset = u32_at(at + 42) as usize;
-            let name = String::from_utf8(bytes[at + 46..at + 46 + name_len].to_vec()).unwrap();
-            let data_at = offset + 30 + u16_at(offset + 26) + u16_at(offset + 28);
-            let mut data = Vec::new();
-            flate2::read::DeflateDecoder::new(&bytes[data_at..data_at + packed])
-                .read_to_end(&mut data)
-                .unwrap();
-            assert_eq!(crc32fast::hash(&data), u32_at(at + 16));
-            out.push((name, mode, data));
-            at += 46 + name_len;
-        }
-        out
+        let mut archive = ::zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        (0..archive.len())
+            .map(|i| {
+                let mut file = archive.by_index(i).unwrap();
+                let mut data = Vec::new();
+                file.read_to_end(&mut data).unwrap();
+                (file.name().to_string(), file.unix_mode().unwrap(), data)
+            })
+            .collect()
     }
 
     fn untar(bytes: &[u8]) -> Vec<(String, u32, Vec<u8>)> {
@@ -708,7 +627,7 @@ mod tests {
     fn npm_tarballs_prefix_every_entry_with_package() {
         let files = vec![
             PackagedFile::text("package.json", "{}"),
-            PackagedFile::bytes("kv_node.node", b"addon".to_vec()),
+            PackagedFile::bytes("libkv.dylib", b"lib".to_vec()),
         ];
         let tgz = gzip(&tar(&entries(&files, Some("package")).unwrap()).unwrap()).unwrap();
         let unpacked = untar(&gunzip(&tgz));
@@ -716,7 +635,7 @@ mod tests {
             unpacked,
             [
                 ("package/package.json".into(), 0o644, b"{}".to_vec()),
-                ("package/kv_node.node".into(), 0o755, b"addon".to_vec()),
+                ("package/libkv.dylib".into(), 0o755, b"lib".to_vec()),
             ]
         );
         assert_eq!(

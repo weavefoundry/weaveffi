@@ -1,0 +1,34 @@
+version: "0.13.0"
+# A library split across files: this document imports the types it uses
+# from `imports/shapes.yml`, which imports `imports/units.yml` (and both
+# reach `units.yml`, which is read once). Every declaration joins one
+# namespace, so references cross files in every direction: this file uses
+# an imported record (`Canvas.root : Shape`), an import uses a record of
+# this file (`Shape.detail : Detail`), and a function here throws a domain
+# declared in an import.
+imports:
+  - imports/shapes.yml
+  - imports/units.yml
+doc: Drawing with shapes, measured in units.
+records:
+  - name: Canvas
+    doc: A canvas holding one shape.
+    fields:
+      - { name: width, type: i32 }
+      - { name: root, type: Shape, doc: A record from an imported file }
+  - name: Detail
+    doc: Measured detail of a shape.
+    fields:
+      - { name: area, type: f64 }
+functions:
+  - name: new_canvas
+    doc: Construct a Canvas.
+    params:
+      - { name: width, type: i32 }
+    return: Canvas
+  - name: compute
+    doc: Measure a shape. Throws the imported `GraphicsError` domain.
+    params:
+      - { name: shape, type: Shape }
+    return: Detail
+    throws: GraphicsError

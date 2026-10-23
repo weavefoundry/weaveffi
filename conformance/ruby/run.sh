@@ -9,13 +9,24 @@ set -uo pipefail
 use_ruby || require_tools ruby ruby3.2
 require_tools ruby ruby gem
 
-# Build the sample's generated gem with `gem build`, install it into a
+# A private gem home per Ruby version, holding the generated gems and, when
+# the Ruby found has no `ffi` gem (which the bindings depend on), a pinned
+# one installed here rather than into the Ruby's own gem home.
+FFI_GEM_VERSION=1.17.2
+RUBY_GEM_HOME="$OUT/ruby-gems/$(ruby -e 'print RUBY_VERSION')"
+export RUBY_GEM_HOME
+if ! GEM_PATH="$RUBY_GEM_HOME:$(gem env gempath)" ruby -e "require 'ffi'" >/dev/null 2>&1; then
+    echo "--- installing ffi $FFI_GEM_VERSION into $RUBY_GEM_HOME"
+    gem install --silent --no-document --install-dir "$RUBY_GEM_HOME" ffi -v "$FFI_GEM_VERSION" || exit 1
+fi
+
+# Build the sample's generated gem with `gem build`, install it into the
 # private gem home, and run the consumer against the installed gem. The
 # library is selected through the generated loader's {PREFIX}_LIBRARY
 # override.
 rb_consumer() {
     local sample="$1" script="$2"
-    local gemdir="$GENROOT/$sample/ruby" home="$OUT/ruby-gems"
+    local gemdir="$GENROOT/$sample/ruby" home="$RUBY_GEM_HOME"
     local spec gem
     spec=$(cd "$gemdir" && ls ./*.gemspec) || return 1
     gem="$OUT/ruby-${sample}.gem"

@@ -3,10 +3,12 @@
 
 use std::fmt;
 
-use super::{
-    contract_check_symbol, contract_symbol, FnBinding, Model, RUNTIME_SYMBOLS, VALUE_CODECS,
-};
-use crate::plan::RetPass;
+use super::{FnBinding, Model, RUNTIME_SYMBOLS};
+
+/// The codec functions the C value-buffer helper header declares for each
+/// record, rich enum, and error payload struct `T`: `T_write`, `T_read`,
+/// `T_decode`, and `T_free`.
+pub const VALUE_CODECS: &[&str] = &["write", "read", "decode", "free"];
 
 /// One C identifier the library's ABI declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,24 +21,14 @@ pub struct Symbol {
 
 /// The declaration that owns a C [`Symbol`].
 ///
-/// Every `path` is a dotted declaration path: the module path, then the
-/// declaration name, then a member, variant, or code name (`kv.open`,
-/// `kv.Store.get`, `kv.KvError.NotFound`). `Display` renders the
-/// human-readable description diagnostics quote.
+/// Every `path` is a dotted declaration path: the declaration name, then a
+/// member, variant, or code name (`open`, `Store.get`,
+/// `KvError.NotFound`). `Display` renders the human-readable description
+/// diagnostics quote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SymbolOwner {
     /// The runtime surface every producer exports.
     Runtime,
-    /// A top-level module's contract table function (`module` is its name).
-    ContractTable {
-        /// The top-level module's name.
-        module: String,
-    },
-    /// The C header's checker for a top-level module's contract.
-    ContractCheck {
-        /// The top-level module's name.
-        module: String,
-    },
     /// A callable's entry point: the sync symbol, async launcher, or
     /// iterator launcher.
     Callable {
@@ -114,10 +106,21 @@ pub enum SymbolOwner {
         /// The record's path.
         path: String,
     },
+    /// A callback interface's argument struct.
+    Callback {
+        /// The callback interface's path.
+        path: String,
+    },
     /// A callback interface's vtable type.
     Vtable {
         /// The callback interface's path.
         path: String,
+    },
+    /// The C value-buffer header's struct of a composite (an optional,
+    /// list, or map shape), and its codecs.
+    Composite {
+        /// The composite's stem (`list_i32`).
+        stem: String,
     },
     /// One of the [`VALUE_CODECS`] the buffer header declares for a struct.
     Codec {
@@ -133,12 +136,6 @@ impl fmt::Display for SymbolOwner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Runtime => f.write_str("the runtime surface"),
-            Self::ContractTable { module } => {
-                write!(f, "the contract table of module '{module}'")
-            }
-            Self::ContractCheck { module } => {
-                write!(f, "the contract check of module '{module}'")
-            }
             Self::Callable { path } => write!(f, "function '{path}'"),
             Self::AsyncCallback { path } => write!(f, "the completion type of '{path}'"),
             Self::IteratorType { path } => write!(f, "the iterator type of '{path}'"),
@@ -156,17 +153,29 @@ impl fmt::Display for SymbolOwner {
                 write!(f, "the payload struct of error code '{path}'")
             }
             Self::Record { path } => write!(f, "record '{path}'"),
+            Self::Composite { stem } => write!(f, "the value-buffer codec of '{stem}'"),
+            Self::Callback { path } => write!(f, "callback interface '{path}'"),
             Self::Vtable { path } => write!(f, "the vtable of callback interface '{path}'"),
             Self::Codec { codec, of } => write!(f, "the value-buffer codec '{codec}' of {of}"),
         }
     }
 }
 
-/// Build the symbol table of `model` (see [`Model::c_symbols`]).
+/// Build the symbol table of `model` (see [`Model::c_symbols`]). The
+/// per-declaration contract functions are left out: their names fall in a
+/// family no declaration may use.
 pub(super) fn collect(model: &Model) -> Vec<Symbol> {
     let p = model.prefix();
     let mut out: Vec<Symbol> = RUNTIME_SYMBOLS
         .iter()
+        .map(|s| s.to_string())
+        .chain(
+            crate::ty::Prim::ALL
+                .into_iter()
+                .filter(|p| p.is_scalar())
+                .map(|prim| format!("opt_{}", prim.snake())),
+        )
+        .chain(std::iter::once("contract_check".to_string()))
         .map(|s| Symbol {
             name: format!("{p}_{s}"),
             owner: SymbolOwner::Runtime,
@@ -178,145 +187,141 @@ pub(super) fn collect(model: &Model) -> Vec<Symbol> {
             owner,
         });
     };
-    for m in model.roots() {
+    let callable = |out: &mut Vec<Symbol>, f: &FnBinding| {
+        let path = f.path.clone();
         push(
-            &mut out,
-            &contract_symbol(p, &m.name),
-            SymbolOwner::ContractTable {
-                module: m.name.clone(),
-            },
+            out,
+            &f.abi.symbol,
+            SymbolOwner::Callable { path: path.clone() },
         );
-        push(
-            &mut out,
-            &contract_check_symbol(p, &m.name),
-            SymbolOwner::ContractCheck {
-                module: m.name.clone(),
-            },
-        );
-    }
-    let callable = |out: &mut Vec<Symbol>, f: &FnBinding, owner: &str| {
-        let path = format!("{owner}.{}", f.name);
-        out.push(Symbol {
-            name: f.abi.symbol.clone(),
-            owner: SymbolOwner::Callable { path: path.clone() },
-        });
         if let Some(a) = f.async_binding() {
-            out.push(Symbol {
-                name: a.callback_type.clone(),
-                owner: SymbolOwner::AsyncCallback { path: path.clone() },
-            });
+            push(
+                out,
+                &a.callback_type,
+                SymbolOwner::AsyncCallback { path: path.clone() },
+            );
         }
-        if let RetPass::Iterator(it) = &f.ret_pass {
-            out.push(Symbol {
-                name: it.iter_tag.clone(),
-                owner: SymbolOwner::IteratorType { path: path.clone() },
-            });
-            out.push(Symbol {
-                name: it.next.symbol.clone(),
-                owner: SymbolOwner::IteratorNext { path: path.clone() },
-            });
-            out.push(Symbol {
-                name: it.destroy_symbol.clone(),
-                owner: SymbolOwner::IteratorDestroy { path },
-            });
+        if let Some(it) = f.iterator() {
+            push(
+                out,
+                &it.iter_tag,
+                SymbolOwner::IteratorType { path: path.clone() },
+            );
+            push(
+                out,
+                &it.next.symbol,
+                SymbolOwner::IteratorNext { path: path.clone() },
+            );
+            push(
+                out,
+                &it.destroy_symbol,
+                SymbolOwner::IteratorDestroy { path },
+            );
         }
     };
     let codecs = |out: &mut Vec<Symbol>, tag: &str, of: &SymbolOwner| {
         for codec in VALUE_CODECS {
-            out.push(Symbol {
-                name: format!("{tag}_{codec}"),
-                owner: SymbolOwner::Codec {
+            push(
+                out,
+                &format!("{tag}_{codec}"),
+                SymbolOwner::Codec {
                     codec,
                     of: Box::new(of.clone()),
                 },
-            });
+            );
         }
     };
-    for m in &model.modules {
-        let dot = &m.dot_path;
-        for e in &m.errors {
-            let path = format!("{dot}.{}", e.name);
+    for e in &model.errors {
+        let path = e.name.clone();
+        push(
+            &mut out,
+            &e.c_tag,
+            SymbolOwner::ErrorDomain { path: path.clone() },
+        );
+        for c in &e.codes {
+            let code = format!("{path}.{}", c.name);
             push(
                 &mut out,
-                &e.c_tag,
-                SymbolOwner::ErrorDomain { path: path.clone() },
+                &c.c_const,
+                SymbolOwner::ErrorCode { path: code.clone() },
             );
-            for c in &e.codes {
-                let code = format!("{path}.{}", c.name);
-                push(
-                    &mut out,
-                    &c.c_const,
-                    SymbolOwner::ErrorCode { path: code.clone() },
-                );
-                if !c.fields.is_empty() {
-                    let owner = SymbolOwner::ErrorPayload { path: code };
-                    let tag = c.payload_tag();
-                    codecs(&mut out, &tag, &owner);
-                    push(&mut out, &tag, owner);
-                }
+            if !c.fields.is_empty() {
+                let owner = SymbolOwner::ErrorPayload { path: code };
+                let tag = c.payload_tag();
+                codecs(&mut out, &tag, &owner);
+                push(&mut out, &tag, owner);
             }
         }
-        for e in &m.enums {
-            let path = format!("{dot}.{}", e.name);
-            let owner = SymbolOwner::Enum { path: path.clone() };
-            push(&mut out, &e.c_tag, owner.clone());
-            if e.rich {
-                push(
-                    &mut out,
-                    &format!("{}_Tag", e.c_tag),
-                    SymbolOwner::EnumTag { path: path.clone() },
-                );
-                codecs(&mut out, &e.c_tag, &owner);
-            }
-            for v in &e.variants {
-                push(
-                    &mut out,
-                    &v.c_const,
-                    SymbolOwner::EnumVariant {
-                        path: format!("{path}.{}", v.name),
-                    },
-                );
-            }
-        }
-        for s in &m.structs {
-            let owner = SymbolOwner::Record {
-                path: format!("{dot}.{}", s.name),
-            };
-            codecs(&mut out, &s.c_tag, &owner);
-            push(&mut out, &s.c_tag, owner);
-        }
-        for c in &m.callback_interfaces {
+    }
+    for e in &model.enums {
+        let path = e.name.clone();
+        let owner = SymbolOwner::Enum { path: path.clone() };
+        push(&mut out, &e.c_tag, owner.clone());
+        if e.is_rich() {
             push(
                 &mut out,
-                &c.vtable_tag,
-                SymbolOwner::Vtable {
-                    path: format!("{dot}.{}", c.name),
+                &format!("{}_Tag", e.c_tag),
+                SymbolOwner::EnumTag { path: path.clone() },
+            );
+            codecs(&mut out, &e.c_tag, &owner);
+        }
+        for v in &e.variants {
+            push(
+                &mut out,
+                &v.c_const,
+                SymbolOwner::EnumVariant {
+                    path: format!("{path}.{}", v.name),
                 },
             );
         }
-        for i in &m.interfaces {
-            let path = format!("{dot}.{}", i.name);
-            push(
-                &mut out,
-                &i.c_tag,
-                SymbolOwner::Interface { path: path.clone() },
-            );
-            push(
-                &mut out,
-                &i.clone_symbol,
-                SymbolOwner::InterfaceClone { path: path.clone() },
-            );
-            push(
-                &mut out,
-                &i.destroy_symbol,
-                SymbolOwner::InterfaceDestroy { path: path.clone() },
-            );
-            for f in i.members() {
-                callable(&mut out, f, &path);
-            }
+    }
+    for r in &model.records {
+        let owner = SymbolOwner::Record {
+            path: r.name.clone(),
+        };
+        codecs(&mut out, &r.c_tag, &owner);
+        push(&mut out, &r.c_tag, owner);
+    }
+    for c in &model.callbacks {
+        let path = c.name.clone();
+        push(
+            &mut out,
+            &c.c_tag,
+            SymbolOwner::Callback { path: path.clone() },
+        );
+        push(&mut out, &c.vtable_tag, SymbolOwner::Vtable { path });
+    }
+    for i in &model.interfaces {
+        let path = i.name.clone();
+        push(
+            &mut out,
+            &i.c_tag,
+            SymbolOwner::Interface { path: path.clone() },
+        );
+        push(
+            &mut out,
+            &i.clone_symbol,
+            SymbolOwner::InterfaceClone { path: path.clone() },
+        );
+        push(
+            &mut out,
+            &i.destroy_symbol,
+            SymbolOwner::InterfaceDestroy { path },
+        );
+        for f in i.members() {
+            callable(&mut out, f);
         }
-        for f in &m.functions {
-            callable(&mut out, f, dot);
+    }
+    for f in &model.functions {
+        callable(&mut out, f);
+    }
+    if model.has_buffers() {
+        for ty in model.composites() {
+            let stem = ty.stem();
+            let owner = SymbolOwner::Composite { stem: stem.clone() };
+            let tag = format!("{p}_buf_{stem}");
+            codecs(&mut out, &tag, &owner);
+            push(&mut out, &tag, owner);
         }
     }
     out
