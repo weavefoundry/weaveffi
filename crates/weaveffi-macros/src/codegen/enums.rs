@@ -1,4 +1,4 @@
-//! Codegen for enums: the [`weaveffi::abi::CEnum`] implementation of a
+//! Codegen for enums: the [`weaveffi::abi::Scalar`] implementation of a
 //! C-style enum, and the [`weaveffi::abi::BufferValue`] implementation of
 //! every enum.
 //!
@@ -12,14 +12,20 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use weaveffi_model::model::EnumBinding;
 
+use super::custom::CustomScope;
 use super::helpers::ident;
+use super::records::{field_codec, field_type, FieldCodec};
 
-/// Generate the surface for one enum: `CEnum` plus a `BufferValue` impl for
+/// Generate the surface for one enum: `Scalar` plus a `BufferValue` impl for
 /// a C-style enum, or the tag-and-fields `BufferValue` impl for a rich
 /// (algebraic) enum.
-pub(crate) fn gen_enum(e: &EnumBinding) -> TokenStream {
+pub(crate) fn gen_enum(
+    e: &EnumBinding,
+    item: Option<&syn::ItemEnum>,
+    customs: CustomScope<'_>,
+) -> TokenStream {
     if e.is_rich() {
-        return gen_rich_enum(e);
+        return gen_rich_enum(e, item, customs);
     }
     let ty = ident(&e.name);
     let from_arms = e.variants.iter().map(|v| {
@@ -33,14 +39,15 @@ pub(crate) fn gen_enum(e: &EnumBinding) -> TokenStream {
         quote!(Self::#vident => #value,)
     });
     quote! {
-        impl ::weaveffi::abi::CEnum for #ty {
-            fn from_i32(value: i32) -> ::std::option::Option<Self> {
-                match value {
+        impl ::weaveffi::abi::Scalar for #ty {
+            type Abi = i32;
+            fn from_abi(__wv_value: i32) -> ::std::option::Option<Self> {
+                match __wv_value {
                     #(#from_arms)*
                     _ => ::std::option::Option::None,
                 }
             }
-            fn to_i32(&self) -> i32 {
+            fn to_abi(&self) -> i32 {
                 match self {
                     #(#to_arms)*
                 }
@@ -64,54 +71,80 @@ pub(crate) fn gen_enum(e: &EnumBinding) -> TokenStream {
     }
 }
 
+/// The codecs of a variant's fields, reached through the bindings its
+/// pattern introduces (each a `&T`).
+fn variant_codecs(
+    fields: &[weaveffi_model::model::FieldBinding],
+    written: Option<&syn::Fields>,
+    customs: CustomScope<'_>,
+) -> Vec<FieldCodec> {
+    fields
+        .iter()
+        .map(|f| {
+            let binding = field_local(&f.name);
+            field_codec(&quote!(#binding), field_type(written, &f.name), customs)
+        })
+        .collect()
+}
+
+/// The local a variant's field `name` binds to in a generated pattern:
+/// `__wv_f_{name}`, so a constant the producer declared with the field's
+/// name can't turn the binding into a constant pattern.
+pub(crate) fn field_local(name: &str) -> syn::Ident {
+    quote::format_ident!("__wv_f_{}", name)
+}
+
+/// The written fields of the variant `name` of `item`.
+pub(crate) fn variant_fields<'a>(
+    item: Option<&'a syn::ItemEnum>,
+    name: &str,
+) -> Option<&'a syn::Fields> {
+    item?
+        .variants
+        .iter()
+        .find(|v| v.ident == name)
+        .map(|v| &v.fields)
+}
+
 /// Generate the `BufferValue` impl for a rich (algebraic) enum: the write
 /// side emits the active variant's tag then its fields in declaration order;
 /// the read side dispatches on the tag and reconstructs the variant.
-fn gen_rich_enum(e: &EnumBinding) -> TokenStream {
+fn gen_rich_enum(
+    e: &EnumBinding,
+    item: Option<&syn::ItemEnum>,
+    customs: CustomScope<'_>,
+) -> TokenStream {
     let ty = ident(&e.name);
-    let len_arms = e.variants.iter().map(|v| {
-        let vident = ident(&v.name);
-        if v.fields.is_empty() {
-            quote!(Self::#vident => 4,)
-        } else {
-            let bindings: Vec<syn::Ident> = v.fields.iter().map(|f| ident(&f.name)).collect();
-            quote! {
-                Self::#vident { #(#bindings),* } => {
-                    4 #(+ ::weaveffi::abi::BufferValue::encoded_len(#bindings))*
-                }
-            }
-        }
-    });
-    let write_arms = e.variants.iter().map(|v| {
+    let mut len_arms = Vec::new();
+    let mut write_arms = Vec::new();
+    let mut read_arms = Vec::new();
+    for v in &e.variants {
         let value = v.value;
         let vident = ident(&v.name);
         let bindings: Vec<syn::Ident> = v.fields.iter().map(|f| ident(&f.name)).collect();
+        let locals: Vec<syn::Ident> = v.fields.iter().map(|f| field_local(&f.name)).collect();
+        let codecs = variant_codecs(&v.fields, variant_fields(item, &v.name), customs);
         let pattern = if bindings.is_empty() {
             quote!(Self::#vident)
         } else {
-            quote!(Self::#vident { #(#bindings),* })
+            quote!(Self::#vident { #(#bindings: #locals),* })
         };
-        quote! {
+        let lens = codecs.iter().map(|c| &c.len);
+        let writes = codecs.iter().map(|c| &c.write);
+        let reads = codecs.iter().map(|c| &c.read);
+        len_arms.push(quote!(#pattern => 4 #(+ #lens)*,));
+        write_arms.push(quote! {
             #pattern => {
                 __wv_w.write_i32(#value);
-                #(::weaveffi::abi::BufferValue::write_value(#bindings, __wv_w);)*
+                #(#writes)*
             }
-        }
-    });
-    let read_arms = e.variants.iter().map(|v| {
-        let value = v.value;
-        let vident = ident(&v.name);
-        if v.fields.is_empty() {
+        });
+        read_arms.push(if bindings.is_empty() {
             quote!(#value => Self::#vident,)
         } else {
-            let names: Vec<syn::Ident> = v.fields.iter().map(|f| ident(&f.name)).collect();
-            quote! {
-                #value => Self::#vident {
-                    #(#names: ::weaveffi::abi::BufferValue::read_value(__wv_r)?),*
-                },
-            }
-        }
-    });
+            quote!(#value => Self::#vident { #(#bindings: #reads),* },)
+        });
+    }
 
     quote! {
         #[allow(unsafe_code, unused_unsafe)]

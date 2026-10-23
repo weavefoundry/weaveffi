@@ -10,20 +10,13 @@ mod surface {
 
     #[weaveffi::error]
     #[repr(i32)]
+    #[derive(Debug)]
     pub enum Failure {
         /// Not found
         NotFound = 1,
         /// Payload variant
+        #[weaveffi(message = "{code}: {note}")]
         Detailed { code: i32, note: String } = 2,
-    }
-
-    impl std::fmt::Display for Failure {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::NotFound => f.write_str("not found"),
-                Self::Detailed { code, note } => write!(f, "{code}: {note}"),
-            }
-        }
     }
 
     #[weaveffi::enumeration]
@@ -147,6 +140,8 @@ mod surface {
         w
     }
 }
+
+weaveffi::export_runtime!();
 
 fn main() {
     let _ = Arc::new(surface::Widget::new(1));

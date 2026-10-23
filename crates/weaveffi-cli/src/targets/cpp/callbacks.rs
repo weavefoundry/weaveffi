@@ -1,66 +1,68 @@
-//! Callback interfaces: the abstract class the consumer implements, the
-//! trampolines that adapt an implementation to the C vtable, and the
-//! process-wide static vtable, satisfying
-//! [`weaveffi_model::plan::CallbackProtocol`].
+//! Callback interfaces: the abstract class the consumer implements, and its
+//! `detail::Callbacks<I>` specialization holding the trampolines that adapt
+//! an implementation to the C vtable and the process-wide static vtable.
+//!
+//! Each trampoline receives its arguments per the method's [`ArgPass`]
+//! slots, hands its return back per the method's [`CallbackRetPass`], and
+//! reports any exception through `out_err` per the method's
+//! [`ErrorStrategy`] (through the runtime's `detail::callback`), so nothing
+//! unwinds through the C frame.
 
 use crate::codegen::common::DocCommentStyle;
 use crate::codegen::CodeWriter;
-use weaveffi_model::model::{CallbackInterfaceBinding, CallbackMethodBinding, ErrorBinding};
-use weaveffi_model::plan::{ArgPass, RetPass};
+use crate::lang;
+use weaveffi_model::model::{CallbackInterfaceBinding, CallbackMethodBinding};
+use weaveffi_model::plan::{ArgPass, CallbackRetPass, ErrorStrategy};
 use weaveffi_model::ty::Ty;
 
-use crate::targets::cpp::codec::{read_fn, write_stmt};
-use crate::targets::cpp::entities::{doc_text, report_fn};
+use crate::targets::cpp::entities::type_doc;
 use crate::targets::cpp::types::{
-    cpp_cb_param_decl, cpp_fn_name, cpp_ident, cpp_type, render_param_decls, slot_name,
-    trampoline_struct, vtable_accessor,
+    cpp_cb_param_decl, cpp_error_class, cpp_fn_name, cpp_ident, cpp_type, error_class, slot_decl,
+    slot_name, Ctx,
 };
 
-/// The code a trampoline reports for any failure other than a declared
-/// domain code.
-const FOREIGN_ERROR_CODE: i32 = -4;
-
-/// Append a callback interface: the abstract class, then (in `detail`) its
-/// trampolines and static vtable. `domain` is the error domain in scope for
-/// the interface's module, which its `throws` methods may report.
+/// Append a callback interface: the abstract class, then its
+/// `detail::Callbacks` specialization.
 pub(crate) fn render_callback_interface(
     w: &mut CodeWriter,
+    ctx: &Ctx<'_>,
     cb: &CallbackInterfaceBinding,
-    domain: Option<&ErrorBinding>,
-    prefix: &str,
 ) {
-    render_callback_class(w, cb, domain);
-    render_trampolines(w, cb, domain, prefix);
+    render_callback_class(w, ctx, cb);
+    render_trampolines(w, ctx, cb);
+}
+
+/// The `@throws` paragraph of a callback method that declares errors.
+fn throws_note(error: &ErrorStrategy) -> Option<String> {
+    match error {
+        ErrorStrategy::Trap => None,
+        ErrorStrategy::Untyped => {
+            Some("@throws std::exception to report a failure, with `what()` as its message.".into())
+        }
+        ErrorStrategy::Domain(name) => Some(format!(
+            "@throws {} (or one of its codes' classes) to report one of the domain's codes, \
+             fields included; any other exception reports a plain failure.",
+            cpp_error_class(name)
+        )),
+    }
 }
 
 /// Append the abstract class a consumer subclasses: a virtual destructor and
 /// one pure virtual method per IDL method. Strings arrive as views valid for
-/// the call, buffered values by const reference, and objects by value as
-/// wrappers the implementation owns; every family can be returned.
-fn render_callback_class(
-    w: &mut CodeWriter,
-    cb: &CallbackInterfaceBinding,
-    domain: Option<&ErrorBinding>,
-) {
+/// the call, typed arrays, bytes, and buffered values by const reference,
+/// optional scalars by value, and objects by value as wrappers the
+/// implementation owns.
+fn render_callback_class(w: &mut CodeWriter, ctx: &Ctx<'_>, cb: &CallbackInterfaceBinding) {
     let name = &cb.name;
-    let throws = match domain.filter(|_| cb.methods.iter().any(|m| m.throws)) {
-        Some(eb) => format!(
-            " A method that declares errors may throw a `{}` code's exception, \
-             which reaches the producer with its fields; any other exception \
-             reaches it as a callback failure (code -4).",
-            eb.type_name
-        ),
-        None => " An exception a method throws reaches the producer as a callback \
-                  failure (code -4)."
-            .to_string(),
-    };
     let usage = format!(
         "Subclass it and pass a `std::shared_ptr<{name}>` where the API takes a \
          `{name}`. The producer may call the methods from any thread, so they must \
-         be thread-safe, until it releases the implementation (also from any \
-         thread).{throws}"
+         be thread-safe, and releases the implementation (also from any thread) \
+         once it's done with it. An exception a method throws never unwinds into \
+         the producer: a method that declares errors reports it as described on \
+         the method, and any other method reports a callback failure (-4)."
     );
-    let doc = match doc_text(cb.doc.as_deref(), cb.deprecated.as_deref()) {
+    let doc = match type_doc(ctx, &cb.doc, &cb.deprecated) {
         Some(d) => format!("{d}\n\n{usage}"),
         None => usage,
     };
@@ -71,15 +73,11 @@ fn render_callback_class(
         w.line(format!("virtual ~{name}() = default;"));
         for m in &cb.methods {
             w.blank();
-            let mut doc = doc_text(m.doc.as_deref(), m.deprecated.as_deref());
-            if let Some(eb) = domain.filter(|_| m.throws) {
-                let tag = format!(
-                    "@throws {} to report one of the domain's codes to the producer.",
-                    eb.type_name
-                );
+            let mut doc = type_doc(ctx, &m.doc, &m.deprecated);
+            if let Some(note) = throws_note(&m.error) {
                 doc = Some(match doc {
-                    Some(d) => format!("{d}\n\n{tag}"),
-                    None => tag,
+                    Some(d) => format!("{d}\n\n{note}"),
+                    None => note,
                 });
             }
             w.doc(&doc, DocCommentStyle::Javadoc);
@@ -87,7 +85,7 @@ fn render_callback_class(
             let params: Vec<String> = m
                 .params
                 .iter()
-                .map(|p| cpp_cb_param_decl(&p.ty, &cpp_ident(&p.name)))
+                .map(|p| cpp_cb_param_decl(&p.ty, &p.pass, &cpp_ident(&p.name)))
                 .collect();
             w.line(format!(
                 "virtual {ret} {}({}) = 0;",
@@ -100,230 +98,215 @@ fn render_callback_class(
     w.blank();
 }
 
-/// Append, in `detail`, the trampolines and the static vtable of a callback
-/// interface.
+/// The trampoline name of a method: its vtable field name, kept clear of
+/// the `vtable()` accessor beside it.
+fn trampoline_name(m: &CallbackMethodBinding) -> String {
+    lang::escape_member(&cpp_ident(&m.abi.symbol), &["vtable"])
+}
+
+/// Append, in `detail`, the `Callbacks<I>` specialization of a callback
+/// interface: one trampoline per method and the static vtable.
 ///
-/// `ctx` is a heap-allocated `std::shared_ptr<Iface>` box made when the
+/// `ctx` is a heap-allocated `std::shared_ptr<I>` box made when the
 /// implementation is passed to the producer; the vtable's `free` deletes
-/// it. Each trampoline receives its arguments per the callback protocol,
-/// calls the method, and hands the return back through the C return or the
-/// `out_ptr`/`out_len` slots (a run from `{prefix}_alloc`). Any exception is
-/// reported through `out_err` and nothing unwinds through the C frame.
-fn render_trampolines(
-    w: &mut CodeWriter,
-    cb: &CallbackInterfaceBinding,
-    domain: Option<&ErrorBinding>,
-    prefix: &str,
-) {
+/// it. The vtable's `flags` are 0: C++ implementations may be called from
+/// any thread.
+fn render_trampolines(w: &mut CodeWriter, ctx: &Ctx<'_>, cb: &CallbackInterfaceBinding) {
     let name = &cb.name;
-    let strukt = trampoline_struct(name);
     let vtable = &cb.vtable_tag;
     w.line("namespace detail {");
     w.blank();
     w.line(format!(
-        "/** Trampolines adapting a `{name}` implementation to `{vtable}`. */"
+        "/** Adapts a `{name}` implementation to `{vtable}`. */"
     ));
-    w.block(format!("struct {strukt} {{"), "};", |w| {
+    w.line("template <>");
+    w.block(format!("struct Callbacks<{name}> {{"), "};", |w| {
         for m in &cb.methods {
-            render_trampoline(w, cb, m, domain.filter(|_| m.throws), prefix);
+            render_trampoline(w, ctx, cb, m);
         }
-        w.line("/** Deletes the implementation box once the producer releases it. */");
-        w.block("static void free_ctx(void* ctx) {", "}", |w| {
-            w.line(format!(
-                "delete static_cast<std::shared_ptr<{name}>*>(ctx);"
-            ));
-        });
+        w.line(format!(
+            "/** The vtable every `{name}` implementation is passed with. */"
+        ));
+        w.block(
+            format!("static const {vtable}& vtable() noexcept {{"),
+            "}",
+            |w| {
+                let mut entries = vec![
+                    format!("sizeof({vtable})"),
+                    "0".to_string(),
+                    format!("&release<{name}>"),
+                ];
+                entries.extend(
+                    cb.methods
+                        .iter()
+                        .map(|m| format!("&{}", trampoline_name(m))),
+                );
+                w.block(format!("static const {vtable} table = {{"), "};", |w| {
+                    for entry in &entries {
+                        w.line(format!("{entry},"));
+                    }
+                });
+                w.line("return table;");
+            },
+        );
     });
-    w.blank();
-    w.line(format!(
-        "/** The vtable every `{name}` implementation is passed with. */"
-    ));
-    w.block(
-        format!("inline const {vtable}& {}() {{", vtable_accessor(name)),
-        "}",
-        |w| {
-            w.block(format!("static const {vtable} vtable = {{"), "};", |w| {
-                w.line(format!("static_cast<uint32_t>(sizeof({vtable})),"));
-                w.line("0,");
-                w.line(format!("&{strukt}::free_ctx,"));
-                for m in &cb.methods {
-                    w.line(format!("&{strukt}::{},", cpp_ident(&m.name)));
-                }
-            });
-            w.line("return vtable;");
-        },
-    );
     w.blank();
     w.line("} // namespace detail");
     w.blank();
 }
 
-/// Append one trampoline: a static function with the vtable entry's exact C
-/// signature. `domain` is set when the method declares errors.
-fn render_trampoline(
-    w: &mut CodeWriter,
-    cb: &CallbackInterfaceBinding,
-    m: &CallbackMethodBinding,
-    domain: Option<&ErrorBinding>,
-    prefix: &str,
-) {
-    let iface = &cb.name;
-    let method = cpp_fn_name(&m.name);
-    let c_ret = m.abi_ret.render_c(prefix);
-    let slots = &m.abi_params;
-    let ctx = slot_name(&slots[0]);
-    let out_err = slot_name(&slots[slots.len() - 1]);
-    let ret_pass = RetPass::of(m.ret.as_ref());
-    let returns_run = matches!(ret_pass, RetPass::String | RetPass::Bytes | RetPass::Buffer);
-    let (out_ptr, out_len) = if returns_run {
-        (
-            slot_name(&slots[slots.len() - 3]),
-            slot_name(&slots[slots.len() - 2]),
-        )
-    } else {
-        (String::new(), String::new())
-    };
-    let params = render_param_decls(slots, prefix).join(", ");
-
-    w.block(
-        format!("static {c_ret} {}({params}) {{", cpp_ident(&m.name)),
-        "}",
-        |w| {
-            // Object arguments each transfer one strong reference. Adopting
-            // can't throw, so it comes first, which releases every reference
-            // even when another argument fails to decode.
-            for p in &m.params {
-                if let ArgPass::Object { slot, nullable } = p.arg_pass() {
-                    let class = p.ty.interface_name().expect("objects name an interface");
-                    let slot = slot_name(slot);
-                    let var = format!("{}_arg", p.name);
-                    if nullable {
-                        w.line(format!("std::optional<{class}> {var};"));
-                        w.line(format!("if ({slot} != nullptr) {var}.emplace(adopt, {slot});"));
-                    } else {
-                        w.line(format!("{class} {var}(adopt, {slot});"));
-                    }
-                }
-            }
-            w.line("try {");
-            w.scope(|w| {
-                w.line(format!(
-                    "{iface}& impl = **static_cast<std::shared_ptr<{iface}>*>({ctx});"
-                ));
-                // Buffers carrying object tokens decode first, so a failure
-                // decoding another argument still adopts their references.
-                let mut order: Vec<_> = m.params.iter().collect();
-                order.sort_by_key(|p| !p.ty.contains_object());
-                for p in order {
-                    if let ArgPass::Buffer { ptr, len } = p.arg_pass() {
-                        w.line(format!(
-                            "{} {}_arg = detail::decode({}, {}, &{});",
-                            cpp_type(&p.ty),
-                            p.name,
-                            slot_name(ptr),
-                            slot_name(len),
-                            read_fn(&p.ty)
-                        ));
-                    }
-                }
-                let args: Vec<String> = m.params.iter().map(trampoline_arg).collect();
-                let call = format!("impl.{method}({})", args.join(", "));
-                match (&m.ret, ret_pass.clone()) {
-                    (None, _) => {
-                        w.line(format!("{call};"));
-                    }
-                    (Some(Ty::Enum(_)), _) => {
-                        w.line(format!(
-                            "return static_cast<{c_ret}>(static_cast<int32_t>({call}));"
-                        ));
-                    }
-                    (Some(_), RetPass::Direct) => {
-                        w.line(format!("return {call};"));
-                    }
-                    (Some(_), RetPass::Object { nullable: false, .. }) => {
-                        // A moved-from wrapper returns null, which the
-                        // producer rejects (-3).
-                        w.line(format!("return {call}.clone_handle();"));
-                    }
-                    (Some(ty), RetPass::Object { nullable: true, .. }) => {
-                        w.line(format!("{} ret = {call};", cpp_type(ty)));
-                        w.line("return ret.has_value() ? ret->clone_handle() : nullptr;");
-                    }
-                    (Some(ty), RetPass::String | RetPass::Bytes) => {
-                        w.line(format!("{} ret = {call};", cpp_type(ty)));
-                        w.line(format!(
-                            "detail::hand_over(ret.data(), ret.size(), {out_ptr}, {out_len});"
-                        ));
-                    }
-                    (Some(ty), RetPass::Buffer) => {
-                        w.line(format!("{} ret = {call};", cpp_type(ty)));
-                        w.line("detail::BufferWriter ret_buf;");
-                        w.line(write_stmt(ty, "ret", "ret_buf"));
-                        w.line(format!(
-                            "detail::hand_over(ret_buf.data(), ret_buf.size(), {out_ptr}, {out_len});"
-                        ));
-                    }
-                    (Some(_), RetPass::Void) => unreachable!("a return type is never void"),
-                }
-            });
-            if let Some(eb) = domain {
-                w.line(format!("}} catch (const {}& e) {{", eb.type_name));
-                w.scope(|w| {
-                    w.line(format!("{}(e, {out_err});", report_fn(eb)));
-                });
-            }
-            w.line("} catch (const std::exception& e) {");
-            w.scope(|w| {
-                w.line(format!(
-                    "{prefix}_error_set({out_err}, {FOREIGN_ERROR_CODE}, e.what());"
-                ));
-            });
-            w.line("} catch (...) {");
-            w.scope(|w| {
-                w.line(format!(
-                    "{prefix}_error_set({out_err}, {FOREIGN_ERROR_CODE}, \"{iface}::{method} threw a non-standard exception\");"
-                ));
-            });
-            w.line("}");
-            match ret_pass {
-                RetPass::Direct => {
-                    w.line(format!("return {c_ret}{{}};"));
-                }
-                RetPass::Object { .. } => {
-                    w.line("return nullptr;");
-                }
-                _ => {}
-            }
-        },
-    );
-    w.blank();
-}
-
-/// The expression handing one argument to the implementation: a string
-/// viewed in place, bytes copied, a decoded buffer or adopted object moved
-/// in, and a direct value converted.
-fn trampoline_arg(p: &weaveffi_model::model::ParamBinding) -> String {
-    match p.arg_pass() {
-        ArgPass::Buffer { .. } | ArgPass::Object { .. } => format!("std::move({}_arg)", p.name),
-        ArgPass::String { ptr, len } => format!(
-            "detail::borrow_string({}, {})",
-            slot_name(ptr),
-            slot_name(len)
+/// The expression handing one argument to the implementation, per its
+/// [`ArgPass`]: a string viewed in place, a typed array or bytes copied, an
+/// optional scalar or enum lifted from its flag and value, a decoded buffer
+/// or adopted object moved in, and a direct value converted.
+fn trampoline_arg(ty: &Ty, pass: &ArgPass, local: &str) -> String {
+    match pass {
+        ArgPass::Buffer { .. } | ArgPass::Object { .. } => format!("std::move({local})"),
+        ArgPass::String { ptr, len } => {
+            format!("borrow_string({}, {})", slot_name(ptr), slot_name(len))
+        }
+        ArgPass::Bytes { ptr, len } => {
+            format!("borrow_bytes({}, {})", slot_name(ptr), slot_name(len))
+        }
+        ArgPass::Slice { ptr, len, .. } => {
+            format!("borrow_slice({}, {})", slot_name(ptr), slot_name(len))
+        }
+        ArgPass::OptDirect { has, value, inner } => format!(
+            "lift_optional<{}>({}, {})",
+            cpp_type(inner),
+            slot_name(has),
+            slot_name(value)
         ),
-        ArgPass::Bytes { ptr, len } => format!(
-            "detail::borrow_bytes({}, {})",
-            slot_name(ptr),
-            slot_name(len)
-        ),
-        ArgPass::Direct { slot } => match &p.ty {
-            Ty::Enum(e) => format!(
-                "static_cast<{e}>(static_cast<int32_t>({}))",
-                slot_name(slot)
-            ),
+        ArgPass::Direct { slot } => match ty {
+            Ty::Enum(e) => format!("static_cast<{e}>({})", slot_name(slot)),
             _ => slot_name(slot),
         },
         ArgPass::Callback { .. } => {
             unreachable!("callback interfaces are never callback-method parameters")
         }
     }
+}
+
+/// Append one trampoline: a static function with the vtable entry's exact
+/// C signature.
+fn render_trampoline(
+    w: &mut CodeWriter,
+    ctx: &Ctx<'_>,
+    cb: &CallbackInterfaceBinding,
+    m: &CallbackMethodBinding,
+) {
+    let iface = &cb.name;
+    let c_ret = m.abi.ret.render_c(ctx.prefix);
+    let params: Vec<String> = m
+        .abi
+        .params
+        .iter()
+        .map(|p| slot_decl(p, ctx.prefix))
+        .collect();
+    let local = |name: &str| format!("{}_arg", cpp_ident(name));
+
+    w.block(
+        format!("static {c_ret} {}({}) {{", trampoline_name(m), params.join(", ")),
+        "}",
+        |w| {
+            // Object arguments each transfer one strong reference. Adopting
+            // can't throw, so it comes first, which releases every reference
+            // even when another argument fails to decode.
+            for p in &m.params {
+                if let ArgPass::Object {
+                    slot,
+                    nullable,
+                    interface,
+                } = &p.pass
+                {
+                    let slot = slot_name(slot);
+                    let arg = local(&p.name);
+                    if *nullable {
+                        w.line(format!(
+                            "std::optional<{interface}> {arg} = adopt_optional<{interface}>({slot});"
+                        ));
+                    } else {
+                        w.line(format!("{interface} {arg}(adopt, {slot});"));
+                    }
+                }
+            }
+            let errors = error_class(&m.error);
+            let returns = !matches!(
+                m.ret_pass,
+                CallbackRetPass::Void
+                    | CallbackRetPass::Slice { .. }
+                    | CallbackRetPass::String { .. }
+                    | CallbackRetPass::Bytes { .. }
+                    | CallbackRetPass::Buffer { .. }
+            );
+            let lead = if returns { "return " } else { "" };
+            w.line(format!("{lead}callback<{errors}>(out_err, [&] {{"));
+            w.scope(|w| {
+                // Buffers carrying object tokens decode first, so a failure
+                // decoding another argument still adopts their references.
+                let mut order: Vec<_> = m.params.iter().collect();
+                order.sort_by_key(|p| !p.ty.contains_object());
+                for p in order {
+                    if let ArgPass::Buffer { ptr, len } = &p.pass {
+                        w.line(format!(
+                            "auto {} = decode<{}>({}, {});",
+                            local(&p.name),
+                            cpp_type(&p.ty),
+                            slot_name(ptr),
+                            slot_name(len)
+                        ));
+                    }
+                }
+                let args: Vec<String> = m
+                    .params
+                    .iter()
+                    .map(|p| trampoline_arg(&p.ty, &p.pass, &local(&p.name)))
+                    .collect();
+                let call = format!(
+                    "implementation<{iface}>(ctx).{}({})",
+                    cpp_fn_name(&m.name),
+                    args.join(", ")
+                );
+                let line = match &m.ret_pass {
+                    CallbackRetPass::Void => format!("{call};"),
+                    CallbackRetPass::Direct => match &m.ret {
+                        Some(Ty::Enum(_)) => format!("return static_cast<int32_t>({call});"),
+                        _ => format!("return {call};"),
+                    },
+                    CallbackRetPass::OptDirect { out_value } => {
+                        format!("return give_optional({call}, {});", slot_name(out_value))
+                    }
+                    CallbackRetPass::Slice {
+                        out_ptr, out_len, ..
+                    } => format!(
+                        "give_slice({call}, {}, {});",
+                        slot_name(out_ptr),
+                        slot_name(out_len)
+                    ),
+                    CallbackRetPass::String { out_ptr, out_len }
+                    | CallbackRetPass::Bytes { out_ptr, out_len } => format!(
+                        "give({call}, {}, {});",
+                        slot_name(out_ptr),
+                        slot_name(out_len)
+                    ),
+                    CallbackRetPass::Buffer { out_ptr, out_len } => format!(
+                        "give(encode({call}), {}, {});",
+                        slot_name(out_ptr),
+                        slot_name(out_len)
+                    ),
+                    // A moved-from wrapper returns null, which the producer
+                    // rejects (-3).
+                    CallbackRetPass::Object {
+                        nullable: false, ..
+                    } => format!("return {call}.clone_handle();"),
+                    CallbackRetPass::Object { nullable: true, .. } => {
+                        format!("return clone_of({call});")
+                    }
+                };
+                w.line(line);
+            });
+            w.line("});");
+        },
+    );
+    w.blank();
 }

@@ -11,18 +11,12 @@
 //! ```ignore
 //! #[weaveffi::module]
 //! pub mod math {
-//!     /// The module's error domain; `Display` supplies the runtime message.
+//!     /// The module's error domain. Its `Display` comes from the messages.
 //!     #[weaveffi::error]
 //!     #[derive(Debug)]
 //!     pub enum MathError {
 //!         /// Division by zero.
 //!         DivisionByZero = 1,
-//!     }
-//!
-//!     impl std::fmt::Display for MathError {
-//!         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//!             f.write_str("division by zero")
-//!         }
 //!     }
 //!
 //!     /// Add two integers.
@@ -35,6 +29,12 @@
 //!     #[weaveffi::export]
 //!     pub fn div(a: i32, b: i32) -> Result<i32, MathError> {
 //!         a.checked_div(b).ok_or(MathError::DivisionByZero)
+//!     }
+//!
+//!     /// Parse an integer; any error type with `Display` works (`throws any`).
+//!     #[weaveffi::export]
+//!     pub fn parse(text: &str) -> Result<i64, std::num::ParseIntError> {
+//!         text.parse()
 //!     }
 //! }
 //!
@@ -51,34 +51,42 @@
 //!
 //! * [`macro@module`] - the driver attribute on an exported `mod`.
 //! * [`macro@export`] - export a function (`async fn` is asynchronous; a
-//!   `Result`-returning fn is fallible).
+//!   `Result`-returning fn is fallible: `throws` its error type when that's
+//!   a [`macro@error`] enum of the module tree, else `throws any`).
 //! * [`macro@record`] - a by-value struct serialized across the ABI.
 //! * [`macro@enumeration`] - a `#[repr(i32)]` C-style enum, or a rich enum
 //!   with data-carrying variants.
 //! * [`macro@interface`] - an opaque, reference-counted object type; pass one
 //!   as `&T` or `Arc<T>`, return one as `Self`, `T`, or `Arc<T>`.
-//! * [`macro@error`] - the module's error domain.
+//!   [`macro@skip`] leaves a `pub fn` of its `impl` unexported.
+//! * [`macro@error`] - an error domain; the macro generates its `Display`
+//!   (from `#[weaveffi(message = "...")]` templates or the variants' docs)
+//!   and `std::error::Error`.
 //! * [`macro@callback_interface`] - a trait the consumer implements; accept
 //!   one as `Arc<dyn Trait>` (or `Option<Arc<dyn Trait>>`). Its methods
-//!   return `Result<T, ForeignError>`; [`macro@throws`] lets one report the
-//!   module's domain errors.
+//!   return `Result<T, E>` with `E: From<ForeignError>`; when `E` is a
+//!   declared domain, the consumer's typed errors arrive typed.
+//! * [`macro@custom`] - a type alias that crosses as another type (its
+//!   repr), converted with your `lift` and `lower` functions.
 //! * [`macro@cancellable`] - mark an `async fn` as accepting a cancel token.
 //! * [`set_spawner`] - install the executor async exports run on; the default
-//!   is a small pool of worker threads, or Tokio with the `tokio` feature.
+//!   is Tokio (the `tokio` feature), else a thread per call.
 //! * [`export_runtime!`] - export the runtime symbols (memory, errors, cancel
-//!   tokens, ABI version) under the crate's prefix, once per library.
+//!   tokens, ABI version) under the crate's prefix, once per library. A
+//!   crate whose modules use the macros fails to compile without it.
 //! * [`abi`] - the C ABI runtime: the error struct, memory helpers, and the
 //!   marshalling converters the expansion calls.
 //!
 //! # Features
 //!
+//! * `tokio` (default) runs exported `async fn`s on Tokio: the current
+//!   runtime when a launcher is called from inside one, otherwise a
+//!   multi-thread runtime created on first use. Without it, each async call
+//!   runs on a thread of its own. [`set_spawner`] overrides either. On
+//!   `wasm32` the feature has no effect: calls are polled inline.
 //! * `leak-check` counts live objects, callbacks, iterators, cancel tokens,
 //!   and returned allocations, reported by `{prefix}_debug_live` so a test
 //!   harness can assert a consumer released everything. Off by default.
-//! * `tokio` runs exported `async fn`s on Tokio: the current runtime when a
-//!   launcher is called from inside one, otherwise a multi-thread runtime
-//!   created on first use. [`set_spawner`] still overrides it. Off by
-//!   default.
 
 #![deny(missing_docs)]
 #![warn(clippy::missing_errors_doc)]
@@ -102,30 +110,21 @@ pub use abi::Iter;
 /// cooperative cleanup (work on other threads, say).
 pub use abi::CancelToken;
 
-/// A consumer's callback-interface implementation failed. Every callback
-/// trait method returns `Result<T, ForeignError>`, so the failure arrives as
-/// an `Err`; a method marked `#[weaveffi::throws]` can decode a declared
-/// domain error from it with [`ForeignError::domain`](abi::ForeignError::domain).
+/// A consumer's callback-interface implementation failed. A callback trait
+/// method's error type converts from it (`E: From<ForeignError>`), and it's
+/// a valid error type itself; [`ForeignError::domain`](abi::ForeignError::domain)
+/// decodes a declared domain error from one.
 pub use abi::ForeignError;
 
-/// A module's error domain: the trait the `#[weaveffi::error]` expansion
-/// implements so [`ForeignError::domain`](abi::ForeignError::domain) can
-/// decode a typed error a callback reported.
+/// A declared error domain: the trait the `#[weaveffi::error]` expansion
+/// implements, mapping each variant to its code, message, and payload.
 pub use abi::ErrorDomain;
-
-/// Maps a producer error onto the ABI's `(code, message)` pair. A fallible
-/// `#[weaveffi::export]` function reports `Err(e)` through its trailing
-/// `out_err` slot using this trait: `String` and `&str` errors get the
-/// generic code `-1` out of the box, while a `#[weaveffi::error]` enum (or a
-/// manual [`ErrorReport`] impl) surfaces the named codes of an IDL error
-/// domain, with its `Display` output as the message.
-pub use abi::ErrorReport;
 
 /// Install the process-wide executor that exported `async fn`s run on. Call it
 /// once at startup (before the first async export is launched) to hand futures
 /// to a runtime of your choice; until then, and if never called, futures run
-/// on the default executor (a small worker pool, or Tokio with the `tokio`
-/// feature).
+/// on the default executor (Tokio with the default `tokio` feature, else a
+/// thread per call).
 pub use abi::set_spawner;
 
 /// The executor hook [`set_spawner`] accepts: anything callable as
@@ -136,6 +135,6 @@ pub use abi::Spawner;
 pub use abi::BoxFuture;
 
 pub use weaveffi_macros::{
-    callback_interface, cancellable, enumeration, error, export, export_runtime, interface, module,
-    record, throws,
+    callback_interface, cancellable, custom, enumeration, error, export, export_runtime, interface,
+    module, record, skip,
 };

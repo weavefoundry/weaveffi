@@ -10,7 +10,11 @@
 # astral text), the typed out-of-range error and its payload, malformed
 # buffers sent through the raw attached function (each rejected with -3)
 # and the encoder's own range checks, and object identity and reference
-# counting through buffers. Ends with every leak counter at zero.
+# counting through buffers. Then the scalar optionals (a flag and a value,
+# no buffer), typed arrays in and out (range-checked, bit-exact floats, a
+# misaligned raw array rejected), `usize` and `char`, a custom type crossing
+# as a string, and an iterator of typed arrays. Ends with every leak counter
+# at zero.
 
 require_relative 'support'
 require 'codec'
@@ -70,11 +74,24 @@ end
 # Sends a raw (malformed) Vector encoding to `check_vector` through the
 # attached C function, which must reject it as a marshalling failure.
 def reject(bytes, what)
-  err = Codec::ErrorStruct.new
-  ok = Codec.codec_codec_check_vector(0, bytes, bytes.bytesize, err)
+  raw(what) { |err| native(Codec).codec_codec_check_vector(0, bytes, bytes.bytesize, err) }
+end
+
+# Runs a raw C call through the private Native module, which must fail with
+# -3; the error is cleared.
+def raw(what)
+  err = native(Codec)::ErrorStruct.new
+  yield err
   code = err[:code]
-  Codec.codec_error_clear(err)
-  expect(!ok && code == -3, "#{what} is rejected with -3 (got #{code})")
+  native(Codec).codec_error_clear(err)
+  expect(code == -3, "#{what} is rejected with -3 (got #{code})")
+end
+
+# Asserts the block raises the marshalling trap (code -3) whose message
+# names `detail`.
+def marshal_error(what, detail)
+  e = expect_raise(Codec::NativeBugError, what) { yield }
+  expect(e.code == -3 && e.message.end_with?(detail), "#{what}: #{e.message}")
 end
 
 def run_codec
@@ -216,7 +233,64 @@ def run_codec
   release(full)
   closed = expect_raise(Codec::Error, 'a closed token') { p.value }
   expect(closed.message.include?('used after close'), closed.message)
+  run_direct_families
   n
+end
+
+# The ABI 5 transports: scalar optionals, typed arrays, usize, char, a
+# custom type, and an iterator of typed arrays.
+def run_direct_families
+  i32_min = -(2**31)
+  i32_max = (2**31) - 1
+  expect(Codec.echo_opt_i32.nil? && Codec.echo_opt_i32(nil).nil?, 'echo_opt_i32(nil)')
+  expect(Codec.echo_opt_i32(i32_min) == i32_min && Codec.echo_opt_i32(0).zero?, 'echo_opt_i32')
+  expect_raise(RangeError, 'an optional i32 out of range') { Codec.echo_opt_i32(i32_max + 1) }
+  expect(f64_bits(Codec.echo_opt_f64(-0.0)) == f64_bits(-0.0), 'echo_opt_f64 keeps the sign of zero')
+  expect(Codec.echo_opt_f64(Float::NAN).nan? && Codec.echo_opt_f64(nil).nil?, 'echo_opt_f64')
+  expect(Codec.echo_opt_bool(true) == true && Codec.echo_opt_bool(false) == false, 'echo_opt_bool')
+  expect(Codec.echo_opt_bool(nil).nil?, 'echo_opt_bool(nil)')
+  expect(Codec.echo_opt_color(Codec::Color::INFRARED) == -1 && Codec.echo_opt_color(Codec::Color::BLUE) == 7,
+         'echo_opt_color')
+  expect(Codec.echo_opt_color(nil).nil?, 'echo_opt_color(nil)')
+  out = FFI::MemoryPointer.new(:int32)
+  raw('a present undeclared Color') { |err| native(Codec).codec_codec_echo_opt_color(true, 3, out, err) }
+  marshal_error('an undeclared Color through the wrapper', '3 is not a valid Color') { Codec.echo_opt_color(3) }
+
+  floats = Codec.echo_f64s([Float::NAN, -0.0, 5e-324, Float::INFINITY])
+  expect(floats.length == 4 && floats[0].nan?, 'echo_f64s keeps NaN')
+  expect(floats[1..].map { |f| f64_bits(f) } == [-0.0, 5e-324, Float::INFINITY].map { |f| f64_bits(f) },
+         'echo_f64s is bit-exact')
+  expect(Codec.echo_i32s([i32_min, 0, i32_max]) == [i32_min, 0, i32_max] && Codec.echo_i32s([]) == [],
+         'echo_i32s')
+  expect_raise(RangeError, 'an i32 element out of range') { Codec.echo_i32s([i32_max + 1]) }
+  expect(Codec.echo_u64s([U64_MAX, 2**63]) == [18_446_744_073_709_551_615, 9_223_372_036_854_775_808],
+         'echo_u64s')
+  expect(Codec.echo_u64s([]) == [], 'echo_u64s([])')
+  expect_raise(RangeError, 'a negative u64 element') { Codec.echo_u64s([-1]) }
+  misaligned = FFI::MemoryPointer.new(:uint8, 16) + 1
+  out_len = FFI::MemoryPointer.new(:size_t)
+  raw('a misaligned i32 array') { |err| native(Codec).codec_codec_echo_i32s(misaligned, 2, out_len, err) }
+  raw('a null array with a length') { |err| native(Codec).codec_codec_echo_i32s(nil, 2, out_len, err) }
+
+  expect(Codec.echo_usize(4_294_967_295) == 4_294_967_295 && Codec.echo_usize(U64_MAX) == U64_MAX, 'echo_usize')
+  expect(Codec.echo_char('🦀') == '🦀' && Codec.echo_char('é') == 'é' && Codec.echo_char('a') == 'a', 'echo_char')
+  marshal_error('echo_char("ab")', 'value: "ab" is not a valid char') { Codec.echo_char('ab') }
+  marshal_error('echo_char("")', 'value: "" is not a valid char') { Codec.echo_char('') }
+  expect(Codec.echo_hex('ff') == 'ff' && Codec.echo_hex('00FF') == 'ff' && Codec.echo_hex('0') == '0', 'echo_hex')
+  marshal_error('echo_hex("xyz")', 'value: invalid digit found in string') { Codec.echo_hex('xyz') }
+  marshal_error('echo_hex("")', 'value: cannot parse integer from empty string') { Codec.echo_hex('') }
+  marshal_error('echo_hex("100000000")', 'value: number too large to fit in target type') do
+    Codec.echo_hex('100000000')
+  end
+
+  chunks = Codec.chunks([i32_min, 0, i32_max], 2)
+  expect(chunks.is_a?(Enumerator), 'chunks is an Enumerator')
+  expect(chunks.to_a == [[i32_min, 0], [i32_max]], 'chunks of an odd count')
+  expect(chunks.to_a == [[i32_min, 0], [i32_max]], 'an enumerator enumerates again')
+  expect(Codec.chunks([1, 2, 3, 4], 2).to_a == [[1, 2], [3, 4]], 'chunks')
+  expect(Codec.chunks([1, 2], 0).to_a == [] && Codec.chunks([], 3).to_a == [], 'empty chunks')
+  expect(Codec.chunks([1, 2, 3, 4], 1).first(2) == [[1], [2]], 'an abandoned enumeration')
+  expect(bridge(Codec).debug_live(2).zero?, 'abandoning an enumeration releases its iterator')
 end
 
 count = nil

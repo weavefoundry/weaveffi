@@ -9,7 +9,8 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 /**
  * Bridges one native async call to a suspended coroutine. The JNI shim pins
  * this object with a global reference and calls exactly one `on*` method,
- * from whichever producer thread completes the call.
+ * from whichever producer thread completes the call. [convert] lifts the
+ * boxed JNI result into the public value.
  */
 internal class NativeCompletion<T>(
     private val cont: CancellableContinuation<T>,
@@ -52,35 +53,8 @@ internal class NativeCompletion<T>(
         token = 0L
     }
 
-    fun onUnit() = succeed(Unit)
-
-    fun onBoolean(value: Boolean) = succeed(value)
-
-    fun onByte(value: Byte) = succeed(value)
-
-    fun onShort(value: Short) = succeed(value)
-
-    fun onInt(value: Int) = succeed(value)
-
-    fun onLong(value: Long) = succeed(value)
-
-    fun onFloat(value: Float) = succeed(value)
-
-    fun onDouble(value: Double) = succeed(value)
-
-    fun onBytes(value: ByteArray) = succeed(value)
-
-    fun onError(code: Int, message: ByteArray, payload: ByteArray?) {
-        releaseToken()
-        val error = if (code == -5) {
-            CancellationException(decodeUtf8(message))
-        } else {
-            JniBridge.error(domain, code, message, payload)
-        }
-        cont.resumeWithException(error)
-    }
-
-    private fun succeed(raw: Any?) {
+    /** The call succeeded with [raw]: the result in its JNI form, boxed. */
+    fun onValue(raw: Any?) {
         releaseToken()
         val result = try {
             convert(raw)
@@ -89,6 +63,23 @@ internal class NativeCompletion<T>(
             return
         }
         cont.resume(result)
+    }
+
+    /** The call failed with a native error (code -5 is a cancellation). */
+    fun onError(code: Int, message: ByteArray?, payload: ByteArray?) {
+        releaseToken()
+        val error = if (code == -5) {
+            CancellationException(message?.let(::decodeUtf8) ?: "cancelled")
+        } else {
+            JniBridge.error(domain, code, message ?: ByteArray(0), payload)
+        }
+        cont.resumeWithException(error)
+    }
+
+    /** The JVM couldn't take the result (out of memory, typically). */
+    fun onFailure(error: Throwable) {
+        releaseToken()
+        cont.resumeWithException(error)
     }
 }
 

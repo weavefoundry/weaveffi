@@ -1,25 +1,29 @@
 //! Swift binding generator.
 //!
 //! Emits a standalone SwiftPM package: the Swift wrapper module over the C
-//! ABI, plus a `C{Module}` system-library target holding a copy of the C
-//! header and a module map that links the native library. Implements
-//! [`LanguageBackend`]; the shared driver bridges it into the generator
-//! pipeline.
+//! ABI (the API file plus a fixed runtime file), and a `C{Module}`
+//! system-library target holding a copy of the C header and a module map
+//! that links the native library.
 //!
-//! Records, rich enums, optionals, lists, and maps cross the C ABI as value
-//! buffers. The wrapper ships a small private writer/reader pair
-//! (`WvWriter`/`WvReader`, decoding in place from the library's memory) and a
-//! `WvCodable` protocol: every primitive conforms, optionals, arrays, and
-//! dictionaries conform generically, and each record, enum, and interface
-//! conforms where it's declared, so records surface as plain Swift structs
-//! and rich enums as native Swift enums with associated values, and every
-//! composite type has one codec. Objects surface as `final class` wrappers
-//! owning one strong reference each, callback interfaces as class-bound
-//! `Sendable` protocols whose implementations cross the boundary through a
-//! process-wide vtable of `@convention(c)` trampolines, and async functions
-//! as `async` functions over checked continuations, with task cancellation
-//! wired to the native cancel token. Before the first call the wrapper checks
-//! the ABI revision and every top-level module's contract table.
+//! Records, rich enums, and every optional, list, and map that isn't an
+//! optional scalar or a numeric list cross the C ABI as value buffers. The
+//! runtime ships a small private writer/reader pair (`WvWriter`/`WvReader`,
+//! decoding in place from the library's memory) and a `WvCodable` protocol:
+//! every primitive conforms, optionals, arrays, and dictionaries conform
+//! generically, and each record, enum, and interface conforms where it's
+//! declared, so records surface as plain `Hashable` Swift structs and rich
+//! enums as native Swift enums with associated values. Optional scalars
+//! (`T?`) cross directly as a presence flag and a value, and numeric lists
+//! (`[T]`) as the array's own storage. Objects surface as `final class`
+//! wrappers owning one strong reference each, `Hashable` by identity;
+//! callback interfaces as class-bound `Sendable` protocols whose
+//! implementations cross through a process-wide vtable of `@convention(c)`
+//! trampolines; iterators as the runtime's generic `NativeSequence`; and
+//! async functions as `async` functions over checked continuations, with task
+//! cancellation wired to the native cancel token. Error domains are open
+//! `Error` enums. `{Module}Library.check()` reports a library that doesn't
+//! match the bindings as a thrown error; a call made while it doesn't
+//! match stops the process.
 //!
 //! The fixed Swift sources (runtime, manifest, module map, README) live
 //! under `runtime/` and are spliced with the package's names.
@@ -34,22 +38,28 @@ mod runtime;
 #[cfg(test)]
 mod tests;
 mod types;
+mod xcframework;
 
-use crate::backend::{LanguageBackend, OutputFile};
 use crate::codegen::CodeWriter;
+use crate::codegen::OutputFile;
 use crate::package::{Artifact, PackageContext, PackagedFile};
 use crate::platform::Os;
 use crate::targets::c::{header_name, render_c_header_from_model};
+use crate::targets::{Linkage, Target};
 use crate::utils::{render_prelude, render_trailer, CommentStyle};
 use camino::{Utf8Path, Utf8PathBuf};
+use miette::Result;
 use serde::{Deserialize, Serialize};
 use weaveffi_model::model::Model;
 
-use crate::targets::swift::entities::{render_swift_module_types, render_swift_namespace};
+use crate::codegen::errors;
+use crate::targets::swift::entities::{
+    render_swift_errors, render_swift_module_types, render_swift_namespace,
+};
 use crate::targets::swift::package::{
     render_modulemap, render_package_swift, render_packaged_readme, CSource,
 };
-use crate::targets::swift::runtime::{render_load_checks, render_runtime, Names};
+use crate::targets::swift::runtime::{render_contract_checks, render_runtime, Names, RUNTIME_FILE};
 use crate::targets::swift::types::SwiftCtx;
 
 /// The URL a packaged manifest points its binary target at when
@@ -158,6 +168,7 @@ impl Layout {
         config: &SwiftConfig,
     ) -> Vec<(Utf8PathBuf, String)> {
         let c_dir = dir.join("Sources").join(&self.c_module);
+        let swift_dir = dir.join("Sources").join(&self.module);
         let swift_file = format!("{}.swift", self.module);
         vec![
             (
@@ -173,44 +184,67 @@ impl Layout {
                 render_c_header_from_model(model, &self.header),
             ),
             (
-                dir.join("Sources").join(&self.module).join(&swift_file),
+                swift_dir.join(&swift_file),
                 render_swift_wrapper(self, model, &swift_file),
             ),
+            (swift_dir.join(RUNTIME_FILE), self.runtime(model)),
         ]
+    }
+
+    /// The runtime source file, framed with the prelude and trailer.
+    fn runtime(&self, model: &Model) -> String {
+        format!(
+            "{}{}\n{}",
+            render_prelude(CommentStyle::DoubleSlash),
+            render_runtime(model, &self.names()),
+            render_trailer(CommentStyle::DoubleSlash, RUNTIME_FILE),
+        )
     }
 }
 
 /// Swift backend: emits a standalone SwiftPM package wrapping the C ABI.
-pub struct SwiftGenerator;
+pub struct SwiftGenerator {
+    config: SwiftConfig,
+}
 
-impl LanguageBackend for SwiftGenerator {
-    type Config = SwiftConfig;
+impl From<SwiftConfig> for SwiftGenerator {
+    fn from(config: SwiftConfig) -> Self {
+        Self { config }
+    }
+}
 
+impl Target for SwiftGenerator {
     fn name(&self) -> &'static str {
         "swift"
     }
 
-    fn files(&self, model: &Model, out_dir: &Utf8Path, config: &Self::Config) -> Vec<OutputFile> {
+    fn render(&self, model: &Model) -> Vec<OutputFile> {
+        let config = &self.config;
         Layout::new(model, config)
-            .sources(model, &out_dir.join("swift"), config)
+            .sources(model, &Utf8PathBuf::new(), config)
             .into_iter()
             .map(|(path, contents)| OutputFile::new(path, contents))
             .collect()
     }
 
+    fn linkage(&self) -> Linkage {
+        Linkage::Link
+    }
+
+    fn fixed_files(&self) -> &'static [&'static str] {
+        &["Package.swift", "module.modulemap", RUNTIME_FILE]
+    }
+
     /// The SwiftPM package at `swift/{Module}/` whose binary target is the
-    /// `C{Module}.xcframework.zip` archive `weaveffi package` assembles from
-    /// the Apple static libraries (at the configured `xcframework_url`, with
-    /// its checksum). Without an archive (no Apple platform built, or not on
-    /// macOS) there is nothing to package.
-    fn package(
-        &self,
-        model: &Model,
-        ctx: &PackageContext,
-        config: &Self::Config,
-    ) -> Option<Vec<Artifact>> {
-        let Some(archive) = ctx.xcframework else {
-            return Some(Vec::new());
+    /// `C{Module}.xcframework.zip` archive assembled here from the Apple
+    /// static libraries (at the configured `xcframework_url`, with its
+    /// checksum), written next to it with a `.sha256` file. Without an
+    /// archive (no Apple platform built, or no Xcode) there is nothing to
+    /// package.
+    fn package(&self, model: &Model, ctx: &PackageContext<'_>) -> Result<Vec<Artifact>> {
+        let config = &self.config;
+        let Some(archive) = xcframework::assemble(model, &config.c_module_name(model), ctx)? else {
+            return Ok(Vec::new());
         };
         let layout = Layout::new(model, config);
         let names = layout.names();
@@ -241,20 +275,29 @@ impl LanguageBackend for SwiftGenerator {
                 render_swift_wrapper(&layout, model, &swift_file),
             ),
             PackagedFile::text(
+                format!("Sources/{}/{RUNTIME_FILE}", layout.module),
+                layout.runtime(model),
+            ),
+            PackagedFile::text(
                 "README.md",
                 render_packaged_readme(&names, &slices, &url, &archive.checksum),
             ),
         ];
-        Some(vec![Artifact::directory(
-            format!("swift/{}", layout.module),
-            files,
-        )])
+        let checksum_file = format!("{}  {}\n", archive.checksum, archive.file_name);
+        Ok(vec![
+            Artifact::single_file(
+                format!("swift/{}.sha256", archive.file_name),
+                checksum_file.into_bytes(),
+            ),
+            Artifact::single_file(format!("swift/{}", archive.file_name), archive.bytes),
+            Artifact::directory(format!("swift/{}", layout.module), files),
+        ])
     }
 }
 
-/// Render the complete Swift wrapper file: prelude and imports, the private
-/// runtime, the load-time checks, every module's file-scope types, and one
-/// namespace `enum` per top-level module.
+/// Render the Swift API file: prelude and imports, the contract rows the
+/// load check compares, every error domain, every module's file-scope
+/// types, and one namespace `enum` per top-level module.
 fn render_swift_wrapper(layout: &Layout, model: &Model, filename: &str) -> String {
     let ctx = SwiftCtx::new(model, &layout.module);
     let mut w = CodeWriter::four_space();
@@ -262,11 +305,10 @@ fn render_swift_wrapper(layout: &Layout, model: &Model, filename: &str) -> Strin
     w.line(format!("import {}", layout.c_module));
     w.line("import Foundation");
     w.blank();
-    w.raw(render_runtime(model, &layout.names(), &ctx.runtime_error));
-    w.blank();
-    render_load_checks(&mut w, model);
+    render_contract_checks(&mut w, model, &ctx.library_type);
     w.line("// MARK: - API");
     w.blank();
+    render_swift_errors(&mut w, &errors::tables(model, "Error"), &ctx);
     for mb in &model.modules {
         render_swift_module_types(&mut w, mb, &ctx);
     }

@@ -2,17 +2,24 @@
 //! called, and how to turn it into bindings.
 //!
 //! A project's input is either an IDL document or a Rust producer crate.
-//! A crate's API is read from its built library (see [`crate::library`]):
+//! A crate's API is read from the metadata frames in its built library:
 //! [`Project`] builds the crate with Cargo, or reads a library built
 //! earlier ([`Project::library`]). Every `weaveffi` subcommand starts here,
 //! and so can a `build.rs`:
 //!
 //! ```no_run
 //! // build.rs of a crate that ships bindings for an IDL-defined library.
+//! use weaveffi_cli::codegen::Orchestrator;
+//! use weaveffi_cli::project::Project;
+//!
 //! fn main() -> miette::Result<()> {
 //!     println!("cargo::rerun-if-changed=weaveffi.toml");
 //!     println!("cargo::rerun-if-changed=api.yml");
-//!     weaveffi_cli::project::Project::discover(env!("CARGO_MANIFEST_DIR"))?.generate()?;
+//!     let project = Project::discover(env!("CARGO_MANIFEST_DIR"))?;
+//!     let targets = project.config.targets(None)?;
+//!     Orchestrator::new()
+//!         .with_targets(targets.iter().map(AsRef::as_ref))
+//!         .run(&project.model()?, &project.config.out_dir(None))?;
 //!     Ok(())
 //! }
 //! ```
@@ -33,15 +40,14 @@ use weaveffi_model::validate::{
 };
 
 use crate::cargo::CargoCrate;
-use crate::codegen::{GenerateReport, Orchestrator};
-use crate::config::{ProjectConfig, CONFIG_FILE_NAME};
+use crate::config::{current_dir, discover, ProjectConfig, CONFIG_FILE_NAME};
 use crate::library;
 use crate::report::with_named_source;
 
 /// Where a project's API comes from.
 #[derive(Debug, Clone)]
-pub enum Source {
-    /// An IDL document (`.yml`, `.yaml`, `.json`, or `.toml`).
+pub(crate) enum Source {
+    /// An IDL document (`.yml`, `.yaml`, or `.json`).
     Idl(Utf8PathBuf),
     /// A Rust producer crate, whose API is read from its built library.
     Crate(Box<CargoCrate>),
@@ -55,10 +61,11 @@ pub struct Project {
     /// The `weaveffi.toml` settings (the defaults when there is none).
     pub config: ProjectConfig,
     /// Where the API comes from.
-    pub source: Source,
+    pub(crate) source: Source,
     /// A built library to read a crate's API from instead of building it.
     library: Option<Utf8PathBuf>,
-    release: bool,
+    /// The Cargo profile a crate's library is built with.
+    profile: String,
     quiet: bool,
 }
 
@@ -102,7 +109,7 @@ impl Project {
     /// parse, or when its input can't be resolved.
     pub fn discover(dir: impl AsRef<Utf8Path>) -> Result<Self> {
         let dir = dir.as_ref();
-        if let Some(config) = discover_config(&dir.join(CONFIG_FILE_NAME)) {
+        if let Some(config) = discover(&dir.join(CONFIG_FILE_NAME)) {
             return Self::locate(Some(config.as_str()), None, None);
         }
         if dir.join("Cargo.toml").is_file() {
@@ -145,7 +152,7 @@ impl Project {
                     Some(p) => ProjectConfig::from_file(Utf8Path::new(p))?,
                     None => current_dir()
                         .ok()
-                        .and_then(|cwd| discover_config(&cwd.join(CONFIG_FILE_NAME)))
+                        .and_then(|cwd| discover(&cwd.join(CONFIG_FILE_NAME)))
                         .map(|p| ProjectConfig::from_file(&p))
                         .transpose()?
                         .unwrap_or_default(),
@@ -170,7 +177,7 @@ impl Project {
             config,
             source,
             library: None,
-            release: false,
+            profile: "dev".into(),
             quiet: false,
         };
         if let Some(library) = library {
@@ -200,10 +207,11 @@ impl Project {
         Ok(self)
     }
 
-    /// Build a crate's library in release mode instead of debug.
+    /// Build a crate's library with the Cargo profile `profile` (default
+    /// `dev`).
     #[must_use]
-    pub fn release(mut self, release: bool) -> Self {
-        self.release = release;
+    pub fn profile(mut self, profile: impl Into<String>) -> Self {
+        self.profile = profile.into();
         self
     }
 
@@ -215,14 +223,12 @@ impl Project {
     }
 
     /// Whether Cargo runs with `--quiet`.
-    #[must_use]
-    pub fn is_quiet(&self) -> bool {
+    pub(crate) fn is_quiet(&self) -> bool {
         self.quiet
     }
 
     /// The producer crate, when the input is one.
-    #[must_use]
-    pub fn krate(&self) -> Option<&CargoCrate> {
+    pub(crate) fn krate(&self) -> Option<&CargoCrate> {
         match &self.source {
             Source::Crate(k) => Some(k),
             _ => None,
@@ -232,11 +238,7 @@ impl Project {
     /// The library a Rust producer's API is read from: the one named with
     /// [`library`](Self::library), else the crate's, built now.
     ///
-    /// # Errors
-    ///
-    /// Returns an error for an IDL input, from inside the crate's own build
-    /// script, or when the build fails.
-    pub fn library_path(&self) -> Result<Utf8PathBuf> {
+    pub(crate) fn library_path(&self) -> Result<Utf8PathBuf> {
         match &self.source {
             Source::Idl(idl) => Err(miette!("{idl} is an IDL; it has no library to read")),
             Source::Library(lib) => Ok(lib.clone()),
@@ -252,9 +254,7 @@ impl Project {
                         krate.name
                     );
                 }
-                krate
-                    .build_library(self.release, self.quiet)
-                    .map_err(|e| miette!("{e:#}"))
+                krate.build_library(&self.profile, self.quiet)
             }
         }
     }
@@ -284,7 +284,7 @@ impl Project {
             Source::Crate(krate) => {
                 rust_only_keys(package)?;
                 let path = self.library_path()?;
-                let api = read_api(&path, &krate.lib_name)?;
+                let (api, _) = read_api(&path, Some(&krate.lib_name))?;
                 Ok(Definition {
                     api,
                     identity: crate_identity(krate, package),
@@ -293,21 +293,7 @@ impl Project {
             }
             Source::Library(path) => {
                 rust_only_keys(package)?;
-                let frames = library::read_frames(path).map_err(|e| miette!("{e:#}"))?;
-                let prefixes: std::collections::BTreeSet<&str> =
-                    frames.iter().map(|f| f.prefix.as_str()).collect();
-                let prefix = match prefixes.len() {
-                    0 => return Err(no_metadata(path, None)),
-                    1 => prefixes.into_iter().next().unwrap_or_default().to_string(),
-                    _ => {
-                        return Err(miette!(
-                            "{path} holds the APIs of several crates ({}); pass the producer \
-                             crate so WeaveFFI knows which one to bind",
-                            prefixes.into_iter().collect::<Vec<_>>().join(", ")
-                        ))
-                    }
-                };
-                let api = meta::assemble(&frames, &prefix).map_err(|e| miette!("{path}: {e}"))?;
+                let (api, prefix) = read_api(path, None)?;
                 let mut merged = package.clone();
                 merged.c_prefix = Some(prefix.clone());
                 merged.library = Some(library::library_name(path));
@@ -329,28 +315,6 @@ impl Project {
     pub fn model(&self) -> Result<Model> {
         self.definition()?.validate().map_err(Report::new)
     }
-
-    /// Generate the `[project] targets` (else every target) into the
-    /// `[project] out` directory, writing only changed files and removing
-    /// stale ones.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of [`model`](Self::model), an unknown target name,
-    /// or a failure to write the output.
-    pub fn generate(&self) -> Result<GenerateReport> {
-        let model = self.model()?;
-        let out = self.config.out_dir(None);
-        let targets = self.config.select_targets(None)?;
-        std::fs::create_dir_all(out.as_std_path())
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to create output directory: {out}"))?;
-        let mut orchestrator = Orchestrator::new();
-        for target in &targets {
-            orchestrator = orchestrator.with_target(target.as_ref());
-        }
-        orchestrator.run(&model, &out).map_err(|e| miette!("{e:#}"))
-    }
 }
 
 /// What `input` is: a crate (a directory with a `Cargo.toml`, or the
@@ -361,7 +325,7 @@ fn source_of(input: &Utf8Path) -> Result<Source> {
         if !manifest.is_file() {
             bail!(
                 "{input} is a directory without a Cargo.toml; the input is a Rust producer crate \
-                 or an IDL file (yml|yaml|json|toml)"
+                 or an IDL file (yml|yaml|json)"
             );
         }
         Some(manifest)
@@ -371,9 +335,7 @@ fn source_of(input: &Utf8Path) -> Result<Source> {
         None
     };
     match manifest {
-        Some(m) => Ok(Source::Crate(Box::new(
-            CargoCrate::resolve(&m).map_err(|e| miette!("{e:#}"))?,
-        ))),
+        Some(m) => Ok(Source::Crate(Box::new(CargoCrate::resolve(&m)?))),
         None => {
             idl_format(input)?;
             Ok(Source::Idl(input.to_path_buf()))
@@ -386,14 +348,13 @@ fn idl_format(path: &Utf8Path) -> Result<&'static str> {
     match path.extension().unwrap_or("") {
         "yml" | "yaml" => Ok("yaml"),
         "json" => Ok("json"),
-        "toml" => Ok("toml"),
         "rs" => Err(miette!(
             "{path} is Rust source; WeaveFFI reads a Rust producer's API from its built \
              library, so pass the crate (its directory or Cargo.toml) instead"
         )),
         other => Err(miette!(
             "unsupported input {path}{}: expected a Rust producer crate (its directory or \
-             Cargo.toml) or an IDL file (yml|yaml|json|toml)",
+             Cargo.toml) or an IDL file (yml|yaml|json)",
             if other.is_empty() {
                 String::new()
             } else {
@@ -432,19 +393,38 @@ fn crate_identity(krate: &CargoCrate, package: &Package) -> Identity {
     Identity::new(&krate.name, &merged)
 }
 
-/// The API the library at `path` embeds for the crate with `prefix`.
-fn read_api(path: &Utf8Path, prefix: &str) -> Result<Api> {
-    let frames = library::read_frames(path).map_err(|e| miette!("{e:#}"))?;
-    let api = meta::assemble(&frames, prefix).map_err(|e| miette!("{path}: {e}"))?;
+/// The API the library at `path` embeds, and its crate's C prefix: the
+/// crate with `prefix`, or, without one, the only crate whose metadata the
+/// library holds.
+fn read_api(path: &Utf8Path, prefix: Option<&str>) -> Result<(Api, String)> {
+    let frames = library::read_frames(path)?;
+    let prefixes: std::collections::BTreeSet<&str> =
+        frames.iter().map(|f| f.prefix.as_str()).collect();
+    let prefix = match (prefix, prefixes.len()) {
+        (Some(prefix), _) => prefix.to_string(),
+        (None, 0) => return Err(no_metadata(path, None)),
+        (None, 1) => prefixes
+            .iter()
+            .next()
+            .copied()
+            .unwrap_or_default()
+            .to_string(),
+        (None, _) => {
+            return Err(miette::miette!(
+            "{path} holds the APIs of several crates ({}); pass the producer crate so WeaveFFI \
+             knows which one to bind",
+            prefixes.into_iter().collect::<Vec<_>>().join(", ")
+        ))
+        }
+    };
+    let api = meta::assemble(&frames, &prefix).map_err(|e| miette!("{path}: {e}"))?;
     if api.modules.is_empty() {
-        let others: std::collections::BTreeSet<&str> =
-            frames.iter().map(|f| f.prefix.as_str()).collect();
         return Err(no_metadata(
             path,
-            Some((prefix, others.into_iter().collect())),
+            Some((&prefix, prefixes.into_iter().collect())),
         ));
     }
-    Ok(api)
+    Ok((api, prefix))
 }
 
 /// The error for a library without (the crate's) metadata.
@@ -472,17 +452,6 @@ fn in_own_build_script(krate: &CargoCrate) -> bool {
         && std::env::var("CARGO_MANIFEST_DIR").is_ok_and(|dir| {
             Utf8Path::new(&dir).canonicalize_utf8().ok() == krate.dir().canonicalize_utf8().ok()
         })
-}
-
-/// The current directory as a UTF-8 path.
-fn current_dir() -> std::io::Result<Utf8PathBuf> {
-    Utf8PathBuf::from_path_buf(std::env::current_dir()?)
-        .map_err(|_| std::io::Error::other("current directory is not valid UTF-8"))
-}
-
-/// The nearest `weaveffi.toml` at or above the directory of `start`.
-fn discover_config(start: &Utf8Path) -> Option<Utf8PathBuf> {
-    crate::config::discover(start)
 }
 
 #[cfg(test)]

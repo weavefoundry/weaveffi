@@ -20,6 +20,7 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
+. "$ROOT/scripts/toolchains.sh"
 
 if [ $# -gt 0 ]; then
     TARGETS="$*"
@@ -74,13 +75,14 @@ TARGET_LIST=$(echo "$TARGETS" | tr ' ' ',')
 echo "==> generate ($TARGET_LIST)"
 "$WEAVEFFI" generate --config "$CONFIG" --target "$TARGET_LIST"
 echo "==> package ($TARGET_LIST)"
-"$WEAVEFFI" package --config "$CONFIG" --target "$TARGET_LIST"
+# Under CI every tool is installed, so a skipped artifact is a failure.
+"$WEAVEFFI" package --config "$CONFIG" --target "$TARGET_LIST" ${CI:+--strict}
 
 smoke_python() {
-    have python3 || return 77
-    local wheel
+    local python wheel
+    python=$(find_python) || have python3.10 || return 77
     wheel=$(ls "$DIST"/python/calculator-1.0.0-py3-none-*.whl)
-    python3 -m venv "$SCRATCH/venv"
+    "$python" -m venv "$SCRATCH/venv"
     "$SCRATCH/venv/bin/python" -m pip install --quiet --disable-pip-version-check "$wheel"
     (cd "$SCRATCH" && venv/bin/python -c '
 import calculator

@@ -18,17 +18,37 @@
 //! accepted, which lets a newer consumer pass methods this producer doesn't
 //! know yet.
 //!
-//! A callback method returns `Result<T, ForeignError>`. A failure the
-//! consumer reports through `out_err` becomes the `Err`: a method that
-//! `throws` keeps a declared code of its module's error domain (decode it
-//! with [`ForeignError::domain`]), and every other failure has the code
-//! [`FOREIGN_ERROR_CODE`].
+//! A vtable whose `flags` include [`VTABLE_THREAD_AFFINE`] may only have its
+//! value-returning methods called on the thread that passed it to the
+//! producer (a Dart isolate's callbacks, say). The runtime records that
+//! thread when it adopts the vtable, and a generated wrapper calls
+//! [`ForeignCallback::check_thread`] before such a method: called from
+//! another thread, the method fails with [`FOREIGN_ERROR_CODE`] and the
+//! message `callback called off its thread` without calling the consumer.
+//! Methods with no return value may still be called from any thread.
+//!
+//! A callback method returns `Result<T, E>` where `E: From<ForeignError>`.
+//! A failure the consumer reports through `out_err` becomes the `Err`: when
+//! `E` is a declared error domain, a code of that domain (with a payload
+//! that decodes) arrives as the typed variant, and every other failure is a
+//! [`ForeignError`] with the code [`FOREIGN_ERROR_CODE`] converted with
+//! `From`.
 
 use std::ffi::c_void;
 use std::sync::Arc;
 
 use crate::abi::buffer::BufferReader;
 use crate::abi::error::{ErrorDomain, FfiError, FOREIGN_ERROR_CODE, MARSHAL_ERROR_CODE};
+use crate::abi::scalar::{Scalar, Text};
+
+/// The vtable `flags` bit (`{P}_VTABLE_THREAD_AFFINE` in C) declaring that
+/// the consumer's value-returning methods may only be called on the thread
+/// that passed the vtable to the producer.
+pub const VTABLE_THREAD_AFFINE: u32 = 1;
+
+/// The message a thread-affine callback method fails with when it's called
+/// from another thread.
+pub const OFF_THREAD_MESSAGE: &str = "callback called off its thread";
 
 /// The fixed header every callback-interface vtable starts with, in this
 /// order and at these offsets (`{prefix}_..._vtable` in C).
@@ -37,7 +57,8 @@ use crate::abi::error::{ErrorDomain, FfiError, FOREIGN_ERROR_CODE, MARSHAL_ERROR
 pub struct VtableHeader {
     /// `sizeof` the whole vtable as the consumer compiled it.
     pub size: u32,
-    /// Reserved; consumers set it to `0`.
+    /// Behavior flags: [`VTABLE_THREAD_AFFINE`], or `0`. Other bits are
+    /// reserved and ignored.
     pub flags: u32,
     /// The consumer's release hook, called exactly once (from any producer
     /// thread) when the producer drops its last reference to the callback.
@@ -145,6 +166,8 @@ pub struct VtableTooSmall {
 pub struct ForeignCallback<V: Vtable> {
     ctx: *mut c_void,
     vtable: *const V,
+    /// The adopting thread, for a vtable flagged [`VTABLE_THREAD_AFFINE`].
+    owner: Option<std::thread::ThreadId>,
 }
 
 // SAFETY: the ABI contract obliges the consumer to make every vtable entry
@@ -156,7 +179,8 @@ unsafe impl<V: Vtable> Sync for ForeignCallback<V> {}
 
 impl<V: Vtable> ForeignCallback<V> {
     /// Adopt a `(ctx, vtable)` pair lifted from a callback-interface
-    /// parameter's slots. Returns `Ok(None)` when the vtable pointer is null.
+    /// parameter's slots, recording the calling thread when the vtable is
+    /// thread-affine. Returns `Ok(None)` when the vtable pointer is null.
     ///
     /// # Errors
     ///
@@ -195,7 +219,25 @@ impl<V: Vtable> ForeignCallback<V> {
             });
         }
         crate::abi::leak::track(crate::abi::leak::CALLBACKS, 1);
-        Ok(Some(Self { ctx, vtable }))
+        let owner = (header.flags & VTABLE_THREAD_AFFINE != 0).then(|| std::thread::current().id());
+        Ok(Some(Self { ctx, vtable, owner }))
+    }
+
+    /// Whether a value-returning method may be called on this thread: always
+    /// for an ordinary vtable, and only on the adopting thread for one
+    /// flagged [`VTABLE_THREAD_AFFINE`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FOREIGN_ERROR_CODE`] failure with the message
+    /// [`OFF_THREAD_MESSAGE`] on any other thread.
+    pub fn check_thread(&self) -> Result<(), ForeignError> {
+        match self.owner {
+            Some(owner) if owner != std::thread::current().id() => {
+                Err(ForeignError::new(FOREIGN_ERROR_CODE, OFF_THREAD_MESSAGE))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// The consumer's context pointer, passed as the first argument of every
@@ -229,12 +271,14 @@ impl<V: Vtable> Drop for ForeignCallback<V> {
 /// A failure a consumer's callback-interface implementation reported, or a
 /// value it returned that the producer couldn't accept.
 ///
-/// Every callback trait method returns `Result<T, ForeignError>`. `code` is
-/// [`FOREIGN_ERROR_CODE`] for any consumer failure, except that a method
-/// declared `throws` keeps a code of its module's error domain, whose fields
-/// [`domain`](Self::domain) decodes. A malformed return value (a string that
-/// isn't UTF-8, a null object, a bad enum value or buffer) has the code
-/// [`MARSHAL_ERROR_CODE`].
+/// A callback method's error type converts from it (`E:
+/// From<ForeignError>`), and `ForeignError` itself is a valid error type.
+/// `code` is [`FOREIGN_ERROR_CODE`] for any consumer failure (and for a
+/// thread-affine method called off its thread), and
+/// [`MARSHAL_ERROR_CODE`] for a return value the producer couldn't accept (a
+/// string that isn't UTF-8, a null object, a bad enum value, array, or
+/// buffer). A declared code of the method's own error domain never arrives
+/// as a `ForeignError`; it's decoded into the typed error instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForeignError {
     /// The failure's code (see the type's docs).
@@ -286,27 +330,13 @@ impl std::fmt::Display for ForeignError {
 
 impl std::error::Error for ForeignError {}
 
-/// A `ForeignError` is reported with its own code, message, and payload, so
-/// a producer function whose error type is `ForeignError` can propagate a
-/// callback failure with `?`.
-impl crate::abi::ErrorReport for ForeignError {
-    fn code(&self) -> i32 {
-        self.code
-    }
-    fn message(&self) -> String {
-        self.message.clone()
-    }
-    fn payload(&self) -> Vec<u8> {
-        self.payload.clone()
-    }
-}
-
 fn failure(err: &FfiError, code: i32) -> ForeignError {
     // SAFETY: the consumer fills `out_err` only through `{prefix}_error_set`,
-    // so a non-null message is a NUL-terminated string this runtime owns.
-    let message = unsafe { err.message_str() }
-        .unwrap_or("callback interface implementation failed")
-        .to_string();
+    // so a non-null message is a run this runtime owns.
+    let message = match unsafe { err.message_str() } {
+        Some(m) if !m.is_empty() => m.to_string(),
+        _ => "callback interface implementation failed".to_string(),
+    };
     ForeignError {
         code,
         message,
@@ -318,48 +348,136 @@ fn failure(err: &FfiError, code: i32) -> ForeignError {
     }
 }
 
-/// Read the `out_err` slot a vtable entry of a method that doesn't `throw`
-/// wrote: `Ok(())` when the consumer succeeded, otherwise its failure with
-/// the code [`FOREIGN_ERROR_CODE`] (whatever code it wrote).
+/// Read the `out_err` slot a vtable entry wrote, for a method whose error
+/// type isn't a declared domain (`throws any`, or `ForeignError` itself):
+/// `Ok(())` when the consumer succeeded, otherwise its failure with the code
+/// [`FOREIGN_ERROR_CODE`] (whatever code it wrote), converted to `E`.
 ///
 /// # Errors
 ///
 /// Returns the consumer's failure when `err.code` isn't `0`.
-pub fn callback_status(err: &FfiError) -> Result<(), ForeignError> {
+pub fn callback_status<E: From<ForeignError>>(err: &FfiError) -> Result<(), E> {
     if err.code == 0 {
         Ok(())
     } else {
-        Err(failure(err, FOREIGN_ERROR_CODE))
+        Err(E::from(failure(err, FOREIGN_ERROR_CODE)))
     }
 }
 
-/// Read the `out_err` slot a vtable entry of a `throws` method wrote: a
-/// positive code that `E` declares (with a payload that decodes) is kept,
-/// and every other failure gets the code [`FOREIGN_ERROR_CODE`].
+/// Read the `out_err` slot a vtable entry wrote, for a method that throws
+/// the domain `E`: a positive code `E` declares (with a payload that
+/// decodes) becomes that typed error, and every other failure is a
+/// [`FOREIGN_ERROR_CODE`] [`ForeignError`] converted to `E`.
 ///
 /// # Errors
 ///
 /// Returns the consumer's failure when `err.code` isn't `0`.
-pub fn callback_status_in<E: ErrorDomain>(err: &FfiError) -> Result<(), ForeignError> {
+pub fn callback_status_in<E: ErrorDomain + From<ForeignError>>(err: &FfiError) -> Result<(), E> {
     if err.code == 0 {
         return Ok(());
     }
-    let kept = failure(err, err.code);
-    if kept.domain::<E>().is_some() {
-        Err(kept)
-    } else {
-        Err(failure(err, FOREIGN_ERROR_CODE))
+    match failure(err, err.code).domain::<E>() {
+        Some(typed) => Err(typed),
+        None => Err(E::from(failure(err, FOREIGN_ERROR_CODE))),
     }
 }
 
-/// Lift a C-style enum a vtable entry returned.
+/// Convert a [`ForeignError`] into a callback method's error type. The
+/// generated wrappers convert through this one function so a missing
+/// `From<ForeignError>` is reported once, at the error type.
+pub fn convert_foreign<E: From<ForeignError>>(e: ForeignError) -> E {
+    E::from(e)
+}
+
+/// Lift a scalar (an integer, float, `bool`, `usize`, `isize`, or C-style
+/// enum) a vtable entry returned.
 ///
 /// # Errors
 ///
-/// Returns a [`MARSHAL_ERROR_CODE`] failure for a value `E` doesn't declare.
-pub fn callback_ret_enum<E: crate::abi::CEnum>(value: i32) -> Result<E, ForeignError> {
-    E::from_i32(value)
-        .ok_or_else(|| ForeignError::marshal("callback interface returned an invalid enum value"))
+/// Returns a [`MARSHAL_ERROR_CODE`] failure for a value with no `T`
+/// counterpart (an undeclared enum value, say).
+pub fn callback_ret_scalar<T: Scalar>(value: T::Abi) -> Result<T, ForeignError> {
+    T::from_abi(value).ok_or_else(|| {
+        ForeignError::marshal(&format!(
+            "callback interface returned an invalid value ({value:?})"
+        ))
+    })
+}
+
+/// Lift an optional scalar (OptDirect) a vtable entry returned as its
+/// `bool` C return and `*out_value`.
+///
+/// # Errors
+///
+/// Same as [`callback_ret_scalar`] for a present value.
+pub fn callback_ret_opt<T: Scalar>(
+    present: bool,
+    value: T::Abi,
+) -> Result<Option<T>, ForeignError> {
+    if present {
+        callback_ret_scalar(value).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Adopt a typed array (Slice) a vtable entry wrote to its `out_ptr` and
+/// `out_len` slots (`len` is the element count), converting each element.
+/// The run is released whether or not it's accepted.
+///
+/// # Errors
+///
+/// Returns a [`MARSHAL_ERROR_CODE`] failure for a null pointer with a
+/// non-zero count, a pointer not aligned for the element, or an element
+/// with no `T` counterpart.
+///
+/// # Safety
+///
+/// `ptr` must be null or a run of `len * size_of::<T::Abi>()` bytes from
+/// `{prefix}_alloc`, which this adopts and frees.
+pub unsafe fn callback_ret_slice<T: Scalar>(
+    ptr: *mut T::Abi,
+    len: usize,
+) -> Result<Vec<T>, ForeignError> {
+    if ptr.is_null() {
+        return if len == 0 {
+            Ok(Vec::new())
+        } else {
+            Err(ForeignError::marshal(
+                "callback interface returned a null array",
+            ))
+        };
+    }
+    let Some(size) = len.checked_mul(std::mem::size_of::<T::Abi>()) else {
+        return Err(ForeignError::marshal(
+            "callback interface returned an array too large for memory",
+        ));
+    };
+    let result = if ptr.is_aligned() {
+        // SAFETY: non-null and aligned; the caller guarantees `len`
+        // initialized elements.
+        let items = unsafe { std::slice::from_raw_parts(ptr, len) };
+        items.iter().map(|v| callback_ret_scalar(*v)).collect()
+    } else {
+        Err(ForeignError::marshal(
+            "callback interface returned an array that isn't aligned for its element type",
+        ))
+    };
+    // SAFETY: the run is ours to release, exactly once.
+    unsafe { crate::abi::free_bytes(ptr.cast(), size) };
+    result
+}
+
+/// Lift a custom type's value from the repr a vtable entry returned.
+///
+/// # Errors
+///
+/// Returns a [`MARSHAL_ERROR_CODE`] failure with the `lift` function's
+/// message when it rejects the value.
+pub fn lift_custom_returned<C: crate::abi::Custom>(
+    repr: C::Repr,
+) -> Result<C::Value, ForeignError> {
+    C::lift(repr).map_err(|e| ForeignError::marshal(&format!("callback interface returned {e}")))
 }
 
 /// Adopt the strong object reference a vtable entry returned.
@@ -407,20 +525,26 @@ pub unsafe fn callback_ret_bytes(ptr: *mut u8, len: usize) -> Result<Vec<u8>, Fo
         .ok_or_else(|| ForeignError::marshal("callback interface returned a null run"))
 }
 
-/// Adopt a string a vtable entry wrote to its `out_ptr`/`out_len` slots.
+/// Adopt text (a `String`, or a `char`) a vtable entry wrote to its
+/// `out_ptr`/`out_len` slots.
 ///
 /// # Errors
 ///
 /// Returns a [`MARSHAL_ERROR_CODE`] failure for a null pointer with a
-/// non-zero length or bytes that aren't UTF-8.
+/// non-zero length, bytes that aren't UTF-8, or text with no `T`
+/// counterpart (anything but one Unicode scalar value for a `char`).
 ///
 /// # Safety
 ///
 /// Same contract as [`callback_ret_bytes`].
-pub unsafe fn callback_ret_string(ptr: *mut u8, len: usize) -> Result<String, ForeignError> {
+pub unsafe fn callback_ret_text<T: Text>(ptr: *mut u8, len: usize) -> Result<T, ForeignError> {
     // SAFETY: forwarded from the caller.
-    String::from_utf8(unsafe { callback_ret_bytes(ptr, len) }?)
-        .map_err(|_| ForeignError::marshal("callback interface returned a string that isn't UTF-8"))
+    let bytes = unsafe { callback_ret_bytes(ptr, len) }?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        ForeignError::marshal("callback interface returned a string that isn't UTF-8")
+    })?;
+    T::from_text(text)
+        .ok_or_else(|| ForeignError::marshal(&format!("callback interface returned {text:?}")))
 }
 
 /// Adopt and decode a value buffer a vtable entry wrote to its
@@ -491,7 +615,7 @@ mod tests {
     fn call(cb: &ForeignCallback<TestVtable>, x: i32) -> Result<i32, ForeignError> {
         let mut err = FfiError::default();
         let out = unsafe { (cb.vtable().ping)(cb.ctx(), x, &mut err) };
-        callback_status(&err).map(|()| out)
+        callback_status::<ForeignError>(&err).map(|()| out)
     }
 
     #[test]
@@ -520,7 +644,10 @@ mod tests {
         assert_eq!(err.code, FOREIGN_ERROR_CODE);
         assert_eq!(err.message, "negative");
         let err = FfiError::new(MARSHAL_ERROR_CODE, "kept?");
-        assert_eq!(callback_status(&err).unwrap_err().code, FOREIGN_ERROR_CODE);
+        assert_eq!(
+            callback_status::<ForeignError>(&err).unwrap_err().code,
+            FOREIGN_ERROR_CODE
+        );
     }
 
     #[test]
@@ -567,7 +694,10 @@ mod tests {
     fn returned_runs_are_adopted() {
         let ptr = crate::abi::alloc(5);
         unsafe { std::ptr::copy_nonoverlapping(b"hello".as_ptr(), ptr, 5) };
-        assert_eq!(unsafe { callback_ret_string(ptr, 5) }.unwrap(), "hello");
+        assert_eq!(
+            unsafe { callback_ret_text::<String>(ptr, 5) }.unwrap(),
+            "hello"
+        );
         assert_eq!(
             unsafe { callback_ret_bytes(std::ptr::null_mut(), 0) },
             Ok(vec![])
@@ -580,6 +710,64 @@ mod tests {
         );
         let bad = crate::abi::alloc(1);
         unsafe { *bad = 0xff };
-        assert!(unsafe { callback_ret_string(bad, 1) }.is_err());
+        assert!(unsafe { callback_ret_text::<String>(bad, 1) }.is_err());
+        let c = crate::abi::alloc(1);
+        unsafe { *c = b'z' };
+        assert_eq!(unsafe { callback_ret_text::<char>(c, 1) }, Ok('z'));
+    }
+
+    #[test]
+    fn returned_arrays_and_optionals_are_adopted() {
+        let ptr = crate::abi::alloc(16).cast::<u64>();
+        unsafe { ptr.write(3) };
+        unsafe { ptr.add(1).write(4) };
+        let sizes: Vec<usize> = unsafe { callback_ret_slice(ptr, 2) }.unwrap();
+        assert_eq!(sizes, [3, 4]);
+        assert_eq!(
+            unsafe { callback_ret_slice::<f64>(std::ptr::null_mut(), 0) },
+            Ok(vec![])
+        );
+        assert_eq!(
+            unsafe { callback_ret_slice::<f64>(std::ptr::null_mut(), 1) }
+                .unwrap_err()
+                .code,
+            MARSHAL_ERROR_CODE
+        );
+        assert_eq!(callback_ret_opt::<i32>(true, 5), Ok(Some(5)));
+        assert_eq!(callback_ret_opt::<i32>(false, 5), Ok(None));
+        assert_eq!(callback_ret_scalar::<u8>(9), Ok(9));
+    }
+
+    #[test]
+    fn thread_affine_vtables_reject_other_threads() {
+        let freed = AtomicUsize::new(0);
+        let affine = TestVtable {
+            header: VtableHeader {
+                size: std::mem::size_of::<TestVtable>() as u32,
+                flags: VTABLE_THREAD_AFFINE,
+                free,
+            },
+            ping,
+        };
+        let cb = unsafe { ForeignCallback::from_raw(ctx(&freed), &affine) }
+            .unwrap()
+            .unwrap();
+        assert_eq!(cb.check_thread(), Ok(()));
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let err = cb.check_thread().unwrap_err();
+                assert_eq!(err.code, FOREIGN_ERROR_CODE);
+                assert_eq!(err.message, OFF_THREAD_MESSAGE);
+            });
+        });
+        drop(cb);
+        let free_threaded = unsafe { ForeignCallback::from_raw(ctx(&freed), &VTABLE) }
+            .unwrap()
+            .unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| assert_eq!(free_threaded.check_thread(), Ok(())));
+        });
+        drop(free_threaded);
+        assert_eq!(freed.load(Ordering::SeqCst), 2);
     }
 }

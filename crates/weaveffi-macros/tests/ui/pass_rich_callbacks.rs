@@ -1,5 +1,5 @@
-//! Callback methods return any family, may throw the domain in scope, and a
-//! callback parameter may be optional.
+//! Callback methods return any family, may throw a declared domain (whose
+//! typed errors arrive typed), and a callback parameter may be optional.
 
 use std::sync::Arc;
 
@@ -13,12 +13,15 @@ mod rich {
     #[repr(i32)]
     #[derive(Debug)]
     pub enum LookupError {
+        #[weaveffi(message = "missing {key}")]
         Missing { key: String } = 1,
+        #[weaveffi(message = "{message}")]
+        Other { message: String } = 2,
     }
 
-    impl std::fmt::Display for LookupError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("missing")
+    impl From<ForeignError> for LookupError {
+        fn from(e: ForeignError) -> Self {
+            Self::Other { message: e.message }
         }
     }
 
@@ -43,8 +46,7 @@ mod rich {
         fn card(&self) -> Result<Card, ForeignError>;
         fn token(&self) -> Result<Arc<Token>, ForeignError>;
         fn maybe(&self) -> Result<Option<Arc<Token>>, ForeignError>;
-        #[weaveffi::throws]
-        fn lookup(&self, key: &str) -> Result<i64, ForeignError>;
+        fn lookup(&self, key: &str) -> Result<i64, LookupError>;
     }
 
     #[weaveffi::export]
@@ -57,11 +59,14 @@ mod rich {
 
     #[weaveffi::export]
     pub fn missing_key(source: Arc<dyn Source>) -> Option<String> {
-        match source.lookup("k").err()?.domain::<LookupError>()? {
+        match source.lookup("k").err()? {
             LookupError::Missing { key } => Some(key),
+            LookupError::Other { .. } => None,
         }
     }
 }
+
+weaveffi::export_runtime!();
 
 fn main() {
     let _ = Arc::new(rich::Token::new());

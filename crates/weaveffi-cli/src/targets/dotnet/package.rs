@@ -2,7 +2,7 @@
 //! metadata `dotnet pack` needs) and the README.
 //!
 //! Every interpolated user string routes through the shared
-//! [`xml_escape`](crate::manifest::xml_escape), so markup-sensitive
+//! [`xml_escape`], so markup-sensitive
 //! characters can't corrupt the XML.
 
 use crate::manifest::xml_escape;
@@ -65,8 +65,10 @@ pub(crate) fn render_csproj(p: &Project<'_>, filename: &str, extra: &str) -> Str
 {meta}    <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <IsAotCompatible>true</IsAotCompatible>
-    <!-- The bindings themselves reference the API's deprecated items. -->
-    <NoWarn>$(NoWarn);CS0618</NoWarn>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- The bindings themselves reference the API's deprecated items, and
+         carry the IDL's docs, which needn't cover every member. -->
+    <NoWarn>$(NoWarn);CS0618;CS1573;CS1591</NoWarn>
   </PropertyGroup>
 {extra}
 </Project>
@@ -92,7 +94,11 @@ pub(crate) const NATIVE_ASSETS: &str = "  <PropertyGroup>
 
 /// Render the README. A packaged build lists its bundled runtime
 /// identifiers.
-pub(crate) fn render_readme(p: &Project<'_>, ctx: Option<&PackageContext>) -> String {
+pub(crate) fn render_readme(
+    p: &Project<'_>,
+    library_class: &str,
+    ctx: Option<&PackageContext>,
+) -> String {
     let ns = p.namespace;
     let env = p.identity.library_env_var();
     let (mac, linux, win) = p.identity.library_files();
@@ -133,7 +139,12 @@ pub(crate) fn render_readme(p: &Project<'_>, ctx: Option<&PackageContext>) -> St
          The bindings load `{lib}` with the platform's normal rules\n\
          (`{mac}`, `{linux}`, or `{win}` next to the app or on the\n\
          library search path). Set `{env}` to a full path to load a\n\
-         specific file instead.\n\n",
+         specific file instead.\n\n\
+         The first call checks that the loaded library matches these\n\
+         bindings (its ABI revision and every declaration's contract) and\n\
+         throws `NativeLoadException` when it doesn't, as does every later\n\
+         call. Call `{library_class}.Check()` at startup to run the check\n\
+         up front.\n\n",
         lib = p.library,
     ));
     out.push_str(&render_trailer(CommentStyle::Xml, "README.md"));

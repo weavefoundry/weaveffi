@@ -8,21 +8,126 @@
 
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
+use miette::{bail, IntoDiagnostic, Result, WrapErr};
 
 use crate::build::ndk::Ndk;
-use crate::build::BuildSettings;
-use crate::platform::{jni_shim_name, node_addon_name, Os, Platform};
+use crate::build::{BuildSettings, Builder};
+use crate::package::Skips;
+use crate::platform::{jni_shim_name, node_addon_name, BinarySet, Os, Platform};
+use crate::targets::{Glue, GlueKind};
+
+/// Prebuild `glue` for every platform in `binaries` it targets (macOS and
+/// Linux for a Node.js addon, and Android too for a JNI shim; Windows glue is
+/// never prebuilt, since the packages build it there), staging its sources under `{dir}/.glue/` and recording each library in
+/// `binaries`. A platform this host can't compile it for, or whose
+/// compiler, headers, JDK, or NDK is missing, is skipped (recorded in
+/// `skips`); the packages then fall back to compiling the glue at install or
+/// build time.
+pub(crate) fn prebuild(
+    glue: &Glue,
+    dir: &Utf8Path,
+    binaries: &mut BinarySet,
+    builder: &Builder<'_>,
+    settings: &BuildSettings,
+    skips: &Skips,
+) -> Result<()> {
+    let platforms: Vec<Platform> = binaries
+        .platforms()
+        .filter(|p| match glue.kind {
+            GlueKind::NodeAddon => matches!(p.os(), Os::MacOs | Os::Linux),
+            GlueKind::JniShim => matches!(p.os(), Os::MacOs | Os::Linux | Os::Android),
+        })
+        .collect();
+    if platforms.is_empty() {
+        return Ok(());
+    }
+    let (what, staging) = match glue.kind {
+        GlueKind::NodeAddon => ("the Node.js addon", dir.join(".glue/node-addon")),
+        GlueKind::JniShim => ("the JNI shim", dir.join(".glue/jni-shim")),
+    };
+    std::fs::create_dir_all(staging.as_std_path())
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create {staging}"))?;
+    for file in [&glue.source, &glue.header] {
+        let name = file.path.file_name().unwrap_or_default();
+        std::fs::write(staging.join(name).as_std_path(), &file.contents)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to stage {name}"))?;
+    }
+    let source = GlueSource {
+        source: staging.join(glue.source.path.file_name().unwrap_or_default()),
+        include_dir: staging,
+    };
+    let library = binaries.lib_name.clone();
+    let node_include = match glue.kind {
+        GlueKind::NodeAddon => match node_headers() {
+            Ok(headers) => Some(headers),
+            Err(e) => {
+                for p in &platforms {
+                    skips.skip(format!("{what} for {}", p.id()), one_line(&e));
+                }
+                return Ok(());
+            }
+        },
+        GlueKind::JniShim => None,
+    };
+    for platform in platforms {
+        let platform_dir = dir.join(platform.id());
+        let built = match (&glue.kind, &node_include) {
+            (GlueKind::NodeAddon, Some(include)) => compile_node_addon(
+                &source,
+                platform,
+                &platform_dir,
+                &library,
+                include,
+                settings,
+            ),
+            _ => {
+                let ndk = match platform.os() {
+                    Os::Android => builder.ndk().map(Some),
+                    _ => Ok(None),
+                };
+                ndk.and_then(|ndk| {
+                    compile_jni_shim(&source, platform, &platform_dir, &library, ndk, settings)
+                })
+            }
+        };
+        match built {
+            Ok(path) => {
+                if let Some(nb) = binaries
+                    .binaries
+                    .iter_mut()
+                    .find(|b| b.platform == platform)
+                {
+                    match glue.kind {
+                        GlueKind::NodeAddon => nb.node_addon = Some(path),
+                        GlueKind::JniShim => nb.jni_shim = Some(path),
+                    }
+                }
+            }
+            Err(e) => skips.skip(format!("{what} for {}", platform.id()), one_line(&e)),
+        }
+    }
+    Ok(())
+}
+
+/// An error and its causes on one line, for a skip warning.
+pub(crate) fn one_line(e: &miette::Report) -> String {
+    e.chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
 
 /// One glue library to compile: its C source and the directory holding the
 /// header it includes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GlueSource {
+pub(crate) struct GlueSource {
     /// The C source file.
-    pub source: Utf8PathBuf,
+    pub(crate) source: Utf8PathBuf,
     /// The directory holding the producer's C header.
-    pub include_dir: Utf8PathBuf,
+    pub(crate) include_dir: Utf8PathBuf,
 }
 
 /// Check that this host can compile desktop glue for `platform`: macOS
@@ -31,7 +136,7 @@ pub struct GlueSource {
 /// # Errors
 ///
 /// Returns an error explaining which host can compile it instead.
-pub fn check_desktop_host(platform: Platform) -> Result<()> {
+pub(crate) fn check_desktop_host(platform: Platform) -> Result<()> {
     let ok = match platform.os() {
         Os::MacOs => cfg!(target_os = "macos"),
         Os::Linux => cfg!(target_os = "linux") && Platform::host() == Some(platform),
@@ -76,7 +181,7 @@ fn apple_flags(platform: Platform, settings: &BuildSettings) -> Vec<String> {
 ///
 /// Returns an error explaining how to make the headers available when none
 /// are found.
-pub fn node_headers() -> Result<Utf8PathBuf> {
+pub(crate) fn node_headers() -> Result<Utf8PathBuf> {
     let has_headers =
         |dir: &Utf8Path| dir.join("node_api.h").is_file() && dir.join("uv.h").is_file();
     if let Ok(nodedir) = std::env::var("npm_config_nodedir") {
@@ -121,7 +226,7 @@ pub fn node_headers() -> Result<Utf8PathBuf> {
         .into_iter()
         .find(|d| has_headers(d))
         .ok_or_else(|| {
-            anyhow::anyhow!(
+            miette::miette!(
                 "Node.js's C headers (node_api.h) weren't found next to {exec}; install them with \
              `npx node-gyp install` or point npm_config_nodedir at a Node.js source or headers \
              directory"
@@ -136,7 +241,7 @@ pub fn node_headers() -> Result<Utf8PathBuf> {
 ///
 /// Returns an error when this host can't compile for `platform`, the
 /// headers are missing, or the compiler fails.
-pub fn compile_node_addon(
+pub(crate) fn compile_node_addon(
     glue: &GlueSource,
     platform: Platform,
     dir: &Utf8Path,
@@ -182,7 +287,7 @@ pub fn compile_node_addon(
 /// # Errors
 ///
 /// Returns an error when no JDK with `jni.h` is found.
-pub fn jdk_includes() -> Result<Vec<Utf8PathBuf>> {
+pub(crate) fn jdk_includes() -> Result<Vec<Utf8PathBuf>> {
     let mut homes = Vec::new();
     if let Some(home) = std::env::var("JAVA_HOME").ok().filter(|h| !h.is_empty()) {
         homes.push(Utf8PathBuf::from(home));
@@ -217,7 +322,9 @@ pub fn jdk_includes() -> Result<Vec<Utf8PathBuf>> {
             return Ok(vec![include.clone(), include.join(os_dir)]);
         }
     }
-    bail!("no JDK with jni.h was found; install a JDK and set JAVA_HOME")
+    Err(miette::miette!(
+        "no JDK with jni.h was found; install a JDK and set JAVA_HOME"
+    ))
 }
 
 /// Compile the JNI shim `glue` for `platform` (a desktop JVM platform, or
@@ -228,7 +335,7 @@ pub fn jdk_includes() -> Result<Vec<Utf8PathBuf>> {
 ///
 /// Returns an error when this host can't compile for `platform`, the JDK or
 /// NDK is missing, or the compiler fails.
-pub fn compile_jni_shim(
+pub(crate) fn compile_jni_shim(
     glue: &GlueSource,
     platform: Platform,
     dir: &Utf8Path,
@@ -252,10 +359,12 @@ pub fn compile_jni_shim(
                 .arg("-Wl,-z,max-page-size=16384");
             cmd
         }
-        Os::Windows => bail!(
-            "prebuilding the JNI shim for windows-x64 isn't supported; build it with the \
+        Os::Windows => {
+            return Err(miette::miette!(
+                "prebuilding the JNI shim for windows-x64 isn't supported; build it with the \
              generated CMake project on Windows"
-        ),
+            ))
+        }
         Os::MacOs | Os::Linux => {
             check_desktop_host(platform)?;
             let mut cmd = Command::new(desktop_cc());
@@ -273,7 +382,7 @@ pub fn compile_jni_shim(
             }
             cmd
         }
-        Os::Ios | Os::Wasm => bail!("{} has no JVM", platform.id()),
+        Os::Ios | Os::Wasm => return Err(miette::miette!("{} has no JVM", platform.id())),
     };
     cmd.args(["-shared", "-fPIC", "-O2"])
         .arg(format!("-I{}", glue.include_dir))
@@ -291,7 +400,8 @@ fn run(mut cmd: Command, what: &str, platform: Platform) -> Result<()> {
     let program = cmd.get_program().to_string_lossy().into_owned();
     let out = cmd
         .output()
-        .with_context(|| format!("failed to run `{program}` to compile {what}"))?;
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to run `{program}` to compile {what}"))?;
     if !out.status.success() {
         bail!(
             "compiling {what} for {} failed:\n{}",

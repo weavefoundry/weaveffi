@@ -70,20 +70,20 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p weaveffi-cli
-      # `weaveffi diff --check` is the CI gate we recommend to users, so it
-      # must hold for our own samples: a fresh tree diffs clean, and a tree
-      # with a stale file is reported instead of silently passing.
-      - name: weaveffi diff --check on every sample
+      # `weaveffi generate --check` is the CI gate we recommend to users, so
+      # it must hold for our own samples: a fresh tree checks clean, and a
+      # tree with a stale file is reported instead of silently passing.
+      - name: weaveffi generate --check on every sample
         run: |
           set -euo pipefail
           BIN=target/debug/weaveffi
           for sample in calculator codec kvstore; do
             "$BIN" generate "samples/$sample" -o "diffcheck/$sample" --quiet
-            "$BIN" diff "samples/$sample" -o "diffcheck/$sample" --check --quiet
+            "$BIN" generate "samples/$sample" -o "diffcheck/$sample" --check --quiet
           done
           echo "stale" >> diffcheck/calculator/c/calculator.h
-          if "$BIN" diff samples/calculator -o diffcheck/calculator --check --quiet; then
-            echo "diff --check did not detect a modified file" >&2
+          if "$BIN" generate samples/calculator -o diffcheck/calculator --check --quiet; then
+            echo "generate --check did not detect a modified file" >&2
             exit 1
           fi
       - name: weaveffi.schema.json is up to date
@@ -197,7 +197,7 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
           set -euxo pipefail
-          cargo run -q -p weaveffi-cli -- build samples/kvstore --platforms android-arm64 --target kotlin
+          cargo run -q -p weaveffi-cli -- build samples/kvstore --platforms android-arm64 --target kotlin --strict
           readelf="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
           "$readelf" -d target/weaveffi/android-arm64/libkvstore.so | grep 'SONAME.*libkvstore.so'
           "$readelf" -d target/weaveffi/android-arm64/libkvstore_jni.so | grep 'NEEDED.*libkvstore.so'

@@ -11,8 +11,10 @@
 //!   parameter. A thunk lifts **every** parameter before it looks at any
 //!   result, so a callback context or the object tokens in a buffer are
 //!   always adopted (and released again) even when another parameter fails.
-//! * `lower_*` functions (and [`CEnum::to_i32`]) turn a returned value into
-//!   its C return and out slots.
+//! * `lower_*` functions (and [`Scalar::to_abi`]) turn a returned value
+//!   into its C return and out slots, and the `*_run` and `*_slots`
+//!   functions into an async completion's result slots or a callback
+//!   method's argument slots.
 //! * [`call_sync`] runs a synchronous thunk's body under `catch_unwind` and
 //!   reports its outcome through `out_err`.
 
@@ -21,24 +23,13 @@ use std::sync::Arc;
 
 use crate::abi::callback::{lift_callback, lift_callback_opt, CallbackInterface};
 use crate::abi::error::{error_clear, error_store, FfiError, MARSHAL_ERROR_CODE};
+use crate::abi::scalar::{Custom, Scalar, Text};
 use crate::abi::BufferValue;
-
-/// A C-style enum: an `i32` discriminant at the C ABI and inside value
-/// buffers. The `#[weaveffi::module]` expansion implements it for every
-/// `#[repr(i32)]` `#[weaveffi::enumeration]`.
-pub trait CEnum: Sized {
-    /// The variant whose discriminant is `value`, or `None` when no variant
-    /// has it.
-    fn from_i32(value: i32) -> Option<Self>;
-
-    /// This variant's discriminant.
-    fn to_i32(&self) -> i32;
-}
 
 /// Write a C-style enum into a value buffer (the body of its
 /// `BufferValue::write_value`).
-pub fn write_enum<E: CEnum>(value: &E, w: &mut crate::abi::BufferWriter) {
-    w.write_i32(value.to_i32());
+pub fn write_enum<E: Scalar<Abi = i32>>(value: &E, w: &mut crate::abi::BufferWriter) {
+    w.write_i32(value.to_abi());
 }
 
 /// Read a C-style enum from a value buffer (the body of its
@@ -48,10 +39,10 @@ pub fn write_enum<E: CEnum>(value: &E, w: &mut crate::abi::BufferWriter) {
 ///
 /// Returns an error when the buffer is exhausted or the discriminant isn't
 /// one of `E`'s.
-pub fn read_enum<E: CEnum>(
+pub fn read_enum<E: Scalar<Abi = i32>>(
     r: &mut crate::abi::BufferReader<'_>,
 ) -> Result<E, crate::abi::BufferDecodeError> {
-    E::from_i32(r.read_i32()?).ok_or(crate::abi::BufferDecodeError {
+    E::from_abi(r.read_i32()?).ok_or(crate::abi::BufferDecodeError {
         context: "enum discriminant out of range",
     })
 }
@@ -140,20 +131,187 @@ fn invalid(name: &str) -> FfiError {
     FfiError::new(MARSHAL_ERROR_CODE, &format!("{name} is null or invalid"))
 }
 
-/// Lift a C-style enum parameter.
+fn short_type_name<T>() -> &'static str {
+    let full = std::any::type_name::<T>();
+    full.rsplit("::").next().unwrap_or(full)
+}
+
+fn out_of_range<T: Scalar>(name: &str, value: T::Abi) -> FfiError {
+    FfiError::new(
+        MARSHAL_ERROR_CODE,
+        &format!(
+            "{name}: {value:?} is not a valid {}",
+            short_type_name::<T>()
+        ),
+    )
+}
+
+// ── Direct and OptDirect ────────────────────────────────────────────────
+
+/// Lift a scalar parameter (an integer, float, `bool`, `usize`, `isize`, or
+/// C-style enum) from its C slot.
 ///
 /// # Errors
 ///
-/// Returns a marshalling error when `value` isn't one of `E`'s
-/// discriminants.
-pub fn lift_enum<E: CEnum>(value: i32, name: &str) -> Result<E, FfiError> {
-    E::from_i32(value).ok_or_else(|| {
-        FfiError::new(
-            MARSHAL_ERROR_CODE,
-            &format!("{name}: {value} is not a valid enum value"),
-        )
-    })
+/// Returns a marshalling error when the value has no `T` counterpart (an
+/// undeclared enum value, a `u64` past `usize::MAX`).
+pub fn lift_scalar_param<T: Scalar>(value: T::Abi, name: &str) -> Result<T, FfiError> {
+    T::from_abi(value).ok_or_else(|| out_of_range::<T>(name, value))
 }
+
+/// Lift an optional scalar parameter (OptDirect) from its `has_{name}` and
+/// `{name}` slots. `value` is ignored when `has` is false.
+///
+/// # Errors
+///
+/// Returns a marshalling error when a present value has no `T` counterpart.
+pub fn lift_opt_param<T: Scalar>(
+    has: bool,
+    value: T::Abi,
+    name: &str,
+) -> Result<Option<T>, FfiError> {
+    if has {
+        lift_scalar_param(value, name).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Lower an optional scalar return (OptDirect): write the value to
+/// `*out_value` (the zero value when absent) and return whether it's
+/// present.
+///
+/// # Safety
+///
+/// `out_value` must be null or point to a writable `T::Abi`.
+pub unsafe fn lower_opt_ret<T: Scalar>(value: Option<T>, out_value: *mut T::Abi) -> bool {
+    let (present, abi) = opt_run(value);
+    if !out_value.is_null() {
+        // SAFETY: the caller guarantees `out_value` is writable when
+        // non-null.
+        unsafe { *out_value = abi };
+    }
+    present
+}
+
+/// An optional scalar as an async completion's `(has_result, result)`
+/// slots (the zero value when absent).
+#[must_use]
+pub fn opt_run<T: Scalar>(value: Option<T>) -> (bool, T::Abi) {
+    opt_slots(value.as_ref())
+}
+
+/// An optional scalar as a callback method argument's `(has_{name},
+/// {name})` slots (the zero value when absent).
+#[must_use]
+pub fn opt_slots<T: Scalar>(value: Option<&T>) -> (bool, T::Abi) {
+    match value {
+        Some(v) => (true, v.to_abi()),
+        None => (false, T::Abi::sentinel()),
+    }
+}
+
+// ── Slice ───────────────────────────────────────────────────────────────
+
+/// Check a typed array's `(ptr, len)` slots: null only with a count of `0`,
+/// aligned for `A`, and a byte size that fits in memory.
+fn check_slice<A>(ptr: *const A, len: usize, name: &str) -> Result<(), FfiError> {
+    if ptr.is_null() {
+        return if len == 0 { Ok(()) } else { Err(invalid(name)) };
+    }
+    if !ptr.is_aligned() {
+        return Err(FfiError::new(
+            MARSHAL_ERROR_CODE,
+            &format!("{name}: the array isn't aligned for its element type"),
+        ));
+    }
+    if len
+        .checked_mul(std::mem::size_of::<A>())
+        .is_none_or(|n| n > isize::MAX as usize)
+    {
+        return Err(invalid(name));
+    }
+    Ok(())
+}
+
+/// Borrow a typed-array parameter (Slice) as a slice of its own element
+/// type, without copying.
+///
+/// # Errors
+///
+/// Returns a marshalling error for null with a non-zero count, a pointer
+/// not aligned for `P`, or a count too large for memory.
+///
+/// # Safety
+///
+/// When `ptr` is non-null it must point to `len` initialized elements that
+/// stay valid and unmodified for `'a` (generated thunks bound `'a` by the
+/// call).
+pub unsafe fn lift_slice_param<'a, P: Scalar<Abi = P>>(
+    ptr: *const P,
+    len: usize,
+    name: &str,
+) -> Result<&'a [P], FfiError> {
+    check_slice(ptr, len, name)?;
+    if ptr.is_null() {
+        return Ok(&[]);
+    }
+    // SAFETY: checked non-null and aligned above; the caller guarantees the
+    // elements are live for `'a`.
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
+/// Copy a typed-array parameter (Slice) into a `Vec<T>`, converting each
+/// element (a `[u64]` into a `Vec<usize>`, say).
+///
+/// # Errors
+///
+/// Same as [`lift_slice_param`], plus a marshalling error when an element
+/// has no `T` counterpart.
+///
+/// # Safety
+///
+/// Same contract as [`lift_slice_param`], for the duration of the call.
+pub unsafe fn lift_slice_vec_param<T: Scalar>(
+    ptr: *const T::Abi,
+    len: usize,
+    name: &str,
+) -> Result<Vec<T>, FfiError> {
+    check_slice(ptr, len, name)?;
+    if ptr.is_null() {
+        return Ok(Vec::new());
+    }
+    // SAFETY: checked non-null and aligned above; forwarded from the caller.
+    let items = unsafe { std::slice::from_raw_parts(ptr, len) };
+    items.iter().map(|v| lift_scalar_param(*v, name)).collect()
+}
+
+/// Lower a typed-array return (Slice) as a new 8-aligned run of
+/// `T::Abi` elements, writing the **element count** to `*out_len`. The
+/// consumer releases it with `{prefix}_free_bytes(ptr, count *
+/// sizeof(T))`.
+///
+/// # Safety
+///
+/// `out_len` must be null or point to a writable `usize`.
+pub unsafe fn lower_slice_ret<T: Scalar>(value: &[T], out_len: *mut usize) -> *mut T::Abi {
+    let (ptr, len) = crate::abi::convert::slice_into_raw(&T::abi_slice(value));
+    if !out_len.is_null() {
+        // SAFETY: the caller guarantees `out_len` is writable when non-null.
+        unsafe { *out_len = len };
+    }
+    ptr
+}
+
+/// A typed array as an async completion's owned `(result_ptr, result_len)`
+/// slots (`result_len` is the element count).
+#[must_use]
+pub fn slice_run<T: Scalar>(value: &[T]) -> (*const T::Abi, usize) {
+    let (ptr, len) = crate::abi::convert::slice_into_raw(&T::abi_slice(value));
+    (ptr.cast_const(), len)
+}
+
+// ── String, Bytes, and Buffer ───────────────────────────────────────────
 
 /// Borrow a string parameter's UTF-8 `(ptr, len)` run as a `&str`.
 ///
@@ -174,22 +332,30 @@ pub unsafe fn lift_str_param<'a>(
     unsafe { crate::abi::lift_str(ptr, len) }.ok_or_else(|| invalid(name))
 }
 
-/// Copy a string parameter into an owned `String`.
+/// Lift a string parameter into an owned [`Text`]: a `String`, or a `char`
+/// (which must be exactly one Unicode scalar value).
 ///
 /// # Errors
 ///
-/// Same as [`lift_str_param`].
+/// Same as [`lift_str_param`], plus a marshalling error when the text has no
+/// `T` counterpart.
 ///
 /// # Safety
 ///
 /// Same contract as [`lift_str_param`].
-pub unsafe fn lift_string_param(
+pub unsafe fn lift_text_param<T: Text>(
     ptr: *const u8,
     len: usize,
     name: &str,
-) -> Result<String, FfiError> {
+) -> Result<T, FfiError> {
     // SAFETY: forwarded from the caller.
-    unsafe { lift_str_param(ptr, len, name) }.map(str::to_owned)
+    let text = unsafe { lift_str_param(ptr, len, name) }?;
+    T::from_text(text).ok_or_else(|| {
+        FfiError::new(
+            MARSHAL_ERROR_CODE,
+            &format!("{name}: {text:?} is not a valid {}", short_type_name::<T>()),
+        )
+    })
 }
 
 /// Borrow a bytes parameter's `(ptr, len)` run as a slice.
@@ -201,7 +367,7 @@ pub unsafe fn lift_string_param(
 /// # Safety
 ///
 /// Same contract as [`lift_byte_slice`](crate::abi::lift_byte_slice).
-pub unsafe fn lift_slice_param<'a>(
+pub unsafe fn lift_byte_slice_param<'a>(
     ptr: *const u8,
     len: usize,
     name: &str,
@@ -214,18 +380,18 @@ pub unsafe fn lift_slice_param<'a>(
 ///
 /// # Errors
 ///
-/// Same as [`lift_slice_param`].
+/// Same as [`lift_byte_slice_param`].
 ///
 /// # Safety
 ///
-/// Same contract as [`lift_slice_param`].
+/// Same contract as [`lift_byte_slice_param`].
 pub unsafe fn lift_bytes_param(
     ptr: *const u8,
     len: usize,
     name: &str,
 ) -> Result<Vec<u8>, FfiError> {
     // SAFETY: forwarded from the caller.
-    unsafe { lift_slice_param(ptr, len, name) }.map(<[u8]>::to_vec)
+    unsafe { lift_byte_slice_param(ptr, len, name) }.map(<[u8]>::to_vec)
 }
 
 /// Decode a value-buffer parameter (a record, rich enum, optional, list, or
@@ -238,7 +404,7 @@ pub unsafe fn lift_bytes_param(
 ///
 /// # Safety
 ///
-/// Same contract as [`lift_slice_param`], plus that of
+/// Same contract as [`lift_byte_slice_param`], plus that of
 /// [`decode_value`](crate::abi::decode_value) for the buffer's object tokens.
 pub unsafe fn lift_buffer_param<T: BufferValue>(
     ptr: *const u8,
@@ -246,11 +412,75 @@ pub unsafe fn lift_buffer_param<T: BufferValue>(
     name: &str,
 ) -> Result<T, FfiError> {
     // SAFETY: forwarded from the caller.
-    let bytes = unsafe { lift_slice_param(ptr, len, name) }?;
+    let bytes = unsafe { lift_byte_slice_param(ptr, len, name) }?;
     // SAFETY: forwarded from the caller; the thunk decodes each buffer once.
     unsafe { crate::abi::decode_value(bytes) }
         .map_err(|e| FfiError::new(MARSHAL_ERROR_CODE, &format!("{name}: {e}")))
 }
+
+/// Lower a returned string (or `char`) as a producer-allocated run plus
+/// `*out_len`.
+///
+/// # Safety
+///
+/// `out_len` must be null or point to a writable `usize`.
+pub unsafe fn lower_string_ret<T: Text + ?Sized>(value: &T, out_len: *mut usize) -> *const u8 {
+    // SAFETY: forwarded from the caller.
+    unsafe { crate::abi::lower_string(&value.as_text(), out_len) }
+}
+
+/// Lower returned bytes as a producer-allocated run plus `*out_len`.
+///
+/// # Safety
+///
+/// Same contract as [`lower_string_ret`].
+pub unsafe fn lower_bytes_ret<B: AsRef<[u8]> + ?Sized>(
+    value: &B,
+    out_len: *mut usize,
+) -> *const u8 {
+    // SAFETY: forwarded from the caller.
+    unsafe { crate::abi::lower_bytes(value.as_ref(), out_len) }
+}
+
+/// Encode a returned value buffer as a producer-allocated run plus
+/// `*out_len`.
+///
+/// # Safety
+///
+/// Same contract as [`lower_string_ret`].
+pub unsafe fn lower_buffer_ret<T: BufferValue>(value: &T, out_len: *mut usize) -> *const u8 {
+    // SAFETY: forwarded from the caller.
+    unsafe { crate::abi::lower_bytes(&crate::abi::encode_value(value), out_len) }
+}
+
+/// A string (or `char`) as an async completion's owned `(result_ptr,
+/// result_len)` run.
+#[must_use]
+pub fn string_run<T: Text + ?Sized>(value: &T) -> (*const u8, usize) {
+    crate::abi::bytes_into_raw(value.as_text().as_bytes())
+}
+
+/// Bytes as an async completion's owned `(result_ptr, result_len)` run.
+#[must_use]
+pub fn bytes_run<B: AsRef<[u8]> + ?Sized>(value: &B) -> (*const u8, usize) {
+    crate::abi::bytes_into_raw(value.as_ref())
+}
+
+/// A value buffer as an async completion's owned `(result_ptr, result_len)`
+/// run.
+#[must_use]
+pub fn buffer_run<T: BufferValue>(value: &T) -> (*const u8, usize) {
+    crate::abi::bytes_into_raw(&crate::abi::encode_value(value))
+}
+
+/// Borrow a bytes-like argument as the `(ptr, len)` slots of a callback
+/// method call.
+pub fn byte_slots<B: AsRef<[u8]> + ?Sized>(value: &B) -> (*const u8, usize) {
+    let b = value.as_ref();
+    (b.as_ptr(), b.len())
+}
+
+// ── Objects, callbacks, and receivers ───────────────────────────────────
 
 /// Borrow an object parameter for the call.
 ///
@@ -309,7 +539,8 @@ pub unsafe fn lift_object_arc_opt_param<T>(ptr: *const T) -> Result<Option<Arc<T
     Ok(unsafe { crate::abi::object_arc(ptr) })
 }
 
-/// Adopt a callback-interface parameter's `(ctx, vtable)` pair.
+/// Adopt a callback-interface parameter's `(ctx, vtable)` pair, recording
+/// the calling thread for a thread-affine vtable.
 ///
 /// # Errors
 ///
@@ -376,68 +607,28 @@ pub unsafe fn lift_self_arc<T>(ptr: *const T) -> Result<Arc<T>, FfiError> {
     unsafe { lift_object_arc_param(ptr, "self") }
 }
 
-/// Lower a returned string as a producer-allocated run plus `*out_len`.
+/// Lift a custom type's value from its repr (already lifted from the
+/// parameter's slots).
 ///
-/// # Safety
+/// # Errors
 ///
-/// `out_len` must be null or point to a writable `usize`.
-pub unsafe fn lower_string_ret(value: impl Into<String>, out_len: *mut usize) -> *const u8 {
-    // SAFETY: forwarded from the caller.
-    unsafe { crate::abi::lower_string(value.into(), out_len) }
+/// Returns a marshalling error naming the parameter, with the `lift`
+/// function's message, when it rejects the value.
+pub fn lift_custom_param<C: Custom>(repr: C::Repr, name: &str) -> Result<C::Value, FfiError> {
+    C::lift(repr).map_err(|e| FfiError::new(MARSHAL_ERROR_CODE, &format!("{name}: {e}")))
 }
 
-/// Lower returned bytes as a producer-allocated run plus `*out_len`.
+/// Lift a custom type's value from a repr read out of a value buffer.
 ///
-/// # Safety
+/// # Errors
 ///
-/// Same contract as [`lower_string_ret`].
-pub unsafe fn lower_bytes_ret(value: impl Into<Vec<u8>>, out_len: *mut usize) -> *const u8 {
-    // SAFETY: forwarded from the caller.
-    unsafe { crate::abi::lower_bytes(value.into(), out_len) }
-}
-
-/// Encode a returned value buffer as a producer-allocated run plus
-/// `*out_len`.
-///
-/// # Safety
-///
-/// Same contract as [`lower_string_ret`].
-pub unsafe fn lower_buffer_ret<T: BufferValue>(value: &T, out_len: *mut usize) -> *const u8 {
-    // SAFETY: forwarded from the caller.
-    unsafe { crate::abi::lower_bytes(crate::abi::encode_value(value), out_len) }
-}
-
-/// A string as an async completion's owned `(result_ptr, result_len)` run.
-#[must_use]
-pub fn string_run(value: impl Into<String>) -> (*const u8, usize) {
-    crate::abi::bytes_into_raw(value.into().into_bytes())
-}
-
-/// Bytes as an async completion's owned `(result_ptr, result_len)` run.
-#[must_use]
-pub fn bytes_run(value: impl Into<Vec<u8>>) -> (*const u8, usize) {
-    crate::abi::bytes_into_raw(value.into())
-}
-
-/// A value buffer as an async completion's owned `(result_ptr, result_len)`
-/// run.
-#[must_use]
-pub fn buffer_run<T: BufferValue>(value: &T) -> (*const u8, usize) {
-    crate::abi::bytes_into_raw(crate::abi::encode_value(value))
-}
-
-/// Borrow a string-like argument as the `(ptr, len)` slots of a callback
-/// method call.
-pub fn str_slots<S: AsRef<str> + ?Sized>(value: &S) -> (*const u8, usize) {
-    let s = value.as_ref();
-    (s.as_ptr(), s.len())
-}
-
-/// Borrow a bytes-like argument as the `(ptr, len)` slots of a callback
-/// method call.
-pub fn byte_slots<B: AsRef<[u8]> + ?Sized>(value: &B) -> (*const u8, usize) {
-    let b = value.as_ref();
-    (b.as_ptr(), b.len())
+/// Returns a decode error when the `lift` function rejects the value.
+pub fn lift_custom_buffered<C: Custom>(
+    repr: C::Repr,
+) -> Result<C::Value, crate::abi::BufferDecodeError> {
+    C::lift(repr).map_err(|_| crate::abi::BufferDecodeError {
+        context: "a custom type's lift rejected the value",
+    })
 }
 
 #[cfg(test)]
@@ -450,15 +641,16 @@ mod tests {
         Blue,
     }
 
-    impl CEnum for Color {
-        fn from_i32(value: i32) -> Option<Self> {
+    impl Scalar for Color {
+        type Abi = i32;
+        fn from_abi(value: i32) -> Option<Self> {
             match value {
                 0 => Some(Self::Red),
                 2 => Some(Self::Blue),
                 _ => None,
             }
         }
-        fn to_i32(&self) -> i32 {
+        fn to_abi(&self) -> i32 {
             match self {
                 Self::Red => 0,
                 Self::Blue => 2,
@@ -468,14 +660,78 @@ mod tests {
 
     #[test]
     fn enums_lift_and_round_trip_through_buffers() {
-        assert_eq!(lift_enum::<Color>(2, "c").unwrap(), Color::Blue);
-        let err = lift_enum::<Color>(1, "c").unwrap_err();
+        assert_eq!(lift_scalar_param::<Color>(2, "c").unwrap(), Color::Blue);
+        let err = lift_scalar_param::<Color>(1, "c").unwrap_err();
         assert_eq!(err.code, MARSHAL_ERROR_CODE);
+        assert_eq!(
+            unsafe { err.message_str() },
+            Some("c: 1 is not a valid Color")
+        );
         let mut w = crate::abi::BufferWriter::new();
         write_enum(&Color::Blue, &mut w);
         let bytes = w.finish();
         let mut r = crate::abi::BufferReader::new(&bytes);
         assert_eq!(read_enum::<Color>(&mut r).unwrap(), Color::Blue);
+    }
+
+    #[test]
+    fn optionals_cross_as_a_flag_and_a_value() {
+        assert_eq!(lift_opt_param::<i32>(false, 99, "x").unwrap(), None);
+        assert_eq!(lift_opt_param::<i32>(true, 7, "x").unwrap(), Some(7));
+        assert!(lift_opt_param::<Color>(true, 5, "x").is_err());
+        assert_eq!(lift_opt_param::<Color>(false, 5, "x").unwrap(), None);
+        let mut out = 1.0f64;
+        assert!(!unsafe { lower_opt_ret::<f64>(None, &mut out) });
+        assert_eq!(out, 0.0);
+        assert!(unsafe { lower_opt_ret(Some(2.5f64), &mut out) });
+        assert_eq!(out, 2.5);
+        assert_eq!(opt_run(Some(3usize)), (true, 3u64));
+        assert_eq!(opt_slots::<Color>(Some(&Color::Blue)), (true, 2));
+        assert_eq!(opt_slots::<bool>(None), (false, false));
+    }
+
+    #[test]
+    fn slices_borrow_copy_convert_and_check() {
+        let xs = [1.5f64, -2.0, 3.25];
+        let lent = unsafe { lift_slice_param(xs.as_ptr(), xs.len(), "xs") }.unwrap();
+        assert!(std::ptr::eq(lent, &xs[..]));
+        assert!(
+            unsafe { lift_slice_param::<f64>(std::ptr::null(), 0, "xs") }
+                .unwrap()
+                .is_empty()
+        );
+        assert!(unsafe { lift_slice_param::<f64>(std::ptr::null(), 2, "xs") }.is_err());
+        let words = [0u64, 1, 2];
+        let misaligned = unsafe { words.as_ptr().cast::<u8>().add(1) }.cast::<u64>();
+        let err = unsafe { lift_slice_param(misaligned, 1, "ws") }.unwrap_err();
+        assert_eq!(err.code, MARSHAL_ERROR_CODE);
+        let sizes: Vec<usize> = unsafe { lift_slice_vec_param(words.as_ptr(), 3, "ws") }.unwrap();
+        assert_eq!(sizes, [0, 1, 2]);
+
+        let mut len = 0usize;
+        let ptr = unsafe { lower_slice_ret(&[4usize, 5], &mut len) };
+        assert_eq!(len, 2);
+        assert_eq!(ptr as usize % crate::abi::convert::RUN_ALIGN, 0);
+        assert_eq!(unsafe { std::slice::from_raw_parts(ptr, len) }, [4u64, 5]);
+        unsafe { crate::abi::free_bytes(ptr.cast(), len * 8) };
+        let (ptr, len) = slice_run::<i32>(&[]);
+        assert!(ptr.is_null() && len == 0);
+    }
+
+    #[test]
+    fn text_lifts_strings_and_chars() {
+        let s = "\u{1F980}";
+        let c: char = unsafe { lift_text_param(s.as_ptr(), s.len(), "c") }.unwrap();
+        assert_eq!(c, '\u{1F980}');
+        let err = unsafe { lift_text_param::<char>(b"ab".as_ptr(), 2, "c") }.unwrap_err();
+        assert_eq!(
+            unsafe { err.message_str() },
+            Some("c: \"ab\" is not a valid char")
+        );
+        let mut len = 0usize;
+        let p = unsafe { lower_string_ret(&'x', &mut len) };
+        assert_eq!(unsafe { crate::abi::lift_str(p, len) }, Some("x"));
+        unsafe { crate::abi::free_bytes(p.cast_mut(), len) };
     }
 
     #[test]
@@ -507,7 +763,7 @@ mod tests {
             Some("title is null or invalid")
         );
         let bad = [0xffu8];
-        assert!(unsafe { lift_string_param(bad.as_ptr(), 1, "s") }.is_err());
+        assert!(unsafe { lift_text_param::<String>(bad.as_ptr(), 1, "s") }.is_err());
         let err = unsafe { lift_buffer_param::<Vec<i32>>(bad.as_ptr(), 1, "xs") }.unwrap_err();
         assert!(unsafe { err.message_str() }
             .unwrap()
@@ -516,5 +772,26 @@ mod tests {
         assert!(unsafe { lift_object_opt_param::<u8>(std::ptr::null()) }
             .unwrap()
             .is_none());
+        struct Small;
+        impl Custom for Small {
+            type Repr = String;
+            type Value = u8;
+            fn lift(repr: String) -> Result<u8, String> {
+                repr.parse()
+                    .map_err(|e: std::num::ParseIntError| e.to_string())
+            }
+            fn lower(value: &u8) -> String {
+                value.to_string()
+            }
+        }
+        let err = lift_custom_param::<Small>("x".to_string(), "id").unwrap_err();
+        assert!(unsafe { err.message_str() }
+            .unwrap()
+            .starts_with("id: invalid digit"));
+        assert_eq!(
+            lift_custom_param::<Small>("7".to_string(), "id").unwrap(),
+            7
+        );
+        assert!(lift_custom_buffered::<Small>("300".to_string()).is_err());
     }
 }

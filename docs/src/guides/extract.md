@@ -3,24 +3,24 @@
 The CLI never reads Rust source. A Rust producer's API is read from the
 library the crate builds: `#[weaveffi::module]` embeds a description of every
 declaration it exports in the compiled library, and `weaveffi generate`,
-`diff`, `validate`, `extract`, `dev`, `build`, and `package` read it back
-out. The bindings therefore describe exactly what the library was compiled
+`validate`, `extract`, `dev`, `build`, and `package` read it back out. The bindings therefore describe exactly what the library was compiled
 with, `#[cfg]` and type aliases resolved, macro expansion and all.
 
 A Rust project's input is the crate: its directory (`[project] input = "."`,
 which `weaveffi init` writes) or its `Cargo.toml`.
 
 ```bash
-weaveffi generate                    # build the crate (debug), read it, generate
-weaveffi generate --release          # read a release build instead
+weaveffi generate                    # build the crate (dev profile), read it, generate
+weaveffi generate --profile release  # read a release build instead
 weaveffi generate --library target/x86_64-unknown-linux-gnu/release/libkvstore.so
 ```
 
 Without `--library`, the CLI resolves the crate with `cargo metadata` (its
-name, version, library name, and target directory), runs
-`cargo build --lib --message-format=json-render-diagnostics` (Cargo's errors
-and warnings print as usual), and reads the crate's `cdylib`, or its
-`staticlib` when it has no `cdylib`. `--library` skips the build and reads
+name, version, library name, and target directory), runs `cargo rustc --lib
+--crate-type cdylib --profile <profile> --message-format=json-render-diagnostics`
+(Cargo's errors and warnings print as usual), and reads the `cdylib` it
+built, so the crate needs no `crate-type` of its own. `--profile` defaults
+to `dev`. `--library` skips the build and reads
 the given file: a shared library, a static archive, or a `.wasm` module, for
 any platform (an Android `.so` reads fine on a Mac). With no crate at all (no
 input argument and no `[project] input`), `--library` reads the library on
@@ -37,16 +37,16 @@ next to the crate, or handing the API to a non-Rust implementation.
 ```bash
 weaveffi extract                     # the project's crate, YAML to stdout
 weaveffi extract path/to/crate -o api.yml
-weaveffi extract -f json -o api.json # JSON (or -f toml)
+weaveffi extract -f json -o api.json # JSON
 weaveffi extract --library libkvstore.dylib
 ```
 
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `-o`, `--output` | stdout | Write to a file |
-| `-f`, `--format` | `yaml` | `yaml`, `json`, or `toml` |
+| `-f`, `--format` | `yaml` | `yaml` or `json` |
 | `--library` | build the crate | Read this library instead |
-| `--release` | off | Build the crate in release mode |
+| `--profile` | `dev` | The Cargo profile to build the crate with |
 | `--config` | discovered | The `weaveffi.toml` to use |
 
 The document is validated before it's printed, so what `extract` prints
@@ -62,8 +62,9 @@ the generated bindings must load the Rust library.
 
 ## How the API is embedded
 
-For every declaration (a module, its error domain, a function, an interface
-and each of its members, a record, an enum, a callback interface) the macro
+For every declaration (a module, each of its error domains, a function, an
+interface and each of its members, a record, an enum, a callback interface)
+the macro
 emits an exported static:
 
 ```rust,ignore
@@ -108,13 +109,14 @@ pub mod shop {
 `weaveffi extract` lists `discount` only for a build with the `extra`
 feature (`cargo build --features extra`, then `--library`).
 
-A library with no frames for the crate (the API isn't annotated, or the
-crate builds no `cdylib` or `staticlib`) is an error naming what's missing:
+A library with no frames for the crate (the API isn't annotated) is an
+error naming what's missing:
 `#[weaveffi::module]` on the API and one `weaveffi::export_runtime!()` call.
 
 ## Iterating: `weaveffi dev`
 
-`weaveffi dev` builds the crate's debug library, generates, and makes the
+`weaveffi dev` builds the crate's library (the `dev` profile unless
+`--profile` names another), generates, and makes the
 generated packages find that library without any environment variables
 where a package looks for a bundled copy (when the crate builds a shared
 library; a static-only build gets the environment variable instead):
@@ -138,28 +140,36 @@ follow later builds.
 ## Generating from a build script
 
 The CLI is also a library. `weaveffi_cli::project::Project` locates a
-project the way the `weaveffi` command does and generates it, so a crate
-that ships bindings can generate them from its `build.rs`:
+project the way the `weaveffi` command does, and the
+`weaveffi_cli::codegen::Orchestrator` generates it, so a crate that ships
+bindings can generate them from its `build.rs`:
 
 ```rust,ignore
 // build.rs
+use weaveffi_cli::codegen::Orchestrator;
+use weaveffi_cli::project::Project;
+
 fn main() -> miette::Result<()> {
     println!("cargo::rerun-if-changed=weaveffi.toml");
     println!("cargo::rerun-if-changed=api.yml");
-    weaveffi_cli::project::Project::discover(env!("CARGO_MANIFEST_DIR"))?.generate()?;
+    let project = Project::discover(env!("CARGO_MANIFEST_DIR"))?;
+    let targets = project.config.targets(None)?;
+    Orchestrator::new()
+        .with_targets(targets.iter().map(AsRef::as_ref))
+        .run(&project.model()?, &project.config.out_dir(None))?;
     Ok(())
 }
 ```
 
 ```toml
 [build-dependencies]
-weaveffi-cli = "0.24"
+weaveffi-cli = "0.25"
 miette = "7"
 ```
 
 `Project::discover` finds the nearest `weaveffi.toml` at or above the
-directory, and `generate` writes the `[project] targets` into `[project]
-out`, rewriting only changed files.
+directory, and the orchestrator writes the `[project] targets` into
+`[project] out`, rewriting only changed files.
 
 A build script runs before its crate is compiled, so it can't read its own
 crate's library: from a `build.rs`, the project's input must be an IDL, or
@@ -173,6 +183,8 @@ instead: `weaveffi generate` in CI or a `cargo xtask`.
 | Rust | IDL |
 |------|-----|
 | `i8`..`i64`, `u8`..`u64`, `f32`, `f64`, `bool` | same |
+| `usize`, `isize` | `u64`, `i64` |
+| `char` | `string` |
 | `String`, `&str` | `string` |
 | `Vec<u8>`, `&[u8]` | `bytes` |
 | `Vec<T>`, `&[T]` | `[T]` |
@@ -182,24 +194,28 @@ instead: `weaveffi generate` in CI or a `cargo xtask`.
 | `&T`, `Arc<T>` (interface), `Arc<Self>` | `T` |
 | `Arc<dyn Trait>` (callback interface) | `Trait` |
 | `weaveffi::CancelToken` | removed (`#[weaveffi::cancellable]` sets `cancellable: true`) |
-| `Result<T, E>` | return `T`, sets `throws: true` |
+| `Result<T, E>`, `E` a `#[weaveffi::error]` domain of the tree | return `T`, `throws: E` |
+| `Result<T, E>`, any other `E` | return `T`, `throws: any` |
+| a `#[weaveffi::custom]` alias | its repr |
 | a type alias declared in the tree | its target |
 | any other name | that name, resolved by the validator |
 
 Compositions map recursively: `Option<Vec<i32>>` is `[i32]?` and
-`Vec<Arc<Gadget>>` is `[Gadget]`. An `async fn` sets `async: true`, `()` and
-`Result<(), E>` returns are no return, and a callback method's
-`Result<T, ForeignError>` is a `T` return that throws only with
-`#[weaveffi::throws]`. A type is always referenced by its bare name
-(`Store`, wherever it's declared), because type names are global; a path
-such as `super::kv::Store` contributes only its last segment.
+`Vec<Arc<Gadget>>` is `[Gadget]`. An `async fn` sets `async: true`, and `()`
+and `Result<(), E>` returns are no return. A callback method's `Result<T,
+E>` follows the same rule as a function's: a domain `E` throws that domain,
+anything else (`ForeignError` included) throws `any`. A type is always
+referenced by its bare name (`Store`, wherever it's declared), because type
+names are global; a path such as `super::kv::Store` contributes only its
+last segment.
 
 ## Limits
 
 - **Error messages.** A `#[weaveffi::error]` variant's doc comment becomes
-  the code's `doc:`, and its first line the code's `message:` (the variant
-  name when it has no doc), so a Rust producer can't give a code a message
-  that differs from its doc's first line.
+  the code's `doc:`, and the code's `message:` is the doc's first line, else
+  the variant's `#[weaveffi(message = "...")]` template as written, else the
+  variant name. The runtime message is the generated `Display` (the
+  template filled from the fields), which the IDL can't express.
 - **Deprecation versions.** `#[deprecated(since = "...")]` keeps only the
   note; the IDL has no `since` field.
 - **Parameter docs.** Rust doesn't allow doc comments on function

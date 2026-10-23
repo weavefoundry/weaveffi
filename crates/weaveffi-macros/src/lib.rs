@@ -2,12 +2,11 @@
 //!
 //! A producer annotates an ordinary Rust module with `#[weaveffi::module]`,
 //! tags the items it wants to export, and calls `weaveffi::export_runtime!()`
-//! once. The module macro lowers the module tree to the WeaveFFI IR (through
-//! [`weaveffi_model::rust`]), builds the canonical
-//! [`Model`](weaveffi_model::model::Model), and emits the
-//! `extern "C"` thunks every generated language binding calls. All of the
-//! `unsafe` marshalling lives in the `weaveffi::abi` runtime, so the producer
-//! writes only safe Rust.
+//! once. The module macro lowers the module tree to the WeaveFFI IR, builds
+//! the canonical [`Model`](weaveffi_model::model::Model) with the shared
+//! validator, and emits the `extern "C"` thunks every generated language
+//! binding calls. All of the `unsafe` marshalling lives in the
+//! `weaveffi::abi` runtime, so the producer writes only safe Rust.
 //!
 //! ```ignore
 //! #[weaveffi::module]
@@ -34,25 +33,28 @@
 //!   [`macro@enumeration`] a `#[repr(i32)]` C-style enum or a rich enum with
 //!   data-carrying variants.
 //! * [`macro@interface`] declares an opaque, reference-counted object type
-//!   whose `impl` block's `pub fn`s become constructors, methods, and statics.
-//! * [`macro@error`] declares the module's error domain from an enum with
-//!   explicit discriminants; a variant's named fields become the code's
-//!   structured payload.
+//!   whose `impl` blocks' `pub fn`s become constructors, methods, and
+//!   statics; [`macro@skip`] leaves one of them unexported.
+//! * [`macro@error`] declares an error domain from an enum with explicit
+//!   discriminants; a variant's named fields become the code's structured
+//!   payload, and the macro generates `Display` and `std::error::Error`.
 //! * [`macro@callback_interface`] declares a trait the consumer implements,
-//!   whose methods return `Result<T, weaveffi::ForeignError>`;
-//!   [`macro@throws`] lets one of them report the module's domain errors.
-//!   [`macro@cancellable`] marks an async function as cancellable.
+//!   whose methods return `Result<T, E>` with `E: From<ForeignError>`.
+//! * [`macro@custom`] declares a type alias that crosses as another type.
+//! * [`macro@cancellable`] marks an async function as cancellable.
 //! * [`export_runtime!`] emits the runtime symbols (memory, errors, cancel
 //!   tokens, ABI version) once per library.
 //!
-//! The item-level attributes are inert markers that [`macro@module`] reads; on
-//! their own they expand to the item unchanged.
+//! The item-level attributes are markers that [`macro@module`] reads and
+//! removes; one that's left to expand on its own (because it isn't inside a
+//! `#[weaveffi::module]`) is a compile error.
 
 #![deny(missing_docs)]
 
 use proc_macro::TokenStream;
 
 mod codegen;
+mod extract;
 mod runtime;
 
 /// Mark an inline `mod` as an exported WeaveFFI namespace.
@@ -87,63 +89,94 @@ pub fn export_runtime(input: TokenStream) -> TokenStream {
         .into()
 }
 
-/// Generate `#[doc(hidden)]` no-op marker attributes that [`macro@module`]
-/// reads. Each expands to the annotated item unchanged.
+/// Generate the marker attributes that [`macro@module`] reads and strips.
+/// Expanding on their own means they aren't inside a `#[weaveffi::module]`,
+/// so each reports that and passes the item through unchanged (so the item's
+/// other errors still surface).
 macro_rules! marker_attr {
-    ($(#[$meta:meta])* $name:ident) => {
+    ($(#[$meta:meta])* $name:ident, $placement:literal) => {
         $(#[$meta])*
         #[proc_macro_attribute]
         pub fn $name(_attr: TokenStream, item: TokenStream) -> TokenStream {
-            item
+            misplaced(stringify!($name), $placement, item)
         }
     };
 }
 
+/// A `compile_error!` for a marker that expanded on its own, pointing at the
+/// attribute, followed by the item.
+fn misplaced(name: &str, placement: &str, item: TokenStream) -> TokenStream {
+    let item = proc_macro2::TokenStream::from(item);
+    let span = proc_macro2::Span::call_site();
+    let message = format!(
+        "`#[weaveffi::{name}]` only works {placement}; put the item in an inline module \
+         annotated `#[weaveffi::module]` (`#[weaveffi::module] pub mod api {{ ... }}`)"
+    );
+    let error = quote::quote_spanned!(span=> ::core::compile_error!(#message););
+    quote::quote!(#error #item).into()
+}
+
 marker_attr! {
     /// Export a function across the FFI boundary. An `async fn` lowers to an
-    /// asynchronous symbol; a `fn -> Result<T, E>` is fallible.
-    export
+    /// asynchronous symbol. A `fn -> Result<T, E>` is fallible: it throws
+    /// `E` when `E` is a `#[weaveffi::error]` enum of the module tree, and
+    /// otherwise reports `E`'s `Display` output as an untyped error
+    /// (`throws any`).
+    export, "on an item inside a `#[weaveffi::module]`"
 }
 marker_attr! {
     /// Declare a by-value record (struct) serialized in the value-buffer
     /// format when it crosses the ABI.
-    record
+    record, "on an item inside a `#[weaveffi::module]`"
 }
 marker_attr! {
     /// Declare an interface: an opaque, reference-counted object type with
-    /// constructors, methods, and statics read from its `impl` block. Methods
-    /// take `&self` or `self: Arc<Self>`; the type must be `Send + Sync`.
-    interface
+    /// constructors, methods, and statics read from its `impl` blocks.
+    /// Methods take `&self` or `self: Arc<Self>`; the type must be
+    /// `Send + Sync`.
+    interface, "on an item inside a `#[weaveffi::module]`"
 }
 marker_attr! {
-    /// Declare the module's error domain from an enum with explicit
-    /// discriminants (the stable error codes). The enum must implement
-    /// `std::fmt::Display`, which supplies the runtime message; each
-    /// variant's doc comment is the documented default message.
-    error
+    /// Declare an error domain from an enum with explicit discriminants (the
+    /// stable error codes). The macro generates `Display` (each variant's
+    /// `#[weaveffi(message = "...")]` template, which may name the
+    /// variant's fields in braces, else the first line of its doc comment)
+    /// and `std::error::Error` (so the enum must derive `Debug`), unless
+    /// written `#[weaveffi::error(no_display)]`. A module may declare
+    /// several.
+    error, "on an item inside a `#[weaveffi::module]`"
 }
 marker_attr! {
     /// Declare an enum exported by value: a `#[repr(i32)]` C-style enum, or a
     /// rich enum whose variants carry named fields.
-    enumeration
+    enumeration, "on an item inside a `#[weaveffi::module]`"
 }
 marker_attr! {
     /// Declare a callback interface: a trait whose `&self` methods the
     /// consumer implements. Producers accept one as `Arc<dyn Trait>` (or
-    /// `Option<Arc<dyn Trait>>`). Every method returns
-    /// `Result<T, weaveffi::ForeignError>`, which carries the consumer's
-    /// failure as a value.
-    callback_interface
-}
-marker_attr! {
-    /// Mark a callback-interface method as able to report the error domain
-    /// in scope: the consumer may fail with one of its codes, which the
-    /// producer decodes with `weaveffi::ForeignError::domain`.
-    throws
+    /// `Option<Arc<dyn Trait>>`). Every method returns `Result<T, E>` with
+    /// `E: From<weaveffi::ForeignError>`; when `E` is a `#[weaveffi::error]`
+    /// domain of the module tree, the method throws that domain and the
+    /// consumer's typed errors arrive as its variants.
+    callback_interface, "on an item inside a `#[weaveffi::module]`"
 }
 marker_attr! {
     /// Mark an `async fn` as cancellable: it takes a `weaveffi::CancelToken`
     /// as its final parameter, and cancelling the token completes the call
     /// with the cancelled code.
-    cancellable
+    cancellable, "on an exported `async fn` inside a `#[weaveffi::module]`"
+}
+marker_attr! {
+    /// Declare a custom type on a type alias,
+    /// `#[weaveffi::custom(repr = R, lift = f, lower = g)] pub type Name = T;`:
+    /// `Name` crosses the ABI as `R` (bindings see `R`), converted with
+    /// `f: fn(R) -> Result<T, E: Display>` on the way in (a failure is a
+    /// marshalling error carrying the message) and `g: fn(&T) -> R` on the
+    /// way out.
+    custom, "on a type alias inside a `#[weaveffi::module]`"
+}
+marker_attr! {
+    /// Leave a `pub fn` of an interface's `impl` block out of the exported
+    /// interface.
+    skip, "on a `pub fn` in the `impl` block of a `#[weaveffi::interface]` inside a `#[weaveffi::module]`"
 }

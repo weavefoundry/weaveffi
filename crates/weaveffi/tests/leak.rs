@@ -76,6 +76,18 @@ pub mod pool {
         slot.n
     }
 
+    /// Squares as a typed array (a returned run).
+    #[weaveffi::export]
+    pub fn squares(xs: &[u32]) -> Vec<u64> {
+        xs.iter().map(|x| u64::from(*x) * u64::from(*x)).collect()
+    }
+
+    /// Fail with an untyped error (its message is a run).
+    #[weaveffi::export]
+    pub fn fail(why: String) -> Result<(), String> {
+        Err(why)
+    }
+
     /// Count up lazily.
     #[weaveffi::export]
     pub fn count(n: i32) -> weaveffi::Iter<i32> {
@@ -149,10 +161,20 @@ fn every_counter_returns_to_zero() {
         let back = pool::leak_pool_release(bytes.as_ptr(), bytes.len(), &mut err);
         assert_eq!(live()[0], 3, "the token was adopted, the return handed out");
 
-        // Allocations: a returned string.
+        // Allocations: a returned string, a typed array, and an error's
+        // message, each a run until it's released.
         let text = pool::leak_pool_describe(back, &mut len, &mut err);
         assert_eq!(live()[4], 1);
         leak_free_bytes(text.cast_mut(), len);
+        let xs = [2u32, 3];
+        let sq = pool::leak_pool_squares(xs.as_ptr(), 2, &mut len, &mut err);
+        assert_eq!((live()[4], len), (1, 2));
+        leak_free_bytes(sq.cast(), len * 8);
+        let why = "no";
+        pool::leak_pool_fail(why.as_ptr(), why.len(), &mut err);
+        assert_eq!((err.code, live()[4]), (abi::GENERIC_ERROR_CODE, 1));
+        abi::error_clear(&mut err);
+        assert_eq!(live()[4], 0);
 
         pool::leak_pool_Slot_destroy(back);
         pool::leak_pool_Slot_destroy(twin);

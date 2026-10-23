@@ -11,7 +11,7 @@
 use std::borrow::Cow;
 use std::io::Write as _;
 
-use anyhow::{bail, Context, Result};
+use miette::{bail, IntoDiagnostic, Result, WrapErr};
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::package::PackagedFile;
@@ -103,11 +103,13 @@ pub fn tar(entries: &[Entry<'_>]) -> Result<Vec<u8>> {
         header.set_entry_type(tar::EntryType::Regular);
         builder
             .append_data(&mut header, &entry.path, entry.data.as_ref())
-            .with_context(|| format!("failed to add {} to a tar archive", entry.path))?;
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to add {} to a tar archive", entry.path))?;
     }
     builder
         .into_inner()
-        .context("failed to finish a tar archive")
+        .into_diagnostic()
+        .wrap_err("failed to finish a tar archive")
 }
 
 /// `bytes` compressed with gzip (with a zeroed header timestamp).
@@ -119,8 +121,14 @@ pub fn gzip(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = flate2::GzBuilder::new()
         .mtime(0)
         .write(Vec::new(), flate2::Compression::default());
-    encoder.write_all(bytes).context("failed to gzip")?;
-    encoder.finish().context("failed to gzip")
+    encoder
+        .write_all(bytes)
+        .into_diagnostic()
+        .wrap_err("failed to gzip")?;
+    encoder
+        .finish()
+        .into_diagnostic()
+        .wrap_err("failed to gzip")
 }
 
 /// A zip archive of `entries`, each deflated, with Unix permissions.
@@ -137,8 +145,12 @@ pub fn zip(entries: &[Entry<'_>]) -> Result<Vec<u8>> {
             flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
         encoder
             .write_all(&entry.data)
-            .context("failed to deflate")?;
-        let compressed = encoder.finish().context("failed to deflate")?;
+            .into_diagnostic()
+            .wrap_err("failed to deflate")?;
+        let compressed = encoder
+            .finish()
+            .into_diagnostic()
+            .wrap_err("failed to deflate")?;
         let crc = crc32fast::hash(&entry.data);
         let (Ok(size), Ok(packed), Ok(offset), Ok(name_len)) = (
             u32::try_from(entry.data.len()),

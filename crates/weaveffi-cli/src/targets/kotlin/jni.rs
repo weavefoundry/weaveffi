@@ -2,29 +2,34 @@
 //! the load-time contract check, callback-interface trampolines and static
 //! vtables, and one `Java_..._JniBridge_*` export per `JniBridge` native.
 //!
-//! Every export receives strings, bytes, and value buffers as a `ByteArray`
-//! it borrows for the call as a `(ptr, len)` pair, and returns them as a
-//! fresh `ByteArray` after freeing the producer's allocation with
-//! `{prefix}_free_bytes`. The C argument list is built by walking the
-//! callable's lowered [`AbiFn`] slots, so it matches the header exactly.
+//! Every export reads each argument's C slots off the model's passing
+//! contracts ([`ArgPass`], [`RetPass`], [`ResultPass`], [`ItemPass`],
+//! [`CallbackRetPass`]), so the C call matches the header exactly. Strings,
+//! bytes, value buffers, and typed arrays arrive as Java arrays and are
+//! copied once (`Get<Kind>ArrayRegion`) into inline or heap storage for the
+//! call; the producer's runs come back as new Java arrays
+//! (`New<Kind>Array`), after which the shim frees them with
+//! `{prefix}_free_bytes`. An optional scalar parameter arrives as its
+//! presence flag and value; an optional scalar result leaves as a box.
 
+use crate::codegen::contract;
 use crate::codegen::CodeWriter;
 use weaveffi_model::abi::{AbiParam, CType};
-use weaveffi_model::contract;
 use weaveffi_model::model::{
-    contract_symbol, AbiFn, CallShape, CallbackInterfaceBinding, CallbackMethodBinding, FnBinding,
-    InterfaceBinding, IteratorBinding, Model,
+    CallShape, CallbackInterfaceBinding, CallbackMethodBinding, FnBinding, InterfaceBinding,
+    IteratorBinding, Model,
 };
-use weaveffi_model::plan::{ArgPass, RetPass};
-use weaveffi_model::ty::{Family, Prim, Ty};
+use weaveffi_model::plan::{ArgPass, CallbackRetPass, ItemPass, ResultPass, RetPass};
 
 use crate::targets::kotlin::bridge::{shim_descriptor, shim_name};
-use crate::targets::kotlin::calls::item_slot;
-use crate::targets::kotlin::names::{jni_c_type, jni_kind, Names};
+use crate::targets::kotlin::carrier::{Carrier, Kind};
+use crate::targets::kotlin::names::Names;
 
-/// The C name of a user parameter inside an export (`p_{name}`), which no
-/// C keyword and no local of the shim can spell.
-fn c_param(name: &str) -> String {
+/// The C name of a user parameter's JNI argument inside an export
+/// (`p_{name}`); its presence flag is `h_{name}`, its copied run
+/// `r_{name}`, and its pinned callback `c_{name}`. The prefixes keep the
+/// four apart and away from every fixed local (`env`, `err`, `rv`, ...).
+fn arg(name: &str) -> String {
     format!("p_{name}")
 }
 
@@ -43,11 +48,6 @@ fn trampoline(n: &Names, cb: &CallbackInterfaceBinding, method: &str) -> String 
     format!("Jni_{}_{method}", n.native(&cb.c_tag))
 }
 
-/// The expected contract table of the top-level module `root`.
-fn contract_var(root: &str) -> String {
-    format!("Jni_contract_{root}")
-}
-
 /// The pointee of a pointer slot (an iterator's `out_item`).
 fn pointee(t: &CType) -> &CType {
     match t {
@@ -56,92 +56,163 @@ fn pointee(t: &CType) -> &CType {
     }
 }
 
-/// One export under construction: its JNI parameters, the statements before
-/// and after the C call, and the C call's arguments in slot order.
-struct Export {
-    params: Vec<String>,
-    before: Vec<String>,
-    after: Vec<String>,
-    args: Vec<String>,
+/// The C expression of a C scalar `v` as the JNI value of `kind`.
+fn to_jni(kind: Kind, v: &str) -> String {
+    if kind == Kind::Boolean {
+        format!("{v} ? JNI_TRUE : JNI_FALSE")
+    } else {
+        format!("({}){v}", kind.jni())
+    }
 }
 
-/// Lower `f`'s receiver and parameters onto the slots of `abi`, then the
-/// trailing slots (`out_len`, `out_err`, `cancel_token`, `callback`,
-/// `context`) by name.
-fn lower_export(n: &Names, model: &Model, f: &FnBinding, abi: &AbiFn, done: &str) -> Export {
+/// The C expression boxing the C scalar `v` of `kind`.
+fn boxed(kind: Kind, v: &str) -> String {
+    format!(
+        "Jni_box(env, {}, (jvalue){{.{} = {}}})",
+        kind.c_const(),
+        kind.jvalue(),
+        to_jni(kind, v)
+    )
+}
+
+/// The C expression of the JNI value `v` of `kind` as the C type `ty`.
+fn from_jni(kind: Kind, ty: &str, v: &str) -> String {
+    if kind == Kind::Boolean {
+        format!("{v} == JNI_TRUE")
+    } else {
+        format!("({ty}){v}")
+    }
+}
+
+/// One step before a native call that can fail on the JVM side: its
+/// statements, the condition under which it failed (with an exception
+/// pending), and how to undo it if a later step fails.
+struct Step {
+    lines: Vec<String>,
+    failed: String,
+    undo: String,
+}
+
+/// One export under construction: its JNI parameters (after `env` and
+/// `cls`), the fallible steps, the C call's arguments in slot order, and
+/// the releases after the call.
+#[derive(Default)]
+struct Export {
+    params: Vec<String>,
+    steps: Vec<Step>,
+    args: Vec<String>,
+    after: Vec<String>,
+}
+
+impl Export {
+    /// Emit the steps, each failure undoing the earlier ones and returning
+    /// `fail` (` 0`, ` NULL`, or empty for void).
+    fn emit_steps(&self, w: &mut CodeWriter, fail: &str) {
+        for (i, step) in self.steps.iter().enumerate() {
+            for l in &step.lines {
+                w.line(l);
+            }
+            w.line(format!("if ({}) {{", step.failed));
+            w.scope(|w| {
+                for earlier in self.steps[..i].iter().rev() {
+                    w.line(&earlier.undo);
+                }
+                w.line(format!("return{fail};"));
+            });
+            w.line("}");
+        }
+    }
+}
+
+/// Lower `f`'s receiver and parameters onto their C slots, borrowing every
+/// array argument and pinning every callback implementation.
+fn lower_export(n: &Names, model: &Model, f: &FnBinding) -> Export {
     let p = &n.prefix;
-    let mut e = Export {
-        params: Vec::new(),
-        before: Vec::new(),
-        after: Vec::new(),
-        args: Vec::new(),
-    };
-    let mut slots = abi.params.iter();
-    if f.has_self {
-        let slot = slots.next().expect("a method has a receiver slot");
+    let mut e = Export::default();
+    if let Some(slot) = &f.receiver {
         e.params.push("jlong self".into());
         e.args
             .push(format!("({})(intptr_t)self", slot.ty.render_c(p)));
     }
     for param in &f.params {
-        for _ in &param.abi {
-            slots.next();
-        }
-        let name = c_param(&param.name);
-        e.params.push(format!("{} {name}", jni_c_type(&param.ty)));
-        match param.arg_pass() {
-            ArgPass::Direct { slot } => e.args.push(if matches!(param.ty, Ty::Prim(Prim::Bool)) {
-                format!("{name} == JNI_TRUE")
-            } else {
-                format!("({}){name}", slot.ty.render_c(p))
-            }),
-            ArgPass::String { .. } | ArgPass::Bytes { .. } | ArgPass::Buffer { .. } => {
-                e.before.push(format!(
-                    "Jni_bytes {name}_b = Jni_borrow_bytes(env, {name});"
-                ));
-                e.after.push(format!("Jni_release_bytes(env, &{name}_b);"));
-                e.args.push(format!("{name}_b.ptr"));
-                e.args.push(format!("{name}_b.len"));
+        let name = arg(&param.name);
+        let carrier = Carrier::of_arg(&param.pass);
+        match (&param.pass, carrier) {
+            (ArgPass::Direct { slot }, Some(Carrier::Prim(k))) => {
+                e.params.push(format!("{} {name}", k.jni()));
+                e.args.push(from_jni(k, &slot.ty.render_c(p), &name));
             }
-            ArgPass::Object { slot, .. } => {
+            (ArgPass::OptDirect { value, .. }, Some(Carrier::Split(k))) => {
+                let has = format!("h_{}", param.name);
+                e.params.push(format!("jboolean {has}"));
+                e.params.push(format!("{} {name}", k.jni()));
+                e.args.push(format!("{has} == JNI_TRUE"));
+                e.args.push(from_jni(k, &value.ty.render_c(p), &name));
+            }
+            (
+                ArgPass::Slice { ptr, .. }
+                | ArgPass::String { ptr, .. }
+                | ArgPass::Bytes { ptr, .. }
+                | ArgPass::Buffer { ptr, .. },
+                Some(c),
+            ) => {
+                let kind = c.run_kind().expect("runs have an element kind");
+                let run = format!("r_{}", param.name);
+                e.params.push(format!("{} {name}", c.jni()));
+                e.steps.push(Step {
+                    lines: vec![format!("Jni_run {run};")],
+                    failed: format!(
+                        "!Jni_borrow(env, {name}, {}, &{run})",
+                        Carrier::Array(kind).c_kind()
+                    ),
+                    undo: format!("Jni_unborrow(&{run});"),
+                });
+                e.args.push(format!("({}){run}.ptr", ptr.ty.render_c(p)));
+                e.args.push(format!("{run}.len"));
+                e.after.push(format!("Jni_unborrow(&{run});"));
+            }
+            (ArgPass::Object { slot, .. }, _) => {
+                e.params.push(format!("jlong {name}"));
                 e.args
                     .push(format!("({})(intptr_t){name}", slot.ty.render_c(p)));
             }
-            ArgPass::Callback { nullable, .. } => {
-                let cb = model.callback_interface(
-                    param
-                        .ty
-                        .callback_interface_name()
-                        .expect("callback slots name a callback interface"),
-                );
-                // The producer owns this global reference from here on and
-                // drops it through the vtable's `free`.
-                let ctx = format!("(void*)(*env)->NewGlobalRef(env, {name})");
+            (
+                ArgPass::Callback {
+                    nullable,
+                    interface,
+                    ..
+                },
+                _,
+            ) => {
+                let cb = model.callback_interface(interface);
+                let ctx = format!("c_{}", param.name);
+                e.params.push(format!("jobject {name}"));
+                // The producer owns this global reference from the call on
+                // and drops it through the vtable's `free`.
+                e.steps.push(Step {
+                    lines: vec![format!("void* {ctx} = Jni_pin(env, {name});")],
+                    failed: format!("{name} != NULL && {ctx} == NULL"),
+                    undo: format!("Jni_unpin(env, {ctx});"),
+                });
+                e.args.push(ctx);
                 let vtable = format!("&{}", vtable_var(n, cb));
-                if nullable {
-                    e.args.push(format!("{name} != NULL ? {ctx} : NULL"));
-                    e.args.push(format!("{name} != NULL ? {vtable} : NULL"));
+                e.args.push(if *nullable {
+                    format!("{name} != NULL ? {vtable} : NULL")
                 } else {
-                    e.args.push(ctx);
-                    e.args.push(vtable);
-                }
+                    vtable
+                });
             }
+            (pass, c) => unreachable!("no JNI form for {pass:?} as {c:?}"),
         }
     }
-    for slot in slots {
-        e.args.push(match slot.name.as_str() {
-            "out_len" => "&out_len".into(),
-            "out_err" => "&err".into(),
-            "cancel_token" => {
-                e.params.push("jlong cancel_token".into());
-                format!("({p}_cancel_token*)(intptr_t)cancel_token")
-            }
-            "callback" => done.to_string(),
-            "context" => "context".into(),
-            other => unreachable!("unexpected trailing slot '{other}'"),
-        });
-    }
     e
+}
+
+impl Carrier {
+    /// The shim's `Jni_kind` constant of an array or byte-array carrier.
+    fn c_kind(self) -> String {
+        self.run_kind().unwrap_or(Kind::Byte).c_const()
+    }
 }
 
 /// Emit `JNIEXPORT {ret} JNICALL {export}(...) {` with the shared leading
@@ -156,7 +227,7 @@ fn open_export(w: &mut CodeWriter, n: &Names, ret: &str, native: &str, params: &
     ));
 }
 
-/// The error check after a sync call: throw through `domain` and return.
+/// The error check after a call: throw through `domain` and return.
 fn error_check(w: &mut CodeWriter, domain: u32, fail: &str) {
     w.line("if (err.code != 0) {");
     w.line(format!("    Jni_throw(env, &err, {domain});"));
@@ -164,78 +235,116 @@ fn error_check(w: &mut CodeWriter, domain: u32, fail: &str) {
     w.line("}");
 }
 
-/// The JNI value of a direct C value `v` of `t`.
-fn direct_to_jni(t: &Ty, v: &str) -> String {
-    if matches!(t, Ty::Prim(Prim::Bool)) {
-        format!("{v} ? JNI_TRUE : JNI_FALSE")
-    } else {
-        format!("({}){v}", jni_c_type(t))
-    }
+/// The zero-initialized error every export passes as `out_err`.
+fn err_decl(p: &str) -> String {
+    format!("{p}_error err = {{0, NULL, 0, NULL, 0}};")
 }
 
-/// A synchronous callable (or an iterator launcher).
-fn render_sync(
-    w: &mut CodeWriter,
-    n: &Names,
-    model: &Model,
-    f: &FnBinding,
-    abi: &AbiFn,
-    domain: u32,
-) {
+/// A synchronous callable or an iterator launcher.
+fn render_sync(w: &mut CodeWriter, n: &Names, model: &Model, f: &FnBinding) {
     let p = &n.prefix;
-    let native = n.native(&abi.symbol);
-    let e = lower_export(n, model, f, abi, "");
-    let is_iter = matches!(f.shape, CallShape::Iterator(_));
-    let ret = if is_iter {
-        RetPass::Object { nullable: false }
-    } else {
-        RetPass::of(f.ret.as_ref())
+    let native = n.native(&f.abi.symbol);
+    let e = lower_export(n, model, f);
+    let value = f.ret.as_ref().and_then(|r| r.value());
+    let carrier = Carrier::of_ret(&f.ret_pass, value);
+    let (jret, fail) = match carrier {
+        None => ("void".to_string(), ""),
+        Some(c @ (Carrier::Prim(_) | Carrier::Handle)) => (c.jni(), " 0"),
+        Some(c) => (c.jni(), " NULL"),
     };
-    let (jret, fail) = match &ret {
-        RetPass::Void => ("void", ""),
-        RetPass::String | RetPass::Bytes | RetPass::Buffer => ("jbyteArray", " NULL"),
-        RetPass::Object { .. } => ("jlong", " 0"),
-        RetPass::Direct => (
-            jni_c_type(f.ret.as_ref().expect("direct returns have a type")),
-            " 0",
-        ),
-    };
-    open_export(w, n, jret, &native, &e.params);
+    open_export(w, n, &jret, &native, &e.params);
     w.scope(|w| {
-        w.line(format!("{p}_error err = {{0, NULL, NULL, 0}};"));
-        w.line("(void)cls;");
-        for s in &e.before {
-            w.line(s);
-        }
-        let call = format!("{}({})", abi.symbol, e.args.join(", "));
-        match &ret {
-            RetPass::Void => w.line(format!("{call};")),
-            RetPass::String | RetPass::Bytes | RetPass::Buffer => {
-                w.line("size_t out_len = 0;");
-                w.line(format!("{} rv = {call};", abi.ret.render_c(p)))
+        w.line(err_decl(p));
+        // The return's out slots, then `out_err`.
+        let mut args = e.args.clone();
+        match &f.ret_pass {
+            RetPass::OptDirect { out_value } => {
+                w.line(format!(
+                    "{} {} = 0;",
+                    pointee(&out_value.ty).render_c(p),
+                    out_value.name
+                ));
+                args.push(format!("&{}", out_value.name));
             }
-            _ => w.line(format!("{} rv = {call};", abi.ret.render_c(p))),
-        };
+            RetPass::Slice { out_len, .. }
+            | RetPass::String { out_len }
+            | RetPass::Bytes { out_len }
+            | RetPass::Buffer { out_len } => {
+                w.line(format!("size_t {} = 0;", out_len.name));
+                args.push(format!("&{}", out_len.name));
+            }
+            _ => {}
+        }
+        args.push("&err".into());
+        w.line("(void)cls;");
+        e.emit_steps(w, fail);
+        let call = format!("{}({})", f.abi.symbol, args.join(", "));
+        if carrier.is_none() {
+            w.line(format!("{call};"));
+        } else {
+            w.line(format!("{} rv = {call};", f.abi.ret.render_c(p)));
+        }
         for s in &e.after {
             w.line(s);
         }
-        error_check(w, domain, fail);
-        match &ret {
-            RetPass::Void => {}
-            RetPass::Object { .. } => {
+        error_check(w, n.domain_index(&f.error), fail);
+        match (&f.ret_pass, carrier) {
+            (_, None) => {}
+            (RetPass::OptDirect { out_value }, Some(Carrier::Boxed(k))) => {
+                w.line(format!("return rv ? {} : NULL;", boxed(k, &out_value.name)));
+            }
+            (
+                RetPass::Slice { out_len, .. }
+                | RetPass::String { out_len }
+                | RetPass::Bytes { out_len }
+                | RetPass::Buffer { out_len },
+                Some(c),
+            ) => {
+                w.line(format!(
+                    "return ({})Jni_take_array(env, {}, rv, {});",
+                    c.jni(),
+                    c.c_kind(),
+                    out_len.name
+                ));
+            }
+            (_, Some(Carrier::Handle)) => {
                 w.line("return (jlong)(intptr_t)rv;");
             }
-            RetPass::String | RetPass::Bytes | RetPass::Buffer => {
-                w.line("return Jni_take_bytes(env, rv, out_len);");
+            (_, Some(Carrier::Prim(k))) => {
+                w.line(format!("return {};", to_jni(k, "rv")));
             }
-            RetPass::Direct => {
-                let t = f.ret.as_ref().expect("direct returns have a type");
-                w.line(format!("return {};", direct_to_jni(t, "rv")));
-            }
-        };
+            (pass, c) => unreachable!("no JNI return for {pass:?} as {c:?}"),
+        }
     });
     w.line("}");
     w.blank();
+}
+
+/// The C expression making the `Any?` Kotlin receives for an async result.
+fn result_value(pass: &ResultPass, c: Option<Carrier>) -> String {
+    match (pass, c) {
+        (ResultPass::Void, _) | (_, None) => "NULL".to_string(),
+        (ResultPass::Direct { result }, Some(Carrier::Prim(k))) => boxed(k, &result.name),
+        (ResultPass::OptDirect { has, value }, Some(Carrier::Boxed(k))) => {
+            format!("{} ? {} : NULL", has.name, boxed(k, &value.name))
+        }
+        (
+            ResultPass::Slice { ptr, len, .. }
+            | ResultPass::String { ptr, len }
+            | ResultPass::Bytes { ptr, len }
+            | ResultPass::Buffer { ptr, len },
+            Some(c),
+        ) => format!(
+            "Jni_take_array(env, {}, {}, {})",
+            c.c_kind(),
+            ptr.name,
+            len.name
+        ),
+        (ResultPass::Object { result, .. }, _) => {
+            boxed(Kind::Long, &format!("(intptr_t){}", result.name))
+        }
+        (pass, c) => unreachable!("no async result for {pass:?} as {c:?}"),
+    }
 }
 
 /// An async callable: its completion trampoline, then the launcher export.
@@ -244,55 +353,49 @@ fn render_async(w: &mut CodeWriter, n: &Names, model: &Model, f: &FnBinding) {
         unreachable!("render_async needs an async call shape");
     };
     let p = &n.prefix;
-    let native = n.native(&ab.launch.symbol);
+    let native = n.native(&f.abi.symbol);
     let done = format!("Jni_done_{native}");
-    let result_slots: Vec<&AbiParam> = ab.callback_params.iter().skip(2).collect();
-    let decls: String = result_slots
+    let decls: Vec<String> = ab
+        .callback_params
         .iter()
-        .map(|s| format!(", {} {}", s.ty.render_c(p), s.name))
+        .map(|s| format!("{} {}", s.ty.render_c(p), s.name))
         .collect();
-    w.line(format!(
-        "static void {done}(void* context, {p}_error* err{decls}) {{"
-    ));
+    w.line(format!("static void {done}({}) {{", decls.join(", ")));
     w.scope(|w| {
         w.line("int detach = 0;");
         w.line("JNIEnv* env = Jni_complete_begin(context, err, &detach);");
         w.line("if (env == NULL) {");
         w.line("    return;");
         w.line("}");
-        let deliver = match RetPass::of(f.ret.as_ref()) {
-            RetPass::Void => "Jni_on_unit".to_string(),
-            RetPass::String | RetPass::Bytes | RetPass::Buffer => {
-                "Jni_on_bytes, Jni_take_bytes(env, result_ptr, result_len)".to_string()
-            }
-            RetPass::Object { .. } => "Jni_on_long, (jlong)(intptr_t)result".to_string(),
-            RetPass::Direct => {
-                let t = f.ret.as_ref().expect("direct results have a type");
-                format!(
-                    "Jni_on_{}, {}",
-                    jni_kind(t).to_lowercase(),
-                    direct_to_jni(t, "result")
-                )
-            }
-        };
+        let value = f.ret.as_ref().and_then(|r| r.value());
+        let c = Carrier::of_result(&ab.result, value);
         w.line(format!(
-            "(*env)->CallVoidMethod(env, (jobject)context, {deliver});"
+            "Jni_complete(env, context, detach, {});",
+            result_value(&ab.result, c)
         ));
-        w.line("Jni_complete_end(env, context, detach);");
     });
     w.line("}");
     w.blank();
 
-    let mut e = lower_export(n, model, f, &ab.launch, &done);
+    let mut e = lower_export(n, model, f);
+    let mut args = e.args.clone();
+    if let Some(token) = &ab.cancel_token {
+        e.params.push("jlong cancel_token".into());
+        args.push(format!("({})(intptr_t)cancel_token", token.ty.render_c(p)));
+    }
+    args.push(done);
+    args.push("context".into());
     e.params.push("jobject completion".into());
+    e.steps.push(Step {
+        lines: vec!["void* context = Jni_pin(env, completion);".into()],
+        failed: "context == NULL".into(),
+        undo: String::new(),
+    });
     open_export(w, n, "void", &native, &e.params);
     w.scope(|w| {
-        w.line("void* context = (void*)(*env)->NewGlobalRef(env, completion);");
         w.line("(void)cls;");
-        for s in &e.before {
-            w.line(s);
-        }
-        w.line(format!("{}({});", ab.launch.symbol, e.args.join(", ")));
+        e.emit_steps(w, "");
+        w.line(format!("{}({});", f.abi.symbol, args.join(", ")));
         for s in &e.after {
             w.line(s);
         }
@@ -301,64 +404,75 @@ fn render_async(w: &mut CodeWriter, n: &Names, model: &Model, f: &FnBinding) {
     w.blank();
 }
 
-/// An iterator's `_next` and `_destroy` exports.
-fn render_iterator_natives(w: &mut CodeWriter, n: &Names, it: &IteratorBinding, domain: u32) {
+/// An iterator's `_next` and `_destroy` exports. `_next` hands the item to
+/// Kotlin through a one-element `Array<Any?>` and returns whether there was
+/// one.
+fn render_iterator_natives(w: &mut CodeWriter, n: &Names, f: &FnBinding, it: &IteratorBinding) {
     let p = &n.prefix;
     let tag = &it.iter_tag;
-    let item_ty = pointee(&it.next.params[1].ty).render_c(p);
     let next = n.native(&it.next.symbol);
-    match item_slot(&it.elem) {
-        None => {
-            open_export(w, n, "jbyteArray", &next, &["jlong iter".to_string()]);
-            w.scope(|w| {
-                w.line(format!("{p}_error err = {{0, NULL, NULL, 0}};"));
-                w.line(format!("{item_ty} item = NULL;"));
-                w.line("size_t out_len = 0;");
-                w.line("(void)cls;");
-                w.line(format!(
-                    "int32_t has = {}(({tag}*)(intptr_t)iter, &item, &out_len, &err);",
-                    it.next.symbol
-                ));
-                error_check(w, domain, " NULL");
-                w.line("if (has == 0) {");
-                w.line("    return NULL;");
-                w.line("}");
-                w.line("return Jni_take_bytes(env, item, out_len);");
-            });
+    let local = |slot: &AbiParam, init: &str| {
+        format!("{} {} = {init};", pointee(&slot.ty).render_c(p), slot.name)
+    };
+    let c = Carrier::of_item(&it.item, &it.elem);
+    let (decls, value) = match (&it.item, c) {
+        (ItemPass::Direct { out_item }, Carrier::Prim(k)) => {
+            (vec![local(out_item, "0")], boxed(k, &out_item.name))
         }
-        Some(slot) => {
-            open_export(
-                w,
-                n,
-                "jboolean",
-                &next,
-                &["jlong iter".to_string(), format!("{} out", slot.jni_array)],
-            );
-            w.scope(|w| {
-                w.line(format!("{p}_error err = {{0, NULL, NULL, 0}};"));
-                w.line(format!("{item_ty} item = ({item_ty})0;"));
-                w.line("(void)cls;");
-                w.line(format!(
-                    "int32_t has = {}(({tag}*)(intptr_t)iter, &item, &err);",
-                    it.next.symbol
-                ));
-                error_check(w, domain, " JNI_FALSE");
-                w.line("if (has == 0) {");
-                w.line("    return JNI_FALSE;");
-                w.line("}");
-                let value = match it.elem.family() {
-                    Family::Object { .. } => "(jlong)(intptr_t)item".to_string(),
-                    _ => direct_to_jni(&it.elem, "item"),
-                };
-                w.line(format!("{} value = {value};", slot.jni_elem));
-                w.line(format!(
-                    "(*env)->Set{}ArrayRegion(env, out, 0, 1, &value);",
-                    slot.region
-                ));
-                w.line("return JNI_TRUE;");
-            });
+        (ItemPass::OptDirect { out_has, out_item }, Carrier::Boxed(k)) => (
+            vec![local(out_has, "false"), local(out_item, "0")],
+            format!("{} ? {} : NULL", out_has.name, boxed(k, &out_item.name)),
+        ),
+        (
+            ItemPass::Slice {
+                out_item, out_len, ..
+            }
+            | ItemPass::String { out_item, out_len }
+            | ItemPass::Bytes { out_item, out_len }
+            | ItemPass::Buffer { out_item, out_len },
+            c,
+        ) => (
+            vec![local(out_item, "NULL"), local(out_len, "0")],
+            format!(
+                "Jni_take_array(env, {}, {}, {})",
+                c.c_kind(),
+                out_item.name,
+                out_len.name
+            ),
+        ),
+        (ItemPass::Object { out_item, .. }, _) => (
+            vec![local(out_item, "NULL")],
+            boxed(Kind::Long, &format!("(intptr_t){}", out_item.name)),
+        ),
+        (item, c) => unreachable!("no iterator item for {item:?} as {c:?}"),
+    };
+    let mut args = vec![format!("({tag}*)(intptr_t)iter")];
+    args.extend(it.item.slots().iter().map(|s| format!("&{}", s.name)));
+    args.push("&err".into());
+    open_export(
+        w,
+        n,
+        "jboolean",
+        &next,
+        &["jlong iter".to_string(), "jobjectArray out".to_string()],
+    );
+    w.scope(|w| {
+        w.line(err_decl(p));
+        for d in &decls {
+            w.line(d);
         }
-    }
+        w.line("(void)cls;");
+        w.line(format!(
+            "int32_t has = {}({});",
+            it.next.symbol,
+            args.join(", ")
+        ));
+        error_check(w, n.domain_index(&f.error), " JNI_FALSE");
+        w.line("if (has == 0) {");
+        w.line("    return JNI_FALSE;");
+        w.line("}");
+        w.line(format!("return Jni_yield(env, out, {value});"));
+    });
     w.line("}");
     w.blank();
     open_export(
@@ -424,28 +538,40 @@ fn render_trampoline(
     m: &CallbackMethodBinding,
 ) {
     let p = &n.prefix;
-    // `ctx` first and `out_err` last; the parameters' slots, then the
-    // return's out slots, in between.
-    let inner = &m.abi_params[1..m.abi_params.len() - 1];
-    let param_slots: usize = m.params.iter().map(|x| x.abi.len()).sum();
-    let (params, outs) = inner.split_at(param_slots);
+    // `ctx`, the parameters' slots (as `p_{slot}`), the return's out slots,
+    // then `out_err`.
     let mut decls = vec!["void* ctx".to_string()];
-    decls.extend(
-        params
-            .iter()
-            .map(|s| format!("{} {}", s.ty.render_c(p), c_param(&s.name))),
-    );
-    decls.extend(
-        outs.iter()
-            .map(|s| format!("{} {}", s.ty.render_c(p), s.name)),
-    );
+    for param in &m.params {
+        for s in param.pass.slots() {
+            decls.push(format!("{} {}", s.ty.render_c(p), arg(&s.name)));
+        }
+    }
+    for s in m.ret_pass.out_slots() {
+        decls.push(format!("{} {}", s.ty.render_c(p), s.name));
+    }
     decls.push(format!("{p}_error* out_err"));
-    let ret_c = m.abi_ret.render_c(p);
-    let ret = RetPass::of(m.ret.as_ref());
-    let fail = match ret {
-        RetPass::Direct | RetPass::Object { .. } => format!(" ({ret_c})0"),
-        _ => String::new(),
+    let ret_c = m.abi.ret.render_c(p);
+    let fail = if matches!(m.abi.ret, CType::Void) {
+        String::new()
+    } else {
+        format!(" ({ret_c})0")
     };
+    // The object arguments are the trampoline's to release when the call
+    // can't reach the implementation.
+    let adopted: Vec<String> = m
+        .params
+        .iter()
+        .filter_map(|param| match &param.pass {
+            ArgPass::Object {
+                slot, interface, ..
+            } => Some(format!(
+                "if ({0} != NULL) {{ {1}({0}); }}",
+                arg(&slot.name),
+                model.interface(interface).destroy_symbol
+            )),
+            _ => None,
+        })
+        .collect();
     w.line(format!(
         "static {ret_c} {}({}) {{",
         trampoline(n, cb, &m.name),
@@ -456,18 +582,8 @@ fn render_trampoline(
         w.line("JNIEnv* env = Jni_callback_begin(out_err, &detach);");
         w.line("if (env == NULL) {");
         w.scope(|w| {
-            // The object arguments are ours to release when the call can't
-            // reach the implementation.
-            let mut slots = params.iter();
-            for param in &m.params {
-                let own: Vec<&AbiParam> = param.abi.iter().filter_map(|_| slots.next()).collect();
-                if let Some(name) = param.ty.interface_name() {
-                    w.line(format!(
-                        "{}({});",
-                        model.interface(name).destroy_symbol,
-                        c_param(&own[0].name)
-                    ));
-                }
+            for a in &adopted {
+                w.line(a);
             }
             w.line(format!("return{fail};"));
         });
@@ -476,57 +592,114 @@ fn render_trampoline(
             "(jobject)ctx".to_string(),
             "(jlong)(intptr_t)out_err".to_string(),
         ];
-        let mut slots = params.iter();
+        let mut arrays = false;
         for param in &m.params {
-            let own: Vec<&AbiParam> = param.abi.iter().filter_map(|_| slots.next()).collect();
-            args.push(match param.ty.family() {
-                Family::String | Family::Bytes | Family::Buffer => format!(
-                    "Jni_new_bytes(env, {}, {})",
-                    c_param(&own[0].name),
-                    c_param(&own[1].name)
-                ),
-                Family::Object { .. } => format!("(jlong)(intptr_t){}", c_param(&own[0].name)),
-                _ => direct_to_jni(&param.ty, &c_param(&own[0].name)),
-            });
+            match (&param.pass, Carrier::of_arg(&param.pass)) {
+                (ArgPass::Direct { slot }, Some(Carrier::Prim(k))) => {
+                    args.push(to_jni(k, &arg(&slot.name)));
+                }
+                (ArgPass::OptDirect { has, value, .. }, Some(Carrier::Split(k))) => {
+                    args.push(to_jni(Kind::Boolean, &arg(&has.name)));
+                    args.push(to_jni(k, &arg(&value.name)));
+                }
+                (
+                    ArgPass::Slice { ptr, len, .. }
+                    | ArgPass::String { ptr, len }
+                    | ArgPass::Bytes { ptr, len }
+                    | ArgPass::Buffer { ptr, len },
+                    Some(c),
+                ) => {
+                    let local = format!("a_{}", param.name);
+                    w.line(format!(
+                        "jarray {local} = Jni_new_array(env, {}, {}, {});",
+                        c.c_kind(),
+                        arg(&ptr.name),
+                        arg(&len.name)
+                    ));
+                    arrays = true;
+                    args.push(local);
+                }
+                (ArgPass::Object { slot, .. }, _) => {
+                    args.push(format!("(jlong)(intptr_t){}", arg(&slot.name)));
+                }
+                (pass, c) => unreachable!("no callback argument for {pass:?} as {c:?}"),
+            }
         }
-        let kind = match (&ret, m.ret.as_ref()) {
-            (RetPass::Void, _) => "Void",
-            (RetPass::String | RetPass::Bytes | RetPass::Buffer, _) => "Object",
-            (RetPass::Object { .. }, _) => "Long",
-            (RetPass::Direct, Some(t)) => jni_kind(t),
-            (RetPass::Direct, None) => unreachable!("direct returns have a type"),
-        };
+        if arrays {
+            // An argument the JVM couldn't make: the call never happens.
+            w.line("if ((*env)->ExceptionCheck(env)) {");
+            w.scope(|w| {
+                for a in &adopted {
+                    w.line(a);
+                }
+                w.line("Jni_callback_end(env, out_err, detach);");
+                w.line(format!("return{fail};"));
+            });
+            w.line("}");
+        }
+        let ret = Carrier::of_callback_ret(&m.ret_pass, m.ret.as_ref());
+        let stem = ret.map_or("Void", Carrier::call_stem);
         let call = format!(
-            "(*env)->CallStatic{kind}Method(env, Jni_bridge, {}, {})",
+            "(*env)->CallStatic{stem}Method(env, Jni_bridge, {}, {})",
             shim_mid(n, cb, &m.name),
             args.join(", ")
         );
-        match (&ret, m.ret.as_ref()) {
-            (RetPass::Void, _) => {
+        match (&m.ret_pass, ret) {
+            (CallbackRetPass::Void, _) | (_, None) => {
                 w.line(format!("{call};"));
                 w.line("Jni_callback_end(env, out_err, detach);");
             }
-            (RetPass::String | RetPass::Bytes | RetPass::Buffer, _) => {
-                w.line(format!("jbyteArray rv = (jbyteArray){call};"));
-                w.line("Jni_callback_return_bytes(env, rv, out_ptr, out_len, out_err);");
+            (CallbackRetPass::Direct, Some(Carrier::Prim(k))) => {
+                // A failure leaves the zero value the shim (or JNI) returned.
+                w.line(format!("{} rv = {call};", k.jni()));
+                w.line("Jni_callback_end(env, out_err, detach);");
+                w.line(format!("return {};", from_jni(k, &ret_c, "rv")));
+            }
+            (CallbackRetPass::OptDirect { out_value }, Some(Carrier::Boxed(k))) => {
+                w.line("jvalue value = {0};");
+                w.line(format!(
+                    "bool present = Jni_callback_opt(env, {}, {call}, &value);",
+                    k.c_const()
+                ));
+                w.line("if (present) {");
+                w.line(format!(
+                    "    *{} = {};",
+                    out_value.name,
+                    from_jni(
+                        k,
+                        &pointee(&out_value.ty).render_c(p),
+                        &format!("value.{}", k.jvalue())
+                    )
+                ));
+                w.line("}");
+                w.line("Jni_callback_end(env, out_err, detach);");
+                w.line("return present;");
+            }
+            (
+                CallbackRetPass::Slice {
+                    out_ptr, out_len, ..
+                }
+                | CallbackRetPass::String { out_ptr, out_len }
+                | CallbackRetPass::Bytes { out_ptr, out_len }
+                | CallbackRetPass::Buffer { out_ptr, out_len },
+                Some(c),
+            ) => {
+                w.line(format!("jarray rv = (jarray){call};"));
+                w.line(format!(
+                    "*{} = ({})Jni_callback_run(env, {}, rv, {}, out_err);",
+                    out_ptr.name,
+                    pointee(&out_ptr.ty).render_c(p),
+                    c.c_kind(),
+                    out_len.name
+                ));
                 w.line("Jni_callback_end(env, out_err, detach);");
             }
-            (RetPass::Object { .. }, _) => {
+            (CallbackRetPass::Object { .. }, Some(Carrier::Handle)) => {
                 w.line(format!("jlong rv = {call};"));
                 w.line("Jni_callback_end(env, out_err, detach);");
                 w.line(format!("return ({ret_c})(intptr_t)rv;"));
             }
-            (RetPass::Direct, Some(t)) => {
-                // A failure leaves the zero value the shim (or JNI) returned.
-                w.line(format!("{} rv = {call};", jni_c_type(t)));
-                w.line("Jni_callback_end(env, out_err, detach);");
-                if matches!(t, Ty::Prim(Prim::Bool)) {
-                    w.line("return rv == JNI_TRUE;");
-                } else {
-                    w.line(format!("return ({ret_c})rv;"));
-                }
-            }
-            (RetPass::Direct, None) => unreachable!("direct returns have a type"),
+            (pass, c) => unreachable!("no callback return for {pass:?} as {c:?}"),
         }
     });
     w.line("}");
@@ -569,42 +742,46 @@ fn render_callback_interface(
 
 /// The contract tables these bindings were generated with (one per
 /// top-level module that declares anything), then `Jni_load`: the contract
-/// checks and the method IDs the generated code caches.
+/// checks and the classes and method IDs the shim caches.
 fn render_load(w: &mut CodeWriter, n: &Names, model: &Model) {
-    let mut checked = Vec::new();
-    for root in model.roots() {
-        let entries = contract::entries(model, root);
-        if entries.is_empty() {
-            continue;
-        }
+    let tables: Vec<_> = contract::tables(model)
+        .into_iter()
+        .filter(|t| !t.rows.is_empty())
+        .collect();
+    let var = |root: &str| format!("Jni_contract_{root}");
+    for table in &tables {
         w.line(format!(
             "static const Jni_contract_entry {}[] = {{",
-            contract_var(&root.name)
+            var(&table.root.name)
         ));
         w.scope(|w| {
-            for e in &entries {
+            for row in &table.rows {
                 w.line(format!(
-                    "{{UINT64_C(0x{:016x}), UINT64_C(0x{:016x}), \"{}\"}},",
-                    e.id, e.hash, e.path
+                    "{{UINT64_C({}), UINT64_C({}), \"{}\"}}, /* {} */",
+                    contract::hex(row.id),
+                    contract::hex(row.hash),
+                    row.path,
+                    row.signature
                 ));
             }
         });
         w.line("};");
         w.blank();
-        checked.push(root);
     }
     w.line("static jint Jni_load(JNIEnv* env) {");
     w.scope(|w| {
-        w.line("(void)env;");
-        for root in checked {
-            let var = contract_var(&root.name);
+        for table in &tables {
+            let v = var(&table.root.name);
             w.line(format!(
-                "if (Jni_check_contract(env, {}, {var}, sizeof {var} / sizeof {var}[0]) != JNI_OK) {{",
-                contract_symbol(&n.prefix, &root.name)
+                "if (Jni_check_contract(env, {}, {v}, sizeof {v} / sizeof {v}[0]) != JNI_OK) {{",
+                table.symbol
             ));
             w.line("    return JNI_ERR;");
             w.line("}");
         }
+        w.line("if (Jni_load_boxes(env) != JNI_OK) {");
+        w.line("    return JNI_ERR;");
+        w.line("}");
         if model.has_async() {
             w.line("if (Jni_load_async(env) != JNI_OK) {");
             w.line("    return JNI_ERR;");
@@ -642,14 +819,13 @@ pub(crate) fn render_exports(n: &Names, model: &Model) -> String {
             render_interface_natives(&mut w, n, i);
         }
         for f in m.callables() {
-            let domain = n.domain(f, model.error_domain(m));
-            match &f.shape {
-                CallShape::Sync(abi) => render_sync(&mut w, n, model, f, abi, domain),
-                CallShape::Iterator(it) => {
-                    render_sync(&mut w, n, model, f, &it.launch, domain);
-                    render_iterator_natives(&mut w, n, it, domain);
+            match (&f.shape, &f.ret_pass) {
+                (CallShape::Async(_), _) => render_async(&mut w, n, model, f),
+                (CallShape::Sync, RetPass::Iterator(it)) => {
+                    render_sync(&mut w, n, model, f);
+                    render_iterator_natives(&mut w, n, f, it);
                 }
-                CallShape::Async(_) => render_async(&mut w, n, model, f),
+                (CallShape::Sync, _) => render_sync(&mut w, n, model, f),
             }
         }
     }

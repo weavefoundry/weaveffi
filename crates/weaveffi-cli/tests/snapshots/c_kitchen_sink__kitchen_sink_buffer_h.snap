@@ -26,6 +26,8 @@ extern "C" {
  * followed by the value, lists as a `uint32_t` count followed by the
  * elements, maps as a `uint32_t` count followed by alternating keys and
  * values, and objects as a `uint64_t` token holding one strong reference.
+ * Every count and length is a `uint32_t`, so a writer fails on a string,
+ * bytes, list, or map past UINT32_MAX elements.
  * ------------------------------------------------------------------------- */
 
 /* A UTF-8 string view: `len` bytes at `ptr`, which may contain NUL bytes.
@@ -335,9 +337,64 @@ static inline uint8_t* kitchen_sink_reader_get_run(kitchen_sink_reader* r, size_
     return copy;
 }
 
+/* Whether the `n` bytes at `s` are well-formed UTF-8: no stray or missing
+   continuation bytes, overlong forms, surrogates, or code points past
+   U+10FFFF. */
+static inline bool kitchen_sink_reader_utf8(const uint8_t* s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        uint8_t c = s[i];
+        if (c < 0x80) {
+            i++;
+            continue;
+        }
+        size_t len;
+        uint32_t cp;
+        uint32_t min;
+        if ((c & 0xE0) == 0xC0) {
+            len = 2;
+            cp = c & 0x1F;
+            min = 0x80;
+        } else if ((c & 0xF0) == 0xE0) {
+            len = 3;
+            cp = c & 0x0F;
+            min = 0x800;
+        } else if ((c & 0xF8) == 0xF0) {
+            len = 4;
+            cp = c & 0x07;
+            min = 0x10000;
+        } else {
+            return false;
+        }
+        if (n - i < len) {
+            return false;
+        }
+        for (size_t k = 1; k < len; k++) {
+            uint8_t cc = s[i + k];
+            if ((cc & 0xC0) != 0x80) {
+                return false;
+            }
+            cp = (cp << 6) | (uint32_t)(cc & 0x3F);
+        }
+        if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            return false;
+        }
+        i += len;
+    }
+    return true;
+}
+
+/* A string must be well-formed UTF-8: anything else fails the reader (the
+   decoder then returns false, the buffer analog of runtime code -3). */
 static inline kitchen_sink_str kitchen_sink_reader_get_string(kitchen_sink_reader* r) {
     kitchen_sink_str v;
     v.ptr = (const char*)kitchen_sink_reader_get_run(r, &v.len);
+    if (v.ptr != NULL && !kitchen_sink_reader_utf8((const uint8_t*)v.ptr, v.len)) {
+        free((void*)v.ptr);
+        v.ptr = NULL;
+        v.len = 0;
+        r->failed = true;
+    }
     return v;
 }
 
@@ -367,10 +424,11 @@ static inline void* kitchen_sink_reader_get_object(kitchen_sink_reader* r) {
 
 typedef struct kitchen_sink_shared_Token kitchen_sink_shared_Token;
 typedef struct kitchen_sink_kitchen_Item kitchen_sink_kitchen_Item;
+typedef struct kitchen_sink_kitchen_PantryError_OutOfStock_payload kitchen_sink_kitchen_PantryError_OutOfStock_payload;
 typedef struct kitchen_sink_list_string kitchen_sink_list_string;
 typedef struct kitchen_sink_map_string_string kitchen_sink_map_string_string;
-typedef struct kitchen_sink_list_kitchen_Gadget kitchen_sink_list_kitchen_Gadget;
-typedef struct kitchen_sink_list_kitchen_Item kitchen_sink_list_kitchen_Item;
+typedef struct kitchen_sink_list_Gadget kitchen_sink_list_Gadget;
+typedef struct kitchen_sink_list_Item kitchen_sink_list_Item;
 typedef struct kitchen_sink_map_string_i32 kitchen_sink_map_string_i32;
 
 /** `[string]` */
@@ -387,13 +445,13 @@ struct kitchen_sink_map_string_string {
 };
 
 /** `[Gadget]` */
-struct kitchen_sink_list_kitchen_Gadget {
+struct kitchen_sink_list_Gadget {
     kitchen_sink_kitchen_Gadget** items;
     size_t len;
 };
 
 /** `[Item]` */
-struct kitchen_sink_list_kitchen_Item {
+struct kitchen_sink_list_Item {
     kitchen_sink_kitchen_Item* items;
     size_t len;
 };
@@ -435,6 +493,15 @@ struct kitchen_sink_kitchen_Item {
     kitchen_sink_kitchen_Gadget* gadget;
 };
 
+/**
+ * The fields of a `kitchen_sink_kitchen_PantryError_OutOfStock` error
+ * (`OutOfStockError` in the language bindings), which it carries in
+ * `payload_ptr`/`payload_len`.
+ */
+struct kitchen_sink_kitchen_PantryError_OutOfStock_payload {
+    kitchen_sink_str item;
+};
+
 /* ---------------------------------------------------------------------------
  * Codecs. Each value type T above, and each optional shape, has four
  * functions:
@@ -461,6 +528,10 @@ static inline void kitchen_sink_kitchen_Item_write(kitchen_sink_writer* w, const
 static inline void kitchen_sink_kitchen_Item_read(kitchen_sink_reader* r, kitchen_sink_kitchen_Item* out);
 static inline bool kitchen_sink_kitchen_Item_decode(const uint8_t* ptr, size_t len, kitchen_sink_kitchen_Item* out);
 static inline void kitchen_sink_kitchen_Item_free(kitchen_sink_kitchen_Item* v);
+static inline void kitchen_sink_kitchen_PantryError_OutOfStock_payload_write(kitchen_sink_writer* w, const kitchen_sink_kitchen_PantryError_OutOfStock_payload* v);
+static inline void kitchen_sink_kitchen_PantryError_OutOfStock_payload_read(kitchen_sink_reader* r, kitchen_sink_kitchen_PantryError_OutOfStock_payload* out);
+static inline bool kitchen_sink_kitchen_PantryError_OutOfStock_payload_decode(const uint8_t* ptr, size_t len, kitchen_sink_kitchen_PantryError_OutOfStock_payload* out);
+static inline void kitchen_sink_kitchen_PantryError_OutOfStock_payload_free(kitchen_sink_kitchen_PantryError_OutOfStock_payload* v);
 static inline void kitchen_sink_list_string_write(kitchen_sink_writer* w, const kitchen_sink_list_string* v);
 static inline void kitchen_sink_list_string_read(kitchen_sink_reader* r, kitchen_sink_list_string* out);
 static inline bool kitchen_sink_list_string_decode(const uint8_t* ptr, size_t len, kitchen_sink_list_string* out);
@@ -473,26 +544,30 @@ static inline void kitchen_sink_opt_i64_write(kitchen_sink_writer* w, const int6
 static inline void kitchen_sink_opt_i64_read(kitchen_sink_reader* r, int64_t** out);
 static inline bool kitchen_sink_opt_i64_decode(const uint8_t* ptr, size_t len, int64_t** out);
 static inline void kitchen_sink_opt_i64_free(int64_t** v);
-static inline void kitchen_sink_opt_kitchen_Gadget_write(kitchen_sink_writer* w, const kitchen_sink_kitchen_Gadget* v);
-static inline void kitchen_sink_opt_kitchen_Gadget_read(kitchen_sink_reader* r, kitchen_sink_kitchen_Gadget** out);
-static inline bool kitchen_sink_opt_kitchen_Gadget_decode(const uint8_t* ptr, size_t len, kitchen_sink_kitchen_Gadget** out);
-static inline void kitchen_sink_opt_kitchen_Gadget_free(kitchen_sink_kitchen_Gadget** v);
-static inline void kitchen_sink_list_kitchen_Gadget_write(kitchen_sink_writer* w, const kitchen_sink_list_kitchen_Gadget* v);
-static inline void kitchen_sink_list_kitchen_Gadget_read(kitchen_sink_reader* r, kitchen_sink_list_kitchen_Gadget* out);
-static inline bool kitchen_sink_list_kitchen_Gadget_decode(const uint8_t* ptr, size_t len, kitchen_sink_list_kitchen_Gadget* out);
-static inline void kitchen_sink_list_kitchen_Gadget_free(kitchen_sink_list_kitchen_Gadget* v);
-static inline void kitchen_sink_opt_kitchen_Item_write(kitchen_sink_writer* w, const kitchen_sink_kitchen_Item* v);
-static inline void kitchen_sink_opt_kitchen_Item_read(kitchen_sink_reader* r, kitchen_sink_kitchen_Item** out);
-static inline bool kitchen_sink_opt_kitchen_Item_decode(const uint8_t* ptr, size_t len, kitchen_sink_kitchen_Item** out);
-static inline void kitchen_sink_opt_kitchen_Item_free(kitchen_sink_kitchen_Item** v);
-static inline void kitchen_sink_list_kitchen_Item_write(kitchen_sink_writer* w, const kitchen_sink_list_kitchen_Item* v);
-static inline void kitchen_sink_list_kitchen_Item_read(kitchen_sink_reader* r, kitchen_sink_list_kitchen_Item* out);
-static inline bool kitchen_sink_list_kitchen_Item_decode(const uint8_t* ptr, size_t len, kitchen_sink_list_kitchen_Item* out);
-static inline void kitchen_sink_list_kitchen_Item_free(kitchen_sink_list_kitchen_Item* v);
+static inline void kitchen_sink_opt_Gadget_write(kitchen_sink_writer* w, const kitchen_sink_kitchen_Gadget* v);
+static inline void kitchen_sink_opt_Gadget_read(kitchen_sink_reader* r, kitchen_sink_kitchen_Gadget** out);
+static inline bool kitchen_sink_opt_Gadget_decode(const uint8_t* ptr, size_t len, kitchen_sink_kitchen_Gadget** out);
+static inline void kitchen_sink_opt_Gadget_free(kitchen_sink_kitchen_Gadget** v);
+static inline void kitchen_sink_list_Gadget_write(kitchen_sink_writer* w, const kitchen_sink_list_Gadget* v);
+static inline void kitchen_sink_list_Gadget_read(kitchen_sink_reader* r, kitchen_sink_list_Gadget* out);
+static inline bool kitchen_sink_list_Gadget_decode(const uint8_t* ptr, size_t len, kitchen_sink_list_Gadget* out);
+static inline void kitchen_sink_list_Gadget_free(kitchen_sink_list_Gadget* v);
+static inline void kitchen_sink_opt_Item_write(kitchen_sink_writer* w, const kitchen_sink_kitchen_Item* v);
+static inline void kitchen_sink_opt_Item_read(kitchen_sink_reader* r, kitchen_sink_kitchen_Item** out);
+static inline bool kitchen_sink_opt_Item_decode(const uint8_t* ptr, size_t len, kitchen_sink_kitchen_Item** out);
+static inline void kitchen_sink_opt_Item_free(kitchen_sink_kitchen_Item** v);
+static inline void kitchen_sink_list_Item_write(kitchen_sink_writer* w, const kitchen_sink_list_Item* v);
+static inline void kitchen_sink_list_Item_read(kitchen_sink_reader* r, kitchen_sink_list_Item* out);
+static inline bool kitchen_sink_list_Item_decode(const uint8_t* ptr, size_t len, kitchen_sink_list_Item* out);
+static inline void kitchen_sink_list_Item_free(kitchen_sink_list_Item* v);
 static inline void kitchen_sink_map_string_i32_write(kitchen_sink_writer* w, const kitchen_sink_map_string_i32* v);
 static inline void kitchen_sink_map_string_i32_read(kitchen_sink_reader* r, kitchen_sink_map_string_i32* out);
 static inline bool kitchen_sink_map_string_i32_decode(const uint8_t* ptr, size_t len, kitchen_sink_map_string_i32* out);
 static inline void kitchen_sink_map_string_i32_free(kitchen_sink_map_string_i32* v);
+static inline void kitchen_sink_opt_string_write(kitchen_sink_writer* w, const kitchen_sink_str* v);
+static inline void kitchen_sink_opt_string_read(kitchen_sink_reader* r, kitchen_sink_str** out);
+static inline bool kitchen_sink_opt_string_decode(const uint8_t* ptr, size_t len, kitchen_sink_str** out);
+static inline void kitchen_sink_opt_string_free(kitchen_sink_str** v);
 
 static inline void kitchen_sink_shared_Token_write(kitchen_sink_writer* w, const kitchen_sink_shared_Token* v) {
     kitchen_sink_writer_put_i64(w, v->id);
@@ -533,7 +608,7 @@ static inline void kitchen_sink_kitchen_Item_write(kitchen_sink_writer* w, const
     kitchen_sink_opt_i64_write(w, v->parent);
     kitchen_sink_shared_Token_write(w, &v->token);
     kitchen_sink_writer_put_i32(w, (int32_t)v->priority);
-    kitchen_sink_opt_kitchen_Gadget_write(w, v->gadget);
+    kitchen_sink_opt_Gadget_write(w, v->gadget);
 }
 
 static inline void kitchen_sink_kitchen_Item_read(kitchen_sink_reader* r, kitchen_sink_kitchen_Item* out) {
@@ -550,7 +625,7 @@ static inline void kitchen_sink_kitchen_Item_read(kitchen_sink_reader* r, kitche
     kitchen_sink_opt_i64_read(r, &out->parent);
     kitchen_sink_shared_Token_read(r, &out->token);
     out->priority = (kitchen_sink_kitchen_Priority)kitchen_sink_reader_get_i32(r);
-    kitchen_sink_opt_kitchen_Gadget_read(r, &out->gadget);
+    kitchen_sink_opt_Gadget_read(r, &out->gadget);
 }
 
 static inline bool kitchen_sink_kitchen_Item_decode(const uint8_t* ptr, size_t len, kitchen_sink_kitchen_Item* out) {
@@ -570,7 +645,31 @@ static inline void kitchen_sink_kitchen_Item_free(kitchen_sink_kitchen_Item* v) 
     kitchen_sink_map_string_string_free(&v->attrs);
     kitchen_sink_opt_i64_free(&v->parent);
     kitchen_sink_shared_Token_free(&v->token);
-    kitchen_sink_opt_kitchen_Gadget_free(&v->gadget);
+    kitchen_sink_opt_Gadget_free(&v->gadget);
+    memset(v, 0, sizeof *v);
+}
+
+static inline void kitchen_sink_kitchen_PantryError_OutOfStock_payload_write(kitchen_sink_writer* w, const kitchen_sink_kitchen_PantryError_OutOfStock_payload* v) {
+    kitchen_sink_writer_put_string(w, v->item);
+}
+
+static inline void kitchen_sink_kitchen_PantryError_OutOfStock_payload_read(kitchen_sink_reader* r, kitchen_sink_kitchen_PantryError_OutOfStock_payload* out) {
+    memset(out, 0, sizeof *out);
+    out->item = kitchen_sink_reader_get_string(r);
+}
+
+static inline bool kitchen_sink_kitchen_PantryError_OutOfStock_payload_decode(const uint8_t* ptr, size_t len, kitchen_sink_kitchen_PantryError_OutOfStock_payload* out) {
+    kitchen_sink_reader r = kitchen_sink_reader_of(ptr, len);
+    kitchen_sink_kitchen_PantryError_OutOfStock_payload_read(&r, out);
+    if (!kitchen_sink_reader_finish(&r)) {
+        kitchen_sink_kitchen_PantryError_OutOfStock_payload_free(out);
+        return false;
+    }
+    return true;
+}
+
+static inline void kitchen_sink_kitchen_PantryError_OutOfStock_payload_free(kitchen_sink_kitchen_PantryError_OutOfStock_payload* v) {
+    kitchen_sink_str_free(&v->item);
     memset(v, 0, sizeof *v);
 }
 
@@ -698,43 +797,43 @@ static inline void kitchen_sink_opt_i64_free(int64_t** v) {
     *v = NULL;
 }
 
-static inline void kitchen_sink_opt_kitchen_Gadget_write(kitchen_sink_writer* w, const kitchen_sink_kitchen_Gadget* v) {
+static inline void kitchen_sink_opt_Gadget_write(kitchen_sink_writer* w, const kitchen_sink_kitchen_Gadget* v) {
     kitchen_sink_writer_put_bool(w, v != NULL);
     if (v != NULL) {
         kitchen_sink_writer_put_object(w, kitchen_sink_kitchen_Gadget_clone(v));
     }
 }
 
-static inline void kitchen_sink_opt_kitchen_Gadget_read(kitchen_sink_reader* r, kitchen_sink_kitchen_Gadget** out) {
+static inline void kitchen_sink_opt_Gadget_read(kitchen_sink_reader* r, kitchen_sink_kitchen_Gadget** out) {
     *out = NULL;
     if (kitchen_sink_reader_get_bool(r)) {
         *out = (kitchen_sink_kitchen_Gadget*)kitchen_sink_reader_get_object(r);
     }
 }
 
-static inline bool kitchen_sink_opt_kitchen_Gadget_decode(const uint8_t* ptr, size_t len, kitchen_sink_kitchen_Gadget** out) {
+static inline bool kitchen_sink_opt_Gadget_decode(const uint8_t* ptr, size_t len, kitchen_sink_kitchen_Gadget** out) {
     kitchen_sink_reader r = kitchen_sink_reader_of(ptr, len);
-    kitchen_sink_opt_kitchen_Gadget_read(&r, out);
+    kitchen_sink_opt_Gadget_read(&r, out);
     if (!kitchen_sink_reader_finish(&r)) {
-        kitchen_sink_opt_kitchen_Gadget_free(out);
+        kitchen_sink_opt_Gadget_free(out);
         return false;
     }
     return true;
 }
 
-static inline void kitchen_sink_opt_kitchen_Gadget_free(kitchen_sink_kitchen_Gadget** v) {
+static inline void kitchen_sink_opt_Gadget_free(kitchen_sink_kitchen_Gadget** v) {
     kitchen_sink_kitchen_Gadget_destroy(*v);
     *v = NULL;
 }
 
-static inline void kitchen_sink_list_kitchen_Gadget_write(kitchen_sink_writer* w, const kitchen_sink_list_kitchen_Gadget* v) {
+static inline void kitchen_sink_list_Gadget_write(kitchen_sink_writer* w, const kitchen_sink_list_Gadget* v) {
     kitchen_sink_writer_put_len(w, v->len);
     for (size_t i = 0; i < v->len; i++) {
         kitchen_sink_writer_put_object(w, kitchen_sink_kitchen_Gadget_clone(v->items[i]));
     }
 }
 
-static inline void kitchen_sink_list_kitchen_Gadget_read(kitchen_sink_reader* r, kitchen_sink_list_kitchen_Gadget* out) {
+static inline void kitchen_sink_list_Gadget_read(kitchen_sink_reader* r, kitchen_sink_list_Gadget* out) {
     memset(out, 0, sizeof *out);
     size_t n = kitchen_sink_reader_get_u32(r);
     out->items = (kitchen_sink_kitchen_Gadget**)kitchen_sink_reader_alloc(r, n, sizeof(kitchen_sink_kitchen_Gadget*), 8);
@@ -747,17 +846,17 @@ static inline void kitchen_sink_list_kitchen_Gadget_read(kitchen_sink_reader* r,
     }
 }
 
-static inline bool kitchen_sink_list_kitchen_Gadget_decode(const uint8_t* ptr, size_t len, kitchen_sink_list_kitchen_Gadget* out) {
+static inline bool kitchen_sink_list_Gadget_decode(const uint8_t* ptr, size_t len, kitchen_sink_list_Gadget* out) {
     kitchen_sink_reader r = kitchen_sink_reader_of(ptr, len);
-    kitchen_sink_list_kitchen_Gadget_read(&r, out);
+    kitchen_sink_list_Gadget_read(&r, out);
     if (!kitchen_sink_reader_finish(&r)) {
-        kitchen_sink_list_kitchen_Gadget_free(out);
+        kitchen_sink_list_Gadget_free(out);
         return false;
     }
     return true;
 }
 
-static inline void kitchen_sink_list_kitchen_Gadget_free(kitchen_sink_list_kitchen_Gadget* v) {
+static inline void kitchen_sink_list_Gadget_free(kitchen_sink_list_Gadget* v) {
     for (size_t i = 0; i < v->len; i++) {
         kitchen_sink_kitchen_Gadget_destroy(v->items[i]);
     }
@@ -765,14 +864,14 @@ static inline void kitchen_sink_list_kitchen_Gadget_free(kitchen_sink_list_kitch
     memset(v, 0, sizeof *v);
 }
 
-static inline void kitchen_sink_opt_kitchen_Item_write(kitchen_sink_writer* w, const kitchen_sink_kitchen_Item* v) {
+static inline void kitchen_sink_opt_Item_write(kitchen_sink_writer* w, const kitchen_sink_kitchen_Item* v) {
     kitchen_sink_writer_put_bool(w, v != NULL);
     if (v != NULL) {
         kitchen_sink_kitchen_Item_write(w, &(*v));
     }
 }
 
-static inline void kitchen_sink_opt_kitchen_Item_read(kitchen_sink_reader* r, kitchen_sink_kitchen_Item** out) {
+static inline void kitchen_sink_opt_Item_read(kitchen_sink_reader* r, kitchen_sink_kitchen_Item** out) {
     *out = NULL;
     if (!kitchen_sink_reader_get_bool(r)) {
         return;
@@ -786,17 +885,17 @@ static inline void kitchen_sink_opt_kitchen_Item_read(kitchen_sink_reader* r, ki
     *out = value;
 }
 
-static inline bool kitchen_sink_opt_kitchen_Item_decode(const uint8_t* ptr, size_t len, kitchen_sink_kitchen_Item** out) {
+static inline bool kitchen_sink_opt_Item_decode(const uint8_t* ptr, size_t len, kitchen_sink_kitchen_Item** out) {
     kitchen_sink_reader r = kitchen_sink_reader_of(ptr, len);
-    kitchen_sink_opt_kitchen_Item_read(&r, out);
+    kitchen_sink_opt_Item_read(&r, out);
     if (!kitchen_sink_reader_finish(&r)) {
-        kitchen_sink_opt_kitchen_Item_free(out);
+        kitchen_sink_opt_Item_free(out);
         return false;
     }
     return true;
 }
 
-static inline void kitchen_sink_opt_kitchen_Item_free(kitchen_sink_kitchen_Item** v) {
+static inline void kitchen_sink_opt_Item_free(kitchen_sink_kitchen_Item** v) {
     if (*v == NULL) {
         return;
     }
@@ -805,14 +904,14 @@ static inline void kitchen_sink_opt_kitchen_Item_free(kitchen_sink_kitchen_Item*
     *v = NULL;
 }
 
-static inline void kitchen_sink_list_kitchen_Item_write(kitchen_sink_writer* w, const kitchen_sink_list_kitchen_Item* v) {
+static inline void kitchen_sink_list_Item_write(kitchen_sink_writer* w, const kitchen_sink_list_Item* v) {
     kitchen_sink_writer_put_len(w, v->len);
     for (size_t i = 0; i < v->len; i++) {
         kitchen_sink_kitchen_Item_write(w, &v->items[i]);
     }
 }
 
-static inline void kitchen_sink_list_kitchen_Item_read(kitchen_sink_reader* r, kitchen_sink_list_kitchen_Item* out) {
+static inline void kitchen_sink_list_Item_read(kitchen_sink_reader* r, kitchen_sink_list_Item* out) {
     memset(out, 0, sizeof *out);
     size_t n = kitchen_sink_reader_get_u32(r);
     out->items = (kitchen_sink_kitchen_Item*)kitchen_sink_reader_alloc(r, n, sizeof(kitchen_sink_kitchen_Item), 59);
@@ -825,17 +924,17 @@ static inline void kitchen_sink_list_kitchen_Item_read(kitchen_sink_reader* r, k
     }
 }
 
-static inline bool kitchen_sink_list_kitchen_Item_decode(const uint8_t* ptr, size_t len, kitchen_sink_list_kitchen_Item* out) {
+static inline bool kitchen_sink_list_Item_decode(const uint8_t* ptr, size_t len, kitchen_sink_list_Item* out) {
     kitchen_sink_reader r = kitchen_sink_reader_of(ptr, len);
-    kitchen_sink_list_kitchen_Item_read(&r, out);
+    kitchen_sink_list_Item_read(&r, out);
     if (!kitchen_sink_reader_finish(&r)) {
-        kitchen_sink_list_kitchen_Item_free(out);
+        kitchen_sink_list_Item_free(out);
         return false;
     }
     return true;
 }
 
-static inline void kitchen_sink_list_kitchen_Item_free(kitchen_sink_list_kitchen_Item* v) {
+static inline void kitchen_sink_list_Item_free(kitchen_sink_list_Item* v) {
     for (size_t i = 0; i < v->len; i++) {
         kitchen_sink_kitchen_Item_free(&v->items[i]);
     }
@@ -887,6 +986,46 @@ static inline void kitchen_sink_map_string_i32_free(kitchen_sink_map_string_i32*
     free(v->keys);
     free(v->values);
     memset(v, 0, sizeof *v);
+}
+
+static inline void kitchen_sink_opt_string_write(kitchen_sink_writer* w, const kitchen_sink_str* v) {
+    kitchen_sink_writer_put_bool(w, v != NULL);
+    if (v != NULL) {
+        kitchen_sink_writer_put_string(w, (*v));
+    }
+}
+
+static inline void kitchen_sink_opt_string_read(kitchen_sink_reader* r, kitchen_sink_str** out) {
+    *out = NULL;
+    if (!kitchen_sink_reader_get_bool(r)) {
+        return;
+    }
+    kitchen_sink_str* value = (kitchen_sink_str*)calloc(1, sizeof(kitchen_sink_str));
+    if (value == NULL) {
+        r->failed = true;
+        return;
+    }
+    (*value) = kitchen_sink_reader_get_string(r);
+    *out = value;
+}
+
+static inline bool kitchen_sink_opt_string_decode(const uint8_t* ptr, size_t len, kitchen_sink_str** out) {
+    kitchen_sink_reader r = kitchen_sink_reader_of(ptr, len);
+    kitchen_sink_opt_string_read(&r, out);
+    if (!kitchen_sink_reader_finish(&r)) {
+        kitchen_sink_opt_string_free(out);
+        return false;
+    }
+    return true;
+}
+
+static inline void kitchen_sink_opt_string_free(kitchen_sink_str** v) {
+    if (*v == NULL) {
+        return;
+    }
+    kitchen_sink_str_free(&(**v));
+    free(*v);
+    *v = NULL;
 }
 
 #ifdef __cplusplus

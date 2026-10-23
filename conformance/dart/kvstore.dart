@@ -6,36 +6,37 @@
 //     which loading the bindings performs;
 //   * `Store`: fallible and infallible constructors (`Store.open`, `Store()`),
 //     methods, statics, the deprecated `size()`, the `Entry` and `StoreInfo`
-//     value classes, the `EntryKind` enum, maps and optionals, and the
-//     logical clock;
-//   * the sealed `KvException` hierarchy with its payload fields
-//     (`KeyNotFound`, `Expired`, `StoreFull`, `Rejected`), and runtime
-//     failures (-4) as the root `NativeException`;
-//   * lazy `Iterable`s of strings (throwing at launch), records, and objects,
-//     including one abandoned part-way;
-//   * three callback interfaces implemented in Dart: a `Listener` (retained,
+//     value classes, the `EntryKind` enum, maps and optionals, the logical
+//     clock, an optional TTL parameter and an optional expiry return (optional
+//     scalars crossing directly), a `[u64]` return (a typed array), `usize`
+//     counts, and a `throws any` method (`importLines`);
+//   * the open `KvException` hierarchy with its payload fields
+//     (`KeyNotFound`, `Expired`, `StoreFull`, `Rejected`, `CallbackFailed`);
+//   * lazy `Iterable`s of strings (throwing at launch), records, objects, and
+//     optional scalars, including one abandoned part-way;
+//   * four callback interfaces implemented in Dart: a `Listener` (retained,
 //     filtered by `accepts`, told about every `Change` on the event loop,
-//     and detached when it throws), a `Policy` (a record return, a throwing
-//     method whose `RejectedException` reaches the `put` caller with its
-//     payload, an object parameter and object return), and a `Loader` passed
-//     as an optional callback (string, bytes, and optional-object returns;
-//     typed errors decoded by the producer or passed through);
+//     detached when it throws, and detached when the producer calls its
+//     value-returning `accepts` from a worker thread, which the thread-affine
+//     vtable refuses instead of letting the VM abort), a `Policy` (an
+//     optional-scalar method choosing the TTL, a record return, a typed
+//     `RejectedException` that reaches the `put` caller with its payload, any
+//     other failure arriving as `CallbackFailed`, an object parameter and
+//     object return, and calls back into the store from inside a callback,
+//     each in its own call frame), a `Loader` passed as an optional callback
+//     (string, bytes, and optional-object returns; typed errors decoded by the
+//     producer or passed through), and a `Scorer` (a typed array in and out);
 //   * `Store` objects in every position: parameter, return, optional, list,
 //     map value, record field, iterator element, async result, and callback
 //     parameter and return;
 //   * futures: an async free function returning an object, a cancellable
 //     method cancelled mid-pause (completing at once with
 //     `CancelledException` while its background work stops cooperatively,
-//     shown by `activeJobs`), an async list launched concurrently, and an
-//     async function in the nested `kv.stats` module;
+//     shown by `activeJobs`), an async list launched concurrently, async
+//     optional-scalar and typed-array results, and an async function in the
+//     nested `kv.stats` module;
 //   * the sibling `report` root (the shared `Entry` record and its own error
 //     domain).
-//
-// One assertion other languages make is skipped: compaction notifies
-// listeners from a producer thread, and a listener's `accepts` returns a
-// value, which Dart can only run on the isolate's thread (a call from
-// another thread aborts the process; see the Dart generator's threading
-// rules). So no listener is subscribed while `compact` runs.
 //
 // Releases of consumer callbacks are observed through the producer's
 // callback counter (`debug_live(1)`). Ends by asserting the producer's leak
@@ -112,9 +113,11 @@ class RecordingListener implements Listener {
   final String? skip;
   final String? failOn;
   final List<Change> changes = <Change>[];
+  int asked = 0;
 
   @override
   bool accepts(String key) {
+    asked++;
     if (key == failOn) throw StateError('listener refused');
     return key != skip;
   }
@@ -145,9 +148,17 @@ class TestPolicy implements Policy {
   int admitted = 0;
 
   @override
+  int? ttlFor(String key, int? requested) => requested;
+
+  @override
   Entry admit(Entry entry) {
     admitted++;
     expect(entry.version == 0, 'the store assigns the version after admission');
+    // Calls back into the library from inside a callback run in frames of
+    // their own: a string return, and a failure caught here, leave the
+    // outer `put` untouched.
+    expect(other.path() == '/other', 'a nested call returns its own string');
+    expectKeyNotFound('nested', () => other.get('nested'));
     if (entry.key.startsWith('secret')) {
       throw RejectedException(
         entry.key,
@@ -175,6 +186,43 @@ class TestPolicy implements Policy {
     // The producer gets its own reference; `home` was ours to release.
     if (!identical(target, home)) home.dispose();
     return target;
+  }
+}
+
+/// Picks TTLs by key: `short` gets 1, `forever` none, `full` and `oops`
+/// fail (typed and untyped), and anything else keeps the requested TTL.
+class TtlPolicy implements Policy {
+  @override
+  int? ttlFor(String key, int? requested) => switch (key) {
+    'short' => 1,
+    'forever' => null,
+    'full' => throw StoreFullException(7),
+    'oops' => throw Failure('ttl exploded'),
+    _ => requested,
+  };
+
+  @override
+  Entry admit(Entry entry) => entry;
+
+  @override
+  Store route(String key, Store home) => home;
+}
+
+// ── scorer (consumer-implemented, typed arrays in and out) ───────────────
+
+class TestScorer implements Scorer {
+  TestScorer({this.fail = false, this.drop = false});
+
+  final bool fail;
+  final bool drop;
+  List<int>? seen;
+
+  @override
+  List<double> scores(List<int> sizes) {
+    seen = sizes.toList();
+    if (fail) throw Failure('scorer is broken');
+    final scores = [for (final size in sizes) size * 1.0];
+    return drop ? scores.sublist(1) : scores;
   }
 }
 
@@ -453,13 +501,14 @@ void policies() {
   expect(s.count() == 1 && other.count() == 1, 'route redirected b/x');
 
   // A typed error from the throwing callback reaches the caller with its
-  // code, message, and payload.
+  // code and payload, and the message the producer renders from them.
   final rejected = expectThrows<RejectedException>(
     () => s.putText('secret', '3'),
     'put(secret)',
   );
   expect(
-    rejected.code == 1005 && rejected.message == 'secrets are not stored',
+    rejected.code == 1005 &&
+        rejected.message == 'write to secret rejected: no secrets',
     'Rejected code and message (got ${rejected.code}: ${rejected.message})',
   );
   expect(
@@ -467,16 +516,16 @@ void policies() {
     'Rejected payload',
   );
 
-  // Anything else arrives as -4 with the consumer's message.
-  final boom = expectThrows<NativeException>(
+  // Anything else arrives as CallbackFailed with the consumer's message.
+  final boom = expectThrows<CallbackFailedException>(
     () => s.putText('boom', '4'),
     'put(boom)',
   );
   expect(
-    boom is! KvException &&
-        boom.code == -4 &&
+    boom.code == 1006 &&
+        boom.message_ == 'policy exploded' &&
         boom.message == 'policy exploded',
-    '-4 (got ${boom.code}: ${boom.message})',
+    'CallbackFailed (got ${boom.code}: ${boom.message})',
   );
   expect(
     s.count() == 1 && other.count() == 1 && p.admitted == 4,
@@ -502,6 +551,36 @@ void policies() {
   replacement.other.dispose();
   other.dispose();
   s.dispose();
+
+  // ttl_for: an optional scalar in and out picks each write's TTL.
+  final t = Store.open('/ttl');
+  t.setPolicy(TtlPolicy());
+  expect(t.putText('short', 'x').expiresAt == 1, 'ttlFor overrides none');
+  expect(
+    t.putText('forever', 'x', EntryKind.persistent, 5).expiresAt == null,
+    'ttlFor removes a TTL',
+  );
+  expect(
+    t.putText('other', 'x', EntryKind.persistent, 9).expiresAt == 9,
+    'ttlFor keeps the requested TTL',
+  );
+  expect(t.putText('plain', 'x').expiresAt == null, 'no TTL stays none');
+  final full = expectThrows<StoreFullException>(
+    () => t.putText('full', 'x'),
+    'ttlFor raising StoreFull',
+  );
+  expect(
+    full.capacity == 7 && full.message == 'store is full (7 entries)',
+    'a typed ttlFor failure reaches put (got ${full.message})',
+  );
+  final oops = expectThrows<CallbackFailedException>(
+    () => t.putText('oops', 'x'),
+    'ttlFor failing otherwise',
+  );
+  expect(oops.message_ == 'ttl exploded', 'CallbackFailed from ttlFor');
+  expect(t.count() == 4, 'failed puts stored nothing');
+  t.setPolicy(null);
+  t.dispose();
 }
 
 void loaders() {
@@ -542,39 +621,53 @@ void loaders() {
     s.getOrLoad('missing', TestLoader()) == null,
     'KeyNotFound for the same key is none',
   );
-  // KeyNotFound for another key: passed through, payload intact.
+  // KeyNotFound for another key: passed through, payload intact, with the
+  // message the producer renders from it.
   final other = expectThrows<KeyNotFoundException>(
     () => s.getOrLoad('elsewhere', TestLoader()),
     'getOrLoad(elsewhere)',
   );
   expect(
-    other.key == 'other' && other.message == 'not in the loader',
+    other.key == 'other' && other.message == 'key not found: other',
     'KeyNotFound(other) passed through',
   );
-  // Any other failure is -4.
-  final broken = expectThrows<NativeException>(
+  // Any other failure is CallbackFailed with the loader's message.
+  final broken = expectThrows<CallbackFailedException>(
     () => s.getOrLoad('broken', TestLoader()),
     'getOrLoad(broken)',
   );
   expect(
-    broken.code == -4 && broken.message == 'loader is broken',
-    '-4 (got ${broken.code}: ${broken.message})',
+    broken.code == 1006 && broken.message_ == 'loader is broken',
+    'CallbackFailed (got ${broken.code}: ${broken.message})',
   );
   expect(liveCallbacks() == base, 'every loader was released');
   s.dispose();
 }
 
 Future<void> asyncCalls() async {
+  final base = liveCallbacks();
   final s = Store.open('/async-calls');
+  // Subscribed on this thread, so `put` (a synchronous call) asks it here.
+  final affine = RecordingListener();
+  s.subscribe(affine);
   s.putText('old1', 'x', EntryKind.volatile, 1);
   s.putText('old2', 'x', EntryKind.volatile, 1);
   s.putText('keep', 'x');
   s.tick(5);
+  expect(affine.asked == 3, 'accepts ran for each put (got ${affine.asked})');
 
-  // compact runs on a producer thread (no listener: see the header).
+  // compact runs on a producer thread and tells listeners there. The
+  // listener's vtable is thread-affine, so the producer refuses to call its
+  // `accepts` (it returns a value) off this thread: the method never runs,
+  // the listener fails with -4 and is detached, and compaction carries on.
   final token = CancelToken();
   expect(await s.compact(0, cancelToken: token) == 2, 'compact(0) removed 2');
   expect(s.count() == 1, 'one entry left');
+  expect(affine.asked == 3, 'accepts never ran off its thread');
+  expect(
+    s.listenerCount() == 0 && liveCallbacks() == base,
+    'the refused listener was detached and released',
+  );
   expect(await s.compact(5) == 0, 'compact(5) removed nothing');
 
   // Cancel mid-pause: the call completes at once with a cancellation, and
@@ -602,6 +695,21 @@ Future<void> asyncCalls() async {
     'the cancelled pause stopped cooperatively',
     timeout: const Duration(seconds: 2),
   );
+
+  // Async optional-scalar and typed-array results.
+  final v = Store.open('/versions');
+  v.putText('b', '12');
+  v.putText('a', '123', EntryKind.volatile, 7);
+  expect(await v.versionOf('a') == 1, 'versionOf(a)');
+  expect(await v.versionOf('q') == null, 'versionOf(q) is absent');
+  v.putText('b', 'x');
+  final versions = await v.versions(['b', 'q', 'a']);
+  expect(listEquals(versions, [2, 0, 1]), 'versions (got $versions)');
+  expect(
+    listEquals(await v.versions(const []), const <int>[]),
+    'versions([])',
+  );
+  v.dispose();
 
   // getMany: an async list of optional records, launched concurrently.
   final results = await Future.wait([
@@ -721,6 +829,70 @@ void objectGraph() {
   expectThrows<StateError>(() => s.count(), "a disposed wrapper can't be used");
 }
 
+void directTransports() {
+  final base = liveCallbacks();
+  final s = Store.open('/direct');
+  s.putText('b', '12');
+  s.put('a', [1, 2, 3], EntryKind.volatile, 7);
+  expect(s.count() == 2, 'count is a usize');
+  expect(s.expiresAt('a') == 7, 'expiresAt(a)');
+  expect(s.expiresAt('b') == null, 'expiresAt(b) is absent');
+  expect(s.expiresAt('zzz') == null, 'expiresAt(zzz) is absent');
+  final sizes = s.valueSizes();
+  expect(listEquals(sizes, [3, 2]), 'valueSizes (got $sizes)');
+  final expirations = s.expirations().toList();
+  expect(
+    listEquals(expirations, [7, null]),
+    'expirations (got $expirations)',
+  );
+  s.dispose();
+
+  // rank: the scorer gets a typed array and returns one.
+  final r = Store.open('/rank');
+  r.putText('a', '1');
+  r.putText('b', '333');
+  r.putText('c', '22');
+  final scorer = TestScorer();
+  final ranked = r.rank(scorer);
+  expect(listEquals(ranked, ['b', 'c', 'a']), 'rank (got $ranked)');
+  expect(listEquals(scorer.seen!, [1, 3, 2]), 'scores(sizes) (got ${scorer.seen})');
+  final broken = expectThrows<CallbackFailedException>(
+    () => r.rank(TestScorer(fail: true)),
+    'rank with a failing scorer',
+  );
+  expect(
+    broken.code == 1006 && broken.message_ == 'scorer is broken',
+    'a failing scorer (got ${broken.message})',
+  );
+  final short = expectThrows<CallbackFailedException>(
+    () => r.rank(TestScorer(drop: true)),
+    'rank with too few scores',
+  );
+  expect(
+    short.message_ == 'expected 3 scores, got 2',
+    'a short score list (got ${short.message})',
+  );
+  expect(liveCallbacks() == base, 'every scorer was released');
+  r.dispose();
+
+  // importLines: `throws any`, failing with -1 and the producer's message.
+  final i = Store.open('/import');
+  expect(i.importLines('a=1\n\nb=two\n') == 2, 'importLines stored 2');
+  expect(text(i.get('b').value) == 'two', 'imported b');
+  final bad = expectThrows<NativeException>(
+    () => i.importLines('c=3\nbroken\nd=4'),
+    'importLines with a malformed line',
+  );
+  expect(
+    bad.runtimeType == NativeException &&
+        bad.code == NativeException.genericCode &&
+        bad.message == 'line 2: expected key=value',
+    'untyped error (got ${bad.runtimeType} ${bad.code}: ${bad.message})',
+  );
+  expect(i.count() == 3 && i.find('d') == null, 'c was stored, d wasn\'t');
+  i.dispose();
+}
+
 void statsAndReport() {
   final s = Store.open('/stats');
   s.putText('b', '12');
@@ -771,6 +943,7 @@ Future<void> main() async {
   loaders();
   await asyncCalls();
   objectGraph();
+  directTransports();
   statsAndReport();
 
   await expectNoLeaks('kvstore');

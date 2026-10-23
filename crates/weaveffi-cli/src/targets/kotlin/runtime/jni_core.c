@@ -14,67 +14,166 @@
    (all lowercase `{{PREFIX}}_...`) and no JNI export (`Java_...`) can
    spell. */
 
+/* Helpers a given shim may not use (it only uses what its API needs). */
+#if defined(__GNUC__)
+#define Jni_helper static inline __attribute__((unused))
+#else
+#define Jni_helper static inline
+#endif
+
 static JavaVM* Jni_vm = NULL;
 static jclass Jni_bridge = NULL;
 static jmethodID Jni_error = NULL;
 
-/* A borrowed view of a Kotlin `ByteArray`: strings, bytes, and value
-   buffers all cross as one. */
-typedef struct {
-    jbyteArray array;
-    jbyte* elems;
-    const uint8_t* ptr;
-    size_t len;
-} Jni_bytes;
+/* The JNI primitive kinds: a direct value's carrier, a typed array's
+   element, and a box's payload. A string, bytes, or a value buffer crosses
+   as a byte array (`Jni_B`). */
+typedef enum { Jni_Z, Jni_B, Jni_S, Jni_I, Jni_J, Jni_F, Jni_D } Jni_kind;
 
-static inline Jni_bytes Jni_borrow_bytes(JNIEnv* env, jbyteArray array) {
-    Jni_bytes b = {array, NULL, NULL, 0};
-    if (array == NULL) {
-        return b;
-    }
-    b.len = (size_t)(*env)->GetArrayLength(env, array);
-    b.elems = (*env)->GetByteArrayElements(env, array, NULL);
-    b.ptr = (const uint8_t*)b.elems;
-    if (b.elems == NULL) {
-        b.len = 0;
-    }
-    return b;
-}
+static const size_t Jni_kind_size[] = {1, 1, 2, 4, 8, 4, 8};
 
-static inline void Jni_release_bytes(JNIEnv* env, Jni_bytes* b) {
-    if (b->elems != NULL) {
-        (*env)->ReleaseByteArrayElements(env, b->array, b->elems, JNI_ABORT);
+Jni_helper void Jni_throw_oom(JNIEnv* env, const char* what) {
+    jclass cls = (*env)->FindClass(env, "java/lang/OutOfMemoryError");
+    if (cls != NULL) {
+        (*env)->ThrowNew(env, cls, what);
     }
 }
 
-/* Copies `len` bytes into a new Kotlin `ByteArray` (never NULL for valid
-   input, so NULL + 0 is the empty array). */
-static inline jbyteArray Jni_new_bytes(JNIEnv* env, const uint8_t* ptr, size_t len) {
-    jbyteArray out = (*env)->NewByteArray(env, (jsize)len);
-    if (out != NULL && len > 0 && ptr != NULL) {
-        (*env)->SetByteArrayRegion(env, out, 0, (jsize)len, (const jbyte*)ptr);
+/* Copies all `n` elements of a Java primitive array into `dst`. */
+Jni_helper void Jni_get_region(JNIEnv* env, jarray array, Jni_kind kind, jsize n, void* dst) {
+    switch (kind) {
+    case Jni_Z: (*env)->GetBooleanArrayRegion(env, (jbooleanArray)array, 0, n, (jboolean*)dst); break;
+    case Jni_B: (*env)->GetByteArrayRegion(env, (jbyteArray)array, 0, n, (jbyte*)dst); break;
+    case Jni_S: (*env)->GetShortArrayRegion(env, (jshortArray)array, 0, n, (jshort*)dst); break;
+    case Jni_I: (*env)->GetIntArrayRegion(env, (jintArray)array, 0, n, (jint*)dst); break;
+    case Jni_J: (*env)->GetLongArrayRegion(env, (jlongArray)array, 0, n, (jlong*)dst); break;
+    case Jni_F: (*env)->GetFloatArrayRegion(env, (jfloatArray)array, 0, n, (jfloat*)dst); break;
+    case Jni_D: (*env)->GetDoubleArrayRegion(env, (jdoubleArray)array, 0, n, (jdouble*)dst); break;
+    }
+}
+
+/* A new Java primitive array holding a copy of the `count` elements at
+   `ptr` (never read when `count` is 0); NULL with an exception pending when
+   the JVM can't make it. */
+Jni_helper jarray Jni_new_array(JNIEnv* env, Jni_kind kind, const void* ptr, size_t count) {
+    if (count > (size_t)INT32_MAX) {
+        Jni_throw_oom(env, "native array is too large for a JVM array");
+        return NULL;
+    }
+    jsize n = (jsize)count;
+    jarray out = NULL;
+    switch (kind) {
+    case Jni_Z: out = (*env)->NewBooleanArray(env, n); break;
+    case Jni_B: out = (*env)->NewByteArray(env, n); break;
+    case Jni_S: out = (*env)->NewShortArray(env, n); break;
+    case Jni_I: out = (*env)->NewIntArray(env, n); break;
+    case Jni_J: out = (*env)->NewLongArray(env, n); break;
+    case Jni_F: out = (*env)->NewFloatArray(env, n); break;
+    case Jni_D: out = (*env)->NewDoubleArray(env, n); break;
+    }
+    if (out == NULL || n == 0 || ptr == NULL) {
+        return out;
+    }
+    switch (kind) {
+    case Jni_Z: (*env)->SetBooleanArrayRegion(env, (jbooleanArray)out, 0, n, (const jboolean*)ptr); break;
+    case Jni_B: (*env)->SetByteArrayRegion(env, (jbyteArray)out, 0, n, (const jbyte*)ptr); break;
+    case Jni_S: (*env)->SetShortArrayRegion(env, (jshortArray)out, 0, n, (const jshort*)ptr); break;
+    case Jni_I: (*env)->SetIntArrayRegion(env, (jintArray)out, 0, n, (const jint*)ptr); break;
+    case Jni_J: (*env)->SetLongArrayRegion(env, (jlongArray)out, 0, n, (const jlong*)ptr); break;
+    case Jni_F: (*env)->SetFloatArrayRegion(env, (jfloatArray)out, 0, n, (const jfloat*)ptr); break;
+    case Jni_D: (*env)->SetDoubleArrayRegion(env, (jdoubleArray)out, 0, n, (const jdouble*)ptr); break;
     }
     return out;
 }
 
-/* Copies a producer-owned allocation into a `ByteArray`, then frees it. */
-static inline jbyteArray Jni_take_bytes(JNIEnv* env, const uint8_t* ptr, size_t len) {
-    jbyteArray out = Jni_new_bytes(env, ptr, len);
+/* Jni_new_array over a run the producer handed over (a string, bytes, a
+   value buffer, or a typed array of `count` elements), which it then frees
+   whether or not the copy succeeded. */
+Jni_helper jarray Jni_take_array(JNIEnv* env, Jni_kind kind, const void* ptr, size_t count) {
+    jarray out = Jni_new_array(env, kind, ptr, count);
     if (ptr != NULL) {
-        {{PREFIX}}_free_bytes((uint8_t*)ptr, len);
+        {{PREFIX}}_free_bytes((uint8_t*)(uintptr_t)ptr, count * Jni_kind_size[kind]);
     }
     return out;
 }
 
-/* Throws the Kotlin exception for `err` (mapped through error domain
-   `domain`, or 0 for a call that can't fail, which raises the trap) and
-   clears `err`. */
-static inline void Jni_throw(JNIEnv* env, {{PREFIX}}_error* err, jint domain) {
-    const char* message = err->message != NULL ? err->message : "";
-    jbyteArray text = Jni_new_bytes(env, (const uint8_t*)message, strlen(message));
-    jbyteArray payload = NULL;
+/* A Java primitive array's elements copied out for one call (strings,
+   bytes, and value buffers as `ByteArray`s, typed arrays as `IntArray`s and
+   the like): one copy, into inline storage when it fits (8-aligned, as the
+   producer requires of typed arrays) and the heap otherwise. */
+typedef struct {
+    const void* ptr; /* NULL when empty */
+    size_t len;      /* element count */
+    void* heap;
+    uint64_t inline_buf[32];
+} Jni_run;
+
+/* Fills `run` from `array` (NULL is empty); 0, with OutOfMemoryError
+   pending, when the heap copy can't be allocated. */
+Jni_helper int Jni_borrow(JNIEnv* env, jarray array, Jni_kind kind, Jni_run* run) {
+    run->ptr = NULL;
+    run->len = 0;
+    run->heap = NULL;
+    if (array == NULL) {
+        return 1;
+    }
+    jsize n = (*env)->GetArrayLength(env, array);
+    if (n <= 0) {
+        return 1;
+    }
+    size_t bytes = (size_t)n * Jni_kind_size[kind];
+    void* dst = run->inline_buf;
+    if (bytes > sizeof run->inline_buf) {
+        run->heap = malloc(bytes);
+        if (run->heap == NULL) {
+            Jni_throw_oom(env, "could not copy an array argument");
+            return 0;
+        }
+        dst = run->heap;
+    }
+    Jni_get_region(env, array, kind, n, dst);
+    run->ptr = dst;
+    run->len = (size_t)n;
+    return 1;
+}
+
+Jni_helper void Jni_unborrow(Jni_run* run) {
+    free(run->heap);
+    run->heap = NULL;
+}
+
+/* A global reference the producer holds on to (a callback implementation
+   or an async completion): NULL for NULL, and NULL with OutOfMemoryError
+   pending when the JVM can't make one. */
+Jni_helper void* Jni_pin(JNIEnv* env, jobject obj) {
+    if (obj == NULL) {
+        return NULL;
+    }
+    jobject ref = (*env)->NewGlobalRef(env, obj);
+    if (ref == NULL && !(*env)->ExceptionCheck(env)) {
+        Jni_throw_oom(env, "could not create a JNI global reference");
+    }
+    return (void*)ref;
+}
+
+Jni_helper void Jni_unpin(JNIEnv* env, void* ref) {
+    if (ref != NULL) {
+        (*env)->DeleteGlobalRef(env, (jobject)ref);
+    }
+}
+
+/* Sets a failure with a C string message on `err`. */
+Jni_helper void Jni_set_error({{PREFIX}}_error* err, int32_t code, const char* message) {
+    {{PREFIX}}_error_set(err, code, (const uint8_t*)message, strlen(message));
+}
+
+/* Throws the Kotlin exception for `err` (mapped through `JniBridge.error`
+   domain `domain`) and clears `err`. */
+Jni_helper void Jni_throw(JNIEnv* env, {{PREFIX}}_error* err, jint domain) {
+    jarray text = Jni_new_array(env, Jni_B, err->message_ptr, err->message_len);
+    jarray payload = NULL;
     if (err->payload_ptr != NULL) {
-        payload = Jni_new_bytes(env, err->payload_ptr, err->payload_len);
+        payload = Jni_new_array(env, Jni_B, err->payload_ptr, err->payload_len);
     }
     jint code = (jint)err->code;
     {{PREFIX}}_error_clear(err);
@@ -87,7 +186,7 @@ static inline void Jni_throw(JNIEnv* env, {{PREFIX}}_error* err, jint domain) {
     }
 }
 
-static jint Jni_load_error(JNIEnv* env, const char* message) {
+Jni_helper jint Jni_load_error(JNIEnv* env, const char* message) {
     jclass cls = (*env)->FindClass(env, "java/lang/UnsatisfiedLinkError");
     if (cls != NULL) {
         (*env)->ThrowNew(env, cls, message);
@@ -107,7 +206,7 @@ typedef struct {
    has every expected entry with an equal hash; entries only the library
    has are fine. Fails loading with an error naming the first declaration
    that's missing or changed. */
-static inline jint Jni_check_contract(JNIEnv* env, const {{PREFIX}}_contract_entry* (*contract)(size_t*), const Jni_contract_entry* expected, size_t count) {
+Jni_helper jint Jni_check_contract(JNIEnv* env, const {{PREFIX}}_contract_entry* (*contract)(size_t*), const Jni_contract_entry* expected, size_t count) {
     size_t len = 0;
     const {{PREFIX}}_contract_entry* table = contract(&len);
     if (table == NULL) {
@@ -139,7 +238,8 @@ static inline jint Jni_check_contract(JNIEnv* env, const {{PREFIX}}_contract_ent
     return JNI_OK;
 }
 
-/* Generated below: the contract checks and the method IDs the shim caches. */
+/* Generated below: the contract checks and the classes and method IDs the
+   shim caches. */
 static jint Jni_load(JNIEnv* env);
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
@@ -156,7 +256,10 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     if (bridge == NULL) {
         return JNI_ERR;
     }
-    Jni_bridge = (jclass)(*env)->NewGlobalRef(env, bridge);
+    Jni_bridge = (jclass)Jni_pin(env, bridge);
+    if (Jni_bridge == NULL) {
+        return JNI_ERR;
+    }
     Jni_error = (*env)->GetStaticMethodID(env, Jni_bridge, "error", "(II[B[B)Ljava/lang/Throwable;");
     if (Jni_error == NULL) {
         return JNI_ERR;

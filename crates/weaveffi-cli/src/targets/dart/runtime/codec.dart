@@ -1,8 +1,8 @@
 // ── Value buffers ──
-// Records, rich enums, optionals, lists, maps, and error payloads cross the
-// C ABI serialized in this little-endian, packed format. A malformed buffer
-// is a contract violation between producer and bindings, never a domain
-// error.
+// Records, rich enums, maps, error payloads, and every optional or list that
+// isn't a scalar optional or a numeric array at a call boundary cross the C
+// ABI serialized in this little-endian, packed format. A malformed buffer is
+// a contract violation between producer and bindings, never a domain error.
 
 Never _bufferError(String context) =>
     throw StateError('malformed value buffer: $context');

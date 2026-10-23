@@ -1,50 +1,36 @@
-//! Snapshot tests covering every generator against a small, feature-complete
-//! IDL corpus.
+//! Snapshot tests covering every generator.
 //!
 //! Five fixtures cover the whole IDL surface between them: `kitchen_sink`
-//! (every scalar and composite type, an interface with objects in optional,
-//! list, iterator, and record positions, a callback interface, an error
-//! domain, iterators, async and cancellable functions, deprecation, and a
-//! nested submodule), `shapes` (rich enums and the full numeric primitive
-//! set), `nested_modules` (a three-deep module tree with cross-module
-//! references), `docs_everywhere` (doc comments on every declaration kind),
-//! and `edge_cases` (identifiers that are reserved words in some target,
-//! deeply nested composites, optional parameters, interfaces and callback
-//! interfaces in every legal position, async functions with non-string
-//! results, type-level deprecation, and scalar and string iterators). One
-//! test per generator renders all five fixtures and checks each file, in
-//! sorted order, by one of three rules:
+//! (every scalar and composite type, OptDirect and Slice values in every
+//! position, an interface with objects in optional, list, iterator, and
+//! record positions, two callback interfaces, two error domains, typed and
+//! untyped `throws`, iterators, async and cancellable functions,
+//! deprecation, and a nested submodule), `shapes` (rich enums and the full
+//! numeric primitive set), `nested_modules` (a three-deep module tree with
+//! cross-module references), `docs_everywhere` (doc comments on every
+//! declaration kind), and `edge_cases` (identifiers that are reserved words
+//! in some target, deeply nested composites, and every legal position of
+//! interfaces and callback interfaces).
 //!
-//! - A file that shares its name with a C target output is that target's
-//!   copy of the C header. It must be byte-equal to the C target's own
-//!   header, which `snapshot_c` snapshots, so it gets no snapshot of its own.
-//! - A file matching the target's entry in [`FIXED_FILES`] (fixed runtimes,
-//!   package manifests, READMEs) is the same for every fixture apart from
-//!   its name, so it's snapshotted once, from [`FIXED_FROM`].
-//! - Every other file depends on the fixture and is snapshotted for every
-//!   fixture.
+//! Every target renders all five fixtures. Each rendered file must carry the
+//! WeaveFFI prelude, and a file that shares its name with a C target output
+//! (a target's copy of the C header) must be byte-equal to the C target's.
+//! Only `kitchen_sink` is snapshotted, as full files, and only the files
+//! that depend on the API: a file matching one of the target's
+//! [`fixed_files`](weaveffi_cli::targets::Target::fixed_files) patterns
+//! (fixed runtimes, package manifests, READMEs) isn't snapshotted at all.
+//! The other fixtures are covered by the fixture compile checks
+//! (`scripts/check-fixtures.sh`) and by targeted assertions in each target's
+//! unit tests.
 //!
-//! Snapshots live under `tests/snapshots/`. Regressions in any generator's
-//! output fail the affected `cargo insta test` job; behavioral regressions
-//! are the conformance harness's job.
+//! Snapshots live under `tests/snapshots/` and are named
+//! `{target}_kitchen_sink__{path}`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use camino::Utf8Path;
-use weaveffi_cli::codegen::{ConfiguredBackend, Target};
-use weaveffi_cli::targets::c::{CConfig, CGenerator};
-use weaveffi_cli::targets::cpp::{CppConfig, CppGenerator};
-use weaveffi_cli::targets::dart::{DartConfig, DartGenerator};
-use weaveffi_cli::targets::dotnet::{DotnetConfig, DotnetGenerator};
-use weaveffi_cli::targets::go::{GoConfig, GoGenerator};
-use weaveffi_cli::targets::kotlin::{KotlinConfig, KotlinGenerator};
-use weaveffi_cli::targets::node::{NodeConfig, NodeGenerator};
-use weaveffi_cli::targets::python::{PythonConfig, PythonGenerator};
-use weaveffi_cli::targets::ruby::{RubyConfig, RubyGenerator};
-use weaveffi_cli::targets::swift::{SwiftConfig, SwiftGenerator};
-use weaveffi_cli::targets::wasm::{WasmConfig, WasmGenerator};
+use weaveffi_cli::targets::{self, Target, REGISTRY};
 use weaveffi_model::model::Model;
 use weaveffi_model::parse::parse_api_str;
 use weaveffi_model::pkg::Identity;
@@ -58,60 +44,11 @@ const FIXTURES: [&str; 5] = [
     "edge_cases",
 ];
 
-/// The fixture that fixed files are snapshotted from. It exercises every
-/// feature, so it also emits every optional fixed file (such as Kotlin's
-/// `Async.kt`).
-const FIXED_FROM: &str = "kitchen_sink";
-
-/// Per target, the files whose content doesn't depend on the fixture beyond
-/// its name: fixed runtimes, package manifests, and READMEs. (A README's
-/// usage example names the top-level modules, and Kotlin's
-/// `build.gradle.kts` adds the coroutines dependency only for async APIs;
-/// [`FIXED_FROM`] covers both.) A pattern starting with `*` matches a
-/// file-name suffix; any other pattern matches the whole file name. Every
-/// pattern must match a [`FIXED_FROM`] output, so a renamed or removed file
-/// can't leave a stale entry behind.
-const FIXED_FILES: &[(&str, &[&str])] = &[
-    ("c", &[]),
-    ("cpp", &["CMakeLists.txt", "README.md"]),
-    ("swift", &["Package.swift", "module.modulemap"]),
-    (
-        "kotlin",
-        &[
-            "Async.kt",
-            "Buffers.kt",
-            "CMakeLists.txt",
-            "Runtime.kt",
-            "build.gradle.kts",
-            "consumer-rules.pro",
-            "settings.gradle.kts",
-        ],
-    ),
-    (
-        "node",
-        &["README.md", "binding.gyp", "package.json", "runtime.js"],
-    ),
-    (
-        "wasm",
-        &["README.md", "linear.js", "package.json", "runtime.js"],
-    ),
-    (
-        "python",
-        &["README.md", "__init__.py", "py.typed", "pyproject.toml"],
-    ),
-    ("dotnet", &["*.csproj", "README.md", "Runtime.cs"]),
-    ("dart", &["README.md", "pubspec.yaml"]),
-    ("go", &["README.md", "codec.go", "go.mod", "runtime.go"]),
-    ("ruby", &["*.gemspec", "README.md", "runtime.rb"]),
-];
-
-fn fixed_patterns(target: &str) -> &'static [&'static str] {
-    FIXED_FILES
-        .iter()
-        .find(|(name, _)| *name == target)
-        .map(|(_, patterns)| *patterns)
-        .unwrap_or_else(|| panic!("target {target} has no FIXED_FILES entry"))
-}
+/// The one fixture whose outputs are snapshotted. It exercises every
+/// feature, so it also emits every optional file (such as Kotlin's
+/// `Async.kt`), and every fixed-file pattern must match one of its outputs,
+/// so a renamed or removed file can't leave a stale entry behind.
+const SNAPSHOTTED: &str = "kitchen_sink";
 
 fn matches_pattern(pattern: &str, file_name: &str) -> bool {
     match pattern.strip_prefix('*') {
@@ -123,8 +60,10 @@ fn matches_pattern(pattern: &str, file_name: &str) -> bool {
 /// The C target's outputs for `api`, keyed by file name. Other targets copy
 /// the C header verbatim, under the same file name.
 fn c_outputs(model: &Model) -> BTreeMap<String, String> {
-    ConfiguredBackend::new(CGenerator, CConfig::default())
-        .render(model, Utf8Path::new("out"))
+    targets::find("c")
+        .expect("the C target")
+        .build_default()
+        .render(model)
         .into_iter()
         .map(|file| {
             let name = file.path.file_name().expect("file name").to_owned();
@@ -182,8 +121,7 @@ fn assert_prelude_present(contents: &str, file: &Path) {
 }
 
 fn run_snapshots(target: &dyn Target) {
-    let out_dir = Utf8Path::new("out");
-    let fixed = fixed_patterns(target.name());
+    let fixed = target.fixed_files();
     let mut unmatched: BTreeSet<&str> = fixed.iter().copied().collect();
     for stem in FIXTURES {
         let model = load_model(stem);
@@ -192,14 +130,13 @@ fn run_snapshots(target: &dyn Target) {
         } else {
             c_outputs(&model)
         };
-        let mut files = target.render(&model, out_dir);
+        let mut files = target.render(&model);
         files.sort_by(|a, b| a.path.cmp(&b.path));
         assert!(
             !files.is_empty(),
             "generator {} produced no files for fixture {stem}",
             target.name(),
         );
-        let root = out_dir.join(target.name());
 
         insta::with_settings!({
             snapshot_path => "snapshots",
@@ -217,49 +154,33 @@ fn run_snapshots(target: &dyn Target) {
                     );
                     continue;
                 }
-                if let Some(pattern) = fixed.iter().find(|p| matches_pattern(p, file_name)) {
-                    if stem != FIXED_FROM {
-                        continue;
-                    }
-                    unmatched.remove(pattern);
+                if stem != SNAPSHOTTED {
+                    continue;
                 }
-                let rel = file
-                    .path
-                    .strip_prefix(&root)
-                    .expect("file under generator root");
-                let name = format!("{}_{stem}__{}", target.name(), sanitize(rel.as_std_path()));
+                if let Some(pattern) = fixed.iter().find(|p| matches_pattern(p, file_name)) {
+                    unmatched.remove(pattern);
+                    continue;
+                }
+                let name = format!(
+                    "{}_{stem}__{}",
+                    target.name(),
+                    sanitize(file.path.as_std_path())
+                );
                 insta::assert_snapshot!(name, redact_version(&file.contents));
             }
         });
     }
     assert!(
         unmatched.is_empty(),
-        "FIXED_FILES patterns for {} match no {FIXED_FROM} output: {unmatched:?}",
+        "fixed-file patterns for {} match no {SNAPSHOTTED} output: {unmatched:?}",
         target.name(),
     );
 }
 
-macro_rules! snapshot_tests {
-    ($( $fn_name:ident => $gen:expr, $cfg:ty; )*) => {
-        $(
-            #[test]
-            fn $fn_name() {
-                run_snapshots(&ConfiguredBackend::new($gen, <$cfg>::default()));
-            }
-        )*
-    };
-}
-
-snapshot_tests! {
-    snapshot_c => CGenerator, CConfig;
-    snapshot_cpp => CppGenerator, CppConfig;
-    snapshot_swift => SwiftGenerator, SwiftConfig;
-    snapshot_kotlin => KotlinGenerator, KotlinConfig;
-    snapshot_node => NodeGenerator, NodeConfig;
-    snapshot_wasm => WasmGenerator, WasmConfig;
-    snapshot_python => PythonGenerator, PythonConfig;
-    snapshot_dotnet => DotnetGenerator, DotnetConfig;
-    snapshot_dart => DartGenerator, DartConfig;
-    snapshot_go => GoGenerator, GoConfig;
-    snapshot_ruby => RubyGenerator, RubyConfig;
+/// Every registered target, each with its default configuration.
+#[test]
+fn snapshot_every_target() {
+    for desc in REGISTRY {
+        run_snapshots(desc.build_default().as_ref());
+    }
 }

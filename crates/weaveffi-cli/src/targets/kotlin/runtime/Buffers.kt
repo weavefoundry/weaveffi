@@ -244,3 +244,33 @@ internal inline fun <T> decodeBuffer(bytes: ByteArray, read: (BufferReader) -> T
     r.expectEnd()
     return v
 }
+
+/**
+ * Structural equality that compares `ByteArray`s by content, also inside
+ * lists, maps, and optionals: what a record field holding bytes compares
+ * by (a `ByteArray`'s own `equals` is identity).
+ */
+internal fun deepEquals(a: Any?, b: Any?): Boolean = when {
+    a === b -> true
+    a is ByteArray && b is ByteArray -> a.contentEquals(b)
+    a is List<*> && b is List<*> -> a.size == b.size && a.indices.all { deepEquals(a[it], b[it]) }
+    a is Map<*, *> && b is Map<*, *> ->
+        a.size == b.size && a.all { (k, v) -> b.containsKey(k) && deepEquals(v, b[k]) }
+    else -> a == b
+}
+
+/** The hash matching [deepEquals]. */
+internal fun deepHashCode(a: Any?): Int = when (a) {
+    is ByteArray -> a.contentHashCode()
+    is List<*> -> a.fold(1) { h, e -> 31 * h + deepHashCode(e) }
+    is Map<*, *> -> a.entries.sumOf { (k, v) -> k.hashCode() xor deepHashCode(v) }
+    else -> a.hashCode()
+}
+
+/** The `toString` matching [deepEquals]: byte arrays print their content. */
+internal fun deepToString(a: Any?): String = when (a) {
+    is ByteArray -> a.contentToString()
+    is List<*> -> a.joinToString(", ", "[", "]") { deepToString(it) }
+    is Map<*, *> -> a.entries.joinToString(", ", "{", "}") { (k, v) -> "$k=${deepToString(v)}" }
+    else -> a.toString()
+}

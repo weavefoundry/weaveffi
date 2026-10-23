@@ -1,11 +1,17 @@
 # C++
 
-The C++ target emits a header-only C++17 library over the C ABI (revision
-4). Records become value structs, rich enums become `std::variant`-backed
-sum types, interfaces become copyable RAII classes, callback interfaces
-become abstract classes you subclass, error domains become exception
-hierarchies, async functions return `std::future`, and `iter<T>` returns a
-lazy range.
+The C++ target emits a header-only C++17 library over the
+[C ABI](../reference/abi.md) (revision 5). Records become aggregates with
+memberwise equality, rich enums become `std::variant`-backed sum types,
+interfaces become copyable RAII classes, callback interfaces become abstract
+classes you subclass, error domains become exception hierarchies rooted in
+one `Error` class, async functions return `std::future`, and `iter<T>`
+returns a lazy `Range<T>`.
+
+C++ is a [Tier 1](../stability.md#target-tiers) target: it tracks every ABI
+revision as it lands and runs the full conformance suite in CI. The header
+compiles warning-free with `-Wall -Wextra -Werror` as C++17 (with
+`-Wpedantic`) and as C++20.
 
 ## What gets generated
 
@@ -21,7 +27,8 @@ For the kvstore sample that's `kvstore.h`, `kvstore.hpp`, `CMakeLists.txt`,
 and `README.md`. Everything in the wrapper lives in `namespace {prefix}`
 (`kvstore`), and each IDL module's free functions live in a nested namespace
 named after the module path (`kvstore::kv::stats::summarize`). Types sit at
-the namespace root, since type names are unique across an API.
+the namespace root, since type names are unique across an API. Machinery the
+wrapper uses internally lives in `{namespace}::detail`.
 
 | `[generators.cpp]` key | Default | Meaning |
 |---|---|---|
@@ -57,37 +64,34 @@ README, and a `CMakeLists.txt` that links the host's library into
 ### The library check
 
 `check_library()` verifies that the linked library implements C ABI revision
-4 and every declaration the header was generated with, and throws
+5 and every declaration the header was generated with, and throws
 `LoadError` naming the first mismatch. The header embeds each top-level
-module's contract table as `(id, hash, path)` entries and compares them with
-the table the library returns from `{prefix}_{module}_contract`:
+module's contract table as `(id, hash, path)` entries, with the canonical
+signature as a comment, and compares them with the table the library returns
+from `{prefix}_{module}_contract`:
 
 ```cpp
-inline void check_library() {
-    static const std::string failure = []() -> std::string {
-        uint32_t abi = kvstore_abi_version();
-        if (abi != KVSTORE_ABI_VERSION) {
-            return "kvstore: C ABI revision mismatch (header " + std::to_string(KVSTORE_ABI_VERSION) +
-                   ", library " + std::to_string(abi) + ")";
-        }
-        if (std::string why = detail::contract_mismatch(kvstore_kv_contract, detail::kv_contract); !why.empty()) {
-            return "kvstore: " + why;
-        }
-        ...
+inline constexpr ContractEntry kv_contract[] = {
+    {0x1bac41daa51c4fd5ull, 0x828679ef84968913ull, "kv.KvError.CallbackFailed"}, // code CallbackFailed = 1006 {string}
+    ...
+};
 ```
 
 A declaration the library lacks fails with `kvstore: kv.Store.put is
 missing from the library`, and one whose signature differs with
-`kvstore: kv.Store.put changed since these bindings were generated`.
-Declarations the library has and the header doesn't are fine, so a library
-that adds functions keeps working with older bindings.
+`kvstore: kv.Store.put changed since these bindings were generated`. The
+table has one entry per function and member, type, error domain, error code,
+callback interface, and callback method. Entries the library has and the
+header doesn't are fine, so a library that adds functions, error codes, or
+callback methods keeps working with older bindings.
 
 A C++ binary links its library rather than loading it, and an exception
 thrown during static initialization can't be caught, so the check runs on
 first use instead: every free function, constructor, and static member calls
 `check_library()` before its first native call. The result is cached in a
 function-local static, so the cost after the first call is one
-guard-variable read. Call it at startup to fail early.
+guard-variable read. Call it at startup to fail early; `LoadError` derives
+from `Error` (with code 0), so one `catch` handles it with everything else.
 
 ## Type mapping
 
@@ -97,37 +101,63 @@ guard-variable read. Call it at startup to fail early.
 | `string` | `std::string` | `std::string_view` |
 | `bytes` | `std::vector<uint8_t>` | `const std::vector<uint8_t>&` |
 | C-style enum | `enum class E : int32_t` | by value |
-| record | `struct R` | `const R&` |
+| record | `struct R` (aggregate) | `const R&` |
 | rich enum | `struct E` with `std::variant<...> value` | `const E&` |
 | interface | RAII class | `const I&` (borrowed) |
 | `I?` | `std::optional<I>` | `const std::optional<I>&` |
 | callback interface, `Cb?` | abstract class | `std::shared_ptr<Cb>` (empty for none when optional) |
-| `T?`, `[T]`, `{K: V}` | `std::optional<T>`, `std::vector<T>`, `std::unordered_map<K, V>` | by const reference |
-| `iter<T>` | lazy range class (returns only) | n/a |
+| `T?` of a scalar, `bool`, or C-style enum | `std::optional<T>` | by value |
+| `[P]` of a numeric primitive | `std::vector<P>` | `const std::vector<P>&` |
+| other `T?`, `[T]`, `{K: V}` | `std::optional<T>`, `std::vector<T>`, `std::unordered_map<K, V>` | by const reference |
+| `iter<T>` | `Range<T>` (returns only) | n/a |
 
-Strings cross the ABI as a UTF-8 pointer and a length, so interior NULs
-survive in both directions. A returned string is copied into a `std::string`
-and the producer's run is released with `{prefix}_free_bytes`. Records, rich
-enums, optionals, lists, and maps cross as one value buffer. The header has
-one writer and one reader per record, rich enum, and distinct composite type
-(`detail::write_list_Entry`, `detail::read_map_string_Store`), and every call
-site delegates to them.
+How a value crosses the ABI follows its type:
+
+- Strings cross as a UTF-8 pointer and a length, so interior NULs survive in
+  both directions. A returned string is copied into a `std::string` and the
+  producer's run is released with `{prefix}_free_bytes`.
+- An optional scalar, `bool`, or C-style enum (`i64?`, `Mode?`) crosses
+  directly as a presence flag and a value, never through a buffer.
+- A list of a numeric primitive other than `u8` (`[i32]`, `[f64]`) crosses
+  as a typed array: the wrapper passes the vector's own storage (`.data()`,
+  `.size()`) without copying, and a returned array is copied into a new
+  `std::vector` before the producer's run is released.
+- Records, rich enums, and every other optional, list, and map cross as one
+  value buffer. The header has one `detail::write` and one `detail::read`
+  overload per record and rich enum; optionals, vectors, and maps are encoded
+  by generic templates in the runtime, so a new composite shape never adds
+  code.
+
+Records are aggregates: build one with braces (`Entry{"key", value}`), and
+every member not given takes its default member initializer (zero for
+scalars and enums, empty otherwise), so a partial initializer compiles
+without `-Wmissing-field-initializers` warnings. An interface wrapper has no
+empty state, so a member holding one by value (or holding a record that
+does) has no default, and a record with such a member has no default
+constructor. Records and rich enums
+compare with `==` and `!=` memberwise: floating-point members as IEEE values
+(a NaN member is unequal to itself), and interface members by identity.
 
 ## Objects and lifetime
 
 An interface class holds one strong reference to a reference-counted
-producer object:
+producer object through a `detail::Handle`, so the class itself follows the
+Rule of Zero:
 
 ```cpp
 class Store {
-    kvstore_kv_Store* raw_;
-
 public:
-    /** The C type this class wraps. */
     using raw_type = kvstore_kv_Store;
-
-    /** Adopts one strong reference to a producer object: `Store(adopt, raw)`. */
-    explicit Store(adopt_t, kvstore_kv_Store* h) noexcept : raw_(h) {}
+    explicit Store(adopt_t, raw_type* raw) noexcept : raw_(raw) {}
+    ...
+private:
+    struct traits {
+        using raw_type = kvstore_kv_Store;
+        static raw_type* clone(const raw_type* raw) noexcept { return kvstore_kv_Store_clone(raw); }
+        static void destroy(raw_type* raw) noexcept { kvstore_kv_Store_destroy(raw); }
+    };
+    detail::Handle<traits> raw_;
+};
 ```
 
 - The destructor releases the reference with `_destroy`; copying takes a new
@@ -141,10 +171,11 @@ public:
   handed to a callback are adopted.
 - An object inside a record, list, map, or optional crosses as a token
   minted with `_clone`, so a record can be copied and destroyed freely.
-- `handle()` borrows the C pointer (compare two wrappers' handles to test
-  identity); `clone_handle()` returns a new reference the caller owns. An
-  interface member named `handle`, `clone_handle`, or `raw_type` gains a
-  trailing `_` ([reserved member names](../reference/naming.md#identifiers-in-generated-code)).
+- `==` and `!=` compare identity: two wrappers are equal when they share one
+  producer object. `handle()` borrows the C pointer; `clone_handle()`
+  returns a new reference the caller owns. An interface member named
+  `handle`, `clone_handle`, `raw_type`, or `traits` gains a trailing `_`
+  ([reserved member names](../reference/naming.md#identifiers-in-generated-code)).
 
 The C++ object model makes lifetimes the caller's responsibility: a wrapper
 must outlive the calls made through it, and destroying a wrapper on one
@@ -153,29 +184,38 @@ object. A moved-from wrapper holds null.
 
 ## Errors
 
-A call that declares errors (`throws`) throws an exception derived from
-`{namespace}::Error`, which derives from `std::runtime_error` and carries
-`code()`:
+Every exception the library throws derives from `{namespace}::Error`, which
+derives from `std::runtime_error` and carries `code()`. Which class a failed
+call throws depends on what it declares:
 
-- Each module that declares an error domain gets a domain class
-  (`KvError : Error`) and one subclass per code (`KeyNotFoundError`). Both
-  names end in `Error`, which is appended when the IDL name lacks it (the
-  `KitchenErrors` domain becomes `KitchenErrorsError`). A code with payload
-  fields exposes them as public members (`e.key`).
-- A positive code throws its typed subclass. A negative runtime code
-  throws the root `Error` with that code: -1 generic, -2 producer panic, -3
-  marshalling failure, and -4 a callback implementation that failed.
-- -5 throws `Cancelled`, which also derives from `Error`.
+- `throws: SomeDomain`: each error domain gets a class (`KvError : Error`)
+  and one subclass per code (`KeyNotFoundError : KvError`). The names come
+  from the shared naming rule, which appends `Error` unless the IDL name
+  already ends in it (the `KitchenErrors` domain is `KitchenError`). A code
+  with payload fields exposes them as public members (`e.key`); a field
+  named `code` or `what` gains a trailing `_` so it doesn't hide `code()` or
+  `what()`. A declared code throws its class. Domains are open: a positive
+  code these bindings don't know (a newer producer added it) throws the
+  domain class itself, with the code and message intact. A module may
+  declare several domains, and each call throws only its own, so two domains
+  can reuse a code value.
+- `throws: any`: a failure throws `Error` itself, with code -1 and the
+  producer's message.
+- Nothing declared: the call can still fail, but only through a producer
+  bug, so it follows the
+  [trap policy](../guides/errors-and-memory.md#the-trap-policy) and throws
+  `InternalError` (an `Error`) with the runtime code and message.
 
-A call that declares no errors can still fail, but only through a producer
-bug, so it follows the [trap policy](../guides/errors-and-memory.md#the-trap-policy):
-it throws `InternalError`, a `std::runtime_error` that isn't an `Error`,
-whose `what()` names the runtime code and the producer's message and whose
-`code()` and `message()` return them. A value buffer the wrapper can't
-decode is also an `InternalError` with code -3.
+On a call that declares errors, a runtime code throws the root `Error` with
+that code (-2 producer panic, -3 marshalling failure, -4 a callback
+implementation that failed); under every policy, -5 throws `Cancelled`. A value
+buffer the wrapper can't decode is an `InternalError` with code -3, and a
+required callback interface passed as an empty `std::shared_ptr` is an
+`Error` with code -3, refused before the call. `LoadError` reports a library
+that doesn't match the headers. Wrappers are never `noexcept`.
 
-`LoadError` (also a `std::runtime_error`) reports a library that doesn't
-match the headers. Wrappers are never `noexcept`.
+Error messages cross the ABI as a pointer and a length, so they keep any byte
+the producer sent; an empty message is `""`.
 
 ```cpp
 try {
@@ -183,7 +223,9 @@ try {
 } catch (const kvstore::KeyNotFoundError& e) {
     std::cerr << e.what() << " (" << e.key << ")\n";
 } catch (const kvstore::KvError& e) {
-    // Any other kv code.
+    // Any other kv code, known or not.
+} catch (const kvstore::Error& e) {
+    // A runtime failure (e.code() < 0).
 }
 ```
 
@@ -214,8 +256,10 @@ try {
 }
 ```
 
-`std::future` has no cancellation of its own, so destroying a future doesn't
-cancel the call; cancel its token instead.
+An async result crosses like a return of its type: an optional scalar as a
+flag and a value, a typed array as a pointer and a count. `std::future` has
+no cancellation of its own, so destroying a future doesn't cancel the call;
+cancel its token instead.
 
 ## Callback interfaces
 
@@ -227,54 +271,62 @@ class Policy {
 public:
     virtual ~Policy() = default;
 
+    virtual std::optional<int64_t> ttl_for(std::string_view key, std::optional<int64_t> requested) = 0;
     virtual Entry admit(const Entry& entry) = 0;
     virtual Store route(std::string_view key, Store home) = 0;
 };
 ```
 
 Pass an implementation as `std::shared_ptr`. The wrapper boxes the pointer
-as the vtable context and hands the producer a static vtable whose header
-records its `size` and whose `free` deletes the box when the producer
-releases the implementation, which runs your destructor if nothing else
-holds it. For an optional callback parameter (`Loader?`), an empty
-`std::shared_ptr` (or `nullptr`) passes none; a required one throws
-`std::invalid_argument` when empty. The producer may call methods, and
-release the implementation, from any thread, so implementations must be
-thread-safe.
+as the vtable context and hands the producer a static vtable (from
+`detail::Callbacks<Policy>`) whose header records its `size` and whose `free`
+deletes the box when the producer releases the implementation, which runs
+your destructor if nothing else holds it. For an optional callback parameter
+(`Loader?`), an empty `std::shared_ptr` (or `nullptr`) passes none. The
+producer may call methods, and release the implementation, from any thread,
+so implementations must be thread-safe; the vtable never sets the
+thread-affine flag.
 
 Arguments follow the parameter rules seen from your side: a string is a
-`std::string_view` valid for the call, bytes and buffered values arrive by
-const reference to a decoded copy, and an object arrives by value as a
-wrapper you own.
+`std::string_view` valid for the call, a typed array, bytes, or a buffered
+value arrives by const reference to a copy, an optional scalar as
+`std::optional<T>`, and an object by value as a wrapper you own.
 
-A method can return any family. A direct value is returned as is; an object
-(`Store`, `std::optional<Store>`) hands the producer a fresh reference; a
-string, bytes, or buffered value is copied into a run allocated with
-`{prefix}_alloc`, which the producer adopts. A required object return that's
-null (a moved-from wrapper) is refused by the producer with -3, as is a
-record the producer can't decode.
+A method can return any type. A scalar is returned as is and an optional
+scalar as a flag and a value; an object (`Store`, `std::optional<Store>`)
+hands the producer a fresh reference; a string, bytes, typed array, or
+buffered value is copied into a run allocated with `{prefix}_alloc`, which
+the producer adopts. A required object return that's null (a moved-from
+wrapper) and a value the producer can't decode are refused by the producer
+with -3.
 
-A method declared `throws` may throw its module's domain exception: the
-code, the message (`what()`), and the code's fields reach the producer,
-which decodes them into its own error type.
+Each method reports an exception according to what it declares, and nothing
+unwinds through the C frame:
+
+- `throws: SomeDomain`: throw the domain's class or one of its codes'
+  classes. The code, the message (`what()`), and the code's fields reach the
+  producer, which decodes them into its own error type. Any other exception
+  is a plain failure (code -1 with its `what()`).
+- `throws: any`: any exception is a failure, code -1 with its `what()`.
+- Nothing declared: any exception is a callback failure, -4.
 
 ```cpp
 Entry admit(const Entry& entry) override {
-    if (entry.key == "secret") throw kvstore::RejectedError("secrets are not stored", entry.key, "no secrets");
+    if (entry.key == "secret") throw kvstore::RejectedError("not stored", entry.key, "no secrets");
     return entry;
 }
 ```
 
-Any other exception, or a domain exception from a method that doesn't
-declare errors, reaches the producer as a callback failure (-4) with the
-exception's `what()`; nothing unwinds through the C frame. Whether the
-original call then fails is the producer's decision: a Rust producer that
-propagates the failure with `?` makes a throwing call throw the same
-`RejectedError` (or the root `Error` with code -4).
+Whether the original call then fails is the producer's decision. A Rust
+producer that propagates a typed failure with `?` makes the call throw the
+same `RejectedError`, with the message the producer renders for it; the
+kvstore sample turns any other callback failure into `CallbackFailedError`
+carrying your exception's message.
 
 ## Iterators
 
-An `iter<T>` function returns a move-only range class:
+An `iter<T>` function returns `Range<T>`, a lazy, single-pass, move-only
+range:
 
 ```cpp
 for (const std::string& key : store.keys(std::nullopt)) {
@@ -282,16 +334,25 @@ for (const std::string& key : store.keys(std::nullopt)) {
 }
 ```
 
-Each step pulls one element. The range releases the producer iterator when
-it's exhausted or destroyed, so abandoning a loop early leaks nothing.
-`next()` returns `std::optional<T>` for manual iteration.
+Each step pulls one element; an element crosses like a return of its type,
+so `iter<i64?>` yields `std::optional<int64_t>` (an absent element isn't the
+end) and `iter<[i32]>` yields `std::vector<int32_t>`. The range releases the
+producer iterator exactly once: when it's exhausted, when a step throws, on
+`close()`, or from the destructor, so abandoning a loop early leaks nothing.
+`next()` returns `std::optional<T>` for manual iteration. The iterator type
+models an input iterator with a sentinel end, so under C++20 a `Range<T>` is
+a `std::ranges::input_range`.
 
 ## Known limitations
 
-- The ranges are single-pass input ranges; copy them into a `std::vector`
-  for random access.
+- Ranges are single-pass input ranges; copy them into a `std::vector` for
+  random access.
+- A typed array argument is a `const std::vector<T>&`; C++17 has no
+  `std::span`, so other contiguous storage must be copied into a vector first.
 - A callback interface must be a `std::shared_ptr` to a subclass; there's
   no lambda overload.
+- C++ implementations don't declare their vtables thread-affine, so the
+  producer may call any method from any thread.
 - Exceptions not derived from `std::exception` are reported to the
   producer with a generic message.
 - The library check runs on first use, not at load time (see above).

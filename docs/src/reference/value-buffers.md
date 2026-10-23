@@ -10,16 +10,23 @@ This page is the normative wire format every generator and the
 
 - a struct (record)
 - a rich enum (any variant has fields)
-- `[T]`, `{K:V}`
-- `T?`, except `Interface?`, which stays a nullable object pointer at the top
-  level of a parameter or return, and `Cb?`, an optional callback parameter
-  whose null vtable means none
+- `{K:V}`
+- `[T]`, except a list of a fixed-width number (`[i8]`, `[i16]`, `[i32]`,
+  `[i64]`, `[u16]`, `[u32]`, `[u64]`, `[f32]`, `[f64]`), which crosses as a
+  typed array (the Slice family) at the top level of a parameter, return,
+  async result, iterator item, or callback method
+- `T?`, except an optional scalar or C-style enum (the OptDirect family,
+  `bool has_v, T v` at the top level), `Interface?`, which stays a nullable
+  object pointer, and `Cb?`, an optional callback parameter whose null
+  vtable means none
 
 Everything else keeps its own slot shape at the top level (see the
 [C ABI contract](abi.md#families-and-slots)): direct values by value, strings
 and bytes as `(ptr, len)`, objects as pointers. Any of them may appear
-*inside* a buffer. Iterators and callback interfaces never do; validation
-rejects them in buffered positions.
+*inside* a buffer, and there they all use the encoding below: a record's
+`i64?` field is a flag byte and a value, and its `[f64]` field is a count and
+packed elements, exactly as before revision 5. Iterators and callback
+interfaces never appear inside a buffer; validation rejects them there.
 
 ## Encoding
 
@@ -95,13 +102,25 @@ exactly one strong reference, in either direction.
 A zero token is invalid in a non-optional position; `Interface?` inside a
 buffer uses the optional flag byte followed by the token.
 
-A callback method's error payload can't carry object tokens: an error code
-whose fields include an interface can't be reported from a callback, and a
+An error payload never carries object tokens: validation rejects an error
+code whose fields reach an interface (`ObjectInErrorPayload`), because a
+consumer that doesn't know a code discards its payload undecoded, and a
 Rust producer decodes a callback's payload with a reader that refuses every
 token. That reader (`BufferReader::token_free`) is also why decoding is
 otherwise `unsafe` in the Rust runtime: only a reader that refuses tokens can
 safely decode arbitrary bytes, because no safe function can turn an arbitrary
 `u64` into an object reference.
+
+## Runs
+
+A buffer the producer hands out (a return, an iterator element, an async
+result, an error payload) is a run allocated with alignment 8, released
+with `{p}_free_bytes(ptr, len)` (or, for a payload, with the error). A
+buffer a consumer returns from a callback method is a run it allocates
+with `{p}_alloc(len)`, which the producer adopts. A buffer a consumer
+passes as a parameter is its own memory, borrowed for the call, with no
+alignment requirement: values inside a buffer are packed and read
+byte-wise.
 
 ## Slots and ownership
 
@@ -112,6 +131,7 @@ safely decode arbitrary bytes, because no safe function can turn an arbitrary
 | iterator element | `const uint8_t** out_item, size_t* out_len` | the consumer, per element |
 | async result | `const uint8_t* result_ptr, size_t result_len` | the consumer |
 | callback method argument | `const uint8_t* v_ptr, size_t v_len` | the producer; borrowed for the call |
+| callback method return | `uint8_t** out_ptr, size_t* out_len` | a `{p}_alloc` run the producer adopts |
 | error payload | `payload_ptr`, `payload_len` in `{p}_error` | freed by `{p}_error_clear` or `{p}_error_free` |
 
 Object tokens inside any of these transfer their reference to whoever
@@ -122,7 +142,9 @@ decodes them, including the consumer decoding a callback argument.
 Each binding ships a small private codec (a writer and a reader for the
 table above) plus one encode and one decode routine per record and rich enum,
 generated from the definition so field order is fixed at generation time.
-Optionals, lists, and maps are handled generically. Lists of bytes and of
+Optionals, lists, and maps nested in buffers each get one codec per distinct
+shape, named by one canonical stem shared by every target (`list_i32`,
+`opt_Item`, `map_string_list_i64`). Lists of bytes and of
 fixed-width numbers (every integer and float type, but not `bool`, whose
 bytes must be validated) encode and decode with a single copy where the
 platform is little-endian. The `codec` sample's conformance lane checks every

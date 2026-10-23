@@ -9,7 +9,13 @@
 // OutOfRangeException and its payload, malformed input rejected as
 // marshalling failures (sent through raw `dart:ffi`, since the bindings only
 // encode well-formed values), and object identity and reference counting
-// through buffers. Ends by asserting the producer's leak counters are zero.
+// through buffers. Then the direct transports: optional scalars (OptDirect)
+// in both directions, numeric lists as typed arrays (bit-exact floats, the
+// u64 edges, a misaligned raw array rejected), `usize`, `char`, and a custom
+// type crossing as strings (their marshalling failures surface as a
+// NativeError, since those functions don't declare `throws`), and an
+// iterator of typed arrays. Ends by asserting the producer's leak counters
+// are zero.
 
 import 'dart:convert';
 import 'dart:ffi';
@@ -319,11 +325,13 @@ void outOfRange(int n) {
   );
 }
 
-/// The C `codec_error` struct, for raw calls.
+/// The C `codec_error` struct (ABI 5), for raw calls.
 final class RawError extends Struct {
   @Int32()
   external int code;
-  external Pointer<Utf8> message;
+  external Pointer<Uint8> messagePtr;
+  @Size()
+  external int messageLen;
   external Pointer<Uint8> payloadPtr;
   @Size()
   external int payloadLen;
@@ -365,6 +373,26 @@ final class Raw {
         Int64 Function(Pointer<Uint8>, Size, Pointer<RawError>),
         int Function(Pointer<Uint8>, int, Pointer<RawError>)
       >('codec_codec_sum_holder');
+  late final echoOptColor = _lib
+      .lookupFunction<
+        Bool Function(Bool, Int32, Pointer<Int32>, Pointer<RawError>),
+        bool Function(bool, int, Pointer<Int32>, Pointer<RawError>)
+      >('codec_codec_echo_opt_color');
+  late final echoU64s = _lib
+      .lookupFunction<
+        Pointer<Uint64> Function(
+          Pointer<Uint64>,
+          Size,
+          Pointer<Size>,
+          Pointer<RawError>,
+        ),
+        Pointer<Uint64> Function(
+          Pointer<Uint64>,
+          int,
+          Pointer<Size>,
+          Pointer<RawError>,
+        )
+      >('codec_codec_echo_u64s');
   late final errorClear = _lib
       .lookupFunction<
         Void Function(Pointer<RawError>),
@@ -434,6 +462,32 @@ void malformed(Raw raw) {
   ], (p, n, e) => raw.echoText(p, n, len, e));
   calloc.free(len);
   expect(textCode == -3, 'invalid UTF-8 is rejected (got $textCode)');
+  // An optional Color that's present must be a declared Color.
+  final out = calloc<Int32>();
+  final optColorCode = raw.code(
+    const [],
+    (_, __, e) => raw.echoOptColor(true, 3, out, e),
+  );
+  final absentCode = raw.code(
+    const [],
+    (_, __, e) => raw.echoOptColor(false, 3, out, e),
+  );
+  calloc.free(out);
+  expect(
+    optColorCode == -3 && absentCode == 0,
+    'a present undeclared Color? is rejected, an absent one ignored '
+    '(got $optColorCode, $absentCode)',
+  );
+  // A typed array must be aligned for its element type.
+  final misalignedCode = raw.code(List<int>.filled(17, 0), (p, n, e) {
+    final len = calloc<Size>();
+    raw.echoU64s((p + 1).cast(), 2, len, e);
+    calloc.free(len);
+  });
+  expect(
+    misalignedCode == -3,
+    'a misaligned array is rejected (got $misalignedCode)',
+  );
   // A zero token is a marshalling failure, not a crash.
   final zeroCode = raw.code(
     List<int>.filled(17, 0),
@@ -501,6 +555,111 @@ void objects(int n) {
   expectThrows<StateError>(() => p.value(), "a disposed wrapper can't be used");
 }
 
+bool listEquals<T>(List<T> a, List<T> b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
+void optionalScalars() {
+  expect(c.echoOptI32(null) == null, 'echoOptI32(null)');
+  expect(c.echoOptI32(i32Min) == i32Min, 'echoOptI32(i32 min)');
+  expect(c.echoOptI32(0) == 0, 'echoOptI32(0) is present');
+  final negZero = c.echoOptF64(-0.0);
+  expect(negZero != null && f64Bits(negZero) == f64Bits(-0.0), 'echoOptF64(-0.0)');
+  expect(c.echoOptF64(double.nan)?.isNaN ?? false, 'echoOptF64(NaN)');
+  expect(c.echoOptF64(null) == null, 'echoOptF64(null)');
+  expect(c.echoOptBool(true) == true, 'echoOptBool(true)');
+  expect(c.echoOptBool(false) == false, 'echoOptBool(false) is present');
+  expect(c.echoOptBool(null) == null, 'echoOptBool(null)');
+  expect(c.echoOptColor(c.Color.infrared) == c.Color.infrared, 'Infrared');
+  expect(c.echoOptColor(c.Color.blue) == c.Color.blue, 'Blue');
+  expect(c.echoOptColor(null) == null, 'echoOptColor(null)');
+}
+
+void typedArrays() {
+  final floats = [double.nan, -0.0, 5e-324, double.infinity];
+  final echoed = c.echoF64s(floats);
+  expect(
+    echoed.length == 4 &&
+        [for (var i = 0; i < 4; i++) f64Bits(echoed[i]) == f64Bits(floats[i])]
+            .every((same) => same),
+    'echoF64s is bit-identical (got $echoed)',
+  );
+  expect(echoed is Float64List, 'a returned [f64] is a Float64List');
+  expect(c.echoF64s(const []).isEmpty, 'echoF64s([])');
+  const ints = [i32Min, 0, 0x7fffffff];
+  expect(listEquals(c.echoI32s(ints), ints), 'echoI32s');
+  expect(
+    listEquals(c.echoI32s(Int32List.fromList(ints)), ints),
+    'echoI32s(Int32List)',
+  );
+  expect(c.echoI32s(const []).isEmpty, 'echoI32s([])');
+  // u64 travels as its bit pattern: u64::MAX is -1, 2^63 is i64 min.
+  expect(
+    listEquals(c.echoU64s(const [-1, i64Min]), const [-1, i64Min]),
+    'echoU64s edges',
+  );
+  expect(c.echoU64s(const []).isEmpty, 'echoU64s([])');
+
+  // An iterator of typed arrays.
+  List<List<int>> chunks(List<int> values, int size) =>
+      [for (final chunk in c.chunks(values, size)) chunk.toList()];
+  final edges = chunks(ints, 2);
+  expect(
+    edges.length == 2 &&
+        listEquals(edges[0], [i32Min, 0]) &&
+        listEquals(edges[1], [0x7fffffff]),
+    'chunks of the edges (got $edges)',
+  );
+  final pairs = chunks([1, 2, 3, 4], 2);
+  expect(
+    pairs.length == 2 && listEquals(pairs[0], [1, 2]) && listEquals(pairs[1], [3, 4]),
+    'chunks([1, 2, 3, 4], 2)',
+  );
+  expect(chunks([1, 2], 0).isEmpty && chunks(const [], 3).isEmpty, 'no chunks');
+}
+
+void customAndChar() {
+  expect(c.echoUsize(4294967295) == 4294967295, 'echoUsize(u32 max)');
+  expect(c.echoUsize(-1) == -1, 'echoUsize(u64 max)');
+  for (final s in ['\u{1F980}', 'é', 'a']) {
+    expect(c.echoChar(s) == s, 'echoChar($s)');
+  }
+  for (final (input, message) in [
+    ('ab', 'value: "ab" is not a valid char'),
+    ('', 'value: "" is not a valid char'),
+  ]) {
+    final e = expectThrows<c.NativeError>(
+      () => c.echoChar(input),
+      'echoChar("$input")',
+    );
+    expect(
+      e.code == c.NativeException.marshalCode && e.message == message,
+      'echoChar("$input") is -3 (got ${e.code}: ${e.message})',
+    );
+  }
+  expect(c.echoHex('ff') == 'ff', 'echoHex(ff)');
+  expect(c.echoHex('00FF') == 'ff', 'echoHex normalizes');
+  expect(c.echoHex('0') == '0', 'echoHex(0)');
+  for (final (input, message) in [
+    ('xyz', 'value: invalid digit found in string'),
+    ('', 'value: cannot parse integer from empty string'),
+    ('100000000', 'value: number too large to fit in target type'),
+  ]) {
+    final e = expectThrows<c.NativeError>(
+      () => c.echoHex(input),
+      'echoHex("$input")',
+    );
+    expect(
+      e.code == -3 && e.message == message,
+      'echoHex("$input") is -3 (got ${e.code}: ${e.message})',
+    );
+  }
+}
+
 Future<void> main() async {
   final n = c.vectorCount();
   expect(n >= 60, 'at least 60 vectors (got $n)');
@@ -511,6 +670,9 @@ Future<void> main() async {
   outOfRange(n);
   malformed(Raw());
   objects(n);
+  optionalScalars();
+  typedArrays();
+  customAndChar();
 
   await expectNoLeaks('codec');
   print('dart/codec: OK ($n vectors)');

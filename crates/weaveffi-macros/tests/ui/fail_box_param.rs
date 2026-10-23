@@ -9,4 +9,6 @@ mod bad {
     }
 }
 
+weaveffi::export_runtime!();
+
 fn main() {}

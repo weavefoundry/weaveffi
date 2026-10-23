@@ -3,24 +3,24 @@
 //!
 //! Every C prototype is bound once, at import time, from the model's lowered
 //! [`AbiFn`] (`argtypes` and `restype` come straight from its slots).
-//! Marshalling dispatch is driven by the shared plans: [`ArgPass`] decides
-//! how each parameter crosses and [`Family`] how a result is received, so
-//! this module never re-derives those shapes.
+//! Marshalling is driven by the stored passing contracts: [`ArgPass`]
+//! decides how each parameter crosses, [`RetPass`], [`ResultPass`], and
+//! [`ItemPass`] how a sync return, an async result, and an iterator item are
+//! received, and [`ErrorStrategy`](weaveffi_model::plan::ErrorStrategy)
+//! what a failure raises, so this module never re-derives those shapes.
 
 use crate::codegen::CodeWriter;
 use weaveffi_model::abi::{AbiParam, CType};
-use weaveffi_model::model::{
-    AbiFn, CallShape, ErrorBinding, FnBinding, IteratorBinding, ModuleBinding, ParamBinding,
-};
-use weaveffi_model::plan::ArgPass;
-use weaveffi_model::ty::{Family, Ty};
+use weaveffi_model::model::{AbiFn, AsyncBinding, FnBinding, IteratorBinding};
+use weaveffi_model::plan::{ArgPass, ItemPass, ResultPass, RetPass};
+use weaveffi_model::ty::{Prim, RetTy, Ty};
 
 use crate::targets::python::codec::{decode_expr, encode_stmts};
-use crate::targets::python::docs::{fn_docstring, with_deprecation};
-use crate::targets::python::entities::py_raise_factory;
+use crate::targets::python::docs::{fn_docstring, ParamDoc};
 use crate::targets::python::types::{
-    py_binding_name, py_ctype, py_local, py_member_name, py_name, py_object_member, py_return_hint,
-    py_slot_hint, py_str_literal, py_type_hint, Slot,
+    enum_class, int_checker, prim_kind, py_binding_name, py_ctype, py_local, py_member_name,
+    py_name, py_object_member, py_out_local, py_param_hint, py_restype, py_return_hint,
+    py_slot_hint, py_str_literal, py_type_hint, Dir,
 };
 use crate::targets::python::Gen;
 
@@ -40,26 +40,14 @@ pub(crate) enum FnScope {
     Init,
 }
 
-/// The lowered C function a callable's wrapper invokes.
-fn launcher(f: &FnBinding) -> &AbiFn {
-    match &f.shape {
-        CallShape::Sync(abi) => abi,
-        CallShape::Async(a) => &a.launch,
-        CallShape::Iterator(it) => &it.launch,
-    }
-}
-
 /// `_bind("symbol", restype, argtypes...)` for one lowered function. The
 /// async launcher's `callback` slot is typed with the completion's
 /// `CFUNCTYPE` (`callback_type`).
 fn bind_line(g: &Gen<'_>, abi: &AbiFn, callback_type: Option<&str>) -> String {
-    let mut parts = vec![
-        format!("\"{}\"", abi.symbol),
-        py_ctype(&abi.ret, Slot::Recv),
-    ];
-    parts.extend(abi.params.iter().map(|p| match (&p.ty, callback_type) {
-        (CType::Named(_), Some(cb)) if p.name == "callback" => cb.to_string(),
-        _ => py_ctype(&p.ty, Slot::Arg),
+    let mut parts = vec![format!("\"{}\"", abi.symbol), py_restype(&abi.ret)];
+    parts.extend(abi.params.iter().map(|p| match callback_type {
+        Some(cb) if p.name == "callback" => cb.to_string(),
+        _ => py_ctype(&p.ty, true),
     }));
     format!(
         "{} = _bind({})",
@@ -68,10 +56,11 @@ fn bind_line(g: &Gen<'_>, abi: &AbiFn, callback_type: Option<&str>) -> String {
     )
 }
 
-/// The `CFUNCTYPE(...)` spelling for a C function-pointer signature.
+/// The `CFUNCTYPE(...)` spelling for a C function-pointer signature the
+/// producer calls (a vtable method or an async completion).
 pub(crate) fn cfunctype(ret: &CType, params: &[AbiParam]) -> String {
-    let parts: Vec<String> = std::iter::once(py_ctype(ret, Slot::Recv))
-        .chain(params.iter().map(|p| py_ctype(&p.ty, Slot::Recv)))
+    let parts: Vec<String> = std::iter::once(py_restype(ret))
+        .chain(params.iter().map(|p| py_ctype(&p.ty, false)))
         .collect();
     format!("ctypes.CFUNCTYPE({})", parts.join(", "))
 }
@@ -89,40 +78,85 @@ pub(crate) fn slot_params(params: &[AbiParam]) -> String {
 /// The module-level stem of an async function's completion objects: the
 /// launcher's binding name without `_c`.
 fn completion_stem(g: &Gen<'_>, f: &FnBinding) -> String {
-    let binding = py_binding_name(&launcher(f).symbol, g.prefix);
+    let binding = py_binding_name(&f.abi.symbol, g.prefix);
     binding.strip_prefix("_c").unwrap_or(&binding).to_string()
 }
 
-/// The module-level iterator class for an iterator-returning callable:
-/// `_` plus the iterator tag without its prefix.
-fn iterator_class(g: &Gen<'_>, it: &IteratorBinding) -> String {
-    py_binding_name(&it.iter_tag, g.prefix).replacen("_c_", "_", 1)
+/// The module-level function pulling one element of an iterator:
+/// `_pull_` plus the iterator tag without its prefix.
+fn pull_fn(g: &Gen<'_>, it: &IteratorBinding) -> String {
+    py_binding_name(&it.iter_tag, g.prefix).replacen("_c_", "_pull_", 1)
 }
 
-/// The expression receiving one producer-owned value of `ty` (a sync
-/// return, an async result, or an iterator element) from its pointer (or
-/// direct value) expression `p` and length expression `len`, releasing what
-/// it owes.
-fn recv_expr(ty: &Ty, p: &str, len: &str) -> String {
-    match ty.family() {
-        Family::String => format!("_take_str({p}, {len})"),
-        Family::Bytes => format!("_take_bytes({p}, {len})"),
-        Family::Buffer => decode_expr(&format!("_take_bytes({p}, {len})"), ty),
-        Family::Object { nullable } => adopt_expr(ty, p, nullable),
-        Family::Direct => match ty {
-            Ty::Enum(name) => format!("{name}({p})"),
-            _ => p.to_string(),
-        },
-        Family::Callback { .. } | Family::Iterator => {
-            unreachable!("callback interfaces and iterators are never received as values")
+/// The value expression `expr` of a direct slot of C type `ty` as Python
+/// hands it out: re-wrapped in its `IntEnum` for a C-style enum.
+pub(crate) fn direct_value(expr: &str, ty: &CType) -> String {
+    match enum_class(ty) {
+        Some(class) => format!("{class}({expr})"),
+        None => expr.to_string(),
+    }
+}
+
+/// One value the producer hands over (a sync return, an async result, or
+/// an iterator item) as the expressions that hold its slots.
+pub(crate) enum Recv<'a> {
+    /// A number, `bool`, or enum, by value.
+    Direct { value: String, ty: &'a CType },
+    /// A present flag and a value (ignored when absent).
+    OptDirect {
+        has: String,
+        value: String,
+        ty: &'a CType,
+    },
+    /// An owned typed-array run: address and element count.
+    Slice {
+        ptr: String,
+        len: String,
+        elem: Prim,
+    },
+    /// An owned UTF-8 run.
+    String { ptr: String, len: String },
+    /// An owned byte run.
+    Bytes { ptr: String, len: String },
+    /// An owned value buffer of type `ty`.
+    Buffer {
+        ptr: String,
+        len: String,
+        ty: &'a Ty,
+    },
+    /// One strong reference to an object.
+    Object {
+        ptr: String,
+        nullable: bool,
+        interface: &'a str,
+    },
+}
+
+/// The expression taking ownership of a received value: copying it into a
+/// Python value and releasing what the producer handed over.
+pub(crate) fn recv_expr(r: &Recv<'_>) -> String {
+    match r {
+        Recv::Direct { value, ty } => direct_value(value, ty),
+        Recv::OptDirect { has, value, ty } => {
+            format!("{} if {has} else None", direct_value(value, ty))
         }
+        Recv::Slice { ptr, len, elem } => {
+            format!("_take_array({ptr}, {len}, \"{}\")", prim_kind(*elem))
+        }
+        Recv::String { ptr, len } => format!("_take_str({ptr}, {len})"),
+        Recv::Bytes { ptr, len } => format!("_take_bytes({ptr}, {len})"),
+        Recv::Buffer { ptr, len, ty } => decode_expr(&format!("_take_bytes({ptr}, {len})"), ty),
+        Recv::Object {
+            ptr,
+            nullable,
+            interface,
+        } => adopt_expr(interface, ptr, *nullable),
     }
 }
 
 /// The expression adopting the object pointer `p` (one strong reference)
-/// into a new wrapper of `ty`'s interface; `None` for a null `I?`.
-pub(crate) fn adopt_expr(ty: &Ty, p: &str, nullable: bool) -> String {
-    let class = ty.interface_name().expect("object names an interface");
+/// into a new wrapper of `class`; `None` for a null `I?`.
+pub(crate) fn adopt_expr(class: &str, p: &str, nullable: bool) -> String {
     if nullable {
         format!("{class}._adopt({p}) if {p} else None")
     } else {
@@ -130,151 +164,276 @@ pub(crate) fn adopt_expr(ty: &Ty, p: &str, nullable: bool) -> String {
     }
 }
 
-/// Emit every module-level piece a callable needs ahead of its wrapper: the
-/// bound launcher, plus the iterator class (iterator shape) or the static
-/// completion trampoline (async shape). `owner` names the callable in docs
-/// (`Store.get` for a member); `packed` appends a sync member's binding to
-/// the block the previous member started, with no blank lines between.
-pub(crate) fn render_bindings(
-    w: &mut CodeWriter,
-    g: &Gen<'_>,
-    f: &FnBinding,
-    error: Option<&ErrorBinding>,
-    owner: &str,
-    packed: bool,
-) {
-    match &f.shape {
-        CallShape::Sync(abi) => {
-            if !packed {
-                w.blank().blank();
-            }
-            w.line(bind_line(g, abi, None));
-        }
-        CallShape::Iterator(it) => {
-            w.blank().blank();
-            w.line(bind_line(g, &it.launch, None));
-            render_iterator_class(w, g, f, it, error, owner);
-        }
-        CallShape::Async(a) => {
-            let stem = completion_stem(g, f);
-            let cb_type = py_binding_name(&a.callback_type, g.prefix);
-            let factory = py_raise_factory(f, error);
-            let value = match &f.ret {
-                None => "None".to_string(),
-                Some(ty) => match ty.family() {
-                    Family::String | Family::Bytes | Family::Buffer => {
-                        recv_expr(ty, "result_ptr", "result_len")
-                    }
-                    _ => recv_expr(ty, "result", ""),
-                },
-            };
-            w.blank().blank();
-            w.line(format!(
-                "{cb_type} = {}",
-                cfunctype(&CType::Void, &a.callback_params)
-            ));
-            w.line(bind_line(g, &a.launch, Some(&cb_type)));
-            w.blank().blank();
-            w.line(format!(
-                "def {stem}_complete({}) -> None:",
-                slot_params(&a.callback_params)
-            ));
-            w.scope(|w| {
-                w.line("# Runs once, on a producer thread: take ownership of the result");
-                w.line("# here, then hand it to the awaiting event loop.");
-                w.line("try:");
-                w.scope(|w| {
-                    w.line("if err:");
-                    w.scope(|w| {
-                        w.line(format!(
-                            "_async_settle(context, _async_error(err, {factory}), None)"
-                        ));
-                    });
-                    w.line("else:");
-                    w.scope(|w| {
-                        w.line(format!("_async_settle(context, None, {value})"));
-                    });
-                });
-                w.line("except BaseException as exc:");
-                w.scope(|w| {
-                    w.line("_async_settle(context, exc, None)");
-                });
-            });
-            w.blank().blank();
-            w.line(format!("{stem}_completion = {cb_type}({stem}_complete)"));
-        }
+/// The local holding an out slot's value: `_` plus the slot name
+/// (`_out_len`, `_out_value`, `_out_item`).
+fn out_local(slot: &AbiParam) -> String {
+    format!("_{}", slot.name)
+}
+
+/// How an async completion's result slots become the awaited value.
+fn result_recv<'a>(result: &'a ResultPass, elem: Option<&'a Ty>) -> Option<Recv<'a>> {
+    let local = |slot: &AbiParam| py_local(&slot.name);
+    Some(match result {
+        ResultPass::Void => return None,
+        ResultPass::Direct { result } => Recv::Direct {
+            value: local(result),
+            ty: &result.ty,
+        },
+        ResultPass::OptDirect { has, value } => Recv::OptDirect {
+            has: local(has),
+            value: local(value),
+            ty: &value.ty,
+        },
+        ResultPass::Slice { ptr, len, elem } => Recv::Slice {
+            ptr: local(ptr),
+            len: local(len),
+            elem: *elem,
+        },
+        ResultPass::String { ptr, len } => Recv::String {
+            ptr: local(ptr),
+            len: local(len),
+        },
+        ResultPass::Bytes { ptr, len } => Recv::Bytes {
+            ptr: local(ptr),
+            len: local(len),
+        },
+        ResultPass::Buffer { ptr, len } => Recv::Buffer {
+            ptr: local(ptr),
+            len: local(len),
+            ty: elem.expect("a buffered result has a value type"),
+        },
+        ResultPass::Object {
+            result,
+            nullable,
+            interface,
+            ..
+        } => Recv::Object {
+            ptr: local(result),
+            nullable: *nullable,
+            interface,
+        },
+    })
+}
+
+/// How an iterator's `_next` out slots become the yielded item. The slots
+/// are locals named by [`out_local`], read through `.value`.
+fn item_recv<'a>(item: &'a ItemPass, elem: &'a Ty) -> Recv<'a> {
+    let value = |slot: &AbiParam| format!("{}.value", out_local(slot));
+    let pointee = |slot: &'a AbiParam| match &slot.ty {
+        CType::Ptr { pointee, .. } => pointee.as_ref(),
+        other => other,
+    };
+    match item {
+        ItemPass::Direct { out_item } => Recv::Direct {
+            value: value(out_item),
+            ty: pointee(out_item),
+        },
+        ItemPass::OptDirect { out_has, out_item } => Recv::OptDirect {
+            has: value(out_has),
+            value: value(out_item),
+            ty: pointee(out_item),
+        },
+        ItemPass::Slice {
+            out_item,
+            out_len,
+            elem,
+        } => Recv::Slice {
+            ptr: value(out_item),
+            len: value(out_len),
+            elem: *elem,
+        },
+        ItemPass::String { out_item, out_len } => Recv::String {
+            ptr: value(out_item),
+            len: value(out_len),
+        },
+        ItemPass::Bytes { out_item, out_len } => Recv::Bytes {
+            ptr: value(out_item),
+            len: value(out_len),
+        },
+        ItemPass::Buffer { out_item, out_len } => Recv::Buffer {
+            ptr: value(out_item),
+            len: value(out_len),
+            ty: elem,
+        },
+        ItemPass::Object {
+            out_item,
+            nullable,
+            interface,
+            ..
+        } => Recv::Object {
+            ptr: value(out_item),
+            nullable: *nullable,
+            interface,
+        },
     }
 }
 
-/// Render the module-level class for one iterator-returning callable,
-/// satisfying the pull contract of
-/// [`weaveffi_model::plan::IteratorProtocol`]: one producer `next` call per
-/// `__next__`, per-element releases after copying, and exactly one
-/// `destroy` (on exhaustion, `close()`, or garbage collection).
-fn render_iterator_class(
-    w: &mut CodeWriter,
-    g: &Gen<'_>,
-    f: &FnBinding,
-    it: &IteratorBinding,
-    error: Option<&ErrorBinding>,
-    owner: &str,
-) {
-    let class = iterator_class(g, it);
-    let next = py_binding_name(&it.next.symbol, g.prefix);
-    let destroy = py_binding_name(&it.destroy_symbol, g.prefix);
-    let factory = py_raise_factory(f, error);
-    let item_ty = py_ctype(it.item_ctype(), Slot::Recv);
-    let has_len = it.next.params.iter().any(|p| p.name == "out_len");
+/// How a sync call's C return (`_ret`) and out slots become the returned
+/// value; `None` for a void call or an iterator (handled by the caller).
+fn ret_recv<'a>(ret_pass: &'a RetPass, ret: Option<&'a RetTy>, abi: &'a AbiFn) -> Option<Recv<'a>> {
+    let value = |slot: &AbiParam| format!("{}.value", out_local(slot));
+    let ret_ptr = || "_ret".to_string();
+    Some(match ret_pass {
+        RetPass::Void | RetPass::Iterator(_) => return None,
+        RetPass::Direct => Recv::Direct {
+            value: ret_ptr(),
+            ty: &abi.ret,
+        },
+        RetPass::OptDirect { out_value } => Recv::OptDirect {
+            has: ret_ptr(),
+            value: value(out_value),
+            ty: match &out_value.ty {
+                CType::Ptr { pointee, .. } => pointee,
+                other => other,
+            },
+        },
+        RetPass::Slice { out_len, elem } => Recv::Slice {
+            ptr: ret_ptr(),
+            len: value(out_len),
+            elem: *elem,
+        },
+        RetPass::String { out_len } => Recv::String {
+            ptr: ret_ptr(),
+            len: value(out_len),
+        },
+        RetPass::Bytes { out_len } => Recv::Bytes {
+            ptr: ret_ptr(),
+            len: value(out_len),
+        },
+        RetPass::Buffer { out_len } => Recv::Buffer {
+            ptr: ret_ptr(),
+            len: value(out_len),
+            ty: ret
+                .and_then(RetTy::value)
+                .expect("a buffered return has a value type"),
+        },
+        RetPass::Object {
+            nullable,
+            interface,
+            ..
+        } => Recv::Object {
+            ptr: ret_ptr(),
+            nullable: *nullable,
+            interface,
+        },
+    })
+}
 
+/// Emit every module-level piece a callable needs ahead of its wrapper: the
+/// bound entry point, plus the iterator's bound `_next`/`_destroy` and its
+/// pull function (iterator returns) or the static completion trampoline
+/// (async calls). `packed` appends a plain sync member's binding to the
+/// block the previous member started, with no blank lines between.
+pub(crate) fn render_bindings(w: &mut CodeWriter, g: &Gen<'_>, f: &FnBinding, packed: bool) {
+    if let Some(a) = f.async_binding() {
+        render_completion(w, g, f, a);
+        return;
+    }
+    let Some(it) = f.iterator() else {
+        if !packed {
+            w.blank().blank();
+        }
+        w.line(bind_line(g, &f.abi, None));
+        return;
+    };
+    w.blank().blank();
+    w.line(bind_line(g, &f.abi, None));
     w.line(bind_line(g, &it.next, None));
     w.line(format!(
-        "{destroy} = _bind(\"{}\", None, ctypes.c_void_p)",
+        "{} = _bind(\"{}\", None, ctypes.c_void_p)",
+        py_binding_name(&it.destroy_symbol, g.prefix),
         it.destroy_symbol
     ));
+    render_pull(w, g, f, it);
+}
+
+/// Render the module-level function pulling one item of an iterator: one
+/// producer `_next` call, the item copied out and released, and
+/// `StopIteration` once the stream ends. The runtime's `NativeIterator`
+/// calls it for each step and destroys the handle exactly once.
+fn render_pull(w: &mut CodeWriter, g: &Gen<'_>, f: &FnBinding, it: &IteratorBinding) {
+    let next = py_binding_name(&it.next.symbol, g.prefix);
     w.blank().blank();
-    w.line(format!("class {class}(_Iterator):"));
+    w.line(format!(
+        "def {}(_p: int) -> {}:",
+        pull_fn(g, it),
+        py_type_hint(&it.elem, Dir::Out)
+    ));
     w.scope(|w| {
-        w.line(format!(
-            "\"\"\"The lazy iterator `{owner}` returns: each step pulls one element"
-        ));
-        w.line("from the producer.\"\"\"");
-        w.blank();
-        w.line(format!("_destroy = staticmethod({destroy})"));
-        w.blank();
-        w.line(format!("def __next__(self) -> {}:", py_type_hint(&it.elem)));
-        w.scope(|w| {
-            w.line(format!("_item = {item_ty}()"));
-            let mut args = vec!["_p".to_string(), "ctypes.byref(_item)".into()];
-            if has_len {
-                w.line("_len = ctypes.c_size_t()");
-                args.push("ctypes.byref(_len)".into());
-            }
-            args.push("ctypes.byref(_err)".into());
-            w.line("_err = _ErrorStruct()");
-            w.line("_p = self._step()");
-            w.line("try:");
-            w.scope(|w| {
-                w.line(format!("_more = {next}({})", args.join(", ")));
-            });
-            w.line("finally:");
-            w.scope(|w| {
-                w.line("self._release()");
-            });
-            w.line("if _err.code:");
-            w.scope(|w| {
-                w.line(format!("raise {factory}(*_read_error(_err))"));
-            });
-            w.line("if not _more:");
-            w.scope(|w| {
-                w.line("self.close()");
-                w.line("raise StopIteration");
-            });
+        let mut args = vec!["_p".to_string()];
+        for slot in it.item.slots() {
             w.line(format!(
-                "return {}",
-                recv_expr(&it.elem, "_item.value", "_len.value")
+                "{} = {}()",
+                out_local(slot),
+                py_out_local(&slot.ty)
+            ));
+            args.push(format!("ctypes.byref({})", out_local(slot)));
+        }
+        w.line("_err = _ErrorStruct()");
+        args.push("ctypes.byref(_err)".into());
+        w.line(format!("_more = {next}({})", args.join(", ")));
+        w.line("if _err.code:");
+        w.scope(|w| {
+            w.line(format!(
+                "raise {}(*_read_error(_err))",
+                g.raise_factory(&f.error)
             ));
         });
+        w.line("if not _more:");
+        w.scope(|w| {
+            w.line("raise StopIteration");
+        });
+        w.line(format!(
+            "return {}",
+            recv_expr(&item_recv(&it.item, &it.elem))
+        ));
     });
+}
+
+/// Render an async call's bindings: the completion's `CFUNCTYPE`, the bound
+/// launcher, and the one static completion trampoline, which takes
+/// ownership of the result on the producer's thread and settles the
+/// awaiting future.
+fn render_completion(w: &mut CodeWriter, g: &Gen<'_>, f: &FnBinding, a: &AsyncBinding) {
+    let stem = completion_stem(g, f);
+    let cb_type = py_binding_name(&a.callback_type, g.prefix);
+    let elem = f.ret.as_ref().and_then(RetTy::value);
+    let value = result_recv(&a.result, elem).map_or_else(|| "None".into(), |r| recv_expr(&r));
+    w.blank().blank();
+    w.line(format!(
+        "{cb_type} = {}",
+        cfunctype(&CType::Void, &a.callback_params)
+    ));
+    w.line(bind_line(g, &f.abi, Some(&cb_type)));
+    w.blank().blank();
+    w.line(format!(
+        "def {stem}_complete({}) -> None:",
+        slot_params(&a.callback_params)
+    ));
+    w.scope(|w| {
+        w.line("# Runs once, on a producer thread: take ownership of the result");
+        w.line("# here, then hand it to the awaiting event loop.");
+        w.line("try:");
+        w.scope(|w| {
+            w.line("if err:");
+            w.scope(|w| {
+                w.line(format!(
+                    "_async_settle(context, _async_error(err, {}), None)",
+                    g.raise_factory(&f.error)
+                ));
+            });
+            w.line("else:");
+            w.scope(|w| {
+                w.line(format!("_async_settle(context, None, {value})"));
+            });
+        });
+        w.line("except BaseException as exc:");
+        w.scope(|w| {
+            w.line("_async_settle(context, exc, None)");
+        });
+    });
+    w.blank().blank();
+    w.line(format!("{stem}_completion = {cb_type}({stem}_complete)"));
 }
 
 /// The emitted Python name for a callable in `scope`.
@@ -296,9 +455,14 @@ struct Lend {
 }
 
 /// One parameter's local preparation and its C argument expressions.
+#[derive(Default)]
 struct ParamPlan {
-    /// Statements run before any object is lent (encoding).
+    /// Statements run before any object is lent (checking and encoding).
     prep: Vec<String>,
+    /// Range checks: `(local, expression)`, inlined into the argument list
+    /// when nothing is lent or registered before the call, else bound to the
+    /// local in `prep` (a failing check must not strand a registration).
+    checks: Vec<(String, String)>,
     /// Statements run inside the innermost borrow scope, just before the
     /// call (finishing value buffers, registering callbacks).
     late: Vec<String>,
@@ -308,16 +472,52 @@ struct ParamPlan {
     args: Vec<String>,
 }
 
-fn plan_param(p: &ParamBinding) -> ParamPlan {
-    let n = py_name(&p.name);
-    let mut plan = ParamPlan {
-        prep: vec![],
-        late: vec![],
-        lend: None,
-        args: vec![],
-    };
-    match p.arg_pass() {
-        ArgPass::Direct { .. } => plan.args.push(n),
+/// The checked argument for a direct value `n` of C type `ty`: the
+/// runtime's range check for an integer or enum, the value itself for a
+/// float or `bool`.
+fn checked(plan: &mut ParamPlan, n: &str, local: String, ty: &CType) -> String {
+    match int_checker(ty) {
+        Some(check) => {
+            plan.checks
+                .push((local.clone(), format!("{check}({n}, \"{n}\")")));
+            local
+        }
+        None => n.to_string(),
+    }
+}
+
+/// Plan how parameter `n` crosses per its passing contract.
+fn plan_param(n: &str, pass: &ArgPass) -> ParamPlan {
+    let mut plan = ParamPlan::default();
+    match pass {
+        ArgPass::Direct { slot } => {
+            let arg = checked(&mut plan, n, format!("_{n}_v"), &slot.ty);
+            plan.args.push(arg);
+        }
+        ArgPass::OptDirect { value, .. } => {
+            let zero = match value.ty {
+                CType::Float | CType::Double => "0.0",
+                CType::Bool => "False",
+                _ => "0",
+            };
+            let local = format!("_{n}_v");
+            let present = match int_checker(&value.ty) {
+                Some(check) => format!("{check}({n}, \"{n}\")"),
+                None => n.to_string(),
+            };
+            plan.checks.push((
+                local.clone(),
+                format!("{present} if {n} is not None else {zero}"),
+            ));
+            plan.args = vec![format!("{n} is not None"), local];
+        }
+        ArgPass::Slice { elem, .. } => {
+            plan.prep.push(format!(
+                "_{n}_a = _array({n}, \"{}\", \"{n}\")",
+                prim_kind(*elem)
+            ));
+            plan.args = vec![format!("_{n}_a.buffer_info()[0]"), format!("len(_{n}_a)")];
+        }
         ArgPass::String { .. } => {
             plan.prep.push(format!("_{n}_b = {n}.encode(\"utf-8\")"));
             plan.args = vec![format!("_{n}_b"), format!("len(_{n}_b)")];
@@ -326,27 +526,26 @@ fn plan_param(p: &ParamBinding) -> ParamPlan {
             plan.prep.push(format!("_{n}_b = bytes({n})"));
             plan.args = vec![format!("_{n}_b"), format!("len(_{n}_b)")];
         }
-        // Encode now, mint object tokens later: `finish()` runs once every
-        // parameter has encoded and every lent object is held, so a failure
-        // anywhere before the call leaks no strong reference.
+        // Encoded with every other parameter; buffers are finished (object
+        // tokens minted) later.
         ArgPass::Buffer { .. } => {
-            plan.prep
-                .extend(encode_stmts(&format!("_{n}_w"), &n, &p.ty));
-            plan.late.push(format!("_{n}_b = _{n}_w.finish()"));
             plan.args = vec![format!("_{n}_b"), format!("len(_{n}_b)")];
         }
-        ArgPass::Object { nullable, .. } => {
-            let class = p.ty.interface_name().expect("object names an interface");
-            plan.lend = Some(if nullable {
+        ArgPass::Object {
+            nullable,
+            interface,
+            ..
+        } => {
+            plan.lend = Some(if *nullable {
                 Lend {
                     local: format!("_{n}_p"),
-                    acquire: format!("_lend_opt({n}, {class})"),
+                    acquire: format!("_lend_opt({n}, {interface})"),
                     release: format!("_release_opt({n})"),
                 }
             } else {
                 Lend {
                     local: format!("_{n}_p"),
-                    acquire: format!("_lend({n}, {class})"),
+                    acquire: format!("_lend({n}, {interface})"),
                     release: format!("{n}._release()"),
                 }
             });
@@ -354,21 +553,23 @@ fn plan_param(p: &ParamBinding) -> ParamPlan {
         }
         // Registered last, so nothing between registration and the call can
         // fail and strand the entry; the producer releases it with `free`.
-        ArgPass::Callback { nullable, .. } => {
-            let cb =
-                p.ty.callback_interface_name()
-                    .expect("callback names a callback interface");
-            let vtable = format!("_{cb}_vtable_ptr");
-            if nullable {
-                plan.late
-                    .push(format!("_{n}_ctx = _callback_register_opt({n}, {cb})"));
+        ArgPass::Callback {
+            nullable,
+            interface,
+            ..
+        } => {
+            let vtable = format!("_{interface}_vtable_ptr");
+            if *nullable {
+                plan.late.push(format!(
+                    "_{n}_ctx = _callback_register_opt({n}, {interface})"
+                ));
                 plan.args = vec![
                     format!("_{n}_ctx"),
                     format!("{vtable} if {n} is not None else None"),
                 ];
             } else {
                 plan.late
-                    .push(format!("_{n}_ctx = _callback_register({n}, {cb})"));
+                    .push(format!("_{n}_ctx = _callback_register({n}, {interface})"));
                 plan.args = vec![format!("_{n}_ctx"), vtable];
             }
         }
@@ -377,24 +578,11 @@ fn plan_param(p: &ParamBinding) -> ParamPlan {
 }
 
 /// Render one callable's wrapper `def` (its bindings are emitted separately
-/// by [`render_bindings`]). A throwing callable raises the error domain in
-/// scope for `module`; any other failure raises the unchecked trap.
-pub(crate) fn render_callable(
-    w: &mut CodeWriter,
-    g: &Gen<'_>,
-    module: &ModuleBinding,
-    f: &FnBinding,
-    scope: FnScope,
-) {
-    let error = g.model.error_domain(module);
-    let raises = error.filter(|_| f.throws).map(|eb| {
-        (
-            eb.type_name.as_str(),
-            "If the call reports one of the domain's error codes.",
-        )
-    });
-    let abi = launcher(f);
-    let binding = py_binding_name(&abi.symbol, g.prefix);
+/// by [`render_bindings`]). A callable that throws raises its error domain
+/// (or the root error for `throws: any`); any other failure raises the
+/// unchecked trap.
+pub(crate) fn render_callable(w: &mut CodeWriter, g: &Gen<'_>, f: &FnBinding, scope: FnScope) {
+    let binding = py_binding_name(&f.abi.symbol, g.prefix);
 
     let mut sig: Vec<String> = match scope {
         FnScope::Method | FnScope::Init => vec!["self".into()],
@@ -404,7 +592,7 @@ pub(crate) fn render_callable(
     sig.extend(
         f.params
             .iter()
-            .map(|p| format!("{}: {}", py_name(&p.name), py_type_hint(&p.ty))),
+            .map(|p| format!("{}: {}", py_name(&p.name), py_param_hint(&p.ty))),
     );
     let ret_hint = match scope {
         FnScope::Init => "None".to_string(),
@@ -431,56 +619,45 @@ pub(crate) fn render_callable(
         sig.join(", "),
     ));
     w.indent();
-    let mut doc = with_deprecation(f.doc.as_deref(), f.deprecated.as_deref());
-    if let CallShape::Iterator(_) = f.shape {
-        let streaming = "Returns a lazy iterator: each step pulls one element from the\n\
-                         producer. Exhaust or close() the iterator to release its native\n\
-                         handle (garbage collection also releases it).";
+    let mut doc = g.doc(&f.doc, &f.deprecated);
+    if f.iterator().is_some() {
+        let streaming = "Returns a lazy `NativeIterator`: each step pulls one element from\n\
+                         the producer. Exhaust it, `close()` it, or use it in a `with`\n\
+                         statement to release its native handle (garbage collection also\n\
+                         releases it).";
         doc = Some(match doc {
             Some(d) => format!("{d}\n\n{streaming}"),
             None => streaming.to_string(),
         });
     }
-    fn_docstring(w, doc.as_deref(), &f.params, raises);
+    let params: Vec<ParamDoc> = f
+        .params
+        .iter()
+        .map(|p| ParamDoc {
+            name: py_name(&p.name),
+            hint: py_param_hint(&p.ty),
+            doc: g.text(&p.doc),
+        })
+        .collect();
+    fn_docstring(w, doc.as_deref(), &params, &g.raises(&f.error));
 
-    if let Some(msg) = &f.deprecated {
+    if let Some(msg) = g.deprecation(&f.deprecated) {
         w.line(format!(
             "warnings.warn(\"{}\", DeprecationWarning, stacklevel=2)",
-            py_str_literal(msg)
+            py_str_literal(&msg)
         ));
     }
 
-    let plans: Vec<ParamPlan> = f.params.iter().map(plan_param).collect();
-    for line in plans.iter().flat_map(|p| &p.prep) {
-        w.line(line);
-    }
+    let mut plans: Vec<ParamPlan> = f
+        .params
+        .iter()
+        .map(|p| plan_param(&py_name(&p.name), &p.pass))
+        .collect();
 
-    // The C arguments: `self`, each parameter's slots, then the trailing
-    // slots the lowering appended, named by the model.
-    let mut args: Vec<String> = Vec::new();
-    let mut consumed = 0;
-    if f.has_self {
-        args.push("_self_p".into());
-        consumed = 1;
-    }
-    for (p, plan) in f.params.iter().zip(&plans) {
-        args.extend(plan.args.iter().cloned());
-        consumed += p.abi.len();
-    }
-    for slot in &abi.params[consumed..] {
-        args.push(match slot.name.as_str() {
-            "out_len" => "ctypes.byref(_out_len)".to_string(),
-            "out_err" => "ctypes.byref(_err)".to_string(),
-            "cancel_token" => "_token".to_string(),
-            "callback" => format!("{}_completion", completion_stem(g, f)),
-            "context" => "_call".to_string(),
-            other => unreachable!("unexpected trailing slot `{other}`"),
-        });
-    }
-    let call = format!("{binding}({})", args.join(", "));
-
+    // Lent objects (the receiver first), and the late statements: finishing
+    // value buffers and registering callbacks.
     let mut lends: Vec<Lend> = Vec::new();
-    if f.has_self {
+    if f.has_self() {
         lends.push(Lend {
             local: "_self_p".into(),
             acquire: "self._acquire()".into(),
@@ -488,11 +665,63 @@ pub(crate) fn render_callable(
         });
     }
     lends.extend(plans.iter().filter_map(|p| p.lend.clone()));
-    let late: Vec<String> = plans.iter().flat_map(|p| p.late.clone()).collect();
+    let mut late: Vec<String> = Vec::new();
+    for (p, plan) in f.params.iter().zip(&plans) {
+        if let ArgPass::Buffer { .. } = p.pass {
+            let n = py_name(&p.name);
+            late.push(format!("_{n}_b = _{n}_w.finish()"));
+        }
+        late.extend(plan.late.iter().cloned());
+    }
+    // Range checks run in the argument list unless something is lent or
+    // registered first.
+    let inline = lends.is_empty() && late.is_empty();
+    for plan in &mut plans {
+        let checks = std::mem::take(&mut plan.checks);
+        for (local, expr) in checks {
+            if inline {
+                for arg in &mut plan.args {
+                    if *arg == local {
+                        arg.clone_from(&expr);
+                    }
+                }
+            } else {
+                plan.prep.push(format!("{local} = {expr}"));
+            }
+        }
+    }
+    for (p, plan) in f.params.iter().zip(&plans) {
+        for line in &plan.prep {
+            w.line(line);
+        }
+        if let (ArgPass::Buffer { .. }, Some(ty)) = (&p.pass, p.ty.value()) {
+            let n = py_name(&p.name);
+            for line in encode_stmts(&format!("_{n}_w"), &n, ty) {
+                w.line(line);
+            }
+        }
+    }
 
-    if let CallShape::Async(_) = f.shape {
+    // The C arguments: `self`, each parameter's slots, then the trailing
+    // slots of the shape.
+    let mut args: Vec<String> = Vec::new();
+    if f.has_self() {
+        args.push("_self_p".into());
+    }
+    for plan in &plans {
+        args.extend(plan.args.iter().cloned());
+    }
+
+    if let Some(a) = f.async_binding() {
+        if a.cancellable() {
+            args.push("_token".into());
+        }
+        args.push(format!("{}_completion", completion_stem(g, f)));
+        args.push("_call".into());
+        debug_assert_eq!(args.len(), f.abi.params.len(), "{}", f.abi.symbol);
+        let call = format!("{binding}({})", args.join(", "));
         w.line("_call, _future = _async_begin()");
-        if f.cancellable {
+        if a.cancellable() {
             w.line("_token = _cancel_token_create()");
         }
         w.line("try:");
@@ -500,21 +729,21 @@ pub(crate) fn render_callable(
         w.line("except BaseException:");
         w.scope(|w| {
             w.line("_async_abandon(_call)");
-            if f.cancellable {
+            if a.cancellable() {
                 w.line("_cancel_token_destroy(_token)");
             }
             w.line("raise");
         });
-        let wait = if f.cancellable {
+        let wait = if a.cancellable() {
             "await _async_wait_cancellable(_future, _token)"
         } else {
             "await _future"
         };
         // The completion built the value; the annotation hands its type to
         // checkers.
-        match &f.ret {
+        match f.ret.as_ref().and_then(RetTy::value) {
             Some(ty) => {
-                w.line(format!("_result: {} = {wait}", py_type_hint(ty)));
+                w.line(format!("_result: {} = {wait}", py_type_hint(ty, Dir::Out)));
                 w.line("return _result");
             }
             None => {
@@ -525,45 +754,52 @@ pub(crate) fn render_callable(
         return;
     }
 
-    w.line("_err = _ErrorStruct()");
-    if abi.params.iter().any(|p| p.name == "out_len") {
-        w.line("_out_len = ctypes.c_size_t()");
+    for slot in f.ret_pass.out_slots() {
+        w.line(format!(
+            "{} = {}()",
+            out_local(slot),
+            py_out_local(&slot.ty)
+        ));
+        args.push(format!("ctypes.byref({})", out_local(slot)));
     }
-    // A direct result is used as returned, so its annotation tells checkers
-    // what the untyped `ctypes` call produced.
-    let call = match &f.ret {
-        Some(ty @ Ty::Prim(_)) if ty.family() == Family::Direct => {
-            format!("_ret: {} = {call}", py_type_hint(ty))
+    w.line("_err = _ErrorStruct()");
+    args.push("ctypes.byref(_err)".into());
+    debug_assert_eq!(args.len(), f.abi.params.len(), "{}", f.abi.symbol);
+    let call = format!("{binding}({})", args.join(", "));
+    // A direct scalar result is used as returned, so its annotation tells
+    // checkers what the untyped `ctypes` call produced.
+    let call = match (&f.ret_pass, f.ret.as_ref().and_then(RetTy::value)) {
+        (RetPass::Void, _) if !matches!(scope, FnScope::Init | FnScope::Factory) => call,
+        (RetPass::Direct, Some(ty @ Ty::Prim(_))) => {
+            format!("_ret: {} = {call}", py_type_hint(ty, Dir::Out))
         }
-        Some(_) => format!("_ret = {call}"),
-        None if matches!(scope, FnScope::Init | FnScope::Factory) => format!("_ret = {call}"),
-        None => call,
+        _ => format!("_ret = {call}"),
     };
     emit_lent_call(w, &lends, &late, &call);
     w.line("if _err.code:");
     w.scope(|w| {
         w.line(format!(
             "raise {}(*_read_error(_err))",
-            py_raise_factory(f, error)
+            g.raise_factory(&f.error)
         ));
     });
 
-    match (scope, &f.shape) {
-        (FnScope::Init, _) => {
+    match scope {
+        FnScope::Init => {
             w.line("self._init_handle(_required(_ret))");
         }
-        (FnScope::Factory, _) => {
+        FnScope::Factory => {
             w.line("return cls._adopt(_required(_ret))");
         }
-        (_, CallShape::Iterator(it)) => {
-            w.line(format!("return {}._adopt(_ret)", iterator_class(g, it)));
-        }
         _ => {
-            if let Some(ty) = &f.ret {
+            if let RetPass::Iterator(it) = &f.ret_pass {
                 w.line(format!(
-                    "return {}",
-                    recv_expr(ty, "_ret", "_out_len.value")
+                    "return _iterate(_required(_ret), {}, {})",
+                    pull_fn(g, it),
+                    py_binding_name(&it.destroy_symbol, g.prefix)
                 ));
+            } else if let Some(r) = ret_recv(&f.ret_pass, f.ret.as_ref(), &f.abi) {
+                w.line(format!("return {}", recv_expr(&r)));
             }
         }
     }

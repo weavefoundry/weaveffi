@@ -1,34 +1,50 @@
-//! Go type mapping: how resolved types, zero values, scalar conversions,
-//! and C ABI slot types are spelled in the generated package.
+//! Go type mapping: how value types, parameter and return types, zero
+//! values, and C ABI slot types are spelled in the generated package.
 
 use weaveffi_model::abi::{CType, ConstPos};
-use weaveffi_model::ty::{Prim, Ty};
+use weaveffi_model::ty::{ParamTy, Prim, RetTy, Ty};
 
 use crate::targets::go::names::pascal;
 
-/// The Go type spelling of a resolved type.
+/// The Go type spelling of a value type.
 ///
-/// Records are value structs, rich enums sealed interfaces, interfaces
-/// wrapper pointers (one Go value owns each strong reference), and callback
-/// interfaces Go interfaces. `T?` is `*T` unless `T` is already nil-able
-/// (see [`optional_derefs`]).
+/// Records are value structs, rich enums sealed interfaces, and interfaces
+/// wrapper pointers (one Go value owns each strong reference). `T?` is `*T`
+/// unless `T` is already nil-able (see [`optional_derefs`]); that holds for
+/// optional scalars too, whichever way they cross.
 pub(crate) fn go_type(ty: &Ty) -> String {
     match ty {
         Ty::Prim(p) => prim_type(*p).into(),
-        Ty::Record(n) | Ty::RichEnum(n) | Ty::Enum(n) | Ty::CallbackInterface(n) => pascal(n),
+        Ty::Record(n) | Ty::RichEnum(n) | Ty::Enum(n) => pascal(n),
         Ty::Interface(n) => format!("*{}", pascal(n)),
         Ty::Optional(inner) if optional_derefs(inner) => format!("*{}", go_type(inner)),
         Ty::Optional(inner) => go_type(inner),
         Ty::List(inner) => format!("[]{}", go_type(inner)),
         Ty::Map(k, v) => format!("map[{}]{}", go_type(k), go_type(v)),
-        // A throwing iterator wrapper spells `iter.Seq2[T, error]` at its
-        // signature site instead.
-        Ty::Iterator(inner) => format!("iter.Seq[{}]", go_type(inner)),
+    }
+}
+
+/// The Go type of a parameter: a value type, or the Go interface a
+/// callback implementation satisfies (nil for an absent optional one).
+pub(crate) fn param_type(ty: &ParamTy) -> String {
+    match ty {
+        ParamTy::Value(t) => go_type(t),
+        ParamTy::Callback { name, .. } => pascal(name),
+    }
+}
+
+/// The Go type a wrapper returns for `ret` (before any `error`): a value
+/// type, or a lazy sequence of the element type.
+pub(crate) fn ret_type(ret: &RetTy, throws: bool) -> String {
+    match ret {
+        RetTy::Value(t) => go_type(t),
+        RetTy::Iterator(t) if throws => format!("iter.Seq2[{}, error]", go_type(t)),
+        RetTy::Iterator(t) => format!("iter.Seq[{}]", go_type(t)),
     }
 }
 
 /// The Go type of a primitive.
-fn prim_type(p: Prim) -> &'static str {
+pub(crate) fn prim_type(p: Prim) -> &'static str {
     match p {
         Prim::I8 => "int8",
         Prim::I16 => "int16",
@@ -47,17 +63,12 @@ fn prim_type(p: Prim) -> &'static str {
 }
 
 /// `true` when `T?` surfaces as `*T` in Go. Types that are already
-/// nil-able (rich enums, slices, maps, byte slices, wrapper pointers, and
-/// callback interfaces) use nil as the none marker instead.
+/// nil-able (rich enums, slices, maps, byte slices, and wrapper pointers)
+/// use nil as the none marker instead.
 pub(crate) fn optional_derefs(inner: &Ty) -> bool {
     !matches!(
         inner,
-        Ty::RichEnum(_)
-            | Ty::List(_)
-            | Ty::Map(_, _)
-            | Ty::Prim(Prim::Bytes)
-            | Ty::Interface(_)
-            | Ty::CallbackInterface(_)
+        Ty::RichEnum(_) | Ty::List(_) | Ty::Map(_, _) | Ty::Prim(Prim::Bytes) | Ty::Interface(_)
     )
 }
 
@@ -71,18 +82,6 @@ pub(crate) fn go_zero(ty: &Ty) -> String {
         Ty::Record(n) => format!("{}{{}}", pascal(n)),
         _ => "nil".into(),
     }
-}
-
-/// The Go expression converting the Go value `expr` into the by-value C
-/// slot of type `slot` (a scalar, `bool`, or C-style enum).
-pub(crate) fn to_c_direct(expr: &str, slot: &CType, prefix: &str) -> String {
-    format!("{}({expr})", cgo_type(slot, prefix))
-}
-
-/// The Go expression converting the by-value C slot `expr` back into the
-/// Go value of type `ty`.
-pub(crate) fn from_c_direct(expr: &str, ty: &Ty) -> String {
-    format!("{}({expr})", go_type(ty))
 }
 
 /// The cgo spelling of one C ABI type: `C.int32_t`, `*C.uint8_t`,
@@ -106,6 +105,14 @@ pub(crate) fn cgo_type(ct: &CType, prefix: &str) -> String {
         CType::Ptr { pointee, .. } => format!("*{}", cgo_type(pointee, prefix)),
         CType::Void => unreachable!("a void slot is never spelled in Go"),
         named => format!("C.{}", named.render_c(prefix)),
+    }
+}
+
+/// The cgo type a pointer slot points at (`C.int32_t` for `int32_t*`).
+pub(crate) fn cgo_pointee(ct: &CType, prefix: &str) -> String {
+    match ct {
+        CType::Ptr { pointee, .. } => cgo_type(&strip_const(pointee), prefix),
+        other => unreachable!("{other:?} is not a pointer slot"),
     }
 }
 

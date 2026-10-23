@@ -9,8 +9,8 @@
 //     data classes, the `EntryKind` enum class, maps and optionals, unsigned
 //     counts as `UInt`/`ULong`, and the logical clock;
 //   * `KvException` subclasses with their payload fields (`KeyNotFound`,
-//     `Expired`, `StoreFull`, `Rejected`), and runtime failures (-4) as the
-//     root `FfiException`;
+//     `Expired`, `StoreFull`, `Rejected`, `CallbackFailed`), and untyped
+//     failures (-1) as the root `FfiException`;
 //   * lazy `NativeIterator`s of strings (throwing at launch), records, and
 //     objects, including one abandoned part-way;
 //   * three callback interfaces implemented in Kotlin: a `Listener`
@@ -18,9 +18,10 @@
 //     when it throws, and notified from a producer thread during
 //     compaction), a `Policy` (a record return, a throwing method whose
 //     `KvException.Rejected` reaches the `put` caller with its payload, an
-//     object parameter and object return), and a `Loader` passed as an
-//     optional callback (string, bytes, and optional-object returns; typed
-//     errors decoded by the producer or passed through);
+//     object parameter and object return, any other failure arriving as
+//     `CallbackFailed`), and a `Loader` passed as an optional callback
+//     (string, bytes, and optional-object returns; typed errors decoded by
+//     the producer or passed through);
 //   * `Store` objects in every position: parameter, return, optional, list,
 //     map value, record field, iterator element, async result, and callback
 //     parameter and return;
@@ -30,7 +31,15 @@
 //     list launched concurrently, and an async function in the nested
 //     `kv.stats` module (`Kv.StatsModule`);
 //   * the sibling `report` root (the shared `Entry` record and its own error
-//     domain).
+//     domain);
+//   * the ABI 5 shapes: optional scalars as a parameter (`ttlSeconds`), a
+//     return (`expiresAt`), iterator items (`expirations`), an async result
+//     (`versionOf`), and a callback parameter and return (`Policy.ttlFor`);
+//     typed arrays as a return (`valueSizes`), an async result
+//     (`versions`), and a callback parameter and return (`Scorer`, as a
+//     lambda through its `fun interface`); `usize` counts as `ULong`; a
+//     `throws: any` method (`importLines`); callback failures converted into
+//     `KvException.CallbackFailed`; and content equality of `Entry`.
 //
 // Releases of consumer callbacks are observed through the producer's
 // callback counter (`debug_live(1)`). Ends by asserting the producer's leak
@@ -58,6 +67,7 @@ import kvstore.Loader
 import kvstore.Policy
 import kvstore.Report
 import kvstore.ReportException
+import kvstore.Scorer
 import kvstore.Stats
 import kvstore.Store
 import kvstore.StoreInfo
@@ -111,9 +121,21 @@ class RecordingListener(private val skip: String? = null, private val failOn: St
 
 // ── policy (consumer-implemented, rich returns, throws) ───────────────────
 
-/** Routes `b/` keys to [other], a reference this policy owns. */
+/**
+ * Routes `b/` keys to [other], a reference this policy owns, and sets TTLs:
+ * 1 for `short`, none for `forever`, a typed failure for `ttl-typed`, an
+ * untyped one for `ttl-boom`, and the requested TTL otherwise.
+ */
 class TestPolicy(private val other: Store) : Policy {
     val admitted = AtomicInteger()
+
+    override fun ttlFor(key: String, requested: Long?): Long? = when (key) {
+        "short" -> 1L
+        "forever" -> null
+        "ttl-typed" -> throw KvException.StoreFull(7u, "no room for a TTL")
+        "ttl-boom" -> throw IllegalStateException("ttl exploded")
+        else -> requested
+    }
 
     override fun admit(entry: Entry): Entry {
         admitted.incrementAndGet()
@@ -169,7 +191,7 @@ fun basics() = Store.open("/basics").use { s ->
     // put returns the stored entry; the version counts puts of the key.
     val e1 = s.putText("alpha", "one", EntryKind.Persistent)
     expect(e1.key == "alpha" && text(e1.value) == "one" && e1.kind == EntryKind.Persistent, "put alpha")
-    expect(e1.version == 1u && e1.expires_at == null && e1.tags.isEmpty() && e1.metadata.isEmpty(), "put alpha fields")
+    expect(e1.version == 1u && e1.expiresAt == null && e1.tags.isEmpty() && e1.metadata.isEmpty(), "put alpha fields")
     val e2 = s.putText("alpha", "two", EntryKind.Volatile)
     expect(e2.version == 2u && e2.kind == EntryKind.Volatile, "put alpha again")
 
@@ -180,12 +202,12 @@ fun basics() = Store.open("/basics").use { s ->
     expect(s.find("nope") == null, "find nope")
 
     // TTLs follow the logical clock; an expired get reports when.
-    expect(s.putText("ttl", "x", EntryKind.Volatile, 10).expires_at == 10L, "ttl expires_at")
+    expect(s.putText("ttl", "x", EntryKind.Volatile, 10).expiresAt == 10L, "ttl expiresAt")
     expect(s.now() == 0L, "clock starts at 0")
-    expect(s.tick(9) == 9L && s.count() == 2u, "tick 9")
-    expect(s.tick(1) == 10L && s.count() == 1u, "tick 10")
+    expect(s.tick(9) == 9L && s.count() == 2uL, "tick 9")
+    expect(s.tick(1) == 10L && s.count() == 1uL, "tick 10")
     val expired = expectThrows<KvException.Expired>("get(ttl)") { s.get("ttl") }
-    expect(expired.key == "ttl" && expired.expired_at == 10L, "Expired payload")
+    expect(expired.key == "ttl" && expired.expiredAt == 10L, "Expired payload")
     expectKeyNotFound("ttl") { s.get("ttl") } // the expired read removed it
 
     // Capacity: a new key past it is StoreFull { capacity }.
@@ -201,8 +223,8 @@ fun basics() = Store.open("/basics").use { s ->
     expect(s.delete("beta") && !s.delete("beta"), "delete twice")
     @Suppress("DEPRECATION")
     val size = s.size()
-    expect(size == s.count() && size == 1u, "deprecated size() == count()")
-    expect(s.clear() == 1u && s.count() == 0u, "clear")
+    expect(size.toULong() == s.count() && size == 1u, "deprecated size() == count()")
+    expect(s.clear() == 1u && s.count() == 0uL, "clear")
 }
 
 fun iterators() = Store.open("/iter").use { s ->
@@ -230,7 +252,7 @@ fun iterators() = Store.open("/iter").use { s ->
     for (part in s.partition(prefixes)) {
         part.use {
             expect(it.address() != s.address(), "partition yields new stores")
-            expect(it.count() == listOf(2u, 1u, 0u)[i] && it.path() == prefixes[i], "partition $i")
+            expect(it.count() == listOf(2uL, 1uL, 0uL)[i] && it.path() == prefixes[i], "partition $i")
         }
         i++
     }
@@ -242,7 +264,7 @@ fun listeners() {
     val s = Store.open("/listen")
     val l = RecordingListener(skip = "quiet")
     val id = s.subscribe(l)
-    expect(id > 0u && s.listenerCount() == 1u && liveCallbacks() == base + 1, "subscribe")
+    expect(id > 0u && s.listenerCount() == 1uL && liveCallbacks() == base + 1, "subscribe")
 
     s.putText("a", "1")
     var put = l.puts().last()
@@ -267,7 +289,7 @@ fun listeners() {
 
     // Unsubscribing releases the listener once.
     expect(s.unsubscribe(id) && liveCallbacks() == base, "unsubscribe releases the listener")
-    expect(!s.unsubscribe(id) && s.listenerCount() == 0u, "unsubscribe twice")
+    expect(!s.unsubscribe(id) && s.listenerCount() == 0uL, "unsubscribe twice")
 
     // A listener that fails is detached (and released); the put succeeds.
     val failing = RecordingListener(failOn = "boom")
@@ -275,13 +297,13 @@ fun listeners() {
     s.putText("fine", "1")
     expect(failing.puts().size == 1, "the failing listener saw fine")
     s.putText("boom", "1")
-    expect(s.count() == 2u && s.listenerCount() == 0u, "a failing listener is detached")
+    expect(s.count() == 2uL && s.listenerCount() == 0uL, "a failing listener is detached")
     expect(liveCallbacks() == base, "the failing listener was released")
 
     // Closing the store releases the listeners it still holds.
     s.subscribe(RecordingListener())
     s.subscribe(RecordingListener())
-    expect(s.listenerCount() == 2u && liveCallbacks() == base + 2, "two listeners")
+    expect(s.listenerCount() == 2uL && liveCallbacks() == base + 2, "two listeners")
     s.close()
     expect(liveCallbacks() == base, "closing the store released its listeners")
 }
@@ -301,18 +323,34 @@ fun policies() {
 
     // route: the object parameter and object return redirect a write.
     s.putText("b/x", "2", EntryKind.Volatile)
-    expect(s.count() == 1u && other.count() == 1u, "route redirected b/x")
+    expect(s.count() == 1uL && other.count() == 1uL, "route redirected b/x")
 
     // A typed error from the throwing callback reaches the caller with its
-    // code, message, and payload.
+    // code and payload, and the message the producer renders from them.
     val rejected = expectThrows<KvException.Rejected>("put(secret)") { s.putText("secret", "3") }
-    expect(rejected.code == 1005 && rejected.message == "secrets are not stored", "Rejected code and message")
+    expect(
+        rejected.code == 1005 && rejected.message == "write to secret rejected: no secrets",
+        "Rejected code and message (got ${rejected.message})",
+    )
     expect(rejected.key == "secret" && rejected.reason == "no secrets", "Rejected payload")
 
-    // Anything else arrives as -4 with the consumer's message.
-    val boom = expectThrows<FfiException>("put(boom)") { s.putText("boom", "4") }
-    expect(boom !is KvException && boom.code == -4 && boom.message == "policy exploded", "-4 (got ${boom.code}: ${boom.message})")
-    expect(s.count() == 1u && other.count() == 1u && p.admitted.get() == 4, "failed puts changed nothing")
+    // Anything else arrives as CallbackFailed with the consumer's message.
+    val boom = expectThrows<KvException.CallbackFailed>("put(boom)") { s.putText("boom", "4") }
+    expect(boom.code == 1006 && boom.message == "policy exploded", "CallbackFailed (got ${boom.code}: ${boom.message})")
+    expect(boom.message_ == "policy exploded", "CallbackFailed payload")
+    expect(s.count() == 1uL && other.count() == 1uL && p.admitted.get() == 4, "failed puts changed nothing")
+
+    // ttlFor: an optional scalar parameter and return.
+    expect(s.putText("short", "x").expiresAt == 1L && s.expiresAt("short") == 1L, "ttlFor sets a TTL")
+    expect(s.putText("forever", "x", ttl = 5).expiresAt == null, "ttlFor removes a TTL")
+    expect(s.putText("plain", "x", ttl = 9).expiresAt == 9L, "ttlFor keeps the requested TTL")
+    expect(s.putText("plain2", "x").expiresAt == null, "ttlFor keeps no TTL")
+    val typed = expectThrows<KvException.StoreFull>("put(ttl-typed)") { s.putText("ttl-typed", "x") }
+    expect(typed.capacity == 7u && typed.message == "store is full (7 entries)", "ttlFor's typed error (got ${typed.message})")
+    val ttlBoom = expectThrows<KvException.CallbackFailed>("put(ttl-boom)") { s.putText("ttl-boom", "x") }
+    expect(ttlBoom.message == "ttl exploded", "ttlFor's untyped error (got ${ttlBoom.message})")
+    expect(s.count() == 5uL, "ttl failures stored nothing")
+    s.clear()
 
     // Replacing the policy releases the old one; null removes it.
     s.setPolicy(TestPolicy(other.share()))
@@ -320,7 +358,7 @@ fun policies() {
     s.setPolicy(null)
     expect(!s.hasPolicy() && liveCallbacks() == base, "setPolicy(null) released it")
     s.putText("secret", "now allowed")
-    expect(s.count() == 2u, "no policy, no veto")
+    expect(s.count() == 1uL, "no policy, no veto")
 
     other.close()
     s.close()
@@ -337,7 +375,7 @@ fun loaders() = Store.open("/load").use { s ->
     expect(loaded != null && text(loaded.value) == "loaded:k", "loaded value")
     expect(loaded!!.kind == EntryKind.Volatile && loaded.metadata == mapOf("source" to "kotlin-loader"), "loaded entry")
     expect(liveCallbacks() == base, "a loader is released after the call")
-    expect(s.count() == 1u, "the loaded entry is stored")
+    expect(s.count() == 1uL, "the loaded entry is stored")
     // A hit doesn't consult the loader.
     expect(s.getOrLoad("k", TestLoader())?.version == 1u, "a hit")
 
@@ -353,10 +391,13 @@ fun loaders() = Store.open("/load").use { s ->
     expect(s.getOrLoad("missing", TestLoader()) == null, "KeyNotFound for the same key is none")
     // KeyNotFound for another key: passed through, payload intact.
     val other = expectThrows<KvException.KeyNotFound>("getOrLoad(elsewhere)") { s.getOrLoad("elsewhere", TestLoader()) }
-    expect(other.key == "other" && other.message == "not in the loader", "KeyNotFound(other) passed through")
-    // Any other failure is -4.
-    val broken = expectThrows<FfiException>("getOrLoad(broken)") { s.getOrLoad("broken", TestLoader()) }
-    expect(broken.code == -4 && broken.message == "loader is broken", "-4 (got ${broken.code}: ${broken.message})")
+    expect(
+        other.key == "other" && other.message == "key not found: other",
+        "KeyNotFound(other) passed through (got ${other.message})",
+    )
+    // Any other failure is CallbackFailed with the loader's message.
+    val broken = expectThrows<KvException.CallbackFailed>("getOrLoad(broken)") { s.getOrLoad("broken", TestLoader()) }
+    expect(broken.code == 1006 && broken.message == "loader is broken", "CallbackFailed (got ${broken.code}: ${broken.message})")
     expect(liveCallbacks() == base, "every loader was released")
 }
 
@@ -373,7 +414,7 @@ fun asyncCalls() = runBlocking {
     expect(s.compact(0u) == 2u, "compact(0) removed 2")
     expect(l.removed(expired = true).size == 2, "the listener saw both expirations")
     expect(l.offMainThread.get() == 2, "notified from a producer thread")
-    expect(s.count() == 1u, "one entry left")
+    expect(s.count() == 1uL, "one entry left")
     expect(s.compact(5u) == 0u, "compact(5) removed nothing")
 
     // Cancel mid-pause: the call completes at once with a cancellation, and
@@ -422,13 +463,13 @@ fun objectGraph() {
     val s = s0.share()
     expect(s.address() == s0.address(), "share() is the same object")
     s0.close()
-    expect(s.count() == 1u, "alive through the shared reference")
+    expect(s.count() == 1uL, "alive through the shared reference")
 
     // fork(): a distinct object with a copy of the entries.
     val fork = s.fork()
-    expect(fork.address() != s.address() && fork.count() == 1u && fork.path() == "/graph", "fork")
+    expect(fork.address() != s.address() && fork.count() == 1uL && fork.path() == "/graph", "fork")
     fork.putText("k2", "v")
-    expect(fork.count() == 2u && s.count() == 1u, "fork is independent")
+    expect(fork.count() == 2uL && s.count() == 1uL, "fork is independent")
 
     // larger(): `Store?` in and out.
     val empty = Store.open("/empty")
@@ -440,7 +481,7 @@ fun objectGraph() {
     val info = s.describe("main", fork)
     expect(info.label == "main" && info.count == 1u, "describe label and count")
     expect(info.store.address() == s.address() && info.mirror?.address() == fork.address(), "describe objects")
-    expect(info.mirror?.count() == 2u, "the mirror is live")
+    expect(info.mirror?.count() == 2uL, "the mirror is live")
 
     // openMany(): a list of objects; one bad path fails the whole call.
     val many = Store.openMany(listOf("/a", "/b"))
@@ -461,7 +502,7 @@ fun objectGraph() {
     expect(Store.totalCount(stores, named, null) == 5u, "totalCount without extra")
 
     // Everything is still intact; release each reference once.
-    expect(s.count() == 1u && fork.count() == 2u && many[0].count() == 1u, "still usable")
+    expect(s.count() == 1uL && fork.count() == 2uL && many[0].count() == 1uL, "still usable")
     named.values.forEach { it.close() }
     info.store.close()
     info.mirror?.close()
@@ -492,6 +533,76 @@ fun statsAndReport() = Store.open("/stats").use { s ->
     expect(nothing.code == 2001 && nothing.message == "nothing to report", "NothingToReport")
 }
 
+// ── ABI 5 shapes ──────────────────────────────────────────────────────────
+
+/** Optional scalars and typed arrays as returns, iterator items, and async results. */
+fun abi5Shapes() = Store.open("/abi5").use { s ->
+    s.putText("b", "12", EntryKind.Persistent)
+    s.put("a", byteArrayOf(1, 2, 3), EntryKind.Volatile, 7)
+    expect(s.count() == 2uL, "count() is a usize")
+    expect(s.expiresAt("a") == 7L, "expiresAt(a)")
+    expect(s.expiresAt("b") == null && s.expiresAt("zzz") == null, "expiresAt absent")
+    expect(s.valueSizes() == listOf(3uL, 2uL), "valueSizes (got ${s.valueSizes()})")
+    val expirations = s.expirations().asSequence().toList()
+    expect(expirations == listOf(7L, null), "expirations (got $expirations)")
+    expect(JniBridge.debug_live(2) == 0L, "the expirations iterator is released")
+    runBlocking {
+        expect(s.versionOf("a") == 1u, "versionOf(a)")
+        expect(s.versionOf("q") == null, "versionOf(q) is absent")
+        s.putText("b", "x")
+        val versions = s.versions(listOf("b", "q", "a"))
+        expect(versions == listOf(2u, 0u, 1u), "versions (got $versions)")
+    }
+}
+
+/** A callback interface with a typed-array parameter and return, as a lambda. */
+fun ranking() = Store.open("/rank").use { s ->
+    val base = liveCallbacks()
+    s.putText("a", "1")
+    s.putText("b", "333")
+    s.putText("c", "22")
+    var seen: List<ULong>? = null
+    val ranked = s.rank { sizes ->
+        seen = sizes
+        sizes.map { it.toDouble() }
+    }
+    expect(seen == listOf(1uL, 3uL, 2uL), "the scorer saw the sizes (got $seen)")
+    expect(ranked == listOf("b", "c", "a"), "rank (got $ranked)")
+    val failed = expectThrows<KvException.CallbackFailed>("rank with a failing scorer") {
+        s.rank { throw IllegalStateException("scorer failed") }
+    }
+    expect(failed.message == "scorer failed", "the scorer's message (got ${failed.message})")
+    val short = expectThrows<KvException.CallbackFailed>("rank with too few scores") { s.rank { listOf(1.0) } }
+    expect(short.message == "expected 3 scores, got 1", "the count mismatch (got ${short.message})")
+    val reverse = object : Scorer {
+        override fun scores(sizes: List<ULong>): List<Double> = sizes.map { -it.toDouble() }
+    }
+    expect(s.rank(reverse) == listOf("a", "c", "b"), "an object scorer")
+    expect(liveCallbacks() == base, "every scorer was released")
+}
+
+/** A `throws: any` method returning a usize. */
+fun imports() = Store.open("/import").use { s ->
+    expect(s.importLines("a=1\n\nb=two\n") == 2uL, "importLines")
+    expect(text(s.get("b").value) == "two", "an imported value")
+    val e = thrownBy { s.importLines("c=3\nbroken\nd=4") }
+    expect(
+        e is FfiException && e !is KvException && e.code == -1 && e.message == "line 2: expected key=value",
+        "importLines fails untyped (got $e)",
+    )
+    expect(s.count() == 3uL && s.find("c") != null && s.find("d") == null, "the lines before the failure were stored")
+}
+
+/** Records holding bytes compare by content. */
+fun recordEquality() = Store.open("/equality").use { s ->
+    val e = s.putText("k", "v")
+    val copy = e.copy(value = bytes("v"))
+    expect(e == copy && e.hashCode() == copy.hashCode(), "Entry compares its bytes by content")
+    expect(e != copy.copy(value = bytes("w")), "different bytes differ")
+    expect(e.toString().contains("value=[118]"), "Entry prints its bytes (got $e)")
+    expect(s.get("k") == e, "a fetched entry equals the put one")
+}
+
 fun main() {
     expect(JniBridge.debug_live(-1) == 1L, "the sample counts live allocations")
 
@@ -504,6 +615,10 @@ fun main() {
     asyncCalls()
     objectGraph()
     statsAndReport()
+    abi5Shapes()
+    ranking()
+    imports()
+    recordEquality()
 
     expectNoLeaks(JniBridge::debug_live)
     println("kotlin/kvstore: OK")

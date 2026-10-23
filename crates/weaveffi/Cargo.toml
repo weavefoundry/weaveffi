@@ -12,23 +12,32 @@ categories = ["development-tools::ffi"]
 
 [dependencies]
 weaveffi-macros = { workspace = true }
+
+# Tokio has no multi-thread runtime on wasm32, where async calls are polled
+# inline instead, so the dependency (and the `tokio` feature's effect) is
+# native-only.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread"], optional = true }
 
 [features]
+default = ["tokio"]
 # Count live objects, callbacks, iterators, cancel tokens, and returned byte
 # allocations so `{prefix}_debug_live` can report leaks. Off by default
 # because every counted operation pays for an atomic update. Every sample
 # enables it.
 leak-check = []
-# Run exported `async fn`s on Tokio: the current runtime when a launcher is
-# called from inside one, otherwise a multi-thread runtime created on first
-# use. `set_spawner` still overrides it.
+# Run exported `async fn`s on Tokio (on by default): the current runtime
+# when a launcher is called from inside one, otherwise a multi-thread
+# runtime created on first use. Without it, each call runs on a thread of
+# its own. `set_spawner` overrides either.
 tokio = ["dep:tokio"]
 
 [dev-dependencies]
 # The leak-counter test needs counting on. A path-only self dependency turns
-# the feature on for this crate's tests, and `cargo publish` strips it.
-weaveffi = { path = ".", features = ["leak-check"] }
+# the feature on for this crate's tests, and `cargo publish` strips it. It
+# leaves the default features to the command line, so
+# `--no-default-features` tests the thread-per-call executor.
+weaveffi = { path = ".", default-features = false, features = ["leak-check"] }
 proptest = "1.11.0"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
 

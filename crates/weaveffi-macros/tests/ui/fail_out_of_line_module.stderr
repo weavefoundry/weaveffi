@@ -1,5 +1,5 @@
 error: weaveffi: a #[weaveffi::module] must have an inline body (`mod name { ... }`); the macro can't read a module from another file
- --> tests/ui/fail_out_of_line_module.rs:6:5
+ --> tests/ui/fail_out_of_line_module.rs:7:9
   |
-6 |     #[weaveffi::module]
-  |     ^
+7 |     mod inner;
+  |         ^^^^^

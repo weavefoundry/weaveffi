@@ -1,19 +1,21 @@
-//! Value-buffer codecs: one `wvWrite{T}`/`wvRead{T}` pair per type that
-//! crosses inside a buffer, against the `wvWriter`/`wvReader` pair and the
-//! generic list, map, and optional helpers in `runtime/codec.go`.
+//! Value-buffer codecs: one `wvWrite*`/`wvRead*` pair per type that crosses
+//! inside a buffer, against the `wvWriter`/`wvReader` pair and the generic
+//! list, map, and optional helpers in `runtime/codec.go`.
 //!
-//! Every composite type the API uses (`[string]`, `{string:Store}`,
-//! `Entry?`) gets exactly one named pair, built from the pairs of its parts,
-//! so a call site, a record field, and a callback argument of the same type
-//! share one encoder and one decoder. Primitives use the writer and reader
-//! methods directly (`(*wvWriter).writeString`); records, rich enums,
-//! C-style enums, and interfaces get their pairs from the entity renderers.
+//! Records, rich enums, C-style enums, and interfaces get their pairs from
+//! the entity renderers, named after the Go type (`wvWriteItem`). Every
+//! composite the API uses ([`codecs::composites`]) gets one pair named
+//! after its shared stem (`wvWrite_list_string`, `wvRead_opt_Item`), so a
+//! call site, a record field, and a callback argument of the same type
+//! share one encoder and one decoder, and the stem matches every other
+//! target's. Primitives use the writer and reader methods directly
+//! (`(*wvWriter).writeString`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use crate::codegen::CodeWriter;
+use crate::codegen::{codecs, CodeWriter};
 use weaveffi_model::model::Model;
-use weaveffi_model::ty::{Family, Ty, WireType};
+use weaveffi_model::ty::Ty;
 
 use crate::targets::go::names::pascal;
 use crate::targets::go::types::{go_type, optional_derefs};
@@ -27,21 +29,12 @@ pub(crate) fn func(w: &mut CodeWriter, signature: &str, body: &str) {
     w.blank();
 }
 
-/// The stem naming a type's codec pair: `String`, `Entry`, `ListString`,
-/// `MapStringStore`, `OptEntry`. Prefix notation with fixed arities, so
-/// distinct types never share a stem.
-fn stem(ty: &Ty) -> String {
+/// The name fragment of a type's codec pair: a user type's Go name, or a
+/// composite's shared stem after an underscore (`Item`, `_list_string`).
+fn suffix(ty: &Ty) -> String {
     match ty {
-        Ty::Prim(p) => p.pascal().to_string(),
-        Ty::Optional(inner) => format!("Opt{}", stem(inner)),
-        Ty::List(inner) => format!("List{}", stem(inner)),
-        Ty::Map(k, v) => format!("Map{}{}", stem(k), stem(v)),
-        Ty::Iterator(inner) => format!("Iter{}", stem(inner)),
-        Ty::Record(n)
-        | Ty::RichEnum(n)
-        | Ty::Enum(n)
-        | Ty::Interface(n)
-        | Ty::CallbackInterface(n) => pascal(n),
+        Ty::Record(n) | Ty::RichEnum(n) | Ty::Enum(n) | Ty::Interface(n) => pascal(n),
+        _ => format!("_{}", codecs::stem(ty)),
     }
 }
 
@@ -50,7 +43,7 @@ fn stem(ty: &Ty) -> String {
 pub(crate) fn write_fn(ty: &Ty) -> String {
     match ty {
         Ty::Prim(p) => format!("(*wvWriter).write{}", p.pascal()),
-        _ => format!("wvWrite{}", stem(ty)),
+        _ => format!("wvWrite{}", suffix(ty)),
     }
 }
 
@@ -59,7 +52,7 @@ pub(crate) fn write_fn(ty: &Ty) -> String {
 pub(crate) fn read_fn(ty: &Ty) -> String {
     match ty {
         Ty::Prim(p) => format!("(*wvReader).read{}", p.pascal()),
-        _ => format!("wvRead{}", stem(ty)),
+        _ => format!("wvRead{}", suffix(ty)),
     }
 }
 
@@ -67,7 +60,7 @@ pub(crate) fn read_fn(ty: &Ty) -> String {
 pub(crate) fn write_stmt(w: &str, expr: &str, ty: &Ty) -> String {
     match ty {
         Ty::Prim(p) => format!("{w}.write{}({expr})", p.pascal()),
-        _ => format!("wvWrite{}({w}, {expr})", stem(ty)),
+        _ => format!("{}({w}, {expr})", write_fn(ty)),
     }
 }
 
@@ -75,96 +68,88 @@ pub(crate) fn write_stmt(w: &str, expr: &str, ty: &Ty) -> String {
 pub(crate) fn read_expr(r: &str, ty: &Ty) -> String {
     match ty {
         Ty::Prim(p) => format!("{r}.read{}()", p.pascal()),
-        _ => format!("wvRead{}({r})", stem(ty)),
+        _ => format!("{}({r})", read_fn(ty)),
     }
 }
 
-/// Every type the API carries inside value buffers, by kind of codec it
-/// needs.
-#[derive(Default)]
+/// The types the API carries inside value buffers that need codec pairs
+/// beyond records and rich enums (which always get theirs).
 pub(crate) struct BufferTypes {
-    /// Optionals, lists, and maps, by stem.
-    composites: BTreeMap<String, Ty>,
+    /// Optionals, lists, and maps, innermost first.
+    composites: Vec<Ty>,
     /// C-style enums that appear inside a buffer.
-    pub(crate) enums: BTreeSet<String>,
+    enums: BTreeSet<String>,
     /// Interfaces that appear inside a buffer (as object tokens).
-    pub(crate) interfaces: BTreeSet<String>,
+    interfaces: BTreeSet<String>,
 }
 
 impl BufferTypes {
-    /// Walk every position of `model` where a value crosses in a buffer.
+    /// Every buffered shape of `model`: the shared composites, and the
+    /// C-style enums and interfaces inside them or inside a record,
+    /// variant, or error payload field.
     pub(crate) fn of(model: &Model) -> Self {
-        let mut t = Self::default();
-        for m in &model.modules {
-            for s in &m.structs {
-                for f in &s.fields {
-                    t.visit(&f.ty);
-                }
-            }
-            for e in &m.enums {
-                for v in &e.variants {
-                    for f in &v.fields {
-                        t.visit(&f.ty);
-                    }
-                }
-            }
-            if let Some(e) = &m.errors {
-                for c in &e.codes {
-                    for f in &c.fields {
-                        t.visit(&f.ty);
-                    }
-                }
-            }
-            let callables = m.callables().map(|f| (&f.params, f.ret.as_ref()));
-            let methods = m
-                .callback_interfaces
+        let composites = codecs::composites(model);
+        let mut t = Self {
+            composites: Vec::new(),
+            enums: BTreeSet::new(),
+            interfaces: BTreeSet::new(),
+        };
+        let fields = model.modules.iter().flat_map(|m| {
+            let structs = m.structs.iter().flat_map(|s| &s.fields);
+            let variants = m
+                .enums
                 .iter()
-                .flat_map(|cb| &cb.methods)
-                .map(|f| (&f.params, f.ret.as_ref()));
-            for (params, ret) in callables.chain(methods) {
-                for p in params {
-                    t.visit_top(&p.ty);
-                }
-                if let Some(ret) = ret {
-                    t.visit_top(ret.iterator_elem().unwrap_or(ret));
-                }
-            }
+                .flat_map(|e| &e.variants)
+                .flat_map(|v| &v.fields);
+            let payloads = m
+                .errors
+                .iter()
+                .flat_map(|e| &e.codes)
+                .flat_map(|c| &c.fields);
+            structs.chain(variants).chain(payloads).map(|f| &f.ty)
+        });
+        for ty in fields.chain(&composites) {
+            t.leaves(ty);
         }
+        t.composites = composites;
         t
     }
 
-    /// A parameter, return, or element: only a buffer-family value crosses
-    /// in a buffer.
-    fn visit_top(&mut self, ty: &Ty) {
-        if ty.family() == Family::Buffer {
-            self.visit(ty);
+    fn leaves(&mut self, ty: &Ty) {
+        match ty {
+            Ty::Enum(n) => {
+                self.enums.insert(n.clone());
+            }
+            Ty::Interface(n) => {
+                self.interfaces.insert(n.clone());
+            }
+            Ty::Optional(inner) | Ty::List(inner) => self.leaves(inner),
+            Ty::Map(k, v) => {
+                self.leaves(k);
+                self.leaves(v);
+            }
+            Ty::Prim(_) | Ty::Record(_) | Ty::RichEnum(_) => {}
         }
     }
 
-    fn visit(&mut self, ty: &Ty) {
-        match ty.wire() {
-            WireType::Prim(_) | WireType::User(_) => {}
-            WireType::Enum(n) => {
-                self.enums.insert(n.to_string());
-            }
-            WireType::Object(n) => {
-                self.interfaces.insert(n.to_string());
-            }
-            WireType::Optional(inner) | WireType::List(inner) => {
-                self.composites.insert(stem(ty), ty.clone());
-                self.visit(inner);
-            }
-            WireType::Map(k, v) => {
-                self.composites.insert(stem(ty), ty.clone());
-                self.visit(k);
-                self.visit(v);
-            }
-        }
+    /// `true` when the C-style enum `name` crosses inside a buffer.
+    pub(crate) fn has_enum(&self, name: &str) -> bool {
+        self.enums.contains(name)
     }
 
-    /// Render the composite pairs, sorted by stem.
+    /// `true` when the interface `name` crosses inside a buffer.
+    pub(crate) fn has_interface(&self, name: &str) -> bool {
+        self.interfaces.contains(name)
+    }
+
+    /// `true` when any interface crosses inside a buffer.
+    pub(crate) fn has_interfaces(&self) -> bool {
+        !self.interfaces.is_empty()
+    }
+
+    /// Render the composite pairs, innermost first.
     pub(crate) fn render_composites(&self, w: &mut CodeWriter) {
-        for (stem, ty) in &self.composites {
+        for ty in &self.composites {
             let go = go_type(ty);
             let (write, read) = match ty {
                 Ty::List(inner) => (
@@ -187,12 +172,12 @@ impl BufferTypes {
             };
             func(
                 w,
-                &format!("func wvWrite{stem}(w *wvWriter, v {go})"),
+                &format!("func {}(w *wvWriter, v {go})", write_fn(ty)),
                 &write,
             );
             func(
                 w,
-                &format!("func wvRead{stem}(r *wvReader) {go}"),
+                &format!("func {}(r *wvReader) {go}", read_fn(ty)),
                 &format!("return {read}"),
             );
         }
@@ -205,24 +190,22 @@ mod tests {
     use weaveffi_model::ty::Prim;
 
     #[test]
-    fn stems_are_prefix_notation() {
+    fn composites_are_named_by_the_shared_stem() {
         let s = Ty::Prim(Prim::String);
-        let store = Ty::Interface("Store".into());
-        assert_eq!(stem(&Ty::List(Box::new(s.clone()))), "ListString");
+        let item = Ty::Record("Item".into());
         assert_eq!(
-            stem(&Ty::Map(Box::new(s.clone()), Box::new(store))),
-            "MapStringStore"
+            write_fn(&Ty::List(Box::new(s.clone()))),
+            "wvWrite_list_string"
         );
         assert_eq!(
-            stem(&Ty::List(Box::new(Ty::Optional(Box::new(Ty::Record(
-                "Entry".into()
-            )))))),
-            "ListOptEntry"
+            read_fn(&Ty::Optional(Box::new(item.clone()))),
+            "wvRead_opt_Item"
         );
         assert_eq!(write_fn(&s), "(*wvWriter).writeString");
+        assert_eq!(read_expr("r", &item), "wvReadItem(r)");
         assert_eq!(
-            read_expr("r", &Ty::Record("Entry".into())),
-            "wvReadEntry(r)"
+            write_stmt("w", "v.ID", &Ty::Enum("user_kind".into())),
+            "wvWriteUserKind(w, v.ID)"
         );
     }
 }

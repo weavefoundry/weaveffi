@@ -1,252 +1,193 @@
-//! Value-buffer codec: the C# statement writing and the expression reading
-//! every wire shape, dispatched on [`Ty::wire`], and the internal
-//! `FfiCodecs` class, which holds one `Write`/`Read` pair per distinct
-//! composite type (`[Entry]`, `{string:i64}`, `Shape?`) so no call site
-//! inlines a loop.
+//! Value-buffer codec and value equality expressions.
 //!
-//! Records and rich enums carry their own `WriteTo`/`ReadFrom` pair. The
-//! runtime's `FfiBufferWriter`/`FfiBufferReader` name one method per
-//! [`Prim`](weaveffi_model::ty::Prim) (`WriteI32`, `ReadString`), so
-//! primitives need a single arm. An object token carries one strong
-//! reference: writing one clones the wrapper's handle through the
-//! interface's `_clone` symbol, and reading one adopts the pointer into a
-//! new wrapper.
+//! Nothing here is monomorphized per composite type: optionals, lists, and
+//! maps go through the runtime's generic `FfiBufferWriter.WriteList` /
+//! `FfiBufferReader.ReadList` (and friends), handed a `static` lambda for
+//! the element, so `[{string:[i32]}]` is three nested calls rather than a
+//! generated method per shape. Records and rich enums carry their own
+//! `WriteTo`/`ReadFrom` pair. An object token carries one strong reference:
+//! writing one clones the wrapper's handle, and reading one adopts the
+//! pointer into a new wrapper.
 
-use std::collections::BTreeMap;
+use weaveffi_model::ty::{Prim, Ty};
 
-use crate::codegen::CodeWriter;
-use weaveffi_model::model::{FieldBinding, Model, ParamBinding};
-use weaveffi_model::ty::{Ty, WireType};
+use crate::targets::dotnet::types::{cs_type, is_value_type, Cx};
 
-use crate::targets::dotnet::types::{cs_type, Cx};
-
-/// The name of a composite's codec methods after `Write`/`Read`, spelled in
-/// prefix order so it's unambiguous: `[Entry]` is `ListOfEntry`,
-/// `{string:[i32]}` is `MapOfStringToListOfI32`, `Shape?` is
-/// `OptionalOfShape`.
-pub(crate) fn codec_name(t: &Ty) -> String {
-    match t {
-        Ty::Prim(p) => p.pascal().to_string(),
-        Ty::Optional(inner) => format!("OptionalOf{}", codec_name(inner)),
-        Ty::List(inner) => format!("ListOf{}", codec_name(inner)),
-        Ty::Map(k, v) => format!("MapOf{}To{}", codec_name(k), codec_name(v)),
-        other => other
-            .user_name()
-            .or_else(|| other.interface_name())
-            .expect("only named types remain")
-            .to_string(),
+/// The C# expression (a `void` call) writing `value`, the surface value of
+/// `ty`, into the writer `writer`. `depth` numbers the lambda parameters of
+/// nested composites so they never shadow each other.
+pub(crate) fn write_call(ty: &Ty, writer: &str, value: &str, depth: usize) -> String {
+    match ty {
+        Ty::Prim(p) => format!("{writer}.Write{}({value})", p.pascal()),
+        Ty::Enum(_) => format!("{writer}.WriteI32((int){value})"),
+        Ty::Interface(_) => format!("{writer}.WriteObject({value}.CloneHandle())"),
+        Ty::Record(_) | Ty::RichEnum(_) => format!("{value}.WriteTo({writer})"),
+        Ty::Optional(inner) => {
+            let method = if is_value_type(inner) {
+                "WriteOptionalValue"
+            } else {
+                "WriteOptional"
+            };
+            format!("{writer}.{method}({value}, {})", write_lambda(inner, depth))
+        }
+        Ty::List(inner) => format!(
+            "{writer}.WriteList({value}, {})",
+            write_lambda(inner, depth)
+        ),
+        Ty::Map(k, v) => format!(
+            "{writer}.WriteMap({value}, {}, {})",
+            write_lambda(k, depth),
+            write_lambda(v, depth)
+        ),
     }
 }
 
-/// The C# statement writing `expr` (the surface value of `ty`) into the
-/// writer `writer`.
-///
-/// An object is written as a token carrying a new strong reference
-/// (`CloneHandle()`), so the encoding never hands over the reference the
-/// wrapper still owns.
-pub(crate) fn write_stmt(ty: &Ty, writer: &str, expr: &str) -> String {
-    match ty.wire() {
-        WireType::Prim(p) => format!("{writer}.Write{}({expr});", p.pascal()),
-        WireType::Enum(_) => format!("{writer}.WriteI32((int){expr});"),
-        WireType::Object(_) => format!("{writer}.WriteObject({expr}.CloneHandle());"),
-        WireType::User(_) => format!("{expr}.WriteTo({writer});"),
-        WireType::Optional(_) | WireType::List(_) | WireType::Map(..) => {
-            format!("FfiCodecs.Write{}({writer}, {expr});", codec_name(ty))
-        }
-    }
+/// A `static` lambda writing one value of `ty`: the element writer handed to
+/// the runtime's generic composite methods.
+pub(crate) fn write_lambda(ty: &Ty, depth: usize) -> String {
+    let (w, v) = (format!("w{depth}"), format!("v{depth}"));
+    format!("static ({w}, {v}) => {}", write_call(ty, &w, &v, depth + 1))
 }
 
 /// The C# expression reading a value of `ty` from the reader `reader`; the
-/// inverse of [`write_stmt`]. An object token is adopted into a new
+/// inverse of [`write_call`]. An object token is adopted into a new
 /// wrapper, which owes the reference's release.
-pub(crate) fn read_expr(cx: Cx<'_>, ty: &Ty, reader: &str) -> String {
-    match ty.wire() {
-        WireType::Prim(p) => format!("{reader}.Read{}()", p.pascal()),
-        WireType::Enum(name) => format!("({}){reader}.ReadI32()", cx.ty(name)),
-        WireType::Object(name) => format!("{}.Adopt({reader}.ReadObject())", cx.ty(name)),
-        WireType::User(name) => format!("{}.ReadFrom({reader})", cx.ty(name)),
-        WireType::Optional(_) | WireType::List(_) | WireType::Map(..) => {
-            format!("FfiCodecs.Read{}({reader})", codec_name(ty))
+pub(crate) fn read_expr(cx: Cx<'_>, ty: &Ty, reader: &str, depth: usize) -> String {
+    match ty {
+        Ty::Prim(p) => format!("{reader}.Read{}()", p.pascal()),
+        Ty::Enum(name) => format!("({}){reader}.ReadI32()", cx.ty(name)),
+        Ty::Interface(name) => format!("{}.Adopt({reader}.ReadObject())", cx.ty(name)),
+        Ty::Record(name) | Ty::RichEnum(name) => format!("{}.ReadFrom({reader})", cx.ty(name)),
+        Ty::Optional(inner) => {
+            let method = if is_value_type(inner) {
+                "ReadOptionalValue"
+            } else {
+                "ReadOptional"
+            };
+            format!("{reader}.{method}({})", read_lambda(cx, inner, depth))
         }
+        Ty::List(inner) => format!("{reader}.ReadList({})", read_lambda(cx, inner, depth)),
+        // A dictionary isn't covariant in its value type, so the reader
+        // builds it with the surface types spelled out.
+        Ty::Map(k, v) => format!(
+            "{reader}.ReadMap<{}, {}>({}, {})",
+            cs_type(k),
+            cs_type(v),
+            read_lambda(cx, k, depth),
+            read_lambda(cx, v, depth)
+        ),
     }
 }
 
-/// The C# expression decoding a whole value buffer of `ty` from the reader
-/// expression `reader` and checking that nothing trails it.
-pub(crate) fn decode_expr(cx: Cx<'_>, ty: &Ty, reader: &str) -> String {
-    format!(
-        "FfiCodecs.Decode({reader}, static r => {})",
-        read_expr(cx, ty, "r")
-    )
+/// A `static` lambda reading one value of `ty`.
+pub(crate) fn read_lambda(cx: Cx<'_>, ty: &Ty, depth: usize) -> String {
+    let r = format!("r{depth}");
+    format!("static {r} => {}", read_expr(cx, ty, &r, depth + 1))
 }
 
-/// Every distinct composite type (optional, list, or map) that crosses
-/// inside a value buffer, by codec name.
-fn composites(model: &Model) -> BTreeMap<String, Ty> {
-    /// A type in a top-level position: a parameter, return, or iterator
-    /// element. `Interface?` and `Cb?` aren't buffers there.
-    fn top(t: &Ty, out: &mut BTreeMap<String, Ty>) {
-        match t {
-            Ty::Iterator(elem) => top(elem, out),
-            _ if t.is_buffered() => nested(t, out),
-            _ => {}
-        }
+/// True when the surface type of `ty` compares by reference in C# (a byte
+/// array, a list, or a map, possibly optional), so a record's value
+/// equality has to compare its contents explicitly.
+pub(crate) fn needs_deep_equality(ty: &Ty) -> bool {
+    match ty {
+        Ty::Prim(Prim::Bytes) | Ty::List(_) | Ty::Map(..) => true,
+        Ty::Optional(inner) => needs_deep_equality(inner),
+        _ => false,
     }
-    /// A type inside a value buffer, where every optional is encoded.
-    fn nested(t: &Ty, out: &mut BTreeMap<String, Ty>) {
-        match t {
-            Ty::Optional(inner) | Ty::List(inner) => {
-                out.insert(codec_name(t), t.clone());
-                nested(inner, out);
-            }
-            Ty::Map(k, v) => {
-                out.insert(codec_name(t), t.clone());
-                nested(k, out);
-                nested(v, out);
-            }
-            _ => {}
-        }
-    }
-    fn fields(fs: &[FieldBinding], out: &mut BTreeMap<String, Ty>) {
-        for f in fs {
-            nested(&f.ty, out);
-        }
-    }
-    fn signature(ps: &[ParamBinding], ret: &Option<Ty>, out: &mut BTreeMap<String, Ty>) {
-        for p in ps {
-            top(&p.ty, out);
-        }
-        if let Some(t) = ret {
-            top(t, out);
-        }
-    }
-    let mut out = BTreeMap::new();
-    for m in &model.modules {
-        for s in &m.structs {
-            fields(&s.fields, &mut out);
-        }
-        for e in &m.enums {
-            for v in &e.variants {
-                fields(&v.fields, &mut out);
-            }
-        }
-        if let Some(eb) = &m.errors {
-            for c in &eb.codes {
-                fields(&c.fields, &mut out);
-            }
-        }
-        for f in m.callables() {
-            signature(&f.params, &f.ret, &mut out);
-        }
-        for cb in &m.callback_interfaces {
-            for f in &cb.methods {
-                signature(&f.params, &f.ret, &mut out);
-            }
-        }
-    }
-    out
 }
 
-/// Render the internal `FfiCodecs` class: `Decode`, which reads a whole
-/// buffer, plus one `Write{Name}`/`Read{Name}` pair per composite type.
-///
-/// A list or map count isn't bounded by the remaining input (elements can
-/// encode to zero bytes), so a read grows its collection from a capped
-/// capacity instead of preallocating whatever the count claims. A map that
-/// repeats a key is malformed.
-pub(crate) fn render_codecs(w: &mut CodeWriter, cx: Cx<'_>, model: &Model) {
-    w.line("/// <summary>The value-buffer codec of every composite type the API");
-    w.line("/// carries.</summary>");
-    w.line("internal static class FfiCodecs");
-    w.block("{", "}", |w| {
-        w.line("/// <summary>Reads one value that must fill the whole buffer.</summary>");
-        w.line(
-            "internal static T Decode<T>(FfiBufferReader reader, Func<FfiBufferReader, T> read)",
+/// The C# expression comparing two values of `ty` by value: contents for
+/// byte arrays, lists, and maps, default equality for everything else.
+pub(crate) fn equal_expr(ty: &Ty, a: &str, b: &str, depth: usize) -> String {
+    match ty {
+        Ty::Prim(Prim::Bytes) => format!("FfiEquality.Bytes({a}, {b})"),
+        Ty::Optional(inner) if needs_deep_equality(inner) => equal_expr(inner, a, b, depth),
+        Ty::List(inner) => match equal_lambda(inner, depth) {
+            Some(eq) => format!("FfiEquality.Lists({a}, {b}, {eq})"),
+            None => format!("FfiEquality.Lists({a}, {b})"),
+        },
+        Ty::Map(_, v) => match equal_lambda(v, depth) {
+            Some(eq) => format!("FfiEquality.Maps({a}, {b}, {eq})"),
+            None => format!("FfiEquality.Maps({a}, {b})"),
+        },
+        _ => format!("FfiEquality.Equal({a}, {b})"),
+    }
+}
+
+/// The element comparer of a collection whose elements need content
+/// equality, or `None` when default equality does.
+fn equal_lambda(ty: &Ty, depth: usize) -> Option<String> {
+    needs_deep_equality(ty).then(|| {
+        let (x, y) = (format!("x{depth}"), format!("y{depth}"));
+        format!("static ({x}, {y}) => {}", equal_expr(ty, &x, &y, depth + 1))
+    })
+}
+
+/// The C# expression a record's `GetHashCode` adds for one field: the value
+/// itself, or a hash consistent with [`equal_expr`] for collections.
+pub(crate) fn hash_expr(ty: &Ty, value: &str) -> String {
+    match ty {
+        Ty::Prim(Prim::Bytes) => format!("FfiEquality.BytesHash({value})"),
+        Ty::List(_) => format!("FfiEquality.ListHash({value})"),
+        Ty::Map(..) => format!("FfiEquality.MapHash({value})"),
+        Ty::Optional(inner) if needs_deep_equality(inner) => hash_expr(inner, value),
+        _ => value.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list(t: Ty) -> Ty {
+        Ty::List(Box::new(t))
+    }
+
+    #[test]
+    fn nested_composites_are_nested_generic_calls() {
+        let cx = Cx {
+            ns: "Kv",
+            base: "NativeException",
+            bug: "NativeBugException",
+        };
+        let ty = Ty::Map(
+            Box::new(Ty::Prim(Prim::String)),
+            Box::new(list(Ty::Optional(Box::new(Ty::Prim(Prim::I32))))),
         );
-        w.block("{", "}", |w| {
-            w.line("var value = read(reader);");
-            w.line("reader.ExpectEnd();");
-            w.line("return value;");
-        });
-        for t in composites(model).values() {
-            w.blank();
-            render_pair(w, cx, t);
-        }
-    });
-    w.blank();
-}
+        assert_eq!(
+            write_call(&ty, "writer", "Value", 0),
+            "writer.WriteMap(Value, static (w0, v0) => w0.WriteString(v0), \
+             static (w0, v0) => w0.WriteList(v0, static (w1, v1) => \
+             w1.WriteOptionalValue(v1, static (w2, v2) => w2.WriteI32(v2))))"
+        );
+        assert_eq!(
+            read_expr(cx, &ty, "reader", 0),
+            "reader.ReadMap<string, IReadOnlyList<int?>>(static r0 => r0.ReadString(), \
+             static r0 => r0.ReadList(static r1 => r1.ReadOptionalValue(static r2 => r2.ReadI32())))"
+        );
+    }
 
-/// One composite's `Write{Name}`/`Read{Name}` pair.
-fn render_pair(w: &mut CodeWriter, cx: Cx<'_>, t: &Ty) {
-    let name = codec_name(t);
-    let cs = cs_type(t);
-    w.line(format!(
-        "internal static void Write{name}(FfiBufferWriter writer, {cs} value)"
-    ));
-    w.block("{", "}", |w| match t {
-        Ty::Optional(inner) => {
-            w.line("writer.WriteBool(value != null);");
-            w.line("if (value is { } present)");
-            w.block("{", "}", |w| {
-                w.line(write_stmt(inner, "writer", "present"));
-            });
-        }
-        Ty::List(inner) => {
-            w.line("writer.WriteLen(value.Length);");
-            w.line("foreach (var item in value)");
-            w.block("{", "}", |w| {
-                w.line(write_stmt(inner, "writer", "item"));
-            });
-        }
-        Ty::Map(k, v) => {
-            w.line("writer.WriteLen(value.Count);");
-            w.line("foreach (var entry in value)");
-            w.block("{", "}", |w| {
-                w.line(write_stmt(k, "writer", "entry.Key"));
-                w.line(write_stmt(v, "writer", "entry.Value"));
-            });
-        }
-        _ => unreachable!("only composites are collected"),
-    });
-    w.blank();
-    w.line(format!(
-        "internal static {cs} Read{name}(FfiBufferReader reader)"
-    ));
-    w.block("{", "}", |w| match t {
-        Ty::Optional(inner) => {
-            w.line(format!(
-                "return reader.ReadBool() ? {} : null;",
-                read_expr(cx, inner, "reader")
-            ));
-        }
-        Ty::List(inner) => {
-            w.line("var count = reader.ReadLen();");
-            w.line(format!(
-                "var list = new List<{}>(reader.Capacity(count));",
-                cs_type(inner)
-            ));
-            w.line("for (var i = 0; i < count; i++)");
-            w.block("{", "}", |w| {
-                w.line(format!("list.Add({});", read_expr(cx, inner, "reader")));
-            });
-            w.line("return list.ToArray();");
-        }
-        Ty::Map(k, v) => {
-            w.line("var count = reader.ReadLen();");
-            w.line(format!("var map = new {cs}(reader.Capacity(count));"));
-            w.line("for (var i = 0; i < count; i++)");
-            w.block("{", "}", |w| {
-                w.line(format!("var key = {};", read_expr(cx, k, "reader")));
-                w.line(format!(
-                    "if (!map.TryAdd(key, {}))",
-                    read_expr(cx, v, "reader")
-                ));
-                w.block("{", "}", |w| {
-                    w.line("throw FfiBufferReader.Malformed(\"repeated map key\");");
-                });
-            });
-            w.line("return map;");
-        }
-        _ => unreachable!("only composites are collected"),
-    });
+    #[test]
+    fn equality_compares_collection_contents() {
+        let bytes = Ty::Prim(Prim::Bytes);
+        assert_eq!(
+            equal_expr(&list(bytes.clone()), "A", "o.A", 0),
+            "FfiEquality.Lists(A, o.A, static (x0, y0) => FfiEquality.Bytes(x0, y0))"
+        );
+        assert_eq!(
+            equal_expr(&list(Ty::Prim(Prim::I32)), "A", "o.A", 0),
+            "FfiEquality.Lists(A, o.A)"
+        );
+        assert_eq!(
+            equal_expr(&Ty::Prim(Prim::F64), "A", "o.A", 0),
+            "FfiEquality.Equal(A, o.A)"
+        );
+        assert!(!needs_deep_equality(&Ty::Optional(Box::new(Ty::Prim(
+            Prim::I64
+        )))));
+        assert_eq!(
+            hash_expr(&Ty::Optional(Box::new(bytes)), "B"),
+            "FfiEquality.BytesHash(B)"
+        );
+    }
 }

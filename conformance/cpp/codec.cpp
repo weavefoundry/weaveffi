@@ -1,4 +1,4 @@
-// Conformance consumer: codec sample, C++ target (ABI revision 4).
+// Conformance consumer: codec sample, C++ target (ABI revision 5).
 //
 // The shared-vector loop: fetch every vector the producer serves (decoded by
 // the generated codecs), hand it back to `check_vector` (re-encoded by them),
@@ -7,14 +7,20 @@
 // literals (so a symmetric encode/decode bug can't hide), spot checks of
 // decoded fields, the typed out-of-range error and its payload, malformed
 // input rejected on both sides, and object identity and reference counting
-// through value buffers. Ends by asserting the producer's leak counters are
-// zero.
+// through value buffers. Then the ABI 5 shapes: optional scalars and enums
+// in both directions (`std::optional<T>`), typed arrays in both directions
+// (`std::vector<T>` storage passed as is, bit-exact), a `usize` crossing as
+// `uint64_t`, a `char` and a custom type crossing as strings (their
+// marshalling failures are InternalError -3), a lazy `Range` of typed
+// arrays, and record equality. Ends by asserting the producer's leak
+// counters are zero.
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <variant>
@@ -204,7 +210,7 @@ static void malformed() {
     };
     for (const auto& buf : bad) {
         InternalError d = expect_throw<InternalError>(
-            [&buf] { codec::detail::decode(buf.data(), buf.size(), &codec::detail::read_Vector); },
+            [&buf] { codec::detail::decode<Vector>(buf.data(), buf.size()); },
             "decoding a malformed Vector");
         CHECK(d.code() == -3);
     }
@@ -245,6 +251,121 @@ static void objects(uint32_t n) {
     CHECK(moved.handle() == twin.handle() && copy.handle() == nullptr);
 }
 
+static void optional_scalars() {
+    CHECK(!api::echo_opt_i32(std::nullopt).has_value());
+    CHECK(api::echo_opt_i32(INT32_MIN) == INT32_MIN);
+    CHECK(api::echo_opt_i32(0) == 0);
+
+    std::optional<double> neg_zero = api::echo_opt_f64(-0.0);
+    CHECK(neg_zero.has_value() && *neg_zero == 0.0 && std::signbit(*neg_zero));
+    std::optional<double> nan = api::echo_opt_f64(std::numeric_limits<double>::quiet_NaN());
+    CHECK(nan.has_value() && std::isnan(*nan));
+    CHECK(!api::echo_opt_f64(std::nullopt).has_value());
+
+    CHECK(api::echo_opt_bool(true) == true);
+    CHECK(api::echo_opt_bool(false) == false);
+    CHECK(!api::echo_opt_bool(std::nullopt).has_value());
+
+    CHECK(api::echo_opt_color(Color::Infrared) == Color::Infrared);
+    CHECK(api::echo_opt_color(Color::Blue) == Color::Blue);
+    CHECK(!api::echo_opt_color(std::nullopt).has_value());
+
+    // A present value that isn't a declared variant is a marshalling failure.
+    InternalError e = expect_throw<InternalError>(
+        [] { api::echo_opt_color(static_cast<Color>(3)); }, "echo_opt_color(3)");
+    CHECK(e.code() == -3);
+}
+
+template <typename T>
+static bool same_bits(const std::vector<T>& a, const std::vector<T>& b) {
+    return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0);
+}
+
+static void typed_arrays() {
+    uint64_t nan_bits = 0x7ff8000000000001ull;
+    double nan = 0;
+    std::memcpy(&nan, &nan_bits, sizeof nan);
+    const std::vector<double> floats{nan, -0.0, 5e-324, std::numeric_limits<double>::infinity()};
+    CHECK(same_bits(api::echo_f64s(floats), floats));
+    CHECK(api::echo_f64s({}).empty());
+
+    const std::vector<int32_t> ints{INT32_MIN, 0, INT32_MAX};
+    CHECK(api::echo_i32s(ints) == ints);
+    CHECK(api::echo_i32s({}).empty());
+
+    const std::vector<uint64_t> wide{UINT64_MAX, 9223372036854775808ull};
+    CHECK(api::echo_u64s(wide) == wide);
+    CHECK(api::echo_u64s({}).empty());
+
+    // Every primitive vector's value through the matching typed array too.
+    std::vector<int32_t> one{-7};
+    CHECK(api::echo_i32s(one) == one);
+}
+
+static void usize_char_custom() {
+    CHECK(api::echo_usize(4294967295ull) == 4294967295ull);
+    CHECK(api::echo_usize(UINT64_MAX) == UINT64_MAX);
+
+    CHECK(api::echo_char("\xf0\x9f\xa6\x80") == "\xf0\x9f\xa6\x80");
+    CHECK(api::echo_char("\xc3\xa9") == "\xc3\xa9");
+    CHECK(api::echo_char("a") == "a");
+    InternalError e = expect_throw<InternalError>([] { api::echo_char("ab"); }, "echo_char('ab')");
+    CHECK(e.code() == -3 && std::string(e.what()) == "value: \"ab\" is not a valid char");
+    e = expect_throw<InternalError>([] { api::echo_char(""); }, "echo_char('')");
+    CHECK(e.code() == -3 && std::string(e.what()) == "value: \"\" is not a valid char");
+
+    CHECK(api::echo_hex("ff") == "ff");
+    CHECK(api::echo_hex("00FF") == "ff");
+    CHECK(api::echo_hex("0") == "0");
+    e = expect_throw<InternalError>([] { api::echo_hex("xyz"); }, "echo_hex('xyz')");
+    CHECK(e.code() == -3 && std::string(e.what()) == "value: invalid digit found in string");
+    e = expect_throw<InternalError>([] { api::echo_hex(""); }, "echo_hex('')");
+    CHECK(e.code() == -3 && std::string(e.what()) == "value: cannot parse integer from empty string");
+    e = expect_throw<InternalError>([] { api::echo_hex("100000000"); }, "echo_hex(2^32)");
+    CHECK(e.code() == -3 && std::string(e.what()) == "value: number too large to fit in target type");
+}
+
+static std::vector<std::vector<int32_t>> pull(codec::Range<std::vector<int32_t>> range) {
+    std::vector<std::vector<int32_t>> out;
+    for (std::vector<int32_t>& chunk : range) out.push_back(std::move(chunk));
+    return out;
+}
+
+static void chunked_iterators() {
+    CHECK((pull(api::chunks({INT32_MIN, 0, INT32_MAX}, 2)) ==
+           std::vector<std::vector<int32_t>>{{INT32_MIN, 0}, {INT32_MAX}}));
+    CHECK((pull(api::chunks({1, 2, 3, 4}, 2)) == std::vector<std::vector<int32_t>>{{1, 2}, {3, 4}}));
+    CHECK(pull(api::chunks({1, 2}, 0)).empty());
+    CHECK(pull(api::chunks({}, 3)).empty());
+
+    // Manual pulls, then an early close releases the producer iterator.
+    codec::Range<std::vector<int32_t>> range = api::chunks({1, 2, 3}, 1);
+    CHECK(range.next() == std::vector<int32_t>{1});
+    CHECK(codec_debug_live(2) == 1);
+    range.close();
+    CHECK(codec_debug_live(2) == 0);
+    CHECK(!range.next().has_value());
+}
+
+static void equality(uint32_t n) {
+    // Records compare memberwise; NaN fields compare unequal, as in C++.
+    CHECK(canonical_scalars() == canonical_scalars());
+    Scalars changed = canonical_scalars();
+    changed.u16_value = 1;
+    CHECK(changed != canonical_scalars());
+
+    // Rich enums compare by active variant and payload; tokens by identity.
+    CHECK(fetch(n, "shape labeled") == fetch(n, "shape labeled"));
+    CHECK(fetch(n, "shape labeled") != fetch(n, "blank"));
+    Token t(5);
+    CHECK((Holder{t, std::nullopt, {}, {}} == Holder{t, std::nullopt, {}, {}}));
+    CHECK((Holder{t, std::nullopt, {}, {}} != Holder{Token(5), std::nullopt, {}, {}}));
+
+    // Default member initializers zero every scalar.
+    Scalars zero;
+    CHECK(zero.i32_value == 0 && zero.f64_value == 0.0 && !zero.flag && zero.color == Color{});
+}
+
 int main() {
     codec::check_library();
     uint32_t n = api::vector_count();
@@ -256,6 +377,11 @@ int main() {
     out_of_range(n);
     malformed();
     objects(n);
+    optional_scalars();
+    typed_arrays();
+    usize_char_custom();
+    chunked_iterators();
+    equality(n);
 
     check_no_leaks(codec_debug_live, "codec");
     std::printf("cpp/codec: OK (%u vectors)\n", n);

@@ -1,147 +1,166 @@
-//! The generated half of `NativeMethods`: the load-time contract check and
-//! one `[LibraryImport]` per lowered C symbol, matching each callable's
-//! shape.
+//! The generated half of `NativeMethods`: the contract tables checked at
+//! load and one `[LibraryImport]` per lowered C symbol.
 //!
-//! Every slot is blittable (`byte*`, `nuint`, `FfiError*`, function
-//! pointers) except object slots, which take the interface's `SafeHandle`
-//! subclass: the source-generated stub adds a reference to the handle for
-//! the duration of the call, so a wrapper that's disposed or collected
-//! mid-call can't free the native object under it.
+//! Every slot is blittable (`byte*`, `nuint`, `FfiError*`, enums, function
+//! pointers; `bool` is marshalled as one byte) except object slots, which
+//! take the interface's `SafeHandle` subclass: the source-generated stub
+//! adds a reference to the handle for the duration of the call, so a
+//! wrapper that's disposed or collected mid-call can't free the native
+//! object under it.
 
 use std::collections::HashMap;
 
-use crate::codegen::CodeWriter;
-use weaveffi_model::abi::AbiParam;
-use weaveffi_model::contract;
-use weaveffi_model::model::{
-    contract_symbol, AbiFn, CallShape, FnBinding, InterfaceBinding, Model,
-};
+use weaveffi_model::abi::{AbiParam, CType};
+use weaveffi_model::model::{AbiFn, FnBinding, InterfaceBinding, Model};
 use weaveffi_model::plan::ArgPass;
 
-use crate::targets::dotnet::types::{cs_ctype, fn_pointer_type, safe_cs_name};
+use crate::codegen::contract::{hex, tables};
+use crate::codegen::CodeWriter;
+use crate::targets::dotnet::types::{cs_ctype, cs_str, fn_pointer_type, safe_cs_name};
 
 /// The C# type of an interface's `SafeHandle` subclass.
-pub(crate) fn handle_type(interface: &str) -> String {
+fn handle_type(interface: &str) -> String {
     format!("{interface}.NativeHandle")
 }
 
 /// Slot types that differ from the plain [`cs_ctype`] mapping for one
-/// callable: the receiver and every object parameter take a `SafeHandle`.
-fn slot_overrides(f: &FnBinding, owner: Option<&str>) -> HashMap<String, String> {
+/// callable: the receiver and every object parameter take a `SafeHandle`,
+/// and an async launcher's `callback` takes the completion's function
+/// pointer type.
+fn slot_overrides(ns: &str, f: &FnBinding, owner: Option<&str>) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    if let (true, Some(owner)) = (f.has_self, owner) {
-        map.insert("self".to_string(), handle_type(owner));
+    if let (Some(slot), Some(owner)) = (&f.receiver, owner) {
+        map.insert(slot.name.clone(), handle_type(owner));
     }
     for p in &f.params {
-        if let ArgPass::Object { slot, .. } = p.arg_pass() {
-            let iface =
-                p.ty.interface_name()
-                    .expect("object parameters name an interface");
-            map.insert(slot.name.clone(), handle_type(iface));
+        if let ArgPass::Object {
+            slot, interface, ..
+        } = &p.pass
+        {
+            map.insert(slot.name.clone(), handle_type(interface));
+        }
+    }
+    if let Some(a) = f.async_binding() {
+        for slot in &f.abi.params {
+            // The completion callback is the launcher's one by-value named
+            // type (iterator and object handles are pointers).
+            if matches!(slot.ty, CType::Named(_)) {
+                map.insert(
+                    slot.name.clone(),
+                    fn_pointer_type(ns, &a.callback_params, &CType::Void),
+                );
+            }
         }
     }
     map
 }
 
-/// One parameter declaration for `slot`, honoring `overrides`.
-fn slot_decl(
-    slot: &AbiParam,
-    overrides: &HashMap<String, String>,
-    callback: Option<&str>,
-) -> String {
-    let ty = match (overrides.get(&slot.name), callback) {
-        (Some(ty), _) => ty.clone(),
-        (None, Some(cb)) if slot.name == "callback" => cb.to_string(),
-        _ => cs_ctype(&slot.ty),
-    };
-    format!("{ty} {}", safe_cs_name(&slot.name))
+/// One parameter declaration for `slot`, honoring `overrides`. A `bool`
+/// crosses as one byte.
+fn slot_decl(ns: &str, slot: &AbiParam, overrides: &HashMap<String, String>) -> String {
+    let name = safe_cs_name(&slot.name);
+    match overrides.get(&slot.name) {
+        Some(ty) => format!("{ty} {name}"),
+        None if slot.ty == CType::Bool => format!("[MarshalAs(UnmanagedType.U1)] bool {name}"),
+        None => format!("{} {name}", cs_ctype(ns, &slot.ty)),
+    }
 }
 
 /// Emit one `[LibraryImport]` declaration.
-fn import(w: &mut CodeWriter, symbol: &str, ret: &str, params: &[String]) {
+fn import(w: &mut CodeWriter, symbol: &str, ret: &CType, ns: &str, params: &[String]) {
     w.line(format!(
         "[LibraryImport(LibName, EntryPoint = \"{symbol}\")]"
     ));
     w.line("[UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]");
+    if *ret == CType::Bool {
+        w.line("[return: MarshalAs(UnmanagedType.U1)]");
+    }
     w.line(format!(
-        "internal static partial {ret} {symbol}({});",
+        "internal static partial {} {symbol}({});",
+        cs_ctype(ns, ret),
         params.join(", ")
     ));
     w.blank();
 }
 
 /// Emit the import for one lowered function.
-fn import_fn(
-    w: &mut CodeWriter,
-    abi: &AbiFn,
-    overrides: &HashMap<String, String>,
-    callback: Option<&str>,
-) {
+fn import_fn(w: &mut CodeWriter, ns: &str, abi: &AbiFn, overrides: &HashMap<String, String>) {
     let params: Vec<String> = abi
         .params
         .iter()
-        .map(|s| slot_decl(s, overrides, callback))
+        .map(|s| slot_decl(ns, s, overrides))
         .collect();
-    import(w, &abi.symbol, &cs_ctype(&abi.ret), &params);
+    import(w, &abi.symbol, &abi.ret, ns, &params);
 }
 
-/// Emit every import behind one callable: the sync symbol; the async
-/// launcher (its `callback` slot typed as the completion function pointer);
-/// or the iterator launcher, `_next` (taking the iterator's `SafeHandle`),
-/// and `_destroy`.
-fn render_callable(w: &mut CodeWriter, f: &FnBinding, owner: Option<&str>) {
-    let overrides = slot_overrides(f, owner);
-    match &f.shape {
-        CallShape::Sync(abi) => import_fn(w, abi, &overrides, None),
-        CallShape::Async(a) => {
-            let cb = fn_pointer_type(&a.callback_params, &weaveffi_model::abi::CType::Void);
-            import_fn(w, &a.launch, &overrides, Some(&cb));
-        }
-        CallShape::Iterator(it) => {
-            import_fn(w, &it.launch, &overrides, None);
-            let next_overrides =
-                HashMap::from([("iter".to_string(), "FfiIteratorHandle".to_string())]);
-            import_fn(w, &it.next, &next_overrides, None);
-            import(w, &it.destroy_symbol, "void", &["IntPtr iter".to_string()]);
-        }
+/// Emit every import behind one callable: its entry point (the sync
+/// symbol, async launcher, or iterator launcher) and, for an iterator,
+/// `_next` (taking the iterator's `SafeHandle`) and `_destroy`.
+fn render_callable(w: &mut CodeWriter, ns: &str, f: &FnBinding, owner: Option<&str>) {
+    import_fn(w, ns, &f.abi, &slot_overrides(ns, f, owner));
+    if let Some(it) = f.iterator() {
+        let iter = &it.next.params[0].name;
+        let next_overrides = HashMap::from([(iter.clone(), "FfiIteratorHandle".to_string())]);
+        import_fn(w, ns, &it.next, &next_overrides);
+        import(
+            w,
+            &it.destroy_symbol,
+            &CType::Void,
+            ns,
+            &["IntPtr iter".to_string()],
+        );
     }
 }
 
 /// The imports behind one interface: `_clone`, `_destroy`, and every member.
-fn render_interface(w: &mut CodeWriter, i: &InterfaceBinding) {
+fn render_interface(w: &mut CodeWriter, ns: &str, i: &InterfaceBinding) {
+    w.line(format!(
+        "[LibraryImport(LibName, EntryPoint = \"{}\")]",
+        i.clone_symbol
+    ));
+    w.line("[UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]");
+    w.line(format!(
+        "internal static partial IntPtr {}({} self);",
+        i.clone_symbol,
+        handle_type(&i.name)
+    ));
+    w.blank();
     import(
         w,
-        &i.clone_symbol,
-        "IntPtr",
-        &[format!("{} self", handle_type(&i.name))],
+        &i.destroy_symbol,
+        &CType::Void,
+        ns,
+        &["IntPtr self".to_string()],
     );
-    import(w, &i.destroy_symbol, "void", &["IntPtr self".to_string()]);
-    for f in i.constructors.iter().chain(&i.methods).chain(&i.statics) {
-        render_callable(w, f, Some(&i.name));
+    for f in i.members() {
+        render_callable(w, ns, f, Some(&i.name));
     }
 }
 
 /// Render the generated half of `NativeMethods`: the contract check run at
 /// load (every top-level module's table must carry each declaration these
-/// bindings were generated with, unchanged), each root's contract import,
-/// and every interface and function import in declaration order.
-pub(crate) fn render_native_methods(w: &mut CodeWriter, model: &Model) {
+/// bindings were generated with, unchanged) and every interface and
+/// function import in declaration order.
+pub(crate) fn render_native_methods(w: &mut CodeWriter, model: &Model, ns: &str) {
     w.line("internal static unsafe partial class NativeMethods");
     w.line("{");
     w.indent();
-    w.line("static partial void VerifyContracts()");
+    w.line("static partial void VerifyContracts(IntPtr library)");
     w.block("{", "}", |w| {
-        for root in model.roots() {
-            let symbol = contract_symbol(model.prefix(), &root.name);
+        for table in tables(model) {
             w.line(format!(
-                "VerifyContract(\"{symbol}\", &{symbol}, new (ulong, ulong, string)[]"
+                "VerifyContract(library, \"{}\", new (ulong, ulong, string)[]",
+                table.symbol
             ));
             w.line("{");
             w.indent();
-            for e in contract::entries(model, root) {
+            for row in &table.rows {
                 w.line(format!(
-                    "(0x{:016x}UL, 0x{:016x}UL, \"{}\"),",
-                    e.id, e.hash, e.path
+                    "({}UL, {}UL, \"{}\"), // {}",
+                    hex(row.id),
+                    hex(row.hash),
+                    cs_str(&row.path),
+                    row.signature
                 ));
             }
             w.dedent();
@@ -149,20 +168,12 @@ pub(crate) fn render_native_methods(w: &mut CodeWriter, model: &Model) {
         }
     });
     w.blank();
-    for root in model.roots() {
-        import(
-            w,
-            &contract_symbol(model.prefix(), &root.name),
-            "FfiContractEntry*",
-            &["nuint* out_len".to_string()],
-        );
-    }
     for m in &model.modules {
         for i in &m.interfaces {
-            render_interface(w, i);
+            render_interface(w, ns, i);
         }
         for f in &m.functions {
-            render_callable(w, f, None);
+            render_callable(w, ns, f, None);
         }
     }
     w.dedent();

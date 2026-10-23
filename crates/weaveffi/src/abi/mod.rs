@@ -20,6 +20,7 @@ pub mod iter;
 pub mod leak;
 pub mod marshal;
 pub mod object;
+pub mod scalar;
 pub mod spawn;
 
 pub use buffer::{
@@ -27,10 +28,11 @@ pub use buffer::{
     ByValue, FixedWidth,
 };
 pub use callback::{
-    callback_ret_buffer, callback_ret_bytes, callback_ret_enum, callback_ret_object,
-    callback_ret_object_opt, callback_ret_string, callback_status, callback_status_in,
-    lift_callback, lift_callback_opt, CallbackInterface, ForeignCallback, ForeignError, Vtable,
-    VtableHeader, VtableTooSmall,
+    callback_ret_buffer, callback_ret_bytes, callback_ret_object, callback_ret_object_opt,
+    callback_ret_opt, callback_ret_scalar, callback_ret_slice, callback_ret_text, callback_status,
+    callback_status_in, convert_foreign, lift_callback, lift_callback_opt, lift_custom_returned,
+    CallbackInterface, ForeignCallback, ForeignError, Vtable, VtableHeader, VtableTooSmall,
+    OFF_THREAD_MESSAGE, VTABLE_THREAD_AFFINE,
 };
 pub use cancel::{
     cancel_token_cancel, cancel_token_create, cancel_token_destroy, cancel_token_is_cancelled,
@@ -39,29 +41,32 @@ pub use cancel::{
 pub use contract::{contract_compact, contract_len, contract_table, ContractEntry};
 pub use convert::{
     adopt_bytes, alloc, bytes_into_raw, free_bytes, lift_byte_slice, lift_bytes, lift_str,
-    lift_string, lower_bytes, lower_string,
+    lift_string, lower_bytes, lower_string, slice_into_raw, RUN_ALIGN,
 };
 pub use error::{
     boxed_error, error_clear, error_free, error_set, error_set_c, error_set_payload_c, error_store,
-    panic_message, ErrorDomain, ErrorReport, FfiError, CANCELLED_ERROR_CODE, FOREIGN_ERROR_CODE,
+    panic_message, ErrorDomain, FfiError, CANCELLED_ERROR_CODE, FOREIGN_ERROR_CODE,
     GENERIC_ERROR_CODE, MARSHAL_ERROR_CODE, PANIC_ERROR_CODE,
 };
 pub use iter::{iter_destroy, iter_into_raw, iter_next, Iter, IterHandle};
 pub use leak::debug_live;
 pub use marshal::{
-    buffer_run, byte_slots, bytes_run, call_sync, lift_buffer_param, lift_bytes_param,
-    lift_callback_opt_param, lift_callback_param, lift_enum, lift_object_arc_opt_param,
-    lift_object_arc_param, lift_object_opt_param, lift_object_param, lift_self, lift_self_arc,
-    lift_slice_param, lift_str_param, lift_string_param, lower_buffer_ret, lower_bytes_ret,
-    lower_string_ret, read_enum, str_slots, string_run, write_enum, CEnum, Sentinel,
+    buffer_run, byte_slots, bytes_run, call_sync, lift_buffer_param, lift_byte_slice_param,
+    lift_bytes_param, lift_callback_opt_param, lift_callback_param, lift_custom_buffered,
+    lift_custom_param, lift_object_arc_opt_param, lift_object_arc_param, lift_object_opt_param,
+    lift_object_param, lift_opt_param, lift_scalar_param, lift_self, lift_self_arc,
+    lift_slice_param, lift_slice_vec_param, lift_str_param, lift_text_param, lower_buffer_ret,
+    lower_bytes_ret, lower_opt_ret, lower_slice_ret, lower_string_ret, opt_run, opt_slots,
+    read_enum, slice_run, string_run, write_enum, Sentinel,
 };
 pub use object::{
     lower_object, lower_object_opt, object_arc, object_clone, object_destroy, object_from_token,
     object_ref, object_to_token,
 };
+pub use scalar::{Custom, Scalar, Text};
 pub use spawn::{
-    block_on, default_pool_size, launch_async, run_async, set_spawner, spawn, BoxFuture,
-    CatchUnwind, SpawnError, Spawner, SpawnerAlreadySet,
+    block_on, launch_async, run_async, set_spawner, spawn, BoxFuture, CatchUnwind, SpawnError,
+    Spawner, SpawnerAlreadySet,
 };
 
 /// The revision of the WeaveFFI C ABI this runtime implements.
@@ -76,9 +81,11 @@ pub use spawn::{
 /// the set and signatures of the runtime symbols) changes incompatibly. It's
 /// independent of the crate version and of the IDL schema version.
 ///
-/// Revision 4 replaced the per-module checksums with per-declaration
-/// contract tables, gave callback vtables a size-checked header and every
-/// return family (with `throws` and optional callback parameters), exported
-/// `{prefix}_alloc` on every target (removing `{prefix}_dealloc`), and added
-/// `{prefix}_error_set_payload`.
-pub const ABI_VERSION: u32 = 4;
+/// Revision 5 gave the error struct a length-delimited message
+/// (`message_ptr`, `message_len`, set with `{prefix}_error_set(err, code,
+/// ptr, len)`), passes optional scalars (OptDirect) and numeric lists
+/// (Slice) directly instead of through value buffers, allocates every byte
+/// run with alignment 8, adds the thread-affine vtable flag, and splits the
+/// contract tables' error-domain and callback-interface entries per code
+/// and per method, so a revision-5 library can grow without a revision 6.
+pub const ABI_VERSION: u32 = 5;

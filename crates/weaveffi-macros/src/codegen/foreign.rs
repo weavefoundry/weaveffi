@@ -47,7 +47,7 @@ impl Finder<'_> {
     /// Visit the parts of `item` that reach the IR: exported signatures,
     /// record and enum fields, and callback-interface methods (never bodies).
     fn exported_item(&mut self, item: &syn::Item) {
-        use weaveffi_model::rust::has_marker;
+        use crate::extract::has_marker;
         match item {
             syn::Item::Fn(f) if has_marker(&f.attrs, "export") => self.visit_signature(&f.sig),
             syn::Item::Struct(s) if has_marker(&s.attrs, "record") => self.visit_fields(&s.fields),

@@ -4,71 +4,114 @@
 // interface vtables). The generated `index.js` builds one native entry point
 // per C symbol on top of this.
 //
-// Byte runs from `{prefix}_alloc` have alignment 1, so every multi-byte
-// read and write goes through a `DataView`, and the slots the producer
-// writes through typed pointers (the error struct, `out_len`, iterator
-// items, vtables) live in 8-byte-aligned blocks carved from the transport's
-// own arenas.
+// Runs from {prefix}_alloc are 8-aligned, but multi-byte reads and writes
+// still go through a `DataView` (little-endian, any address). The slots the
+// producer writes through typed pointers (the error struct, `out_len`,
+// `out_value`, iterator items, vtables) live in 8-byte-aligned blocks carved
+// from the transport's own arenas.
+//
+// A trap (a producer panic aborts on wasm32) leaves the instance's memory in
+// an unknown state, so it poisons the instance: every later call throws a
+// code -2 fault instead of running, and releases (`_destroy`, cancel
+// tokens, freeing runs) do nothing.
 
 import { $Fault } from './runtime.js';
 
 const $enc = new TextEncoder();
 const $dec = new TextDecoder();
 
-function $expected(what, v) {
-  return new TypeError(`expected ${what}, got ${v === null ? 'null' : typeof v}`);
+function $show(v) {
+  if (v === null) return 'null';
+  if (typeof v === 'bigint') return `${v}n`;
+  if (typeof v === 'number') return String(v);
+  return typeof v;
 }
 
-function $bigint(v, bits, what) {
+function $expected(what, v) {
+  return new TypeError(`expected ${what}, got ${$show(v)}`);
+}
+
+/** Integer argument checks: `[min, max]` per kind. */
+function $int(v, lo, hi) {
+  if (typeof v !== 'number') throw $expected('a number', v);
+  if (!Number.isInteger(v) || v < lo || v > hi) {
+    throw new RangeError(`expected an integer in [${lo}, ${hi}], got ${v}`);
+  }
+  return v;
+}
+
+function $int64(v, signed) {
+  const shape = signed ? 'a signed 64-bit integer' : 'an unsigned 64-bit integer';
   let b;
   if (typeof v === 'bigint') {
     b = v;
-  } else if (typeof v === 'number' && Number.isInteger(v)) {
+  } else if (typeof v === 'number') {
+    if (!Number.isInteger(v)) throw new RangeError(`expected ${shape}, got ${v}`);
     b = BigInt(v);
   } else {
     throw $expected('a bigint', v);
   }
-  if (bits(64, b) !== b) throw new RangeError(`bigint does not fit in ${what} 64-bit integer`);
+  if ((signed ? BigInt.asIntN(64, b) : BigInt.asUintN(64, b)) !== b) {
+    throw new RangeError(`expected ${shape}, got ${b}`);
+  }
   return b;
 }
 
 /** The size of each arena the transport carves its permanent blocks from. */
 const $ARENA = 4096;
 
+/** Offsets in `{prefix}_error` on wasm32: code, message (ptr, len), payload (ptr, len). */
+const $ERR_SIZE = 20;
+
 /**
- * One loaded module's linear memory and runtime symbols. `x` holds the
- * module's exports by C symbol name; `memory()` returns the current
- * `ArrayBuffer`; `fnptr(params, results, sig, fn)` installs `fn` in the
- * function table and returns its index.
+ * One loaded module's linear memory and runtime symbols. `exports` holds
+ * the module's exports by C symbol name; `memory()` returns the current
+ * `ArrayBuffer`; `fnptr(params, results, fn)` installs `fn` in the function
+ * table and returns its index.
+ *
+ * `x` holds every exported function guarded against a poisoned instance (a
+ * call throws), `q` the same functions for releases (a call does nothing).
  */
 export class $Linear {
-  constructor(x, prefix, memory, fnptr) {
-    this.x = x;
+  constructor(library, exports, prefix, memory, fnptr) {
+    this.library = library;
     this.memory = memory;
     this.fnptr = fnptr;
-    this.allocFn = x[`${prefix}_alloc`];
-    this.freeBytesFn = x[`${prefix}_free_bytes`];
-    this.errorClearFn = x[`${prefix}_error_clear`];
-    this.errorFreeFn = x[`${prefix}_error_free`];
-    this.errorSetFn = x[`${prefix}_error_set`];
-    this.errorSetPayloadFn = x[`${prefix}_error_set_payload`];
-    if (typeof this.allocFn !== 'function' || typeof this.freeBytesFn !== 'function') {
-      throw new Error(`the WebAssembly module does not export ${prefix}_alloc and ${prefix}_free_bytes`);
+    this.trap = null;
+    this.x = {};
+    this.q = {};
+    for (const [name, fn] of Object.entries(exports)) {
+      if (typeof fn !== 'function') continue;
+      this.x[name] = (...args) => this.enter(fn, args);
+      this.q[name] = (...args) => (this.trap === null ? this.enter(fn, args) : undefined);
     }
+    for (const symbol of ['alloc', 'free_bytes', 'error_set', 'error_set_payload', 'error_clear', 'error_free']) {
+      if (typeof exports[`${prefix}_${symbol}`] !== 'function') {
+        throw new Error(`${library}: the WebAssembly module does not export ${prefix}_${symbol}`);
+      }
+    }
+    this.allocFn = this.x[`${prefix}_alloc`];
+    this.freeBytesFn = this.q[`${prefix}_free_bytes`];
+    this.errorClearFn = this.q[`${prefix}_error_clear`];
+    this.errorFreeFn = this.q[`${prefix}_error_free`];
+    this.errorSetFn = this.x[`${prefix}_error_set`];
+    this.errorSetPayloadFn = this.x[`${prefix}_error_set_payload`];
     // Permanent blocks (the scratch slots and the vtables) come from
     // arenas allocated with {prefix}_alloc and never freed; `arenas` counts
     // them so the leak counter of byte runs can leave them out.
     this.arenas = 0;
     this.arenaNext = 0;
     this.arenaEnd = 0;
-    // One scratch block reused by every call: the error slot (16 bytes),
-    // the out_len slot (4), and the iterator out_item slot (8). The producer
-    // only writes them as a call returns, so a call made from a callback in
-    // the middle of another call can reuse them safely.
-    const scratch = this.reserve(32);
+    // One scratch block reused by every call: the error slot, `out_len`,
+    // `out_value` (and an iterator's item), and an iterator's presence
+    // flag. The producer only writes them as a call returns, so a call made
+    // from a callback in the middle of another call can reuse them safely.
+    const scratch = this.reserve(48);
     this.err = scratch;
-    this.len = scratch + 16;
-    this.item = scratch + 24;
+    this.len = scratch + 24;
+    this.out = scratch + 32;
+    this.item = scratch + 32;
+    this.has = scratch + 40;
     this.callbacks = new Map();
     this.nextCallback = 1;
     this.pending = new Map();
@@ -77,14 +120,36 @@ export class $Linear {
     this.vtables = new Map();
   }
 
+  /**
+   * Call the module function `fn`. A trap poisons the instance (see the
+   * file comment); a poisoned instance throws instead of calling.
+   */
+  enter(fn, args) {
+    if (this.trap !== null) throw this.poisoned();
+    try {
+      return fn(...args);
+    } catch (e) {
+      if (e instanceof WebAssembly.RuntimeError && this.trap === null) this.trap = e;
+      throw e;
+    }
+  }
+
+  poisoned() {
+    return new $Fault(
+      -2,
+      `${this.library}: the WebAssembly instance trapped earlier (${this.trap.message}) and can't be used anymore; load the module again in a new process or page`,
+      null,
+    );
+  }
+
   bytes() {
     const buffer = this.memory();
     if (buffer !== this.buffer) {
       this.buffer = buffer;
-      this.u8 = new Uint8Array(buffer);
+      this.heap = new Uint8Array(buffer);
       this.dv = new DataView(buffer);
     }
-    return this.u8;
+    return this.heap;
   }
 
   view() {
@@ -124,23 +189,31 @@ export class $Linear {
     return kind === 4 && n > 0n ? n - BigInt(this.arenas) : n;
   }
 
-  // Argument checks and conversions for by-value slots.
+  // Argument checks and conversions for by-value slots: integers are
+  // range-checked (a `RangeError` rather than a silent wrap), 64-bit ones
+  // take a bigint or an integral number.
+  i8(v) { return $int(v, -128, 127); }
+  i16(v) { return $int(v, -32768, 32767); }
+  i32(v) { return $int(v, -2147483648, 2147483647); }
+  u8(v) { return $int(v, 0, 255); }
+  u16(v) { return $int(v, 0, 65535); }
+  u32(v) { return $int(v, 0, 4294967295); }
+  i64(v) { return $int64(v, true); }
+  u64(v) { return $int64(v, false); }
+
   num(v) {
     if (typeof v !== 'number') throw $expected('a number', v);
     return v;
   }
 
-  i64(v) {
-    return $bigint(v, BigInt.asIntN, 'a signed');
-  }
-
-  u64(v) {
-    return $bigint(v, BigInt.asUintN, 'an unsigned');
-  }
-
   bool(v) {
     if (typeof v !== 'boolean') throw $expected('a boolean', v);
     return v ? 1 : 0;
+  }
+
+  /** Whether an optional argument is present (neither null nor undefined). */
+  some(v) {
+    return v !== null && v !== undefined;
   }
 
   handle(v) {
@@ -152,8 +225,9 @@ export class $Linear {
     return v === null || v === undefined ? 0 : this.handle(v);
   }
 
-  // Staging: copy a string or bytes into a run for one call. A staged value
-  // is [ptr, len, size]; release it with unstage().
+  // Staging: copy a string, bytes, or a typed array into a run for one
+  // call. A staged value is [ptr, len, size] (`len` counts elements of a
+  // typed array); release it with unstage().
   str(s) {
     if (typeof s !== 'string') throw $expected('a string', s);
     if (s.length === 0) return [0, 0, 0];
@@ -171,6 +245,14 @@ export class $Linear {
     return [ptr, b.length, b.length];
   }
 
+  slice(a, Typed) {
+    if (!(a instanceof Typed)) throw $expected(`a ${Typed.name}`, a);
+    if (a.length === 0) return [0, 0, 0];
+    const ptr = this.alloc(a.byteLength);
+    this.bytes().set(new Uint8Array(a.buffer, a.byteOffset, a.byteLength), ptr);
+    return [ptr, a.length, a.byteLength];
+  }
+
   unstage(staged) {
     if (staged !== null && staged[2] !== 0) this.freeBytesFn(staged[0], staged[2]);
   }
@@ -178,6 +260,11 @@ export class $Linear {
   // Results.
   outLen() {
     return this.view().getUint32(this.len, true);
+  }
+
+  /** The pointer stored at `addr`. */
+  ptrAt(addr) {
+    return this.view().getUint32(addr, true);
   }
 
   readStr(ptr, len) {
@@ -188,6 +275,13 @@ export class $Linear {
   readData(ptr, len) {
     ptr >>>= 0;
     return len === 0 ? new Uint8Array(0) : this.bytes().slice(ptr, ptr + len);
+  }
+
+  /** A copy of the typed array of `count` elements at `ptr`. */
+  readSlice(ptr, count, Typed) {
+    ptr >>>= 0;
+    if (count === 0) return new Typed(0);
+    return new Typed(this.memory().slice(ptr, ptr + count * Typed.BYTES_PER_ELEMENT));
   }
 
   takeStr(ptr, len) {
@@ -202,24 +296,21 @@ export class $Linear {
     return b;
   }
 
-  cstr(ptr) {
-    ptr >>>= 0;
-    if (ptr === 0) return '';
-    const u8 = this.bytes();
-    let end = ptr;
-    while (u8[end] !== 0) end++;
-    return $dec.decode(u8.subarray(ptr, end));
+  takeSlice(ptr, count, Typed) {
+    const a = this.readSlice(ptr, count, Typed);
+    if (ptr !== 0) this.freeBytesFn(ptr, count * Typed.BYTES_PER_ELEMENT);
+    return a;
   }
 
   fault(errPtr) {
     const dv = this.view();
     const code = dv.getInt32(errPtr, true);
     if (code === 0) return null;
-    const payloadPtr = dv.getUint32(errPtr + 8, true);
-    const payloadLen = dv.getUint32(errPtr + 12, true);
+    const payloadPtr = dv.getUint32(errPtr + 12, true);
+    const payloadLen = dv.getUint32(errPtr + 16, true);
     return new $Fault(
       code,
-      this.cstr(dv.getUint32(errPtr + 4, true)),
+      this.readStr(dv.getUint32(errPtr + 4, true), dv.getUint32(errPtr + 8, true)),
       payloadPtr === 0 ? null : this.readData(payloadPtr, payloadLen),
     );
   }
@@ -262,18 +353,10 @@ export class $Linear {
     this.callbacks.delete(id);
   }
 
-  /** Stage `text` as a NUL-terminated C string (release it with unstage()). */
-  cstrArg(text) {
-    const bytes = $enc.encode(text);
-    const ptr = this.alloc(bytes.length + 1);
-    this.bytes().set(bytes, ptr);
-    return [ptr, bytes.length, bytes.length + 1];
-  }
-
   /**
    * Report a callback implementation's exception through `errPtr`: a
-   * `$Fault` (a domain error a throwing method raised) with its code,
-   * message, and payload, anything else as code -4 with its message.
+   * `$Fault` (the adapter's report of a method declared `throws`) with its
+   * code, message, and payload, anything else as code -4 with its message.
    */
   foreign(errPtr, e) {
     let code = -4;
@@ -286,9 +369,9 @@ export class $Linear {
     } else {
       message = e instanceof Error ? e.message || e.name : String(e);
     }
-    const text = this.cstrArg(message);
+    const text = this.str(message);
     try {
-      this.errorSetFn(errPtr, code, text[0]);
+      this.errorSetFn(errPtr, code, text[0], text[1]);
     } finally {
       this.unstage(text);
     }
@@ -321,22 +404,34 @@ export class $Linear {
     this.give(outPtr, outLen, $enc.encode(s));
   }
 
+  /** `give` for a typed array of `Typed`; `out_len` is its element count. */
+  giveSlice(outPtr, outLen, a, Typed) {
+    if (!(a instanceof Typed)) throw $expected(`a ${Typed.name}`, a);
+    const run = this.alloc(a.byteLength);
+    if (a.length > 0) this.bytes().set(new Uint8Array(a.buffer, a.byteOffset, a.byteLength), run);
+    const dv = this.view();
+    dv.setUint32(outPtr >>> 0, run, true);
+    dv.setUint32(outLen >>> 0, a.length, true);
+  }
+
   /**
    * The static vtable of one callback interface, built on first use: the
    * header (`size`, `flags`, then the `free` entry), then one table entry
-   * per method (`methods()` returns each as `[params, results, sig, fn]`).
+   * per method (`methods()` returns each as `[params, results, fn]`).
+   * `flags` is 0: methods may be called from any thread (there is only
+   * one).
    */
   vtable(name, methods) {
     let ptr = this.vtables.get(name);
     if (ptr !== undefined) return ptr;
-    const entries = [[['i32'], [], 'vi', (ctx) => this.unregister(ctx)], ...methods()];
+    const entries = [[['i32'], [], (ctx) => this.unregister(ctx)], ...methods()];
     const size = 8 + entries.length * 4;
     ptr = this.reserve(size);
     const dv = this.view();
     dv.setUint32(ptr, size, true);
     dv.setUint32(ptr + 4, 0, true);
-    entries.forEach(([params, results, sig, fn], i) => {
-      dv.setUint32(ptr + 8 + i * 4, this.fnptr(params, results, sig, fn), true);
+    entries.forEach(([params, results, fn], i) => {
+      dv.setUint32(ptr + 8 + i * 4, this.fnptr(params, results, fn), true);
     });
     this.vtables.set(name, ptr);
     return ptr;
@@ -354,12 +449,13 @@ export class $Linear {
    * `convert`. On this single-threaded target the completion normally
    * fires before the launcher returns.
    */
-  launch(params, results, sig, call, convert) {
-    let callback = this.completions.get(sig);
+  launch(params, results, call, convert) {
+    const key = `${params.join(',')}:${results.join(',')}`;
+    let callback = this.completions.get(key);
     if (callback === undefined) {
       const complete = (ctx, errPtr, ...result) => this.complete(ctx, errPtr, result);
-      callback = this.fnptr(params, results, sig, complete);
-      this.completions.set(sig, callback);
+      callback = this.fnptr(params, results, complete);
+      this.completions.set(key, callback);
     }
     const id = this.nextPending++;
     return new Promise((resolve, reject) => {
@@ -473,38 +569,20 @@ async function $bytesOf(source, envVar, fallback) {
  * else `fallback`. The module must export its memory and a growable
  * function table (`__indirect_function_table`).
  */
-export async function $loadWasm(source, prefix, envVar, fallback) {
+export async function $loadWasm(library, source, prefix, envVar, fallback) {
   const bytes = await $bytesOf(source, envVar, fallback);
   const module = bytes instanceof WebAssembly.Module ? bytes : await WebAssembly.compile(bytes);
   const { exports } = await WebAssembly.instantiate(module, {});
   const table = exports.__indirect_function_table;
-  const fnptr = (params, results, sig, fn) => {
+  const fnptr = (params, results, fn) => {
     if (!(table instanceof WebAssembly.Table)) {
-      throw new Error('the WebAssembly module does not export __indirect_function_table (link with --export-table --growable-table)');
+      throw new Error(
+        `${library}: the WebAssembly module does not export __indirect_function_table (link with --export-table --growable-table)`,
+      );
     }
     const index = table.grow(1);
     table.set(index, $wasmFunction(params, results, fn));
     return index;
   };
-  return new $Linear(exports, prefix, () => exports.memory.buffer, fnptr);
-}
-
-/**
- * Adopt an initialized Emscripten module (or the promise its `MODULARIZE`
- * factory returns). Its exports carry a leading underscore, its memory is
- * read through `HEAPU8`, and table entries are installed with
- * `addFunction`, so it must be linked with `-sALLOW_TABLE_GROWTH`,
- * `-sWASM_BIGINT`, and `-sEXPORTED_RUNTIME_METHODS=addFunction,HEAPU8`.
- */
-export async function $loadEmscripten(module, prefix, symbols) {
-  const m = await module;
-  const x = {};
-  for (const symbol of symbols) x[symbol] = m[`_${symbol}`];
-  const fnptr = (params, results, sig, fn) => {
-    if (typeof m.addFunction !== 'function') {
-      throw new Error('the Emscripten module does not export addFunction (link with -sALLOW_TABLE_GROWTH and -sEXPORTED_RUNTIME_METHODS=addFunction,HEAPU8)');
-    }
-    return m.addFunction(fn, sig);
-  };
-  return new $Linear(x, prefix, () => m.HEAPU8.buffer, fnptr);
+  return new $Linear(library, exports, prefix, () => exports.memory.buffer, fnptr);
 }

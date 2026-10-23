@@ -20,18 +20,11 @@ pub mod shop {
     #[repr(i32)]
     pub enum ShopError {
         /// sold out
+        #[weaveffi(message = "{item} is sold out")]
         SoldOut {
             /// The item that ran out.
             item: String,
         } = 1,
-    }
-
-    impl std::fmt::Display for ShopError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::SoldOut { item } => write!(f, "{item} is sold out"),
-            }
-        }
     }
 
     /// A price in cents.

@@ -1,28 +1,37 @@
 //! Building the [`Model`]: index every type declaration, resolve each written
-//! [`TypeRef`] to a [`Ty`], and lower every declaration to its C symbols and
-//! ABI signatures in one walk.
+//! [`TypeRef`] to its positional type, and lower every declaration to its C
+//! symbols, ABI signatures, and passing contracts in one walk.
+//!
+//! The build runs only on a document every validation rule accepted, so
+//! each step that can fail (an undeclared name, a callback interface or an
+//! iterator in a value position) is one a rule already reported. The steps
+//! still return the matching [`ValidationError`] instead of panicking, so a
+//! missing rule surfaces as a diagnostic, never as a crash.
 
 use heck::ToUpperCamelCase;
 
 use super::{
-    AbiFn, AsyncBinding, CallShape, CallbackInterfaceBinding, CallbackMethodBinding, EnumBinding,
-    EnumVariantBinding, ErrorBinding, ErrorCodeBinding, FieldBinding, FnBinding, InterfaceBinding,
-    IteratorBinding, Model, ModuleBinding, ParamBinding, StructBinding,
+    c_tag, member_symbol, AbiFn, AsyncBinding, CallShape, CallbackInterfaceBinding,
+    CallbackMethodBinding, CallbackParamBinding, EnumBinding, EnumVariantBinding, ErrorBinding,
+    ErrorCodeBinding, FieldBinding, FnBinding, InterfaceBinding, IteratorBinding, Model,
+    ModuleBinding, ParamBinding, StructBinding,
 };
+use crate::abi::lower::{Lower, ParamSite, Undeclared};
 use crate::abi::{
-    callback_result_params, cancel_token_param, context_param, ctx_param, error_out_param,
-    lower_callback_return, lower_param, lower_return, AbiParam, CType, ConstPos,
+    cancel_token_param, context_param, ctx_param, error_out_param, AbiParam, CType, ConstPos,
 };
 use crate::ir::{
-    Api, CallbackInterfaceDef, EnumDef, ErrorDomain, Function, InterfaceDef, Module, Param,
-    StructDef, StructField, TypeRef,
+    Api, CallbackInterfaceDef, EnumDef, ErrorDomain, Function, InterfaceDef, Module, StructField,
+    Throws, TypeRef,
 };
 use crate::pkg::Identity;
-use crate::ty::{Family, Ty, TypeDecl, TypeIndex, TypeKind};
+use crate::plan::{ErrorStrategy, RetPass};
+use crate::ty::{ParamTy, RetTy, Ty, TypeDecl, TypeIndex, TypeKind};
+use crate::validate::ValidationError;
 
-/// Index every type declaration in `api`, numbering modules in the
-/// depth-first pre-order [`Model::modules`] uses. The first declaration of a
-/// name wins; validation reports any later one.
+/// Index every type and error-domain declaration in `api`, numbering
+/// modules in the depth-first pre-order [`Model::modules`] uses. The first
+/// declaration of a name wins; validation reports any later one.
 pub(crate) fn index(api: &Api) -> TypeIndex {
     fn walk(modules: &[Module], parent: &[&str], types: &mut TypeIndex) {
         for m in modules {
@@ -56,6 +65,9 @@ pub(crate) fn index(api: &Api) -> TypeIndex {
             for (i, c) in m.callback_interfaces.iter().enumerate() {
                 declare(&c.name, TypeKind::CallbackInterface, i);
             }
+            for (i, d) in m.errors.iter().enumerate() {
+                declare(&d.name, TypeKind::ErrorDomain, i);
+            }
             walk(&m.modules, &segments, types);
         }
     }
@@ -64,289 +76,341 @@ pub(crate) fn index(api: &Api) -> TypeIndex {
     types
 }
 
-/// Map a written type reference to its resolved type. A name no declaration
-/// provides resolves to a [`Ty::Record`] (see [`Model::assume_valid`]).
-pub(crate) fn resolve(types: &TypeIndex, ty: &TypeRef) -> Ty {
-    match ty {
-        TypeRef::Prim(p) => Ty::Prim(*p),
-        TypeRef::Named(name) => {
-            let name = name.clone();
-            match types.kind(&name) {
-                Some(TypeKind::Enum) => Ty::Enum(name),
-                Some(TypeKind::RichEnum) => Ty::RichEnum(name),
-                Some(TypeKind::Interface) => Ty::Interface(name),
-                Some(TypeKind::CallbackInterface) => Ty::CallbackInterface(name),
-                Some(TypeKind::Record) | None => Ty::Record(name),
-            }
-        }
-        TypeRef::Optional(inner) => Ty::Optional(Box::new(resolve(types, inner))),
-        TypeRef::List(inner) => Ty::List(Box::new(resolve(types, inner))),
-        TypeRef::Map(k, v) => Ty::Map(Box::new(resolve(types, k)), Box::new(resolve(types, v))),
-        TypeRef::Iterator(inner) => Ty::Iterator(Box::new(resolve(types, inner))),
-    }
-}
-
-/// Build the model of `api` under `identity`, indexing its declarations
-/// first.
-pub(crate) fn build(api: &Api, identity: Identity) -> Model {
-    let types = index(api);
-    build_indexed(api, identity, types)
-}
-
-/// Build the model of `api` from an index already built by [`index`].
-pub(crate) fn build_indexed(api: &Api, identity: Identity, types: TypeIndex) -> Model {
+/// Build the model of `api` under `identity` from an index built by
+/// [`index`].
+///
+/// # Errors
+///
+/// Returns the violation a validation rule should already have reported:
+/// an undeclared name, or a callback interface, error domain, or iterator
+/// where a value type belongs.
+pub(crate) fn build(
+    api: &Api,
+    identity: Identity,
+    types: TypeIndex,
+) -> Result<Model, ValidationError> {
     let mut modules = Vec::new();
-    let lowerer = Lowerer {
-        types: &types,
-        prefix: &identity.prefix,
-    };
-    for m in &api.modules {
-        lowerer.module(m, &[], &mut modules);
+    {
+        let builder = Builder {
+            lower: Lower {
+                types: &types,
+                prefix: &identity.prefix,
+            },
+        };
+        for m in &api.modules {
+            builder.module(m, None, &[], &mut modules)?;
+        }
     }
-    Model {
+    Ok(Model {
         version: api.version.clone(),
         modules,
         identity,
         types,
+    })
+}
+
+impl From<Undeclared> for ValidationError {
+    fn from(Undeclared(name): Undeclared) -> Self {
+        ValidationError::UnknownTypeRef { name }
     }
 }
 
-/// The per-build lowering context: the type index and the symbol prefix.
-struct Lowerer<'a> {
-    types: &'a TypeIndex,
-    prefix: &'a str,
+/// The error strategy a written `throws` declares.
+fn error_strategy(throws: Option<&Throws>) -> ErrorStrategy {
+    match throws {
+        None => ErrorStrategy::Trap,
+        Some(Throws::Domain(name)) => ErrorStrategy::Domain(name.clone()),
+        Some(Throws::Any) => ErrorStrategy::Untyped,
+    }
 }
 
-/// A fully assembled C signature: the ordered parameter slots and the C
-/// return type.
-struct AbiSig {
-    params: Vec<AbiParam>,
-    ret: CType,
+/// The per-build context: the lowering (type index and symbol prefix).
+struct Builder<'a> {
+    lower: Lower<'a>,
 }
 
-impl Lowerer<'_> {
-    fn ty(&self, ty: &TypeRef) -> Ty {
-        resolve(self.types, ty)
+impl Builder<'_> {
+    fn prefix(&self) -> &str {
+        self.lower.prefix
+    }
+
+    /// Resolve a written type in a value position.
+    fn value(&self, ty: &TypeRef) -> Result<Ty, ValidationError> {
+        Ok(match ty {
+            TypeRef::Prim(p) => Ty::Prim(*p),
+            TypeRef::Named(name) => {
+                let name = name.clone();
+                match self.lower.types.kind(&name) {
+                    Some(TypeKind::Record) => Ty::Record(name),
+                    Some(TypeKind::Enum) => Ty::Enum(name),
+                    Some(TypeKind::RichEnum) => Ty::RichEnum(name),
+                    Some(TypeKind::Interface) => Ty::Interface(name),
+                    Some(TypeKind::CallbackInterface) => {
+                        return Err(ValidationError::CallbackInterfaceInInvalidPosition {
+                            name,
+                            location: "a value position".to_string(),
+                        })
+                    }
+                    Some(TypeKind::ErrorDomain) => {
+                        return Err(ValidationError::ErrorDomainAsType { name })
+                    }
+                    None if self.lower.types.is_foreign(&name) => Ty::Record(name),
+                    None => return Err(ValidationError::UnknownTypeRef { name }),
+                }
+            }
+            TypeRef::Optional(inner) => Ty::Optional(Box::new(self.value(inner)?)),
+            TypeRef::List(inner) => Ty::List(Box::new(self.value(inner)?)),
+            TypeRef::Map(k, v) => Ty::Map(Box::new(self.value(k)?), Box::new(self.value(v)?)),
+            TypeRef::Iterator(_) => {
+                return Err(ValidationError::IteratorInInvalidPosition {
+                    location: "a value position".to_string(),
+                })
+            }
+        })
+    }
+
+    /// Resolve a written parameter type: a bare or optional callback
+    /// interface, or a value.
+    fn param_ty(&self, ty: &TypeRef) -> Result<ParamTy, ValidationError> {
+        let (top, nullable) = match ty {
+            TypeRef::Optional(inner) => (inner.as_ref(), true),
+            other => (other, false),
+        };
+        if let TypeRef::Named(name) = top {
+            if self.lower.types.kind(name) == Some(TypeKind::CallbackInterface) {
+                return Ok(ParamTy::Callback {
+                    name: name.clone(),
+                    nullable,
+                });
+            }
+        }
+        Ok(ParamTy::Value(self.value(ty)?))
+    }
+
+    /// Resolve a written return type: an iterator, or a value.
+    fn ret_ty(&self, ty: &TypeRef) -> Result<RetTy, ValidationError> {
+        Ok(match ty {
+            TypeRef::Iterator(elem) => RetTy::Iterator(self.value(elem)?),
+            other => RetTy::Value(self.value(other)?),
+        })
     }
 
     /// Recursively lower `module` and its descendants into the flat `out`
     /// list, pre-order (parent before children) so symbol declarations
-    /// precede uses and positions match the [`TypeIndex`].
-    fn module(&self, module: &Module, parent: &[String], out: &mut Vec<ModuleBinding>) {
-        let mut segments = parent.to_vec();
+    /// precede uses and positions match the [`TypeIndex`]. Returns the
+    /// module's position.
+    fn module(
+        &self,
+        module: &Module,
+        parent: Option<usize>,
+        parent_segments: &[String],
+        out: &mut Vec<ModuleBinding>,
+    ) -> Result<usize, ValidationError> {
+        let mut segments = parent_segments.to_vec();
         segments.push(module.name.clone());
         let path = segments.join("_");
-        let prefix = self.prefix;
+        let dot_path = segments.join(".");
 
-        let functions = module
-            .functions
-            .iter()
-            .map(|f| self.callable(f, &format!("{prefix}_{path}_{}", f.name), None))
-            .collect();
-        out.push(ModuleBinding {
+        let binding = ModuleBinding {
+            index: out.len(),
             name: module.name.clone(),
-            dot_path: segments.join("."),
             doc: module.doc.clone(),
-            errors: module.errors.as_ref().map(|d| self.error_domain(d, &path)),
+            parent,
+            children: Vec::new(),
+            errors: module
+                .errors
+                .iter()
+                .map(|d| self.error_domain(d, &path, &dot_path))
+                .collect::<Result<_, _>>()?,
             enums: module
                 .enums
                 .iter()
                 .map(|e| self.enum_def(e, &path))
-                .collect(),
-            structs: module.structs.iter().map(|s| self.struct_def(s)).collect(),
+                .collect::<Result<_, _>>()?,
+            structs: module
+                .structs
+                .iter()
+                .map(|s| {
+                    Ok(StructBinding {
+                        name: s.name.clone(),
+                        doc: s.doc.clone(),
+                        deprecated: s.deprecated.clone(),
+                        c_tag: c_tag(self.prefix(), &path, &s.name),
+                        fields: self.fields(&s.fields)?,
+                    })
+                })
+                .collect::<Result<_, ValidationError>>()?,
             interfaces: module
                 .interfaces
                 .iter()
                 .map(|i| self.interface(i, &path))
-                .collect(),
+                .collect::<Result<_, _>>()?,
             callback_interfaces: module
                 .callback_interfaces
                 .iter()
                 .map(|c| self.callback_interface(c, &path))
-                .collect(),
-            functions,
+                .collect::<Result<_, _>>()?,
+            functions: module
+                .functions
+                .iter()
+                .map(|f| self.callable(f, &path, None, None))
+                .collect::<Result<_, _>>()?,
             segments: segments.clone(),
             path,
-        });
-
+            dot_path,
+        };
+        let index = binding.index;
+        out.push(binding);
         for child in &module.modules {
-            self.module(child, &segments, out);
+            let child = self.module(child, Some(index), &segments, out)?;
+            out[index].children.push(child);
         }
+        Ok(index)
     }
 
-    fn error_domain(&self, domain: &ErrorDomain, path: &str) -> ErrorBinding {
-        let c_tag = format!("{}_{path}_{}", self.prefix, domain.name);
-        ErrorBinding {
-            name: domain.name.clone(),
-            type_name: crate::errors::type_name(&domain.name, "Error"),
-            owner_path: path.to_string(),
-            codes: domain
-                .codes
-                .iter()
-                .map(|c| ErrorCodeBinding {
+    fn error_domain(
+        &self,
+        domain: &ErrorDomain,
+        path: &str,
+        dot_path: &str,
+    ) -> Result<ErrorBinding, ValidationError> {
+        let tag = c_tag(self.prefix(), path, &domain.name);
+        let codes = domain
+            .codes
+            .iter()
+            .map(|c| {
+                Ok(ErrorCodeBinding {
                     name: c.name.clone(),
                     value: c.code,
                     message: c.message.clone(),
                     doc: c.doc.clone(),
-                    c_const: format!("{c_tag}_{}", c.name),
-                    fields: self.fields(&c.fields),
+                    c_const: member_symbol(&tag, &c.name),
+                    fields: self.fields(&c.fields)?,
                 })
-                .collect(),
-            c_tag,
-        }
+            })
+            .collect::<Result<_, ValidationError>>()?;
+        Ok(ErrorBinding {
+            name: domain.name.clone(),
+            type_name: crate::errors::type_name(&domain.name, "Error"),
+            module: dot_path.to_string(),
+            owner_path: path.to_string(),
+            c_tag: tag,
+            codes,
+        })
     }
 
-    fn fields(&self, fields: &[StructField]) -> Vec<FieldBinding> {
+    fn fields(&self, fields: &[StructField]) -> Result<Vec<FieldBinding>, ValidationError> {
         fields
             .iter()
-            .map(|f| FieldBinding {
-                name: f.name.clone(),
-                doc: f.doc.clone(),
-                ty: self.ty(&f.ty),
+            .map(|f| {
+                Ok(FieldBinding {
+                    name: f.name.clone(),
+                    doc: f.doc.clone(),
+                    ty: self.value(&f.ty)?,
+                })
             })
             .collect()
     }
 
-    fn struct_def(&self, s: &StructDef) -> StructBinding {
-        StructBinding {
-            name: s.name.clone(),
-            doc: s.doc.clone(),
-            deprecated: s.deprecated.clone(),
-            fields: self.fields(&s.fields),
-        }
-    }
-
-    fn enum_def(&self, e: &EnumDef, path: &str) -> EnumBinding {
-        let c_tag = format!("{}_{path}_{}", self.prefix, e.name);
+    fn enum_def(&self, e: &EnumDef, path: &str) -> Result<EnumBinding, ValidationError> {
+        let tag = c_tag(self.prefix(), path, &e.name);
         let variants = e
             .variants
             .iter()
-            .map(|v| EnumVariantBinding {
-                name: v.name.clone(),
-                value: v.value,
-                doc: v.doc.clone(),
-                c_const: format!("{c_tag}_{}", v.name),
-                fields: self.fields(&v.fields),
+            .map(|v| {
+                Ok(EnumVariantBinding {
+                    name: v.name.clone(),
+                    value: v.value,
+                    doc: v.doc.clone(),
+                    c_const: member_symbol(&tag, &v.name),
+                    fields: self.fields(&v.fields)?,
+                })
             })
-            .collect();
-        EnumBinding {
+            .collect::<Result<_, ValidationError>>()?;
+        Ok(EnumBinding {
             name: e.name.clone(),
             doc: e.doc.clone(),
             deprecated: e.deprecated.clone(),
-            c_tag,
+            c_tag: tag,
             variants,
             rich: e.is_rich(),
-        }
+        })
     }
 
-    fn params(&self, params: &[Param]) -> Vec<ParamBinding> {
-        params
-            .iter()
-            .map(|p| {
-                let ty = self.ty(&p.ty);
-                ParamBinding {
-                    name: p.name.clone(),
-                    abi: lower_param(&p.name, &ty, self.types),
-                    ty,
-                    doc: p.doc.clone(),
-                }
-            })
-            .collect()
-    }
-
-    /// Lower a return type to its C return plus out-parameters, or `void`.
-    fn ret(&self, ret: Option<&Ty>) -> (CType, Vec<AbiParam>) {
-        match ret {
-            Some(ty) => {
-                let r = lower_return(ty, self.types);
-                (r.ret, r.out_params)
-            }
-            None => (CType::Void, vec![]),
-        }
-    }
-
-    /// The signature of one callback-interface method as it appears in the
-    /// vtable: `ctx`, then every parameter's slots, then the return's out
-    /// slots, then `out_err` (see
-    /// [`lower_callback_return`](crate::abi::lower_callback_return)).
-    ///
-    /// Object parameters differ from a plain call: the producer transfers one
-    /// strong reference the consumer adopts, so the slot is a mutable `{tag}*`
-    /// rather than the borrowed `const {tag}*` of a top-level parameter.
-    fn callback_method_signature(&self, params: &[ParamBinding], ret: Option<&Ty>) -> AbiSig {
-        let mut out = vec![ctx_param()];
-        for p in params {
-            if matches!(p.ty.family(), Family::Object { .. }) {
-                let [slot] = p.abi.as_slice() else {
-                    unreachable!("object parameter '{}' has one slot", p.name);
-                };
-                let CType::Ptr { pointee, .. } = &slot.ty else {
-                    unreachable!("object slot '{}' is a pointer", p.name);
-                };
-                out.push(AbiParam::new(&slot.name, CType::ptr((**pointee).clone())));
-            } else {
-                out.extend(p.abi.iter().cloned());
-            }
-        }
-        let ret = match ret {
-            Some(ty) => {
-                let r = lower_callback_return(ty, self.types);
-                out.extend(r.out_params);
-                r.ret
-            }
-            None => CType::Void,
-        };
-        out.push(error_out_param());
-        AbiSig { params: out, ret }
-    }
-
-    /// The full C signature of a *synchronous* call: every input parameter's
-    /// slots, then the return type's out-parameters, then `out_err`.
-    fn sync_signature(&self, params: &[ParamBinding], ret: Option<&Ty>) -> AbiSig {
-        let mut out: Vec<AbiParam> = params.iter().flat_map(|p| p.abi.iter().cloned()).collect();
-        let (ret, out_params) = self.ret(ret);
-        out.extend(out_params);
-        out.push(error_out_param());
-        AbiSig { params: out, ret }
-    }
-
-    fn callback_interface(&self, c: &CallbackInterfaceDef, path: &str) -> CallbackInterfaceBinding {
-        let c_tag = format!("{}_{path}_{}", self.prefix, c.name);
+    fn callback_interface(
+        &self,
+        c: &CallbackInterfaceDef,
+        path: &str,
+    ) -> Result<CallbackInterfaceBinding, ValidationError> {
+        let tag = c_tag(self.prefix(), path, &c.name);
         let methods = c
             .methods
             .iter()
-            .map(|m| {
-                let params = self.params(&m.params);
-                let ret = m.returns.as_ref().map(|r| self.ty(r));
-                let sig = self.callback_method_signature(&params, ret.as_ref());
-                CallbackMethodBinding {
-                    name: m.name.clone(),
-                    doc: m.doc.clone(),
-                    deprecated: m.deprecated.clone(),
-                    throws: m.throws,
-                    params,
-                    ret,
-                    abi_params: sig.params,
-                    abi_ret: sig.ret,
-                }
-            })
-            .collect();
-        CallbackInterfaceBinding {
+            .map(|m| self.callback_method(m))
+            .collect::<Result<_, _>>()?;
+        Ok(CallbackInterfaceBinding {
             name: c.name.clone(),
             doc: c.doc.clone(),
             deprecated: c.deprecated.clone(),
-            vtable_tag: format!("{c_tag}_vtable"),
-            c_tag,
+            vtable_tag: member_symbol(&tag, "vtable"),
+            c_tag: tag,
             methods,
+        })
+    }
+
+    /// Lower one callback-interface method to its vtable entry: `ctx`, then
+    /// every parameter's slots, then the return's out slots, then `out_err`.
+    fn callback_method(&self, m: &Function) -> Result<CallbackMethodBinding, ValidationError> {
+        let params = m
+            .params
+            .iter()
+            .map(|p| {
+                let ty = self.value(&p.ty)?;
+                Ok(CallbackParamBinding {
+                    pass: self
+                        .lower
+                        .value_param(&p.name, &ty, ParamSite::CallbackMethod)?,
+                    name: p.name.clone(),
+                    ty,
+                    doc: p.doc.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, ValidationError>>()?;
+        let ret = m.returns.as_ref().map(|r| self.value(r)).transpose()?;
+        let (c_ret, ret_pass) = self.lower.callback_ret(ret.as_ref())?;
+        let mut slots = vec![ctx_param()];
+        for p in &params {
+            slots.extend(p.pass.slots().into_iter().cloned());
         }
+        slots.extend(ret_pass.out_slots().into_iter().cloned());
+        slots.push(error_out_param());
+        Ok(CallbackMethodBinding {
+            name: m.name.clone(),
+            doc: m.doc.clone(),
+            deprecated: m.deprecated.clone(),
+            abi: AbiFn {
+                symbol: m.name.clone(),
+                params: slots,
+                ret: c_ret,
+            },
+            params,
+            ret,
+            ret_pass,
+            error: error_strategy(m.throws.as_ref()),
+        })
     }
 
     /// Lower an interface: constructors become statics returning the
     /// interface, methods gain the implicit `self` slot, and all member
     /// symbols hang off the interface's `c_tag`.
-    fn interface(&self, iface: &InterfaceDef, path: &str) -> InterfaceBinding {
-        let c_tag = format!("{}_{path}_{}", self.prefix, iface.name);
-        let self_slot = AbiParam::new(
+    fn interface(
+        &self,
+        iface: &InterfaceDef,
+        path: &str,
+    ) -> Result<InterfaceBinding, ValidationError> {
+        let tag = c_tag(self.prefix(), path, &iface.name);
+        let owner = format!("{path}_{}", iface.name);
+        let receiver = AbiParam::new(
             "self",
             CType::Ptr {
                 konst: ConstPos::West,
@@ -356,151 +420,162 @@ impl Lowerer<'_> {
                 }),
             },
         );
-        let member = |name: &str| format!("{c_tag}_{name}");
+        let constructed = RetTy::Value(Ty::Interface(iface.name.clone()));
         let constructors = iface
             .constructors
             .iter()
-            .map(|c| {
-                // A constructor yields a new strong reference to the
-                // interface, exactly like a static returning it.
-                let mut f = c.clone();
-                f.returns = Some(TypeRef::Named(iface.name.clone()));
-                self.callable(&f, &member(&c.name), None)
-            })
-            .collect();
+            .map(|c| self.callable(c, &owner, None, Some(constructed.clone())))
+            .collect::<Result<_, _>>()?;
         let methods = iface
             .methods
             .iter()
-            .map(|m| self.callable(m, &member(&m.name), Some(self_slot.clone())))
-            .collect();
+            .map(|m| self.callable(m, &owner, Some(receiver.clone()), None))
+            .collect::<Result<_, _>>()?;
         let statics = iface
             .statics
             .iter()
-            .map(|s| self.callable(s, &member(&s.name), None))
-            .collect();
-        InterfaceBinding {
+            .map(|s| self.callable(s, &owner, None, None))
+            .collect::<Result<_, _>>()?;
+        Ok(InterfaceBinding {
             name: iface.name.clone(),
             doc: iface.doc.clone(),
             deprecated: iface.deprecated.clone(),
-            clone_symbol: format!("{c_tag}_clone"),
-            destroy_symbol: format!("{c_tag}_destroy"),
-            c_tag,
+            clone_symbol: member_symbol(&tag, "clone"),
+            destroy_symbol: member_symbol(&tag, "destroy"),
+            c_tag: tag,
             constructors,
             methods,
             statics,
-        }
+        })
     }
 
-    /// Lower one callable (free function or interface member) whose full base
-    /// C symbol is `c_base`. When `self_slot` is given (an instance method),
-    /// it is prepended to every ABI signature but never appears in the
-    /// retained [`ParamBinding`] list.
-    fn callable(&self, f: &Function, c_base: &str, self_slot: Option<AbiParam>) -> FnBinding {
-        let prefix = self.prefix;
-        let params = self.params(&f.params);
-        let ret = f.returns.as_ref().map(|r| self.ty(r));
-        // The prefix-stripped spelling used for `CType::Named` cores (which
-        // render as `{prefix}_{core}`), e.g. `kv_Store_scan` from
-        // `weaveffi_kv_Store_scan`.
-        let core_base = c_base
-            .strip_prefix(&format!("{prefix}_"))
-            .expect("c_base always starts with the symbol prefix")
-            .to_string();
-        let with_self = |mut params: Vec<AbiParam>| {
-            if let Some(s) = &self_slot {
-                params.insert(0, s.clone());
-            }
-            params
-        };
-        let inputs =
-            || -> Vec<AbiParam> { params.iter().flat_map(|p| p.abi.iter().cloned()).collect() };
-
-        let shape = if let Some(elem) = ret.as_ref().and_then(Ty::iterator_elem) {
-            let pascal = f.name.to_upper_camel_case();
-            // `{owner}_{Pascal}Iterator`, where owner is the module path for a
-            // free function or `{module path}_{Interface}` for a method.
-            let owner = &core_base[..core_base.len() - f.name.len() - 1];
-            let iter_core = format!("{owner}_{pascal}Iterator");
-            let iter_tag = format!("{prefix}_{iter_core}");
-
-            let mut launch_params = inputs();
-            launch_params.push(error_out_param());
-            let launch = AbiFn {
-                symbol: c_base.to_string(),
-                params: with_self(launch_params),
-                ret: CType::ptr(CType::Named(iter_core.clone())),
-            };
-
-            let item = lower_return(elem, self.types);
-            let mut next_params = vec![
-                AbiParam::new("iter", CType::ptr(CType::Named(iter_core.clone()))),
-                AbiParam::new("out_item", CType::ptr(item.ret)),
-            ];
-            next_params.extend(item.out_params);
-            next_params.push(error_out_param());
-            let next = AbiFn {
-                symbol: format!("{iter_tag}_next"),
-                params: next_params,
-                ret: CType::Int32,
-            };
-
-            CallShape::Iterator(IteratorBinding {
-                elem: elem.clone(),
-                iter_tag: iter_tag.clone(),
-                launch,
-                next,
-                destroy_symbol: format!("{iter_tag}_destroy"),
+    /// Lower one callable (free function or interface member).
+    ///
+    /// `owner` is the prefix-free C path the callable's symbols hang off:
+    /// the module path for a free function, `{module path}_{Interface}` for
+    /// a member. `receiver` is an instance method's `self` slot; `ret`
+    /// overrides the written return (a constructor returns its interface).
+    fn callable(
+        &self,
+        f: &Function,
+        owner: &str,
+        receiver: Option<AbiParam>,
+        ret: Option<RetTy>,
+    ) -> Result<FnBinding, ValidationError> {
+        let prefix = self.prefix();
+        // `CType::Named` cores render as `{prefix}_{core}`.
+        let core = format!("{owner}_{}", f.name);
+        let symbol = format!("{prefix}_{core}");
+        let params = f
+            .params
+            .iter()
+            .map(|p| {
+                let ty = self.param_ty(&p.ty)?;
+                Ok(ParamBinding {
+                    pass: self.lower.param(&p.name, &ty, ParamSite::Call)?,
+                    name: p.name.clone(),
+                    ty,
+                    doc: p.doc.clone(),
+                })
             })
-        } else if f.r#async {
+            .collect::<Result<Vec<_>, ValidationError>>()?;
+        let ret = match ret {
+            Some(ret) => Some(ret),
+            None => f.returns.as_ref().map(|r| self.ret_ty(r)).transpose()?,
+        };
+        let mut slots: Vec<AbiParam> = receiver.iter().cloned().collect();
+        for p in &params {
+            slots.extend(p.pass.slots().into_iter().cloned());
+        }
+
+        let (abi, ret_pass, shape) = if f.r#async {
+            let value = match &ret {
+                None => None,
+                Some(RetTy::Value(ty)) => Some(ty),
+                Some(RetTy::Iterator(_)) => {
+                    return Err(ValidationError::AsyncIteratorReturn {
+                        module: owner.to_string(),
+                        function: f.name.clone(),
+                    })
+                }
+            };
+            let result = self.lower.result(value)?;
             // Launcher: the input slots, the cancel token when cancellable,
             // then the completion callback and its context.
-            let mut launch_params = inputs();
-            if f.cancellable {
-                launch_params.push(cancel_token_param());
-            }
-            launch_params.push(AbiParam::new(
+            let cancel_token = f.cancellable.then(cancel_token_param);
+            slots.extend(cancel_token.iter().cloned());
+            slots.push(AbiParam::new(
                 "callback",
-                CType::Named(format!("{core_base}_callback")),
+                CType::Named(format!("{core}_callback")),
             ));
-            launch_params.push(context_param());
-            // Completion callback: `(void* context, {prefix}_error* err,
-            // <result fields>)`.
+            slots.push(context_param());
             let mut callback_params = vec![
                 context_param(),
                 AbiParam::new("err", CType::ptr(CType::Error)),
             ];
-            if let Some(ret) = &ret {
-                callback_params.extend(callback_result_params(ret, self.types));
-            }
-            CallShape::Async(AsyncBinding {
-                launch: AbiFn {
-                    symbol: c_base.to_string(),
-                    params: with_self(launch_params),
-                    ret: CType::Void,
-                },
-                callback_type: format!("{c_base}_callback"),
+            callback_params.extend(result.slots().into_iter().cloned());
+            let launch = AbiFn {
+                symbol: symbol.clone(),
+                params: slots,
+                ret: CType::Void,
+            };
+            let shape = CallShape::Async(AsyncBinding {
+                callback_type: format!("{symbol}_callback"),
                 callback_params,
-            })
+                result,
+                cancel_token,
+            });
+            (launch, RetPass::Void, shape)
+        } else if let Some(RetTy::Iterator(elem)) = &ret {
+            // `{owner}_{Pascal}Iterator`.
+            let iter_core = format!("{owner}_{}Iterator", f.name.to_upper_camel_case());
+            let iter_tag = format!("{prefix}_{iter_core}");
+            let handle = CType::ptr(CType::Named(iter_core));
+            slots.push(error_out_param());
+            let launch = AbiFn {
+                symbol,
+                params: slots,
+                ret: handle.clone(),
+            };
+            let item = self.lower.item(elem)?;
+            let mut next_params = vec![AbiParam::new("iter", handle)];
+            next_params.extend(item.slots().into_iter().cloned());
+            next_params.push(error_out_param());
+            let iterator = IteratorBinding {
+                elem: elem.clone(),
+                next: AbiFn {
+                    symbol: member_symbol(&iter_tag, "next"),
+                    params: next_params,
+                    ret: CType::Int32,
+                },
+                item,
+                destroy_symbol: member_symbol(&iter_tag, "destroy"),
+                iter_tag,
+            };
+            (launch, RetPass::Iterator(iterator), CallShape::Sync)
         } else {
-            let sig = self.sync_signature(&params, ret.as_ref());
-            CallShape::Sync(AbiFn {
-                symbol: c_base.to_string(),
-                params: with_self(sig.params),
-                ret: sig.ret,
-            })
+            let (c_ret, ret_pass) = self.lower.ret(ret.as_ref().and_then(RetTy::value))?;
+            slots.extend(ret_pass.out_slots().into_iter().cloned());
+            slots.push(error_out_param());
+            let call = AbiFn {
+                symbol,
+                params: slots,
+                ret: c_ret,
+            };
+            (call, ret_pass, CallShape::Sync)
         };
 
-        FnBinding {
+        Ok(FnBinding {
             name: f.name.clone(),
             doc: f.doc.clone(),
             deprecated: f.deprecated.clone(),
-            cancellable: f.cancellable,
-            throws: f.throws,
-            has_self: self_slot.is_some(),
+            receiver,
             params,
             ret,
-            c_base: c_base.to_string(),
+            ret_pass,
+            error: error_strategy(f.throws.as_ref()),
+            abi,
             shape,
-        }
+        })
     }
 }

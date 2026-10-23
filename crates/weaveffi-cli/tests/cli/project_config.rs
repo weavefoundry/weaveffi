@@ -1,7 +1,7 @@
 //! `weaveffi.toml` behavior end to end: automatic discovery next to (or
 //! above) the input, `--config` overriding discovery, `[package]` identity
 //! reaching every manifest, `[generators.<target>]` options reaching their
-//! backend, and the identity's C prefix reaching all eleven targets.
+//! backend, and the identity's C prefix reaching every target.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,8 +38,7 @@ fn read(path: &Path) -> String {
 }
 
 fn generate(input: &Path, out: &Path, extra: &[&str]) {
-    assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
+    crate::weaveffi()
         .args([
             "generate",
             input.to_str().unwrap(),
@@ -51,9 +50,10 @@ fn generate(input: &Path, out: &Path, extra: &[&str]) {
         .success();
 }
 
-const ALL_TARGETS: [&str; 11] = [
-    "c", "cpp", "swift", "kotlin", "node", "wasm", "python", "dotnet", "dart", "go", "ruby",
-];
+/// Every registered target.
+fn all_targets() -> Vec<&'static str> {
+    weaveffi_cli::targets::names().collect()
+}
 
 /// The kvstore sample's `weaveffi.toml` sits beside its `Cargo.toml`;
 /// generating from the crate must pick it up without `--config` and honor
@@ -65,13 +65,14 @@ fn discovers_weaveffi_toml_above_the_input() {
     let out = dir.path();
     generate(&input, out, &[]);
 
-    for target in ALL_TARGETS {
+    for target in all_targets() {
         assert!(
             out.join(target).is_dir(),
             "missing target directory: {target}"
         );
     }
 
+    assert!(read(&out.join("c/kvstore.h")).contains("#define KVSTORE_ABI_VERSION"));
     assert!(read(&out.join("cpp/kvstore.hpp")).contains("namespace kvstore"));
     assert!(read(&out.join("dotnet/Kvstore.cs")).contains("namespace Kvstore"));
     assert!(out.join("swift/Sources/Kvstore/Kvstore.swift").is_file());
@@ -139,8 +140,7 @@ fn explicit_config_overrides_discovery() {
 #[test]
 fn rust_source_input_points_at_the_crate() {
     let input = repo_root().join("samples/calculator/src/lib.rs");
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
+    let output = crate::weaveffi()
         .args(["generate", input.to_str().unwrap()])
         .output()
         .unwrap();
@@ -159,7 +159,7 @@ fn inline_package_block_in_idl_is_an_error() {
     fs::write(
         &idl,
         concat!(
-            "version: \"0.11.0\"\n",
+            "version: \"0.12.0\"\n",
             "package:\n",
             "  name: legacy\n",
             "modules:\n",
@@ -168,8 +168,7 @@ fn inline_package_block_in_idl_is_an_error() {
         ),
     )
     .unwrap();
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
+    let output = crate::weaveffi()
         .args(["validate", idl.to_str().unwrap()])
         .output()
         .unwrap();
@@ -186,8 +185,7 @@ fn unknown_config_table_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("cfg.toml");
     fs::write(&cfg, "[swift]\nmodule_name = \"Old\"\n").unwrap();
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
+    let output = crate::weaveffi()
         .args([
             "generate",
             input.to_str().unwrap(),
@@ -209,8 +207,7 @@ fn unknown_config_table_is_an_error() {
 fn unknown_target_is_an_error() {
     let input = repo_root().join("samples/calculator");
     let dir = tempfile::tempdir().unwrap();
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
+    let output = crate::weaveffi()
         .args([
             "generate",
             input.to_str().unwrap(),
@@ -237,7 +234,7 @@ fn idl_c_prefix_reaches_every_target() {
     fs::write(
         &idl,
         concat!(
-            "version: \"0.11.0\"\n",
+            "version: \"0.12.0\"\n",
             "modules:\n",
             "  - name: calculator\n",
             "    functions:\n",
@@ -254,7 +251,7 @@ fn idl_c_prefix_reaches_every_target() {
     let out = dir.path().join("out");
     generate(&idl, &out, &[]);
 
-    for target in ALL_TARGETS {
+    for target in all_targets() {
         let tree = read_tree(&out.join(target));
         assert!(
             tree.contains("myffi_calculator_add"),
@@ -276,8 +273,7 @@ fn rust_producer_rejects_c_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("cfg.toml");
     fs::write(&cfg, "[package]\nc_prefix = \"myffi\"\n").unwrap();
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
+    let output = crate::weaveffi()
         .args([
             "generate",
             input.to_str().unwrap(),

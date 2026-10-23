@@ -1,0 +1,7 @@
+error: `#[weaveffi::export]` only works on an item inside a `#[weaveffi::module]`; put the item in an inline module annotated `#[weaveffi::module]` (`#[weaveffi::module] pub mod api { ... }`)
+ --> tests/ui/fail_marker_outside_module.rs:3:1
+  |
+3 | #[weaveffi::export]
+  | ^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `weaveffi::export` (in Nightly builds, run with -Z macro-backtrace for more info)

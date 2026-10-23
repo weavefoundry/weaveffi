@@ -34,52 +34,88 @@ class NativeBugException(val code: Int, message: String) :
  * A lazy sequence streamed from the native library, one element per step.
  * The native iterator is released when the sequence is exhausted, when
  * [close] is called, or once this object becomes unreachable, whichever
- * comes first.
+ * comes first. Not thread-safe: iterate it from one thread at a time.
  */
 class NativeIterator<T> internal constructor(
     address: Long,
     release: (Long) -> Unit,
-    private val step: (Long) -> Any?,
+    private val next: (Long, Array<Any?>) -> Boolean,
+    private val convert: (Any?) -> T,
 ) : Iterator<T>, AutoCloseable {
     private val handle = NativeCleaner.register(this, NativeHandle(address, release))
-    private var lookahead: Any? = EMPTY
+    private val slot = arrayOfNulls<Any?>(1)
+    private var ready = false
+    private var lookahead: T? = null
 
     override fun hasNext(): Boolean {
-        if (lookahead !== EMPTY) return true
+        if (ready) return true
         if (handle.isClosed) return false
-        val item = handle.borrow(step)
-        if (item === DONE) {
+        if (!handle.borrow { next(it, slot) }) {
             close()
             return false
         }
-        lookahead = item
+        val raw = slot[0]
+        slot[0] = null
+        lookahead = convert(raw)
+        ready = true
         return true
     }
 
     override fun next(): T {
         if (!hasNext()) throw NoSuchElementException()
-        val item = lookahead
-        lookahead = EMPTY
         @Suppress("UNCHECKED_CAST")
-        return item as T
+        val item = lookahead as T
+        lookahead = null
+        ready = false
+        return item
     }
 
     /** Releases the native iterator; safe to call more than once. */
     override fun close() = handle.close()
-
-    internal companion object {
-        /** What a step function returns once the native sequence is exhausted. */
-        val DONE = Any()
-        private val EMPTY = Any()
-    }
 }
 
-/** Loads the producer library and then the JNI shim, exactly once. */
-internal object NativeLibrary {
+/**
+ * Loads the native library and its JNI shim, exactly once, and checks that
+ * the library implements the C ABI revision and every declaration these
+ * bindings were generated against.
+ *
+ * The first use of the bindings loads them implicitly. Call [load] first to
+ * handle a missing or mismatched library gracefully: it throws the same
+ * [UnsatisfiedLinkError] on every call after a failure, while a binding
+ * used after a failed load throws [NoClassDefFoundError] (both are
+ * [LinkageError]s).
+ *
+ * The library loads from the path in the `{{LIBRARY_ENV}}` environment
+ * variable when it's set, else from the `natives/<os>-<arch>/` classpath
+ * resources of a packaged desktop build, else from `java.library.path`.
+ */
+object NativeLibrary {
     private const val LIBRARY = "{{LIBRARY}}"
     private const val JNI_LIBRARY = "{{JNI_LIBRARY}}"
 
-    init {
+    private val failure: Throwable? = try {
+        loadLibraries()
+        null
+    } catch (t: Throwable) {
+        t
+    }
+
+    /**
+     * Loads and checks the native library if that hasn't happened yet.
+     *
+     * @throws UnsatisfiedLinkError when the library or its JNI shim can't be
+     *   loaded, implements a different C ABI revision, or lacks or changed a
+     *   declaration these bindings use; the message says which.
+     */
+    @JvmStatic
+    fun load() {
+        val cause = failure ?: return
+        val error = UnsatisfiedLinkError(cause.message ?: cause.toString())
+        error.initCause(cause)
+        throw error
+    }
+
+    private fun loadLibraries() {
         val explicit = System.getenv("{{LIBRARY_ENV}}")
         if (!explicit.isNullOrEmpty()) {
             System.load(explicit)
@@ -94,8 +130,6 @@ internal object NativeLibrary {
         }
         if (!loadBundled(JNI_LIBRARY)) System.loadLibrary(JNI_LIBRARY)
     }
-
-    fun ensureLoaded() {}
 
     /**
      * Loads `base` from the `natives/<os>-<arch>/` classpath resources a
@@ -218,3 +252,36 @@ internal fun encodeUtf8(value: String): ByteArray = value.toByteArray(Charsets.U
 
 /** The string a native UTF-8 byte sequence spells. */
 internal fun decodeUtf8(bytes: ByteArray): String = String(bytes, Charsets.UTF_8)
+
+/** The bits of each element, for a `[u16]` crossing as a `ShortArray`. */
+internal fun Collection<UShort>.toShortArrayBits(): ShortArray {
+    val out = ShortArray(size)
+    var i = 0
+    for (v in this) out[i++] = v.toShort()
+    return out
+}
+
+/** The bits of each element, for a `[u32]` crossing as an `IntArray`. */
+internal fun Collection<UInt>.toIntArrayBits(): IntArray {
+    val out = IntArray(size)
+    var i = 0
+    for (v in this) out[i++] = v.toInt()
+    return out
+}
+
+/** The bits of each element, for a `[u64]` crossing as a `LongArray`. */
+internal fun Collection<ULong>.toLongArrayBits(): LongArray {
+    val out = LongArray(size)
+    var i = 0
+    for (v in this) out[i++] = v.toLong()
+    return out
+}
+
+/** A `[u16]` that crossed as a `ShortArray`. */
+internal fun ShortArray.toUShortList(): List<UShort> = List(size) { this[it].toUShort() }
+
+/** A `[u32]` that crossed as an `IntArray`. */
+internal fun IntArray.toUIntList(): List<UInt> = List(size) { this[it].toUInt() }
+
+/** A `[u64]` that crossed as a `LongArray`. */
+internal fun LongArray.toULongList(): List<ULong> = List(size) { this[it].toULong() }

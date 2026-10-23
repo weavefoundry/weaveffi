@@ -1,17 +1,23 @@
-//! The fixed Swift sources the generator splices names into (the private
-//! runtime with its codec, error helpers, and async and callback support;
-//! the `Package.swift` manifest; the C module map; and the packaged README),
-//! plus the load-time checks rendered from the model. Each fixed source
-//! lives as a real file under `runtime/` with `{{PLACEHOLDER}}` markers.
+//! The fixed Swift sources the generator splices names into (the runtime
+//! with the library's load check, error helpers, codec, generic sequence,
+//! and async and callback support; the `Package.swift` manifest; the C
+//! module map; and the packaged README), plus the contract rows rendered
+//! from the model. Each fixed source lives as a real file under `runtime/`
+//! with `{{PLACEHOLDER}}` markers.
 
+use crate::codegen::contract::{self, hex};
 use crate::codegen::CodeWriter;
-use weaveffi_model::contract::entries;
-use weaveffi_model::model::{contract_symbol, Model, ABI_VERSION};
+use weaveffi_model::model::{Model, ABI_VERSION};
+
+use crate::targets::swift::types::{library_type_name, runtime_error_name, swift_str};
 
 const RUNTIME: &str = include_str!("runtime/Runtime.swift");
 const PACKAGE: &str = include_str!("runtime/Package.swift");
 const MODULE_MAP: &str = include_str!("runtime/module.modulemap");
 const README: &str = include_str!("runtime/README.md");
+
+/// The runtime's file name, next to the wrapper in `Sources/{Module}/`.
+pub(crate) const RUNTIME_FILE: &str = "WeaveFFIRuntime.swift";
 
 /// Replace every `{{KEY}}` in `template` with its value.
 ///
@@ -40,52 +46,72 @@ pub(crate) struct Names<'a> {
     pub(crate) header: &'a str,
 }
 
-/// The private runtime the wrapper file starts with: error helpers, the
-/// value-buffer codec, and async and callback support.
-pub(crate) fn render_runtime(model: &Model, names: &Names, runtime_error: &str) -> String {
+/// The runtime source (without the generated-file prelude): the library's
+/// load check, error helpers, the value-buffer codec, the generic sequence,
+/// and async and callback support.
+pub(crate) fn render_runtime(model: &Model, names: &Names) -> String {
     fill(
         RUNTIME,
         &[
-            ("RUNTIME_ERROR", runtime_error),
+            ("RUNTIME_ERROR", &runtime_error_name(names.module)),
+            ("LIBRARY_TYPE", &library_type_name(names.module)),
             ("PREFIX", model.prefix()),
             ("MODULE", names.module),
+            ("C_MODULE", names.c_module),
             ("LIBRARY", names.library),
             ("ABI_VERSION", &ABI_VERSION.to_string()),
         ],
     )
 }
 
-/// Render the load-time checks the runtime's `wvLoad()` runs once: the ABI
-/// revision, then every top-level module's contract table against the
-/// entries these bindings were generated with.
-pub(crate) fn render_load_checks(w: &mut CodeWriter, model: &Model) {
-    w.line("// MARK: - Load-time checks");
+/// Render `wvCheckContracts()`, which the runtime's load check calls after
+/// the ABI revision: every top-level module's contract table against the
+/// rows these bindings were generated with.
+pub(crate) fn render_contract_checks(w: &mut CodeWriter, model: &Model, library_type: &str) {
+    let tables = contract::tables(model);
+    w.line("// MARK: - Contract");
     w.blank();
-    w.line("/// The load-time checks, run once before the first native call: the library");
+    w.line("/// The first declaration these bindings were generated with that the library");
     w.line(format!(
-        "/// must implement C ABI revision {ABI_VERSION} and carry every declaration these"
+        "/// lacks or declares differently, checked once by `{library_type}.check()`."
     ));
-    w.line("/// bindings were generated with, unchanged.");
-    w.line("let wvContract: Void = {");
-    w.scope(|w| {
-        w.line("wvCheckAbiVersion()");
-        for root in model.roots() {
-            w.line(format!(
-                "wvCheckContract({}, [",
-                contract_symbol(model.prefix(), &root.name)
-            ));
-            w.scope(|w| {
-                for e in entries(model, root) {
-                    w.line(format!(
-                        "(0x{:016x}, 0x{:016x}, \"{}\"),",
-                        e.id, e.hash, e.path
-                    ));
-                }
-            });
-            w.line("])");
+    w.line(format!(
+        "func wvCheckContracts() -> {library_type}.LoadError? {{"
+    ));
+    w.indent();
+    for (i, table) in tables.iter().enumerate() {
+        let last = i + 1 == tables.len();
+        let open = format!("wvCheckContract({}, [", table.symbol);
+        if last {
+            w.line(format!("return {open}"));
+        } else {
+            w.line(format!("if let failure = {open}"));
         }
-    });
-    w.line("}()");
+        w.scope(|w| {
+            for row in &table.rows {
+                w.line(format!(
+                    "({}, {}, \"{}\"),",
+                    hex(row.id),
+                    hex(row.hash),
+                    swift_str(&row.path)
+                ));
+            }
+        });
+        if last {
+            w.line("])");
+        } else {
+            w.line("]) {");
+            w.scope(|w| {
+                w.line("return failure");
+            });
+            w.line("}");
+        }
+    }
+    if tables.is_empty() {
+        w.line("return nil");
+    }
+    w.dedent();
+    w.line("}");
     w.blank();
 }
 

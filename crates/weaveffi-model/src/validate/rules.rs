@@ -9,9 +9,10 @@
 //! declaration and member names), which the diagnostic uses to locate the
 //! offending text.
 
-use super::{Found, Options, ValidationError};
+use super::{Found, ValidationError};
 use crate::ir::{
-    Api, CallbackInterfaceDef, ErrorDomain, Function, InterfaceDef, Module, StructField, TypeRef,
+    Api, CallbackInterfaceDef, ErrorDomain, Function, InterfaceDef, Module, StructField, Throws,
+    TypeRef,
 };
 use crate::ty::{Prim, TypeIndex, TypeKind};
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,10 +47,11 @@ fn within(scope: &[String], names: &[&str]) -> Vec<String> {
 }
 
 /// Run every rule over `api`, whose declarations `types` indexes.
-pub(super) fn check(api: &Api, types: &TypeIndex, options: Options, found: &mut Vec<Found>) {
+pub(super) fn check(api: &Api, types: &TypeIndex, found: &mut Vec<Found>) {
+    let carriers = object_carriers(&api.modules, types);
     let mut cx = Cx {
         types,
-        options,
+        carriers: &carriers,
         found,
     };
     let mut names = BTreeSet::new();
@@ -62,7 +64,7 @@ pub(super) fn check(api: &Api, types: &TypeIndex, options: Options, found: &mut 
                 },
             );
         }
-        cx.module(m, &[], false);
+        cx.module(m, &[]);
     }
     check_global_names(&api.modules, found);
 }
@@ -130,7 +132,7 @@ fn check_global_names(modules: &[Module], found: &mut Vec<Found>) {
                 seen.all_functions
                     .push((&f.name, path.clone(), segments.clone()));
             }
-            if let Some(domain) = &m.errors {
+            for domain in &m.errors {
                 seen.domains.entry(&domain.name).or_insert(path.clone());
                 let owner = format!("{path}.{}", domain.name);
                 for code in &domain.codes {
@@ -168,10 +170,12 @@ fn check_global_names(modules: &[Module], found: &mut Vec<Found>) {
     }
 }
 
-/// The rule context: the type index, the options, and the violation sink.
+/// The rule context: the type index and the violation sink.
 struct Cx<'a> {
     types: &'a TypeIndex,
-    options: Options,
+    /// Records and rich enums that carry an interface object somewhere in
+    /// their fields (see [`object_carriers`]).
+    carriers: &'a BTreeSet<String>,
     found: &'a mut Vec<Found>,
 }
 
@@ -204,7 +208,7 @@ impl Cx<'_> {
         self.types.kind(name)
     }
 
-    fn module(&mut self, module: &Module, parent: &[String], ancestor_has_domain: bool) {
+    fn module(&mut self, module: &Module, parent: &[String]) {
         if module.name.trim().is_empty() {
             self.push(parent, ValidationError::NoModuleName);
             return;
@@ -228,10 +232,9 @@ impl Cx<'_> {
         }
         let scope = within(parent, &[&module.name]);
         let path = scope.join(".");
-        let has_domain = ancestor_has_domain || module.errors.is_some();
 
         for f in &module.functions {
-            self.function(&scope, &path, &f.name, f, has_domain);
+            self.function(&scope, &path, &f.name, f);
             self.callable_types(&within(&scope, &[&f.name]), &path, &f.name, f);
         }
 
@@ -321,15 +324,15 @@ impl Cx<'_> {
 
         for i in &module.interfaces {
             self.identifier(&scope, &i.name);
-            self.interface(&scope, &path, i, has_domain);
+            self.interface(&scope, &path, i);
         }
 
         for cb in &module.callback_interfaces {
             self.identifier(&scope, &cb.name);
-            self.callback_interface(&scope, &path, cb, has_domain);
+            self.callback_interface(&scope, &path, cb);
         }
 
-        if let Some(domain) = &module.errors {
+        for domain in &module.errors {
             self.error_domain(&scope, &path, domain);
         }
 
@@ -343,7 +346,7 @@ impl Cx<'_> {
                     },
                 );
             }
-            self.module(sub, &scope, has_domain);
+            self.module(sub, &scope);
         }
     }
 
@@ -370,7 +373,7 @@ impl Cx<'_> {
     /// constructors, methods, and statics; constructor restrictions;
     /// per-member signature rules. C symbol collisions are checked API-wide
     /// once the model is built.
-    fn interface(&mut self, scope: &[String], path: &str, iface: &InterfaceDef, has_domain: bool) {
+    fn interface(&mut self, scope: &[String], path: &str, iface: &InterfaceDef) {
         if iface.constructors.is_empty() && iface.methods.is_empty() && iface.statics.is_empty() {
             self.push(
                 scope,
@@ -399,7 +402,7 @@ impl Cx<'_> {
                 );
             }
             let display = format!("{}.{}", iface.name, f.name);
-            self.function(&decl, path, &display, f, has_domain);
+            self.function(&decl, path, &display, f);
             self.callable_types(&within(&decl, &[&f.name]), path, &display, f);
             if constructor && f.returns.is_some() {
                 self.push(
@@ -427,14 +430,8 @@ impl Cx<'_> {
     /// by the consumer, so it is synchronous, never takes a cancel token,
     /// returns nothing or any value but an iterator or a callback interface,
     /// takes no callback interface or iterator as a parameter, and may
-    /// declare `throws` only when an error domain is in scope.
-    fn callback_interface(
-        &mut self,
-        scope: &[String],
-        path: &str,
-        cb: &CallbackInterfaceDef,
-        has_domain: bool,
-    ) {
+    /// throw only an error domain that exists (or `any`).
+    fn callback_interface(&mut self, scope: &[String], path: &str, cb: &CallbackInterfaceDef) {
         if cb.methods.is_empty() {
             self.push(
                 scope,
@@ -474,15 +471,7 @@ impl Cx<'_> {
                 reject(self, "cannot be cancellable");
             }
             let method = within(&decl, &[&m.name]);
-            if m.throws && !has_domain {
-                self.push(
-                    &method,
-                    ValidationError::ThrowsWithoutErrorDomain {
-                        module: path.to_string(),
-                        function: format!("{}.{}", cb.name, m.name),
-                    },
-                );
-            }
+            self.throws(&method, path, &format!("{}.{}", cb.name, m.name), m);
             if let Some(ret) = &m.returns {
                 let location = || format!("return type of {path}::{}.{}", cb.name, m.name);
                 if contains_iterator(ret) {
@@ -528,16 +517,9 @@ impl Cx<'_> {
     }
 
     /// Name-level checks for one callable declared in `scope`: a valid
-    /// identifier, unique parameter names, and an error domain in scope when
-    /// the callable declares `throws`.
-    fn function(
-        &mut self,
-        scope: &[String],
-        path: &str,
-        display: &str,
-        f: &Function,
-        has_domain: bool,
-    ) {
+    /// identifier, unique parameter names, and an existing error domain when
+    /// the callable throws one.
+    fn function(&mut self, scope: &[String], path: &str, display: &str, f: &Function) {
         self.identifier(scope, &f.name);
         let decl = within(scope, &[&f.name]);
         if f.cancellable && !f.r#async {
@@ -549,15 +531,7 @@ impl Cx<'_> {
                 },
             );
         }
-        if f.throws && !has_domain {
-            self.push(
-                &decl,
-                ValidationError::ThrowsWithoutErrorDomain {
-                    module: path.to_string(),
-                    function: display.to_string(),
-                },
-            );
-        }
+        self.throws(&decl, path, display, f);
         let mut names = BTreeSet::new();
         for p in &f.params {
             self.identifier(&decl, &p.name);
@@ -568,6 +542,23 @@ impl Cx<'_> {
                         module: path.to_string(),
                         function: display.to_string(),
                         param: p.name.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Check that a callable's `throws` names an error domain (declared in
+    /// any module; domain names are global) or is `any`.
+    fn throws(&mut self, scope: &[String], path: &str, display: &str, f: &Function) {
+        if let Some(Throws::Domain(domain)) = &f.throws {
+            if self.kind(domain) != Some(TypeKind::ErrorDomain) {
+                self.push(
+                    scope,
+                    ValidationError::UnknownErrorDomain {
+                        module: path.to_string(),
+                        function: display.to_string(),
+                        domain: domain.clone(),
                     },
                 );
             }
@@ -672,6 +663,35 @@ impl Cx<'_> {
         }
     }
 
+    /// Reject an error-code field that carries an interface object, directly
+    /// or through a record or rich enum. Error domains are open: a consumer
+    /// generated before the code existed discards its payload undecoded, so
+    /// an object token inside it would never be released.
+    fn no_object_in_payload(
+        &mut self,
+        scope: &[String],
+        f: &StructField,
+        location: &dyn Fn() -> String,
+    ) {
+        let mut names = Vec::new();
+        f.ty.walk(&mut |t| {
+            if let TypeRef::Named(name) = t {
+                names.push(name.clone());
+            }
+        });
+        for name in names {
+            if self.kind(&name) == Some(TypeKind::Interface) || self.carriers.contains(&name) {
+                self.push(
+                    &within(scope, &[&f.name]),
+                    ValidationError::ObjectInErrorPayload {
+                        name,
+                        location: location(),
+                    },
+                );
+            }
+        }
+    }
+
     /// Reject any callback-interface reference reachable from `ty`. Callers
     /// that permit a bare top-level callback interface unwrap it first.
     fn no_callback_interface(
@@ -706,13 +726,14 @@ impl Cx<'_> {
             TypeRef::Named(name) => {
                 let error = if name.contains('.') {
                     ValidationError::QualifiedTypeRef { name: name.clone() }
-                } else if self.kind(name).is_some() {
+                } else if self.kind(name) == Some(TypeKind::ErrorDomain) {
+                    ValidationError::ErrorDomainAsType { name: name.clone() }
+                } else if self.kind(name).is_some() || self.types.is_foreign(name) {
+                    // Declared here, or a record or rich enum from another
+                    // module tree the caller named explicitly.
                     return;
                 } else if UNSUPPORTED_PRIMITIVES.contains(&name.as_str()) {
                     ValidationError::UnsupportedPrimitive { name: name.clone() }
-                } else if self.options.foreign_names {
-                    // A record or rich enum from another module tree.
-                    return;
                 } else {
                     ValidationError::UnknownTypeRef { name: name.clone() }
                 };
@@ -761,6 +782,16 @@ impl Cx<'_> {
             return;
         }
         self.identifier(scope, &domain.name);
+        if domain.name == "any" {
+            // `throws: any` means an untyped error, so no domain can be
+            // named `any`.
+            self.push(
+                scope,
+                ValidationError::ReservedKeyword {
+                    name: domain.name.clone(),
+                },
+            );
+        }
         let decl = within(scope, &[&domain.name]);
         let mut values = BTreeSet::new();
         for c in &domain.codes {
@@ -783,6 +814,7 @@ impl Cx<'_> {
                     &decl,
                     ValidationError::DuplicateErrorCode {
                         module: path.to_string(),
+                        domain: domain.name.clone(),
                         value: c.code,
                     },
                 );
@@ -796,7 +828,52 @@ impl Cx<'_> {
                     )
                 };
                 self.buffered_field(&code, f, &location);
+                self.no_object_in_payload(&code, f, &location);
             }
+        }
+    }
+}
+
+/// Every record and rich enum whose fields reach an interface object, directly
+/// or through other records and rich enums (a fixed point over the whole API,
+/// since types may reference each other in any order).
+fn object_carriers(modules: &[Module], types: &TypeIndex) -> BTreeSet<String> {
+    fn collect<'a>(modules: &'a [Module], out: &mut Vec<(&'a str, Vec<&'a TypeRef>)>) {
+        for m in modules {
+            for s in &m.structs {
+                out.push((&s.name, s.fields.iter().map(|f| &f.ty).collect()));
+            }
+            for e in &m.enums {
+                let fields = e.variants.iter().flat_map(|v| &v.fields);
+                out.push((&e.name, fields.map(|f| &f.ty).collect()));
+            }
+            collect(&m.modules, out);
+        }
+    }
+    let mut decls = Vec::new();
+    collect(modules, &mut decls);
+    let mut carriers = BTreeSet::new();
+    loop {
+        let before = carriers.len();
+        for (name, fields) in &decls {
+            if carriers.contains(*name) {
+                continue;
+            }
+            let mut carries = false;
+            for ty in fields {
+                ty.walk(&mut |t| {
+                    if let TypeRef::Named(n) = t {
+                        carries |=
+                            types.kind(n) == Some(TypeKind::Interface) || carriers.contains(n);
+                    }
+                });
+            }
+            if carries {
+                carriers.insert((*name).to_string());
+            }
+        }
+        if carriers.len() == before {
+            return carriers;
         }
     }
 }

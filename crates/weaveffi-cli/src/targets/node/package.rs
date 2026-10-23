@@ -5,7 +5,7 @@ use weaveffi_model::pkg::Identity;
 
 use crate::manifest::{JsonObject, JsonValue};
 use crate::platform::Platform;
-use crate::targets::js::npm_metadata;
+use crate::targets::js::{npm_metadata, PACKAGE_FILES};
 use crate::utils::{render_prelude, render_trailer, CommentStyle};
 
 /// The names every file of the generated package derives from.
@@ -25,14 +25,15 @@ pub(crate) struct NodeNames<'a> {
 impl NodeNames<'_> {
     /// The files `npm pack` publishes.
     fn files(&self) -> Vec<String> {
-        vec![
-            "index.js".into(),
-            "index.d.ts".into(),
-            "runtime.js".into(),
-            "binding.gyp".into(),
-            format!("{}.c", self.addon),
-            self.header.clone(),
-        ]
+        PACKAGE_FILES
+            .iter()
+            .map(|f| (*f).to_string())
+            .chain([
+                "binding.gyp".into(),
+                format!("{}.c", self.addon),
+                self.header.clone(),
+            ])
+            .collect()
     }
 }
 
@@ -47,15 +48,6 @@ fn install_script(names: &NodeNames<'_>) -> String {
          || node-gyp rebuild",
         package = names.package,
         addon = names.addon,
-    )
-}
-
-/// The npm tarball file name `npm pack` gives `name` at `version`
-/// (`kvstore-1.2.0.tgz`, or `acme-kv-1.2.0.tgz` for `@acme/kv`).
-pub(crate) fn npm_tarball_name(name: &str, version: &str) -> String {
-    format!(
-        "{}-{version}.tgz",
-        name.trim_start_matches('@').replace('/', "-")
     )
 }
 

@@ -1,7 +1,7 @@
 use std::io::Write;
 
 fn cargo_bin() -> assert_cmd::Command {
-    assert_cmd::Command::cargo_bin("weaveffi").expect("binary not found")
+    crate::weaveffi()
 }
 
 fn write_temp_file(dir: &tempfile::TempDir, name: &str, contents: &str) -> std::path::PathBuf {
@@ -60,32 +60,10 @@ fn parse_error_json_shows_filename_and_location() {
 }
 
 #[test]
-fn parse_error_toml_shows_filename() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_temp_file(&dir, "bad.toml", "version = [invalid\n");
-
-    let output = cargo_bin()
-        .args(["validate", path.to_str().unwrap()])
-        .output()
-        .unwrap();
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success());
-    assert!(
-        stderr.contains("bad.toml"),
-        "expected filename in error output, got: {stderr}"
-    );
-    assert!(
-        stderr.contains("TOML parse error"),
-        "expected TOML parse error message, got: {stderr}"
-    );
-}
-
-#[test]
 fn validation_error_duplicate_module_shows_suggestion() {
     let dir = tempfile::tempdir().unwrap();
     let yaml = r#"
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: foo
     functions:
@@ -123,7 +101,7 @@ modules:
 fn async_function_validates_successfully() {
     let dir = tempfile::tempdir().unwrap();
     let yaml = r#"
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: mymod
     functions:
@@ -149,7 +127,7 @@ modules:
 fn validation_error_duplicate_function_shows_suggestion() {
     let dir = tempfile::tempdir().unwrap();
     let yaml = r#"
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: mymod
     functions:
@@ -209,7 +187,7 @@ fn generate_parse_error_shows_filename_and_suggestion() {
 fn generate_validation_error_shows_suggestion() {
     let dir = tempfile::tempdir().unwrap();
     let yaml = r#"
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: dup
     functions:
@@ -249,7 +227,7 @@ modules:
 fn validate_with_warnings() {
     let dir = tempfile::tempdir().unwrap();
     let yaml = r#"
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: nodocs
     functions:

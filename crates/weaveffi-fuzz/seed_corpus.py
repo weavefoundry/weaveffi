@@ -9,11 +9,10 @@ them cover the whole IDL surface:
 
 - fuzz_parse_yaml, fuzz_validate: each fixture as is
 - fuzz_parse_json: each fixture converted to JSON
-- fuzz_parse_toml: each fixture converted to TOML (needs `tomli-w`)
 - fuzz_parse_type_ref: every distinct `type` and `return` string
 - fuzz_value_buffer: the committed seeds only
 
-Needs PyYAML (`pip install pyyaml tomli-w`).
+Needs PyYAML (`pip install pyyaml`).
 """
 
 import json
@@ -43,7 +42,7 @@ def type_strings(node, out):
 class FixtureLoader(yaml.SafeLoader):
     """Reads a plain `null` as the string "null", as the IDL parser does where
     it expects a string (`edge_cases` has a parameter named `null`). The
-    fixtures use no real nulls, which TOML couldn't express anyway."""
+    fixtures use no real nulls."""
 
 
 FixtureLoader.yaml_implicit_resolvers = {
@@ -69,11 +68,6 @@ def main():
         for fixture in FIXTURES:
             text = json.dumps(load(fixture), indent=2)
             (corpus / f"{fixture.stem}.json").write_text(text)
-    elif target == "fuzz_parse_toml":
-        import tomli_w
-
-        for fixture in FIXTURES:
-            (corpus / f"{fixture.stem}.toml").write_text(tomli_w.dumps(load(fixture)))
     elif target == "fuzz_parse_type_ref":
         types = set()
         for fixture in FIXTURES:

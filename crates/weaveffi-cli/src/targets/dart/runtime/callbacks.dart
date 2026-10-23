@@ -5,16 +5,22 @@
 // object and the GC never sees a raw pointer. The entry lives until the
 // producer calls the vtable's `free`.
 //
-// Methods that return a value are `NativeCallable.isolateLocal` trampolines:
-// they run synchronously, so the producer must call them on this isolate's
-// thread while a call from Dart is in progress (the VM aborts the process
-// otherwise, and an entry point that may run on any thread can't re-enter
-// the isolate to run the method). Void methods and `free` are
+// Methods that return a value are `NativeCallable.isolateLocal`
+// trampolines: they run synchronously, so the producer may only call them
+// on this isolate's thread while a call from Dart is in progress. Every
+// vtable is flagged thread-affine (`{{PREFIX}}_VTABLE_THREAD_AFFINE`), so
+// the producer refuses such a call from any other thread, failing the
+// method with -4 ("callback called off its thread") instead of making it
+// (the VM would abort the process). Void methods and `free` are
 // `NativeCallable.isolateGroupBound` forwarders, which may run on any
 // thread: they copy their arguments into a message for this isolate
-// (borrowed bytes are copied before the forwarder returns) and the
+// (borrowed runs are copied before the forwarder returns) and the
 // implementation runs later on the event loop, in the zone that passed the
 // callback.
+
+/// Vtable `flags` bit 0: value-returning methods may only be called on the
+/// thread that passed the vtable.
+const int _vtableThreadAffine = 1;
 
 /// Where forwarders send messages: the allocator they build a message with
 /// and the isolate port that receives it. Forwarders run outside the
@@ -150,12 +156,25 @@ final class _CallbackMessage {
   }
 
   static const int free = -1;
+  static const int _kNull = 0;
   static const int _kBool = 1;
   static const int _kInt64 = 3;
   static const int _kDouble = 4;
   static const int _kArray = 6;
   static const int _kTypedData = 7;
-  static const int _kUint8 = 2;
+
+  // `Dart_TypedData_Type` values: a posted array arrives as the matching
+  // typed list (`Int32List`, `Float64List`, ...).
+  static const int typedInt8 = 1;
+  static const int typedUint8 = 2;
+  static const int typedInt16 = 4;
+  static const int typedUint16 = 5;
+  static const int typedInt32 = 6;
+  static const int typedUint32 = 7;
+  static const int typedInt64 = 8;
+  static const int typedUint64 = 9;
+  static const int typedFloat32 = 10;
+  static const int typedFloat64 = 11;
 
   final _CallbackContext _context;
   final int _capacity;
@@ -177,13 +196,26 @@ final class _CallbackMessage {
 
   void pointer(Pointer<Void> v) => int64(v.address);
 
+  /// An absent optional: arrives as `null`.
+  void none() => _next(_kNull);
+
+  void maybeBool(bool present, bool v) => present ? boolean(v) : none();
+
+  void maybeInt64(bool present, int v) => present ? int64(v) : none();
+
+  void maybeFloat64(bool present, double v) => present ? float64(v) : none();
+
   /// A borrowed byte run; posting copies it.
-  void bytes(Pointer<Uint8> ptr, int len) {
+  void bytes(Pointer<Uint8> ptr, int len) => typedData(ptr, len, typedUint8);
+
+  /// A borrowed array of [count] elements of the typed-data [type]; posting
+  /// copies it. A run of length 0 is never read.
+  void typedData(Pointer<NativeType> ptr, int count, int type) {
     final data = _next(_kTypedData).value.asTypedData;
     data
-      ..type = _kUint8
-      ..length = ptr == nullptr ? 0 : len
-      ..values = ptr;
+      ..type = type
+      ..length = count
+      ..values = count == 0 ? nullptr : ptr.cast();
   }
 
   void send() {
@@ -219,47 +251,44 @@ Pointer<NativeFunction<T>> _pin<T extends Function>(NativeCallable<T> callable) 
 }
 
 final _errorSet = _lib.lookupFunction<
-    Void Function(Pointer<_Error>, Int32, Pointer<Utf8>),
-    void Function(Pointer<_Error>, int, Pointer<Utf8>)>('{{PREFIX}}_error_set');
+    Void Function(Pointer<_Error>, Int32, Pointer<Uint8>, Size),
+    void Function(
+        Pointer<_Error>, int, Pointer<Uint8>, int)>('{{PREFIX}}_error_set');
 
 final _errorSetPayload = _lib.lookupFunction<
     Void Function(Pointer<_Error>, Pointer<Uint8>, Size),
     void Function(
         Pointer<_Error>, Pointer<Uint8>, int)>('{{PREFIX}}_error_set_payload');
 
-final _alloc = _lib.lookupFunction<Pointer<Uint8> Function(Size),
-    Pointer<Uint8> Function(int)>('{{PREFIX}}_alloc', isLeaf: true);
-
 /// Reports a failed callback method to the producer through [outErr]:
 /// `{{PREFIX}}_error_set` copies [message], and `{{PREFIX}}_error_set_payload`
-/// copies a domain code's encoded fields. Never throws: it runs in the catch
-/// path of a trampoline an exception must not unwind through.
+/// copies a domain code's encoded fields. Runs in the catch path of a
+/// trampoline, which an exception must never unwind through.
 void _failCallback(
     Pointer<_Error> outErr, int code, String message, Uint8List? payload) {
   if (outErr == nullptr) return;
-  final text = message.toNativeUtf8(allocator: calloc);
+  final text = utf8.encode(message);
+  final scratch = calloc<Uint8>(text.length + (payload?.length ?? 0) + 1);
   try {
-    _errorSet(outErr, code, text);
+    scratch.asTypedList(text.length).setAll(0, text);
+    _errorSet(outErr, code, scratch, text.length);
+    if (payload == null || payload.isEmpty) return;
+    scratch.asTypedList(payload.length).setAll(0, payload);
+    _errorSetPayload(outErr, scratch, payload.length);
   } finally {
-    calloc.free(text);
-  }
-  if (payload == null || payload.isEmpty) return;
-  final bytes = calloc<Uint8>(payload.length);
-  try {
-    bytes.asTypedList(payload.length).setAll(0, payload);
-    _errorSetPayload(outErr, bytes, payload.length);
-  } finally {
-    calloc.free(bytes);
+    calloc.free(scratch);
   }
 }
 
-/// Reports an implementation's exception that isn't a domain error of the
-/// method with the foreign code (-4) and the exception's text.
-void _foreignError(Pointer<_Error> outErr, Object error) {
+/// Reports [error], an exception that isn't a domain error the method
+/// declares, with [code] and the exception's text (a [NativeException]'s
+/// message).
+void _reportCallbackError(Pointer<_Error> outErr, int code, Object error) {
   try {
-    _failCallback(outErr, NativeException.foreignCode, '$error', null);
+    final message = error is NativeException ? error.message : '$error';
+    _failCallback(outErr, code, message, null);
   } catch (_) {
-    _errorSet(outErr, NativeException.foreignCode, nullptr);
+    _errorSet(outErr, code, nullptr, 0);
   }
 }
 
@@ -271,5 +300,5 @@ void _handOver(
   final run = bytes.isEmpty ? nullptr : _alloc(bytes.length);
   if (run != nullptr) run.asTypedList(bytes.length).setAll(0, bytes);
   outPtr.value = run;
-  outLen.value = bytes.length;
+  outLen.value = run == nullptr ? 0 : bytes.length;
 }

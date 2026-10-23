@@ -1,23 +1,31 @@
-//! The fixed runtime of the generated header: the error types, the adopt
-//! tag, the cancel token, the string and callback-return helpers, the
-//! load-time library check, and the value-buffer reader and writer.
+//! The fixed runtime of the generated header, written from real C++ sources
+//! under `runtime/` with `{{PLACEHOLDER}}` substitution:
 //!
-//! The code lives in real C++ sources under `runtime/`, written into the
-//! header with `{{PLACEHOLDER}}` substitution. The library check embeds the
-//! contract table of every top-level module (from
-//! [`weaveffi_model::contract::entries`]) as `(id, hash, path)` triples, so
+//! * `prelude.hpp`: the exception hierarchy, the adopt tag, the generic
+//!   machinery every wrapper delegates to (`detail::Errors<E>` and
+//!   `detail::check<E>`, `detail::settle` for async completions,
+//!   `detail::callback` for trampolines, `detail::Handle<Traits>` for
+//!   objects, the run, slice, and optional helpers), `CancelToken`, the
+//!   generic `Range<T>` every iterator returns, and `check_library()` with
+//!   the expected contract tables;
+//! * `buffer.hpp` (when any value crosses as a value buffer): the
+//!   value-buffer reader and writer and the overloaded `detail::write` and
+//!   `detail::read` templates for primitives, enums, objects, optionals,
+//!   vectors, and maps.
+//!
+//! The library check embeds the contract rows of every top-level module
+//! (from the shared [`contract`] emitter) as `(id, hash, path)` triples, so
 //! a mismatch names the declaration.
 
+use crate::codegen::contract;
 use crate::codegen::CodeWriter;
-use weaveffi_model::contract;
-use weaveffi_model::model::{contract_symbol, Model, ABI_VERSION};
+use weaveffi_model::model::{Model, ABI_VERSION};
 
-/// The error types, adopt tag, cancel token, helpers, and `check_library()`.
-/// `{{CONTRACTS}}` marks where the expected tables go and `{{CHECKS}}` where
-/// `check_library()` compares them.
+/// The runtime prelude. `{{CONTRACTS}}` marks where the expected tables go
+/// and `{{CHECKS}}` where `check_library()` compares them.
 const PRELUDE: &str = include_str!("runtime/prelude.hpp");
 
-/// The value-buffer reader, writer, and release guard.
+/// The value-buffer runtime.
 const BUFFER: &str = include_str!("runtime/buffer.hpp");
 
 /// The `detail` array holding a top-level module's expected contract.
@@ -29,10 +37,9 @@ fn contract_array(module: &str) -> String {
 /// ABI revision and every top-level module's contract table against the
 /// declarations this header was generated with.
 pub(crate) fn render_prelude_runtime(w: &mut CodeWriter, model: &Model) {
-    let prefix = model.prefix();
     let library = &model.identity.library;
     let text = PRELUDE
-        .replace("{{PREFIX}}", prefix)
+        .replace("{{PREFIX}}", model.prefix())
         .replace("{{MACRO}}", &model.identity.macro_prefix())
         .replace("{{LIBRARY}}", library)
         .replace("{{ABI}}", &ABI_VERSION.to_string());
@@ -42,29 +49,31 @@ pub(crate) fn render_prelude_runtime(w: &mut CodeWriter, model: &Model) {
     let (middle, tail) = rest
         .split_once("{{CHECKS}}")
         .expect("the prelude marks the contract checks");
-    let roots: Vec<_> = model
-        .roots()
-        .map(|root| (root, contract::entries(model, root)))
-        .filter(|(_, entries)| !entries.is_empty())
+    let tables: Vec<_> = contract::tables(model)
+        .into_iter()
+        .filter(|t| !t.rows.is_empty())
         .collect();
 
     w.raw(head);
-    for (root, entries) in &roots {
+    for table in &tables {
         w.line(format!(
             "/** The declarations of module `{}` this header was generated with. */",
-            root.dot_path
+            table.root.dot_path
         ));
         w.block(
             format!(
                 "inline constexpr ContractEntry {}[] = {{",
-                contract_array(&root.name)
+                contract_array(&table.root.name)
             ),
             "};",
             |w| {
-                for e in entries {
+                for row in &table.rows {
                     w.line(format!(
-                        "{{{:#018x}ull, {:#018x}ull, \"{}\"}},",
-                        e.id, e.hash, e.path
+                        "{{{}ull, {}ull, \"{}\"}}, // {}",
+                        contract::hex(row.id),
+                        contract::hex(row.hash),
+                        row.path,
+                        row.signature
                     ));
                 }
             },
@@ -74,12 +83,12 @@ pub(crate) fn render_prelude_runtime(w: &mut CodeWriter, model: &Model) {
     w.raw(middle);
     // The checks sit inside `check_library()`'s initializing lambda.
     w.indent().indent();
-    for (root, _) in &roots {
+    for table in &tables {
         w.block(
             format!(
                 "if (std::string why = detail::contract_mismatch({}, detail::{}); !why.empty()) {{",
-                contract_symbol(prefix, &root.name),
-                contract_array(&root.name)
+                table.symbol,
+                contract_array(&table.root.name)
             ),
             "}",
             |w| {

@@ -2,31 +2,35 @@
 //! thunks.
 //!
 //! The flow mirrors the rest of WeaveFFI: extract the annotated module tree
-//! to the IR via [`weaveffi_model::rust`], validate it with the shared
-//! validator (tolerating names declared in another tree, which must be
-//! records or rich enums) to build the canonical [`Model`], then render
-//! each lowered symbol. A validation error becomes a compile error on the
-//! offending item ([`diagnostics`]). Signatures come straight from the model
-//! (so they match the generated header by construction); the bodies call
-//! the runtime's per-family lifting and lowering functions (`weaveffi::abi`),
-//! so every `unsafe` operation has one audited home.
+//! to the IR ([`crate::extract`]), validate it with the shared validator
+//! (passing the names declared in another tree, which must be records or
+//! rich enums) to build the canonical [`Model`], then render each lowered
+//! symbol. A validation error becomes a compile error on the offending item
+//! ([`diagnostics`]). Signatures come straight from the model (so they match
+//! the generated header by construction) and the bodies follow the passing
+//! contracts it stores on every binding, calling the runtime's lifting and
+//! lowering functions (`weaveffi::abi`), so every `unsafe` operation has one
+//! audited home.
 //!
 //! The emission is split by surface: [`sync`] for synchronous callables,
 //! [`async_fns`] for `async fn` launchers, [`iterators`] for `iter<T>` trios,
 //! [`records`] and [`enums`] for the generated `BufferValue` serialization
-//! impls of value types, [`interfaces`] for the object reference-count
-//! symbols, [`callbacks`] for callback-interface vtables and foreign
-//! wrappers, [`contract`] for the module's contract table, [`meta`] for the
-//! library metadata the CLI reads the API from, and [`foreign`] for the
-//! compile-time checks on types declared in another module tree.
-//! [`helpers`] and [`lift`] hold the shared slot rendering and the
-//! lift/lower dispatch. An item's `#[cfg]` wraps everything generated for it.
+//! impls of value types, [`errors`] for error domains, [`interfaces`] for
+//! the object reference-count symbols, [`callbacks`] for callback-interface
+//! vtables and foreign wrappers, [`custom`] for custom types, [`contract`]
+//! for the module's contract table, [`meta`] for the library metadata the
+//! CLI reads the API from, and [`foreign`] for the compile-time checks on
+//! types declared in another module tree. [`helpers`] and [`lift`] hold the
+//! shared slot rendering and the lift/lower dispatch. An item's `#[cfg]`
+//! wraps everything generated for it.
 
 mod async_fns;
 mod callbacks;
 mod contract;
+mod custom;
 mod diagnostics;
 mod enums;
+mod errors;
 mod foreign;
 mod helpers;
 mod interfaces;
@@ -40,11 +44,13 @@ use std::collections::{BTreeSet, HashMap};
 
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, quote_spanned};
-use weaveffi_model::ir::{Api, TypeRef, CURRENT_SCHEMA_VERSION};
-use weaveffi_model::model::{ErrorBinding, Model, ModuleBinding};
-use weaveffi_model::rust::SourceMap;
+use weaveffi_model::ir::{Api, CURRENT_SCHEMA_VERSION};
+use weaveffi_model::model::ModuleBinding;
 use weaveffi_model::validate::{validate_scoped, Options};
 
+use crate::extract::{has_marker, is_weaveffi_attr, Customs, SourceMap};
+
+use self::custom::CustomScope;
 pub(crate) use self::helpers::ident;
 use self::helpers::{cfg_wrap, CallTarget};
 use self::sync::gen_function;
@@ -68,37 +74,29 @@ pub fn expand_module(item_mod: &syn::ItemMod) -> syn::Result<TokenStream> {
     // 1. Extract the whole tree (it recurses into nested
     //    `#[weaveffi::module]` submodules), recording where each declaration
     //    came from and its `#[cfg]`.
-    let (module_ir, source) = weaveffi_model::rust::extract_module(item_mod)?;
+    let extraction = crate::extract::extract_module(item_mod)?;
     let prefix = prefix()?;
 
     // 2. Validate and build the model. A module tree is expanded in
     //    isolation, so a type declared in a *sibling* tree (`orders` using
-    //    `products::Product`) can't be resolved here; `foreign_names`
-    //    accepts such names as records or rich enums, `unresolved` (below)
-    //    lists them, and `foreign` asserts each one really is one.
+    //    `products::Product`) can't be resolved here; such names are passed
+    //    as foreign (records or rich enums), and `foreign` asserts each one
+    //    really is one. The primitives no IDL type covers stay unknown, so
+    //    validation reports them.
     let api = Api {
         version: CURRENT_SCHEMA_VERSION.to_string(),
-        modules: vec![module_ir],
+        modules: vec![extraction.module],
     };
     let identity = weaveffi_model::pkg::Identity::named(&prefix);
-    let model = validate_scoped(
-        &api,
-        &identity,
-        Options {
-            foreign_names: true,
-        },
-    )
-    .map_err(|found| diagnostics::validation_errors(found, &source, item_mod.ident.span()))?;
-    let mut unresolved = BTreeSet::new();
-    api.for_each_type_ref(&mut |ty| {
-        ty.walk(&mut |t| {
-            if let TypeRef::Named(name) = t {
-                if model.types.get(name).is_none() {
-                    unresolved.insert(name.clone());
-                }
-            }
-        });
-    });
+    let mut foreign_names = api.undeclared_type_names();
+    foreign_names.retain(|n| !matches!(n.as_str(), "u128" | "i128"));
+    let options = Options {
+        foreign: foreign_names,
+    };
+    let model = validate_scoped(&api, &identity, &options).map_err(|found| {
+        diagnostics::validation_errors(found, &extraction.source, item_mod.ident.span())
+    })?;
+    let unresolved: BTreeSet<String> = model.types.foreign().map(str::to_string).collect();
     let by_path: HashMap<Vec<String>, &ModuleBinding> = model
         .modules
         .iter()
@@ -106,33 +104,82 @@ pub fn expand_module(item_mod: &syn::ItemMod) -> syn::Result<TokenStream> {
         .collect();
 
     // 3. Rebuild the tree, injecting each module's thunks into its own body
-    //    and stripping inner `#[weaveffi::module]` markers so nested modules
-    //    expand here (with the right symbol path) instead of standalone.
+    //    and stripping the WeaveFFI attributes so nested modules expand here
+    //    (with the right symbol path) instead of standalone, and so a marker
+    //    left to expand on its own is one used outside any module.
     let ctx = Expansion {
-        model: &model,
         tree: &api.modules[0],
         prefix: &prefix,
         by_path: &by_path,
         unresolved: &unresolved,
-        source: &source,
+        source: &extraction.source,
+        customs: &extraction.customs,
     };
     let root = model
         .roots()
         .next()
         .ok_or_else(|| syn::Error::new_spanned(&item_mod.ident, "internal error: no root"))?;
-    let contract_fn = contract::gen_contract(&model, root, &source, &prefix);
-    ctx.rebuild_module(item_mod, &[], contract_fn)
+    let mut extra = contract::gen_contract(&model, root, &extraction.source, &prefix);
+    // Every module tree needs the runtime symbols; `export_runtime!()`
+    // defines this module at the crate root, so forgetting it (or calling it
+    // anywhere else) fails here, at the module's name.
+    let span = item_mod.ident.span();
+    extra.extend(quote_spanned! {span=>
+        #[allow(unused_imports)]
+        use crate::__weaveffi_runtime as _;
+    });
+    ctx.rebuild_module(item_mod, &[], extra)
 }
 
 /// What every module in one expansion shares.
 struct Expansion<'a> {
-    model: &'a Model,
     /// The extracted tree, which the library metadata describes.
     tree: &'a weaveffi_model::ir::Module,
     prefix: &'a str,
     by_path: &'a HashMap<Vec<String>, &'a ModuleBinding>,
     unresolved: &'a BTreeSet<String>,
     source: &'a SourceMap,
+    customs: &'a Customs,
+}
+
+/// Remove every WeaveFFI attribute (markers and `#[weaveffi(...)]` helpers)
+/// from an item the module macro re-emits, including those on its impl
+/// items, trait items, and enum variants.
+fn strip_item(item: &mut syn::Item) {
+    let strip = |attrs: &mut Vec<syn::Attribute>| attrs.retain(|a| !is_weaveffi_attr(a));
+    match item {
+        syn::Item::Fn(f) => strip(&mut f.attrs),
+        syn::Item::Struct(s) => {
+            strip(&mut s.attrs);
+            for field in s.fields.iter_mut() {
+                strip(&mut field.attrs);
+            }
+        }
+        syn::Item::Enum(e) => {
+            strip(&mut e.attrs);
+            for v in &mut e.variants {
+                strip(&mut v.attrs);
+            }
+        }
+        syn::Item::Trait(t) => {
+            strip(&mut t.attrs);
+            for ti in &mut t.items {
+                if let syn::TraitItem::Fn(f) = ti {
+                    strip(&mut f.attrs);
+                }
+            }
+        }
+        syn::Item::Impl(i) => {
+            strip(&mut i.attrs);
+            for ii in &mut i.items {
+                if let syn::ImplItem::Fn(f) = ii {
+                    strip(&mut f.attrs);
+                }
+            }
+        }
+        syn::Item::Type(t) => strip(&mut t.attrs),
+        _ => {}
+    }
 }
 
 impl Expansion<'_> {
@@ -160,7 +207,7 @@ impl Expansion<'_> {
             )
         })?;
 
-        let mut generated = self.render_symbols(mb, items, &item_mod.ident)?;
+        let mut generated = self.render_symbols(mb, items, &item_mod.ident, &segments)?;
         generated.extend(foreign::by_value_assertions(items, self.unresolved));
         generated.extend(meta::gen_metadata(
             self.tree,
@@ -169,23 +216,22 @@ impl Expansion<'_> {
             |names| self.cfg(mb, names),
         ));
 
-        // Pass items through verbatim, except nested `#[weaveffi::module]`s,
-        // which expand inline (recursively) with their marker stripped.
+        // Pass items through without their WeaveFFI attributes, except
+        // nested `#[weaveffi::module]`s, which expand inline (recursively).
         let mut body = TokenStream::new();
         for item in items {
             if let syn::Item::Mod(child) = item {
-                if weaveffi_model::rust::has_marker(&child.attrs, "module") {
+                if has_marker(&child.attrs, "module") {
                     body.extend(self.rebuild_module(child, &segments, TokenStream::new())?);
                     continue;
                 }
             }
+            let mut item = item.clone();
+            strip_item(&mut item);
             body.extend(quote!(#item));
         }
 
-        let attrs = item_mod
-            .attrs
-            .iter()
-            .filter(|a| !weaveffi_model::rust::has_marker(std::slice::from_ref(a), "module"));
+        let attrs = item_mod.attrs.iter().filter(|a| !is_weaveffi_attr(a));
         let vis = &item_mod.vis;
         let mod_token = &item_mod.mod_token;
         let name = &item_mod.ident;
@@ -211,35 +257,23 @@ impl Expansion<'_> {
         out
     }
 
-    /// The path, relative to `mb`, of the error domain in scope there.
-    fn domain_path(&self, mb: &ModuleBinding) -> Option<TokenStream> {
-        let domain = self.model.error_domain(mb)?;
-        let owner = self
-            .model
-            .modules
-            .iter()
-            .find(|m| m.errors.as_ref().is_some_and(|e| e.name == domain.name))?;
-        let ups = mb.segments.len() - owner.segments.len();
-        let supers = std::iter::repeat_n(quote!(super::), ups);
-        let name = ident(&domain.name);
-        Some(quote!(#(#supers)* #name))
-    }
-
     /// Render every C ABI symbol for one lowered module binding.
     ///
     /// `items` are the syn items directly in that module's body; they are
-    /// indexed so body marshalling can read reference-ness and `Result`
-    /// returns from the producer's signatures. `mod_ident` anchors
-    /// module-level diagnostics.
+    /// indexed so body marshalling can read the producer's written types and
+    /// `Result` returns. `mod_ident` anchors module-level diagnostics.
     fn render_symbols(
         &self,
         mb: &ModuleBinding,
         items: &[syn::Item],
         mod_ident: &syn::Ident,
+        segments: &[String],
     ) -> syn::Result<TokenStream> {
         let prefix = self.prefix;
+        let customs = CustomScope::new(self.customs, segments);
         let mut fns: HashMap<String, &syn::ItemFn> = HashMap::new();
         let mut enums: HashMap<String, &syn::ItemEnum> = HashMap::new();
+        let mut structs: HashMap<String, &syn::ItemStruct> = HashMap::new();
         let mut traits: HashMap<String, &syn::ItemTrait> = HashMap::new();
         // Interface member signatures, keyed by `(type name, fn name)` across
         // all inherent `impl` blocks of the type.
@@ -251,6 +285,9 @@ impl Expansion<'_> {
                 }
                 syn::Item::Enum(e) => {
                     enums.insert(e.ident.to_string(), e);
+                }
+                syn::Item::Struct(s) => {
+                    structs.insert(s.ident.to_string(), s);
                 }
                 syn::Item::Trait(t) => {
                     traits.insert(t.ident.to_string(), t);
@@ -277,27 +314,37 @@ impl Expansion<'_> {
         };
 
         let mut generated = TokenStream::new();
-        if let Some(eb) = &mb.errors {
+        for def in self.customs.values().filter(|d| d.module == segments) {
+            generated.extend(custom::gen_custom(def));
+        }
+        for eb in &mb.errors {
             let item = enums
                 .get(&eb.name)
                 .ok_or_else(|| missing("error domain", &eb.name))?;
             generated.extend(cfg_wrap(
                 &self.cfg(mb, &[&eb.name]),
-                gen_error_domain(eb, item),
+                errors::gen_error_domain(eb, item, customs)?,
             ));
         }
         for e in &mb.enums {
-            generated.extend(cfg_wrap(&self.cfg(mb, &[&e.name]), enums::gen_enum(e)));
+            let item = enums.get(&e.name).copied();
+            generated.extend(cfg_wrap(
+                &self.cfg(mb, &[&e.name]),
+                enums::gen_enum(e, item, customs),
+            ));
         }
         for s in &mb.structs {
-            generated.extend(cfg_wrap(&self.cfg(mb, &[&s.name]), records::gen_record(s)));
+            let item = structs.get(&s.name).copied();
+            generated.extend(cfg_wrap(
+                &self.cfg(mb, &[&s.name]),
+                records::gen_record(s, item, customs),
+            ));
         }
-        let domain = self.domain_path(mb);
         for c in &mb.callback_interfaces {
             let item = traits
                 .get(&c.name)
                 .ok_or_else(|| missing("callback interface", &c.name))?;
-            let code = callbacks::gen_callback_interface(c, item, domain.as_ref(), prefix)?;
+            let code = callbacks::gen_callback_interface(c, item, customs, prefix)?;
             generated.extend(cfg_wrap(&self.cfg(mb, &[&c.name]), code));
         }
         for i in &mb.interfaces {
@@ -311,7 +358,7 @@ impl Expansion<'_> {
                     let sig = member_sigs
                         .get(&(i.name.clone(), m.name.clone()))
                         .ok_or_else(|| missing("interface member", &m.name))?;
-                    let code = gen_function(m, sig, &target, prefix)?;
+                    let code = gen_function(m, sig, &target, customs, prefix)?;
                     generated.extend(cfg_wrap(&self.cfg(mb, &[&i.name, &m.name]), code));
                 }
             }
@@ -324,7 +371,7 @@ impl Expansion<'_> {
             let sfn = fns
                 .get(&f.name)
                 .ok_or_else(|| missing("function", &f.name))?;
-            let code = gen_function(f, &sfn.sig, &CallTarget::Free, prefix)?;
+            let code = gen_function(f, &sfn.sig, &CallTarget::Free, customs, prefix)?;
             generated.extend(cfg_wrap(&self.cfg(mb, &[&f.name]), code));
         }
         Ok(generated)
@@ -338,121 +385,6 @@ fn impl_type_name(item_impl: &syn::ItemImpl) -> Option<String> {
         return None;
     };
     p.path.segments.last().map(|s| s.ident.to_string())
-}
-
-/// Generate the [`ErrorReport`](weaveffi::abi::ErrorReport) and
-/// [`ErrorDomain`](weaveffi::abi::ErrorDomain) implementations for a
-/// module's `#[weaveffi::error]` enum: each variant maps to its declared
-/// code, the message is the enum's `Display` output, and a payload
-/// variant's fields are serialized into (and decoded from) the error's
-/// value-buffer payload. This is what routes `Err(Domain::Case)` from a
-/// throwing producer function to the matching C error constant, and a
-/// callback's domain error back to `Domain::Case`.
-fn gen_error_domain(eb: &ErrorBinding, item: &syn::ItemEnum) -> TokenStream {
-    let ty = ident(&eb.name);
-    // A payload-carrying variant matches with `{ .. }`; a unit variant by name.
-    let pattern = |c: &weaveffi_model::model::ErrorCodeBinding| {
-        let v = ident(&c.name);
-        if c.fields.is_empty() {
-            quote!(Self::#v)
-        } else {
-            quote!(Self::#v { .. })
-        }
-    };
-    let code_arms = eb.codes.iter().map(|c| {
-        let pat = pattern(c);
-        let value = c.value;
-        quote!(#pat => #value,)
-    });
-    let payload_arms: Vec<TokenStream> = eb
-        .codes
-        .iter()
-        .filter(|c| !c.fields.is_empty())
-        .map(|c| {
-            let v = ident(&c.name);
-            let bindings: Vec<syn::Ident> = c.fields.iter().map(|f| ident(&f.name)).collect();
-            quote! {
-                Self::#v { #(#bindings),* } => {
-                    let mut __wv_w = ::weaveffi::abi::BufferWriter::with_capacity(
-                        0 #(+ ::weaveffi::abi::BufferValue::encoded_len(#bindings))*
-                    );
-                    #(::weaveffi::abi::BufferValue::write_value(#bindings, &mut __wv_w);)*
-                    __wv_w.finish()
-                }
-            }
-        })
-        .collect();
-    let payload_fn = if payload_arms.is_empty() {
-        TokenStream::new()
-    } else {
-        quote! {
-            fn payload(&self) -> ::std::vec::Vec<u8> {
-                match self {
-                    #(#payload_arms)*
-                    _ => ::std::vec::Vec::new(),
-                }
-            }
-        }
-    };
-    let read_arms = eb.codes.iter().map(|c| {
-        let v = ident(&c.name);
-        let value = c.value;
-        if c.fields.is_empty() {
-            quote!(#value => Self::#v,)
-        } else {
-            let names: Vec<syn::Ident> = c.fields.iter().map(|f| ident(&f.name)).collect();
-            quote! {
-                #value => Self::#v {
-                    #(#names: ::weaveffi::abi::BufferValue::read_value(__wv_r)?),*
-                },
-            }
-        }
-    });
-    // Spanned at the enum so a missing `Display` impl is one error that
-    // points at it and names the requirement.
-    let user_ty = &item.ident;
-    let message = quote_spanned! {user_ty.span()=>
-        fn __weaveffi_error_domains_must_implement_display<
-            T: ::std::fmt::Display + ?::std::marker::Sized,
-        >(
-            e: &T,
-        ) -> ::std::string::String {
-            ::std::string::ToString::to_string(e)
-        }
-        __weaveffi_error_domains_must_implement_display(self)
-    };
-    quote! {
-        impl ::weaveffi::abi::ErrorReport for #ty {
-            fn code(&self) -> i32 {
-                match self {
-                    #(#code_arms)*
-                }
-            }
-            fn message(&self) -> ::std::string::String {
-                #message
-            }
-            #payload_fn
-        }
-
-        #[allow(unsafe_code, unused_unsafe)]
-        impl ::weaveffi::abi::ErrorDomain for #ty {
-            unsafe fn read_code(
-                code: i32,
-                __wv_r: &mut ::weaveffi::abi::BufferReader<'_>,
-            ) -> ::std::result::Result<
-                ::std::option::Option<Self>,
-                ::weaveffi::abi::BufferDecodeError,
-            > {
-                // SAFETY: forwarded from the caller.
-                ::std::result::Result::Ok(::std::option::Option::Some(unsafe {
-                    match code {
-                        #(#read_arms)*
-                        _ => return ::std::result::Result::Ok(::std::option::Option::None),
-                    }
-                }))
-            }
-        }
-    }
 }
 
 /// Build an "unsupported" error for a type shape the macro can't marshal,

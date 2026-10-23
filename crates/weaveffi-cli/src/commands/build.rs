@@ -2,32 +2,43 @@
 //! prebuild the per-language C glue, laying everything out in
 //! `{target_dir}/weaveffi/<platform>/` for `weaveffi package`.
 
+use std::process::ExitCode;
+
 use camino::Utf8PathBuf;
-use miette::{bail, miette, IntoDiagnostic, Result, WrapErr};
-use weaveffi_cli::build::glue::{self, GlueSource};
-use weaveffi_cli::build::{BuildSettings, Builder};
-use weaveffi_cli::codegen::Target;
-use weaveffi_cli::platform::{jni_shim_name, node_addon_name, BinarySet, Os, Platform};
-use weaveffi_cli::project::{Project, Source};
+use miette::{bail, miette, Result};
 use weaveffi_model::model::Model;
 
+use super::Locate;
+use crate::build::glue::{self, one_line};
+use crate::build::{BuildSettings, Builder};
+use crate::package::Skips;
+use crate::platform::{BinarySet, Platform};
+use crate::project::{Project, Source};
+use crate::targets::Target;
+
 /// Options for [`cmd_build`].
-pub(crate) struct BuildArgs<'a> {
-    pub(crate) input: Option<&'a str>,
-    pub(crate) config: Option<&'a str>,
-    pub(crate) platforms: Option<&'a str>,
-    pub(crate) targets: Option<&'a str>,
-    pub(crate) debug: bool,
-    pub(crate) manifest_path: Option<&'a str>,
-    pub(crate) warn: bool,
-    pub(crate) quiet: bool,
+pub struct BuildArgs<'a> {
+    /// Where the project is (`--library` doesn't apply).
+    pub locate: Locate<'a>,
+    /// `--platforms`.
+    pub platforms: Option<&'a str>,
+    /// `--target`.
+    pub targets: Option<&'a [String]>,
+    /// `--manifest-path`.
+    pub manifest_path: Option<&'a str>,
+    /// `--warn`.
+    pub warn: bool,
+    /// `--strict`: fail when an artifact is skipped.
+    pub strict: bool,
 }
 
-pub(crate) fn cmd_build(args: &BuildArgs<'_>) -> Result<()> {
-    let project = Project::locate(args.config, args.input, None)?.quiet(args.quiet);
-    let targets = project.config.select_targets(args.targets)?;
+/// Run `weaveffi build`.
+pub fn cmd_build(args: &BuildArgs<'_>) -> Result<ExitCode> {
+    let project = args.locate.project()?;
+    let targets = project.config.targets(args.targets)?;
     let platforms = resolve_platforms(args.platforms, &project)?;
-    let settings = project.config.build.settings(args.debug);
+    let settings = project.config.build.settings(args.locate.profile);
+    let skips = Skips::default();
     let built = build_project(
         &project,
         &targets,
@@ -35,8 +46,9 @@ pub(crate) fn cmd_build(args: &BuildArgs<'_>) -> Result<()> {
         &settings,
         args.manifest_path,
         args.warn,
+        &skips,
     )?;
-    if !args.quiet {
+    if !args.locate.quiet {
         println!("Built `{}` into {}", built.binaries.lib_name, built.dir);
         for nb in &built.binaries.binaries {
             let mut files = vec![nb.library.file_name().unwrap_or_default().to_string()];
@@ -50,7 +62,7 @@ pub(crate) fn cmd_build(args: &BuildArgs<'_>) -> Result<()> {
             println!("  {}: {}", nb.platform.id(), files.join(", "));
         }
     }
-    Ok(())
+    Ok(super::finish(&skips, args.strict))
 }
 
 /// The platforms to build: `--platforms`, else `[build] platforms`, else
@@ -110,13 +122,13 @@ pub(crate) fn model_from_binaries(
     super::load_model(&project.clone().library(first.library.clone())?, warn)
 }
 
-/// Build the project's producer for every platform, then prebuild the glue
-/// of the selected targets that need it (the Node.js addon for `node`, the
-/// JNI shim for `kotlin`). Every platform is checked before anything
-/// compiles, so a missing rustup target or NDK fails fast with every
-/// problem listed. Glue a host can't compile is skipped with a warning; the
-/// packages then fall back to compiling it at install or build time. A Rust
-/// producer's API is read from the first library built.
+/// Build the project's producer for every platform, then prebuild the
+/// [`glue`](Target::glue) of the selected targets. Every platform is
+/// checked before anything compiles; one this machine can't build (a
+/// missing rustup target or NDK) is skipped and recorded in `skips`, and so
+/// is glue the host can't compile (the packages then fall back to compiling
+/// it at install or build time). A Rust producer's API is read from the
+/// first library built.
 pub(crate) fn build_project(
     project: &Project,
     targets: &[Box<dyn Target>],
@@ -124,6 +136,7 @@ pub(crate) fn build_project(
     settings: &BuildSettings,
     manifest: Option<&str>,
     warn: bool,
+    skips: &Skips,
 ) -> Result<Built> {
     let quiet = project.is_quiet();
     let krate = super::producer_crate(project, manifest)?;
@@ -137,19 +150,21 @@ pub(crate) fn build_project(
         );
     }
     let builder = Builder::new(&krate, library, settings).quiet(quiet);
-    let problems: Vec<String> = platforms
-        .iter()
-        .filter_map(|p| builder.check(*p).err().map(|e| format!("  - {e:#}")))
-        .collect();
-    if !problems.is_empty() {
+    let mut buildable = Vec::new();
+    for &platform in platforms {
+        match builder.check(platform) {
+            Ok(()) => buildable.push(platform),
+            Err(e) => skips.skip(format!("the {} library", platform.id()), one_line(&e)),
+        }
+    }
+    if buildable.is_empty() {
         bail!(
-            "can't build every requested platform on this machine:\n{}",
-            problems.join("\n")
+            "none of the requested platforms can be built on this machine (see the warnings above)"
         );
     }
 
     let mut binaries = BinarySet::new(library.as_str());
-    for &platform in platforms {
+    for platform in buildable {
         if !quiet {
             println!(
                 "Building `{}` for {} ({})...",
@@ -158,8 +173,7 @@ pub(crate) fn build_project(
                 platform.rust_target()
             );
         }
-        let binary = builder.build(platform).map_err(|e| miette!("{e:#}"))?;
-        binaries.insert(binary);
+        binaries.insert(builder.build(platform)?);
     }
     let model = match model {
         Some(model) => model,
@@ -167,171 +181,14 @@ pub(crate) fn build_project(
     };
 
     let dir = krate.weaveffi_dir();
-    let wants = |name: &str| targets.iter().any(|t| t.name() == name);
-    if wants("node") {
-        prebuild_node(&model, targets, &dir, &mut binaries, settings, quiet)?;
-    }
-    if wants("kotlin") {
-        prebuild_jni(
-            &model,
-            targets,
-            &dir,
-            &mut binaries,
-            &builder,
-            settings,
-            quiet,
-        )?;
+    for target in targets {
+        if let Some(g) = target.glue(&model) {
+            glue::prebuild(&g, &dir, &mut binaries, &builder, settings, skips)?;
+        }
     }
     Ok(Built {
         binaries,
         dir,
         model,
     })
-}
-
-/// Render `target_name`'s files in memory and stage its glue source and the
-/// C header under `{dir}/.glue/{target_name}/`.
-fn stage_glue(
-    model: &Model,
-    targets: &[Box<dyn Target>],
-    target_name: &str,
-    source_name: &str,
-    dir: &Utf8PathBuf,
-) -> Result<GlueSource> {
-    let target = targets
-        .iter()
-        .find(|t| t.name() == target_name)
-        .expect("the target is selected");
-    let header_name = format!("{}.h", model.identity.library);
-    let staging = dir.join(".glue").join(target_name);
-    std::fs::create_dir_all(staging.as_std_path())
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to create {staging}"))?;
-    let files = target.render(model, &staging);
-    for wanted in [source_name, header_name.as_str()] {
-        let file = files
-            .iter()
-            .find(|f| f.path.file_name() == Some(wanted))
-            .ok_or_else(|| miette!("the {target_name} target rendered no {wanted}"))?;
-        std::fs::write(staging.join(wanted).as_std_path(), &file.contents)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to stage {wanted}"))?;
-    }
-    Ok(GlueSource {
-        source: staging.join(source_name),
-        include_dir: staging,
-    })
-}
-
-fn warn_skip(quiet: bool, what: &str, platform: Platform, reason: &str) {
-    if !quiet {
-        eprintln!("warning: skipped {what} for {}: {reason}", platform.id());
-    }
-}
-
-/// Prebuild the Node.js addon for every desktop platform this host can
-/// compile for.
-fn prebuild_node(
-    model: &Model,
-    targets: &[Box<dyn Target>],
-    dir: &Utf8PathBuf,
-    binaries: &mut BinarySet,
-    settings: &BuildSettings,
-    quiet: bool,
-) -> Result<()> {
-    let library = binaries.lib_name.clone();
-    let desktop: Vec<Platform> = binaries.platforms().filter(|p| p.is_desktop()).collect();
-    if desktop.is_empty() {
-        return Ok(());
-    }
-    let glue_source = stage_glue(
-        model,
-        targets,
-        "node",
-        &format!("{}.c", node_addon_name(&library)),
-        dir,
-    )?;
-    let headers = match glue::node_headers() {
-        Ok(headers) => headers,
-        Err(e) => {
-            for p in desktop {
-                warn_skip(quiet, "the Node.js addon", p, &format!("{e:#}"));
-            }
-            return Ok(());
-        }
-    };
-    for platform in desktop {
-        let platform_dir = dir.join(platform.id());
-        match glue::compile_node_addon(
-            &glue_source,
-            platform,
-            &platform_dir,
-            &library,
-            &headers,
-            settings,
-        ) {
-            Ok(addon) => {
-                if let Some(nb) = binaries
-                    .binaries
-                    .iter_mut()
-                    .find(|b| b.platform == platform)
-                {
-                    nb.node_addon = Some(addon);
-                }
-            }
-            Err(e) => warn_skip(quiet, "the Node.js addon", platform, &format!("{e:#}")),
-        }
-    }
-    Ok(())
-}
-
-/// Prebuild the JNI shim for every Android ABI (with the NDK) and every
-/// desktop platform this host can compile for (with the JDK's headers).
-fn prebuild_jni(
-    model: &Model,
-    targets: &[Box<dyn Target>],
-    dir: &Utf8PathBuf,
-    binaries: &mut BinarySet,
-    builder: &Builder<'_>,
-    settings: &BuildSettings,
-    quiet: bool,
-) -> Result<()> {
-    let library = binaries.lib_name.clone();
-    let platforms: Vec<Platform> = binaries
-        .platforms()
-        .filter(|p| p.is_desktop() || p.os() == Os::Android)
-        .collect();
-    if platforms.is_empty() {
-        return Ok(());
-    }
-    let shim = jni_shim_name(&library);
-    let glue_source = stage_glue(model, targets, "kotlin", &format!("{shim}.c"), dir)?;
-    for platform in platforms {
-        let ndk = if platform.os() == Os::Android {
-            Some(builder.ndk().map_err(|e| miette!("{e:#}"))?)
-        } else {
-            None
-        };
-        let platform_dir = dir.join(platform.id());
-        match glue::compile_jni_shim(
-            &glue_source,
-            platform,
-            &platform_dir,
-            &library,
-            ndk,
-            settings,
-        ) {
-            Ok(path) => {
-                if let Some(nb) = binaries
-                    .binaries
-                    .iter_mut()
-                    .find(|b| b.platform == platform)
-                {
-                    nb.jni_shim = Some(path);
-                }
-            }
-            Err(e) => warn_skip(quiet, "the JNI shim", platform, &format!("{e:#}")),
-        }
-    }
-    Ok(())
 }

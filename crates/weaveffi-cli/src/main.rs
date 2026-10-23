@@ -1,14 +1,17 @@
-//! `weaveffi` command-line entry point: `clap` definitions and dispatch.
+//! `weaveffi` command-line entry point: `clap` definitions, dispatch, and
+//! error rendering.
 //!
-//! Each subcommand's implementation lives in `commands`, on top of the
-//! library's `project` (locating a project and loading its API) and
-//! `config` (`weaveffi.toml` and the generator registry).
+//! Each subcommand's implementation lives in the library's `commands`
+//! module and returns the process exit code; errors come back as `miette`
+//! reports, which only this binary renders.
 
-mod commands;
+use std::process::ExitCode;
 
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use commands::Locate;
+use clap::builder::{PossibleValue, PossibleValuesParser};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, Result, WrapErr};
+use weaveffi_cli::commands::{self, extract::IdlFormat, Locate};
+use weaveffi_cli::targets::REGISTRY;
 use weaveffi_model::ir::CURRENT_SCHEMA_VERSION;
 
 const PLATFORMS_HELP: &str = "Comma-separated platform ids: darwin-arm64, darwin-x64, linux-x64, \
@@ -17,11 +20,20 @@ const PLATFORMS_HELP: &str = "Comma-separated platform ids: darwin-arm64, darwin
                               else the host)";
 
 const INPUT_HELP: &str = "A Rust producer crate (its directory or Cargo.toml), whose API is read \
-                          from its built library, or an IDL document (yaml|yml|json|toml); \
+                          from its built library, or an IDL document (yaml|yml|json); \
                           defaults to `[project] input` from the nearest weaveffi.toml";
 
 const LIBRARY_HELP: &str = "Read a Rust producer's API from this built library (cdylib, \
                             staticlib, or .wasm) instead of building the crate";
+
+const TARGET_HELP: &str =
+    "Comma-separated targets (default: `[project] targets`, else every target)";
+
+const DEV_PROFILE_HELP: &str =
+    "The Cargo profile to build a Rust producer's library with (default: dev)";
+
+const RELEASE_PROFILE_HELP: &str =
+    "The Cargo profile to build with (default: `[build] profile`, else release)";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -37,6 +49,39 @@ struct Cli {
     command: Commands,
 }
 
+/// Where a command finds its project.
+#[derive(Args, Debug)]
+struct LocateArgs {
+    #[arg(help = INPUT_HELP)]
+    input: Option<String>,
+    /// Path to weaveffi.toml (default: the nearest one at or above the input)
+    #[arg(long)]
+    config: Option<String>,
+}
+
+/// `--target`: registered target names, validated and listed by `clap`.
+#[derive(Args, Debug)]
+struct TargetArgs {
+    #[arg(
+        short,
+        long = "target",
+        value_name = "TARGETS",
+        value_delimiter = ',',
+        value_parser = target_names(),
+        help = TARGET_HELP
+    )]
+    targets: Option<Vec<String>>,
+}
+
+/// Every registered target, with its description, for `--target`.
+fn target_names() -> PossibleValuesParser {
+    PossibleValuesParser::new(
+        REGISTRY
+            .iter()
+            .map(|d| PossibleValue::new(d.name).help(d.description)),
+    )
+}
+
 /// Output format for `validate`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum ReportFormat {
@@ -44,17 +89,6 @@ enum ReportFormat {
     Human,
     /// One JSON object on stdout.
     Json,
-}
-
-/// An IDL serialization format.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub(crate) enum IdlFormat {
-    /// YAML.
-    Yaml,
-    /// JSON.
-    Json,
-    /// TOML.
-    Toml,
 }
 
 /// A schema export format.
@@ -80,120 +114,96 @@ enum Commands {
     },
     /// Generate bindings for every (or the selected) language target
     Generate {
-        #[arg(help = INPUT_HELP)]
-        input: Option<String>,
+        #[command(flatten)]
+        locate: LocateArgs,
+        #[command(flatten)]
+        targets: TargetArgs,
         /// Output directory (default: `[project] out`, else ./bindings)
         #[arg(short, long)]
         out: Option<String>,
-        /// Comma-separated targets: c, cpp, swift, kotlin, node, wasm, python, dotnet, dart, go, ruby (default: `[project] targets`, else all)
-        #[arg(short, long)]
-        target: Option<String>,
-        /// Path to weaveffi.toml (default: the nearest one at or above the input)
-        #[arg(long)]
-        config: Option<String>,
+        #[arg(long, help = LIBRARY_HELP)]
+        library: Option<String>,
+        #[arg(long, value_name = "NAME", help = DEV_PROFILE_HELP)]
+        profile: Option<String>,
         /// Print advisory lints after validation
         #[arg(long)]
         warn: bool,
-        /// Validate and list the files that would be written, without writing
-        #[arg(long)]
+        /// List the files the targets render, without writing
+        #[arg(long, conflicts_with_all = ["check", "diff"])]
         dry_run: bool,
-        #[arg(long, help = LIBRARY_HELP)]
-        library: Option<String>,
-        /// Build a Rust producer's library in release mode
+        /// Write nothing; list the files that would change and exit 1 if any would
         #[arg(long)]
-        release: bool,
+        check: bool,
+        /// Write nothing; print a unified diff of what would change
+        #[arg(long)]
+        diff: bool,
     },
-    /// Build a Rust producer's debug library, generate, and point the bindings at it
+    /// Build a Rust producer's library, generate, and point the bindings at it
     Dev {
-        #[arg(help = INPUT_HELP)]
-        input: Option<String>,
+        #[command(flatten)]
+        locate: LocateArgs,
+        #[command(flatten)]
+        targets: TargetArgs,
         /// Output directory (default: `[project] out`, else ./bindings)
         #[arg(short, long)]
         out: Option<String>,
-        /// Comma-separated targets (default: `[project] targets`, else all)
-        #[arg(short, long)]
-        target: Option<String>,
-        /// Path to weaveffi.toml (default: the nearest one at or above the input)
-        #[arg(long)]
-        config: Option<String>,
+        #[arg(long, help = LIBRARY_HELP)]
+        library: Option<String>,
+        #[arg(long, value_name = "NAME", help = DEV_PROFILE_HELP)]
+        profile: Option<String>,
     },
     /// Validate an API definition without generating anything
     Validate {
-        #[arg(help = INPUT_HELP)]
-        input: Option<String>,
-        /// Path to weaveffi.toml (default: the nearest one at or above the input)
-        #[arg(long)]
-        config: Option<String>,
+        #[command(flatten)]
+        locate: LocateArgs,
+        #[arg(long, help = LIBRARY_HELP)]
+        library: Option<String>,
+        #[arg(long, value_name = "NAME", help = DEV_PROFILE_HELP)]
+        profile: Option<String>,
         /// Also report advisory lints
         #[arg(long)]
         warn: bool,
         /// Output format
         #[arg(long, value_enum, default_value_t = ReportFormat::Human)]
         format: ReportFormat,
-        #[arg(long, help = LIBRARY_HELP)]
-        library: Option<String>,
-        /// Build a Rust producer's library in release mode
-        #[arg(long)]
-        release: bool,
-    },
-    /// Show how regenerating would change the output directory (writes nothing)
-    Diff {
-        #[arg(help = INPUT_HELP)]
-        input: Option<String>,
-        /// Output directory to compare against (default: `[project] out`, else ./bindings)
-        #[arg(short, long)]
-        out: Option<String>,
-        /// Comma-separated targets to compare (default: `[project] targets`, else all)
-        #[arg(short, long)]
-        target: Option<String>,
-        /// Path to weaveffi.toml (default: the nearest one at or above the input)
-        #[arg(long)]
-        config: Option<String>,
-        /// Print only a summary and exit 2 if files differ, 3 if files would be added or removed
-        #[arg(long)]
-        check: bool,
-        #[arg(long, help = LIBRARY_HELP)]
-        library: Option<String>,
-        /// Build a Rust producer's library in release mode
-        #[arg(long)]
-        release: bool,
     },
     /// Cross-compile the Rust producer per platform into target/weaveffi/<platform>/
     Build {
-        #[arg(help = INPUT_HELP)]
-        input: Option<String>,
-        /// Comma-separated platform ids (default: `[build] platforms`, else the host)
+        #[command(flatten)]
+        locate: LocateArgs,
+        /// Comma-separated targets whose C glue to prebuild (default: `[project] targets`,
+        /// else every target)
+        #[arg(
+            short,
+            long = "target",
+            value_name = "TARGETS",
+            value_delimiter = ',',
+            value_parser = target_names()
+        )]
+        targets: Option<Vec<String>>,
         #[arg(long, help = PLATFORMS_HELP)]
         platforms: Option<String>,
-        /// Comma-separated targets whose C glue to prebuild (default: `[project] targets`, else all)
-        #[arg(short, long)]
-        target: Option<String>,
-        /// Path to weaveffi.toml (default: the nearest one at or above the input)
-        #[arg(long)]
-        config: Option<String>,
+        #[arg(long, value_name = "NAME", help = RELEASE_PROFILE_HELP)]
+        profile: Option<String>,
         /// The producer crate's Cargo.toml (default: `[build] manifest`, else the input's crate)
         #[arg(long)]
         manifest_path: Option<String>,
-        /// Build with the dev profile instead of `--release`
-        #[arg(long)]
-        debug: bool,
         /// Print advisory lints after validation
         #[arg(long)]
         warn: bool,
+        /// Exit 1 when an artifact is skipped because a tool is missing
+        #[arg(long)]
+        strict: bool,
     },
     /// Build (unless --binaries) and write installable artifacts for each target
     Package {
-        #[arg(help = INPUT_HELP)]
-        input: Option<String>,
+        #[command(flatten)]
+        locate: LocateArgs,
+        #[command(flatten)]
+        targets: TargetArgs,
         /// Dist directory for the artifacts (default: `[package] dist`, else ./dist)
         #[arg(short, long)]
         out: Option<String>,
-        /// Comma-separated targets to package (default: `[project] targets`, else all)
-        #[arg(short, long)]
-        target: Option<String>,
-        /// Path to weaveffi.toml (default: the nearest one at or above the input)
-        #[arg(long)]
-        config: Option<String>,
         /// Package existing builds laid out as `<dir>/<platform>/` instead of building
         #[arg(long)]
         binaries: Option<String>,
@@ -201,51 +211,50 @@ enum Commands {
         /// --binaries, every platform directory present)
         #[arg(long, help = PLATFORMS_HELP)]
         platforms: Option<String>,
+        #[arg(long, value_name = "NAME", help = RELEASE_PROFILE_HELP)]
+        profile: Option<String>,
         /// The producer crate's Cargo.toml (default: `[build] manifest`, else the input's crate)
         #[arg(long)]
         manifest_path: Option<String>,
-        /// Build with the dev profile instead of `--release`
-        #[arg(long)]
-        debug: bool,
         /// Print advisory lints after validation
         #[arg(long)]
         warn: bool,
+        /// Exit 1 when an artifact is skipped because a tool is missing
+        #[arg(long)]
+        strict: bool,
     },
     /// Print the IDL a Rust producer's built library embeds
     Extract {
-        /// The producer crate (its directory or Cargo.toml); defaults to `[project] input`
-        input: Option<String>,
+        #[command(flatten)]
+        locate: LocateArgs,
+        #[arg(long, help = LIBRARY_HELP)]
+        library: Option<String>,
+        #[arg(long, value_name = "NAME", help = DEV_PROFILE_HELP)]
+        profile: Option<String>,
         /// Output file (default: stdout)
         #[arg(short, long)]
         output: Option<String>,
         /// Output format
         #[arg(short, long, value_enum, default_value_t = IdlFormat::Yaml)]
         format: IdlFormat,
-        /// Path to weaveffi.toml (default: the nearest one at or above the input)
+    },
+    /// Print the IDL document schema (or, with --version, its version)
+    Schema {
+        /// Print the IDL schema version this build reads and writes instead
         #[arg(long)]
-        config: Option<String>,
-        #[arg(long, help = LIBRARY_HELP)]
-        library: Option<String>,
-        /// Build the library in release mode
-        #[arg(long)]
-        release: bool,
+        version: bool,
+        /// Schema export format
+        #[arg(long, value_enum, default_value_t = SchemaFormat::JsonSchema)]
+        format: SchemaFormat,
     },
     /// Print shell completions
     Completions {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
     },
-    /// Print the IDL schema version this build reads and writes
-    SchemaVersion,
-    /// Print the IDL document schema
-    Schema {
-        /// Schema export format
-        #[arg(long, value_enum, default_value_t = SchemaFormat::JsonSchema)]
-        format: SchemaFormat,
-    },
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     let _ = miette::set_hook(Box::new(|_| {
         Box::new(
             miette::MietteHandlerOpts::new()
@@ -254,169 +263,142 @@ fn main() -> Result<()> {
                 .build(),
         )
     }));
-
     let cli = Cli::parse();
-    let quiet = cli.quiet;
-    match cli.command {
+    run(cli.command, cli.quiet)
+}
+
+/// The [`Locate`] of a command's flags.
+fn locate<'a>(
+    args: &'a LocateArgs,
+    library: Option<&'a String>,
+    profile: Option<&'a String>,
+    quiet: bool,
+) -> Locate<'a> {
+    Locate {
+        input: args.input.as_deref(),
+        config: args.config.as_deref(),
+        library: library.map(String::as_str),
+        profile: profile.map(String::as_str),
+        quiet,
+    }
+}
+
+fn run(command: Commands, quiet: bool) -> Result<ExitCode> {
+    match command {
         Commands::Init { dir, name, force } => {
             commands::init::cmd_init(&commands::init::InitArgs {
                 dir: &dir,
                 name: name.as_deref(),
                 force,
                 quiet,
-            })?
+            })
         }
         Commands::Generate {
-            input,
+            locate: l,
+            targets,
             out,
-            target,
-            config,
-            warn,
-            dry_run,
             library,
-            release,
-        } => commands::generate::cmd_generate(&commands::generate::GenerateArgs {
-            locate: Locate {
-                input: input.as_deref(),
-                config: config.as_deref(),
-                library: library.as_deref(),
-                release,
-                quiet,
-            },
-            out: out.as_deref(),
-            targets: target.as_deref(),
+            profile,
             warn,
             dry_run,
-        })?,
-        Commands::Dev {
-            input,
-            out,
-            target,
-            config,
-        } => commands::dev::cmd_dev(&commands::dev::DevArgs {
-            locate: Locate {
-                input: input.as_deref(),
-                config: config.as_deref(),
-                library: None,
-                release: false,
-                quiet,
-            },
+            check,
+            diff,
+        } => commands::generate::cmd_generate(&commands::generate::GenerateArgs {
+            locate: locate(&l, library.as_ref(), profile.as_ref(), quiet),
             out: out.as_deref(),
-            targets: target.as_deref(),
-        })?,
+            targets: targets.targets.as_deref(),
+            warn,
+            dry_run,
+            check,
+            diff,
+        }),
+        Commands::Dev {
+            locate: l,
+            targets,
+            out,
+            library,
+            profile,
+        } => commands::dev::cmd_dev(&commands::dev::DevArgs {
+            locate: locate(&l, library.as_ref(), profile.as_ref(), quiet),
+            out: out.as_deref(),
+            targets: targets.targets.as_deref(),
+        }),
         Commands::Validate {
-            input,
-            config,
+            locate: l,
+            library,
+            profile,
             warn,
             format,
-            library,
-            release,
         } => commands::validate::cmd_validate(
-            &Locate {
-                input: input.as_deref(),
-                config: config.as_deref(),
-                library: library.as_deref(),
-                release,
-                quiet,
-            },
+            &locate(&l, library.as_ref(), profile.as_ref(), quiet),
             warn,
             format == ReportFormat::Json,
-        )?,
-        Commands::Diff {
-            input,
-            out,
-            target,
-            config,
-            check,
-            library,
-            release,
-        } => commands::diff::cmd_diff(&commands::diff::DiffArgs {
-            locate: Locate {
-                input: input.as_deref(),
-                config: config.as_deref(),
-                library: library.as_deref(),
-                release,
-                quiet,
-            },
-            out: out.as_deref(),
-            targets: target.as_deref(),
-            check,
-        })?,
+        ),
         Commands::Build {
-            input,
+            locate: l,
+            targets,
             platforms,
-            target,
-            config,
+            profile,
             manifest_path,
-            debug,
             warn,
+            strict,
         } => commands::build::cmd_build(&commands::build::BuildArgs {
-            input: input.as_deref(),
-            config: config.as_deref(),
+            locate: locate(&l, None, profile.as_ref(), quiet),
             platforms: platforms.as_deref(),
-            targets: target.as_deref(),
-            debug,
+            targets: targets.as_deref(),
             manifest_path: manifest_path.as_deref(),
             warn,
-            quiet,
-        })?,
+            strict,
+        }),
         Commands::Package {
-            input,
+            locate: l,
+            targets,
             out,
-            target,
-            config,
             binaries,
             platforms,
+            profile,
             manifest_path,
-            debug,
             warn,
+            strict,
         } => commands::package::cmd_package(&commands::package::PackageArgs {
-            input: input.as_deref(),
+            locate: locate(&l, None, profile.as_ref(), quiet),
             out: out.as_deref(),
-            targets: target.as_deref(),
-            config: config.as_deref(),
+            targets: targets.targets.as_deref(),
             binaries: binaries.as_deref(),
             platforms: platforms.as_deref(),
-            debug,
             manifest_path: manifest_path.as_deref(),
             warn,
-            quiet,
-        })?,
+            strict,
+        }),
         Commands::Extract {
-            input,
+            locate: l,
+            library,
+            profile,
             output,
             format,
-            config,
-            library,
-            release,
         } => commands::extract::cmd_extract(
-            &Locate {
-                input: input.as_deref(),
-                config: config.as_deref(),
-                library: library.as_deref(),
-                release,
-                quiet,
-            },
+            &locate(&l, library.as_ref(), profile.as_ref(), quiet),
             output.as_deref(),
             format,
-        )?,
-        Commands::Completions { shell } => cmd_completions(shell),
-        Commands::SchemaVersion => println!("{CURRENT_SCHEMA_VERSION}"),
-        Commands::Schema { format } => cmd_schema(format)?,
+        ),
+        Commands::Schema { version, format } => cmd_schema(version, format),
+        Commands::Completions { shell } => {
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "weaveffi",
+                &mut std::io::stdout(),
+            );
+            Ok(ExitCode::SUCCESS)
+        }
     }
-    Ok(())
 }
 
-fn cmd_completions(shell: clap_complete::Shell) {
-    clap_complete::generate(
-        shell,
-        &mut Cli::command(),
-        "weaveffi",
-        &mut std::io::stdout(),
-    );
-}
-
-fn cmd_schema(format: SchemaFormat) -> Result<()> {
+fn cmd_schema(version: bool, format: SchemaFormat) -> Result<ExitCode> {
+    if version {
+        println!("{CURRENT_SCHEMA_VERSION}");
+        return Ok(ExitCode::SUCCESS);
+    }
     match format {
         SchemaFormat::JsonSchema => {
             let schema = schemars::schema_for!(weaveffi_model::ir::Api);
@@ -426,12 +408,17 @@ fn cmd_schema(format: SchemaFormat) -> Result<()> {
             println!("{json}");
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
 
     #[test]
     fn rejects_unknown_human_json_output_formats() {
@@ -445,11 +432,24 @@ mod tests {
     }
 
     #[test]
+    fn targets_are_validated_against_the_registry() {
+        let cli = Cli::try_parse_from(["weaveffi", "generate", "--target", "c"]).unwrap();
+        let Commands::Generate { targets, .. } = cli.command else {
+            panic!("generate");
+        };
+        assert_eq!(targets.targets.unwrap(), ["c"]);
+        let error = Cli::try_parse_from(["weaveffi", "generate", "-t", "c,rustlang"])
+            .expect_err("unknown target");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        assert!(error.to_string().contains("rustlang"), "{error}");
+    }
+
+    #[test]
     fn completions_and_schema_version() {
         for (args, needle) in [
             (&["completions", "bash"][..], "complete"),
             (&["completions", "zsh"][..], "compdef"),
-            (&["schema-version"][..], CURRENT_SCHEMA_VERSION),
+            (&["schema", "--version"][..], CURRENT_SCHEMA_VERSION),
         ] {
             let cmd = assert_cmd::Command::cargo_bin("weaveffi")
                 .expect("binary not found")

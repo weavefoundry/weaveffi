@@ -1,573 +1,581 @@
-//! The **marshalling plan**: the language-neutral calling contracts every
-//! backend renders, stated once.
+//! The **marshalling plan**: the language-neutral passing contracts every
+//! backend renders, computed once and stored on the model.
 //!
 //! The [`crate::model`] layer answers *which symbols exist and what their C
-//! signatures are*. This module answers the questions one level up, the ones
-//! the eleven generators used to answer independently (and inconsistently):
+//! signatures are*. This module holds the answers one level up, which the
+//! model precomputes for every binding so no backend re-derives them:
 //!
-//! * **Passing** ([`ArgPass`], [`RetPass`]): how each argument crosses into
-//!   its ABI slots (by value, pinned string/bytes, serialized value buffer,
-//!   borrowed object pointer, or callback context plus vtable) and what the
-//!   wrapper does with the result (use, copy, decode, or adopt) and which
-//!   release it owes (`{prefix}_free_bytes` or the interface's `_destroy`).
-//! * **Errors** ([`ErrorStrategy`]): when a call reports through `out_err`,
-//!   is that a typed domain error the caller can catch, or a producer bug the
-//!   wrapper must trap on?
-//! * **Iterators** ([`IteratorProtocol`]): the pull contract of `iter<T>`,
-//!   including the requirement that wrappers stay **lazy** (one producer
-//!   `next` per consumer step, never a hidden drain into a list).
-//! * **Async** ([`AsyncProtocol`]): the completion-callback contract,
-//!   including the rule that results and errors are owned by the consumer
-//!   and released through the runtime free symbols.
-//! * **Callback interfaces** ([`CallbackProtocol`]): the contract for the
-//!   consumer-implemented vtable the producer calls back into.
+//! * **Passing** ([`ArgPass`] on every parameter): which C slots one
+//!   argument occupies and how it fills them (by value, a presence flag plus
+//!   a value, a typed array, a pinned string or byte run, a serialized value
+//!   buffer, a borrowed object pointer, or a callback context plus vtable).
+//! * **Receiving** ([`RetPass`] for a call's return, [`ResultPass`] for an
+//!   async completion's result, [`ItemPass`] for an iterator element,
+//!   [`CallbackRetPass`] for a callback method's return): which slots carry
+//!   the value back, what the receiver does with it (use, copy, decode, or
+//!   adopt), and the release it owes, with every obligation resolved (the
+//!   object's `_destroy` symbol, the slice's element type).
+//! * **Errors** ([`ErrorStrategy`] on every callable): when a call reports
+//!   through `out_err`, is that a typed domain error the caller can catch,
+//!   an untyped error, or a producer bug the wrapper must trap on?
 //!
-//! Every classification here derives from [`Ty::family`] and every symbol
-//! comes from the [`Model`](crate::model::Model), so a backend that renders
-//! these plans in its own syntax cannot drift from the others on semantics;
-//! only the spelling differs.
+//! Each variant names its own slots ([`AbiParam`]s, owned), so a backend
+//! that dispatches on these enums never looks a slot up by position. The
+//! slots are the same values that appear, in order, in the binding's
+//! [`AbiFn`](crate::model::AbiFn).
+//!
+//! The protocols below (iterators, async, callback interfaces) are the
+//! contract clauses every backend must satisfy; the C ABI reference
+//! (`docs/src/reference/abi.md`) is normative.
+//!
+//! # Iterators
+//!
+//! The producer returns an opaque iterator handle
+//! ([`RetPass::Iterator`]); the consumer calls
+//! [`next`](crate::model::IteratorBinding::next) once per element and
+//! [`destroy_symbol`](crate::model::IteratorBinding::destroy_symbol) exactly
+//! once when done. Wrappers expose the target's native **lazy** iteration
+//! idiom and issue one producer `next` per consumer step (draining the
+//! producer into a hidden list is a contract violation). Each element is
+//! received as its [`ItemPass`] says, and each `next` follows the owning
+//! callable's [`ErrorStrategy`].
+//!
+//! # Async
+//!
+//! The launcher returns immediately; the producer invokes the completion
+//! callback exactly once, from an arbitrary producer thread. Everything
+//! passed to the callback is owned by the consumer: results are received as
+//! their [`ResultPass`] says, and a non-null `err` is heap-boxed and
+//! released with `{prefix}_error_free`. Wrappers hop back to their native
+//! scheduler before touching consumer state.
+//!
+//! # Callback interfaces
+//!
+//! The wrapper emits one static vtable per interface (the fixed `size`,
+//! `flags`, and `free` header, then one trampoline per method from the
+//! method's [`AbiFn`](crate::model::AbiFn)) and passes a handle-table key as
+//! `ctx`. Inside a trampoline, arguments are received as their [`ArgPass`]
+//! names them: strings, bytes, slices, and buffers are borrowed for the call
+//! (copy or decode them, free nothing), and object arguments transfer one
+//! strong reference the wrapper adopts. The method's return crosses back as
+//! its [`CallbackRetPass`] says. A failure is reported through `out_err`
+//! with `{prefix}_error_set` (never by unwinding through the C frame); see
+//! [`ErrorStrategy`] for which codes a method may report.
 
 use crate::abi::AbiParam;
-use crate::model::{
-    AsyncBinding, CallbackInterfaceBinding, CallbackMethodBinding, FnBinding, IteratorBinding,
-    ParamBinding,
-};
-use crate::ty::{Family, Ty};
+use crate::model::IteratorBinding;
+use crate::ty::{Prim, Ty};
 
-/// How a callable's `out_err` slot is interpreted by idiomatic wrappers.
+/// How a callable's `out_err` slot (or an async completion's `err`) is
+/// interpreted by idiomatic wrappers.
 ///
 /// Every synchronous C ABI entry point carries a trailing `out_err`, and every
-/// async completion callback carries an `err` slot, regardless of `throws`.
+/// async completion callback carries an `err` slot, whatever the strategy.
 /// What differs is the *meaning* of a non-zero code, and every backend must
-/// agree on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// agree on it. A negative code (generic `-1`, panic `-2`, marshalling
+/// failure `-3`, foreign callback failure `-4`, cancelled `-5`) is a runtime
+/// code under every strategy.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ErrorStrategy {
-    /// The function declares `throws: true`: a non-zero code is a typed
-    /// domain error. The wrapper maps the code onto the module's error
-    /// domain (an exception subclass, a Swift `Error` enum case, a Go
-    /// `error` value, ...), decodes any payload fields from the error's
-    /// `payload_ptr`/`payload_len` buffer, and surfaces it through the
-    /// target's normal error channel so callers can catch and match on it.
-    /// A *negative* code (generic `-1`, panic `-2`, marshalling failure
-    /// `-3`, foreign callback failure `-4`, cancelled `-5`) surfaces through
-    /// the same channel as the target's runtime error type, distinct from
-    /// every domain error type, and `-5` as the language's cancellation error
-    /// where it has one.
-    Throws,
-    /// The function does not throw: the only way `out_err` reports failure
-    /// is a producer bug or a runtime trap (a caught panic, code `-2`; a
-    /// consumer callback that raised, code `-4`). The wrapper surfaces it
-    /// through the target's *programming-error* idiom (an unchecked exception
-    /// where the language has them, a Go `panic`, a Swift `fatalError`).
-    /// It must never be silently ignored, and it must never be dressed up as
-    /// a typed domain error.
+    /// The callable doesn't throw: the only way `out_err` reports failure is
+    /// a producer bug or a runtime trap (a caught panic, `-2`; a consumer
+    /// callback that raised, `-4`). The wrapper surfaces it through the
+    /// target's *programming-error* idiom (an unchecked exception where the
+    /// language has them, a Go `panic`, a Swift `fatalError`), never as a
+    /// typed error, and never ignores it. A callback method with this
+    /// strategy reports any failure as `-4`.
     Trap,
+    /// The callable throws the named error domain (`throws: KvError`), a
+    /// name [`Model::error_domain`](crate::model::Model::error_domain)
+    /// resolves. A positive code is one of the domain's codes: the wrapper
+    /// maps it to the code's typed error, decoding any payload fields from
+    /// the error's payload buffer, and maps a positive code it doesn't know
+    /// to the domain's base error type, keeping the code and message
+    /// (domains are open). Runtime codes surface through the same channel
+    /// as the target's runtime error type (`-5` as the language's
+    /// cancellation error where it has one). A callback method with this
+    /// strategy may report the domain's positive codes with their payloads.
+    Domain(String),
+    /// The callable throws an untyped error (`throws: any`): a failure is
+    /// the generic runtime code `-1` with a message, surfaced through the
+    /// target's normal error channel as its runtime error type; there are
+    /// no positive codes. A callback method with this strategy reports a
+    /// failure as `-1` with its message.
+    Untyped,
 }
 
-impl FnBinding {
-    /// The error strategy of this callable: [`ErrorStrategy::Throws`] when the
-    /// IDL declares `throws: true`, otherwise [`ErrorStrategy::Trap`].
-    pub fn error_strategy(&self) -> ErrorStrategy {
-        if self.throws {
-            ErrorStrategy::Throws
-        } else {
-            ErrorStrategy::Trap
+impl ErrorStrategy {
+    /// `true` unless the strategy is [`Trap`](Self::Trap): the idiomatic
+    /// signature declares that the callable can fail.
+    #[must_use]
+    pub fn throws(&self) -> bool {
+        !matches!(self, ErrorStrategy::Trap)
+    }
+
+    /// The error domain's name for [`Domain`](Self::Domain), else `None`.
+    #[must_use]
+    pub fn domain(&self) -> Option<&str> {
+        match self {
+            ErrorStrategy::Domain(name) => Some(name),
+            ErrorStrategy::Trap | ErrorStrategy::Untyped => None,
         }
     }
 }
 
-/// How one parameter crosses the call boundary: the passing contract a
-/// wrapper renders when marshalling its native argument into ABI slots.
+/// How one parameter crosses the call boundary: the C slots it occupies, in
+/// order, and how the wrapper fills them.
 ///
-/// Exactly one variant applies to any parameter, and the borrowed
-/// [`AbiParam`] references point at the parameter's own precomputed slots,
-/// so a backend that dispatches on this enum cannot disagree with the C
-/// header about arity or slot order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArgPass<'a> {
-    /// One slot passed by value: scalars, bools, and C-style enums.
+/// As a callable's parameter, the argument is borrowed by the producer for
+/// the call. As a callback method's parameter, the same slots carry the
+/// producer's argument to the consumer's trampoline: borrowed for the call,
+/// except an object, whose strong reference the consumer adopts. A callback
+/// method's parameter is never [`Callback`](Self::Callback).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArgPass {
+    /// One slot passed by value: scalars, bools, and C-style enums
+    /// (`int32_t`).
     Direct {
-        /// The single ABI slot.
-        slot: &'a AbiParam,
+        /// The value slot, `T {name}`.
+        slot: AbiParam,
     },
-    /// A borrowed `(ptr, len)` pair of UTF-8 bytes, not NUL-terminated. The
-    /// wrapper encodes the string and keeps the encoding alive for the
-    /// duration of the call; the producer copies what it needs.
+    /// An optional scalar, bool, or C-style enum: `bool has_{name}` then
+    /// `T {name}`. When `has` is false, `value` is ignored (pass `0`).
+    OptDirect {
+        /// The presence slot, `bool has_{name}`.
+        has: AbiParam,
+        /// The value slot, `T {name}`.
+        value: AbiParam,
+        /// The inner type: a [`Ty::Prim`] scalar or a [`Ty::Enum`].
+        inner: Ty,
+    },
+    /// A list of a numeric primitive passed as a typed array:
+    /// `const T* {name}_ptr` then `size_t {name}_len` (the element count).
+    /// The array is borrowed, must be aligned for `T`, and may be null when
+    /// the count is `0`.
+    Slice {
+        /// The `const T*` slot.
+        ptr: AbiParam,
+        /// The `size_t` element-count slot.
+        len: AbiParam,
+        /// The element primitive.
+        elem: Prim,
+    },
+    /// A `(ptr, len)` pair of UTF-8 bytes, not NUL-terminated:
+    /// `const uint8_t* {name}_ptr`, `size_t {name}_len`. The wrapper encodes
+    /// the string and keeps the encoding alive for the call.
     String {
         /// The `const uint8_t*` slot.
-        ptr: &'a AbiParam,
-        /// The `size_t` length slot.
-        len: &'a AbiParam,
+        ptr: AbiParam,
+        /// The `size_t` byte-length slot.
+        len: AbiParam,
     },
-    /// A borrowed `(ptr, len)` byte pair. The wrapper pins its native byte
-    /// storage for the call; the producer copies what it needs.
+    /// A `(ptr, len)` byte pair: `const uint8_t* {name}_ptr`,
+    /// `size_t {name}_len`. The wrapper pins its native byte storage for
+    /// the call.
     Bytes {
-        /// The `uint8_t*` data slot.
-        ptr: &'a AbiParam,
-        /// The `size_t` length slot.
-        len: &'a AbiParam,
+        /// The `const uint8_t*` slot.
+        ptr: AbiParam,
+        /// The `size_t` byte-length slot.
+        len: AbiParam,
     },
-    /// A buffered value (record, rich enum, optional, list, or map): the
-    /// wrapper serializes it into the value-buffer wire format
-    /// ([`Ty::wire`]), passes the encoding as a borrowed `(ptr, len)` pair,
-    /// and releases its own encoding after the call returns. Any object
-    /// token written into the encoding must be a freshly cloned reference
-    /// (the interface's
-    /// [`clone_symbol`](crate::model::InterfaceBinding::clone_symbol)).
+    /// A buffered value (record, rich enum, or an optional, list, or map of
+    /// any other family): the wrapper serializes it into the value-buffer
+    /// format ([`Ty::wire`]) and passes the encoding as
+    /// `const uint8_t* {name}_ptr`, `size_t {name}_len`. Any object token in
+    /// the encoding is a freshly cloned reference.
     Buffer {
-        /// The `const uint8_t*` data slot.
-        ptr: &'a AbiParam,
-        /// The `size_t` length slot.
-        len: &'a AbiParam,
+        /// The `const uint8_t*` slot.
+        ptr: AbiParam,
+        /// The `size_t` byte-length slot.
+        len: AbiParam,
     },
-    /// A borrowed object pointer: the wrapper passes the wrapped object's
-    /// native handle and retains its own reference. When `nullable`, the IDL
-    /// type is `Interface?` and null means none.
+    /// An object pointer: `const {tag}* {name}` as a callable's parameter
+    /// (borrowed; the wrapper keeps its own reference), or `{tag}* {name}`
+    /// as a callback method's parameter (one strong reference the consumer
+    /// adopts).
     Object {
-        /// The single object-pointer slot.
-        slot: &'a AbiParam,
+        /// The pointer slot.
+        slot: AbiParam,
         /// `true` for `Interface?`: null is a legal "none" argument.
         nullable: bool,
+        /// The interface's bare name.
+        interface: String,
     },
-    /// A callback interface: the wrapper registers its native implementation
-    /// in a handle table, passes the table key as `ctx` and the interface's
-    /// static vtable as `vtable`, and removes the entry when the producer
-    /// calls the vtable's `free` (see [`CallbackProtocol`]). When
-    /// `nullable`, the IDL type is `Cb?` and a null `vtable` means none.
+    /// A callback interface: `void* {name}_ctx` then
+    /// `const {vtable}* {name}_vtable`. The wrapper registers its native
+    /// implementation in a handle table, passes the key as `ctx` and the
+    /// interface's static vtable as `vtable`, and removes the entry when the
+    /// producer calls the vtable's `free`.
     Callback {
         /// The `void*` context slot.
-        ctx: &'a AbiParam,
+        ctx: AbiParam,
         /// The `const {vtable}*` slot.
-        vtable: &'a AbiParam,
+        vtable: AbiParam,
         /// `true` for `Cb?`: a null vtable is a legal "none" argument.
         nullable: bool,
+        /// The callback interface's bare name.
+        interface: String,
     },
 }
 
-impl ParamBinding {
-    /// The passing contract for this parameter.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the parameter's precomputed ABI slots disagree with its
-    /// type's family, which would be a bug in the model construction, not a
-    /// user error.
-    pub fn arg_pass(&self) -> ArgPass<'_> {
-        let pair = || {
-            assert!(
-                self.abi.len() == 2,
-                "two-slot parameter '{}' must have exactly two ABI slots",
-                self.name
-            );
-            (&self.abi[0], &self.abi[1])
-        };
-        let single = || {
-            assert!(
-                self.abi.len() == 1,
-                "single-slot parameter '{}' must have exactly one ABI slot",
-                self.name
-            );
-            &self.abi[0]
-        };
-        match self.ty.family() {
-            Family::Direct => ArgPass::Direct { slot: single() },
-            Family::String => {
-                let (ptr, len) = pair();
-                ArgPass::String { ptr, len }
-            }
-            Family::Bytes => {
-                let (ptr, len) = pair();
-                ArgPass::Bytes { ptr, len }
-            }
-            Family::Buffer => {
-                let (ptr, len) = pair();
-                ArgPass::Buffer { ptr, len }
-            }
-            Family::Object { nullable } => ArgPass::Object {
-                slot: single(),
-                nullable,
-            },
-            Family::Callback { nullable } => {
-                let (ctx, vtable) = pair();
-                ArgPass::Callback {
-                    ctx,
-                    vtable,
-                    nullable,
-                }
-            }
-            Family::Iterator => unreachable!("iterators are never parameters"),
+impl ArgPass {
+    /// The slots this argument occupies, in signature order.
+    #[must_use]
+    pub fn slots(&self) -> Vec<&AbiParam> {
+        match self {
+            ArgPass::Direct { slot } | ArgPass::Object { slot, .. } => vec![slot],
+            ArgPass::OptDirect { has, value, .. } => vec![has, value],
+            ArgPass::Slice { ptr, len, .. }
+            | ArgPass::String { ptr, len }
+            | ArgPass::Bytes { ptr, len }
+            | ArgPass::Buffer { ptr, len } => vec![ptr, len],
+            ArgPass::Callback { ctx, vtable, .. } => vec![ctx, vtable],
         }
     }
 }
 
-/// How a value produced by the producer crosses back to the wrapper: the
-/// receiving contract, including the decode step and the release obligation.
+/// How a synchronous call's return crosses back to the wrapper: the C
+/// return, any trailing out slots (which precede `out_err`), what the
+/// wrapper does with the value, and the release it owes.
 ///
-/// Sync returns, async results, and iterator elements all use this.
+/// On failure every C return is a zero sentinel the wrapper must not use.
+// A model holds one of these per callable and never moves them in bulk, so
+// boxing the iterator variant would only cost consumers a deref.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetPass {
-    /// No return value.
+    /// No return value: the C return is `void`. Also an async launcher's
+    /// return, whose result arrives through
+    /// [`AsyncBinding::result`](crate::model::AsyncBinding::result).
     Void,
-    /// By-value return (scalar, bool, C-style enum): use directly, nothing to
-    /// free.
+    /// By-value return (scalar, bool, C-style enum): the C return is the
+    /// value. Nothing to free.
     Direct,
-    /// Owned `(const uint8_t*, out_len)` UTF-8: decode into the native string,
-    /// then release with
-    /// `{prefix}_free_bytes`.
-    String,
-    /// Owned `(const uint8_t*, out_len)` raw bytes: copy, then release with
-    /// `{prefix}_free_bytes`.
-    Bytes,
-    /// Owned `(const uint8_t*, out_len)` value buffer: decode via the wire
-    /// format ([`Ty::wire`]), adopting any object tokens it carries, then
-    /// release with `{prefix}_free_bytes`.
-    Buffer,
-    /// One strong object reference the wrapper adopts into its disposal
-    /// idiom, eventually released with the interface's `_destroy` symbol
-    /// ([`InterfaceBinding::destroy_symbol`], from
-    /// [`Model::interface`](crate::model::Model::interface)). When
-    /// `nullable`, the IDL type is `Interface?` and a null return means
-    /// none.
-    ///
-    /// [`InterfaceBinding::destroy_symbol`]: crate::model::InterfaceBinding::destroy_symbol
+    /// An optional scalar, bool, or C-style enum: the C return is a `bool`
+    /// (present), and the value is written to `T* out_value`. Nothing to
+    /// free; on failure the return is `false`.
+    OptDirect {
+        /// The `T* out_value` slot.
+        out_value: AbiParam,
+    },
+    /// A list of a numeric primitive returned as a typed array: the C
+    /// return is `T*` and the element count is written to `size_t*
+    /// out_len`. Copy the elements, then release the run with
+    /// `{prefix}_free_bytes((uint8_t*)ptr, len * sizeof(T))` (see
+    /// [`Prim::size`]).
+    Slice {
+        /// The `size_t* out_len` slot (element count).
+        out_len: AbiParam,
+        /// The element primitive.
+        elem: Prim,
+    },
+    /// Owned UTF-8: the C return is `const uint8_t*` and the byte length is
+    /// written to `size_t* out_len`. Decode into the native string, then
+    /// release with `{prefix}_free_bytes(ptr, len)`.
+    String {
+        /// The `size_t* out_len` slot.
+        out_len: AbiParam,
+    },
+    /// Owned raw bytes, returned like [`String`](Self::String): copy, then
+    /// release with `{prefix}_free_bytes(ptr, len)`.
+    Bytes {
+        /// The `size_t* out_len` slot.
+        out_len: AbiParam,
+    },
+    /// An owned value buffer, returned like [`String`](Self::String):
+    /// decode via the wire format ([`Ty::wire`]), adopting any object tokens
+    /// it carries, then release with `{prefix}_free_bytes(ptr, len)`.
+    Buffer {
+        /// The `size_t* out_len` slot.
+        out_len: AbiParam,
+    },
+    /// One strong object reference (`{tag}*`) the wrapper adopts into its
+    /// disposal idiom, eventually released with `destroy_symbol`.
     Object {
         /// `true` for `Interface?`: a null return is a legal "none" result.
         nullable: bool,
+        /// The interface's bare name.
+        interface: String,
+        /// The interface's `{tag}_destroy` symbol.
+        destroy_symbol: String,
     },
+    /// An iterator handle (`{iter_tag}*`) the wrapper drives lazily with
+    /// [`IteratorBinding::next`] and releases exactly once with
+    /// [`IteratorBinding::destroy_symbol`].
+    Iterator(IteratorBinding),
 }
 
 impl RetPass {
-    /// The receiving contract for a value of type `ty` produced by a
-    /// callable. `None` (a void return) is [`RetPass::Void`].
-    ///
-    /// # Panics
-    ///
-    /// Panics on an iterator return, whose contract is [`IteratorProtocol`],
-    /// not a value-passing plan (backends dispatch on
-    /// [`CallShape`](crate::model::CallShape) before consulting this), and on
-    /// a callback interface, which validation never admits as a return.
-    pub fn of(ty: Option<&Ty>) -> RetPass {
-        let Some(ty) = ty else {
-            return RetPass::Void;
-        };
-        match ty.family() {
-            Family::Direct => RetPass::Direct,
-            Family::String => RetPass::String,
-            Family::Bytes => RetPass::Bytes,
-            Family::Buffer => RetPass::Buffer,
-            Family::Object { nullable } => RetPass::Object { nullable },
-            Family::Callback { .. } => panic!("callback interfaces are never returned"),
-            Family::Iterator => panic!("iterator returns follow IteratorProtocol, not a RetPass"),
-        }
-    }
-}
-
-/// The `iter<T>` pull contract every backend renders.
-///
-/// The producer returns an opaque iterator handle; the consumer then calls
-/// `next` once per element and `destroy` exactly once when done. The binding
-/// contract has three clauses every wrapper must satisfy:
-///
-/// 1. **Laziness.** The wrapper exposes the target's native lazy iteration
-///    idiom (a Python iterator, a Ruby `Enumerator`, a Go `iter.Seq2`, a C#
-///    `IEnumerable`, a Dart `Iterable`, a JS iterable, a Swift `Sequence`, a
-///    Kotlin `Iterator`) and issues **one producer `next` call per consumer
-///    step**. Draining the producer into a hidden list defeats the point of
-///    `iter<T>` (constant-memory streaming) and is a contract violation.
-/// 2. **Element ownership.** Each `next` writes an element the consumer now
-///    owns; the wrapper receives it exactly as it would a return of the same
-///    type ([`elem`](Self::elem)): copy and free a string or bytes, decode
-///    and free a buffer, adopt an object.
-/// 3. **Handle lifecycle.** `destroy` is called exactly once: eagerly on
-///    exhaustion, and from the wrapper's disposal idiom (RAII destructor,
-///    finalizer, `close()`, generator cleanup) when iteration is abandoned
-///    early.
-///
-/// Each `next` call also carries `out_err` and follows the owning function's
-/// [`ErrorStrategy`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IteratorProtocol<'a> {
-    /// The lowered iterator surface: launcher, `next`, and destroy symbols.
-    pub binding: &'a IteratorBinding,
-    /// How each element written by `next` is received.
-    pub elem: RetPass,
-    /// How `out_err` reports from the launcher and each `next` call are
-    /// interpreted.
-    pub error: ErrorStrategy,
-}
-
-impl IteratorBinding {
-    /// Build the full pull contract for this iterator of `f`.
-    pub fn protocol<'a>(&'a self, f: &FnBinding) -> IteratorProtocol<'a> {
-        IteratorProtocol {
-            binding: self,
-            elem: RetPass::of(Some(&self.elem)),
-            error: f.error_strategy(),
-        }
-    }
-}
-
-/// The async completion contract every backend renders.
-///
-/// The launcher returns immediately; the producer later invokes the completion
-/// callback exactly once, from an arbitrary producer thread. The contract has
-/// three clauses:
-///
-/// 1. **Single completion.** The callback fires exactly once per launch; the
-///    wrapper resolves its native future idiom (a Python `asyncio` future, a
-///    JS `Promise`, a Swift continuation, a C# `TaskCompletionSource`, a Go
-///    channel) exactly once and then releases the registration.
-/// 2. **Owned results.** Everything passed to the callback is owned by the
-///    consumer. String results are released with `{prefix}_free_bytes`,
-///    byte and buffered-value results with `{prefix}_free_bytes`, and
-///    interface-object results transfer one strong reference (the wrapper
-///    adopts the pointer). This is what lets runtimes that defer callback
-///    bodies past the native return (Dart's `NativeCallable.listener`, for
-///    example) decode safely; a wrapper that processes results inline still
-///    copies or decodes first and then frees.
-/// 3. **Foreign-thread delivery.** The callback runs on a producer thread,
-///    so the wrapper must hop back to its native scheduler before touching
-///    consumer state (`call_soon_threadsafe`, a threadsafe function, a
-///    dispatched continuation) rather than resolving inline where the
-///    target's runtime forbids it.
-///
-/// The callback's `err` slot follows the owning function's [`ErrorStrategy`].
-/// A non-null error is heap-boxed and owned by the consumer: the wrapper
-/// copies the code, message, and payload, then releases the box with
-/// `{prefix}_error_free` exactly once.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AsyncProtocol<'a> {
-    /// The lowered async surface: launcher and callback typedef.
-    pub binding: &'a AsyncBinding,
-    /// Whether the launcher carries a `cancel_token` slot before
-    /// `callback`/`context`.
-    pub cancellable: bool,
-    /// How the callback's result slots are received, including the release
-    /// owed (`{prefix}_free_bytes` or the destroy symbol an adopted object
-    /// owes).
-    pub result: RetPass,
-    /// How the callback's `err` slot is interpreted.
-    pub error: ErrorStrategy,
-}
-
-impl AsyncBinding {
-    /// Build the full completion contract for this async function `f`.
-    pub fn protocol<'a>(&'a self, f: &FnBinding) -> AsyncProtocol<'a> {
-        AsyncProtocol {
-            binding: self,
-            cancellable: f.cancellable,
-            result: RetPass::of(f.ret.as_ref()),
-            error: f.error_strategy(),
-        }
-    }
-}
-
-/// The callback-interface contract every backend renders.
-///
-/// A callback interface is the consumer's side of the boundary: the consumer
-/// supplies an implementation, the producer calls it. The contract has five
-/// clauses:
-///
-/// 1. **One static vtable per interface.** The wrapper emits exactly one
-///    process-wide vtable value for the interface. It starts with the fixed
-///    header, `size` (`sizeof` the vtable as the wrapper compiled it),
-///    `flags` (`0`), and `free`, followed by one trampoline per method from
-///    the C signature ([`CallbackMethodBinding::abi_params`]) into the native
-///    implementation. The producer rejects a vtable smaller than the one it
-///    was built with, so a stale binding fails with `-3` instead of calling
-///    through a missing slot.
-/// 2. **Context is a handle-table key.** The wrapper stores the native
-///    implementation in a table keyed by an integer or pointer it passes as
-///    `ctx`, so the implementation stays alive as long as the producer holds
-///    the callback and garbage collectors never see a raw pointer. `free`
-///    may run on any producer thread.
-/// 3. **Arguments are received like returns.** Strings, bytes, and buffers
-///    arriving in a trampoline are borrowed for the call: the wrapper copies
-///    or decodes them before returning and frees nothing. Object arguments
-///    transfer one strong reference the wrapper adopts.
-/// 4. **Returns transfer to the producer** ([`method_returns`](Self::method_returns)).
-///    A direct value is the C return. An object is returned as one strong
-///    reference (a fresh `_clone` of the wrapper's handle). A string, bytes,
-///    or buffer is written to the trailing `out_ptr`/`out_len` slots as a run
-///    the wrapper allocates with `{prefix}_alloc`; the producer adopts it.
-/// 5. **Failures go through `out_err`.** When the native implementation
-///    raises, the trampoline calls `{prefix}_error_set(out_err, code,
-///    message)` and returns a zero value; it must never let an exception
-///    unwind through the C frame. A method whose
-///    [`method_errors`](Self::method_errors) entry is
-///    [`ErrorStrategy::Throws`] reports a declared domain error with its
-///    positive code and its payload fields (`{prefix}_error_set_payload`);
-///    every other failure uses `-4`, and the producer treats any code it
-///    can't attribute to the method's domain as `-4`.
-///
-/// Trampolines may be invoked from any producer thread; the wrapper is
-/// responsible for whatever thread affinity its runtime demands (a GIL
-/// acquisition, a JNI attach, a threadsafe-function hop).
-///
-/// [`CallbackMethodBinding::abi_params`]: crate::model::CallbackMethodBinding::abi_params
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CallbackProtocol<'a> {
-    /// The lowered callback interface: vtable tag and methods.
-    pub binding: &'a CallbackInterfaceBinding,
-    /// How each method's parameters are received inside a trampoline, in
-    /// method order then parameter order.
-    pub method_args: Vec<Vec<RetPass>>,
-    /// How each method's return value crosses back to the producer, in
-    /// method order. [`RetPass::String`], [`RetPass::Bytes`], and
-    /// [`RetPass::Buffer`] are written to the `out_ptr`/`out_len` slots as a
-    /// `{prefix}_alloc` run.
-    pub method_returns: Vec<RetPass>,
-    /// How each method may report failure, in method order.
-    pub method_errors: Vec<ErrorStrategy>,
-}
-
-impl CallbackMethodBinding {
-    /// The error strategy of this method: [`ErrorStrategy::Throws`] when it
-    /// declares `throws: true`, otherwise [`ErrorStrategy::Trap`] (any
-    /// failure reaches the producer as `-4`).
-    pub fn error_strategy(&self) -> ErrorStrategy {
-        if self.throws {
-            ErrorStrategy::Throws
-        } else {
-            ErrorStrategy::Trap
-        }
-    }
-}
-
-impl CallbackInterfaceBinding {
-    /// Build the full contract for this callback interface.
-    pub fn protocol(&self) -> CallbackProtocol<'_> {
-        CallbackProtocol {
-            binding: self,
-            method_args: self
-                .methods
-                .iter()
-                .map(|m| m.params.iter().map(|p| RetPass::of(Some(&p.ty))).collect())
-                .collect(),
-            method_returns: self
-                .methods
-                .iter()
-                .map(|m| RetPass::of(m.ret.as_ref()))
-                .collect(),
-            method_errors: self
-                .methods
-                .iter()
-                .map(CallbackMethodBinding::error_strategy)
-                .collect(),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ir::{Api, Function, Param, TypeRef};
-    use crate::model::Model;
-    use crate::pkg::Identity;
-    use crate::ty::Prim;
-
-    fn param(name: &str, ty: &str) -> Param {
-        Param {
-            name: name.into(),
-            ty: crate::ir::parse_type_ref(ty).unwrap(),
-            doc: None,
-        }
-    }
-
-    /// A model with interface `Store` and callback interface `Listener` in
-    /// `kv`, a record `Contact`, and one function `f` taking `params`.
-    fn model(params: Vec<Param>) -> Model {
-        let yaml = r#"
-version: "0.11.0"
-modules:
-  - name: kv
-    structs: [{ name: Contact, fields: [{ name: id, type: i64 }] }]
-    interfaces: [{ name: Store, methods: [{ name: get }] }]
-    callback_interfaces: [{ name: Listener, methods: [{ name: on }] }]
-"#;
-        let mut api: Api = serde_yaml::from_str(yaml).unwrap();
-        api.modules[0].functions.push(Function {
-            name: "f".into(),
-            params,
-            returns: Some(TypeRef::Prim(Prim::I32)),
-            doc: None,
-            throws: false,
-            r#async: false,
-            cancellable: false,
-            deprecated: None,
-        });
-        Model::assume_valid(&api, Identity::named("weaveffi"))
-    }
-
-    #[test]
-    fn arg_pass_classifies_every_family() {
-        let m = model(vec![
-            param("x", "i32"),
-            param("s", "string"),
-            param("data", "bytes"),
-            param("c", "Contact"),
-            param("o", "i32?"),
-            param("store", "Store"),
-            param("maybe", "Store?"),
-            param("l", "Listener"),
-            param("ml", "Listener?"),
-        ]);
-        let p = &m.modules[0].functions[0].params;
-        assert!(matches!(p[0].arg_pass(), ArgPass::Direct { slot } if slot.name == "x"));
-        assert!(matches!(p[1].arg_pass(), ArgPass::String { ptr, .. } if ptr.name == "s_ptr"));
-        assert!(matches!(
-            p[2].arg_pass(),
-            ArgPass::Bytes { ptr, len } if ptr.name == "data_ptr" && len.name == "data_len"
-        ));
-        assert!(matches!(
-            p[3].arg_pass(),
-            ArgPass::Buffer { ptr, len } if ptr.name == "c_ptr" && len.name == "c_len"
-        ));
-        assert!(matches!(p[4].arg_pass(), ArgPass::Buffer { .. }));
-        assert!(matches!(
-            p[5].arg_pass(),
-            ArgPass::Object {
-                nullable: false,
-                ..
+    /// The trailing out slots this return adds before `out_err`, in order.
+    #[must_use]
+    pub fn out_slots(&self) -> Vec<&AbiParam> {
+        match self {
+            RetPass::OptDirect { out_value } => vec![out_value],
+            RetPass::Slice { out_len, .. }
+            | RetPass::String { out_len }
+            | RetPass::Bytes { out_len }
+            | RetPass::Buffer { out_len } => vec![out_len],
+            RetPass::Void | RetPass::Direct | RetPass::Object { .. } | RetPass::Iterator(_) => {
+                vec![]
             }
-        ));
-        assert!(matches!(
-            p[6].arg_pass(),
-            ArgPass::Object { nullable: true, .. }
-        ));
-        assert!(matches!(
-            p[7].arg_pass(),
-            ArgPass::Callback { ctx, vtable, nullable: false }
-                if ctx.name == "l_ctx" && vtable.name == "l_vtable"
-        ));
-        assert!(matches!(
-            p[8].arg_pass(),
-            ArgPass::Callback { nullable: true, .. }
-        ));
-    }
-
-    #[test]
-    fn ret_pass_distinguishes_copy_decode_and_adopt() {
-        assert_eq!(RetPass::of(None), RetPass::Void);
-        assert_eq!(RetPass::of(Some(&Ty::Prim(Prim::I64))), RetPass::Direct);
-        assert_eq!(RetPass::of(Some(&Ty::Prim(Prim::String))), RetPass::String);
-        assert_eq!(RetPass::of(Some(&Ty::Prim(Prim::Bytes))), RetPass::Bytes);
-        for ty in [
-            Ty::Record("Contact".into()),
-            Ty::RichEnum("Shape".into()),
-            Ty::List(Box::new(Ty::Prim(Prim::String))),
-            Ty::List(Box::new(Ty::Interface("Store".into()))),
-            Ty::Optional(Box::new(Ty::Prim(Prim::I64))),
-        ] {
-            assert_eq!(RetPass::of(Some(&ty)), RetPass::Buffer, "{ty}");
         }
-        assert_eq!(
-            RetPass::of(Some(&Ty::Interface("Store".into()))),
-            RetPass::Object { nullable: false }
-        );
-        assert_eq!(
-            RetPass::of(Some(&Ty::Optional(Box::new(Ty::Interface("Store".into()))))),
-            RetPass::Object { nullable: true }
-        );
+    }
+}
+
+/// How an async call's result arrives in its completion callback, after the
+/// `(void* context, {prefix}_error* err)` prefix.
+///
+/// Everything the callback receives is owned by the consumer. On failure
+/// (`err` non-null) the result slots hold zero values the consumer must not
+/// use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResultPass {
+    /// A `void` function: no result slots.
+    Void,
+    /// By value: `T result`.
+    Direct {
+        /// The `T result` slot.
+        result: AbiParam,
+    },
+    /// An optional scalar, bool, or C-style enum: `bool has_result`, then
+    /// `T result` (ignored when `has_result` is false).
+    OptDirect {
+        /// The `bool has_result` slot.
+        has: AbiParam,
+        /// The `T result` slot.
+        value: AbiParam,
+    },
+    /// A typed array: `const T* result_ptr`, `size_t result_len` (the
+    /// element count). Copy, then release with
+    /// `{prefix}_free_bytes((uint8_t*)ptr, len * sizeof(T))`.
+    Slice {
+        /// The `const T*` slot.
+        ptr: AbiParam,
+        /// The `size_t` element-count slot.
+        len: AbiParam,
+        /// The element primitive.
+        elem: Prim,
+    },
+    /// Owned UTF-8: `const uint8_t* result_ptr`, `size_t result_len`.
+    /// Decode, then release with `{prefix}_free_bytes(ptr, len)`.
+    String {
+        /// The `const uint8_t*` slot.
+        ptr: AbiParam,
+        /// The `size_t` byte-length slot.
+        len: AbiParam,
+    },
+    /// Owned raw bytes, delivered like [`String`](Self::String).
+    Bytes {
+        /// The `const uint8_t*` slot.
+        ptr: AbiParam,
+        /// The `size_t` byte-length slot.
+        len: AbiParam,
+    },
+    /// An owned value buffer, delivered like [`String`](Self::String):
+    /// decode (adopting object tokens), then release.
+    Buffer {
+        /// The `const uint8_t*` slot.
+        ptr: AbiParam,
+        /// The `size_t` byte-length slot.
+        len: AbiParam,
+    },
+    /// One strong object reference: `{tag}* result`, adopted and eventually
+    /// released with `destroy_symbol`.
+    Object {
+        /// The `{tag}* result` slot.
+        result: AbiParam,
+        /// `true` for `Interface?`: null is a legal "none" result.
+        nullable: bool,
+        /// The interface's bare name.
+        interface: String,
+        /// The interface's `{tag}_destroy` symbol.
+        destroy_symbol: String,
+    },
+}
+
+impl ResultPass {
+    /// The result slots, in signature order.
+    #[must_use]
+    pub fn slots(&self) -> Vec<&AbiParam> {
+        match self {
+            ResultPass::Void => vec![],
+            ResultPass::Direct { result } | ResultPass::Object { result, .. } => vec![result],
+            ResultPass::OptDirect { has, value } => vec![has, value],
+            ResultPass::Slice { ptr, len, .. }
+            | ResultPass::String { ptr, len }
+            | ResultPass::Bytes { ptr, len }
+            | ResultPass::Buffer { ptr, len } => vec![ptr, len],
+        }
+    }
+}
+
+/// How one iterator element arrives through `{iter_tag}_next`'s out slots
+/// (after `iter`, before `out_err`). `next` returns `1` when it wrote an
+/// element and `0` when the iterator is exhausted (or failed).
+///
+/// Each element is owned by the consumer, exactly like a return of its
+/// type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemPass {
+    /// By value: `T* out_item`.
+    Direct {
+        /// The `T* out_item` slot.
+        out_item: AbiParam,
+    },
+    /// An optional scalar, bool, or C-style enum: `bool* out_has_item`,
+    /// then `T* out_item` (meaningful when `*out_has_item`).
+    OptDirect {
+        /// The `bool* out_has_item` slot.
+        out_has: AbiParam,
+        /// The `T* out_item` slot.
+        out_item: AbiParam,
+    },
+    /// A typed array: `T** out_item`, `size_t* out_len` (the element
+    /// count). Copy, then release with
+    /// `{prefix}_free_bytes((uint8_t*)ptr, len * sizeof(T))`.
+    Slice {
+        /// The `T** out_item` slot.
+        out_item: AbiParam,
+        /// The `size_t* out_len` slot.
+        out_len: AbiParam,
+        /// The element primitive.
+        elem: Prim,
+    },
+    /// Owned UTF-8: `const uint8_t** out_item`, `size_t* out_len`. Decode,
+    /// then release with `{prefix}_free_bytes(ptr, len)`.
+    String {
+        /// The `const uint8_t** out_item` slot.
+        out_item: AbiParam,
+        /// The `size_t* out_len` slot.
+        out_len: AbiParam,
+    },
+    /// Owned raw bytes, delivered like [`String`](Self::String).
+    Bytes {
+        /// The `const uint8_t** out_item` slot.
+        out_item: AbiParam,
+        /// The `size_t* out_len` slot.
+        out_len: AbiParam,
+    },
+    /// An owned value buffer, delivered like [`String`](Self::String):
+    /// decode (adopting object tokens), then release.
+    Buffer {
+        /// The `const uint8_t** out_item` slot.
+        out_item: AbiParam,
+        /// The `size_t* out_len` slot.
+        out_len: AbiParam,
+    },
+    /// One strong object reference: `{tag}** out_item`, adopted and
+    /// eventually released with `destroy_symbol`.
+    Object {
+        /// The `{tag}** out_item` slot.
+        out_item: AbiParam,
+        /// `true` for `Interface?`: a null element is a legal "none".
+        nullable: bool,
+        /// The interface's bare name.
+        interface: String,
+        /// The interface's `{tag}_destroy` symbol.
+        destroy_symbol: String,
+    },
+}
+
+impl ItemPass {
+    /// The item's out slots, in signature order.
+    #[must_use]
+    pub fn slots(&self) -> Vec<&AbiParam> {
+        match self {
+            ItemPass::Direct { out_item } | ItemPass::Object { out_item, .. } => vec![out_item],
+            ItemPass::OptDirect { out_has, out_item } => vec![out_has, out_item],
+            ItemPass::Slice {
+                out_item, out_len, ..
+            }
+            | ItemPass::String { out_item, out_len }
+            | ItemPass::Bytes { out_item, out_len }
+            | ItemPass::Buffer { out_item, out_len } => vec![out_item, out_len],
+        }
+    }
+}
+
+/// How a callback method's return crosses back from the consumer's
+/// trampoline to the producer, which adopts it.
+///
+/// The producer adopts whatever the return and out slots hold whether or
+/// not the method failed, so a trampoline that fails after allocating
+/// doesn't leak.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallbackRetPass {
+    /// No return value: the C return is `void`.
+    Void,
+    /// By value: the C return is the value.
+    Direct,
+    /// An optional scalar, bool, or C-style enum: the C return is a `bool`
+    /// (present), and the trampoline writes the value to `T* out_value`.
+    OptDirect {
+        /// The `T* out_value` slot.
+        out_value: AbiParam,
+    },
+    /// A typed array: the C return is `void`; the trampoline allocates
+    /// `len * sizeof(T)` bytes with `{prefix}_alloc`, copies the elements
+    /// in, and writes the pointer to `T** out_ptr` and the element count to
+    /// `size_t* out_len`. Null with count `0` is the empty list.
+    Slice {
+        /// The `T** out_ptr` slot.
+        out_ptr: AbiParam,
+        /// The `size_t* out_len` slot (element count).
+        out_len: AbiParam,
+        /// The element primitive.
+        elem: Prim,
+    },
+    /// UTF-8: the C return is `void`; the trampoline allocates the run with
+    /// `{prefix}_alloc` and writes it to `uint8_t** out_ptr` and its byte
+    /// length to `size_t* out_len`.
+    String {
+        /// The `uint8_t** out_ptr` slot.
+        out_ptr: AbiParam,
+        /// The `size_t* out_len` slot.
+        out_len: AbiParam,
+    },
+    /// Raw bytes, returned like [`String`](Self::String).
+    Bytes {
+        /// The `uint8_t** out_ptr` slot.
+        out_ptr: AbiParam,
+        /// The `size_t* out_len` slot.
+        out_len: AbiParam,
+    },
+    /// A value buffer, returned like [`String`](Self::String); any object
+    /// token in it is a freshly cloned reference.
+    Buffer {
+        /// The `uint8_t** out_ptr` slot.
+        out_ptr: AbiParam,
+        /// The `size_t* out_len` slot.
+        out_len: AbiParam,
+    },
+    /// One strong object reference as the C return (`{tag}*`): a fresh
+    /// `clone_symbol` of the wrapper's handle, which the producer adopts.
+    Object {
+        /// `true` for `Interface?`: the trampoline may return null.
+        nullable: bool,
+        /// The interface's bare name.
+        interface: String,
+        /// The interface's `{tag}_clone` symbol.
+        clone_symbol: String,
+    },
+}
+
+impl CallbackRetPass {
+    /// The trailing out slots this return adds before `out_err`, in order.
+    #[must_use]
+    pub fn out_slots(&self) -> Vec<&AbiParam> {
+        match self {
+            CallbackRetPass::OptDirect { out_value } => vec![out_value],
+            CallbackRetPass::Slice {
+                out_ptr, out_len, ..
+            }
+            | CallbackRetPass::String { out_ptr, out_len }
+            | CallbackRetPass::Bytes { out_ptr, out_len }
+            | CallbackRetPass::Buffer { out_ptr, out_len } => vec![out_ptr, out_len],
+            CallbackRetPass::Void | CallbackRetPass::Direct | CallbackRetPass::Object { .. } => {
+                vec![]
+            }
+        }
     }
 }

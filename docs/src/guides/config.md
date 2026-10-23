@@ -45,9 +45,9 @@ Without any file, every setting takes its default.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `input` | none | The API definition: a Rust producer crate (its directory, usually `"."`, or its `Cargo.toml`), whose API is read from its built library (see [Library Mode](extract.md)), or a `.yml`, `.yaml`, `.json`, or `.toml` IDL |
-| `out` | `bindings` | Output directory for `generate` and `diff` |
-| `targets` | all eleven | Targets to generate when `--target` isn't given |
+| `input` | none | The API definition: a Rust producer crate (its directory, usually `"."`, or its `Cargo.toml`), whose API is read from its built library (see [Library Mode](extract.md)), or a `.yml`, `.yaml`, or `.json` IDL (TOML is only for this file) |
+| `out` | `bindings` | Output directory for `generate` and `dev` |
+| `targets` | all eleven | Targets to generate when `--target` isn't given (`weaveffi init` writes `["c", "python"]`) |
 
 Paths are relative to the directory holding `weaveffi.toml`. Command-line
 arguments (`input`, `-o`, `--target`) override the table.
@@ -74,7 +74,7 @@ The rules depend on the input:
 |-|-----------------------|-----|
 | `name` | `[package] name`, else the crate's Cargo package name | `[package] name`, else the input file stem |
 | `prefix` | the crate's library name (`[lib] name`, else the package name with `-` mapped to `_`) | `c_prefix`, else snake-case `name` |
-| `library` | same as `prefix` (the cdylib Cargo builds) | `library`, else snake-case `name` |
+| `library` | same as `prefix` (the `cdylib` WeaveFFI builds) | `library`, else snake-case `name` |
 | metadata | `[package]`, falling back to `cargo metadata` (workspace-inherited `version.workspace = true` included) | `[package]` |
 
 A Rust producer's prefix is what the macro compiled into its symbols, so it
@@ -84,12 +84,15 @@ an error. Renaming the published package with `name` is fine.
 ## `[build]`
 
 How `weaveffi build` and `weaveffi package` compile a Rust producer (see
-[Packaging](packaging.md)):
+[Packaging](packaging.md)). The commands that build a producer's host
+library to read its API (`generate`, `dev`, `validate`, `extract`) use the
+`dev` profile unless `--profile` names another; `[build] profile` doesn't
+apply to them.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `platforms` | the host | Platform ids to build when `--platforms` isn't given |
-| `release` | `true` | Build with the release profile (`--debug` overrides it) |
+| `profile` | `"release"` | The Cargo profile to build with (`--profile` overrides it) |
 | `macos_deployment_target` | `"11.0"` | `MACOSX_DEPLOYMENT_TARGET`, and the macOS version wheel tags carry |
 | `ios_deployment_target` | `"13.0"` | `IPHONEOS_DEPLOYMENT_TARGET` |
 | `android_api` | `21` | The minimum Android API level, which picks the NDK compiler |
@@ -122,6 +125,7 @@ The C target has no package name. A few targets name a second thing:
 | `[generators.cpp]` | `header_name` | `{library}.hpp` |
 | `[generators.python]` | `import_name` (the import package) | `{prefix}` |
 | `[generators.ruby]` | `module_name` (the top-level Ruby module) | `PascalCase(name)` |
+| `[generators.go]` | `package` (the Go package name) | `{prefix}` with underscores removed (`kitchen_sink` gives `kitchensink`) |
 
 The constants that go into package manifests are options too:
 
@@ -130,15 +134,15 @@ The constants that go into package manifests are options too:
 | `[generators.swift]` | `min_macos`, `min_ios` (the `platforms:` of `Package.swift`) | `"11.0"`, `"13.0"` |
 | `[generators.swift]` | `xcframework_url` (where the packaged binary target downloads from; `{version}` and `{file}` are substituted) | a placeholder |
 | `[generators.kotlin]` | `min_sdk`, `compile_sdk` | `21`, `35` |
-| `[generators.python]` | `requires_python` | `">=3.9"` |
+| `[generators.python]` | `requires_python` | `">=3.10"` |
 | `[generators.node]` | `node_engine` (`engines.node`) | `">=18"` |
 | `[generators.dart]` | `sdk` (the pubspec SDK constraint) | `">=3.10.0 <4.0.0"` |
 
 Keep `min_macos`, `min_ios`, and `min_sdk` at or above the `[build]`
 deployment targets and API level, or the toolchains warn that the library is
 newer than the package claims. The remaining options (C's
-`buffer_helpers`, C++'s `standard`, Kotlin's `flavor`, and Wasm's
-`emscripten`) are documented on the target's page
+`buffer_helpers`, C++'s `standard`, and Kotlin's `flavor`) are documented on
+the target's page
 under [Generators](../generators/README.md). No target has its own C prefix:
 the prefix belongs to the library.
 
@@ -155,20 +159,25 @@ orchestrator does every write. Every run renders every selected target, then:
   deleted. Files you added under the output directory (a `node_modules/`, a
   build directory) are never touched.
 
-`--dry-run` validates and prints the files that would be written.
+`--dry-run` validates and prints every file the targets render, without
+writing.
 
 ## CI
 
-`weaveffi diff --check` regenerates in memory and compares with the output
+`weaveffi generate --check` renders in memory and compares with the output
 directory without writing anything:
 
 ```bash
-weaveffi diff --check                       # uses [project]
-weaveffi diff path/to/crate -o bindings --target c,swift --check
+weaveffi generate --check                       # uses [project]
+weaveffi generate path/to/crate -o bindings --target c,swift --check
 ```
 
-It exits `0` when the directory is up to date, `2` when files would change,
-and `3` when files would be added or removed (stale files count as removed).
+It lists every file that would change (`+` added, `~` modified, `-`
+removed, where a stale file from the previous run counts as removed) and
+exits `0` when the directory is up to date and `1` otherwise. `weaveffi
+generate --diff` prints the same changes as a unified diff, also without
+writing (it exits `0`; add `--check` to exit `1` on changes). `--dry-run`
+can't be combined with either.
 `weaveffi validate --format json` prints one JSON object with `ok`, counts,
 and any errors (each with a `code` matching the
 [error catalog](../reference/idl.md#error-catalog)); `--warn` adds advisory

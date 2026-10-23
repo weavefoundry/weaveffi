@@ -9,7 +9,7 @@
   ],
   "properties": {
     "version": {
-      "description": "IR schema version this document targets (for example `0.11.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
+      "description": "IR schema version this document targets (for example `0.12.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
       "type": "string"
     },
     "modules": {
@@ -76,15 +76,11 @@
           }
         },
         "errors": {
-          "description": "Optional error domain: the named codes this module's fallible functions report. `None` when the module declares no errors.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ErrorDomain"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "description": "The error domains this module declares: named sets of codes that fallible callables anywhere in the API report by naming the domain in their `throws`. Domain names share the global type namespace.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ErrorDomain"
+          }
         },
         "modules": {
           "description": "Nested submodules, forming a tree that mirrors a package hierarchy.",
@@ -133,8 +129,15 @@
           ]
         },
         "throws": {
-          "description": "Whether the function can fail with a domain error. A throwing function surfaces as `throws`/`raises` in the idiomatic bindings, reporting the owning module's error domain; a non-throwing function has a plain signature and treats any error as a producer bug (a trap, not a typed error). Defaults to `false`.",
-          "type": "boolean"
+          "description": "How the function can fail. Absent for a function that can't, which treats any reported error as a producer bug (a trap, not a typed error); an error domain's name (`throws: KvError`) for one that reports that domain's codes; or `any` (`throws: any`) for one that fails with an untyped error, a message under the generic runtime code `-1`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Throws"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "async": {
           "description": "Whether the function is asynchronous, lowering to a completion-callback form rather than a blocking call. Serialized under the IDL key `async`.",
@@ -187,6 +190,11 @@
     "TypeRef": {
       "title": "TypeRef",
       "description": "Reference to a type. Encoded as a string with custom syntax: primitives (`i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `bool`, `string`, `bytes`), iterators (`iter<{T}>`), lists (`[{T}]`), maps (`{{K:V}}`), optionals (`{T}?`), or the bare (unqualified) name of a user-defined struct, enum, interface, or callback interface.",
+      "type": "string"
+    },
+    "Throws": {
+      "title": "Throws",
+      "description": "What a fallible callable reports: the name of an error domain declared in any module, or `any` for an untyped error (code -1 and a message).",
       "type": "string"
     },
     "InterfaceDef": {
@@ -411,7 +419,7 @@
       "additionalProperties": false
     },
     "ErrorDomain": {
-      "description": "A module's error domain: the named set of error codes its fallible functions can report.",
+      "description": "An error domain: a named, open set of error codes that fallible callables report by naming the domain in their `throws`.\n\nA module may declare several. The domain's name is a type name (unique across the API); its code names are unique across the API too, and its code values are positive and unique within the domain. Domains are open: adding a code never breaks a deployed binding, which maps a positive code it doesn't know to the domain's base error type.",
       "type": "object",
       "required": [
         "codes",
@@ -419,7 +427,7 @@
       ],
       "properties": {
         "name": {
-          "description": "Error domain name, used to name the generated error type (for example `ContactErrors`).",
+          "description": "Error domain name, used to name the generated error type (for example `ContactError`). Callables name it in their `throws`.",
           "type": "string"
         },
         "codes": {

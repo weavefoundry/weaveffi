@@ -1,10 +1,13 @@
 # Node.js
 
 The Node.js target generates an npm package: an ES module with TypeScript
-declarations, and a small N-API addon that calls the library's C ABI. The
-JavaScript API is shared with the [WebAssembly target](wasm.md); only the
-transport underneath differs, so code written against one runs against the
-other.
+declarations, and a small N-API addon that calls the library's
+[C ABI](../reference/abi.md) (revision 5). The JavaScript API is shared with
+the [WebAssembly target](wasm.md); only the transport underneath differs, so
+code written against one runs against the other.
+
+Node.js is a [Tier 1](../stability.md#target-tiers) target: it tracks every
+ABI revision as it lands and runs the full conformance suite in CI.
 
 ## What gets generated
 
@@ -18,7 +21,9 @@ node/
 ├── kvstore.h         a copy of the C header the addon compiles against
 ├── index.js          the API: one namespace export per top-level module
 ├── index.d.ts        TypeScript declarations
-├── runtime.js        the shared runtime (codec, errors, wrappers, load-time checks)
+├── runtime.js        the shared runtime (codec, checks, errors, wrappers, load-time checks)
+├── debug.js          the `./debug` export: leak counters for tests
+├── debug.d.ts
 └── README.md
 ```
 
@@ -70,25 +75,29 @@ See [Packaging](../guides/packaging.md) for which addons are prebuilt.
 Importing the package loads the addon and, before any other call, checks
 that the library matches the bindings (see
 [Load-time checks](../reference/abi.md#load-time-checks)). The library must
-implement ABI revision 4, and every top-level module's contract table must
-hold each declaration the bindings were generated with. `index.js` embeds
-those entries:
+implement ABI revision 5, and every top-level module's contract table must
+hold each row the bindings were generated with: one per declaration, error
+code, and callback method. `index.js` embeds those rows, each with its
+canonical signature:
 
 ```js
 const $contract = [
-  ['kv', [
-    [0x0969575bfbb012d7n, 0xebd38766e3532c4fn, 'kv.Store.fork'],
+  ['kitchen_sink_kitchen_contract', [
+    [0x01d4f09bbddc986fn, 0xffcf2bd3b04aa002n, 'kitchen.Gadget.new'], // constructor new(i64) -> Gadget
     // ...
   ]],
 ];
-$verify($raw, 'kvstore', 'kvstore', 4, $contract);
+$verify($raw, 'kitchen_sink', 'kitchen_sink', 5, $contract);
 ```
 
 If a check fails, the import throws an `Error` naming the declaration:
 `kvstore: kv.Store.put is missing from the library` or `kvstore:
-kv.Store.put changed since these bindings were generated`. Declarations the
-library has and the bindings don't are fine, so a library that only adds to
-its API keeps working with older bindings.
+kv.Store.put changed since these bindings were generated`. Rows the library
+has and the bindings don't are fine, so a library that only adds to its API
+(declarations, error codes, callback methods) keeps working with older
+bindings. The import fails the same way when the addon can't be found or
+the library can't be loaded, so `await import(...)` in a `try` can fall
+back.
 
 ## Modules and names
 
@@ -97,9 +106,12 @@ are nested namespaces, so equal names in different modules never collide:
 
 ```js
 export const kitchen = Object.freeze({
-  KitchenErrorsError: kitchen$KitchenErrorsError,
+  KitchenError: kitchen$KitchenError,
   NotFoundError: kitchen$NotFoundError,
   InvalidInputError: kitchen$InvalidInputError,
+  PantryError: kitchen$PantryError,
+  OutOfStockError: kitchen$OutOfStockError,
+  SpoiledError: kitchen$SpoiledError,
   Priority: kitchen$Priority,
   Gadget: kitchen$Gadget,
   boolId: kitchen$boolId,
@@ -112,15 +124,17 @@ reserved words, which are legal property names (`store.delete(key)`),
 except that an instance method named `close` or `constructor`, and a
 static named `name`, `length`, `prototype`, or `caller`, gains one too
 ([reserved member names](../reference/naming.md#identifiers-in-generated-code)).
-Record fields keep their IDL spelling.
+Record fields keep their IDL spelling. Doc comments in `index.d.ts` name
+declarations in this spelling too: an IDL doc or deprecation message that
+says `` `new_op` `` reads `` `newOp` `` there.
 
 ## Type mapping
 
 | IDL type | TypeScript type | Notes |
 |----------|-----------------|-------|
-| `i8`, `i16`, `i32`, `u8`, `u16`, `u32` | `number` | |
-| `i64`, `u64` | `bigint` | Integral numbers are accepted as arguments; out-of-range values throw a `RangeError` |
-| `f32`, `f64` | `number` | NaN, the infinities, and `-0` round-trip |
+| `i8`, `i16`, `i32`, `u8`, `u16`, `u32` | `number` | A fractional, non-finite, or out-of-range argument throws a `RangeError`; nothing wraps |
+| `i64`, `u64` | `bigint` | Integral numbers in range are accepted as arguments; anything else throws a `RangeError` |
+| `f32`, `f64` | `number` | NaN, the infinities, and `-0` round-trip; an `f32` argument rounds as `Float32Array` does |
 | `bool` | `boolean` | |
 | `string` | `string` | UTF-8, passed as pointer and length, so interior NULs survive |
 | `bytes` | `Uint8Array` | |
@@ -129,18 +143,23 @@ Record fields keep their IDL spelling.
 | rich enum | tagged union | `{ tag: 'Circle', radius: 2.5 }` |
 | interface | `class` | See [Objects](#objects-and-lifetime) |
 | callback interface | `interface` | Any object with the methods; see [Callback interfaces](#callback-interfaces) |
-| `T?` | `T \| null` | `undefined` is accepted as `null` |
-| `[T]` | `T[]` | |
+| `T?` | `T \| null` | `undefined` is accepted as `null`. An optional scalar or C-style enum crosses directly as a flag and a value, with no buffer |
+| `[T]` | `T[]` | A list of `i8`, `i16`, `i32`, `i64`, `u16`, `u32`, `u64`, `f32`, or `f64` crosses as a typed array: an argument may be an array (checked element by element) or the matching typed array (`Float64Array` for `[f64]`, passed as is), and a result is a plain array |
 | `{K: V}` | `Record<string, V>` | `Record<number, V>` for integer keys of 32 bits or fewer, `Partial<Record<E, V>>` for C-style enum keys; keys are property names (strings) at run time, and a `Map` is accepted as an argument |
-| `iter<T>` | `IterableIterator<T>` | Lazy |
+| `iter<T>` | `NativeIterator<T>` | Lazy; an `IterableIterator<T>` with `close()` and `[Symbol.dispose]()` |
 
-Arguments are type-checked: a value of the wrong type throws a `TypeError`
-before the native call.
+Arguments are checked before the native call: a value of the wrong type
+throws a `TypeError`, and an integer that is fractional or out of its type's
+range a `RangeError`, whether it's an argument, an element of a list, a
+field of a record, or a callback's return value. The addon checks integer
+arguments on the `double` it receives before converting it, so the result
+is the same on every platform.
 
 Value buffers are encoded and decoded by one function per type: each record
 and rich enum (`$w$kv$Entry`, `$r$kv$Entry`), each interface carried as an
-object token, and each distinct optional, list, and map type in the API
-(`$w_list_opt_Entry` writes `[Entry?]`). Call sites name these functions.
+object token, and each distinct optional, list, and map type in the API,
+named by its canonical stem (`$w_list_opt_Entry` writes `[Entry?]`). Call
+sites name these functions.
 
 ## Objects and lifetime
 
@@ -176,20 +195,28 @@ Two wrappers may share one native object.
 Every error extends the package's root class, `{Package}Error` (here
 `KitchenSinkError`), which carries the ABI `code`:
 
-- Each error domain is a class (`kitchen.KitchenErrorsError`), and each of
-  its codes a subclass (`kitchen.NotFoundError`) with a static `CODE` and the
-  IDL message as its default message. Payload fields become properties. A
+- Each error domain is a class, named by the shared rule (a domain
+  `KitchenErrors` is `kitchen.KitchenError`, `KvError` stays `KvError`, and
+  `Failure` becomes `FailureError`), and each of its codes a subclass
+  (`kitchen.NotFoundError`) with a static `CODE` and the IDL message as its
+  default message. A module may declare several domains, and codes of
+  different domains may share a value. Payload fields become properties. A
   code without fields is constructed as `new kv.InvalidPathError(message?)`;
   a code with fields takes them first:
   `new kv.RejectedError({ key, reason }, message?)`.
+- A function declared `throws: SomeDomain` fails with that domain's classes.
+  Domains are open: a positive code the bindings don't know (the library
+  added it later) is an instance of the domain class itself, with its
+  `code` and message.
+- A function declared `throws: any` fails with the root class, code -1, and
+  the library's message.
 - A cancelled call rejects with `CancelledError` (code -5).
-- Runtime failures throw the root class itself: -1 generic, -2 producer
-  panic, -3 marshalling failure, -4 a callback implementation failed.
+- Other runtime failures throw the root class itself: -2 producer panic, -3
+  marshalling failure, -4 a callback implementation failed.
 
-Only functions declared `throws` map codes onto their module's domain; a
-failure of any other call is a producer bug, and the binding throws the
-root class with the code and the producer's message (see
-[the trap policy](../guides/errors-and-memory.md#the-trap-policy)).
+A failure of a function that doesn't declare `throws` is a producer bug, and
+the binding throws the root class with the code and the producer's message
+(see [the trap policy](../guides/errors-and-memory.md#the-trap-policy)).
 
 ## Async and cancellation
 
@@ -219,24 +246,37 @@ form:
 
 | IDL return | Return from JavaScript | What the library receives |
 |------------|------------------------|---------------------------|
-| direct (numbers, `bool`, C-style enums) | the value | the value |
+| direct (numbers, `bool`, C-style enums) | the value | the value (integers range-checked) |
+| optional scalar (`i32?`, `Mode?`, ...) | the value, or `null` | a flag and the value |
+| numeric list (`[f64]`, ...) | an array or the matching typed array | a copy in a run the library adopts |
 | `string`, `bytes` | a `string`, a `Uint8Array` | a copy in a run the library adopts |
-| record, rich enum, `T?`, `[T]`, `{K:V}` | the value | its encoding, in a run the library adopts |
+| record, rich enum, other `T?`, `[T]`, `{K:V}` | the value | its encoding, in a run the library adopts |
 | `I` | a wrapper (never `null`) | a new strong reference to its object |
 | `I?` | a wrapper or `null` | a new strong reference, or null |
 
-The implementation keeps its own wrapper; the library gets a reference of
-its own. A method that throws, or returns a value of the wrong type, fails
-the native call with code -4 and the exception's message; nothing unwinds
-through native code. A method declared `throws` may instead throw an error
-of its module's domain, and the library receives that code, message, and
-fields:
+Arguments arrive the same way the API returns values: optional scalars as
+the value or `null`, numeric lists as plain arrays. The implementation keeps
+its own wrapper; the library gets a reference of its own. Nothing unwinds
+through native code; how a failure reaches the library follows the method's
+`throws`:
+
+- A method declared `throws: SomeDomain` may throw one of that domain's
+  errors, and the library receives its code and fields. (A Rust producer
+  re-renders the message from the fields.) Any other exception is reported
+  as code -1 with its message.
+- A method declared `throws: any` reports any exception as code -1 with its
+  message.
+- A method that doesn't declare `throws` reports an exception, or a return
+  value of the wrong type, as code -4 with its message.
 
 ```js
 const policy = {
+  ttlFor(key, requested) {
+    return key.startsWith('tmp/') ? 60n : requested;
+  },
   admit(entry) {
     if (entry.key.startsWith('secret')) {
-      throw new kv.RejectedError({ key: entry.key, reason: 'no secrets' }, 'secrets are not stored');
+      throw new kv.RejectedError({ key: entry.key, reason: 'no secrets' });
     }
     return { ...entry, tags: ['admitted'] };
   },
@@ -284,10 +324,29 @@ synchronous call, or for the event loop, simply runs later. So:
 
 ## Iterators
 
-An `iter<T>` result is a lazy iterator: each `next()` makes one native call.
-The native iterator is destroyed when it's exhausted, when it fails, on
-`return()` (which `for...of` calls on `break`), on `close()`, or when the
-iterator is garbage collected.
+An `iter<T>` result is a lazy `NativeIterator<T>`: each `next()` makes one
+native call. The native iterator is destroyed when it's exhausted, when it
+fails, on `return()` (which `for...of` calls on `break`), on `close()` or a
+`using` declaration, or when the iterator is garbage collected.
+
+```ts
+using chunks = kitchen.streamChunks();
+const first = chunks.next(); // released when the block exits
+```
+
+## Leak counters
+
+The package's `./debug` export reads the library's live-resource counters,
+for tests of code that uses the bindings. It isn't part of the API:
+
+```js
+import { debugLive } from 'kvstore/debug';
+
+debugLive(0); // live objects, as a bigint (1 callbacks, 2 iterators, 3 cancel tokens, 4 byte runs)
+```
+
+Kind -1 is `1n` when the library counts at all (built with `weaveffi`'s
+`leak-check` feature); otherwise every counter is `0n`.
 
 ## Known limitations
 
@@ -299,5 +358,8 @@ iterator is garbage collected.
 - `{PREFIX}_LIBRARY` selects the library at build time, not at run time.
 - Windows builds link `{library}.lib`, and the DLL must be on the loader's
   search path.
+- A numeric list result is copied into a plain array. As an argument, the
+  matching typed array is lent to the library without a copy, while a plain
+  array is checked and copied first.
 - The package is ESM only, and its declarations need TypeScript 5.2 or
   later (for `Symbol.dispose`).

@@ -1,4 +1,4 @@
-// Conformance consumer: codec sample, Go target (ABI revision 4).
+// Conformance consumer: codec sample, Go target (ABI revision 5).
 //
 // The shared-vector loop: for every vector the library serves, decode it
 // through the generated bindings, hand it back to CheckVector (which must
@@ -8,8 +8,11 @@
 // spot checks of decoded fields, the typed *OutOfRangeError and its payload,
 // malformed input rejected (an undeclared enum value, text that isn't UTF-8,
 // a nil sum-type value the encoder refuses), and object identity and
-// reference counting through buffers. Ends by asserting the library's leak
-// counters are zero.
+// reference counting through buffers. Then the ABI 5 shapes: optional
+// scalars (*int32, *float64, *bool, *Color) and typed arrays ([]float64,
+// []int32, []uint64) in and out, a usize, a char and a custom type crossing
+// as strings (and rejected as -3), and an iterator of typed arrays. Ends by
+// asserting the library's leak counters are zero.
 
 package main
 
@@ -17,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"slices"
 
 	codec "__MODPATH__"
 )
@@ -80,24 +84,37 @@ func echo(v codec.Vector) {
 		expect(codec.EchoU16(x.Value) == x.Value, "echo u16")
 	case codec.VectorI32:
 		expect(codec.EchoI32(x.Value) == x.Value, "echo i32")
+		got := codec.EchoOptI32(&x.Value)
+		expect(got != nil && *got == x.Value, "echo opt i32")
+		expect(slices.Equal(codec.EchoI32s([]int32{x.Value}), []int32{x.Value}), "echo i32s")
 	case codec.VectorU32:
 		expect(codec.EchoU32(x.Value) == x.Value, "echo u32")
 	case codec.VectorI64:
 		expect(codec.EchoI64(x.Value) == x.Value, "echo i64")
 	case codec.VectorU64:
 		expect(codec.EchoU64(x.Value) == x.Value, "echo u64")
+		expect(codec.EchoUsize(x.Value) == x.Value, "echo usize")
+		expect(slices.Equal(codec.EchoU64s([]uint64{x.Value}), []uint64{x.Value}), "echo u64s")
 	case codec.VectorF32:
 		expect(sameF32(codec.EchoF32(x.Value), x.Value), "echo f32 (bitwise)")
 	case codec.VectorF64:
 		expect(sameF64(codec.EchoF64(x.Value), x.Value), "echo f64 (bitwise)")
+		got := codec.EchoOptF64(&x.Value)
+		expect(got != nil && (sameF64(*got, x.Value) || math.IsNaN(x.Value) && math.IsNaN(*got)), "echo opt f64")
+		echoed := codec.EchoF64s([]float64{x.Value})
+		expect(len(echoed) == 1 && sameF64(echoed[0], x.Value), "echo f64s (bitwise)")
 	case codec.VectorFlag:
 		expect(codec.EchoBool(x.Value) == x.Value, "echo bool")
+		got := codec.EchoOptBool(&x.Value)
+		expect(got != nil && *got == x.Value, "echo opt bool")
 	case codec.VectorText:
 		expect(codec.EchoText(x.Value) == x.Value, fmt.Sprintf("echo text %q", x.Value))
 	case codec.VectorBlob:
 		expect(bytes.Equal(codec.EchoBlob(x.Value), x.Value), "echo blob")
 	case codec.VectorHue:
 		expect(codec.EchoColor(x.Value) == x.Value, "echo color")
+		got := codec.EchoOptColor(&x.Value)
+		expect(got != nil && *got == x.Value, "echo opt color")
 	}
 }
 
@@ -284,6 +301,7 @@ func objects(n uint32) {
 }
 
 func main() {
+	expect(codec.Check() == nil, fmt.Sprintf("Check() = %v", codec.Check()))
 	n := codec.VectorCount()
 	expect(n >= 60, fmt.Sprintf("vector_count() = %d", n))
 
@@ -293,7 +311,103 @@ func main() {
 	outOfRange(n)
 	malformed()
 	objects(n)
+	abi5()
 
 	expectNoLeaks(codec.DebugLive)
 	fmt.Printf("go/codec: OK (%d vectors)\n", n)
+}
+
+func abi5() {
+	// Optional scalars cross as a flag and a value.
+	expect(codec.EchoOptI32(nil) == nil, "echo_opt_i32(absent)")
+	for _, v := range []int32{math.MinInt32, 0} {
+		got := codec.EchoOptI32(&v)
+		expect(got != nil && *got == v, fmt.Sprintf("echo_opt_i32(%d)", v))
+	}
+	negZero := math.Copysign(0, -1)
+	got := codec.EchoOptF64(&negZero)
+	expect(got != nil && sameF64(*got, negZero), "echo_opt_f64(-0.0) keeps the sign")
+	nan := math.NaN()
+	got = codec.EchoOptF64(&nan)
+	expect(got != nil && math.IsNaN(*got), "echo_opt_f64(NaN)")
+	expect(codec.EchoOptF64(nil) == nil, "echo_opt_f64(absent)")
+	for _, v := range []bool{true, false} {
+		b := codec.EchoOptBool(&v)
+		expect(b != nil && *b == v, fmt.Sprintf("echo_opt_bool(%v)", v))
+	}
+	expect(codec.EchoOptBool(nil) == nil, "echo_opt_bool(absent)")
+	for _, c := range []codec.Color{codec.ColorInfrared, codec.ColorBlue} {
+		got := codec.EchoOptColor(&c)
+		expect(got != nil && *got == c, fmt.Sprintf("echo_opt_color(%d)", c))
+	}
+	expect(codec.ColorInfrared == -1 && codec.ColorBlue == 7, "color values")
+	expect(codec.EchoOptColor(nil) == nil, "echo_opt_color(absent)")
+	bad := codec.Color(3)
+	expectMarshalFailure("echo_opt_color(3)", func() { codec.EchoOptColor(&bad) })
+
+	// Typed arrays: bit-identical floats, the extremes, and empty.
+	floats := []float64{math.NaN(), negZero, 5e-324, math.Inf(1)}
+	echoed := codec.EchoF64s(floats)
+	expect(len(echoed) == 4 && math.IsNaN(echoed[0]), "echo_f64s NaN")
+	for i := 1; i < 4; i++ {
+		expect(sameF64(echoed[i], floats[i]), fmt.Sprintf("echo_f64s[%d] bitwise", i))
+	}
+	ints := []int32{math.MinInt32, 0, math.MaxInt32}
+	expect(slices.Equal(codec.EchoI32s(ints), ints), "echo_i32s extremes")
+	for _, empty := range [][]int32{nil, {}} {
+		e := codec.EchoI32s(empty)
+		expect(e != nil && len(e) == 0, "echo_i32s([])")
+	}
+	big := []uint64{math.MaxUint64, 1 << 63}
+	expect(slices.Equal(codec.EchoU64s(big), big), "echo_u64s extremes")
+	expect(len(codec.EchoU64s(nil)) == 0, "echo_u64s([])")
+	expect(len(codec.EchoF64s(nil)) == 0, "echo_f64s([])")
+	// A sub-slice passes its own window of the backing array.
+	window := []int32{9, 1, 2, 9}[1:3]
+	expect(slices.Equal(codec.EchoI32s(window), []int32{1, 2}), "echo_i32s(sub-slice)")
+
+	// usize crosses as u64.
+	for _, v := range []uint64{4294967295, math.MaxUint64} {
+		expect(codec.EchoUsize(v) == v, fmt.Sprintf("echo_usize(%d)", v))
+	}
+
+	// A char is a one-scalar string.
+	for _, c := range []string{"\U0001F980", "é", "a"} {
+		expect(codec.EchoChar(c) == c, fmt.Sprintf("echo_char(%q)", c))
+	}
+	expectMarshalMessage("echo_char(ab)", "value: \"ab\" is not a valid char", func() { codec.EchoChar("ab") })
+	expectMarshalMessage("echo_char()", "value: \"\" is not a valid char", func() { codec.EchoChar("") })
+
+	// A custom type crossing as a string, normalized by the producer.
+	for in, want := range map[string]string{"ff": "ff", "00FF": "ff", "0": "0"} {
+		expect(codec.EchoHex(in) == want, fmt.Sprintf("echo_hex(%q)", in))
+	}
+	expectMarshalMessage("echo_hex(xyz)", "value: invalid digit found in string", func() { codec.EchoHex("xyz") })
+	expectMarshalMessage("echo_hex()", "value: cannot parse integer from empty string", func() { codec.EchoHex("") })
+	expectMarshalMessage("echo_hex(100000000)", "value: number too large to fit in target type", func() { codec.EchoHex("100000000") })
+
+	// An iterator of typed arrays.
+	chunks := func(values []int32, size uint32) [][]int32 {
+		var out [][]int32
+		for c := range codec.Chunks(values, size) {
+			out = append(out, c)
+		}
+		return out
+	}
+	expect(slices.EqualFunc(chunks(ints, 2), [][]int32{{math.MinInt32, 0}, {math.MaxInt32}}, slices.Equal), "chunks(extremes, 2)")
+	expect(slices.EqualFunc(chunks([]int32{1, 2, 3, 4}, 2), [][]int32{{1, 2}, {3, 4}}, slices.Equal), "chunks([1 2 3 4], 2)")
+	expect(len(chunks([]int32{1, 2}, 0)) == 0 && len(chunks(nil, 3)) == 0, "empty chunks")
+	for c := range codec.Chunks([]int32{1, 2, 3, 4}, 1) {
+		expect(slices.Equal(c, []int32{1}), "the first chunk")
+		break // an abandoned iterator is released
+	}
+	expect(codec.DebugLive(2) == 0, "every chunks iterator was released")
+}
+
+// expectMarshalMessage asserts that f panics with the runtime error for a
+// value the library can't take (-3) carrying message.
+func expectMarshalMessage(what, message string, f func()) {
+	r := catchPanic(f)
+	e, ok := r.(*codec.Error)
+	expect(ok && e.Code == -3 && e.Message == message, fmt.Sprintf("%s: want -3 %q, got %v", what, message, r))
 }

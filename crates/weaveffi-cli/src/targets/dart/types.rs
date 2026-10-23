@@ -5,7 +5,9 @@
 use crate::lang;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_model::abi::CType;
-use weaveffi_model::ty::{Prim, Ty};
+use weaveffi_model::errors::type_name;
+use weaveffi_model::model::FnBinding;
+use weaveffi_model::ty::{ParamTy, Prim, RetTy, Ty};
 
 /// Type names the generated library declares or uses unqualified. A user
 /// type with one of these names would shadow or collide with it, so it gains
@@ -28,12 +30,18 @@ const RESERVED_TYPES: &[&str] = &[
     "File",
     "Finalizable",
     "Float",
+    "Float32List",
+    "Float64List",
     "Function",
     "Future",
     "Int16",
+    "Int16List",
     "Int32",
+    "Int32List",
     "Int64",
+    "Int64List",
     "Int8",
+    "Int8List",
     "IntPtr",
     "Isolate",
     "Iterable",
@@ -45,7 +53,8 @@ const RESERVED_TYPES: &[&str] = &[
     "NativeException",
     "NativeFinalizer",
     "NativeFunction",
-    "NativeLibraryError",
+    "NativeLibraryException",
+    "NativeType",
     "Never",
     "Object",
     "Platform",
@@ -55,14 +64,17 @@ const RESERVED_TYPES: &[&str] = &[
     "StateError",
     "String",
     "Struct",
+    "TypedData",
     "Uint16",
+    "Uint16List",
     "Uint32",
+    "Uint32List",
     "Uint64",
+    "Uint64List",
     "Uint8",
     "Uint8List",
     "Union",
     "Uri",
-    "Utf8",
     "Void",
     "Zone",
 ];
@@ -96,6 +108,35 @@ pub(crate) fn dart_member(name: &str) -> String {
     lang::escape_member(&dart_ident(name), OBJECT_MEMBERS)
 }
 
+/// Members every value class (a record or rich-enum variant) declares or
+/// inherits: its `==`, `hashCode`, and `toString`, and `Object`'s.
+const VALUE_MEMBERS: &[&str] = &["hashCode", "noSuchMethod", "runtimeType", "toString"];
+
+/// Members every error-code exception declares or inherits:
+/// `NativeException`'s `code` and `message`, and `Object`'s.
+const ERROR_MEMBERS: &[&str] = &[
+    "code",
+    "hashCode",
+    "message",
+    "noSuchMethod",
+    "runtimeType",
+    "toString",
+];
+
+/// The Dart spelling of a record or rich-enum variant field:
+/// [`dart_ident`], with a trailing `_` when it would collide with a member
+/// the value class declares or inherits (`to_string` is `toString_`).
+pub(crate) fn dart_field(name: &str) -> String {
+    lang::escape_member(&dart_ident(name), VALUE_MEMBERS)
+}
+
+/// The Dart spelling of an error code's field: like [`dart_field`], and
+/// also escaped against `NativeException`'s `code` and `message` (a field
+/// `message` is `message_`).
+pub(crate) fn error_field(name: &str) -> String {
+    lang::escape_member(&dart_ident(name), ERROR_MEMBERS)
+}
+
 /// The Dart class of a user type: its name in UpperCamelCase, escaped when
 /// it would collide with a reserved type.
 pub(crate) fn dart_class(name: &str) -> String {
@@ -107,9 +148,31 @@ pub(crate) fn dart_class(name: &str) -> String {
     }
 }
 
-/// The idiomatic Dart type a [`Ty`] surfaces as. `u64` values are carried as
-/// their two's-complement bit pattern in a Dart `int`.
+/// The exception class of an error domain or code (`KvError` is
+/// `KvException`, `KitchenErrors` is `KitchenException`, a code `NotFound`
+/// is `NotFoundException`), named by the shared
+/// [`type_name`](weaveffi_model::errors::type_name) and escaped like any
+/// class.
+pub(crate) fn exception_class(raw: &str) -> String {
+    dart_class(&type_name(raw, "Exception"))
+}
+
+/// The surface Dart type of a value the bindings hand to the caller: a
+/// return, a field, a callback argument. `bytes` is a `Uint8List`, and a
+/// `u64` is carried as its two's-complement bit pattern in a Dart `int`.
 pub(crate) fn dart_type(ty: &Ty) -> String {
+    surface(ty, "Uint8List")
+}
+
+/// The surface Dart type of a value the caller hands to the bindings: a
+/// parameter or a callback's return. Like [`dart_type`], except that
+/// `bytes` (at any depth) accepts any `List<int>`, so a `Uint8List` and a
+/// list literal both fit; every output type is assignable to it.
+pub(crate) fn dart_in_type(ty: &Ty) -> String {
+    surface(ty, "List<int>")
+}
+
+fn surface(ty: &Ty, bytes: &str) -> String {
     match ty {
         Ty::Prim(
             Prim::I8
@@ -124,38 +187,50 @@ pub(crate) fn dart_type(ty: &Ty) -> String {
         Ty::Prim(Prim::F32 | Prim::F64) => "double".into(),
         Ty::Prim(Prim::Bool) => "bool".into(),
         Ty::Prim(Prim::String) => "String".into(),
-        Ty::Prim(Prim::Bytes) => "List<int>".into(),
-        Ty::Enum(n)
-        | Ty::Record(n)
-        | Ty::RichEnum(n)
-        | Ty::Interface(n)
-        | Ty::CallbackInterface(n) => dart_class(n),
-        Ty::Optional(inner) => format!("{}?", dart_type(inner)),
-        Ty::List(inner) => format!("List<{}>", dart_type(inner)),
-        Ty::Iterator(inner) => format!("Iterable<{}>", dart_type(inner)),
-        Ty::Map(k, v) => format!("Map<{}, {}>", dart_type(k), dart_type(v)),
+        Ty::Prim(Prim::Bytes) => bytes.into(),
+        Ty::Enum(n) | Ty::Record(n) | Ty::RichEnum(n) | Ty::Interface(n) => dart_class(n),
+        Ty::Optional(inner) => format!("{}?", surface(inner, bytes)),
+        Ty::List(inner) => format!("List<{}>", surface(inner, bytes)),
+        Ty::Map(k, v) => format!("Map<{}, {}>", surface(k, bytes), surface(v, bytes)),
     }
 }
 
-/// The wrapper class of a bare or optional interface type.
-///
-/// # Panics
-///
-/// Panics when `ty` names no interface; callers dispatch on the object
-/// family first.
-pub(crate) fn object_class(ty: &Ty) -> String {
-    dart_class(
-        ty.interface_name()
-            .expect("object positions are (optional) interfaces"),
-    )
+/// The Dart type of a wrapper parameter.
+pub(crate) fn param_type(ty: &ParamTy) -> String {
+    match ty {
+        ParamTy::Value(t) => dart_in_type(t),
+        ParamTy::Callback { name, nullable } => {
+            let class = dart_class(name);
+            if *nullable {
+                format!("{class}?")
+            } else {
+                class
+            }
+        }
+    }
+}
+
+/// The Dart return type of a wrapper (before any `Future<...>`).
+pub(crate) fn return_type(f: &FnBinding) -> String {
+    match &f.ret {
+        None => "void".into(),
+        Some(RetTy::Value(t)) => dart_type(t),
+        Some(RetTy::Iterator(t)) => format!("Iterable<{}>", dart_type(t)),
+    }
+}
+
+/// The wrapper class of an interface.
+pub(crate) fn object_class(interface: &str) -> String {
+    dart_class(interface)
 }
 
 /// The `dart:ffi` (native, Dart) type pair of one C ABI slot or return.
 ///
 /// Opaque pointees (objects, iterators, vtables, cancel tokens, `void*`) are
-/// `Pointer<Void>`; byte runs are `Pointer<Uint8>`; the error slot is
-/// `Pointer<_Error>`. A bare [`CType::Named`] (an async completion callback)
-/// has no generic spelling, so callers substitute the callback typedef.
+/// `Pointer<Void>`; byte runs are `Pointer<Uint8>`; typed arrays point at
+/// their element type; the error slot is `Pointer<_Error>`. A bare
+/// [`CType::Named`] (an async completion callback) has no generic spelling,
+/// so callers substitute the callback typedef.
 pub(crate) fn ffi_type(ct: &CType) -> (String, String) {
     let scalar = |native: &str, dart: &str| (native.to_string(), dart.to_string());
     match ct {
@@ -199,6 +274,28 @@ fn pointee_type(ct: &CType) -> String {
     }
 }
 
+/// The runtime's typed-array helper for `elem` and operation `op`
+/// (`stage`, `copy`, `take`, `handOver`): `_takeI32s`, `_stageF64s`, ...
+pub(crate) fn slice_fn(op: &str, elem: Prim) -> String {
+    format!("_{op}{}s", elem.pascal())
+}
+
+/// The `_CallbackMessage` typed-data constant of a typed-array element.
+pub(crate) fn typed_data_kind(elem: Prim) -> &'static str {
+    match elem {
+        Prim::I8 => "typedInt8",
+        Prim::I16 => "typedInt16",
+        Prim::I32 => "typedInt32",
+        Prim::I64 => "typedInt64",
+        Prim::U16 => "typedUint16",
+        Prim::U32 => "typedUint32",
+        Prim::U64 => "typedUint64",
+        Prim::F32 => "typedFloat32",
+        Prim::F64 => "typedFloat64",
+        other => unreachable!("{other:?} isn't a typed-array element"),
+    }
+}
+
 /// The private Dart variable holding the bound function of C symbol `sym`.
 pub(crate) fn ffi_var(sym: &str) -> String {
     format!("_{}", sym.to_lower_camel_case())
@@ -209,8 +306,9 @@ pub(crate) fn ffi_typedef(c_name: &str) -> String {
     format!("_{}", c_name.to_upper_camel_case())
 }
 
-/// The zero value of a direct type: what a callback trampoline returns when
-/// its implementation threw.
+/// The zero value of a scalar type: the placeholder an absent optional
+/// scalar passes, and what a callback trampoline returns when its
+/// implementation threw.
 pub(crate) fn zero_literal(ty: &Ty) -> &'static str {
     match ty {
         Ty::Prim(Prim::Bool) => "false",
@@ -237,6 +335,17 @@ mod tests {
         assert_eq!(dart_class("Store"), "Store");
         assert_eq!(dart_class("CancelToken"), "CancelToken_");
         assert_eq!(dart_class("String"), "String_");
+        assert_eq!(dart_class("Int32List"), "Int32List_");
+    }
+
+    #[test]
+    fn exceptions_never_double_the_suffix() {
+        assert_eq!(exception_class("KvError"), "KvException");
+        assert_eq!(exception_class("KitchenErrors"), "KitchenException");
+        assert_eq!(exception_class("Failure"), "FailureException");
+        assert_eq!(exception_class("NOT_FOUND"), "NotFoundException");
+        assert_eq!(exception_class("Native"), "NativeException_");
+        assert_eq!(exception_class("Error"), "Exception_");
     }
 
     #[test]
@@ -249,7 +358,29 @@ mod tests {
     }
 
     #[test]
-    fn pointers_map_to_opaque_or_byte_pointers() {
+    fn fields_avoid_the_class_members() {
+        assert_eq!(dart_field("to_string"), "toString_");
+        assert_eq!(dart_field("message"), "message");
+        assert_eq!(error_field("message"), "message_");
+        assert_eq!(error_field("code"), "code_");
+        assert_eq!(error_field("key"), "key");
+    }
+
+    #[test]
+    fn bytes_are_typed_data_out_and_any_list_in() {
+        let bytes = Ty::Prim(Prim::Bytes);
+        let nested = Ty::Map(
+            Box::new(Ty::Prim(Prim::String)),
+            Box::new(Ty::Optional(Box::new(bytes.clone()))),
+        );
+        assert_eq!(dart_type(&bytes), "Uint8List");
+        assert_eq!(dart_in_type(&bytes), "List<int>");
+        assert_eq!(dart_type(&nested), "Map<String, Uint8List?>");
+        assert_eq!(dart_in_type(&nested), "Map<String, List<int>?>");
+    }
+
+    #[test]
+    fn pointers_map_to_opaque_typed_or_byte_pointers() {
         let ptr = |t| CType::ptr(t);
         assert_eq!(ffi_type(&ptr(CType::Error)).0, "Pointer<_Error>");
         assert_eq!(
@@ -257,9 +388,14 @@ mod tests {
             "Pointer<Pointer<Uint8>>"
         );
         assert_eq!(
+            ffi_type(&ptr(ptr(CType::Double))).0,
+            "Pointer<Pointer<Double>>"
+        );
+        assert_eq!(
             ffi_type(&ptr(CType::Named("kv_ScanIterator".into()))).0,
             "Pointer<Void>"
         );
         assert_eq!(ffi_type(&CType::Size), ("Size".into(), "int".into()));
+        assert_eq!(slice_fn("take", Prim::U64), "_takeU64s");
     }
 }

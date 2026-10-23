@@ -1,22 +1,24 @@
 //! Naming policy: the Kotlin package, the Kotlin name of every user type,
-//! error domain, and module object, the Kotlin and JNI types each IR type
-//! crosses as, and JNI name mangling.
+//! error domain, member, field, and module object, the public Kotlin type of
+//! every IR type, and JNI name mangling.
 //!
 //! User types live at the top level of the package, so a type whose name is
 //! a Kotlin keyword, a type Kotlin or Java imports by default (`Unit`,
 //! `String`, `Result`, ...), or a name the generated runtime declares gains a
 //! trailing underscore (`Unit` becomes `Unit_`). A module object whose name
 //! would equal a type's gains a `Module` suffix (`kv.stats` beside a `Stats`
-//! record becomes `Kv.StatsModule`).
+//! record becomes `Kv.StatsModule`). Callables, parameters, and fields are
+//! lowerCamelCased (`expires_at` becomes `expiresAt`).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use crate::codegen::common::pascal_case;
+use crate::codegen::errors;
 use crate::lang;
-use weaveffi_model::errors;
-use weaveffi_model::model::{ErrorBinding, FnBinding, Model, ModuleBinding};
-use weaveffi_model::ty::{Family, Prim, Ty};
+use weaveffi_model::model::{FnBinding, Model, ModuleBinding};
+use weaveffi_model::plan::ErrorStrategy;
+use weaveffi_model::ty::{ParamTy, Prim, RetTy, Ty};
 
 /// Names user types must not take: Kotlin and Java types the compiler
 /// imports into every file, plus the declarations of the generated runtime.
@@ -52,6 +54,7 @@ pub(crate) const RESERVED_TYPE_NAMES: &[&str] = &[
     "Iterable",
     "Iterator",
     "JniBridge",
+    "JvmField",
     "JvmStatic",
     "Lazy",
     "List",
@@ -61,11 +64,11 @@ pub(crate) const RESERVED_TYPE_NAMES: &[&str] = &[
     "MutableList",
     "MutableMap",
     "MutableSet",
+    "NativeBugException",
     "NativeCleaner",
     "NativeCompletion",
     "NativeHandle",
     "NativeIterator",
-    "NativeBugException",
     "NativeLibrary",
     "NoSuchElementException",
     "Nothing",
@@ -84,6 +87,7 @@ pub(crate) const RESERVED_TYPE_NAMES: &[&str] = &[
     "System",
     "Thread",
     "Throwable",
+    "Throws",
     "Triple",
     "UByte",
     "UInt",
@@ -118,6 +122,18 @@ const RESERVED_MEMBER_NAMES: &[&str] = &[
     "wait",
 ];
 
+/// Properties every exception inherits from `Throwable` (plus the `code` of
+/// `FfiException`); an error payload field spelled the same gains a trailing
+/// underscore.
+const THROWABLE_MEMBERS: &[&str] = &[
+    "cause",
+    "code",
+    "localizedMessage",
+    "message",
+    "stackTrace",
+    "suppressed",
+];
+
 /// Escape a user identifier for a Kotlin declaration or expression position:
 /// a reserved word gains a trailing underscore.
 pub(crate) fn kt_escape(name: &str) -> String {
@@ -134,18 +150,42 @@ pub(crate) fn lower_camel(s: &str) -> String {
     }
 }
 
-/// The Kotlin spelling of a parameter: lowerCamelCased, then escaped. It
-/// never starts with `_`, which keeps every generated local (all spelled
-/// `_name`) out of its way.
+/// The Kotlin spelling of a parameter or field: lowerCamelCased, then
+/// escaped. It never starts with `_`, which keeps every generated local (all
+/// spelled `_name`) out of its way.
 pub(crate) fn kt_param(name: &str) -> String {
     kt_escape(&lower_camel(name))
 }
 
-/// The Kotlin spelling of a method, static, or callback method: like
-/// [`kt_param`], and also escaped away from the members every wrapper
-/// declares.
+/// The Kotlin spelling of a callable or callback method: like [`kt_param`],
+/// and also escaped away from the members every wrapper declares.
 pub(crate) fn kt_member(name: &str) -> String {
     lang::escape_member(&kt_param(name), RESERVED_MEMBER_NAMES)
+}
+
+/// The Kotlin spellings of one declaration's fields (or parameters), in
+/// order: each [`kt_param`], with a later field whose camelCase spelling an
+/// earlier one already took (`foo_bar` beside `fooBar`) gaining trailing
+/// underscores until it's unique. `error_payload` also escapes the
+/// properties every exception inherits.
+pub(crate) fn kt_fields<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    error_payload: bool,
+) -> Vec<String> {
+    let mut taken = HashSet::new();
+    names
+        .into_iter()
+        .map(|raw| {
+            let mut name = kt_param(raw);
+            if error_payload {
+                name = lang::escape_member(&name, THROWABLE_MEMBERS);
+            }
+            while !taken.insert(name.clone()) {
+                name.push('_');
+            }
+            name
+        })
+        .collect()
 }
 
 /// Escape a user type name away from keywords and reserved type names.
@@ -175,6 +215,13 @@ pub(crate) fn jni_mangle(ident: &str) -> String {
     out
 }
 
+/// The `JniBridge.error` domain of a call that can't fail: its failure
+/// raises `NativeBugException`.
+pub(crate) const TRAP_DOMAIN: u32 = 0;
+/// The `JniBridge.error` domain of a `throws: any` call: its failure raises
+/// `FfiException` with the code and message.
+pub(crate) const UNTYPED_DOMAIN: u32 = 1;
+
 /// Every name the generated Kotlin and JNI code needs, resolved once from
 /// the identity, the target configuration, and the model.
 pub(crate) struct Names {
@@ -188,8 +235,9 @@ pub(crate) struct Names {
     /// from (`kvstore`).
     pub library: String,
     types: HashMap<String, String>,
-    exceptions: HashMap<String, String>,
-    domains: HashMap<String, u32>,
+    /// Every error domain's exception class and `JniBridge.error` index, by
+    /// the domain's (global) name, in declaration order.
+    domains: Vec<(String, String)>,
     objects: HashMap<String, String>,
     /// Every interface's `_destroy` symbol, by interface name.
     destroys: HashMap<String, String>,
@@ -200,8 +248,6 @@ impl Names {
     /// (already validated) and `library` the producer library name.
     pub(crate) fn new(model: &Model, package: &str, library: &str) -> Self {
         let mut types = HashMap::new();
-        let mut exceptions = HashMap::new();
-        let mut domains = HashMap::new();
         let mut destroys = HashMap::new();
         for m in &model.modules {
             for i in &m.interfaces {
@@ -217,16 +263,15 @@ impl Names {
             for name in declared {
                 types.insert(name.clone(), kt_type_ident(name));
             }
-            if let Some(eb) = m.errors.as_ref() {
-                exceptions.insert(
-                    eb.c_tag.clone(),
-                    kt_type_ident(&errors::exception_type_name(&eb.name)),
-                );
-                let next = u32::try_from(domains.len() + 1).unwrap_or(u32::MAX);
-                domains.insert(eb.c_tag.clone(), next);
-            }
         }
-        let taken: HashSet<&String> = types.values().chain(exceptions.values()).collect();
+        let domains: Vec<(String, String)> = errors::tables(model, "Exception")
+            .into_iter()
+            .map(|t| (t.domain.name.clone(), kt_type_ident(&t.type_name)))
+            .collect();
+        let taken: HashSet<&String> = types
+            .values()
+            .chain(domains.iter().map(|(_, exc)| exc))
+            .collect();
         let objects = model
             .modules
             .iter()
@@ -244,7 +289,6 @@ impl Names {
             prefix: model.prefix().to_string(),
             library: library.to_string(),
             types,
-            exceptions,
             domains,
             objects,
             destroys,
@@ -270,34 +314,54 @@ impl Names {
             .unwrap_or_else(|| kt_type_ident(name))
     }
 
-    /// The Kotlin exception class of an error domain.
-    pub(crate) fn exception(&self, eb: &ErrorBinding) -> String {
-        self.exceptions
-            .get(&eb.c_tag)
-            .cloned()
-            .unwrap_or_else(|| kt_type_ident(&errors::exception_type_name(&eb.name)))
+    /// The Kotlin exception class of the error domain `domain` (its raw
+    /// name): the shared exception spelling (`KvError` is `KvException`,
+    /// `KitchenErrors` is `KitchenException`), escaped like a type.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no domain has that name, which validation rules out.
+    pub(crate) fn exception(&self, domain: &str) -> &str {
+        self.domains
+            .iter()
+            .find(|(name, _)| name == domain)
+            .map(|(_, exc)| exc.as_str())
+            .unwrap_or_else(|| panic!("error domain '{domain}' is not declared"))
     }
 
-    /// The domain index `JniBridge.error` maps a failure of `f` through:
-    /// the module's domain for a throwing callable, else 0 (the trap,
-    /// `NativeBugException`).
-    pub(crate) fn domain(&self, f: &FnBinding, error: Option<&ErrorBinding>) -> u32 {
+    /// The `JniBridge.error` domain a failure of a callable with `error`
+    /// maps through: [`TRAP_DOMAIN`], [`UNTYPED_DOMAIN`], or the domain's
+    /// index (from 2, in declaration order).
+    pub(crate) fn domain_index(&self, error: &ErrorStrategy) -> u32 {
         match error {
-            Some(eb) if f.throws => self.domains.get(&eb.c_tag).copied().unwrap_or(0),
-            _ => 0,
+            ErrorStrategy::Trap => TRAP_DOMAIN,
+            ErrorStrategy::Untyped => UNTYPED_DOMAIN,
+            ErrorStrategy::Domain(name) => {
+                let i = self
+                    .domains
+                    .iter()
+                    .position(|(d, _)| d == name)
+                    .unwrap_or_else(|| panic!("error domain '{name}' is not declared"));
+                u32::try_from(i).map_or(u32::MAX, |i| i + 2)
+            }
         }
     }
 
-    /// Every declared domain with its index, in index order.
-    pub(crate) fn domains<'a>(&self, model: &'a Model) -> Vec<(u32, &'a ErrorBinding)> {
-        let mut out: Vec<(u32, &ErrorBinding)> = model
-            .modules
-            .iter()
-            .filter_map(|m| m.errors.as_ref())
-            .filter_map(|eb| self.domains.get(&eb.c_tag).map(|i| (*i, eb)))
-            .collect();
-        out.sort_by_key(|(i, _)| *i);
-        out
+    /// Every declared domain's `JniBridge.error` index and exception class,
+    /// in index order.
+    pub(crate) fn domains(&self) -> impl Iterator<Item = (u32, &str)> {
+        (2u32..).zip(self.domains.iter().map(|(_, exc)| exc.as_str()))
+    }
+
+    /// The exception class a callable with `error` raises, for its
+    /// `@Throws` annotation: the domain's, `FfiException` for `throws: any`,
+    /// or `None` for a call that can't fail.
+    pub(crate) fn thrown(&self, error: &ErrorStrategy) -> Option<&str> {
+        match error {
+            ErrorStrategy::Trap => None,
+            ErrorStrategy::Untyped => Some("FfiException"),
+            ErrorStrategy::Domain(name) => Some(self.exception(name)),
+        }
     }
 
     /// The simple Kotlin name of a module's object.
@@ -333,7 +397,7 @@ impl Names {
         format!("{}_JniBridge", pkg.join("_"))
     }
 
-    /// The public Kotlin type of an IR type.
+    /// The public Kotlin type of an IR value type.
     pub(crate) fn kt_type(&self, t: &Ty) -> String {
         match t {
             Ty::Prim(Prim::I8) => "Byte".into(),
@@ -349,98 +413,31 @@ impl Names {
             Ty::Prim(Prim::Bool) => "Boolean".into(),
             Ty::Prim(Prim::String) => "String".into(),
             Ty::Prim(Prim::Bytes) => "ByteArray".into(),
-            Ty::Record(n)
-            | Ty::RichEnum(n)
-            | Ty::Enum(n)
-            | Ty::Interface(n)
-            | Ty::CallbackInterface(n) => self.ty(n),
+            Ty::Record(n) | Ty::RichEnum(n) | Ty::Enum(n) | Ty::Interface(n) => self.ty(n),
             Ty::Optional(inner) => format!("{}?", self.kt_type(inner)),
             Ty::List(inner) => format!("List<{}>", self.kt_type(inner)),
             Ty::Map(k, v) => format!("Map<{}, {}>", self.kt_type(k), self.kt_type(v)),
-            Ty::Iterator(inner) => format!("NativeIterator<{}>", self.kt_type(inner)),
         }
     }
 
-    /// The Kotlin type a value crosses the JNI boundary as: unsigned
-    /// integers in the signed type of the same width (an `external fun`
-    /// can't take Kotlin's unsigned value classes), enums as `Int`, strings,
-    /// bytes, and value buffers as `ByteArray`, objects and iterators as
-    /// their address (`0L` is none), and a callback interface as the
-    /// implementing object.
-    pub(crate) fn jni_type(&self, t: &Ty) -> String {
-        match t.family() {
-            Family::Direct => jni_kind(t).into(),
-            Family::String | Family::Bytes | Family::Buffer => "ByteArray".into(),
-            Family::Object { .. } | Family::Iterator => "Long".into(),
-            Family::Callback { nullable } => {
-                let name = t
-                    .callback_interface_name()
-                    .expect("callback families name a callback interface");
-                format!("{}{}", self.ty(name), if nullable { "?" } else { "" })
+    /// The public Kotlin type of a parameter: its value type, or the
+    /// callback interface (nullable when optional).
+    pub(crate) fn kt_param_type(&self, t: &ParamTy) -> String {
+        match t {
+            ParamTy::Value(t) => self.kt_type(t),
+            ParamTy::Callback { name, nullable } => {
+                format!("{}{}", self.ty(name), if *nullable { "?" } else { "" })
             }
         }
     }
 
-    /// The JVM type descriptor of [`Names::jni_type`], for the method IDs
-    /// the shim caches; `None` is `void`.
-    pub(crate) fn jni_descriptor(&self, t: Option<&Ty>) -> String {
-        let Some(t) = t else {
-            return "V".into();
-        };
-        match t.family() {
-            Family::Direct => match jni_kind(t) {
-                "Boolean" => "Z",
-                "Byte" => "B",
-                "Short" => "S",
-                "Int" => "I",
-                "Float" => "F",
-                "Double" => "D",
-                _ => "J",
-            }
-            .into(),
-            Family::String | Family::Bytes | Family::Buffer => "[B".into(),
-            Family::Object { .. } | Family::Iterator => "J".into(),
-            Family::Callback { .. } => {
-                let name = t
-                    .callback_interface_name()
-                    .expect("callback families name a callback interface");
-                format!("L{}/{};", self.package_path, self.ty(name))
-            }
+    /// The public Kotlin type of a return: its value type, or a
+    /// `NativeIterator` of the element type.
+    pub(crate) fn kt_ret_type(&self, t: &RetTy) -> String {
+        match t {
+            RetTy::Value(t) => self.kt_type(t),
+            RetTy::Iterator(elem) => format!("NativeIterator<{}>", self.kt_type(elem)),
         }
-    }
-}
-
-/// The JNI C type of [`Names::jni_type`].
-pub(crate) fn jni_c_type(t: &Ty) -> &'static str {
-    match t.family() {
-        Family::Direct => match jni_kind(t) {
-            "Boolean" => "jboolean",
-            "Byte" => "jbyte",
-            "Short" => "jshort",
-            "Int" => "jint",
-            "Float" => "jfloat",
-            "Double" => "jdouble",
-            _ => "jlong",
-        },
-        Family::String | Family::Bytes | Family::Buffer => "jbyteArray",
-        Family::Object { .. } | Family::Iterator => "jlong",
-        Family::Callback { .. } => "jobject",
-    }
-}
-
-/// The JNI carrier of a direct-family value, which is also the
-/// `Call{Kind}Method` and `on{Kind}` stem: `Boolean`, `Byte`, `Short`,
-/// `Int`, `Long`, `Float`, or `Double`. Unsigned integers ride in the signed
-/// type of the same width; objects ride in `Long`.
-pub(crate) fn jni_kind(t: &Ty) -> &'static str {
-    match t {
-        Ty::Prim(Prim::Bool) => "Boolean",
-        Ty::Prim(Prim::I8 | Prim::U8) => "Byte",
-        Ty::Prim(Prim::I16 | Prim::U16) => "Short",
-        Ty::Prim(Prim::I32 | Prim::U32) | Ty::Enum(_) => "Int",
-        Ty::Prim(Prim::F32) => "Float",
-        Ty::Prim(Prim::F64) => "Double",
-        _ => "Long",
     }
 }
 
@@ -481,5 +478,17 @@ mod tests {
         assert_eq!(kt_member("notify_all"), "notifyAll_");
         assert_eq!(kt_member("dispose"), "dispose");
         assert_eq!(kt_member("object"), "object_");
+    }
+
+    #[test]
+    fn fields_are_camel_cased_and_unique() {
+        assert_eq!(
+            kt_fields(["expires_at", "expiresAt", "in", "_hidden"], false),
+            ["expiresAt", "expiresAt_", "in_", "hidden"]
+        );
+        assert_eq!(
+            kt_fields(["message", "code", "key"], true),
+            ["message_", "code_", "key"]
+        );
     }
 }

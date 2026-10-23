@@ -10,8 +10,8 @@
 
 use std::process::{Command, Stdio};
 
-use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
+use miette::{bail, IntoDiagnostic, Result, WrapErr};
 use serde::Deserialize;
 
 /// The facts about a Rust producer crate that building and packaging need,
@@ -25,8 +25,6 @@ pub struct CargoCrate {
     /// The library target's name with `-` mapped to `_` (`my_kv`): the base
     /// name of the `lib{lib_name}.so` Cargo produces.
     pub lib_name: String,
-    /// The crate types declared for the library target (`cdylib`, `rlib`, …).
-    pub crate_types: Vec<String>,
     /// The absolute path of the crate's `Cargo.toml`.
     pub manifest_path: Utf8PathBuf,
     /// The Cargo target directory (respecting `CARGO_TARGET_DIR`,
@@ -63,7 +61,8 @@ impl CargoCrate {
             .arg("--manifest-path")
             .arg(manifest.as_str())
             .output()
-            .context("failed to run `cargo metadata`; is Cargo installed and on PATH?")?;
+            .into_diagnostic()
+            .wrap_err("failed to run `cargo metadata`; is Cargo installed and on PATH?")?;
         if !output.status.success() {
             bail!(
                 "`cargo metadata` failed for {manifest}:\n{}",
@@ -71,7 +70,8 @@ impl CargoCrate {
             );
         }
         let metadata: Metadata = serde_json::from_slice(&output.stdout)
-            .context("failed to parse `cargo metadata` output")?;
+            .into_diagnostic()
+            .wrap_err("failed to parse `cargo metadata` output")?;
         let wanted = canonical(manifest);
         let Some(package) = metadata
             .packages
@@ -92,7 +92,6 @@ impl CargoCrate {
         };
         Ok(Self {
             lib_name: lib.name.replace('-', "_"),
-            crate_types: lib.crate_types.clone(),
             name: package.name,
             version: package.version,
             manifest_path: package.manifest_path,
@@ -118,24 +117,17 @@ impl CargoCrate {
         self.manifest_path.parent().unwrap_or(Utf8Path::new("."))
     }
 
-    /// Build the crate's library for the host with
-    /// `cargo build --lib --message-format=json-render-diagnostics` (in
-    /// release mode with `release`), forwarding Cargo's diagnostics to
-    /// stderr, and return the library it produced: the `cdylib` if the crate
-    /// declares one, else the `staticlib`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when Cargo can't be run or fails, or when the crate
-    /// produces neither a `cdylib` nor a `staticlib`.
-    pub fn build_library(&self, release: bool, quiet: bool) -> Result<Utf8PathBuf> {
+    /// Build the crate's library for the host as a `cdylib` with `cargo
+    /// rustc --lib --crate-type cdylib --profile {profile}` (so the crate
+    /// needs no particular `crate-type`), forwarding Cargo's diagnostics to
+    /// stderr, and return the shared library it produced.
+    pub(crate) fn build_library(&self, profile: &str, quiet: bool) -> Result<Utf8PathBuf> {
         let mut cmd = Command::new(cargo_bin());
-        cmd.args(["build", "--lib", "--message-format=json-render-diagnostics"])
+        cmd.args(["rustc", "--lib", "--crate-type", "cdylib"])
+            .args(["--profile", profile])
+            .arg("--message-format=json-render-diagnostics")
             .arg("--manifest-path")
             .arg(self.manifest_path.as_str());
-        if release {
-            cmd.arg("--release");
-        }
         if quiet {
             cmd.arg("--quiet");
         }
@@ -143,7 +135,8 @@ impl CargoCrate {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .output()
-            .context("failed to run `cargo build`; is Cargo installed and on PATH?")?;
+            .into_diagnostic()
+            .wrap_err("failed to run `cargo rustc`; is Cargo installed and on PATH?")?;
         if !output.status.success() {
             bail!(
                 "cargo failed to build `{}`; see its errors above",
@@ -151,33 +144,30 @@ impl CargoCrate {
             );
         }
         let files = self.lib_artifacts(&output.stdout);
-        let is = |suffixes: &[&str]| {
-            files
-                .iter()
-                .find(|f| suffixes.iter().any(|s| f.as_str().ends_with(s)))
-                .cloned()
-        };
-        let library = is(&[".dylib", ".so", ".dll", ".wasm"]).or_else(|| {
-            files
-                .iter()
-                .find(|f| {
-                    f.as_str().ends_with(".a")
-                        || (f.as_str().ends_with(".lib") && !f.as_str().ends_with(".dll.lib"))
-                })
-                .cloned()
-        });
-        library.ok_or_else(|| {
-            anyhow::anyhow!(
-                "`{}` builds no cdylib or staticlib to read its API from; add `crate-type = \
-                 [\"cdylib\"]` under [lib] in {}",
-                self.name,
-                self.manifest_path
-            )
-        })
+        files
+            .iter()
+            .find(|f| {
+                [".dylib", ".so", ".dll"]
+                    .iter()
+                    .any(|s| f.as_str().ends_with(s))
+            })
+            .cloned()
+            .ok_or_else(|| {
+                miette::miette!("cargo built `{}` but reported no shared library", self.name)
+            })
     }
 
     /// The files Cargo reported for this crate's library target, from the
     /// JSON messages (`--message-format=json`) it printed to stdout.
+    ///
+    /// Each is the file rustc wrote into the profile's `deps` directory
+    /// rather than the copy Cargo reports, which it uplifts into the profile
+    /// directory: Cargo deletes and re-creates that copy on every run, even
+    /// one with nothing to rebuild, so another `cargo` run on the same
+    /// target directory (a concurrent `weaveffi` command, an editor) can
+    /// remove it while this process reads it. The `deps` file changes only
+    /// when the crate is rebuilt. A file with no `deps` original (a name
+    /// Cargo decorated with a hash) is returned as reported.
     #[must_use]
     pub fn lib_artifacts(&self, stdout: &[u8]) -> Vec<Utf8PathBuf> {
         let manifest = canonical(&self.manifest_path);
@@ -203,7 +193,7 @@ impl CargoCrate {
                     files
                         .iter()
                         .filter_map(|f| f.as_str())
-                        .map(Utf8PathBuf::from),
+                        .map(|f| unuplifted(Utf8Path::new(f))),
                 );
             }
         }
@@ -211,22 +201,22 @@ impl CargoCrate {
     }
 }
 
-/// The nearest `Cargo.toml` at or above `start` (a file or a directory),
-/// or `None` when there is none up to the filesystem root.
-#[must_use]
-pub fn find_manifest(start: &Utf8Path) -> Option<Utf8PathBuf> {
-    let start = std::path::absolute(start.as_std_path()).ok()?;
-    let start = Utf8PathBuf::from_path_buf(start).ok()?;
-    start
-        .ancestors()
-        .map(|dir| dir.join("Cargo.toml"))
-        .find(|candidate| candidate.is_file())
-}
-
 /// The `cargo` executable: `$CARGO` when running under Cargo, else `cargo`.
 #[must_use]
 pub fn cargo_bin() -> String {
     std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string())
+}
+
+/// The original in `deps/` of a file Cargo uplifted to `path`, if there is
+/// one (see [`CargoCrate::lib_artifacts`]), else `path`.
+fn unuplifted(path: &Utf8Path) -> Utf8PathBuf {
+    if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
+        let original = dir.join("deps").join(name);
+        if original.is_file() {
+            return original;
+        }
+    }
+    path.to_path_buf()
 }
 
 /// `path` with symlinks and `..` resolved where possible, for comparing
@@ -260,8 +250,6 @@ struct Package {
 struct Target {
     name: String,
     kind: Vec<String>,
-    #[serde(default)]
-    crate_types: Vec<String>,
 }
 
 impl Target {
@@ -289,7 +277,6 @@ mod tests {
         let krate = CargoCrate::resolve(&manifest).unwrap();
         assert_eq!(krate.name, "calculator");
         assert_eq!(krate.lib_name, "calculator");
-        assert!(krate.crate_types.iter().any(|t| t == "cdylib"));
         assert!(krate.target_dir.ends_with("target"), "{}", krate.target_dir);
         assert_eq!(krate.weaveffi_dir(), krate.target_dir.join("weaveffi"));
     }
@@ -306,11 +293,5 @@ mod tests {
         assert!(err.to_string().contains("virtual workspace"), "{err}");
         let err = CargoCrate::resolve(Utf8Path::new("/nonexistent/Cargo.toml")).unwrap_err();
         assert!(err.to_string().contains("no Cargo.toml"), "{err}");
-    }
-
-    #[test]
-    fn manifests_are_found_from_nested_paths() {
-        let found = find_manifest(&repo_root().join("samples/calculator/src/lib.rs")).unwrap();
-        assert!(found.ends_with("samples/calculator/Cargo.toml"), "{found}");
     }
 }

@@ -1,109 +1,109 @@
+//! `weaveffi generate --diff`: the unified diff of what regenerating would
+//! change, without writing anything.
+
 use std::path::Path;
 
-use predicates::prelude::*;
+use crate::weaveffi;
 
-#[test]
-fn diff_against_empty_dir() {
+fn sample(name: &str) -> std::path::PathBuf {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/calculator");
+    repo_root.join("samples").join(name)
+}
 
+#[test]
+fn diff_against_an_empty_dir_adds_every_file_and_writes_nothing() {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let empty_out = tmp.path().join("empty");
     std::fs::create_dir_all(&empty_out).unwrap();
 
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args([
-            "diff",
-            input.to_str().unwrap(),
-            "--out",
-            empty_out.to_str().unwrap(),
-        ])
+    let output = weaveffi()
+        .args(["generate", "--diff", "--target", "c"])
+        .arg(sample("calculator"))
+        .arg("--out")
+        .arg(&empty_out)
         .output()
-        .expect("failed to run weaveffi diff");
+        .expect("failed to run weaveffi generate --diff");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "diff command failed: {stdout}");
-    assert!(!stdout.is_empty(), "diff output should not be empty");
-
-    for line in stdout.lines() {
-        assert!(
-            line.contains("[new file]"),
-            "expected every line to contain [new file], got: {line}"
-        );
-    }
+    assert!(output.status.success(), "generate --diff failed: {stdout}");
+    assert!(
+        stdout.contains("--- /dev/null\n+++ b/c/calculator.h\n"),
+        "{stdout}"
+    );
+    assert!(
+        std::fs::read_dir(&empty_out).unwrap().next().is_none(),
+        "--diff must not write"
+    );
 }
 
 #[test]
-fn diff_no_changes() {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/calculator");
-
+fn diff_is_empty_when_nothing_changed() {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = tmp.path().join("generated");
 
-    assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args([
-            "generate",
-            input.to_str().unwrap(),
-            "-o",
-            out_path.to_str().unwrap(),
-        ])
+    weaveffi()
+        .arg("generate")
+        .arg(sample("calculator"))
+        .arg("-o")
+        .arg(&out_path)
         .assert()
         .success();
 
-    assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args([
-            "diff",
-            input.to_str().unwrap(),
-            "--out",
-            out_path.to_str().unwrap(),
-        ])
+    let edited = out_path.join("c/calculator.h");
+    let original = std::fs::read_to_string(&edited).unwrap();
+    std::fs::write(&edited, format!("{original}// edited\n")).unwrap();
+    let output = weaveffi()
+        .args(["generate", "--diff"])
+        .arg(sample("calculator"))
+        .arg("--out")
+        .arg(&out_path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.starts_with("--- a/c/calculator.h\n+++ b/c/calculator.h\n")
+            && stdout.contains("-// edited\n"),
+        "{stdout}"
+    );
+    assert!(std::fs::read_to_string(&edited)
+        .unwrap()
+        .ends_with("// edited\n"));
+
+    std::fs::write(&edited, original).unwrap();
+    weaveffi()
+        .args(["generate", "--diff"])
+        .arg(sample("calculator"))
+        .arg("--out")
+        .arg(&out_path)
         .assert()
         .success()
-        .stdout(predicate::str::contains("No differences found."));
+        .stdout("");
 }
 
-/// Regression: `weaveffi diff` must apply the in-IDL `generators:` block
-/// the same way `weaveffi generate` does, otherwise an IDL with custom
-/// per-language naming (cpp namespace, dart package, dotnet assembly,
-/// etc.) reports spurious diffs against its own freshly generated output.
+/// `generate --check` applies the `[generators.*]` tables of the sample's
+/// `weaveffi.toml` the same way `generate` does, so a freshly generated
+/// tree with custom naming checks clean.
 #[test]
-fn diff_check_honors_inline_generators() {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/kvstore");
-
+fn check_honors_generator_tables() {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = tmp.path().join("generated");
 
-    assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args([
-            "generate",
-            input.to_str().unwrap(),
-            "-o",
-            out_path.to_str().unwrap(),
-        ])
+    weaveffi()
+        .arg("generate")
+        .arg(sample("kvstore"))
+        .arg("-o")
+        .arg(&out_path)
         .assert()
         .success();
 
-    assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args([
-            "diff",
-            input.to_str().unwrap(),
-            "--out",
-            out_path.to_str().unwrap(),
-            "--check",
-        ])
+    weaveffi()
+        .args(["generate", "--check"])
+        .arg(sample("kvstore"))
+        .arg("--out")
+        .arg(&out_path)
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "0 added, - 0 removed, ~ 0 modified",
-        ));
+        .stdout("");
 }

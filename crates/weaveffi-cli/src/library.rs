@@ -11,8 +11,8 @@
 
 use std::collections::BTreeSet;
 
-use anyhow::{bail, Context, Result};
 use camino::Utf8Path;
+use miette::{bail, IntoDiagnostic, Result, WrapErr};
 use object::read::archive::ArchiveFile;
 use object::{BinaryFormat, Object, ObjectSection, ObjectSymbol, SymbolSection};
 use weaveffi_model::meta::{self, Frame};
@@ -26,18 +26,23 @@ use weaveffi_model::meta::{self, Frame};
 ///
 /// Returns an error when the file can't be read or isn't an object file
 /// `object` understands, or when a frame is malformed.
-pub fn read_frames(path: &Utf8Path) -> Result<Vec<Frame>> {
-    let data = std::fs::read(path).with_context(|| format!("failed to read {path}"))?;
+pub(crate) fn read_frames(path: &Utf8Path) -> Result<Vec<Frame>> {
+    let data = std::fs::read(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read {path}"))?;
     let mut frames = Vec::new();
     if let Ok(archive) = ArchiveFile::parse(&*data) {
         for member in archive.members() {
-            let member = member.with_context(|| format!("{path} is a malformed archive"))?;
+            let member = member
+                .into_diagnostic()
+                .wrap_err_with(|| format!("{path} is a malformed archive"))?;
             let bytes = member
                 .data(&*data)
-                .with_context(|| format!("{path} is a malformed archive"))?;
+                .into_diagnostic()
+                .wrap_err_with(|| format!("{path} is a malformed archive"))?;
             // Archives also carry symbol tables and other non-object members.
             if let Ok(file) = object::File::parse(bytes) {
-                frames.extend(object_frames(&file).with_context(|| {
+                frames.extend(object_frames(&file).wrap_err_with(|| {
                     format!(
                         "{path}({}) has malformed WeaveFFI metadata",
                         String::from_utf8_lossy(member.name())
@@ -48,15 +53,16 @@ pub fn read_frames(path: &Utf8Path) -> Result<Vec<Frame>> {
         return Ok(frames);
     }
     let file = object::File::parse(&*data)
-        .with_context(|| format!("{path} isn't a library WeaveFFI can read"))?;
-    object_frames(&file).with_context(|| format!("{path} has malformed WeaveFFI metadata"))
+        .into_diagnostic()
+        .wrap_err_with(|| format!("{path} isn't a library WeaveFFI can read"))?;
+    object_frames(&file).wrap_err_with(|| format!("{path} has malformed WeaveFFI metadata"))
 }
 
 /// The frames in one object file.
 fn object_frames(file: &object::File<'_>) -> Result<Vec<Frame>> {
     if file.format() == BinaryFormat::Wasm {
         return match file.section_by_name(meta::SECTION) {
-            Some(section) => Ok(meta::decode(section.data()?)?),
+            Some(section) => meta::decode(section.data().into_diagnostic()?).into_diagnostic(),
             None => Ok(Vec::new()),
         };
     }
@@ -90,11 +96,11 @@ fn object_frames(file: &object::File<'_>) -> Result<Vec<Frame>> {
         let Some(bytes) = data_at(file, address, section) else {
             bail!("the data of `{name}` isn't in the file");
         };
-        let len = meta::frame_len(bytes)?;
+        let len = meta::frame_len(bytes).into_diagnostic()?;
         let Some(frame) = bytes.get(..len) else {
             bail!("`{name}` is truncated");
         };
-        frames.extend(meta::decode(frame)?);
+        frames.extend(meta::decode(frame).into_diagnostic()?);
     }
     Ok(frames)
 }
@@ -120,7 +126,7 @@ fn data_at<'d>(
 /// The base name a library file is loaded by: `libkv.so`, `libkv.dylib`,
 /// `libkv.a`, `kv.dll`, `kv.lib`, and `kv.wasm` are all `kv`.
 #[must_use]
-pub fn library_name(path: &Utf8Path) -> String {
+pub(crate) fn library_name(path: &Utf8Path) -> String {
     let stem = path.file_stem().unwrap_or_default();
     match path.extension() {
         Some("so" | "dylib" | "a") => stem.strip_prefix("lib").unwrap_or(stem).to_string(),

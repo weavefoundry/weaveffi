@@ -1,8 +1,11 @@
 # IDL Schema
 
-An IDL document describes an API: its modules, types, and functions. YAML,
-JSON, and TOML are all accepted; this page uses YAML. It documents schema
-version `0.11.0`, the only version the current tools accept. A Rust producer
+An IDL document describes an API: its modules, types, and functions. YAML
+and JSON are accepted (TOML is only for [`weaveffi.toml`](../guides/config.md),
+never for an IDL); this page uses YAML, read as YAML 1.2, so a name YAML
+reads as null (`null`, `~`) has to be quoted (`name: "null"`). It
+documents schema version
+`0.12.0`, the only version the current tools accept. A Rust producer
 never writes one by hand (the macro embeds the API in the built library, and
 [`weaveffi extract`](../guides/extract.md) prints it as an IDL), but the
 schema is the same either way.
@@ -25,7 +28,7 @@ Editors using the YAML Language Server pick it up from a header comment:
 ## Document structure
 
 ```text
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: my_module
     doc: "..."
@@ -34,7 +37,7 @@ modules:
     interfaces: [...]
     callback_interfaces: [...]
     functions: [...]
-    errors: { ... }
+    errors: [...]
     modules: [...]
 ```
 
@@ -44,7 +47,7 @@ keys, so a misspelled field fails to parse instead of being ignored.
 
 | Field | Type | Required | Meaning |
 |-------|------|----------|---------|
-| `version` | string | yes | Must be `"0.11.0"` |
+| `version` | string | yes | Must be `"0.12.0"` |
 | `modules` | array of Module | yes | Top-level modules |
 
 ### Module
@@ -58,7 +61,7 @@ keys, so a misspelled field fails to parse instead of being ignored.
 | `enums` | array of Enum | C-style or rich enums |
 | `interfaces` | array of Interface | Reference-counted object types |
 | `callback_interfaces` | array of CallbackInterface | Method sets the consumer implements |
-| `errors` | ErrorDomain | The module's error domain |
+| `errors` | array of ErrorDomain | The module's error domains |
 | `modules` | array of Module | Nested submodules |
 
 ### Function
@@ -73,7 +76,7 @@ their sections.
 | `params` | array of Param | Ordered parameters (default none) |
 | `return` | TypeRef | Return type; omit for none |
 | `doc` | string | Documentation |
-| `throws` | bool | Report typed domain errors (default `false`) |
+| `throws` | string | The error domain the callable reports (`KvError`), or `any` for an untyped error; omit when it can't fail (see [Error domains](#error-domains)) |
 | `async` | bool | Complete asynchronously (default `false`) |
 | `cancellable` | bool | Accept a cancel token; requires `async: true` |
 | `deprecated` | string | Deprecation message propagated to every binding |
@@ -109,13 +112,23 @@ The parser reads outside in: `[Contact?]` is a list of optional contacts and
 YAML would otherwise interpret (`"string?"`, `"[i32]"`, `"{string:i32}"`).
 The Node and Wasm targets surface `i64` and `u64` as `BigInt`.
 
+How a type is spelled never depends on how it crosses, but two shapes
+cross faster than the rest at a call boundary: an optional scalar or C-style
+enum (`i32?`, `bool?`, `Color?`, the OptDirect family) is a presence flag
+plus the value, and a list of a fixed-width number (`[i32]`, `[f64]`, every
+integer and float type except `u8` and `bool`, the Slice family) is a typed
+array. Every binding still surfaces them as its ordinary optional and list
+types; inside a record, variant, or error payload they use the value-buffer
+encoding like any other type. See the
+[C ABI contract](abi.md#families-and-slots).
+
 **Map keys** must be an integer, `bool`, `string`, or a C-style enum, so
 every target can use its native dictionary with exact equality. Floats,
 `bytes`, composites, and objects are rejected:
 
 ```yaml
 # rejected: InvalidMapKey
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: maps
     functions:
@@ -132,7 +145,7 @@ and as the return of an async function (`AsyncIteratorReturn`):
 
 ```yaml
 # rejected: IteratorInInvalidPosition
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: streaming
     functions:
@@ -174,7 +187,7 @@ class, struct, or record type; no per-struct C functions exist.
 | `fields` | array of Field (required, non-empty) | Each with `name`, `type`, optional `doc` |
 
 ```yaml
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: geometry
     structs:
@@ -211,7 +224,7 @@ fields, and bindings map it to a Swift enum with associated values, a sealed
 class hierarchy, a tagged union, and so on. Unit and data variants may mix.
 
 ```yaml
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: shapes
     enums:
@@ -263,23 +276,23 @@ constructor where the target has one (Swift `init`, Python `__init__`);
 others become static factories. For an async factory, declare an `async`
 static that returns the interface.
 
-An interface may appear in every position except a map key: parameters,
-returns, optionals, lists, map values, record and variant fields, error
-payloads, iterator elements, async results, and callback parameters and
-returns. A map keyed by an interface reports both `InvalidMapKey` and
+An interface may appear in every position except a map key and an error
+payload: parameters, returns, optionals, lists, map values, record and
+variant fields, iterator elements, async results, and callback parameters
+and returns. A map keyed by an interface reports both `InvalidMapKey` and
 `InterfaceInInvalidPosition`. `Store?`
 at the top level of a parameter or return is a nullable pointer. Every
 position transfers or borrows references by the rules in
 [Errors and Memory](../guides/errors-and-memory.md#objects).
 
 ```yaml
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: kv
     errors:
-      name: KvError
-      codes:
-        - { name: KeyNotFound, code: 1001, message: "key not found" }
+      - name: KvError
+        codes:
+          - { name: KeyNotFound, code: 1001, message: "key not found" }
     structs:
       - name: StoreInfo
         fields:
@@ -291,13 +304,13 @@ modules:
           - name: open
             params:
               - { name: path, type: string }
-            throws: true
+            throws: KvError
         methods:
           - name: get
             params:
               - { name: key, type: string }
             return: bytes
-            throws: true
+            throws: KvError
           - name: share
             return: Store
           - name: larger
@@ -313,12 +326,12 @@ modules:
             params:
               - { name: paths, type: "[string]" }
             return: "[Store]"
-            throws: true
+            throws: KvError
 ```
 
 ```yaml
 # rejected: InvalidMapKey, InterfaceInInvalidPosition
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: kv
     interfaces:
@@ -369,12 +382,15 @@ Methods are restricted:
   (`CallbackInterfaceInInvalidPosition`); an object parameter transfers one
   reference to the consumer.
 
-A method may set `throws: true` when an error domain is in scope for its
-module (otherwise it's `ThrowsWithoutErrorDomain`). Its consumer may then
-fail with one of the domain's codes, with the code's fields (which can't
-include objects), and the producer receives the typed error. Any other
-consumer failure, and every failure of a method without `throws`, reaches
-the producer as the runtime code `-4`.
+A method may declare `throws` like any callable. With `throws: KvError` its
+consumer may fail with one of the domain's codes, with the code's fields
+(which can't include objects), and the producer receives the typed error;
+with `throws: any` a consumer failure reaches the producer as an untyped
+error with its message. Every failure of a method without `throws`, and a
+code its domain doesn't declare, reaches the producer as the runtime code
+`-4`. Each callback method is its own contract entry, so appending a method
+to a callback interface doesn't break a deployed binding; reordering methods
+or inserting one before others moves vtable slots and does.
 
 A callback interface is valid only as a top-level parameter of a function,
 constructor, method, or static, passed bare (`Listener`) or optional
@@ -383,7 +399,7 @@ constructor, method, or static, passed bare (`Listener`) or optional
 
 ```yaml
 # rejected: CallbackInterfaceInInvalidPosition
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: events
     callback_interfaces:
@@ -396,7 +412,7 @@ modules:
 ```
 
 ```yaml
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: events
     enums:
@@ -433,11 +449,11 @@ modules:
 ```
 
 A callback interface lowers to a vtable type that starts with a header (the
-vtable's `size`, reserved `flags`, and the `free` release hook) followed by
-one entry per method in declaration order; a parameter lowers to a `ctx`
-pointer plus the vtable. From the `kitchen_sink` fixture, whose `label`
-returns a `string` and throws, `latest` returns an `Item?`, and `favorite`
-returns a `Gadget`:
+vtable's `size`, its `flags`, and the `free` release hook) followed by one
+entry per method in declaration order; a parameter lowers to a `ctx` pointer
+plus the vtable. From the `kitchen_sink` fixture, whose `label` returns a
+`string` and throws, `latest` returns an `Item?`, and `favorite` returns a
+`Gadget`:
 
 ```c
 typedef struct kitchen_sink_kitchen_ReadyListener_vtable {
@@ -457,10 +473,10 @@ bool kitchen_sink_kitchen_maybe_subscribe(void* listener_ctx, const kitchen_sink
 
 ## Error domains
 
-A module may declare one error domain: named, stable codes its throwing
-callables report. Each binding generates a typed error (an exception
-hierarchy, a Swift `Error` enum, a Go error type) so consumers match on the
-names you declared.
+An error domain is a named set of stable codes that callables report. Each
+binding generates a typed error (an exception hierarchy, a Swift `Error`
+enum, a Go error type) so consumers match on the names you declared. A
+module may declare any number of domains in its `errors:` list.
 
 | Field | Type | Meaning |
 |-------|------|---------|
@@ -470,42 +486,68 @@ names you declared.
 Each code has a required `name` (PascalCase by convention), positive `code`,
 and default `message`, plus an optional `doc` and optional `fields`: a
 structured payload with the same shape as struct fields, delivered as
-properties of the raised error.
+properties of the raised error. Payload fields are plain data: a field may
+not reach an interface, directly or through a record or rich enum
+(`ObjectInErrorPayload`), because a consumer generated before a code existed
+discards its payload without decoding it.
 
 ```yaml
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: kv
     errors:
-      name: KvError
-      codes:
-        - name: KeyNotFound
-          code: 1001
-          message: key not found
-          fields:
-            - { name: key, type: string }
-        - { name: StoreFull, code: 1003, message: store has reached capacity }
+      - name: KvError
+        codes:
+          - name: KeyNotFound
+            code: 1001
+            message: key not found
+            fields:
+              - { name: key, type: string }
+          - { name: StoreFull, code: 1003, message: store has reached capacity }
+      - name: ParseError
+        codes:
+          - { name: BadSyntax, code: 1, message: bad syntax }
     functions:
       - name: lookup
         params:
           - { name: key, type: string }
         return: bytes
-        throws: true
+        throws: KvError
+      - name: parse_key
+        params:
+          - { name: text, type: string }
+        return: string
+        throws: ParseError
+      - name: load_file
+        params:
+          - { name: path, type: string }
+        return: bytes
+        throws: any
       - name: count
         return: i64
 ```
 
-Declaring a domain reserves the codes; a function, constructor, method, or
-static opts in with `throws: true`. A callable without `throws` (`count`
-above) has a plain signature and can't report a domain error; a failure there
-is a producer bug and traps (see
-[Errors and Memory](../guides/errors-and-memory.md#domain-errors-and-the-trap-channel)).
-A domain is in scope for its module and every module nested in it, and
-`throws: true` with no domain in scope is rejected:
+A function, constructor, method, static, or callback method says how it can
+fail with `throws`:
+
+- **`throws: {Domain}`** names the one domain it reports (`lookup` above).
+  The name is global, so the domain can be declared in any module.
+- **`throws: any`** reports an untyped error: a message, with no code a
+  consumer can match on (`load_file`). Bindings surface it as the library's
+  base error type. A Rust producer's `Result<T, E>` becomes `throws: any`
+  whenever `E` isn't a declared domain (an `anyhow::Error`, a
+  `std::io::Error`, a `String`).
+- **No `throws`** (`count`) means a plain signature that can't report an
+  error; a failure there is a producer bug and traps (see
+  [Errors and Memory](../guides/errors-and-memory.md#domain-errors-and-the-trap-channel)).
+
+Boolean `throws: true` is gone; a document that still uses it fails to
+parse with a message pointing at the new syntax. A `throws` that names
+something other than an error domain is rejected:
 
 ```yaml
-# rejected: ThrowsWithoutErrorDomain
-version: "0.11.0"
+# rejected: UnknownErrorDomain
+version: "0.12.0"
 modules:
   - name: contacts
     functions:
@@ -513,13 +555,21 @@ modules:
         params:
           - { name: id, type: i64 }
         return: string
-        throws: true
+        throws: ContactError
 ```
+
+**Domains are open.** Each code is its own contract entry, so a producer may
+add codes to a domain without breaking a deployed binding. A binding that
+receives a positive code it wasn't generated with reports it as the domain's
+base error type with the code and message preserved.
 
 Codes must be positive (`0` is success and negative codes belong to the
 runtime) and unique within their domain. Code names must be unique across
 every domain in the API, because several targets flatten them into one
 namespace; qualify one (`OrderNotFound`) when two domains need the same idea.
+A domain name is a type name (unique with every other type), but it isn't a
+value type: `type: KvError` is `ErrorDomainAsType`. `any` is reserved and
+can't name a domain.
 
 ## Async, cancellable, and deprecated
 
@@ -530,7 +580,7 @@ Constructors can't be async, and `cancellable` requires `async`:
 
 ```yaml
 # rejected: CancellableNotAsync
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: net
     functions:
@@ -544,7 +594,7 @@ deprecation marker.
 ## Modules and names
 
 Modules nest to any depth. A nested module shares the validation rules of a
-top-level one, and an error domain declared on a parent serves the subtree.
+top-level one.
 
 **Names are global.** Modules group declarations and namespace their C
 symbols, but they don't scope names:
@@ -570,7 +620,7 @@ with underscores: a function `get_record` in module `app.data` is
 `{prefix}_app_data_Record`.
 
 ```yaml
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: kv
     interfaces:
@@ -594,7 +644,7 @@ modules:
 
 ```yaml
 # rejected: DuplicateFunctionName, QualifiedTypeRef
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: kv
     interfaces:
@@ -630,14 +680,16 @@ The rules in brief:
 - Names are identifiers (a letter or `_`, then ASCII letters, digits, and
   `_`) and not one of `if`, `else`, `for`, `while`, `loop`, `match`, `type`,
   `return`, `async`, `await`, `break`, `continue`, `fn`, `struct`, `enum`,
-  `mod`, `use`. Generators escape other languages' keywords themselves.
+  `mod`, `use` (and no error domain is named `any`). Generators escape other
+  languages' keywords themselves.
 - Type names, free-function names, and error code names are unique across
   the whole API; every other name is unique in its scope (see
   [Modules and names](#modules-and-names)).
 - Structs, enums, interfaces, and callback interfaces aren't empty.
 - Types are bare names that resolve, and appear only in the positions in the
   table above.
-- `throws` needs a domain in scope; `cancellable` needs `async`.
+- `throws` names an error domain (or is `any`); `cancellable` needs
+  `async`.
 - Codes are positive and their values unique within a domain; no free
   function shares a domain's name.
 - **No two declarations lower to the same C symbol.** Every symbol is the
@@ -650,6 +702,11 @@ The rules in brief:
   reserve (`{prefix}_list_*`, `{prefix}_map_*`, and so on, which covers
   everything in a top-level module named `list`) collide too. The full
   symbol table is in the [C ABI contract](abi.md#symbol-names).
+- **No two C slots of one callable share a name.** A parameter `name` lowers
+  to `name_ptr` and `name_len` (or `has_name` and `name`, or `name_ctx` and
+  `name_vtable`), so it collides with a parameter called `name_ptr` next to
+  it, and a parameter named `out_err`, `out_len`, `out_value`, `callback`,
+  `context`, or `cancel_token` can collide with a slot the lowering adds.
 
 A document with an unsupported `version` reports only
 `UnsupportedSchemaVersion`.
@@ -658,12 +715,12 @@ A document with an unsupported `version` reports only
 
 | Code | Reported when |
 |------|---------------|
-| `UnsupportedSchemaVersion` | `version` isn't `0.11.0` |
+| `UnsupportedSchemaVersion` | `version` isn't `0.12.0` |
 | `NoModuleName` | a module has no name |
 | `InvalidModuleName` | a module name isn't an identifier or is reserved |
 | `DuplicateModuleName` | two sibling modules share a name |
 | `InvalidIdentifier` | a name isn't a valid identifier |
-| `ReservedKeyword` | a name is a reserved word |
+| `ReservedKeyword` | a name is a reserved word, or an error domain is named `any` |
 | `DuplicateFunctionName` | two free functions anywhere in the API share a name |
 | `DuplicateParamName` | two parameters of a callable share a name |
 | `NameCollisionWithErrorDomain` | a free function and an error domain share a name |
@@ -678,6 +735,7 @@ A document with an unsupported `version` reports only
 | `ConstructorHasReturn` | a constructor declares `return` |
 | `AsyncConstructor` | a constructor is `async` |
 | `InterfaceInInvalidPosition` | an interface is used as a map key |
+| `ObjectInErrorPayload` | an error code's field reaches an interface, directly or through a record or rich enum |
 | `EmptyCallbackInterface` | a callback interface has no methods |
 | `DuplicateCallbackMethod` | two methods of a callback interface share a name |
 | `InvalidCallbackMethod` | a callback method is async or cancellable, or returns an iterator |
@@ -690,12 +748,14 @@ A document with an unsupported `version` reports only
 | `IteratorInInvalidPosition` | `iter<T>` appears other than as an outermost return |
 | `AsyncIteratorReturn` | an async function returns `iter<T>` |
 | `CancellableNotAsync` | a synchronous callable is `cancellable` |
-| `ThrowsWithoutErrorDomain` | `throws: true` on a callable or callback method with no error domain in scope |
+| `UnknownErrorDomain` | `throws` names something that isn't an error domain |
+| `ErrorDomainAsType` | an error domain is used as a value type |
 | `ErrorDomainMissingName` | an error domain has no name |
-| `DuplicateErrorCode` | two codes in a domain share a value |
+| `DuplicateErrorCode` | two codes in one domain share a value |
 | `DuplicateErrorCodeName` | two codes anywhere in the API share a name |
 | `InvalidErrorCode` | a code is zero or negative |
 | `SymbolCollision` | two declarations lower to the same C identifier, or one falls in a reserved helper family |
+| `SlotCollision` | two C slots of one callable's lowered signature share a name |
 
 ### Warnings
 
@@ -715,15 +775,15 @@ An address book combining an enum, a record, an error domain, an interface,
 and a nested module that uses its parent's types:
 
 ```yaml
-version: "0.11.0"
+version: "0.12.0"
 modules:
   - name: contacts
     doc: An in-memory address book.
     errors:
-      name: ContactsError
-      codes:
-        - { name: InvalidName, code: 1, message: name must not be empty }
-        - { name: NotFound, code: 2, message: contact not found }
+      - name: ContactsError
+        codes:
+          - { name: InvalidName, code: 1, message: name must not be empty }
+          - { name: NotFound, code: 2, message: contact not found }
     enums:
       - name: ContactType
         variants:
@@ -747,12 +807,12 @@ modules:
               - { name: email, type: "string?" }
               - { name: contact_type, type: ContactType }
             return: Contact
-            throws: true
+            throws: ContactsError
           - name: get
             params:
               - { name: id, type: i64 }
             return: Contact
-            throws: true
+            throws: ContactsError
           - name: list
             return: "[Contact]"
     modules:

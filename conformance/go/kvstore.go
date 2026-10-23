@@ -1,27 +1,30 @@
-// Conformance consumer: kvstore sample, Go target (ABI revision 4).
+// Conformance consumer: kvstore sample, Go target (ABI revision 5).
 //
 // Drives the feature-complete producer through the generated bindings:
 //
 //   - the load-time checks (ABI revision, both modules' contract tables),
-//     which importing the package performs;
+//     which Check reports;
 //   - Store: the throwing OpenStore and plain NewStore factories, methods,
 //     statics (StoreOpenMany, StoreDefaultCapacity, ...), the deprecated
 //     Size, the Entry and StoreInfo structs, the EntryKind constants, maps,
 //     optionals as pointers, and the logical clock;
 //   - KvError code types with their payload fields (*KeyNotFoundError,
-//     *ExpiredError, *StoreFullError, *InvalidPathError, *RejectedError),
-//     matched with errors.As, and runtime failures (-3, -4) as *Error;
+//     *ExpiredError, *StoreFullError, *InvalidPathError, *RejectedError,
+//     *CallbackFailedError), matched with errors.As, runtime failures (-3)
+//     as *Error, and a function that fails with any error (*Error, -1);
 //   - lazy iter.Seq2 and iter.Seq sequences of strings (throwing at launch),
 //     records, and objects, including one abandoned part-way;
-//   - three callback interfaces implemented in Go: a Listener (retained,
+//   - four callback interfaces implemented in Go: a Listener (retained,
 //     filtered by Accepts, told about every Change, detached when it
-//     panics, and called on a producer thread during compaction), a Policy
-//     (a record return, a throwing method whose *RejectedError reaches the
-//     Put caller with its payload, a plain error that arrives as -4, a
-//     malformed record return and a nil required object rejected as -3, an
-//     object parameter and object return), and a Loader passed as an
-//     optional callback (string, bytes, and optional-object returns; typed
-//     errors decoded by the producer or passed through);
+//     panics or fails, and called on a producer thread during compaction),
+//     a Policy (an optional scalar in and out, a record return, a typed
+//     *RejectedError that reaches the Put caller with its payload, a plain
+//     error, a malformed record return, and a nil required object that
+//     arrive as *CallbackFailedError, an object parameter and object
+//     return), a Loader passed as an optional callback (string, bytes, and
+//     optional-object returns; typed errors decoded by the producer or
+//     passed through; a typed nil passes no loader), and a Scorer (typed
+//     arrays in and out);
 //   - Store objects in every position: parameter, return, optional, list,
 //     map value, record field, sequence element, async result, and callback
 //     parameter and return;
@@ -31,7 +34,9 @@
 //     cooperatively, shown by StoreActiveJobs), an async list launched from
 //     32 goroutines, and an async function in the nested kv.stats module;
 //   - the sibling report root (the shared Entry record and its own error
-//     domain).
+//     domain);
+//   - the ABI 5 shapes: an optional scalar return, iterator item, and async
+//     result, typed-array returns and async results, and usize counts.
 //
 // Releases of consumer callbacks are observed through the producer's
 // callback counter (DebugLive(1)). Ends by asserting the producer's leak
@@ -99,37 +104,33 @@ func expectKeyNotFound(err error, key string) {
 	expect(e.Code() == 1001 && e.Key == key, fmt.Sprintf("KeyNotFound key %q (got %q)", key, e.Key))
 }
 
-// expectRuntime asserts that err is the runtime *Error with code.
-func expectRuntime(err error, code int32, message string) {
-	e := expectAs[*kv.Error](err, fmt.Sprintf("code %d", code))
-	expect(e.Code == code && e.Message == message, fmt.Sprintf("want %d %q, got %d %q", code, message, e.Code, e.Message))
-	var domain kv.KvError
-	expect(!errors.As(err, &domain), "a runtime failure isn't a KvError")
-}
-
 // ── listener (consumer-implemented, retained) ─────────────────────────────
 
 type recordingListener struct {
-	skip, failOn string
-	mu           sync.Mutex
-	changes      []kv.Change
-	offMain      atomic.Int32
+	skip, failOn, errOn string
+	mu                  sync.Mutex
+	changes             []kv.Change
+	offMain             atomic.Int32
 }
 
-func (l *recordingListener) Accepts(key string) bool {
+func (l *recordingListener) Accepts(key string) (bool, error) {
 	if l.failOn != "" && key == l.failOn {
 		panic("listener refused")
 	}
-	return key != l.skip
+	if l.errOn != "" && key == l.errOn {
+		return false, errors.New("listener declined")
+	}
+	return key != l.skip, nil
 }
 
-func (l *recordingListener) OnChange(change kv.Change) {
+func (l *recordingListener) OnChange(change kv.Change) error {
 	if C.on_main_thread() == 0 {
 		l.offMain.Add(1)
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.changes = append(l.changes, change)
+	return nil
 }
 
 func (l *recordingListener) last() kv.Change {
@@ -170,6 +171,20 @@ type testPolicy struct {
 	admitted atomic.Int32
 }
 
+// TTLFor: "short" lives one tick, "forever" never expires, "ttl-fail" fails
+// with a typed error, and every other key keeps the requested TTL.
+func (p *testPolicy) TTLFor(key string, requested *int64) (*int64, error) {
+	switch key {
+	case "short":
+		return ptr(int64(1)), nil
+	case "forever":
+		return nil, nil
+	case "ttl-fail":
+		return nil, &kv.InvalidPathError{Message: "no ttl for you"}
+	}
+	return requested, nil
+}
+
 func (p *testPolicy) Admit(entry kv.Entry) (kv.Entry, error) {
 	p.admitted.Add(1)
 	expect(entry.Version == 0, "the store assigns the version after admission")
@@ -194,29 +209,29 @@ func (p *testPolicy) Admit(entry kv.Entry) (kv.Entry, error) {
 
 // Route receives home as a wrapper of its own; the bindings hand the
 // producer a fresh reference to whatever it returns.
-func (p *testPolicy) Route(key string, home *kv.Store) *kv.Store {
+func (p *testPolicy) Route(key string, home *kv.Store) (*kv.Store, error) {
 	switch {
 	case strings.HasPrefix(key, "b/"):
 		home.Close()
-		return p.other
+		return p.other, nil
 	case strings.HasPrefix(key, "null/"):
 		home.Close()
-		return nil // a required object may not be nil: -3
+		return nil, nil // a required object may not be nil
 	}
-	return home
+	return home, nil
 }
 
 // ── loader (consumer-implemented, passed as an optional parameter) ────────
 
 type testLoader struct{ backup *kv.Store }
 
-func (testLoader) Name() string { return "go-loader" }
+func (testLoader) Name() (string, error) { return "go-loader", nil }
 
-func (l testLoader) Fallback(key string) *kv.Store {
+func (l testLoader) Fallback(key string) (*kv.Store, error) {
 	if key == "fb" {
-		return l.backup
+		return l.backup, nil
 	}
-	return nil
+	return nil, nil
 }
 
 func (testLoader) Load(key string) ([]byte, error) {
@@ -229,6 +244,38 @@ func (testLoader) Load(key string) ([]byte, error) {
 		return nil, errors.New("loader is broken")
 	}
 	return []byte("loaded:" + key), nil
+}
+
+// ── scorer (consumer-implemented, typed arrays in and out) ────────────────
+
+type testScorer struct {
+	mode string
+	seen []uint64
+}
+
+func (sc *testScorer) Scores(sizes []uint64) ([]float64, error) {
+	sc.seen = slices.Clone(sizes)
+	switch sc.mode {
+	case "fail":
+		return nil, errors.New("scorer is out of order")
+	case "short":
+		return []float64{1}, nil
+	}
+	scores := make([]float64, len(sizes))
+	for i, n := range sizes {
+		scores[i] = float64(n)
+	}
+	return scores, nil
+}
+
+// expectCallbackFailed asserts that err is the CallbackFailed code a
+// consumer callback's failure becomes, with message unless it's empty.
+func expectCallbackFailed(err error, message string) {
+	e := expectAs[*kv.CallbackFailedError](err, "CallbackFailed")
+	expect(e.Code() == 1006 && e.Message_ != "", fmt.Sprintf("CallbackFailed code %d message %q", e.Code(), e.Message_))
+	if message != "" {
+		expect(e.Message_ == message && e.Error() == message, fmt.Sprintf("CallbackFailed: want %q, got %q / %q", message, e.Message_, e.Error()))
+	}
 }
 
 // ── sections ──────────────────────────────────────────────────────────────
@@ -305,7 +352,7 @@ func basics() {
 	put(s, "beta", "b")
 	expect(s.Delete("beta") && !s.Delete("beta"), "delete twice")
 	size := s.Size() //nolint:staticcheck // the deprecated method still works
-	expect(size == s.Count() && size == 1, "deprecated Size == Count")
+	expect(uint64(size) == s.Count() && size == 1, "deprecated Size == Count")
 	expect(s.Clear() == 1 && s.Count() == 0, "clear")
 }
 
@@ -348,7 +395,7 @@ func iterators() {
 
 	// Partition: objects, created as they're pulled.
 	prefixes := []string{"user.", "sys.", "none."}
-	counts := []uint32{2, 1, 0}
+	counts := []uint64{2, 1, 0}
 	i := 0
 	for part := range s.Partition(prefixes) {
 		expect(part.Count() == counts[i] && part.Path() == prefixes[i], fmt.Sprintf("partition %d", i))
@@ -402,8 +449,17 @@ func listeners() {
 	expect(s.Count() == 2 && s.ListenerCount() == 0, "a failing listener is detached")
 	expect(liveCallbacks() == base, "the failing listener was released")
 
-	// A required callback can't be nil.
+	// So is one that returns an error.
+	declining := &recordingListener{errOn: "no"}
+	s.Subscribe(declining)
+	put(s, "no", "1")
+	expect(s.Count() == 3 && s.ListenerCount() == 0 && liveCallbacks() == base, "a declining listener is detached")
+
+	// A required callback can't be nil, nor a typed nil.
 	expect(catchPanic(func() { s.Subscribe(nil) }) != nil, "Subscribe(nil) panics")
+	var typedNil *recordingListener
+	expect(catchPanic(func() { s.Subscribe(typedNil) }) != nil, "Subscribe(typed nil) panics")
+	expect(s.ListenerCount() == 0 && liveCallbacks() == base, "no nil listener was attached")
 
 	// Closing the store releases the listeners it still holds.
 	s.Subscribe(&recordingListener{})
@@ -430,23 +486,35 @@ func policies() {
 	_, err = putKind(s, "b/x", "2", kv.EntryKindVolatile, nil)
 	expect(err == nil && s.Count() == 1 && other.Count() == 1, "route redirected b/x")
 
-	// A typed error from the throwing callback reaches the caller with its
-	// code, message, and payload.
+	// A typed error from the callback reaches the caller with its code and
+	// payload; the producer renders the message from the fields.
 	_, err = putKind(s, "secret", "3", kv.EntryKindVolatile, nil)
 	r := expectAs[*kv.RejectedError](err, "put(secret)")
-	expect(r.Code() == 1005 && r.Error() == "secrets are not stored", "Rejected code and message")
+	expect(r.Code() == 1005 && r.Error() == "write to secret rejected: no secrets", "Rejected code and message: "+r.Error())
 	expect(r.Key == "secret" && r.Reason == "no secrets", "Rejected payload")
 
-	// Any other error arrives as -4 with the consumer's message.
+	// Any other error becomes CallbackFailed with the consumer's message.
 	_, err = putKind(s, "boom", "4", kv.EntryKindVolatile, nil)
-	expectRuntime(err, -4, "policy exploded")
-	// A return the producer can't accept is -3: a malformed record or a nil
-	// required object.
+	expectCallbackFailed(err, "policy exploded")
+	// So does a return the producer can't accept: a malformed record or a
+	// nil required object.
 	_, err = putKind(s, "garbage", "5", kv.EntryKindVolatile, nil)
-	expect(expectAs[*kv.Error](err, "put(garbage)").Code == -3, "a malformed admit return is -3")
+	expectCallbackFailed(err, "")
 	_, err = putKind(s, "null/x", "6", kv.EntryKindVolatile, nil)
-	expect(expectAs[*kv.Error](err, "put(null/x)").Code == -3, "a nil route return is -3")
+	expectCallbackFailed(err, "")
 	expect(s.Count() == 1 && other.Count() == 1 && p.admitted.Load() == 6, "failed puts changed nothing")
+
+	// TTLFor: an optional scalar in and out, consulted before Admit.
+	e, err := putKind(s, "short", "x", kv.EntryKindVolatile, nil)
+	expect(err == nil && e.ExpiresAt != nil && *e.ExpiresAt == 1, "ttl_for overrides none")
+	e, err = putKind(s, "forever", "x", kv.EntryKindVolatile, ptr(int64(5)))
+	expect(err == nil && e.ExpiresAt == nil, "ttl_for removes the TTL")
+	e, err = putKind(s, "kept", "x", kv.EntryKindVolatile, ptr(int64(5)))
+	expect(err == nil && e.ExpiresAt != nil && *e.ExpiresAt == 5, "ttl_for keeps the TTL")
+	_, err = putKind(s, "ttl-fail", "x", kv.EntryKindVolatile, nil)
+	invalid := expectAs[*kv.InvalidPathError](err, "put(ttl-fail)")
+	expect(invalid.Error() == "invalid path", "InvalidPath message: "+invalid.Error())
+	expect(s.Count() == 4 && p.admitted.Load() == 9, "ttl_for runs before admit")
 
 	// Replacing the policy releases the old one; nil removes it.
 	s.SetPolicy(&testPolicy{other: other.Share()})
@@ -454,7 +522,7 @@ func policies() {
 	s.SetPolicy(nil)
 	expect(!s.HasPolicy() && liveCallbacks() == base, "SetPolicy(nil) released it")
 	put(s, "secret", "now allowed")
-	expect(s.Count() == 2, "no policy, no veto")
+	expect(s.Count() == 5, "no policy, no veto")
 
 	other.Close()
 	s.Close()
@@ -465,9 +533,12 @@ func loaders() {
 	defer s.Close()
 	base := liveCallbacks()
 
-	// No loader (a nil optional callback): a miss is none.
+	// No loader (a nil optional callback, or a typed nil): a miss is none.
 	e, err := s.GetOrLoad("k", nil)
 	expect(err == nil && e == nil, "no loader")
+	var typedNil *testLoader
+	e, err = s.GetOrLoad("k", typedNil)
+	expect(err == nil && e == nil && liveCallbacks() == base, "a typed nil passes no loader")
 
 	// Load's bytes are stored, tagged with the loader's name.
 	e, err = s.GetOrLoad("k", testLoader{})
@@ -490,13 +561,14 @@ func loaders() {
 	// answers none.
 	e, err = s.GetOrLoad("missing", testLoader{})
 	expect(err == nil && e == nil, "KeyNotFound for the same key is none")
-	// KeyNotFound for another key: passed through, payload intact.
+	// KeyNotFound for another key: passed through, payload intact, the
+	// message rendered from it.
 	_, err = s.GetOrLoad("elsewhere", testLoader{})
 	expectKeyNotFound(err, "other")
-	expect(err.Error() == "not in the loader", "the loader's message passed through")
-	// Any other error is -4.
+	expect(err.Error() == "key not found: other", "the domain's message: "+err.Error())
+	// Any other error is CallbackFailed with the loader's message.
 	_, err = s.GetOrLoad("broken", testLoader{})
-	expectRuntime(err, -4, "loader is broken")
+	expectCallbackFailed(err, "loader is broken")
 	expect(liveCallbacks() == base, "every loader was released")
 }
 
@@ -679,6 +751,9 @@ func statsAndReport() {
 }
 
 func main() {
+	expect(kv.Check() == nil, fmt.Sprintf("Check() = %v", kv.Check()))
+	expect(kv.Check() == kv.Check(), "Check reports one result")
+
 	constructors()
 	basics()
 	iterators()
@@ -688,7 +763,78 @@ func main() {
 	asyncCalls()
 	objectGraph()
 	statsAndReport()
+	abi5()
 
 	expectNoLeaks(kv.DebugLive)
 	fmt.Println("go/kvstore: OK")
+}
+
+func abi5() {
+	ctx := context.Background()
+	s, _ := kv.OpenStore("/abi5")
+	_, err := putKind(s, "b", "12", kv.EntryKindPersistent, nil)
+	expect(err == nil, "put b")
+	_, err = s.Put("a", []byte{1, 2, 3}, kv.EntryKindVolatile, ptr(int64(7)))
+	expect(err == nil && s.Count() == 2, "put a")
+
+	// An optional scalar return.
+	at := s.ExpiresAt("a")
+	expect(at != nil && *at == 7, "expires_at(a)")
+	expect(s.ExpiresAt("b") == nil && s.ExpiresAt("zzz") == nil, "expires_at(b), expires_at(zzz)")
+
+	// A typed-array return, in key order.
+	expect(slices.Equal(s.ValueSizes(), []uint64{3, 2}), fmt.Sprintf("value_sizes (got %v)", s.ValueSizes()))
+
+	// Optional scalar iterator items.
+	var expirations []*int64
+	for e := range s.Expirations() {
+		expirations = append(expirations, e)
+	}
+	expect(len(expirations) == 2 && *expirations[0] == 7 && expirations[1] == nil, "expirations")
+	expect(kv.DebugLive(2) == 0, "the expirations iterator was released")
+
+	// An optional scalar async result.
+	v, err := s.VersionOf(ctx, "a")
+	expect(err == nil && v != nil && *v == 1, fmt.Sprintf("version_of(a) = %v, %v", v, err))
+	v, err = s.VersionOf(ctx, "q")
+	expect(err == nil && v == nil, "version_of(q) is absent")
+
+	// A typed-array async result.
+	put(s, "b", "x")
+	versions, err := s.Versions(ctx, []string{"b", "q", "a"})
+	expect(err == nil && slices.Equal(versions, []uint32{2, 0, 1}), fmt.Sprintf("versions = %v, %v", versions, err))
+	versions, err = s.Versions(ctx, nil)
+	expect(err == nil && versions != nil && len(versions) == 0, "versions([])")
+	s.Close()
+
+	// A callback taking and returning typed arrays.
+	s, _ = kv.OpenStore("/rank")
+	put(s, "a", "1")
+	put(s, "b", "333")
+	put(s, "c", "22")
+	base := liveCallbacks()
+	sc := &testScorer{}
+	ranked, err := s.Rank(sc)
+	expect(err == nil && slices.Equal(ranked, []string{"b", "c", "a"}), fmt.Sprintf("rank = %v, %v", ranked, err))
+	expect(slices.Equal(sc.seen, []uint64{1, 3, 2}), fmt.Sprintf("the scorer saw %v", sc.seen))
+	_, err = s.Rank(&testScorer{mode: "fail"})
+	expectCallbackFailed(err, "scorer is out of order")
+	_, err = s.Rank(&testScorer{mode: "short"})
+	expectCallbackFailed(err, "expected 3 scores, got 1")
+	expect(liveCallbacks() == base, "every scorer was released")
+	s.Close()
+
+	// A function that fails with any error, counting with a usize.
+	s, _ = kv.OpenStore("/import")
+	n, err := s.ImportLines("a=1\n\nb=two\n")
+	expect(err == nil && n == 2, fmt.Sprintf("import_lines = %d, %v", n, err))
+	got, err := s.Get("b")
+	expect(err == nil && string(got.Value) == "two", "imported b")
+	_, err = s.ImportLines("c=3\nbroken\nd=4")
+	e := expectAs[*kv.Error](err, "import_lines(broken)")
+	expect(e.Code == -1 && e.Message == "line 2: expected key=value", fmt.Sprintf("import_lines: %d %q", e.Code, e.Message))
+	var domain kv.KvError
+	expect(!errors.As(err, &domain), "an untyped failure isn't a KvError")
+	expect(s.Count() == 3 && s.Find("c") != nil && s.Find("d") == nil, "c was stored, d wasn't")
+	s.Close()
 }

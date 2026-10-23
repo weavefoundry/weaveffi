@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use camino::Utf8Path;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use weaveffi_model::ir::{
     Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
@@ -18,7 +17,7 @@ fn model(api: &Api) -> Model {
 
 fn calculator_api() -> Api {
     Api {
-        version: "0.11.0".to_string(),
+        version: "0.12.0".to_string(),
         modules: vec![Module {
             name: "calculator".to_string(),
             doc: None,
@@ -41,7 +40,7 @@ fn calculator_api() -> Api {
                     returns: Some(TypeRef::Prim(Prim::I32)),
                     r#async: false,
                     cancellable: false,
-                    throws: false,
+                    throws: None,
                     deprecated: None,
                 },
                 Function {
@@ -62,7 +61,7 @@ fn calculator_api() -> Api {
                     returns: Some(TypeRef::Prim(Prim::I32)),
                     r#async: false,
                     cancellable: false,
-                    throws: false,
+                    throws: None,
                     deprecated: None,
                 },
                 Function {
@@ -83,7 +82,7 @@ fn calculator_api() -> Api {
                     returns: Some(TypeRef::Prim(Prim::I32)),
                     r#async: false,
                     cancellable: false,
-                    throws: false,
+                    throws: None,
                     deprecated: None,
                 },
                 Function {
@@ -97,14 +96,14 @@ fn calculator_api() -> Api {
                     returns: Some(TypeRef::Prim(Prim::String)),
                     r#async: false,
                     cancellable: false,
-                    throws: false,
+                    throws: None,
                     deprecated: None,
                 },
             ],
             structs: vec![],
             enums: vec![],
             callback_interfaces: vec![],
-            errors: None,
+            errors: Vec::new(),
             interfaces: vec![],
             modules: vec![],
         }],
@@ -196,7 +195,7 @@ fn large_api() -> Api {
                     ))))),
                     r#async: false,
                     cancellable: false,
-                    throws: false,
+                    throws: None,
                     deprecated: None,
                 })
                 .collect();
@@ -208,7 +207,7 @@ fn large_api() -> Api {
                 structs,
                 enums,
                 callback_interfaces: vec![],
-                errors: None,
+                errors: Vec::new(),
                 interfaces: vec![],
                 modules: vec![],
             }
@@ -216,7 +215,7 @@ fn large_api() -> Api {
         .collect();
 
     Api {
-        version: "0.11.0".to_string(),
+        version: "0.12.0".to_string(),
         modules,
     }
 }
@@ -262,12 +261,14 @@ fn bench_validate_kitchen_sink(c: &mut Criterion) {
 /// Every target rendering the kitchen-sink fixture in memory (no I/O).
 fn bench_render_kitchen_sink(c: &mut Criterion) {
     let model = model(&load_kitchen_sink_unvalidated());
-    let targets = weaveffi_cli::targets::all_default();
-    let out_dir = Utf8Path::new("out");
+    let targets: Vec<_> = weaveffi_cli::targets::REGISTRY
+        .iter()
+        .map(|d| d.build_default())
+        .collect();
     c.bench_function("render_kitchen_sink", |b| {
         b.iter(|| {
             for t in &targets {
-                black_box(t.render(black_box(&model), out_dir));
+                black_box(t.render(black_box(&model)));
             }
         });
     });

@@ -19,7 +19,7 @@ use super::helpers::{ident, thunk_attrs};
 ///   methods and release references from any thread, and async methods hold
 ///   an `Arc<T>` across a spawn;
 /// * `{c_tag}_clone`, which returns a new strong reference to the same object
-///   (the plan's `RetPass::Object::clone_symbol`);
+///   (the clone symbol a callback's object return names);
 /// * `{c_tag}_destroy`, which releases one strong reference; the object drops
 ///   with the last one. A panicking user `Drop` is swallowed (there is no
 ///   `out_err` slot to report through, and a destructor must not take down the
@@ -42,13 +42,13 @@ pub(crate) fn gen_interface_lifecycle(i: &InterfaceBinding) -> TokenStream {
         };
 
         #attrs
-        pub unsafe extern "C" fn #clone_sym(ptr: *const #ty) -> *mut #ty {
-            unsafe { ::weaveffi::abi::object_clone(ptr) }
+        pub unsafe extern "C" fn #clone_sym(__wv_ptr: *const #ty) -> *mut #ty {
+            unsafe { ::weaveffi::abi::object_clone(__wv_ptr) }
         }
 
         #attrs
-        pub unsafe extern "C" fn #destroy_sym(ptr: *mut #ty) {
-            unsafe { ::weaveffi::abi::object_destroy(ptr) }
+        pub unsafe extern "C" fn #destroy_sym(__wv_ptr: *mut #ty) {
+            unsafe { ::weaveffi::abi::object_destroy(__wv_ptr) }
         }
     }
 }

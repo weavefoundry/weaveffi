@@ -6,20 +6,26 @@
 // vectors built from literals (so a symmetric encode/decode bug can't hide),
 // spot checks of decoded fields (64-bit integers exact as bigints, float
 // bits, astral text), the typed out-of-range error and its payload, the
-// marshalling failures the API can express, and object identity and
-// reference counting through buffers. Ends with every leak counter at zero.
+// marshalling failures the API can express, range checks of every integer
+// width (direct, optional, typed-array, and buffered), optional scalars and
+// typed arrays of every kind, `usize`, `char`, and a custom type, a lazy
+// iterator of typed arrays, object identity and reference counting through
+// buffers, and, on WebAssembly, an instance poisoned by a trap. Ends with
+// every leak counter at zero.
 
-import { expect, finish, load, same, throws } from './harness.mjs';
+import { expect, finish, isWasm, live, load, same, throws } from './harness.mjs';
 
 const api = await load('codec');
 const { codec, CodecError } = api;
 const { Color, Token } = codec;
 
+const I32_MIN = -2147483648;
+const I32_MAX = 2147483647;
 const I64_MIN = -(2n ** 63n);
 const I64_MAX = 2n ** 63n - 1n;
 const U64_MAX = 2n ** 64n - 1n;
 
-expect(api.__debugLive(-1) === 1n, 'the sample counts live resources');
+expect(live(-1) === 1n, 'the sample counts live resources');
 
 const n = codec.vectorCount();
 expect(n >= 60, `at least 60 vectors (got ${n})`);
@@ -213,8 +219,143 @@ throws(() => codec.checkVector(0, { tag: 'Flag', value: 2 }), (e) => e instanceo
 throws(() => codec.checkVector(0, { tag: 'Nope' }), (e) => e instanceof TypeError, 'an unknown tag');
 throws(() => codec.checkVector(0, { tag: 'I64', value: 2n ** 64n }), (e) => e instanceof RangeError, 'an i64 out of range');
 throws(() => codec.echoText(null), (e) => e instanceof TypeError, 'a null string');
+throws(
+  () => codec.checkVector(0, { tag: 'I8', value: 128 }),
+  (e) => e instanceof RangeError,
+  'the buffer writer range-checks an i8',
+);
+throws(
+  () => codec.checkVector(0, { tag: 'U32', value: -1 }),
+  (e) => e instanceof RangeError,
+  'the buffer writer range-checks a u32',
+);
+throws(
+  () => codec.checkVector(0, { tag: 'U16', value: 1.5 }),
+  (e) => e instanceof RangeError,
+  'the buffer writer rejects a fractional u16',
+);
 
-// 6. Objects.
+// 6. Direct integers are range-checked before the call, deterministically:
+// a fractional, NaN, or out-of-range number is a RangeError (never a
+// wrapped or truncated value), and 64-bit integers take a bigint or an
+// integral number in range.
+const range = (fn, msg) => throws(fn, (e) => e instanceof RangeError, msg);
+expect(codec.echoI8(-128) === -128 && codec.echoI8(127) === 127, 'i8 bounds');
+range(() => codec.echoI8(128), 'i8 past the range');
+range(() => codec.echoI8(-129), 'i8 below the range');
+expect(codec.echoU8(255) === 255, 'u8 bound');
+range(() => codec.echoU8(256), 'u8 past the range');
+range(() => codec.echoU8(-1), 'u8 below the range');
+expect(codec.echoI16(-32768) === -32768, 'i16 bound');
+range(() => codec.echoI16(32768), 'i16 past the range');
+expect(codec.echoU16(65535) === 65535, 'u16 bound');
+range(() => codec.echoU16(65536), 'u16 past the range');
+expect(codec.echoU32(4294967295) === 4294967295, 'u32 bound');
+range(() => codec.echoU32(4294967296), 'u32 past the range');
+range(() => codec.echoI32(0.5), 'a fractional i32');
+range(() => codec.echoI32(Infinity), 'an infinite i32');
+expect(codec.echoI64(-(2 ** 63)) === I64_MIN, 'an integral number at the i64 minimum');
+expect(codec.echoI64(2 ** 53) === 2n ** 53n, 'an integral number as an i64');
+range(() => codec.echoI64(2 ** 63), '2^63 as a number is past the i64 range');
+range(() => codec.echoI64(I64_MAX + 1n), 'an i64 bigint past the range');
+range(() => codec.echoI64(NaN), 'NaN as an i64');
+range(() => codec.echoI64(1.5), 'a fractional i64');
+throws(() => codec.echoI64('1'), (e) => e instanceof TypeError, 'a string as an i64');
+expect(codec.echoU64(2 ** 63) === 2n ** 63n, '2^63 as a u64 number');
+range(() => codec.echoU64(2 ** 64), '2^64 as a number is past the u64 range');
+range(() => codec.echoU64(-1), 'a negative u64');
+range(() => codec.echoU64(-1n), 'a negative u64 bigint');
+// f32 arguments round as Float32Array does: past FLT_MAX plus half an ulp
+// to infinity, below it to FLT_MAX.
+const FLT_MAX = 3.4028234663852886e38;
+const FLT_OVERFLOW = 3.4028235677973366e38;
+expect(codec.echoF32(FLT_OVERFLOW) === Infinity, 'f32 rounds to infinity');
+expect(codec.echoF32(FLT_OVERFLOW - 2 ** 75) === FLT_MAX, 'f32 rounds to FLT_MAX');
+expect(codec.echoF32(-1e39) === -Infinity, 'f32 overflows to -infinity');
+expect(Object.is(codec.echoF32(-0), -0), 'f32 keeps the sign of zero');
+
+// 7. Optional scalars: null (or undefined) for none.
+expect(codec.echoOptI32(null) === null && codec.echoOptI32(undefined) === null, 'echoOptI32(none)');
+expect(codec.echoOptI32(I32_MIN) === I32_MIN && codec.echoOptI32(0) === 0, 'echoOptI32');
+range(() => codec.echoOptI32(2 ** 31), 'an optional i32 past the range');
+range(() => codec.echoOptI32(0.5), 'a fractional optional i32');
+expect(Object.is(codec.echoOptF64(-0), -0), 'echoOptF64 keeps -0');
+expect(Number.isNaN(codec.echoOptF64(NaN)), 'echoOptF64(NaN)');
+expect(codec.echoOptF64(null) === null, 'echoOptF64(none)');
+expect(
+  codec.echoOptBool(true) === true && codec.echoOptBool(false) === false && codec.echoOptBool(null) === null,
+  'echoOptBool',
+);
+throws(() => codec.echoOptBool(1), (e) => e instanceof TypeError, 'a number as an optional bool');
+expect(codec.echoOptColor(Color.Infrared) === -1 && codec.echoOptColor(Color.Blue) === 7, 'echoOptColor');
+expect(codec.echoOptColor(null) === null, 'echoOptColor(none)');
+throws(
+  () => codec.echoOptColor(3),
+  (e) => e instanceof CodecError && !(e instanceof codec.CodecError) && e.code === -3,
+  'an undeclared optional enum value',
+);
+
+// 8. Typed arrays: arrays (or the matching typed array) in, arrays out.
+const bits = (xs) => Array.from(new Uint8Array(Float64Array.from(xs).buffer));
+const floats = [NaN, -0, 5e-324, Infinity];
+const echoed = codec.echoF64s(floats);
+expect(Array.isArray(echoed), 'echoF64s returns an array');
+same(bits(echoed), bits(floats), 'echoF64s is bit-identical');
+same(codec.echoF64s(Float64Array.from(floats)).length, 4, 'echoF64s of a Float64Array');
+same(codec.echoI32s([I32_MIN, 0, I32_MAX]), [I32_MIN, 0, I32_MAX], 'echoI32s');
+same(codec.echoI32s([]), [], 'echoI32s of nothing');
+same(codec.echoI32s(new Int32Array(0)), [], 'echoI32s of an empty Int32Array');
+same(codec.echoU64s([U64_MAX, 2n ** 63n]), [U64_MAX, 2n ** 63n], 'echoU64s');
+same(codec.echoU64s([1]), [1n], 'echoU64s of an integral number');
+same(codec.echoU64s(BigUint64Array.of(5n)), [5n], 'echoU64s of a BigUint64Array');
+same(codec.echoU64s([]), [], 'echoU64s of nothing');
+range(() => codec.echoU64s([1n, -1n]), 'a negative u64 element');
+range(() => codec.echoI32s([1, 2 ** 31]), 'an i32 element past the range');
+throws(() => codec.echoI32s(new Uint32Array(1)), (e) => e instanceof TypeError, 'the wrong typed array');
+throws(() => codec.echoF64s(null), (e) => e instanceof TypeError, 'null as a list');
+
+// 9. usize (u64), char, and a custom type (Hex, a u32 written in hex).
+expect(codec.echoUsize(4294967295n) === 4294967295n, 'echoUsize');
+if (isWasm(api)) {
+  // wasm32's usize is 32 bits: a wider value fails the conversion.
+  throws(
+    () => codec.echoUsize(U64_MAX),
+    (e) => e instanceof CodecError && e.code === -3 && e.message === `value: ${U64_MAX} is not a valid usize`,
+    'echoUsize(u64::MAX) on a 32-bit producer',
+  );
+} else {
+  expect(codec.echoUsize(U64_MAX) === U64_MAX, 'echoUsize(u64::MAX)');
+}
+for (const ch of ['\u{1F980}', 'é', 'a']) expect(codec.echoChar(ch) === ch, `echoChar(${ch})`);
+const marshalling = (message) => (e) =>
+  e instanceof CodecError && !(e instanceof codec.CodecError) && e.code === -3 && e.message === message;
+throws(() => codec.echoChar('ab'), marshalling('value: "ab" is not a valid char'), 'echoChar("ab")');
+throws(() => codec.echoChar(''), marshalling('value: "" is not a valid char'), 'echoChar("")');
+expect(codec.echoHex('ff') === 'ff' && codec.echoHex('00FF') === 'ff' && codec.echoHex('0') === '0', 'echoHex');
+throws(() => codec.echoHex('xyz'), marshalling('value: invalid digit found in string'), 'echoHex("xyz")');
+throws(() => codec.echoHex(''), marshalling('value: cannot parse integer from empty string'), 'echoHex("")');
+throws(
+  () => codec.echoHex('100000000'),
+  marshalling('value: number too large to fit in target type'),
+  'echoHex past u32',
+);
+
+// 10. An iterator of typed arrays, pulled lazily and closed early.
+same([...codec.chunks([I32_MIN, 0, I32_MAX], 2)], [[I32_MIN, 0], [I32_MAX]], 'chunks of 2');
+same([...codec.chunks([1, 2, 3, 4], 2)], [[1, 2], [3, 4]], 'chunks of an even split');
+same([...codec.chunks([1, 2], 0)], [], 'chunks of size 0');
+same([...codec.chunks([], 3)], [], 'chunks of nothing');
+const lazy = codec.chunks(Int32Array.of(1, 2, 3), 1);
+same(lazy.next(), { done: false, value: [1] }, 'a lazy first chunk');
+expect(live(2) === 1n, 'the iterator is live while open');
+lazy.close();
+expect(live(2) === 0n && lazy.next().done, 'close() releases the iterator');
+lazy.close();
+const disposed = codec.chunks([1, 2], 1);
+disposed[Symbol.dispose]();
+expect(live(2) === 0n && disposed.next().done, '[Symbol.dispose]() releases the iterator');
+
+// 11. Objects.
 const full = codec.vector(find('objects full'));
 expect(full.tag === 'Objects', 'objects full is Objects');
 const h = full.value;
@@ -241,4 +382,33 @@ for (const t of [p, twin, minus4]) t.close();
 release(full);
 throws(() => p.value(), (e) => e instanceof CodecError && e.code === -3, 'a closed token');
 
-await finish(api, `codec (${n} vectors)`);
+// 12. On WebAssembly, a trap poisons the instance: every later call
+// throws a code -2 fault, and releases do nothing. A separate instance of
+// the module is trapped on purpose (an error message read from out of
+// bounds), through the transport itself.
+if (isWasm(api)) {
+  const { $loadWasm } = await import(new URL('./node_modules/codec/linear.js', import.meta.url));
+  const m = await $loadWasm('codec', undefined, 'codec', 'CODEC_LIBRARY', null);
+  expect(m.x.codec_abi_version() === 5, 'a second instance works');
+  let trapped = null;
+  try {
+    m.x.codec_error_set(m.err, 1, 0x7ffffff0, 64);
+  } catch (e) {
+    trapped = e;
+  }
+  expect(trapped instanceof WebAssembly.RuntimeError, `the bad read traps (got ${trapped})`);
+  let after = null;
+  try {
+    m.x.codec_abi_version();
+  } catch (e) {
+    after = e;
+  }
+  expect(
+    after !== null && after.code === -2 && after.message.includes('trapped earlier'),
+    `a call after the trap throws a code -2 fault (got ${after && after.message})`,
+  );
+  expect(m.q.codec_free_bytes(0, 0) === undefined, 'a release after the trap does nothing');
+  expect(codec.echoI32(7) === 7, "the bindings' own instance is unaffected");
+}
+
+await finish(`codec (${n} vectors)`);

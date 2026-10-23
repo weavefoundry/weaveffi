@@ -1,0 +1,16 @@
+error[E0277]: the trait bound `LookupError: From<ForeignError>` is not satisfied
+  --> tests/ui/fail_callback_error_without_from.rs:15:52
+   |
+15 |         fn lookup(&self, key: &str) -> Result<i64, LookupError>;
+   |                                                    ^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `From<ForeignError>` is not implemented for `LookupError`
+  --> tests/ui/fail_callback_error_without_from.rs:8:5
+   |
+ 8 |     pub enum LookupError {
+   |     ^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `convert_foreign`
+  --> $WORKSPACE/crates/weaveffi/src/abi/callback.rs
+   |
+   | pub fn convert_foreign<E: From<ForeignError>>(e: ForeignError) -> E {
+   |                           ^^^^^^^^^^^^^^^^^^ required by this bound in `convert_foreign`

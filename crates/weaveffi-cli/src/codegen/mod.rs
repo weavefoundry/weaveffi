@@ -1,96 +1,323 @@
-//! Target erasure and orchestration.
+//! Orchestration: rendering targets and turning their output into a
+//! [`Changeset`] against an output directory.
 //!
-//! Each language target implements [`LanguageBackend`] with its own typed
-//! `Config`. The orchestrator works on the object-safe [`Target`] trait, which
-//! erases the concrete config; [`ConfiguredBackend`] is the adapter that pairs
-//! a backend with a concrete config value and is what the CLI and tests pass
-//! into [`Orchestrator::with_target`].
+//! Rendering is pure: a [`Target`] returns its files in memory, with paths
+//! relative to its own directory (`{out_dir}/{target}/`). The
+//! [`Orchestrator`] renders every target, compares the result with the
+//! output directory ([`Orchestrator::plan`]), and only then touches disk
+//! ([`Changeset::apply`]). That one plan is what `weaveffi generate` writes,
+//! what `generate --check` reports, and what `generate --diff` prints. A
+//! plan rewrites only files whose contents changed and removes files a
+//! previous run wrote that the current run no longer produces (see the
+//! generation records in `.weaveffi-cache/`).
 //!
-//! Rendering is pure: a target returns its files in memory, and the
-//! [`Orchestrator`] does every write. That is what lets it rewrite only files
-//! whose contents changed, remove files a previous run wrote that the
-//! current run no longer produces (see [`crate::cache`]), and lets
-//! `weaveffi diff` compare without touching disk.
+//! The submodules are the **shared emitters** every target renders through
+//! instead of keeping its own copy:
+//!
+//! - `codecs`: the value-buffer composites an API uses and their one
+//!   canonical stem (`list_i32`, `opt_Item`).
+//! - `contract`: the contract rows a consumer checks at load.
+//! - `errors`: every error domain with its codes and target type names.
+//! - `docs`: doc and deprecation text with backticked identifiers in the
+//!   target's spelling.
+//! - `common`: doc-comment emission, prose wrapping, and `PascalCase`.
+//! - [`CodeWriter`]: the indentation-aware writer.
+//!
+//! None of them matches on a value's family or re-derives lowering: the
+//! passing contracts (`ArgPass`, `RetPass`, `ErrorStrategy`, ...) stored on
+//! the [`Model`] say how every value crosses.
 
-use anyhow::{Context, Result};
-use camino::Utf8Path;
+use std::fmt::Write as _;
+
+use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
+use miette::{miette, IntoDiagnostic, Result, WrapErr};
 use rayon::prelude::*;
+use similar::TextDiff;
 
-use crate::backend::{LanguageBackend, OutputFile};
-use crate::cache::{self, Record};
-use crate::package::{Artifact, PackageContext};
+use crate::record::{self, Record};
+use crate::targets::Target;
 use weaveffi_model::model::Model;
 
-pub mod common;
-pub mod writer;
+pub(crate) mod codecs;
+pub(crate) mod common;
+pub(crate) mod contract;
+pub(crate) mod docs;
+pub(crate) mod errors;
+mod writer;
 
 pub use writer::CodeWriter;
 
-/// Object-safe view of a [`LanguageBackend`] paired with a concrete config.
-///
-/// The orchestrator stores targets as `&dyn Target` so it can hold a
-/// heterogeneous set whose `Config` types differ. [`ConfiguredBackend`] is
-/// the canonical adapter.
-pub trait Target: Send + Sync {
-    /// The target's stable short name. Mirrors [`LanguageBackend::name`].
-    fn name(&self) -> &'static str;
-    /// Render every file the target produces for `model`, with paths under
-    /// `out_dir`. Pure: nothing is written.
-    fn render(&self, model: &Model, out_dir: &Utf8Path) -> Vec<OutputFile>;
-    /// Assemble the installable artifacts for this target, using the bound
-    /// config. Returns `None` when the target has no packaging.
-    fn package(&self, model: &Model, ctx: &PackageContext) -> Option<Vec<Artifact>>;
+/// A single generated file: its path relative to the target's directory and
+/// its rendered contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputFile {
+    /// Path relative to the target's directory (`{out_dir}/{target}/`),
+    /// with `/` separators.
+    pub path: Utf8PathBuf,
+    /// The rendered file contents.
+    pub contents: String,
 }
 
-/// Binds a [`LanguageBackend`] to a concrete config value so it can be erased
-/// to `&dyn Target`.
-///
-/// ```ignore
-/// let swift = ConfiguredBackend::new(SwiftGenerator, SwiftConfig::default());
-/// orchestrator.with_target(&swift);
-/// ```
-pub struct ConfiguredBackend<B: LanguageBackend> {
-    inner: B,
-    config: B::Config,
-}
-
-impl<B: LanguageBackend> ConfiguredBackend<B> {
-    /// Pair a backend with the concrete config it should run under.
-    pub fn new(inner: B, config: B::Config) -> Self {
-        Self { inner, config }
+impl OutputFile {
+    /// Pair a path, relative to the target's directory, with its rendered
+    /// contents.
+    ///
+    /// The path is normalized to `/` separators, which every platform's file
+    /// APIs accept, so listings, generation records, and tests see the same
+    /// path on Windows as elsewhere.
+    pub fn new(path: impl Into<Utf8PathBuf>, contents: impl Into<String>) -> Self {
+        let path: Utf8PathBuf = path.into();
+        let path = if path.as_str().contains('\\') {
+            Utf8PathBuf::from(path.as_str().replace('\\', "/"))
+        } else {
+            path
+        };
+        Self {
+            path,
+            contents: contents.into(),
+        }
     }
 }
 
-impl<B: LanguageBackend> Target for ConfiguredBackend<B> {
-    fn name(&self) -> &'static str {
-        self.inner.name()
+/// The path of a target's `file` relative to the output directory
+/// (`{target}/{file}`), with `/` separators on every platform.
+fn output_path(target: &str, file: &Utf8Path) -> Result<String> {
+    let mut parts = vec![target];
+    for component in file.components() {
+        match component {
+            Utf8Component::Normal(part) => parts.push(part),
+            Utf8Component::CurDir => {}
+            _ => {
+                return Err(miette!(
+                    "the {target} target rendered {file}, which isn't a path inside its directory"
+                ))
+            }
+        }
     }
+    Ok(parts.join("/"))
+}
 
-    fn render(&self, model: &Model, out_dir: &Utf8Path) -> Vec<OutputFile> {
-        self.inner.files(model, out_dir, &self.config)
-    }
+/// How applying a [`Changeset`] changes one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    /// The file doesn't exist yet.
+    Added,
+    /// The file exists with different contents.
+    Modified,
+    /// A previous generation wrote the file and this one doesn't.
+    Removed,
+}
 
-    fn package(&self, model: &Model, ctx: &PackageContext) -> Option<Vec<Artifact>> {
-        self.inner.package(model, ctx, &self.config)
+impl ChangeKind {
+    /// The one-character marker `generate --check` prints before a path.
+    #[must_use]
+    pub fn marker(self) -> char {
+        match self {
+            Self::Added => '+',
+            Self::Modified => '~',
+            Self::Removed => '-',
+        }
     }
 }
 
-/// The path of `file` relative to `out_dir`, with `/` separators on every
-/// platform, so listings and cache records are OS-independent.
-///
-/// # Panics
-///
-/// Panics if a backend emitted a path outside `out_dir`, which is a backend
-/// bug.
-#[must_use]
-pub fn relative_path(out_dir: &Utf8Path, file: &Utf8Path) -> String {
-    let rel = file
-        .strip_prefix(out_dir)
-        .unwrap_or_else(|_| panic!("generated file {file} is outside {out_dir}"));
-    rel.components()
-        .map(|c| c.as_str())
-        .collect::<Vec<_>>()
-        .join("/")
+/// One planned file of one target.
+#[derive(Debug, Clone)]
+struct PlannedFile {
+    /// Path relative to the output directory.
+    path: String,
+    contents: String,
+    /// What's on disk now, when the file exists.
+    old: Option<Vec<u8>>,
+}
+
+impl PlannedFile {
+    fn change(&self) -> Option<ChangeKind> {
+        match &self.old {
+            None => Some(ChangeKind::Added),
+            Some(old) if old != self.contents.as_bytes() => Some(ChangeKind::Modified),
+            Some(_) => None,
+        }
+    }
+}
+
+/// One target's part of a [`Changeset`].
+#[derive(Debug, Clone)]
+struct TargetPlan {
+    name: &'static str,
+    files: Vec<PlannedFile>,
+    /// Files the previous generation wrote that this one doesn't, still on
+    /// disk, with their current contents.
+    removed: Vec<(String, Vec<u8>)>,
+    record: Record,
+    previous: Option<Record>,
+}
+
+impl TargetPlan {
+    fn changes_files(&self) -> bool {
+        !self.removed.is_empty() || self.files.iter().any(|f| f.change().is_some())
+    }
+
+    fn is_current(&self) -> bool {
+        !self.changes_files() && self.previous.as_ref() == Some(&self.record)
+    }
+}
+
+/// Everything regenerating would do to an output directory, computed
+/// without writing: which files would be added, modified, or removed.
+#[derive(Debug, Clone)]
+pub struct Changeset {
+    out_dir: Utf8PathBuf,
+    targets: Vec<TargetPlan>,
+}
+
+/// One file a [`Changeset`] would add, modify, or remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Change<'a> {
+    /// What happens to the file.
+    pub kind: ChangeKind,
+    /// The file's path relative to the output directory.
+    pub path: &'a str,
+}
+
+impl Changeset {
+    /// The output directory the plan was made against.
+    #[must_use]
+    pub fn out_dir(&self) -> &Utf8Path {
+        &self.out_dir
+    }
+
+    /// Every file the targets render, relative to the output directory, in
+    /// target order (what `generate --dry-run` lists).
+    pub fn rendered(&self) -> impl Iterator<Item = &str> {
+        self.targets
+            .iter()
+            .flat_map(|t| t.files.iter().map(|f| f.path.as_str()))
+    }
+
+    /// Every file applying the plan would add, modify, or remove, in target
+    /// order.
+    pub fn changes(&self) -> impl Iterator<Item = Change<'_>> {
+        self.targets.iter().flat_map(|t| {
+            let written = t.files.iter().filter_map(|f| {
+                f.change().map(|kind| Change {
+                    kind,
+                    path: &f.path,
+                })
+            });
+            let removed = t.removed.iter().map(|(path, _)| Change {
+                kind: ChangeKind::Removed,
+                path,
+            });
+            written.chain(removed)
+        })
+    }
+
+    /// Whether applying the plan would leave every generated file as it is.
+    /// (A missing generation record alone doesn't count as a change.)
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.changes().next().is_none()
+    }
+
+    /// A unified diff (`git diff` style, with `a/` and `b/` prefixes) of
+    /// every change, with `/dev/null` standing in for added and removed
+    /// files.
+    #[must_use]
+    pub fn unified_diff(&self) -> String {
+        let mut out = String::new();
+        for t in &self.targets {
+            for f in &t.files {
+                let old = match (&f.old, f.change()) {
+                    (_, None) => continue,
+                    (None, _) => None,
+                    (Some(old), _) => Some(String::from_utf8_lossy(old)),
+                };
+                push_diff(&mut out, &f.path, old.as_deref(), Some(&f.contents));
+            }
+            for (path, old) in &t.removed {
+                push_diff(&mut out, path, Some(&String::from_utf8_lossy(old)), None);
+            }
+        }
+        out
+    }
+
+    /// Apply the plan: write every added or modified file, remove stale
+    /// files, and update the generation records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a directory can't be created or a file can't
+    /// be written or removed.
+    pub fn apply(&self) -> Result<GenerateReport> {
+        let mut report = GenerateReport::default();
+        if self.targets.iter().all(TargetPlan::is_current) {
+            report.up_to_date = self.targets.iter().map(|t| t.name).collect();
+            return Ok(report);
+        }
+        std::fs::create_dir_all(self.out_dir.as_std_path())
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create the output directory {}", self.out_dir))?;
+        for t in &self.targets {
+            let record_changed = t.previous.as_ref() != Some(&t.record);
+            let mut changed = record_changed;
+            for file in &t.files {
+                if file.change().is_none() {
+                    report.unchanged += 1;
+                    continue;
+                }
+                let path = self.out_dir.join(&file.path);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent.as_std_path())
+                        .into_diagnostic()
+                        .wrap_err_with(|| format!("failed to create {parent}"))?;
+                }
+                std::fs::write(path.as_std_path(), &file.contents)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("failed to write {path}"))?;
+                report.written += 1;
+                changed = true;
+            }
+            for (rel, _) in &t.removed {
+                let path = self.out_dir.join(rel);
+                std::fs::remove_file(path.as_std_path())
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("failed to remove the stale file {path}"))?;
+                report.removed.push(rel.clone());
+                changed = true;
+            }
+            if record_changed {
+                record::write_record(&self.out_dir, t.name, &t.record)?;
+            }
+            if changed {
+                report.generated.push(t.name);
+            } else {
+                report.up_to_date.push(t.name);
+            }
+        }
+        Ok(report)
+    }
+}
+
+/// Append one file's unified diff to `out`.
+fn push_diff(out: &mut String, path: &str, old: Option<&str>, new: Option<&str>) {
+    let old_name = if old.is_some() {
+        format!("a/{path}")
+    } else {
+        "/dev/null".to_string()
+    };
+    let new_name = if new.is_some() {
+        format!("b/{path}")
+    } else {
+        "/dev/null".to_string()
+    };
+    let diff = TextDiff::from_lines(old.unwrap_or(""), new.unwrap_or(""));
+    let _ = write!(
+        out,
+        "{}",
+        diff.unified_diff()
+            .context_radius(3)
+            .header(&old_name, &new_name)
+    );
 }
 
 /// What a generation run did.
@@ -109,38 +336,33 @@ pub struct GenerateReport {
     pub removed: Vec<String>,
 }
 
-/// One target's rendered output, paired with its previous record.
-struct Rendered<'a> {
-    target: &'a dyn Target,
-    files: Vec<OutputFile>,
-    previous: Option<Record>,
-    record: Record,
-}
-
-impl Rendered<'_> {
-    /// Files the previous run wrote that this run no longer produces and
-    /// that are still on disk.
-    fn stale<'r>(&'r self, out_dir: &'r Utf8Path) -> impl Iterator<Item = &'r String> {
-        self.previous
-            .iter()
-            .flat_map(|p| p.files.iter())
-            .filter(|rel| !self.record.files.contains(*rel) && out_dir.join(rel).exists())
+impl GenerateReport {
+    /// One line describing the run, for `weaveffi generate`'s output.
+    #[must_use]
+    pub fn summary(&self, out_dir: &Utf8Path) -> String {
+        if self.generated.is_empty() {
+            return format!(
+                "{out_dir} is up to date ({} targets)",
+                self.up_to_date.len()
+            );
+        }
+        let mut line = format!(
+            "Generated {} in {out_dir}: {} written, {} unchanged",
+            self.generated.join(", "),
+            self.written,
+            self.unchanged
+        );
+        if !self.removed.is_empty() {
+            let _ = write!(line, ", {} stale removed", self.removed.len());
+        }
+        if !self.up_to_date.is_empty() {
+            let _ = write!(line, " ({} up to date)", self.up_to_date.join(", "));
+        }
+        line
     }
-
-    /// Whether writing this target would change anything on disk.
-    fn is_current(&self, out_dir: &Utf8Path) -> bool {
-        self.previous.as_ref() == Some(&self.record)
-            && self.stale(out_dir).next().is_none()
-            && self.files.iter().all(on_disk)
-    }
 }
 
-/// Whether `file` is already on disk with its rendered contents.
-fn on_disk(file: &OutputFile) -> bool {
-    std::fs::read(file.path.as_std_path()).is_ok_and(|bytes| bytes == file.contents.as_bytes())
-}
-
-/// Runs a set of targets against one API and output directory.
+/// Runs a set of targets against one model and output directory.
 #[derive(Default)]
 pub struct Orchestrator<'a> {
     targets: Vec<&'a dyn Target>,
@@ -148,6 +370,7 @@ pub struct Orchestrator<'a> {
 
 impl<'a> Orchestrator<'a> {
     /// An orchestrator with no targets.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -159,76 +382,87 @@ impl<'a> Orchestrator<'a> {
         self
     }
 
-    /// Generate every target under `out_dir`.
-    ///
-    /// Every target renders, in parallel. Only files whose contents differ
-    /// from the output directory are written, and files the previous run of
-    /// a target wrote that this run no longer produces are removed.
+    /// Add several targets.
+    #[must_use]
+    pub fn with_targets(mut self, targets: impl IntoIterator<Item = &'a dyn Target>) -> Self {
+        self.targets.extend(targets);
+        self
+    }
+
+    /// Render every target (in parallel) and compare the result with
+    /// `out_dir`, without writing anything.
     ///
     /// # Errors
     ///
-    /// Returns an error when a file cannot be written or removed.
-    pub fn run(&self, model: &Model, out_dir: &Utf8Path) -> Result<GenerateReport> {
-        let rendered: Vec<Rendered<'a>> = self
+    /// Returns an error when a target renders a path outside its directory.
+    pub fn plan(&self, model: &Model, out_dir: &Utf8Path) -> Result<Changeset> {
+        let targets = self
             .targets
             .par_iter()
-            .map(|&target| {
-                let files = target.render(model, out_dir);
-                let record = Record {
-                    files: files
-                        .iter()
-                        .map(|f| relative_path(out_dir, &f.path))
-                        .collect(),
-                };
-                Rendered {
-                    target,
-                    files,
-                    previous: cache::read_record(out_dir, target.name()),
-                    record,
-                }
-            })
-            .collect();
-
-        let mut report = GenerateReport::default();
-        if rendered.iter().all(|r| r.is_current(out_dir)) {
-            report.up_to_date = rendered.iter().map(|r| r.target.name()).collect();
-            return Ok(report);
-        }
-        for r in &rendered {
-            let mut changed = r.previous.as_ref() != Some(&r.record);
-            for file in &r.files {
-                if on_disk(file) {
-                    report.unchanged += 1;
-                    continue;
-                }
-                if let Some(parent) = file.path.parent() {
-                    std::fs::create_dir_all(parent.as_std_path())
-                        .with_context(|| format!("failed to create {parent}"))?;
-                }
-                std::fs::write(file.path.as_std_path(), &file.contents)
-                    .with_context(|| format!("failed to write {}", file.path))?;
-                report.written += 1;
-                changed = true;
-            }
-            let stale: Vec<String> = r.stale(out_dir).cloned().collect();
-            for rel in stale {
-                let path = out_dir.join(&rel);
-                std::fs::remove_file(path.as_std_path())
-                    .with_context(|| format!("failed to remove stale file {path}"))?;
-                report.removed.push(rel);
-                changed = true;
-            }
-            if r.previous.as_ref() != Some(&r.record) {
-                cache::write_record(out_dir, r.target.name(), &r.record)?;
-            }
-            if changed {
-                report.generated.push(r.target.name());
-            } else {
-                report.up_to_date.push(r.target.name());
-            }
-        }
-        Ok(report)
+            .map(|&target| plan_target(target, model, out_dir))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Changeset {
+            out_dir: out_dir.to_path_buf(),
+            targets,
+        })
     }
+
+    /// Generate every target under `out_dir`: [`plan`](Self::plan), then
+    /// [`apply`](Changeset::apply).
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`plan`](Self::plan) and
+    /// [`apply`](Changeset::apply).
+    pub fn run(&self, model: &Model, out_dir: &Utf8Path) -> Result<GenerateReport> {
+        self.plan(model, out_dir)?.apply()
+    }
+}
+
+/// Render `target` and compare its files with `out_dir`.
+fn plan_target(target: &dyn Target, model: &Model, out_dir: &Utf8Path) -> Result<TargetPlan> {
+    let name = target.name();
+    let files = target
+        .render(model)
+        .into_iter()
+        .map(|file| {
+            let path = output_path(name, &file.path)?;
+            let old = std::fs::read(out_dir.join(&path).as_std_path()).ok();
+            Ok(PlannedFile {
+                path,
+                contents: file.contents,
+                old,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let record = Record {
+        files: files.iter().map(|f| f.path.clone()).collect(),
+    };
+    let previous = record::read_record(out_dir, name);
+    let removed = previous
+        .iter()
+        .flat_map(|p| p.files.iter())
+        .filter(|rel| !record.files.contains(*rel))
+        .filter_map(|rel| {
+            let bytes = std::fs::read(out_dir.join(rel).as_std_path()).ok()?;
+            Some((rel.clone(), bytes))
+        })
+        .collect();
+    Ok(TargetPlan {
+        name,
+        files,
+        removed,
+        record,
+        previous,
+    })
+}
+
+/// Parse and validate a YAML IDL for a unit test, with identity `kv`.
+#[cfg(test)]
+pub(crate) fn test_model(yaml: &str) -> Model {
+    let api = weaveffi_model::parse::parse_api_str(yaml, "yaml").expect("valid YAML");
+    let identity = weaveffi_model::pkg::Identity::named("kv");
+    weaveffi_model::validate::validate(&api, &identity, None).expect("valid API")
 }
 
 #[cfg(test)]
@@ -238,38 +472,25 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use weaveffi_model::ir::{Api, Module};
 
-    #[derive(Default, Clone)]
-    struct TestConfig;
-
     struct Counting {
         name: &'static str,
         calls: Arc<AtomicUsize>,
         files: Arc<Mutex<Vec<&'static str>>>,
     }
 
-    impl LanguageBackend for Counting {
-        type Config = TestConfig;
-
+    impl Target for Counting {
         fn name(&self) -> &'static str {
             self.name
         }
 
-        fn files(
-            &self,
-            model: &Model,
-            out_dir: &Utf8Path,
-            _config: &Self::Config,
-        ) -> Vec<OutputFile> {
+        fn render(&self, model: &Model) -> Vec<OutputFile> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.files
                 .lock()
                 .unwrap()
                 .iter()
                 .map(|f| {
-                    OutputFile::new(
-                        out_dir.join(self.name).join(f),
-                        format!("{} {}", model.prefix(), model.modules[0].name),
-                    )
+                    OutputFile::new(*f, format!("{} {}", model.prefix(), model.modules[0].name))
                 })
                 .collect()
         }
@@ -286,7 +507,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 callback_interfaces: vec![],
-                errors: None,
+                errors: Vec::new(),
                 modules: vec![],
             }],
         };
@@ -294,15 +515,12 @@ mod tests {
         weaveffi_model::validate::validate(&api, &identity, None).unwrap()
     }
 
-    fn backend(name: &'static str, calls: &Arc<AtomicUsize>) -> ConfiguredBackend<Counting> {
-        ConfiguredBackend::new(
-            Counting {
-                name,
-                calls: Arc::clone(calls),
-                files: Arc::new(Mutex::new(vec!["out.txt"])),
-            },
-            TestConfig,
-        )
+    fn counting(name: &'static str, calls: &Arc<AtomicUsize>) -> Counting {
+        Counting {
+            name,
+            calls: Arc::clone(calls),
+            files: Arc::new(Mutex::new(vec!["out.txt"])),
+        }
     }
 
     #[test]
@@ -310,7 +528,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = Utf8Path::from_path(dir.path()).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let c = backend("c", &calls);
+        let c = counting("c", &calls);
         let orch = Orchestrator::new().with_target(&c);
         let model = model_named("math");
 
@@ -323,12 +541,27 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
 
         std::fs::write(out.join("c/out.txt"), "edited").unwrap();
-        let third = orch.run(&model, out).unwrap();
+        let plan = orch.plan(&model, out).unwrap();
+        let changes: Vec<_> = plan.changes().collect();
+        assert_eq!(
+            changes,
+            [Change {
+                kind: ChangeKind::Modified,
+                path: "c/out.txt"
+            }]
+        );
+        assert!(
+            plan.unified_diff().contains("-edited\n"),
+            "{}",
+            plan.unified_diff()
+        );
+        let third = plan.apply().unwrap();
         assert_eq!((third.generated.len(), third.written), (1, 1));
         assert_eq!(
             std::fs::read_to_string(out.join("c/out.txt")).unwrap(),
             rendered
         );
+        assert!(orch.plan(&model, out).unwrap().is_empty());
     }
 
     #[test]
@@ -336,15 +569,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = Utf8Path::from_path(dir.path()).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let c = backend("c", &calls);
-        let files = Arc::clone(&c.inner.files);
+        let c = counting("c", &calls);
+        let files = Arc::clone(&c.files);
         *files.lock().unwrap() = vec!["a.txt", "b.txt"];
         let orch = Orchestrator::new().with_target(&c);
         orch.run(&model_named("math"), out).unwrap();
         std::fs::write(out.join("c/user.txt"), "mine").unwrap();
 
         *files.lock().unwrap() = vec!["a.txt"];
-        let report = orch.run(&model_named("math"), out).unwrap();
+        let plan = orch.plan(&model_named("math"), out).unwrap();
+        assert_eq!(
+            plan.changes().collect::<Vec<_>>(),
+            [Change {
+                kind: ChangeKind::Removed,
+                path: "c/b.txt"
+            }]
+        );
+        let report = plan.apply().unwrap();
         assert_eq!(report.removed, ["c/b.txt"]);
         assert_eq!(report.generated, ["c"]);
         assert!(out.join("c/a.txt").exists());
@@ -353,8 +594,12 @@ mod tests {
     }
 
     #[test]
-    fn relative_paths_use_forward_slashes() {
-        let out = Utf8Path::new("gen");
-        assert_eq!(relative_path(out, &out.join("c").join("x.h")), "c/x.h");
+    fn output_paths_stay_inside_the_target_directory() {
+        assert_eq!(
+            output_path("c", &Utf8Path::new("include").join("x.h")).unwrap(),
+            "c/include/x.h"
+        );
+        assert!(output_path("c", Utf8Path::new("../x.h")).is_err());
+        assert!(output_path("c", Utf8Path::new("/x.h")).is_err());
     }
 }

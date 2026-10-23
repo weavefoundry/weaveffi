@@ -61,17 +61,18 @@ export function $fault(e) {
  * Map a fault onto an error domain: `codes` maps each declared code to its
  * class, and `payloads` maps each code that carries fields to the reader
  * that decodes them (the class's constructor then takes the fields first).
- * Codes outside the domain fall back to `$fault`.
+ * Domains are open: a positive code the bindings don't know (a newer
+ * library added it) becomes the domain class `base` itself, with the code
+ * and message. Runtime codes (negative) fall back to `$fault`.
  */
-export function $domain(e, codes, payloads) {
-  if (e instanceof $Fault) {
+export function $domain(e, base, codes, payloads) {
+  if (e instanceof $Fault && e.code > 0) {
     const cls = codes.get(e.code);
-    if (cls !== undefined) {
-      const message = e.message || undefined;
-      const read = payloads.get(e.code);
-      if (read === undefined) return new cls(message);
-      return new cls(e.payload === null ? {} : $decode(e.payload, read), message);
-    }
+    if (cls === undefined) return new base(e.code, e.message);
+    const message = e.message || undefined;
+    const read = payloads.get(e.code);
+    if (read === undefined) return new cls(message);
+    return new cls(e.payload === null ? {} : $decode(e.payload, read), message);
   }
   return $fault(e);
 }
@@ -80,30 +81,169 @@ export function $domain(e, codes, payloads) {
  * The fault a callback implementation reports for exception `e` from a
  * method that throws the error domain `domain`: a declared code of the
  * domain travels with its fields (`fields` maps each code that has any to
- * the writer that encodes them); anything else is rethrown unchanged and
- * reported as a code -4 failure.
+ * the writer that encodes them); anything else is an untyped failure (see
+ * `$untyped`).
  */
 export function $raise(e, domain, codes, fields) {
   if (e instanceof domain && codes.has(e.code)) {
     const write = fields.get(e.code);
     return new $Fault(e.code, e.message, write === undefined ? null : $encode(e, write));
   }
-  return e;
+  return $untyped(e);
+}
+
+/**
+ * The fault a callback implementation reports for exception `e` from a
+ * method declared `throws: any` (or for one its domain doesn't cover):
+ * code -1 with the exception's message.
+ */
+export function $untyped(e) {
+  if (e instanceof $Fault) return e;
+  return new $Fault(-1, $messageOf(e), null);
+}
+
+/** The message of a thrown value: an error's message (or name), else its text. */
+function $messageOf(e) {
+  if (e instanceof Error) return e.message || e.name;
+  try {
+    return String(e);
+  } catch {
+    return 'callback implementation failed';
+  }
 }
 
 function $malformed(what) {
   return new {{ERROR_CLASS}}(-3, 'malformed value buffer: ' + what);
 }
 
-function $expected(what, v) {
-  return new TypeError(`expected ${what}, got ${v === null ? 'null' : typeof v}`);
+/** How a value reads in an error message: its type, or a number's value. */
+function $show(v) {
+  if (v === null) return 'null';
+  if (typeof v === 'bigint') return `${v}n`;
+  if (typeof v === 'number') return String(v);
+  return typeof v;
 }
 
-function $bigint(v) {
-  if (typeof v === 'bigint') return v;
-  if (typeof v === 'number' && Number.isInteger(v)) return BigInt(v);
-  throw $expected('a bigint', v);
+function $expected(what, v) {
+  return new TypeError(`expected ${what}, got ${$show(v)}`);
 }
+
+/** `expected {what} to be {shape}` (or `expected {shape}` without a label). */
+function $want(what, shape) {
+  return what === undefined ? shape : `${what} to be ${shape}`;
+}
+
+/** The inclusive range of each narrow integer kind. */
+const $RANGE = Object.freeze({
+  I8: [-128, 127],
+  I16: [-32768, 32767],
+  I32: [-2147483648, 2147483647],
+  U8: [0, 255],
+  U16: [0, 65535],
+  U32: [0, 4294967295],
+});
+
+function $int(kind) {
+  const [lo, hi] = $RANGE[kind];
+  return (v, what) => {
+    if (typeof v !== 'number') throw $expected($want(what, 'a number'), v);
+    if (!Number.isInteger(v) || v < lo || v > hi) {
+      throw new RangeError(`expected ${$want(what, `an integer in [${lo}, ${hi}]`)}, got ${v}`);
+    }
+    return v;
+  };
+}
+
+function $int64(signed) {
+  const fit = signed ? BigInt.asIntN : BigInt.asUintN;
+  const shape = signed ? 'a signed 64-bit integer' : 'an unsigned 64-bit integer';
+  return (v, what) => {
+    let b;
+    if (typeof v === 'bigint') {
+      b = v;
+    } else if (typeof v === 'number') {
+      if (!Number.isInteger(v)) throw new RangeError(`expected ${$want(what, shape)}, got ${v}`);
+      b = BigInt(v);
+    } else {
+      throw $expected($want(what, 'a bigint'), v);
+    }
+    if (fit(64, b) !== b) throw new RangeError(`expected ${$want(what, shape)}, got ${b}`);
+    return b;
+  };
+}
+
+function $float(v, what) {
+  if (typeof v !== 'number') throw $expected($want(what, 'a number'), v);
+  return v;
+}
+
+/**
+ * Value checks by kind, each `(v, what?) => v`: a value of the wrong type
+ * throws a `TypeError`, and an integer that is fractional or out of its
+ * kind's range a `RangeError` (64-bit kinds take a `bigint` or an integral
+ * `number` and return a `bigint`). `what` names the value in the message.
+ * The value-buffer writer, callback returns, and typed-array arguments all
+ * check through these, so a value never wraps silently.
+ */
+export const $check = Object.freeze({
+  Bool(v, what) {
+    if (typeof v !== 'boolean') throw $expected($want(what, 'a boolean'), v);
+    return v;
+  },
+  I8: $int('I8'),
+  I16: $int('I16'),
+  I32: $int('I32'),
+  U8: $int('U8'),
+  U16: $int('U16'),
+  U32: $int('U32'),
+  I64: $int64(true),
+  U64: $int64(false),
+  F32: $float,
+  F64: $float,
+  String(v, what) {
+    if (typeof v !== 'string') throw $expected($want(what, 'a string'), v);
+    return v;
+  },
+  Bytes(v, what) {
+    if (!(v instanceof Uint8Array)) throw $expected($want(what, 'a Uint8Array'), v);
+    return v;
+  },
+});
+
+/** An optional scalar: `null` (or `undefined`) for none, else `check(v)`. */
+export function $opt(v, check, what) {
+  return v === null || v === undefined ? null : check(v, what);
+}
+
+function $typed(Typed, check) {
+  return (v, what) => {
+    if (v instanceof Typed) return v;
+    if (!Array.isArray(v)) {
+      throw $expected($want(what, `an array or a ${Typed.name}`), v);
+    }
+    const out = new Typed(v.length);
+    const label = what === undefined ? 'element' : what;
+    for (let i = 0; i < v.length; i++) out[i] = check(v[i], `${label}[${i}]`);
+    return out;
+  };
+}
+
+/**
+ * Typed-array conversions by element kind, each `(v, what?) => typedArray`:
+ * the matching typed array passes through as is, and a plain array is
+ * checked element by element (see `$check`) and copied into one.
+ */
+export const $slice = Object.freeze({
+  I8: $typed(Int8Array, $check.I8),
+  I16: $typed(Int16Array, $check.I16),
+  I32: $typed(Int32Array, $check.I32),
+  I64: $typed(BigInt64Array, $check.I64),
+  U16: $typed(Uint16Array, $check.U16),
+  U32: $typed(Uint32Array, $check.U32),
+  U64: $typed(BigUint64Array, $check.U64),
+  F32: $typed(Float32Array, $check.F32),
+  F64: $typed(Float64Array, $check.F64),
+});
 
 const $utf8 = new TextEncoder();
 const $utf8Strict = new TextDecoder('utf-8', { fatal: true });
@@ -112,7 +252,8 @@ const $utf8Strict = new TextDecoder('utf-8', { fatal: true });
  * Writes the value-buffer wire format: little-endian, packed, no alignment.
  * Strings and bytes are a u32 length then the bytes, optionals a presence
  * byte then the value, lists a u32 count then the elements, and maps a u32
- * count then alternating keys and values.
+ * count then alternating keys and values. Every value is checked first (see
+ * `$check`): nothing is truncated or wrapped.
  */
 export class $Writer {
   constructor() {
@@ -131,36 +272,25 @@ export class $Writer {
     this.view = new DataView(grown.buffer);
   }
 
-  num(v) {
-    if (typeof v !== 'number') throw $expected('a number', v);
-    return v;
-  }
-
-  big(v, bits) {
-    const b = $bigint(v);
-    if (bits(64, b) !== b) throw new RangeError(`${b} does not fit in a 64-bit integer`);
-    return b;
-  }
-
   writeBool(v) {
-    if (typeof v !== 'boolean') throw $expected('a boolean', v);
+    $check.Bool(v);
     this.reserve(1);
     this.buf[this.len++] = v ? 1 : 0;
   }
 
-  writeI8(v) { this.reserve(1); this.view.setInt8(this.len, this.num(v)); this.len += 1; }
-  writeU8(v) { this.reserve(1); this.view.setUint8(this.len, this.num(v)); this.len += 1; }
-  writeI16(v) { this.reserve(2); this.view.setInt16(this.len, this.num(v), true); this.len += 2; }
-  writeU16(v) { this.reserve(2); this.view.setUint16(this.len, this.num(v), true); this.len += 2; }
-  writeI32(v) { this.reserve(4); this.view.setInt32(this.len, this.num(v), true); this.len += 4; }
-  writeU32(v) { this.reserve(4); this.view.setUint32(this.len, this.num(v), true); this.len += 4; }
-  writeI64(v) { this.reserve(8); this.view.setBigInt64(this.len, this.big(v, BigInt.asIntN), true); this.len += 8; }
-  writeU64(v) { this.reserve(8); this.view.setBigUint64(this.len, this.big(v, BigInt.asUintN), true); this.len += 8; }
-  writeF32(v) { this.reserve(4); this.view.setFloat32(this.len, this.num(v), true); this.len += 4; }
-  writeF64(v) { this.reserve(8); this.view.setFloat64(this.len, this.num(v), true); this.len += 8; }
+  writeI8(v) { this.reserve(1); this.view.setInt8(this.len, $check.I8(v)); this.len += 1; }
+  writeU8(v) { this.reserve(1); this.view.setUint8(this.len, $check.U8(v)); this.len += 1; }
+  writeI16(v) { this.reserve(2); this.view.setInt16(this.len, $check.I16(v), true); this.len += 2; }
+  writeU16(v) { this.reserve(2); this.view.setUint16(this.len, $check.U16(v), true); this.len += 2; }
+  writeI32(v) { this.reserve(4); this.view.setInt32(this.len, $check.I32(v), true); this.len += 4; }
+  writeU32(v) { this.reserve(4); this.view.setUint32(this.len, $check.U32(v), true); this.len += 4; }
+  writeI64(v) { this.reserve(8); this.view.setBigInt64(this.len, $check.I64(v), true); this.len += 8; }
+  writeU64(v) { this.reserve(8); this.view.setBigUint64(this.len, $check.U64(v), true); this.len += 8; }
+  writeF32(v) { this.reserve(4); this.view.setFloat32(this.len, $check.F32(v), true); this.len += 4; }
+  writeF64(v) { this.reserve(8); this.view.setFloat64(this.len, $check.F64(v), true); this.len += 8; }
 
   writeString(v) {
-    if (typeof v !== 'string') throw $expected('a string', v);
+    $check.String(v);
     // UTF-8 never needs more than three bytes per UTF-16 code unit.
     this.reserve(4 + v.length * 3);
     const { written } = $utf8.encodeInto(v, this.buf.subarray(this.len + 4));
@@ -169,7 +299,7 @@ export class $Writer {
   }
 
   writeBytes(v) {
-    if (!(v instanceof Uint8Array)) throw $expected('a Uint8Array', v);
+    $check.Bytes(v);
     this.reserve(4 + v.length);
     this.view.setUint32(this.len, v.length, true);
     this.buf.set(v, this.len + 4);
@@ -546,54 +676,13 @@ export function $impl(impl, what) {
   return impl;
 }
 
-function $num(v, where) {
-  if (typeof v !== 'number') throw new TypeError(`${where} must return a number`);
-  return v;
-}
-
-function $retBigint(v, where) {
-  if (typeof v === 'bigint') return v;
-  if (typeof v === 'number' && Number.isInteger(v)) return BigInt(v);
-  throw new TypeError(`${where} must return a bigint`);
-}
-
-/**
- * Checks for a callback method's return value, by wire primitive (plus
- * `String` and `Bytes`). A value of the wrong type throws, which reports
- * the call as a code -4 failure.
- */
-export const $ret = Object.freeze({
-  Bool(v, where) {
-    if (typeof v !== 'boolean') throw new TypeError(`${where} must return a boolean`);
-    return v;
-  },
-  I8: $num,
-  I16: $num,
-  I32: $num,
-  U8: $num,
-  U16: $num,
-  U32: $num,
-  F32: $num,
-  F64: $num,
-  I64: $retBigint,
-  U64: $retBigint,
-  String(v, where) {
-    if (typeof v !== 'string') throw new TypeError(`${where} must return a string`);
-    return v;
-  },
-  Bytes(v, where) {
-    if (!(v instanceof Uint8Array)) throw new TypeError(`${where} must return a Uint8Array`);
-    return v;
-  },
-});
-
 /**
  * The load-time checks: the native library must implement ABI revision
  * `abi`, and, for every top-level module, its contract table must hold each
  * entry these bindings were generated with. `contract` lists
- * `[module, [[id, hash, path], ...]]` per module; the native side returns
- * a module's table as a `BigUint64Array` of `id, hash` pairs. Entries the
- * library has and the bindings don't are fine.
+ * `[tableFunction, [[id, hash, path], ...]]` per module; the native side
+ * returns a module's table as a `BigUint64Array` of `id, hash` pairs.
+ * Entries the library has and the bindings don't are fine.
  */
 export function $verify(raw, library, prefix, abi, contract) {
   const version = raw[`${prefix}_abi_version`];
@@ -606,10 +695,10 @@ export function $verify(raw, library, prefix, abi, contract) {
       `${library}: the native library implements ABI revision ${found}, but these bindings require revision ${abi}`,
     );
   }
-  for (const [module, expected] of contract) {
-    const table = raw[`${prefix}_${module}_contract`];
+  for (const [symbol, expected] of contract) {
+    const table = raw[symbol];
     if (typeof table !== 'function') {
-      throw new Error(`${library}: the native library does not export ${prefix}_${module}_contract`);
+      throw new Error(`${library}: the native library does not export ${symbol}`);
     }
     const pairs = table();
     const hashes = new Map();
@@ -624,4 +713,20 @@ export function $verify(raw, library, prefix, abi, contract) {
       }
     }
   }
+}
+
+let $liveFn = null;
+
+/**
+ * Install the leak-counter reader of the loaded bindings (`index.js` does,
+ * once): `kind => bigint`.
+ */
+export function $setLive(fn) {
+  $liveFn = fn;
+}
+
+/** Read a leak counter through the reader `index.js` installed. */
+export function $live(kind) {
+  if ($liveFn === null) throw new Error('the bindings are not loaded');
+  return $liveFn(kind);
 }

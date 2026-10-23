@@ -1,27 +1,33 @@
-// Conformance consumer: codec sample, Swift target (ABI revision 4).
+// Conformance consumer: codec sample, Swift target (ABI revision 5).
 //
 // The shared-vector loop through the generated `Codec` module: every vector
 // the producer serves is decoded by the Swift codec, re-encoded on the way
 // back into `checkVector` (which must accept it, and reject it for the
 // neighboring index), and, for primitive vectors, pushed through the
-// matching direct-family `echo*`. Then vectors built from Swift literals (so
-// a symmetric encode/decode bug can't hide), spot checks of decoded values,
-// the typed `CodecError.outOfRange` with its payload, malformed buffers sent
-// through the raw C entry points (the Swift encoder can't produce them), and
-// object identity and reference counting through buffers. Ends by asserting
-// the producer's leak counters are zero. Exits non-zero on any mismatch.
+// matching direct-family `echo*`, optional-scalar `echoOpt*`, and
+// typed-array `echo*s`. Then vectors built from Swift literals (so a
+// symmetric encode/decode bug can't hide), spot checks of decoded values,
+// the typed `CodecError.outOfRange` with its payload, optional scalars and
+// typed arrays at their edges (NaN, -0.0, extremes, empty), `usize`, `char`,
+// and a custom type crossing as strings, a `NativeSequence` of typed-array
+// chunks, malformed buffers, invalid optional enums, misaligned arrays, and
+// rejected conversions sent through the raw C entry points (the Swift
+// wrappers can't produce them, and the conversions trap there), and object
+// identity (`==` and hashing by native object) and reference counting
+// through buffers. Ends by asserting the producer's leak counters are zero.
+// Exits non-zero on any mismatch.
 
 import CCodec
 import Codec
 import Foundation
 
-func fail(_ msg: String) -> Never {
-    FileHandle.standardError.write(Data("assertion failed: \(msg)\n".utf8))
+func fail(_ msg: String, line: UInt = #line) -> Never {
+    FileHandle.standardError.write(Data("assertion failed (line \(line)): \(msg)\n".utf8))
     exit(1)
 }
 
-func expect(_ cond: Bool, _ msg: @autoclosure () -> String) {
-    if !cond { fail(msg()) }
+func expect(_ cond: Bool, _ msg: @autoclosure () -> String, line: UInt = #line) {
+    if !cond { fail(msg(), line: line) }
 }
 
 /// Every live-resource counter must settle at zero: 0 objects, 1 callbacks,
@@ -65,25 +71,43 @@ func vectorIndex(_ n: UInt32) -> [String: UInt32] {
     return names
 }
 
-/// Push a primitive vector's value through its direct-family echo.
+/// Push a primitive vector's value through its direct-family echo, and,
+/// where one exists, its optional-scalar and typed-array echoes.
 func echo(_ v: Vector) {
     switch v {
     case let .i8(x): expect(Codec.echoI8(value: x) == x, "echoI8(\(x))")
     case let .u8(x): expect(Codec.echoU8(value: x) == x, "echoU8(\(x))")
     case let .i16(x): expect(Codec.echoI16(value: x) == x, "echoI16(\(x))")
     case let .u16(x): expect(Codec.echoU16(value: x) == x, "echoU16(\(x))")
-    case let .i32(x): expect(Codec.echoI32(value: x) == x, "echoI32(\(x))")
+    case let .i32(x):
+        expect(Codec.echoI32(value: x) == x, "echoI32(\(x))")
+        expect(Codec.echoOptI32(value: x) == x, "echoOptI32(\(x))")
+        expect(Codec.echoI32s(values: [x, x]) == [x, x], "echoI32s([\(x)])")
     case let .u32(x): expect(Codec.echoU32(value: x) == x, "echoU32(\(x))")
     case let .i64(x): expect(Codec.echoI64(value: x) == x, "echoI64(\(x))")
-    case let .u64(x): expect(Codec.echoU64(value: x) == x, "echoU64(\(x))")
+    case let .u64(x):
+        expect(Codec.echoU64(value: x) == x, "echoU64(\(x))")
+        expect(Codec.echoUsize(value: x) == x, "echoUsize(\(x))")
+        expect(Codec.echoU64s(values: [x]) == [x], "echoU64s([\(x)])")
     case let .f32(x):
         expect(Codec.echoF32(value: x).bitPattern == x.bitPattern, "echoF32(\(x)) bit for bit")
     case let .f64(x):
         expect(Codec.echoF64(value: x).bitPattern == x.bitPattern, "echoF64(\(x)) bit for bit")
-    case let .flag(x): expect(Codec.echoBool(value: x) == x, "echoBool(\(x))")
+        expect(Codec.echoOptF64(value: x).map { $0.bitPattern == x.bitPattern || ($0.isNaN && x.isNaN) } == true, "echoOptF64(\(x))")
+        expect(Codec.echoF64s(values: [x]).map { $0.isNaN ? 0 : $0.bitPattern } == [x.isNaN ? 0 : x.bitPattern], "echoF64s([\(x)])")
+    case let .flag(x):
+        expect(Codec.echoBool(value: x) == x, "echoBool(\(x))")
+        expect(Codec.echoOptBool(value: x) == x, "echoOptBool(\(x))")
     case let .text(x): expect(same(Codec.echoText(value: x), x), "echoText(\(x.debugDescription))")
     case let .blob(x): expect(Codec.echoBlob(value: x) == x, "echoBlob(\(x as NSData))")
-    case let .hue(x): expect(Codec.echoColor(value: x) == x, "echoColor(\(x))")
+    case let .hue(x):
+        expect(Codec.echoColor(value: x) == x, "echoColor(\(x))")
+        expect(Codec.echoOptColor(value: x) == x, "echoOptColor(\(x))")
+    case let .maybeI64(x):
+        // An `i64?` in a buffer; through the direct `i32?` echo when it fits.
+        if let x = x, let small = Int32(exactly: x) {
+            expect(Codec.echoOptI32(value: small) == small, "echoOptI32(\(small))")
+        }
     default: break
     }
 }
@@ -232,7 +256,7 @@ func malformed() {
     // Direct families: an undeclared enum value (which Swift's `Color` can't
     // even spell) and invalid UTF-8.
     var err = codec_error()
-    _ = codec_codec_echo_color(codec_codec_Color(rawValue: 3), &err)
+    _ = codec_codec_echo_color(3, &err)
     expect(err.code == -3, "echo_color(3) is rejected (got \(err.code))")
     codec_error_clear(&err)
     var len = 0
@@ -251,9 +275,15 @@ func objects(_ index: [String: UInt32]) {
     let expected = [10, 11, 12, 13, 20, 21, Int64.min].reduce(0, &+)
     expect(Codec.sumHolder(holder: h) == expected && Codec.sumHolder(holder: h) == expected, "sumHolder twice")
 
-    // primaryOf returns the very same native object (a new wrapper).
+    // primaryOf returns the very same native object (a new wrapper), which
+    // compares and hashes equal to the holder's.
     let p = Codec.primaryOf(holder: h)
     expect(p.value() == 10, "primaryOf value")
+    expect(p == h.primary && p.hashValue == h.primary.hashValue && Set([p, h.primary]).count == 1, "primaryOf is == the primary")
+    expect(p != Token(value: 10), "an equal value is a different object")
+    // Records carrying objects are Hashable too.
+    let again = Holder(primary: p, spare: h.spare, many: h.many, byName: h.byName)
+    expect(again == h && Set([again, h]).count == 1, "holders of the same objects are equal")
     expect(Codec.samePrimary(a: h, b: Holder(primary: p, spare: nil, many: [], byName: [:])), "samePrimary identity")
     let twin = Token(value: 10)
     expect(!Codec.samePrimary(a: h, b: Holder(primary: twin, spare: nil, many: [], byName: [:])), "an equal value is not the same object")
@@ -264,7 +294,115 @@ func objects(_ index: [String: UInt32]) {
     expect(twin.value() == 10, "the twin is still usable")
 }
 
+func optScalars() {
+    expect(Codec.echoOptI32(value: nil) == nil, "echoOptI32(nil)")
+    expect(Codec.echoOptI32(value: .min) == .min, "echoOptI32(min)")
+    expect(Codec.echoOptI32(value: 0) == 0, "echoOptI32(0)")
+    guard let zero = Codec.echoOptF64(value: -0.0) else { fail("echoOptF64(-0.0)") }
+    expect(zero == 0 && zero.sign == .minus, "echoOptF64 keeps the sign of zero")
+    expect(Codec.echoOptF64(value: .nan)?.isNaN == true, "echoOptF64(nan)")
+    expect(Codec.echoOptF64(value: nil) == nil, "echoOptF64(nil)")
+    expect(Codec.echoOptBool(value: true) == true && Codec.echoOptBool(value: false) == false, "echoOptBool")
+    expect(Codec.echoOptBool(value: nil) == nil, "echoOptBool(nil)")
+    expect(Codec.echoOptColor(value: .infrared) == .infrared && Codec.echoOptColor(value: .blue) == .blue, "echoOptColor")
+    expect(Codec.echoOptColor(value: nil) == nil, "echoOptColor(nil)")
+
+    // A present raw value Swift's `Color` can't spell is rejected; an
+    // absent one is ignored.
+    var err = codec_error()
+    var out: Int32 = 0
+    expect(!codec_codec_echo_opt_color(true, 3, &out, &err) && err.code == -3, "echo_opt_color(3) is rejected (got \(err.code))")
+    codec_error_clear(&err)
+    expect(!codec_codec_echo_opt_color(false, 3, &out, &err) && err.code == 0, "an absent color is ignored")
+}
+
+func typedArrays() {
+    let f64s = [Double(bitPattern: 0x7ff8_0000_0000_0001), -0.0, .leastNonzeroMagnitude, .infinity]
+    let back = Codec.echoF64s(values: f64s)
+    expect(back.count == 4 && back[0].isNaN, "echoF64s NaN")
+    expect(back[1...].map(\.bitPattern) == f64s[1...].map(\.bitPattern), "echoF64s bit for bit")
+    expect(Codec.echoI32s(values: [.min, 0, .max]) == [.min, 0, .max], "echoI32s extremes")
+    expect(Codec.echoI32s(values: []) == [], "echoI32s([])")
+    expect(Codec.echoU64s(values: [.max, 1 << 63]) == [18_446_744_073_709_551_615, 9_223_372_036_854_775_808], "echoU64s extremes")
+    expect(Codec.echoU64s(values: []) == [], "echoU64s([])")
+    // An array slice copied out lends its own storage.
+    let wide: [UInt64] = [7, 8, 9]
+    expect(Codec.echoU64s(values: Array(wide.dropFirst())) == [8, 9], "echoU64s of a slice")
+
+    // A null array with a length, and one not aligned for its element.
+    var err = codec_error()
+    var len = 0
+    expect(codec_codec_echo_u64s(nil, 2, &len, &err) == nil && err.code == -3, "a null array with a length is rejected")
+    codec_error_clear(&err)
+    let raw = UnsafeMutableRawPointer.allocate(byteCount: 24, alignment: 8)
+    defer { raw.deallocate() }
+    raw.initializeMemory(as: UInt8.self, repeating: 0, count: 24)
+    let misaligned = UnsafePointer<UInt64>(OpaquePointer(raw + 4))
+    expect(codec_codec_echo_u64s(misaligned, 2, &len, &err) == nil && err.code == -3, "a misaligned array is rejected")
+    codec_error_clear(&err)
+}
+
+func chunks() {
+    let extremes = Array(Codec.chunks(values: [.min, 0, .max], size: 2))
+    expect(extremes == [[-2_147_483_648, 0], [2_147_483_647]], "chunks of extremes (got \(extremes))")
+    let seq = Codec.chunks(values: [1, 2, 3, 4], size: 2)
+    do {
+        expect(try seq.collect() == [[1, 2], [3, 4]], "chunks of four")
+    } catch {
+        fail("collect threw \(error)")
+    }
+    expect(seq.next() == nil && seq.error == nil, "an exhausted sequence stays at the end")
+    expect(Array(Codec.chunks(values: [1, 2], size: 0)).isEmpty, "chunks of size 0")
+    expect(Array(Codec.chunks(values: [], size: 3)).isEmpty, "chunks of nothing")
+    // Abandoning a sequence part-way releases the native iterator.
+    do {
+        let partial = Codec.chunks(values: [1, 2, 3], size: 1)
+        withExtendedLifetime(partial) {
+            expect(partial.next() == [1], "first chunk")
+            expect(codec_debug_live(2) == 1, "one live iterator")
+        }
+    }
+    expect(codec_debug_live(2) == 0, "the abandoned iterator was released")
+}
+
+/// Echo `input` through the raw C `f`, expecting a -3 with `message`.
+func rejected(
+    _ f: (UnsafePointer<UInt8>?, Int, UnsafeMutablePointer<Int>?, UnsafeMutablePointer<codec_error>?) -> UnsafePointer<UInt8>?,
+    _ input: String, _ message: String
+) {
+    var err = codec_error()
+    var len = 0
+    let bytes = Array(input.utf8)
+    let out = bytes.withUnsafeBufferPointer { f($0.baseAddress, $0.count, &len, &err) }
+    let got = err.message_ptr.map { String(decoding: UnsafeBufferPointer(start: $0, count: err.message_len), as: UTF8.self) } ?? ""
+    expect(out == nil && err.code == -3 && got == message, "\(input.debugDescription) rejected with \(err.code) \(got.debugDescription)")
+    codec_error_clear(&err)
+}
+
+func conversions() {
+    expect(Codec.echoUsize(value: 4_294_967_295) == 4_294_967_295, "echoUsize(u32 max)")
+    expect(Codec.echoUsize(value: .max) == .max, "echoUsize(u64 max)")
+
+    for c in ["🦀", "é", "a"] {
+        expect(same(Codec.echoChar(value: c), c), "echoChar(\(c))")
+    }
+    rejected(codec_codec_echo_char, "ab", "value: \"ab\" is not a valid char")
+    rejected(codec_codec_echo_char, "", "value: \"\" is not a valid char")
+
+    expect(Codec.echoHex(value: "ff") == "ff", "echoHex(ff)")
+    expect(Codec.echoHex(value: "00FF") == "ff", "echoHex(00FF) normalizes")
+    expect(Codec.echoHex(value: "0") == "0", "echoHex(0)")
+    rejected(codec_codec_echo_hex, "xyz", "value: invalid digit found in string")
+    rejected(codec_codec_echo_hex, "", "value: cannot parse integer from empty string")
+    rejected(codec_codec_echo_hex, "100000000", "value: number too large to fit in target type")
+}
+
 func run() {
+    do {
+        try CodecLibrary.check()
+    } catch {
+        fail("check() threw \(error)")
+    }
     let n = Codec.vectorCount()
     expect(n >= 60, "vectorCount (got \(n))")
     let index = vectorIndex(n)
@@ -275,11 +413,15 @@ func run() {
     outOfRange(n)
     malformed()
     objects(index)
+    optScalars()
+    typedArrays()
+    chunks()
+    conversions()
     print("swift/codec: \(n) vectors")
 }
 
 run()
-expect(codec_abi_version() == 4, "ABI revision 4")
+expect(codec_abi_version() == 5, "ABI revision 5")
 expect(codec_debug_live(-1) == 1, "the sample counts live resources")
 assertNoLeaks()
 print("swift/codec: OK")

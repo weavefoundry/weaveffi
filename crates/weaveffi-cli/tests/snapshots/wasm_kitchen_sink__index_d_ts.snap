@@ -9,9 +9,9 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 /**
  * The root of every error these bindings throw. `code` is the ABI error
- * code: positive for a declared domain error, negative for a runtime trap
- * (-1 generic, -2 producer panic, -3 marshalling failure, -4 a callback
- * implementation failed, -5 cancelled).
+ * code: positive for a domain error, negative for a runtime failure (-1
+ * an untyped failure, -2 producer panic, -3 marshalling failure, -4 a
+ * callback implementation failed, -5 cancelled).
  */
 export declare class KitchenSinkError extends Error {
   readonly code: number;
@@ -24,19 +24,24 @@ export declare class CancelledError extends KitchenSinkError {
 /** The root error class, under a name no namespace member can shadow. */
 declare const $Error: typeof KitchenSinkError;
 /**
+ * A lazy iterator over a native `iter<T>`: each `next()` makes one native
+ * call. The native iterator is released when it is exhausted or fails, by
+ * `return()` (which `for...of` calls on `break`), by `close()` or a `using`
+ * declaration, or when the iterator is garbage collected.
+ */
+export interface NativeIterator<T> extends IterableIterator<T> {
+  /** Release the native iterator now. Safe to call more than once. */
+  close(): void;
+  /** Alias of `close()` for `using` declarations. */
+  [Symbol.dispose](): void;
+}
+/**
  * Load the WebAssembly module and check that it matches these bindings.
  * Every other export throws until the returned promise resolves.
  */
 export declare function init(
   source?: string | URL | BufferSource | WebAssembly.Module | Response,
 ): Promise<void>;
-/**
- * The native library's live-resource counters (0 objects, 1 callbacks,
- * 2 iterators, 3 cancel tokens, 4 byte runs), for leak tests. Kind -1 is
- * `1n` when the library counts at all.
- * @internal
- */
-export declare function __debugLive(kind: number): bigint;
 
 export declare namespace shared {
   /** A reusable token referenced across modules */
@@ -49,17 +54,32 @@ export declare namespace shared {
 }
 
 export declare namespace kitchen {
-  /** The errors of the `kitchen` error domain. */
-  export class KitchenErrorsError extends $Error {
+  /** The errors of the `KitchenErrors` domain (an unknown code is this class itself). */
+  export class KitchenError extends $Error {
     constructor(code: number, message?: string);
   }
   /** Item not found */
-  export class NotFoundError extends kitchen.KitchenErrorsError {
+  export class NotFoundError extends kitchen.KitchenError {
     static readonly CODE: 1;
     constructor(message?: string);
   }
   /** Invalid input */
-  export class InvalidInputError extends kitchen.KitchenErrorsError {
+  export class InvalidInputError extends kitchen.KitchenError {
+    static readonly CODE: 2;
+    constructor(message?: string);
+  }
+  /** The errors of the `PantryError` domain (an unknown code is this class itself). */
+  export class PantryError extends $Error {
+    constructor(code: number, message?: string);
+  }
+  /** Out of stock */
+  export class OutOfStockError extends kitchen.PantryError {
+    static readonly CODE: 1;
+    readonly item: string;
+    constructor(fields: { item: string }, message?: string);
+  }
+  /** Spoiled */
+  export class SpoiledError extends kitchen.PantryError {
     static readonly CODE: 2;
     constructor(message?: string);
   }
@@ -103,13 +123,28 @@ export declare namespace kitchen {
     onItem(item: kitchen.Item, gadget: kitchen.Gadget): boolean;
     /**
      * A display label, failing with a kitchen error
-     * @throws {kitchen.KitchenErrorsError} to report that error, with its fields, to the library
+     * @throws {kitchen.KitchenError} to report one of its codes, with its fields, to the library
      */
     label(): string;
     /** The most recent item the listener kept, if any */
     latest(): kitchen.Item | null;
     /** The listener's favorite gadget */
     favorite(): kitchen.Gadget;
+  }
+  /** Consumer-implemented source of scalar samples */
+  export interface Sampler {
+    /** The cutoff for a level, if the sampler has one */
+    threshold(level: number | null): number | null;
+    /**
+     * Up to `limit` samples, failing when the pantry is empty
+     * @throws {kitchen.PantryError} to report one of its codes, with its fields, to the library
+     */
+    samples(limit: number | null, weights: number[]): readonly number[] | Int16Array;
+    /**
+     * A free-form description, failing with an untyped error
+     * @throws to report a failure, with its message, to the library
+     */
+    describe(): string;
   }
   /** A pocket-sized interface exercising the object surface */
   export class Gadget {
@@ -119,9 +154,14 @@ export declare namespace kitchen {
     describe(): string;
     /**
      * Poke the gadget a number of times, failing on a negative count
-     * @throws {kitchen.KitchenErrorsError}
+     * @throws {kitchen.KitchenError} when the call fails with one of its codes
      */
     poke(times: number): number;
+    /**
+     * The gadget's sensor readings, optionally limited
+     * @throws {KitchenSinkError} (code -1) when the call fails
+     */
+    readings(limit: number | null): number[];
     /** The gadget subsystem version string */
     static version(): string;
     /**
@@ -150,10 +190,10 @@ export declare namespace kitchen {
   /** A list of objects */
   export function gadgets(): kitchen.Gadget[];
   /** An iterator over objects */
-  export function streamGadgets(): IterableIterator<kitchen.Gadget>;
+  export function streamGadgets(): NativeIterator<kitchen.Gadget>;
   /**
    * Optional struct return
-   * @throws {kitchen.KitchenErrorsError}
+   * @throws {kitchen.KitchenError} when the call fails with one of its codes
    */
   export function maybeItem(id: bigint): kitchen.Item | null;
   /** List of structs */
@@ -161,7 +201,7 @@ export declare namespace kitchen {
   /** Map return type */
   export function getAttrs(): Record<string, number>;
   /** Iterator return type */
-  export function streamItems(): IterableIterator<kitchen.Item>;
+  export function streamItems(): NativeIterator<kitchen.Item>;
   /** Returns the shared Token type from another module */
   export function crossModuleToken(): shared.Token;
   /** Async operation */
@@ -170,11 +210,48 @@ export declare namespace kitchen {
   export function doCancellable(input: string, options?: { signal?: AbortSignal }): Promise<string>;
   /**
    * Legacy operation kept for compatibility
-   * @deprecated Use new_op instead
+   * @deprecated Use `newOp` instead
    */
   export function legacyOp(): number;
-  /** Replacement for legacy_op */
+  /** Replacement for `legacyOp` */
   export function newOp(): number;
+  /** Optional scalar in both directions */
+  export function optI32Id(x: number | null): number | null;
+  export function optBoolId(x: boolean | null): boolean | null;
+  /** Optional C-style enum in both directions */
+  export function optPriority(p: kitchen.Priority | null): kitchen.Priority | null;
+  /** Optional scalars next to ordinary parameters */
+  export function optMixed(base: number, scale: number | null, offset: bigint | null, label: string | null): number | null;
+  /** A typed-array parameter */
+  export function sumF64(xs: readonly number[] | Float64Array): number;
+  /** Typed arrays in both directions */
+  export function scaleI32(xs: readonly number[] | Int32Array, factor: number): number[];
+  export function idsU64(ids: readonly bigint[] | BigUint64Array): bigint[];
+  /** Every slice element type */
+  export function mixedSlices(a: readonly number[] | Int8Array, b: readonly number[] | Int16Array, c: readonly number[] | Uint16Array, d: readonly number[] | Uint32Array, e: readonly bigint[] | BigInt64Array, f: readonly number[] | Float32Array): number[];
+  /** Async returning an optional scalar */
+  export function asyncMaybeCount(): Promise<bigint | null>;
+  /** Async returning a typed array */
+  export function asyncSamples(n: number, options?: { signal?: AbortSignal }): Promise<number[]>;
+  /** Iterator of optional scalars */
+  export function streamMaybe(): NativeIterator<number | null>;
+  /** Iterator of typed arrays */
+  export function streamChunks(): NativeIterator<number[]>;
+  /**
+   * Drive a consumer-implemented sampler
+   * @throws {kitchen.PantryError} when the call fails with one of its codes
+   */
+  export function sampleWith(sampler: kitchen.Sampler, level: number | null): number[];
+  /**
+   * Fails with the second domain
+   * @throws {kitchen.PantryError} when the call fails with one of its codes
+   */
+  export function takeFromPantry(item: string): number;
+  /**
+   * Fails with an untyped error
+   * @throws {KitchenSinkError} (code -1) when the call fails
+   */
+  export function parseAny(text: string): bigint;
   export namespace nested {
     /** Trivial nested-module function */
     export function hello(): string;

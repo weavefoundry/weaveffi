@@ -1,18 +1,15 @@
 //! Entity rendering: error domains, plain and rich enums, record
 //! dataclasses, and interface wrapper classes.
 
+use crate::codegen::errors::ErrorTable;
 use crate::codegen::CodeWriter;
-use heck::ToSnakeCase;
-use weaveffi_model::model::{
-    CallShape, EnumBinding, ErrorBinding, FieldBinding, FnBinding, InterfaceBinding, Model,
-    ModuleBinding, StructBinding,
-};
+use weaveffi_model::model::{EnumBinding, FieldBinding, InterfaceBinding, StructBinding};
 
 use crate::targets::python::calls::{render_bindings, render_callable, FnScope};
 use crate::targets::python::codec::{
     read_expr, render_record_codecs, render_rich_enum_codecs, write_stmt,
 };
-use crate::targets::python::docs::{comment, docstring, with_deprecation};
+use crate::targets::python::docs::{comment, docstring};
 use crate::targets::python::types::{
     py_binding_name, py_error_field, py_field, py_field_hint, py_str_literal, py_variant,
 };
@@ -20,95 +17,31 @@ use crate::targets::python::Gen;
 
 // ── Errors ──
 
-/// The first of `candidates` that no declaration of the API (a type, or an
-/// error code's class) already names.
-fn free_name(model: &Model, candidates: [String; 3]) -> String {
-    let taken = |name: &str| {
-        model.modules.iter().any(|m| {
-            m.enums.iter().any(|e| e.name == name)
-                || m.structs.iter().any(|s| s.name == name)
-                || m.interfaces.iter().any(|i| i.name == name)
-                || m.callback_interfaces.iter().any(|c| c.name == name)
-                || m.errors.as_ref().is_some_and(|e| {
-                    e.type_name == name
-                        || e.codes.iter().any(|c| py_code_class_name(&c.name) == name)
-                })
-        })
-    };
-    let fallback = format!("{}Root", candidates[2]);
-    candidates
-        .into_iter()
-        .find(|n| !taken(n))
-        .unwrap_or(fallback)
-}
-
-/// The root exception class every declared error derives from: `Error` (so
-/// consumers write `except kvstore.Error`), unless the API declares a type
-/// or error code with that name, in which case `{PascalName}Error`, then
-/// `{PascalName}BaseError`.
-pub(crate) fn root_error_name(model: &Model, pascal_name: &str) -> String {
-    free_name(
-        model,
-        [
-            "Error".to_string(),
-            format!("{pascal_name}Error"),
-            format!("{pascal_name}BaseError"),
-        ],
-    )
-}
-
-/// The unchecked `RuntimeError` subclass a failed call that declares no
-/// errors raises: `InternalError`, unless the API declares that name.
-pub(crate) fn trap_error_name(model: &Model, pascal_name: &str) -> String {
-    free_name(
-        model,
-        [
-            "InternalError".to_string(),
-            format!("{pascal_name}InternalError"),
-            format!("{pascal_name}RuntimeError"),
-        ],
-    )
-}
-
-/// `_{stem}_from`: builds the domain exception matching a code, message,
-/// and payload.
-pub(crate) fn py_factory_name(eb: &ErrorBinding) -> String {
-    format!("_{}_from", eb.type_name.to_snake_case())
-}
-
-/// The factory an out-err slot of `f` is raised through: the module
-/// domain's typed factory when `f` declares errors, the unchecked trap
-/// otherwise.
-pub(crate) fn py_raise_factory(f: &FnBinding, error: Option<&ErrorBinding>) -> String {
-    match error {
-        Some(eb) if f.throws => py_factory_name(eb),
-        _ => "_trap_from".to_string(),
-    }
-}
-
-/// The Python class name for one error code: plain PascalCase with no forced
-/// suffix (`KeyNotFound`, not `KeyNotFoundError`). Each class is also
-/// attached to its domain class (`KvError.KeyNotFound`).
-pub(crate) fn py_code_class_name(name: &str) -> String {
-    weaveffi_model::errors::pascal(name)
-}
-
-/// Render one module's declared error domain: a base exception named after
-/// the domain (subclassing the root exception), one subclass per code
-/// carrying its stable `CODE`, its payload fields as constructor arguments
-/// and attributes, and their value-buffer encoding (a callback method that
-/// declares errors raises them back to the producer), then the factory that
-/// builds the exception for a code, message, and payload. Each code class
-/// is also attached to the domain class, so consumers can catch
+/// Render one error domain: a base exception named after the domain
+/// (subclassing the root exception), one subclass per code carrying its
+/// stable `CODE`, its payload fields as constructor arguments and
+/// attributes, and their value-buffer encoding (a callback method that
+/// throws the domain raises them back to the producer), then the factory
+/// that builds the exception for a code, message, and payload. Each code
+/// class is also attached to the domain class, so consumers can catch
 /// `KvError.KeyNotFound`.
-pub(crate) fn render_error(
-    w: &mut CodeWriter,
-    g: &Gen<'_>,
-    module: &ModuleBinding,
-    eb: &ErrorBinding,
-) {
-    let domain = &eb.type_name;
+///
+/// Domains are open: the factory maps a positive code these bindings don't
+/// know (from a newer library) to the domain's base class itself, with the
+/// code and message preserved.
+pub(crate) fn render_error(w: &mut CodeWriter, g: &Gen<'_>, t: &ErrorTable<'_>) {
+    let domain = &t.type_name;
     let root = &g.root_error;
+    let codes: Vec<(String, String)> = t
+        .codes
+        .iter()
+        .map(|row| {
+            (
+                weaveffi_model::errors::pascal(&row.code.name),
+                g.code_class(&row.code.name).to_string(),
+            )
+        })
+        .collect();
 
     w.blank().blank();
     w.line(format!("class {domain}({root}):"));
@@ -116,29 +49,34 @@ pub(crate) fn render_error(
         docstring(
             w,
             Some(&format!(
-                "Base exception for the `{}` module's error domain.",
-                module.dot_path
+                "Base exception of the `{}` error domain (module `{}`).\n\n\
+                 Each declared code raises its own subclass. A positive code these\n\
+                 bindings don't know (from a newer library) raises this class itself,\n\
+                 with `code` and `message` preserved.",
+                t.domain.name, t.module.dot_path
             )),
         );
-        // The per-code classes, attached below once they exist.
-        w.blank();
-        for c in &eb.codes {
-            let class = py_code_class_name(&c.name);
-            w.line(format!("{class}: Type[{class}]"));
+        if !codes.is_empty() {
+            // The per-code classes, attached below once they exist.
+            w.blank();
+            for (alias, class) in &codes {
+                w.line(format!("{alias}: ClassVar[type[{class}]]"));
+            }
         }
     });
 
-    for c in &eb.codes {
-        let class = py_code_class_name(&c.name);
+    for (row, (_, class)) in t.codes.iter().zip(&codes) {
+        let c = row.code;
         w.blank().blank();
         w.line(format!("class {class}({domain}):"));
         w.scope(|w| {
-            docstring(w, Some(c.doc.as_deref().unwrap_or(&c.message)));
+            let doc = g.text(&c.doc);
+            docstring(w, Some(doc.as_deref().unwrap_or(&c.message)));
             w.blank();
             w.line(format!("CODE = {}", c.value));
             if !c.fields.is_empty() {
                 w.blank();
-                render_dataclass_fields(w, &c.fields, py_error_field);
+                render_fields(w, g, &c.fields, py_error_field);
             }
             let mut params: Vec<String> = c
                 .fields
@@ -183,27 +121,27 @@ pub(crate) fn render_error(
 
     // Scoped aliases: `except KvError.KeyNotFound` names the code through its
     // domain.
-    w.blank().blank();
-    for c in &eb.codes {
-        let class = py_code_class_name(&c.name);
-        w.line(format!("{domain}.{class} = {class}"));
+    if !codes.is_empty() {
+        w.blank().blank();
+        for (alias, class) in &codes {
+            w.line(format!("{domain}.{alias} = {class}"));
+        }
     }
 
     w.blank().blank();
     w.line(format!(
         "def {}(code: int, message: str, payload: bytes = b\"\") -> {root}:",
-        py_factory_name(eb)
+        g.domain_factory(&t.domain.name)
     ));
     w.scope(|w| {
         docstring(
             w,
             Some(&format!(
-                "The {domain} subclass for `code` with its payload fields, or the\n\
-                 plain {root} for a runtime code (a panic, a marshalling failure)."
+                "The exception for a failure of a call that throws {domain}."
             )),
         );
-        for c in &eb.codes {
-            let class = py_code_class_name(&c.name);
+        for (row, (_, class)) in t.codes.iter().zip(&codes) {
+            let c = row.code;
             w.line(format!("if code == {}:", c.value));
             w.scope(|w| {
                 if c.fields.is_empty() {
@@ -222,7 +160,7 @@ pub(crate) fn render_error(
                 w.line("))");
             });
         }
-        w.line(format!("return {root}(code, message)"));
+        w.line(format!("return _unknown_code({domain}, code, message)"));
     });
 }
 
@@ -230,21 +168,21 @@ pub(crate) fn render_error(
 
 /// Render one enum: a plain `IntEnum` for a C-style enum, or the dataclass
 /// sum-type hierarchy for a rich enum.
-pub(crate) fn render_enum(w: &mut CodeWriter, e: &EnumBinding) {
+pub(crate) fn render_enum(w: &mut CodeWriter, g: &Gen<'_>, e: &EnumBinding) {
     if e.is_rich() {
-        render_rich_enum(w, e);
+        render_rich_enum(w, g, e);
         return;
     }
     w.blank().blank();
     w.line(format!("class {}(IntEnum):", e.name));
     w.scope(|w| {
-        let doc = with_deprecation(e.doc.as_deref(), e.deprecated.as_deref());
+        let doc = g.doc(&e.doc, &e.deprecated);
         if doc.is_some() {
             docstring(w, doc.as_deref());
             w.blank();
         }
         for v in &e.variants {
-            comment(w, v.doc.as_deref());
+            comment(w, g.text(&v.doc).as_deref());
             w.line(format!("{} = {}", py_variant(&v.name), v.value));
         }
     });
@@ -252,33 +190,38 @@ pub(crate) fn render_enum(w: &mut CodeWriter, e: &EnumBinding) {
 
 /// Render a rich (algebraic) enum as an idiomatic Python sum type: a base
 /// class holding the nested `Tag` discriminant enum and a `tag` property,
-/// one module-level `@dataclass` subclass per variant carrying its fields,
-/// scoped aliases (`Shape.Circle` is `ShapeCircle`), and the buffer codec.
-/// Consumers construct variants directly and discriminate with `isinstance`
-/// (or the `tag` property).
-fn render_rich_enum(w: &mut CodeWriter, e: &EnumBinding) {
+/// one module-level frozen dataclass subclass per variant carrying its
+/// fields, scoped aliases (`Shape.Circle` is `ShapeCircle`), and the buffer
+/// codec. Consumers construct variants directly and discriminate with
+/// `isinstance`, `match`, or the `tag` property.
+fn render_rich_enum(w: &mut CodeWriter, g: &Gen<'_>, e: &EnumBinding) {
     let name = &e.name;
     w.blank().blank();
     w.line(format!("class {name}:"));
     w.scope(|w| {
-        let doc = with_deprecation(e.doc.as_deref(), e.deprecated.as_deref());
+        let doc = g.doc(&e.doc, &e.deprecated);
         if doc.is_some() {
             docstring(w, doc.as_deref());
             w.blank();
         }
+        w.line("__slots__ = ()");
+        w.blank();
         w.line("class Tag(IntEnum):");
         w.scope(|w| {
             for v in &e.variants {
-                comment(w, v.doc.as_deref());
+                comment(w, g.text(&v.doc).as_deref());
                 w.line(format!("{} = {}", py_variant(&v.name), v.value));
             }
         });
         w.blank();
         // The variant classes, attached below once they exist.
         for v in &e.variants {
-            w.line(format!("{0}: Type[{name}{0}]", py_variant(&v.name)));
+            w.line(format!(
+                "{0}: ClassVar[type[{name}{0}]]",
+                py_variant(&v.name)
+            ));
         }
-        w.line(format!("TAG: {name}.Tag"));
+        w.line(format!("TAG: ClassVar[{name}.Tag]"));
         w.blank();
         w.line("@property");
         w.line(format!("def tag(self) -> {name}.Tag:"));
@@ -291,17 +234,18 @@ fn render_rich_enum(w: &mut CodeWriter, e: &EnumBinding) {
     for v in &e.variants {
         let class = format!("{name}{}", py_variant(&v.name));
         w.blank().blank();
-        w.line("@dataclass");
+        w.line("@dataclass(frozen=True, slots=True)");
         w.line(format!("class {class}({name}):"));
         w.scope(|w| {
-            if v.doc.is_some() {
-                docstring(w, v.doc.as_deref());
+            let doc = g.text(&v.doc);
+            if doc.is_some() {
+                docstring(w, doc.as_deref());
                 w.blank();
             }
             w.line(format!("TAG = {name}.Tag.{}", py_variant(&v.name)));
             if !v.fields.is_empty() {
                 w.blank();
-                render_dataclass_fields(w, &v.fields, py_field);
+                render_fields(w, g, &v.fields, py_field);
             }
         });
     }
@@ -318,16 +262,16 @@ fn render_rich_enum(w: &mut CodeWriter, e: &EnumBinding) {
 
 // ── Records ──
 
-/// Render a record as a plain `@dataclass` value class plus its buffer
-/// codec. Records have no C symbols: construction, equality, and repr all
+/// Render a record as a frozen, slotted dataclass plus its buffer codec.
+/// Records have no C symbols: construction, equality, hashing, and repr all
 /// come from the dataclass, and instances cross the ABI serialized in value
-/// buffers.
-pub(crate) fn render_struct(w: &mut CodeWriter, s: &StructBinding) {
+/// buffers. Derive a changed copy with `dataclasses.replace`.
+pub(crate) fn render_struct(w: &mut CodeWriter, g: &Gen<'_>, s: &StructBinding) {
     w.blank().blank();
-    w.line("@dataclass");
+    w.line("@dataclass(frozen=True, slots=True)");
     w.line(format!("class {}:", s.name));
     w.scope(|w| {
-        let doc = with_deprecation(s.doc.as_deref(), s.deprecated.as_deref());
+        let doc = g.doc(&s.doc, &s.deprecated);
         docstring(w, doc.as_deref());
         if s.fields.is_empty() {
             if doc.is_none() {
@@ -338,16 +282,21 @@ pub(crate) fn render_struct(w: &mut CodeWriter, s: &StructBinding) {
         if doc.is_some() {
             w.blank();
         }
-        render_dataclass_fields(w, &s.fields, py_field);
+        render_fields(w, g, &s.fields, py_field);
     });
     render_record_codecs(w, s);
 }
 
 /// Emit one annotated attribute line (`name: hint`) per field, with field
 /// docs as leading comments; `spell` names each field.
-fn render_dataclass_fields(w: &mut CodeWriter, fields: &[FieldBinding], spell: fn(&str) -> String) {
+fn render_fields(
+    w: &mut CodeWriter,
+    g: &Gen<'_>,
+    fields: &[FieldBinding],
+    spell: fn(&str) -> String,
+) {
     for f in fields {
-        comment(w, f.doc.as_deref());
+        comment(w, g.text(&f.doc).as_deref());
         w.line(format!(
             "{}: {}",
             spell(&f.name),
@@ -367,19 +316,13 @@ fn render_dataclass_fields(w: &mut CodeWriter, fields: &[FieldBinding], spell: f
 /// constructor named `new` becomes `__init__`; every other constructor
 /// becomes a `@classmethod` factory; methods lend `self` as the leading C
 /// argument; statics are `@staticmethod`s.
-pub(crate) fn render_interface(
-    w: &mut CodeWriter,
-    g: &Gen<'_>,
-    module: &ModuleBinding,
-    i: &InterfaceBinding,
-) {
-    let error = g.model.error_domain(module);
+pub(crate) fn render_interface(w: &mut CodeWriter, g: &Gen<'_>, i: &InterfaceBinding) {
     let name = &i.name;
-    // Consecutive sync member bindings are packed into one block.
+    // Consecutive plain sync member bindings are packed into one block.
     let mut packed = false;
-    for m in i.constructors.iter().chain(&i.methods).chain(&i.statics) {
-        render_bindings(w, g, m, error, &format!("{name}.{}", m.name), packed);
-        packed = matches!(m.shape, CallShape::Sync(_));
+    for m in i.members() {
+        render_bindings(w, g, m, packed);
+        packed = !m.is_async() && m.iterator().is_none();
     }
     let clone = py_binding_name(&i.clone_symbol, g.prefix);
     let destroy = py_binding_name(&i.destroy_symbol, g.prefix);
@@ -398,7 +341,7 @@ pub(crate) fn render_interface(
     w.blank().blank();
     w.line(format!("class {name}(_Object):"));
     w.scope(|w| {
-        let doc = with_deprecation(i.doc.as_deref(), i.deprecated.as_deref());
+        let doc = g.doc(&i.doc, &i.deprecated);
         if doc.is_some() {
             docstring(w, doc.as_deref());
             w.blank();
@@ -407,7 +350,7 @@ pub(crate) fn render_interface(
         w.line(format!("_clone = staticmethod({clone})"));
 
         match i.constructors.iter().find(|c| c.name == "new") {
-            Some(c) => render_callable(w, g, module, c, FnScope::Init),
+            Some(c) => render_callable(w, g, c, FnScope::Init),
             None => {
                 // No canonical constructor: instances only come from
                 // factories and producer returns.
@@ -421,13 +364,13 @@ pub(crate) fn render_interface(
             }
         }
         for c in i.constructors.iter().filter(|c| c.name != "new") {
-            render_callable(w, g, module, c, FnScope::Factory);
+            render_callable(w, g, c, FnScope::Factory);
         }
         for m in &i.methods {
-            render_callable(w, g, module, m, FnScope::Method);
+            render_callable(w, g, m, FnScope::Method);
         }
         for s in &i.statics {
-            render_callable(w, g, module, s, FnScope::Static);
+            render_callable(w, g, s, FnScope::Static);
         }
     });
 }

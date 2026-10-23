@@ -1,4 +1,4 @@
-// Conformance consumer: codec sample, C target (ABI revision 4).
+// Conformance consumer: codec sample, C target (ABI revision 5).
 //
 // The shared-vector loop: for every vector the producer serves, decode it
 // with the generated `codec_buffer.h`, re-encode it (which must reproduce the
@@ -8,8 +8,10 @@
 // bug can't hide), spot checks of decoded fields, the typed out-of-range
 // error and its payload, malformed buffers (truncated, unknown tag, trailing
 // bytes, a bad bool, a duplicate map key) rejected as marshalling failures,
-// and object identity and reference counting through buffers. Ends by
-// asserting the producer's leak counters are zero.
+// object identity and reference counting through buffers, and the ABI 5
+// shapes: optional scalars (OptDirect) and typed arrays (Slice) in both
+// directions and as iterator items, a `usize`, a `char`, and a custom type.
+// Ends by asserting the producer's leak counters are zero.
 
 #include "harness.h"
 
@@ -309,7 +311,7 @@ static void out_of_range(uint32_t n) {
     assert(err.code == codec_codec_CodecError_OutOfRange);
     char expected[64];
     snprintf(expected, sizeof expected, "vector %u is out of range (count %u)", n, n);
-    assert(strcmp(err.message, expected) == 0);
+    assert(MSG_EQ(err, expected));
     codec_codec_CodecError_OutOfRange_payload p;
     assert(codec_codec_CodecError_OutOfRange_payload_decode(err.payload_ptr, err.payload_len,
                                                            &p));
@@ -509,9 +511,142 @@ static void objects(uint32_t n) {
     codec_codec_Token_destroy(NULL);
 }
 
+static void opt_scalars(void) {
+    codec_error err = {0};
+    int32_t i = 7;
+    assert(!codec_codec_echo_opt_i32(false, 0, &i, &err) && err.code == 0 && i == 0);
+    assert(codec_codec_echo_opt_i32(true, INT32_MIN, &i, &err) && i == INT32_MIN);
+    assert(codec_codec_echo_opt_i32(true, 0, &i, &err) && i == 0);
+
+    double d = 1.0;
+    assert(codec_codec_echo_opt_f64(true, -0.0, &d, &err) && d == 0.0 && signbit(d));
+    assert(codec_codec_echo_opt_f64(true, NAN, &d, &err) && isnan(d));
+    assert(!codec_codec_echo_opt_f64(false, 0.0, &d, &err));
+
+    bool flag = false;
+    assert(codec_codec_echo_opt_bool(true, true, &flag, &err) && flag);
+    assert(codec_codec_echo_opt_bool(true, false, &flag, &err) && !flag);
+    assert(!codec_codec_echo_opt_bool(false, false, &flag, &err));
+
+    codec_codec_Color c = 0;
+    assert(codec_codec_echo_opt_color(true, codec_codec_Color_Infrared, &c, &err) &&
+           c == codec_codec_Color_Infrared);
+    assert(codec_codec_echo_opt_color(true, codec_codec_Color_Blue, &c, &err) &&
+           c == codec_codec_Color_Blue);
+    assert(!codec_codec_echo_opt_color(false, 0, &c, &err) && err.code == 0);
+    // A present value is still checked; an absent one is ignored.
+    assert(!codec_codec_echo_opt_color(true, 3, &c, &err) && err.code == -3);
+    codec_error_clear(&err);
+    assert(!codec_codec_echo_opt_color(false, 3, &c, &err) && err.code == 0);
+}
+
+static void slices(void) {
+    codec_error err = {0};
+    size_t len = 0;
+
+    uint64_t nan_bits = 0x7ff8000000000001ull;
+    double f64s[4] = {0.0, -0.0, 5e-324, INFINITY};
+    memcpy(&f64s[0], &nan_bits, 8);
+    double* d = codec_codec_echo_f64s(f64s, 4, &len, &err);
+    assert(err.code == 0 && len == 4 && ((uintptr_t)d % 8) == 0);
+    assert(isnan(d[0]) && memcmp(&d[1], &f64s[1], 3 * sizeof(double)) == 0);
+    codec_free_bytes((uint8_t*)d, len * sizeof(double));
+
+    const int32_t i32s[3] = {INT32_MIN, 0, INT32_MAX};
+    int32_t* i = codec_codec_echo_i32s(i32s, 3, &len, &err);
+    assert(err.code == 0 && len == 3 && memcmp(i, i32s, sizeof i32s) == 0);
+    codec_free_bytes((uint8_t*)i, len * sizeof(int32_t));
+    assert(codec_codec_echo_i32s(NULL, 0, &len, &err) == NULL && len == 0 && err.code == 0);
+
+    const uint64_t u64s[2] = {UINT64_MAX, 1ull << 63};
+    uint64_t* u = codec_codec_echo_u64s(u64s, 2, &len, &err);
+    assert(err.code == 0 && len == 2 && memcmp(u, u64s, sizeof u64s) == 0);
+    codec_free_bytes((uint8_t*)u, len * sizeof(uint64_t));
+    assert(codec_codec_echo_u64s(NULL, 0, &len, &err) == NULL && len == 0);
+
+    // A null array with a length, and one not aligned for its element type.
+    assert(codec_codec_echo_u64s(NULL, 2, &len, &err) == NULL && err.code == -3);
+    codec_error_clear(&err);
+    _Alignas(8) uint8_t raw[24] = {0};
+    const uint64_t* misaligned = (const uint64_t*)(const void*)(raw + 4);
+    assert(codec_codec_echo_u64s(misaligned, 2, &len, &err) == NULL && err.code == -3);
+    codec_error_clear(&err);
+}
+
+// Pull every chunk of `chunks(values, size)`, checking it against `expected`
+// (`counts[k]` elements each, laid out back to back).
+static void chunks(const int32_t* values, size_t n, uint32_t size, const int32_t* expected,
+                   const size_t* counts, size_t chunk_count) {
+    codec_error err = {0};
+    codec_codec_ChunksIterator* it = codec_codec_chunks(values, n, size, &err);
+    assert(err.code == 0 && it != NULL);
+    size_t seen = 0, offset = 0;
+    for (;;) {
+        int32_t* item = NULL;
+        size_t len = 0;
+        int32_t more = codec_codec_ChunksIterator_next(it, &item, &len, &err);
+        assert(err.code == 0);
+        if (!more) break;
+        assert(seen < chunk_count && len == counts[seen]);
+        assert(memcmp(item, expected + offset, len * sizeof(int32_t)) == 0);
+        codec_free_bytes((uint8_t*)item, len * sizeof(int32_t));
+        offset += len;
+        seen++;
+    }
+    assert(seen == chunk_count);
+    codec_codec_ChunksIterator_destroy(it);
+}
+
+static void iterators(void) {
+    const int32_t extremes[3] = {INT32_MIN, 0, INT32_MAX};
+    const size_t two_one[2] = {2, 1};
+    chunks(extremes, 3, 2, extremes, two_one, 2);
+    const int32_t four[4] = {1, 2, 3, 4};
+    const size_t two_two[2] = {2, 2};
+    chunks(four, 4, 2, four, two_two, 2);
+    chunks(four, 2, 0, NULL, NULL, 0);
+    chunks(NULL, 0, 3, NULL, NULL, 0);
+}
+
+// Echo a string through `f`, expecting `expected` (or, when `expected` is
+// NULL, a -3 with `message`).
+typedef const uint8_t* (*echo_fn)(const uint8_t*, size_t, size_t*, codec_error*);
+static void echo_text(echo_fn f, const char* in, const char* expected, const char* message) {
+    codec_error err = {0};
+    size_t len = 0;
+    const uint8_t* out = f(STR(in), &len, &err);
+    if (expected != NULL) {
+        assert(err.code == 0 && bytes_eq(out, len, expected));
+        codec_free_bytes((uint8_t*)out, len);
+    } else {
+        assert(out == NULL && err.code == -3 && MSG_EQ(err, message));
+        codec_error_clear(&err);
+    }
+}
+
+static void conversions(void) {
+    codec_error err = {0};
+    assert(codec_codec_echo_usize(4294967295u, &err) == 4294967295u && err.code == 0);
+    assert(codec_codec_echo_usize(UINT64_MAX, &err) == UINT64_MAX && err.code == 0);
+
+    echo_text(codec_codec_echo_char, "\xf0\x9f\xa6\x80", "\xf0\x9f\xa6\x80", NULL);
+    echo_text(codec_codec_echo_char, "\xc3\xa9", "\xc3\xa9", NULL);
+    echo_text(codec_codec_echo_char, "a", "a", NULL);
+    echo_text(codec_codec_echo_char, "ab", NULL, "value: \"ab\" is not a valid char");
+    echo_text(codec_codec_echo_char, "", NULL, "value: \"\" is not a valid char");
+
+    echo_text(codec_codec_echo_hex, "ff", "ff", NULL);
+    echo_text(codec_codec_echo_hex, "00FF", "ff", NULL);
+    echo_text(codec_codec_echo_hex, "0", "0", NULL);
+    echo_text(codec_codec_echo_hex, "xyz", NULL, "value: invalid digit found in string");
+    echo_text(codec_codec_echo_hex, "", NULL, "value: cannot parse integer from empty string");
+    echo_text(codec_codec_echo_hex, "100000000", NULL,
+              "value: number too large to fit in target type");
+}
+
 int main(void) {
     codec_error err = {0};
-    assert(CODEC_ABI_VERSION == 4u && codec_abi_version() == CODEC_ABI_VERSION);
+    assert(CODEC_ABI_VERSION == 5u && codec_abi_version() == CODEC_ABI_VERSION);
     assert(codec_codec_contract_check() == 0);
     assert(codec_debug_live(-1) == 1);
 
@@ -524,6 +659,10 @@ int main(void) {
     out_of_range(n);
     malformed();
     objects(n);
+    opt_scalars();
+    slices();
+    iterators();
+    conversions();
 
     ASSERT_NO_LEAKS(codec_debug_live);
     printf("c/codec: OK (%u vectors)\n", n);

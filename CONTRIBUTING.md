@@ -53,14 +53,17 @@ should also pass that target's fixture check and conformance lanes.
 
 ### Snapshot tests
 
-Snapshot tests (`crates/weaveffi-cli/tests/snapshots.rs`) pin the exact
-output of every generator for the fixtures in
-`crates/weaveffi-cli/tests/fixtures/`, using
+Snapshot tests (`crates/weaveffi-cli/tests/snapshots.rs`) render every
+registered target for every fixture in `crates/weaveffi-cli/tests/fixtures/`
+and pin the exact output for the `kitchen_sink` fixture, file by file, using
 [`cargo-insta`](https://insta.rs/). Fixed files (runtimes, package
-manifests, and READMEs, listed per target in `FIXED_FILES`) are snapshotted
-once, from `kitchen_sink`; a target's copy of the C header is asserted
-byte-equal to the C target's own header instead of snapshotted; every other
-file is snapshotted for every fixture. When output changes on purpose:
+manifests, and READMEs, listed per target by `Target::fixed_files`) aren't
+snapshotted, and a target's copy of the C header is asserted byte-equal to
+the C target's own header instead. The other fixtures are covered by the
+fixture compile checks, the determinism test, and targeted assertions in
+each target's `tests.rs` (which should test only target-specific naming,
+escaping, and configuration, not what the snapshot already pins). When
+output changes on purpose:
 
 ```bash
 cargo install cargo-insta --locked
@@ -80,7 +83,11 @@ type-checks it with the target language's toolchain (through
 `scripts/fixtures/<target>.sh`). Run it for any target whose output you
 change; CI runs one job per target. A missing tool (including `mypy` 1.x for
 Python and the node-gyp headers from `npx node-gyp install` for Node.js) is
-reported as a skip locally and fails the check when `CI=true`.
+reported as a skip locally and fails the check when `CI=true`. The Python
+and Ruby checks (and conformance lanes) need Python 3.10 and Ruby 3.2 or
+newer: they use the `python3` and `ruby` on PATH when those are new enough,
+and otherwise look for a `python3.N` on PATH or Homebrew's Ruby (see
+`scripts/toolchains.sh`).
 
 ### Conformance
 
@@ -121,11 +128,15 @@ Preview the book with `mdbook serve docs -p 3000 -n 127.0.0.1`.
 
 Read the [architecture guide](docs/src/architecture.md) first; its "Adding a
 generator" section is the checklist. In short: add
-`crates/weaveffi-cli/src/targets/<lang>/` implementing `LanguageBackend`,
-register it with one line in the `cli_targets!` registry in
-`crates/weaveffi-cli/src/config.rs`, add it to the snapshot tests, add
-`scripts/fixtures/<lang>.sh` and `conformance/<lang>/`, and document it under
-`docs/src/generators/`.
+`crates/weaveffi-cli/src/targets/<lang>/` implementing `Target` (rendering
+from the passing contracts stored on the model and through the shared
+emitters in `codegen/`, never matching on a type's family), register
+it with one entry in `REGISTRY` in `crates/weaveffi-cli/src/targets/mod.rs`
+(which also adds it to `--target`, the config tables, and the snapshot
+tests), add `scripts/fixtures/<lang>.sh` and `conformance/<lang>/` and list
+the target in the CI matrices, `scripts/check-fixtures.sh`, and
+`conformance/run.sh` (a test checks that every list matches the registry),
+and document it, with its tier, under `docs/src/generators/`.
 
 ## Fuzzing
 
@@ -143,10 +154,9 @@ cargo install cargo-fuzz --locked
 ```
 
 Seed a target's corpus from its committed seeds and the snapshot fixtures
-(needs `pip install pyyaml tomli-w`), then run it for 60 seconds (swap the
-target name for any of `fuzz_parse_yaml`, `fuzz_parse_json`,
-`fuzz_parse_toml`, `fuzz_parse_type_ref`, `fuzz_validate`,
-`fuzz_value_buffer`):
+(needs `pip install pyyaml`), then run it for 60 seconds (swap the target
+name for any of `fuzz_parse_yaml`, `fuzz_parse_json`, `fuzz_parse_type_ref`,
+`fuzz_validate`, `fuzz_value_buffer`):
 
 ```bash
 python3 crates/weaveffi-fuzz/seed_corpus.py fuzz_parse_yaml \
@@ -302,8 +312,8 @@ fix/android-jni-crash
 
 - **CI** (`ci.yml`): formatting, clippy, rustdoc, and a build of
   `weaveffi-model` without its IDL features; the test suite with snapshot
-  checks on Linux, macOS, and Windows; `weaveffi diff --check` on every
-  sample, the JSON Schema drift check, and a `wasm32` build of every sample
+  checks on Linux, macOS, and Windows; `weaveffi generate --check` on
+  every sample, the JSON Schema drift check, and a `wasm32` build of every sample
   whose embedded metadata must match the native build's; the fixture compile
   check per target; the conformance harness per language on Linux and macOS;
   an Android job that links the Kotlin JNI shim with the NDK and runs

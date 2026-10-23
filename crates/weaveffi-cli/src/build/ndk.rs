@@ -1,7 +1,7 @@
 //! Locating the Android NDK and its per-API-level compilers.
 
-use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
+use miette::{bail, IntoDiagnostic, Result, WrapErr};
 
 use crate::platform::Platform;
 
@@ -57,11 +57,11 @@ impl Ndk {
                 return Ok(Self { root: bundle });
             }
         }
-        bail!(
+        Err(miette::miette!(
             "the Android NDK wasn't found: set ANDROID_NDK_HOME to an NDK directory, or install \
              one with the Android SDK manager (`sdkmanager --install \"ndk;27.2.12479018\"`) so \
              it lands in $ANDROID_HOME/ndk/<version>"
-        )
+        ))
     }
 
     /// The directory of the NDK's LLVM toolchain binaries for this host.
@@ -73,16 +73,17 @@ impl Ndk {
         let prebuilt = self.root.join("toolchains/llvm/prebuilt");
         let host = prebuilt
             .read_dir_utf8()
-            .with_context(|| format!("the NDK at {} has no {prebuilt}", self.root))?
+            .into_diagnostic()
+            .wrap_err_with(|| format!("the NDK at {} has no {prebuilt}", self.root))?
             .filter_map(Result::ok)
             .map(|e| e.path().to_path_buf())
             .find(|p| p.join("bin").is_dir());
         match host {
             Some(host) => Ok(host.join("bin")),
-            None => bail!(
+            None => Err(miette::miette!(
                 "the NDK at {} has no LLVM toolchain under {prebuilt}",
                 self.root
-            ),
+            )),
         }
     }
 

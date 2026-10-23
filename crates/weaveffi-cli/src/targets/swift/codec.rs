@@ -6,19 +6,26 @@
 //! encoder and one decoder (the generic ones) instead of a loop inlined at
 //! each use. This module renders the conformances of the declared types: a
 //! record reads and writes its fields in order, a rich enum its `i32` tag and
-//! then the variant's fields, a C-style enum its discriminant, and an
-//! interface an object token carrying one strong reference.
+//! then the variant's fields, and a C-style enum its discriminant (through
+//! the runtime's `WvCEnum`). Interfaces get theirs from the runtime's
+//! `WvObject`: an object token carrying one strong reference.
 
 use crate::codegen::CodeWriter;
-use weaveffi_model::model::{EnumBinding, InterfaceBinding, StructBinding};
+use weaveffi_model::model::{EnumBinding, StructBinding};
 
-use crate::targets::swift::types::{deprecated_attr, swift_ident, SwiftCtx};
+use crate::targets::swift::types::{swift_ident, SwiftCtx};
 
 /// Open a conformance extension of `ty`, marked deprecated with the type
 /// itself so it can name it without a warning.
-fn open_extension(w: &mut CodeWriter, ty: &str, protocol: &str, deprecated: Option<&str>) {
-    if let Some(msg) = deprecated {
-        w.line(deprecated_attr(msg));
+fn open_extension(
+    w: &mut CodeWriter,
+    ty: &str,
+    protocol: &str,
+    deprecated: &Option<String>,
+    ctx: &SwiftCtx,
+) {
+    if let Some(attr) = ctx.deprecated_attr(deprecated) {
+        w.line(attr);
     }
     w.line(format!("extension {ty}: {protocol} {{"));
 }
@@ -26,8 +33,8 @@ fn open_extension(w: &mut CodeWriter, ty: &str, protocol: &str, deprecated: Opti
 /// Render a C-style enum's conformance: its discriminant, via the runtime's
 /// `WvCEnum` defaults.
 pub(crate) fn render_c_enum_codec(w: &mut CodeWriter, e: &EnumBinding, ctx: &SwiftCtx) {
-    if let Some(msg) = &e.deprecated {
-        w.line(deprecated_attr(msg));
+    if let Some(attr) = ctx.deprecated_attr(&e.deprecated) {
+        w.line(attr);
     }
     w.line(format!("extension {}: WvCEnum {{}}", ctx.ty_name(&e.name)));
     w.blank();
@@ -36,7 +43,7 @@ pub(crate) fn render_c_enum_codec(w: &mut CodeWriter, e: &EnumBinding, ctx: &Swi
 /// Render a record's conformance: its fields in declaration order.
 pub(crate) fn render_record_codec(w: &mut CodeWriter, s: &StructBinding, ctx: &SwiftCtx) {
     let ty = ctx.ty_name(&s.name);
-    open_extension(w, &ty, "WvCodable", s.deprecated.as_deref());
+    open_extension(w, &ty, "WvCodable", &s.deprecated, ctx);
     w.scope(|w| {
         let reader = if s.fields.is_empty() { "_" } else { "r" };
         let args = s
@@ -71,7 +78,7 @@ pub(crate) fn render_record_codec(w: &mut CodeWriter, s: &StructBinding, ctx: &S
 /// buffer.
 pub(crate) fn render_rich_enum_codec(w: &mut CodeWriter, e: &EnumBinding, ctx: &SwiftCtx) {
     let ty = ctx.ty_name(&e.name);
-    open_extension(w, &ty, "WvCodable", e.deprecated.as_deref());
+    open_extension(w, &ty, "WvCodable", &e.deprecated, ctx);
     w.scope(|w| {
         w.line(format!(
             "static func wvRead(_ r: inout WvReader) -> {ty} {{"
@@ -127,22 +134,6 @@ pub(crate) fn render_rich_enum_codec(w: &mut CodeWriter, e: &EnumBinding, ctx: &
             w.line("}");
         });
         w.line("}");
-    });
-    w.line("}");
-    w.blank();
-}
-
-/// Render an interface's conformance: an object token. Reading adopts the
-/// token's reference into a new wrapper; writing mints a fresh one, so the
-/// wrapper keeps its own.
-pub(crate) fn render_interface_codec(w: &mut CodeWriter, iface: &InterfaceBinding, ctx: &SwiftCtx) {
-    let ty = ctx.ty_name(&iface.name);
-    open_extension(w, &ty, "WvCodable", iface.deprecated.as_deref());
-    w.scope(|w| {
-        w.line(format!(
-            "static func wvRead(_ r: inout WvReader) -> {ty} {{ {ty}(ptr: r.readObject()) }}"
-        ));
-        w.line("func wvWrite(_ w: inout WvWriter) { w.writeObject(clonePtr()) }");
     });
     w.line("}");
     w.blank();

@@ -9,13 +9,18 @@
 # iterators of strings, records, and objects, three callback interfaces
 # implemented in Ruby (a `Listener` that is retained, filtered, detached
 # when it raises, and called from a producer thread during compaction; a
-# `Policy` with a record return, a typed error raised back through `put`,
-# object parameters and returns, and malformed returns; a `Loader` passed as
-# an optional callback with string, bytes, and optional-object returns),
-# objects in every buffered position, blocking async calls with `cancel:`
-# tokens, the nested `kv.stats` module, the sibling `report` root, and
-# leak-free teardown. `_wv_debug_live(1)` (live callbacks) shows when the
-# producer released an implementation.
+# `Policy` with an optional-scalar parameter and return, a record return, a
+# typed error raised back through `put` with the domain's message, object
+# parameters and returns, and malformed returns that become
+# `CallbackFailed`; a `Loader` passed as an optional callback with string,
+# bytes, and optional-object returns; a `Scorer` taking and returning typed
+# arrays), objects in every buffered position, blocking async calls with
+# `cancel:` tokens (also under a Fiber scheduler, where the waits overlap),
+# optional scalars and typed arrays as returns, async results, and iterator
+# elements, a `throws: any` method, the nested `kv.stats` module, the
+# sibling `report` root, and leak-free teardown (including an external
+# enumeration abandoned midway, released at GC). `debug_live(1)` (live
+# callbacks) shows when the producer released an implementation.
 
 require_relative 'support'
 require 'kvstore'
@@ -25,7 +30,7 @@ EntryKind = Kvstore::EntryKind
 KvError = Kvstore::KvError
 
 def callbacks
-  Kvstore._wv_debug_live(1)
+  bridge(Kvstore).debug_live(1)
 end
 
 def put(store, key, value, kind = EntryKind::PERSISTENT, ttl = nil)
@@ -35,6 +40,15 @@ end
 def entry(key, value, kind: EntryKind::PERSISTENT, version: 1)
   Kvstore::Entry.new(key: key, value: value.b, kind: kind, version: version, expires_at: nil, tags: [],
                      metadata: {})
+end
+
+# A consumer callback's failure, which the sample converts into
+# `CallbackFailed` with the consumer's message (any message when nil).
+def callback_failed(message, msg)
+  e = expect_raise(KvError::CallbackFailed, msg) { yield }
+  expect(e.code == 1006 && !e.message_.empty?, "#{msg}: CallbackFailed (got #{e.code})")
+  expect(e.message == e.message_ && (message.nil? || e.message == message), "#{msg}: message (got #{e.message})")
+  e
 end
 
 def key_not_found(key, msg)
@@ -90,8 +104,8 @@ class Recorder
   end
 end
 
-# A policy that rewrites admitted entries, vetoes secrets with a typed
-# error, and routes `b/` keys to another store.
+# A policy that picks TTLs, rewrites admitted entries, vetoes secrets with
+# a typed error, and routes `b/` keys to another store.
 class Rewriter
   include Kvstore::Policy
 
@@ -100,6 +114,17 @@ class Rewriter
   def initialize(other)
     @other = other
     @admitted = 0
+  end
+
+  # "short" lives one tick, "forever" never expires, "ttl-fail" fails with
+  # a typed error, and every other key keeps the requested TTL.
+  def ttl_for(key, requested)
+    case key
+    when 'short' then 1
+    when 'forever' then nil
+    when 'ttl-fail' then raise KvError::InvalidPath, 'no ttl for you'
+    else requested
+    end
   end
 
   def admit(entry)
@@ -112,7 +137,7 @@ class Rewriter
     when /\Aboom/
       raise 'policy exploded'
     when /\Agarbage/
-      # An undeclared EntryKind: the producer rejects the record with -3.
+      # An undeclared EntryKind: the producer rejects the record.
       Kvstore::Entry.new(key: entry.key, value: entry.value, kind: 9, version: 0, expires_at: nil, tags: [],
                          metadata: {})
     else
@@ -124,7 +149,7 @@ class Rewriter
   def route(key, home)
     case key
     when %r{\Ab/} then @other
-    when %r{\Anull/} then nil # a required Store: the producer rejects it with -3
+    when %r{\Anull/} then nil # a required Store: the producer rejects it
     else home
     end
   end
@@ -207,6 +232,16 @@ def basics
   expect_raise(TypeError, 'a store of the wrong type') { Kvstore.summarize('not a store') }
 end
 
+# Drives an iterator externally (`next`) on its own thread and abandons it
+# midway, so no live stack still references the suspended enumeration.
+def abandon_external(store)
+  Thread.new do
+    keys = store.keys('user.')
+    expect(keys.next == 'user.alice', 'an external next')
+    expect(bridge(Kvstore).debug_live(2) == 1, 'a suspended external enumeration holds its iterator')
+  end.join
+end
+
 def iterators
   s = Store.open('/iter')
   put(s, 'user.bob', 'b')
@@ -216,7 +251,21 @@ def iterators
   expect(s.keys.to_a == ['sys.x', 'user.alice', 'user.bob'], 'keys in order')
   key_not_found('zzz', 'a prefix that matches nothing') { s.keys('zzz').to_a }
   expect(s.keys('user.').first == 'user.alice', 'a lazy first key')
-  expect(Kvstore._wv_debug_live(2).zero?, 'abandoning an iterator releases it')
+  expect(bridge(Kvstore).debug_live(2).zero?, 'abandoning an iterator releases it')
+
+  keys = s.keys('sys.')
+  expect(keys.next == 'sys.x', 'an external first key')
+  expect_raise(StopIteration, 'an exhausted external enumeration') { keys.next }
+  expect(bridge(Kvstore).debug_live(2).zero?, 'exhausting an external enumeration releases it')
+  expect(keys.to_a == ['sys.x'], 'an external enumeration can be enumerated again')
+
+  abandon_external(s)
+  GC.compact if GC.respond_to?(:compact)
+  released = eventually do
+    GC.start(full_mark: true, immediate_sweep: true)
+    bridge(Kvstore).debug_live(2).zero?
+  end
+  expect(released, 'collecting an abandoned external enumeration releases its iterator')
 
   entries = s.entries('sys.').to_a
   expect(entries.length == 1 && entries[0].key == 'sys.x' && entries[0].value == 'xx'.b, 'entries')
@@ -293,14 +342,22 @@ def policies
 
   e = expect_raise(KvError::Rejected, 'a typed error from admit') { put(s, 'secret', '3') }
   expect(e.code == 1005 && e.key == 'secret' && e.reason == 'no secrets', 'Rejected payload')
-  expect(e.message == 'secrets are not stored', "the policy's message (got #{e.message})")
-  e = expect_raise(Kvstore::Error, 'any other exception') { put(s, 'boom', '4') }
-  expect(!e.is_a?(KvError) && e.code == -4 && e.message == 'policy exploded', "-4 (got #{e.code}: #{e.message})")
-  e = expect_raise(Kvstore::Error, 'a malformed admit return') { put(s, 'garbage', '5') }
-  expect(!e.is_a?(KvError) && e.code == -3, "a malformed record is -3 (got #{e.code}: #{e.message})")
-  e = expect_raise(Kvstore::Error, 'a nil route return') { put(s, 'null/x', '6') }
-  expect(!e.is_a?(KvError) && e.code == -3, "a null Store is -3 (got #{e.code}: #{e.message})")
+  expect(e.message == 'write to secret rejected: no secrets', "the domain's message (got #{e.message})")
+  callback_failed('policy exploded', 'any other exception') { put(s, 'boom', '4') }
+  callback_failed(nil, 'a malformed admit return') { put(s, 'garbage', '5') }
+  callback_failed(nil, 'a nil route return') { put(s, 'null/x', '6') }
   expect(s.count == 1 && other.count == 1 && p.admitted == 6, 'failed puts change nothing')
+
+  # ttl_for: an optional scalar in and out, consulted before admit.
+  expect(put(s, 'short', 'x', EntryKind::VOLATILE).expires_at == 1, 'ttl_for gives short a TTL')
+  expect(put(s, 'forever', 'x', EntryKind::VOLATILE, 5).expires_at.nil?, 'ttl_for drops the TTL of forever')
+  expect(put(s, 'kept', 'x', EntryKind::VOLATILE, 5).expires_at == 5, 'ttl_for keeps a requested TTL')
+  e = expect_raise(KvError::InvalidPath, 'a typed error from ttl_for') { put(s, 'ttl-fail', 'x') }
+  expect(e.message == 'invalid path', "the domain's message (got #{e.message})")
+  expect(s.count == 4 && p.admitted == 9, 'ttl_for runs before admit')
+  s.delete('short')
+  s.delete('forever')
+  s.delete('kept')
 
   s.set_policy(Rewriter.new(other))
   expect(callbacks == base + 1, 'replacing the policy releases the old one')
@@ -330,9 +387,8 @@ def loaders
 
   expect(s.get_or_load('missing', Source.new).nil?, 'KeyNotFound for this key is none')
   e = key_not_found('other', 'KeyNotFound for another key passes through') { s.get_or_load('elsewhere', Source.new) }
-  expect(e.message == 'not in the loader', "the loader's message (got #{e.message})")
-  e = expect_raise(Kvstore::Error, 'any other loader failure') { s.get_or_load('broken', Source.new) }
-  expect(!e.is_a?(KvError) && e.code == -4 && e.message == 'loader is broken', "-4 (got #{e.code}: #{e.message})")
+  expect(e.message == 'key not found: other', "the domain's message (got #{e.message})")
+  callback_failed('loader is broken', 'any other loader failure') { s.get_or_load('broken', Source.new) }
   expect(callbacks == base, 'every loader is released')
   s.close
 end
@@ -455,9 +511,84 @@ def stats_and_report
   s.close
 end
 
+# A scorer returning each size as its score, failing, or returning too few.
+class Sizer
+  include Kvstore::Scorer
+
+  attr_reader :seen
+
+  def initialize(mode = :sizes)
+    @mode = mode
+  end
+
+  def scores(sizes)
+    @seen = sizes
+    case @mode
+    when :sizes then sizes.map(&:to_f)
+    when :fail then raise 'scorer is out of order'
+    else [1.0]
+    end
+  end
+end
+
+def abi5_shapes
+  s = Store.open('/abi5')
+  put(s, 'b', '12')
+  put(s, 'a', "\x01\x02\x03", EntryKind::VOLATILE, 7)
+  expect(s.count == 2, 'two entries')
+
+  # An optional scalar return, a typed-array return, and optional scalar
+  # iterator elements.
+  expect(s.expires_at('a') == 7 && s.expires_at('b').nil? && s.expires_at('zzz').nil?, 'expires_at')
+  expect(s.value_sizes == [3, 2], "value_sizes in key order (got #{s.value_sizes})")
+  expect(s.expirations.to_a == [7, nil], 'expirations')
+
+  # An optional scalar and a typed array as async results.
+  expect(s.version_of('a') == 1 && s.version_of('q').nil?, 'version_of')
+  put(s, 'b', 'x')
+  expect(s.versions(%w[b q a]) == [2, 0, 1], 'versions')
+  s.close
+
+  # A callback taking and returning typed arrays.
+  s = Store.open('/rank')
+  put(s, 'a', '1')
+  put(s, 'b', '333')
+  put(s, 'c', '22')
+  sizer = Sizer.new
+  expect(s.rank(sizer) == %w[b c a] && sizer.seen == [1, 3, 2], 'rank by the scorer')
+  callback_failed('scorer is out of order', 'a failing scorer') { s.rank(Sizer.new(:fail)) }
+  callback_failed('expected 3 scores, got 1', 'a short scorer') { s.rank(Sizer.new(:short)) }
+  s.close
+
+  # throws: any, and a usize return.
+  s = Store.open('/import')
+  expect(s.import_lines("a=1\n\nb=two\n") == 2 && s.get('b').value == 'two'.b, 'import_lines')
+  e = expect_raise(Kvstore::Error, 'a malformed line') { s.import_lines("c=3\nbroken\nd=4") }
+  expect(e.instance_of?(Kvstore::Error) && e.code == -1, "an untyped error (got #{e.class}, #{e.code})")
+  expect(e.message == 'line 2: expected key=value', "the untyped message (got #{e.message})")
+  expect(s.count == 3, 'the lines before the failure were stored')
+  s.close
+end
+
+# Two async calls waiting in two Fibers of one thread under a Fiber
+# scheduler overlap: each wait yields to the scheduler.
+def fibers
+  s = Store.open('/fibers')
+  results = []
+  started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  Thread.new do
+    Fiber.set_scheduler(MiniScheduler.new)
+    2.times { Fiber.schedule { results << s.compact(300) } }
+  end.join
+  elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+  expect(results == [0, 0], "both compactions completed (got #{results})")
+  expect(elapsed < 0.55, "the waits overlapped (took #{elapsed.round(3)}s)")
+  s.close
+end
+
 run_and_check_leaks(Kvstore) do
   main = Thread.current
-  expect(Kvstore::ABI_VERSION == 4, 'bindings target ABI revision 4')
+  expect(Kvstore::ABI_VERSION == 5, 'bindings target ABI revision 5')
   constructors
   basics
   iterators
@@ -467,6 +598,8 @@ run_and_check_leaks(Kvstore) do
   async_calls(main)
   object_graph
   stats_and_report
+  abi5_shapes
+  fibers
   expect(callbacks.zero?, 'every callback implementation was released')
 end
 

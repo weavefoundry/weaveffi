@@ -38,13 +38,26 @@
 //! Buffers aren't the only way values cross. The `echo_*` functions return
 //! their argument unchanged through the direct ABI families (scalars by
 //! value, strings and bytes as `(ptr, len)` runs, the C-style enum as an
-//! `int32_t`), so a consumer feeds every primitive vector's value through the
-//! matching echo too. The `Token` interface with `primary_of`,
-//! `same_primary`, and `sum_holder` checks object identity and reference
-//! counting through buffers.
+//! `int32_t`, optional scalars as a presence flag plus a value, numeric
+//! lists as typed arrays, `usize` as a `u64`, a `char` as a one-scalar
+//! string, and the custom `Hex` type as its string repr), so a consumer
+//! feeds every primitive vector's value through the matching echo too.
+//! `chunks` streams typed arrays through an iterator. The `Token` interface
+//! with `primary_of`, `same_primary`, and `sum_holder` checks object
+//! identity and reference counting through buffers.
 //!
 //! The producer itself is pure safe Rust; the `#[weaveffi::module]`
 //! expansion supplies the codecs the consumers are checked against.
+
+/// Parse a `Hex`: lowercase or uppercase hex digits, no prefix.
+fn parse_hex(text: String) -> Result<u32, std::num::ParseIntError> {
+    u32::from_str_radix(&text, 16)
+}
+
+/// Format a `Hex`: lowercase hex digits, no prefix.
+fn format_hex(value: &u32) -> String {
+    format!("{value:x}")
+}
 
 /// Value-buffer round-trip oracle covering every wire shape.
 #[weaveffi::module]
@@ -58,6 +71,7 @@ pub mod codec {
     #[repr(i32)]
     pub enum CodecError {
         /// vector index out of range
+        #[weaveffi(message = "vector {index} is out of range (count {count})")]
         OutOfRange {
             /// The requested index.
             index: u32,
@@ -66,15 +80,10 @@ pub mod codec {
         } = 1,
     }
 
-    impl std::fmt::Display for CodecError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::OutOfRange { index, count } => {
-                    write!(f, "vector {index} is out of range (count {count})")
-                }
-            }
-        }
-    }
+    /// A `u32` written in hex, crossing as its string (`"ff"`): a custom
+    /// type. Bindings see a `string`; the producer sees a `u32`.
+    #[weaveffi::custom(repr = String, lift = super::parse_hex, lower = super::format_hex)]
+    pub type Hex = u32;
 
     /// A C-style enum with sparse and negative discriminants (crosses by
     /// value, and as an `i32` inside buffers).
@@ -838,6 +847,85 @@ pub mod codec {
         value
     }
 
+    /// Return the argument unchanged (an optional `i32`: a presence flag and
+    /// a value).
+    #[weaveffi::export]
+    pub fn echo_opt_i32(value: Option<i32>) -> Option<i32> {
+        value
+    }
+
+    /// Return the argument unchanged (an optional `f64`).
+    #[weaveffi::export]
+    pub fn echo_opt_f64(value: Option<f64>) -> Option<f64> {
+        value
+    }
+
+    /// Return the argument unchanged (an optional `bool`).
+    #[weaveffi::export]
+    pub fn echo_opt_bool(value: Option<bool>) -> Option<bool> {
+        value
+    }
+
+    /// Return the argument unchanged (an optional C-style enum).
+    #[weaveffi::export]
+    pub fn echo_opt_color(value: Option<Color>) -> Option<Color> {
+        value
+    }
+
+    /// Return the argument unchanged (a typed array of `f64`, borrowed).
+    #[weaveffi::export]
+    pub fn echo_f64s(values: &[f64]) -> Vec<f64> {
+        values.to_vec()
+    }
+
+    /// Return the argument unchanged (a typed array of `i32`).
+    #[weaveffi::export]
+    pub fn echo_i32s(values: Vec<i32>) -> Vec<i32> {
+        values
+    }
+
+    /// Return the argument unchanged (a typed array of `u64`, borrowed).
+    #[weaveffi::export]
+    pub fn echo_u64s(values: &[u64]) -> Vec<u64> {
+        values.to_vec()
+    }
+
+    /// Return the argument unchanged (a `usize`, crossing as a `u64`; a
+    /// value past `usize::MAX` on a 32-bit producer is a marshalling error).
+    #[weaveffi::export]
+    pub fn echo_usize(value: usize) -> usize {
+        value
+    }
+
+    /// Return the argument unchanged (a `char`, crossing as a string of
+    /// exactly one Unicode scalar value; any other string is a marshalling
+    /// error).
+    #[weaveffi::export]
+    pub fn echo_char(value: char) -> char {
+        value
+    }
+
+    /// Return the argument normalized (a `Hex`, crossing as a string): the
+    /// same number, written in lowercase hex without leading zeros. A
+    /// string that isn't hex for a `u32` is a marshalling error carrying the
+    /// parse failure's message.
+    #[weaveffi::export]
+    pub fn echo_hex(value: Hex) -> Hex {
+        value
+    }
+
+    /// `values` split into consecutive arrays of `size` elements (the last
+    /// may be shorter), pulled lazily; nothing for a `size` of `0`.
+    #[weaveffi::export]
+    pub fn chunks(values: &[i32], size: u32) -> weaveffi::Iter<Vec<i32>> {
+        let chunks: Vec<Vec<i32>> = if size == 0 {
+            Vec::new()
+        } else {
+            values.chunks(size as usize).map(<[i32]>::to_vec).collect()
+        };
+        weaveffi::Iter::new(chunks)
+    }
+
     /// The sum of every token value inside `holder` (wrapping on overflow).
     #[weaveffi::export]
     pub fn sum_holder(holder: &Holder) -> i64 {
@@ -1002,6 +1090,108 @@ mod tests {
         unsafe { abi::free_bytes(out.cast_mut(), len) };
         let out = unsafe { codec_codec_echo_text(std::ptr::null(), 0, &mut len, &mut err) };
         assert!(out.is_null() && len == 0 && err.code == 0);
+    }
+
+    #[test]
+    fn optional_scalars_echo() {
+        let mut err = FfiError::default();
+        let mut out = 0i32;
+        assert!(unsafe { codec_codec_echo_opt_i32(true, i32::MIN, &mut out, &mut err) });
+        assert_eq!(out, i32::MIN);
+        assert!(!unsafe { codec_codec_echo_opt_i32(false, 5, &mut out, &mut err) });
+        let mut f = 0.0f64;
+        assert!(unsafe { codec_codec_echo_opt_f64(true, -0.0, &mut f, &mut err) });
+        assert!(f == 0.0 && f.is_sign_negative());
+        let mut b = false;
+        assert!(unsafe { codec_codec_echo_opt_bool(true, true, &mut b, &mut err) });
+        assert!(b);
+        let mut c = 0i32;
+        assert!(unsafe { codec_codec_echo_opt_color(true, -1, &mut c, &mut err) });
+        assert_eq!(c, Color::Infrared as i32);
+        assert!(!unsafe { codec_codec_echo_opt_color(true, 3, &mut c, &mut err) });
+        assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
+        unsafe { abi::error_clear(&mut err) };
+    }
+
+    fn take<T: Copy>(ptr: *mut T, len: usize) -> Vec<T> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let out = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+        unsafe { abi::free_bytes(ptr.cast(), len * std::mem::size_of::<T>()) };
+        out
+    }
+
+    #[test]
+    fn typed_arrays_echo() {
+        let mut err = FfiError::default();
+        let mut len = 0usize;
+        let floats = [f64::NAN, -0.0, 5e-324, f64::INFINITY];
+        let out = take(
+            unsafe { codec_codec_echo_f64s(floats.as_ptr(), 4, &mut len, &mut err) },
+            len,
+        );
+        assert_eq!(
+            out.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+            floats.iter().map(|f| f.to_bits()).collect::<Vec<_>>()
+        );
+        let ints = [i32::MIN, 0, i32::MAX];
+        let out = take(
+            unsafe { codec_codec_echo_i32s(ints.as_ptr(), 3, &mut len, &mut err) },
+            len,
+        );
+        assert_eq!(out, ints);
+        let words = [u64::MAX, 1 << 63];
+        let out = take(
+            unsafe { codec_codec_echo_u64s(words.as_ptr(), 2, &mut len, &mut err) },
+            len,
+        );
+        assert_eq!(out, words);
+        let empty = unsafe { codec_codec_echo_u64s(std::ptr::null(), 0, &mut len, &mut err) };
+        assert!(empty.is_null() && len == 0 && err.code == 0);
+
+        let it = unsafe { codec_codec_chunks(ints.as_ptr(), 3, 2, &mut err) };
+        let mut got = Vec::new();
+        loop {
+            let mut item: *mut i32 = std::ptr::null_mut();
+            if unsafe { codec_codec_ChunksIterator_next(it, &mut item, &mut len, &mut err) } == 0 {
+                break;
+            }
+            got.push(take(item, len));
+        }
+        unsafe { codec_codec_ChunksIterator_destroy(it) };
+        assert_eq!(got, vec![vec![i32::MIN, 0], vec![i32::MAX]]);
+    }
+
+    #[test]
+    fn sizes_chars_and_custom_types_echo() {
+        let mut err = FfiError::default();
+        assert_eq!(
+            unsafe { codec_codec_echo_usize(u64::from(u32::MAX), &mut err) },
+            u64::from(u32::MAX)
+        );
+        let mut len = 0usize;
+        let crab = "\u{1F980}";
+        let p = unsafe { codec_codec_echo_char(crab.as_ptr(), crab.len(), &mut len, &mut err) };
+        assert_eq!(unsafe { abi::lift_str(p, len) }, Some(crab));
+        unsafe { abi::free_bytes(p.cast_mut(), len) };
+        let two = "ab";
+        let p = unsafe { codec_codec_echo_char(two.as_ptr(), two.len(), &mut len, &mut err) };
+        assert!(p.is_null());
+        assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
+        let hex = "00FF";
+        let p = unsafe { codec_codec_echo_hex(hex.as_ptr(), hex.len(), &mut len, &mut err) };
+        assert_eq!(unsafe { abi::lift_str(p, len) }, Some("ff"));
+        unsafe { abi::free_bytes(p.cast_mut(), len) };
+        let bad = "xyz";
+        let p = unsafe { codec_codec_echo_hex(bad.as_ptr(), bad.len(), &mut len, &mut err) };
+        assert!(p.is_null());
+        assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
+        assert_eq!(
+            unsafe { err.message_str() },
+            Some("value: invalid digit found in string")
+        );
+        unsafe { abi::error_clear(&mut err) };
     }
 
     #[test]

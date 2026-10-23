@@ -9,7 +9,7 @@ require_tools go go
 
 # Run a Go consumer in a throwaway module that requires the generated module
 # as-is (a `replace` points at its directory). The module path follows the
-# package identity or the configured `module_path`, so it's read from the
+# package identity or the configured `name`, so it's read from the
 # generated go.mod and substituted for the consumer's `__MODPATH__` import
 # sentinel. The generated module ships its C header and links
 # `-l<library>`; only the library directory is supplied.
@@ -24,7 +24,7 @@ go_consumer() {
     cp "$ROOT/conformance/go/common.go" "$moddir/common.go"
     cat > "$moddir/go.mod" <<EOF
 module conformance
-go 1.23
+go 1.24
 require $modpath v0.0.0
 replace $modpath => $GENROOT/$sample/go
 EOF

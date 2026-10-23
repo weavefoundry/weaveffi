@@ -1,18 +1,91 @@
-//! C++ spellings: identifier escaping, name casing, namespace paths, and the
-//! IR-to-C++ type mapping.
+//! C++ spellings: identifier escaping, name casing, namespace paths, the
+//! IR-to-C++ type mapping, the exception a call throws, and the doc-text
+//! spelling of backticked API identifiers.
 
 use crate::cabi::c_param_name;
+use crate::codegen::docs::{ApiNames, IdentKind};
 use crate::lang::{self, CPP_KEYWORDS};
 use heck::ToSnakeCase;
-use weaveffi_model::abi::AbiParam;
+use weaveffi_model::abi::{AbiParam, CType};
 use weaveffi_model::errors;
-use weaveffi_model::model::ModuleBinding;
-use weaveffi_model::ty::{Prim, Ty};
+use weaveffi_model::model::{Model, ModuleBinding};
+use weaveffi_model::plan::{ArgPass, ErrorStrategy};
+use weaveffi_model::ty::{ParamTy, Prim, RetTy, Ty};
 
-/// Idiomatic C++ exception class name for an error code: PascalCase with a
-/// single `Error` suffix (`KEY_NOT_FOUND` becomes `KeyNotFoundError`).
+/// What every renderer needs: the model, its C prefix, and the identifier
+/// index the doc rewriting consults.
+pub(crate) struct Ctx<'m> {
+    /// The validated model.
+    pub(crate) model: &'m Model,
+    /// The C symbol prefix (`kvstore`).
+    pub(crate) prefix: &'m str,
+    names: ApiNames,
+}
+
+impl<'m> Ctx<'m> {
+    /// Index `model` once for a render.
+    pub(crate) fn new(model: &'m Model) -> Self {
+        Self {
+            model,
+            prefix: model.prefix(),
+            names: ApiNames::new(model),
+        }
+    }
+
+    /// The C++ spelling of a backticked identifier in IDL doc or
+    /// deprecation text, or `None` to keep it as written: callables,
+    /// parameters, and fields in their C++ casing, and error domains and
+    /// codes as their exception classes.
+    pub(crate) fn spell(&self, ident: &str) -> Option<String> {
+        match self.names.kind(ident)? {
+            IdentKind::Function | IdentKind::CallbackMethod => Some(cpp_fn_name(ident)),
+            IdentKind::Member => Some(cpp_member_name(ident)),
+            IdentKind::Param | IdentKind::Field => Some(cpp_ident(ident)),
+            IdentKind::ErrorDomain | IdentKind::ErrorCode => Some(cpp_error_class(ident)),
+            IdentKind::Module | IdentKind::Type | IdentKind::Variant => None,
+        }
+    }
+}
+
+/// Whether a member of type `ty` can be value-initialized (`T x{}`): every
+/// type but an interface wrapper (which has no empty state), and a record or
+/// rich enum whose by-value members (a rich enum's first variant's) all
+/// can. Optionals, vectors, and maps are empty by default whatever they
+/// hold.
+pub(crate) fn defaultable(model: &Model, ty: &Ty) -> bool {
+    match ty {
+        Ty::Interface(_) => false,
+        Ty::Record(name) => model
+            .record(name)
+            .fields
+            .iter()
+            .all(|f| defaultable(model, &f.ty)),
+        Ty::RichEnum(name) => model
+            .enumeration(name)
+            .variants
+            .first()
+            .is_none_or(|v| v.fields.iter().all(|f| defaultable(model, &f.ty))),
+        Ty::Prim(_) | Ty::Enum(_) | Ty::Optional(_) | Ty::List(_) | Ty::Map(..) => true,
+    }
+}
+
+/// The C++ exception class of an error domain or code: PascalCase with a
+/// single `Error` suffix (`KitchenErrors` is `KitchenError`, `NOT_FOUND` is
+/// `NotFoundError`), through the shared [`errors::type_name`].
 pub(crate) fn cpp_error_class(name: &str) -> String {
     errors::type_name(name, "Error")
+}
+
+/// The exception class a call with `error` throws, which keys its
+/// `detail::Errors<E>` policy: `InternalError` for a call that declares no
+/// errors (the trap policy), `Error` for `throws: any`, and the domain's
+/// class otherwise.
+pub(crate) fn error_class(error: &ErrorStrategy) -> String {
+    match error {
+        ErrorStrategy::Trap => "InternalError".to_string(),
+        ErrorStrategy::Untyped => "Error".to_string(),
+        ErrorStrategy::Domain(name) => cpp_error_class(name),
+    }
 }
 
 /// C++ reserved words the shared [`CPP_KEYWORDS`] table doesn't carry: the
@@ -49,16 +122,16 @@ pub(crate) fn cpp_fn_name(name: &str) -> String {
     cpp_ident(&name.to_snake_case())
 }
 
-/// Members every interface wrapper class declares besides its special
-/// members: the `raw_type` alias and the `handle()` and `clone_handle()`
-/// readers. (The private `raw_` field can't collide: a snake-cased name
-/// only ends in `_` once escaped, and `raw` is reserved nowhere.)
-const OBJECT_MEMBERS: &[&str] = &["clone_handle", "handle", "raw_type"];
+/// Names every interface wrapper class declares besides its members: the
+/// `raw_type` alias, the `handle()` and `clone_handle()` readers, and the
+/// private `traits` struct. (The private `raw_` field can't collide: a
+/// snake-cased name only ends in `_` once escaped, and `raw` is reserved
+/// nowhere.)
+const OBJECT_MEMBERS: &[&str] = &["clone_handle", "handle", "raw_type", "traits"];
 
 /// The C++ spelling of an interface member (a factory constructor, method,
 /// or static): [`cpp_fn_name`], with a trailing underscore when it would
-/// collide with a member the wrapper class declares (`handle` is
-/// `handle_`).
+/// collide with a name the wrapper class declares (`handle` is `handle_`).
 pub(crate) fn cpp_member_name(name: &str) -> String {
     lang::escape_member(&cpp_fn_name(name), OBJECT_MEMBERS)
 }
@@ -82,92 +155,100 @@ pub(crate) fn slot_name(p: &AbiParam) -> String {
     c_param_name(&p.name)
 }
 
-/// Renders ABI parameter slots to C declarations (`<type> <name>`), the form
-/// used inside async completion lambdas and callback-interface trampolines.
-pub(crate) fn render_param_decls(params: &[AbiParam], prefix: &str) -> Vec<String> {
-    params
-        .iter()
-        .map(|p| format!("{} {}", p.ty.render_c(prefix), slot_name(p)))
-        .collect()
+/// One ABI slot as a C declaration (`<type> <name>`), the form trampoline
+/// and completion parameter lists use.
+pub(crate) fn slot_decl(p: &AbiParam, prefix: &str) -> String {
+    format!("{} {}", p.ty.render_c(prefix), slot_name(p))
 }
 
-/// The `detail` accessor returning the process-wide static vtable for a
-/// callback interface.
-pub(crate) fn vtable_accessor(name: &str) -> String {
-    format!("{name}_vtable")
+/// The C type an out slot (`T* out_value`, `T** out_item`) points to: the
+/// type of the local the wrapper passes the address of.
+pub(crate) fn pointee(p: &AbiParam, prefix: &str) -> String {
+    match &p.ty {
+        CType::Ptr { pointee, .. } => pointee.render_c(prefix),
+        other => other.render_c(prefix),
+    }
 }
 
-/// The `detail` struct holding a callback interface's trampolines.
-pub(crate) fn trampoline_struct(name: &str) -> String {
-    format!("{name}_trampolines")
+/// The C++ spelling of a primitive.
+fn cpp_prim(p: Prim) -> &'static str {
+    match p {
+        Prim::I8 => "int8_t",
+        Prim::I16 => "int16_t",
+        Prim::I32 => "int32_t",
+        Prim::I64 => "int64_t",
+        Prim::U8 => "uint8_t",
+        Prim::U16 => "uint16_t",
+        Prim::U32 => "uint32_t",
+        Prim::U64 => "uint64_t",
+        Prim::F32 => "float",
+        Prim::F64 => "double",
+        Prim::Bool => "bool",
+        Prim::String => "std::string",
+        Prim::Bytes => "std::vector<uint8_t>",
+    }
 }
 
-/// The idiomatic C++ spelling of an IR type. Interfaces map to their RAII
-/// wrapper class and `Interface?` to `std::optional` of it; a callback
-/// interface (bare or optional) is a `std::shared_ptr` of the abstract class
-/// the consumer implements, empty for none.
+/// The idiomatic C++ spelling of a value type. Interfaces map to their RAII
+/// wrapper class and `Interface?` to `std::optional` of it.
 pub(crate) fn cpp_type(ty: &Ty) -> String {
     match ty {
-        Ty::Prim(p) => match p {
-            Prim::I8 => "int8_t",
-            Prim::I16 => "int16_t",
-            Prim::I32 => "int32_t",
-            Prim::I64 => "int64_t",
-            Prim::U8 => "uint8_t",
-            Prim::U16 => "uint16_t",
-            Prim::U32 => "uint32_t",
-            Prim::U64 => "uint64_t",
-            Prim::F32 => "float",
-            Prim::F64 => "double",
-            Prim::Bool => "bool",
-            Prim::String => "std::string",
-            Prim::Bytes => "std::vector<uint8_t>",
-        }
-        .to_string(),
+        Ty::Prim(p) => cpp_prim(*p).to_string(),
         Ty::Record(n) | Ty::RichEnum(n) | Ty::Enum(n) | Ty::Interface(n) => n.clone(),
-        Ty::CallbackInterface(n) => format!("std::shared_ptr<{n}>"),
-        Ty::Optional(inner) if matches!(inner.as_ref(), Ty::CallbackInterface(_)) => {
-            cpp_type(inner)
-        }
         Ty::Optional(inner) => format!("std::optional<{}>", cpp_type(inner)),
         Ty::List(inner) => format!("std::vector<{}>", cpp_type(inner)),
         Ty::Map(k, v) => format!("std::unordered_map<{}, {}>", cpp_type(k), cpp_type(v)),
-        Ty::Iterator(_) => unreachable!("iterator returns render as range classes"),
     }
 }
 
-/// One C++ parameter declaration (`<type> <name>`) for a wrapper signature.
-/// Strings borrow as `std::string_view` (the ABI passes a pointer and a
-/// length, so interior NULs survive); heavier types borrow by const
-/// reference; scalars and enums pass by value. A callback interface is a
-/// `std::shared_ptr` by value, which the wrapper moves into the box it hands
-/// the producer as `ctx`.
-pub(crate) fn cpp_param_decl(ty: &Ty, name: &str) -> String {
-    match ty {
-        Ty::Prim(Prim::String) => format!("std::string_view {name}"),
-        Ty::Prim(Prim::Bytes)
-        | Ty::Record(_)
-        | Ty::RichEnum(_)
-        | Ty::Interface(_)
-        | Ty::List(_)
-        | Ty::Map(_, _) => format!("const {}& {name}", cpp_type(ty)),
-        Ty::Optional(inner) if !matches!(inner.as_ref(), Ty::CallbackInterface(_)) => {
-            format!("const {}& {name}", cpp_type(ty))
-        }
-        _ => format!("{} {name}", cpp_type(ty)),
+/// The C++ type a callable returns synchronously: the mapped value type, or
+/// the lazy `Range<T>` of an iterator.
+pub(crate) fn cpp_ret_type(ret: &RetTy) -> String {
+    match ret {
+        RetTy::Value(ty) => cpp_type(ty),
+        RetTy::Iterator(elem) => format!("Range<{}>", cpp_type(elem)),
     }
 }
 
-/// One C++ parameter declaration for a callback-interface method the consumer
-/// implements. Strings arrive as a `std::string_view` valid for the call;
-/// bytes and buffered values by const reference to the trampoline's decoded
-/// copy; objects transfer one strong reference, so they arrive by value as
-/// the wrapper (or `std::optional` of it) the implementation now owns.
-pub(crate) fn cpp_cb_param_decl(ty: &Ty, name: &str) -> String {
-    if ty.interface_name().is_some() {
-        format!("{} {name}", cpp_type(ty))
-    } else {
-        cpp_param_decl(ty, name)
+/// One C++ parameter declaration (`<type> <name>`) for a wrapper signature,
+/// per how the argument crosses: scalars, enums, and optional scalars by
+/// value; strings as `std::string_view` (the ABI passes a pointer and a
+/// length, so interior NULs survive); typed arrays, bytes, buffered values,
+/// and objects by const reference (the array's storage is passed as is); a
+/// callback interface as a `std::shared_ptr` by value, which the wrapper
+/// moves into the box it hands the producer.
+pub(crate) fn cpp_param_decl(ty: &ParamTy, pass: &ArgPass, name: &str) -> String {
+    match (ty, pass) {
+        (ParamTy::Callback { name: iface, .. }, _) => format!("std::shared_ptr<{iface}> {name}"),
+        (ParamTy::Value(ty), pass) => cpp_value_param_decl(ty, pass, name),
+    }
+}
+
+/// [`cpp_param_decl`] for a value-typed argument, shared with callback
+/// methods' parameters except for objects (see [`cpp_cb_param_decl`]).
+fn cpp_value_param_decl(ty: &Ty, pass: &ArgPass, name: &str) -> String {
+    let cpp = cpp_type(ty);
+    match pass {
+        ArgPass::Direct { .. } | ArgPass::OptDirect { .. } => format!("{cpp} {name}"),
+        ArgPass::String { .. } => format!("std::string_view {name}"),
+        ArgPass::Slice { .. }
+        | ArgPass::Bytes { .. }
+        | ArgPass::Buffer { .. }
+        | ArgPass::Object { .. }
+        | ArgPass::Callback { .. } => format!("const {cpp}& {name}"),
+    }
+}
+
+/// One C++ parameter declaration for a callback-interface method the
+/// consumer implements. Strings arrive as a `std::string_view` valid for the
+/// call; typed arrays, bytes, and buffered values by const reference to the
+/// trampoline's copy; objects transfer one strong reference, so they arrive
+/// by value as the wrapper (or `std::optional` of it) the implementation
+/// now owns.
+pub(crate) fn cpp_cb_param_decl(ty: &Ty, pass: &ArgPass, name: &str) -> String {
+    match pass {
+        ArgPass::Object { .. } => format!("{} {name}", cpp_type(ty)),
+        _ => cpp_value_param_decl(ty, pass, name),
     }
 }
 
@@ -180,7 +261,21 @@ mod tests {
         assert_eq!(cpp_member_name("handle"), "handle_");
         assert_eq!(cpp_member_name("clone_handle"), "clone_handle_");
         assert_eq!(cpp_member_name("raw_type"), "raw_type_");
+        assert_eq!(cpp_member_name("traits"), "traits_");
         assert_eq!(cpp_member_name("delete"), "delete_");
         assert_eq!(cpp_member_name("close"), "close");
+    }
+
+    #[test]
+    fn error_classes_never_double_the_suffix() {
+        assert_eq!(cpp_error_class("KitchenErrors"), "KitchenError");
+        assert_eq!(cpp_error_class("KvError"), "KvError");
+        assert_eq!(cpp_error_class("NOT_FOUND"), "NotFoundError");
+        assert_eq!(error_class(&ErrorStrategy::Trap), "InternalError");
+        assert_eq!(error_class(&ErrorStrategy::Untyped), "Error");
+        assert_eq!(
+            error_class(&ErrorStrategy::Domain("PantryError".into())),
+            "PantryError"
+        );
     }
 }

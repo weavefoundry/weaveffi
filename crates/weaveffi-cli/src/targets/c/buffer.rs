@@ -12,10 +12,13 @@
 //! spliced in with the prefix substituted; everything after them is rendered
 //! from the [`Model`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::cabi::c_param_name;
-use crate::codegen::common::DocCommentStyle;
+use crate::codegen::codecs;
+use crate::codegen::common::{self, DocCommentStyle};
+use crate::codegen::docs::{ApiNames, Doc};
+use crate::codegen::errors;
 use crate::codegen::CodeWriter;
 use crate::utils::{render_prelude, render_trailer, CommentStyle};
 use weaveffi_model::model::{EnumBinding, FieldBinding, InterfaceBinding, Model};
@@ -52,13 +55,14 @@ struct Codecs<'a> {
     users: Vec<UserType<'a>>,
     /// Record or rich enum name to an index into `users`.
     user_index: HashMap<&'a str, usize>,
-    /// Optional, list, and map shapes, innermost first, without duplicates.
+    /// Optional, list, and map shapes, innermost first, without duplicates
+    /// (see [`codecs::composites`]).
     composites: Vec<Ty>,
 }
 
 /// The header file name for a library: `{library}_buffer.h`.
 #[must_use]
-pub fn buffer_header_name(library: &str) -> String {
+pub(crate) fn buffer_header_name(library: &str) -> String {
     format!("{library}_buffer.h")
 }
 
@@ -68,7 +72,11 @@ pub fn buffer_header_name(library: &str) -> String {
 /// `header_name` is the main header the helper includes; `file_name` is the
 /// helper's own name, used in its trailer.
 #[must_use]
-pub fn render_buffer_header(model: &Model, header_name: &str, file_name: &str) -> Option<String> {
+pub(crate) fn render_buffer_header(
+    model: &Model,
+    header_name: &str,
+    file_name: &str,
+) -> Option<String> {
     if !model.has_buffers() {
         return None;
     }
@@ -105,14 +113,19 @@ struct Unit {
 impl<'a> Codecs<'a> {
     fn new(model: &'a Model) -> Self {
         let prefix = model.prefix();
+        let names = ApiNames::new(model);
+        let doc = |doc: &Option<String>, deprecated: &Option<String>| {
+            Doc::new(doc, deprecated)
+                .with_deprecation(|ident| names.c_name(ident).map(str::to_string))
+        };
         let mut users = Vec::new();
         let mut user_index = HashMap::new();
         for m in &model.modules {
             for s in &m.structs {
                 user_index.insert(s.name.as_str(), users.len());
                 users.push(UserType {
-                    name: format!("{prefix}_{}_{}", m.path, s.name),
-                    doc: with_deprecation(&s.doc, &s.deprecated),
+                    name: s.c_tag.clone(),
+                    doc: doc(&s.doc, &s.deprecated),
                     body: Body::Fields(&s.fields),
                 });
             }
@@ -120,59 +133,25 @@ impl<'a> Codecs<'a> {
                 user_index.insert(e.name.as_str(), users.len());
                 users.push(UserType {
                     name: e.c_tag.clone(),
-                    doc: with_deprecation(&e.doc, &e.deprecated),
+                    doc: doc(&e.doc, &e.deprecated),
                     body: Body::Variants(e),
                 });
             }
         }
-        for m in &model.modules {
-            let Some(err) = m.errors.as_ref() else {
-                continue;
-            };
-            for code in err.codes.iter().filter(|c| !c.fields.is_empty()) {
+        for table in errors::tables(model, "Error") {
+            for row in table.codes.iter().filter(|r| !r.code.fields.is_empty()) {
                 users.push(UserType {
-                    name: code.payload_tag(),
-                    doc: Some(format!(
-                        "The fields a `{}` error carries in `payload_ptr`/`payload_len`.",
-                        code.c_const
+                    name: row.code.payload_tag(),
+                    doc: Some(common::wrap(
+                        &format!(
+                            "The fields of a `{}` error (`{}` in the language bindings), \
+                             which it carries in `payload_ptr`/`payload_len`.",
+                            row.code.c_const, row.type_name
+                        ),
+                        76,
                     )),
-                    body: Body::Fields(&code.fields),
+                    body: Body::Fields(&row.code.fields),
                 });
-            }
-        }
-
-        let mut composites = Vec::new();
-        let mut seen = HashSet::new();
-        for u in &users {
-            match u.body {
-                Body::Fields(fields) => {
-                    for f in fields {
-                        collect(&f.ty, &mut composites, &mut seen);
-                    }
-                }
-                Body::Variants(e) => {
-                    for f in e.variants.iter().flat_map(|v| &v.fields) {
-                        collect(&f.ty, &mut composites, &mut seen);
-                    }
-                }
-            }
-        }
-        let mut boundary = |ty: &Ty| {
-            let ty = ty.iterator_elem().unwrap_or(ty);
-            if ty.is_buffered() {
-                collect(ty, &mut composites, &mut seen);
-            }
-        };
-        for m in &model.modules {
-            for f in m.callables() {
-                f.params.iter().for_each(|p| boundary(&p.ty));
-                f.ret.iter().for_each(&mut boundary);
-            }
-            for cb in &m.callback_interfaces {
-                for meth in &cb.methods {
-                    meth.params.iter().for_each(|p| boundary(&p.ty));
-                    meth.ret.iter().for_each(&mut boundary);
-                }
             }
         }
 
@@ -181,7 +160,7 @@ impl<'a> Codecs<'a> {
             prefix,
             users,
             user_index,
-            composites,
+            composites: codecs::composites(model),
         }
     }
 
@@ -206,7 +185,7 @@ impl<'a> Codecs<'a> {
         match ty {
             Ty::Record(n) | Ty::RichEnum(n) => Some(self.user(n).name.clone()),
             Ty::Optional(_) | Ty::List(_) | Ty::Map(_, _) => {
-                Some(format!("{}_{}", self.prefix, mangle(self.model, ty)))
+                Some(format!("{}_{}", self.prefix, codecs::stem(ty)))
             }
             _ => None,
         }
@@ -768,47 +747,6 @@ impl<'a> Codecs<'a> {
             read,
             free,
         }
-    }
-}
-
-/// A type's doc comment with its deprecation note appended. The struct
-/// itself carries no deprecation attribute: the codecs in this header use it,
-/// and every such use would warn.
-fn with_deprecation(doc: &Option<String>, deprecated: &Option<String>) -> Option<String> {
-    match (doc, deprecated) {
-        (_, None) => doc.clone(),
-        (None, Some(msg)) => Some(format!("Deprecated: {msg}")),
-        (Some(doc), Some(msg)) => Some(format!("{doc}\n\nDeprecated: {msg}")),
-    }
-}
-
-/// Record every optional, list, and map shape inside `ty`, innermost first.
-fn collect(ty: &Ty, out: &mut Vec<Ty>, seen: &mut HashSet<Ty>) {
-    match ty {
-        Ty::Optional(inner) | Ty::List(inner) => collect(inner, out, seen),
-        Ty::Map(k, v) => {
-            collect(k, out, seen);
-            collect(v, out, seen);
-        }
-        _ => return,
-    }
-    if seen.insert(ty.clone()) {
-        out.push(ty.clone());
-    }
-}
-
-/// The identifier fragment naming `ty` inside a composite's codec stem:
-/// `string`, `kv_Entry` (a user type with its module path), `opt_i64`,
-/// `list_string`, `map_string_i64`.
-fn mangle(model: &Model, ty: &Ty) -> String {
-    match ty {
-        Ty::Optional(inner) => format!("opt_{}", mangle(model, inner)),
-        Ty::List(inner) => format!("list_{}", mangle(model, inner)),
-        Ty::Map(k, v) => format!("map_{}_{}", mangle(model, k), mangle(model, v)),
-        _ => match ty.user_name() {
-            Some(name) => format!("{}_{name}", model.owner(name).path),
-            None => prim(ty).snake().to_string(),
-        },
     }
 }
 

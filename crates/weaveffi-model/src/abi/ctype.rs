@@ -7,8 +7,10 @@
 //! structure is shared, every target agrees on the calling convention by
 //! construction.
 
+use crate::ty::Prim;
+
 /// Placement of a `const` qualifier on a pointer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConstPos {
     /// No `const` (mutable pointer): `T*`.
     None,
@@ -18,7 +20,7 @@ pub enum ConstPos {
 
 /// A single C type in an ABI signature, independent of the configured symbol
 /// prefix (applied at render time by [`CType::render_c`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CType {
     /// `int8_t` (the `i8` primitive).
     Int8,
@@ -53,7 +55,9 @@ pub enum CType {
     CancelToken,
     /// `{prefix}_error`.
     Error,
-    /// An enum value type: `{prefix}_{module}_{name}`.
+    /// A C-style enum (or error-domain code) value type:
+    /// `{prefix}_{module}_{name}`, which the header declares as
+    /// `typedef int32_t`.
     Enum {
         /// Underscore-joined symbol path of the module that declares the enum.
         module: String,
@@ -89,6 +93,26 @@ pub enum CType {
 }
 
 impl CType {
+    /// The by-value C type of a scalar primitive (`int32_t` for `i32`,
+    /// `double` for `f64`, `bool` for `bool`). For `string` and `bytes`,
+    /// which cross as byte runs, it's the run's element type, `uint8_t`.
+    #[must_use]
+    pub fn of_prim(p: Prim) -> CType {
+        match p {
+            Prim::Bool => CType::Bool,
+            Prim::I8 => CType::Int8,
+            Prim::I16 => CType::Int16,
+            Prim::I32 => CType::Int32,
+            Prim::I64 => CType::Int64,
+            Prim::U8 | Prim::String | Prim::Bytes => CType::Uint8,
+            Prim::U16 => CType::Uint16,
+            Prim::U32 => CType::Uint32,
+            Prim::U64 => CType::Uint64,
+            Prim::F32 => CType::Float,
+            Prim::F64 => CType::Double,
+        }
+    }
+
     /// Pointer to `pointee` with no `const`.
     pub fn ptr(pointee: CType) -> CType {
         CType::Ptr {
@@ -122,9 +146,8 @@ impl CType {
     ///   imports `std::os::raw::c_char`), and [`Void`](Self::Void) as
     ///   `std::ffi::c_void` (only meaningful as a pointee; a bare `void`
     ///   *return* is the absence of a `-> T`, handled by the caller).
-    /// * A C-style [`Enum`](Self::Enum) crosses the ABI as its `int`-sized
-    ///   discriminant, so it lowers to `i32` (matching the header's
-    ///   `int`-backed `typedef enum`).
+    /// * A C-style [`Enum`](Self::Enum) crosses the ABI as its discriminant,
+    ///   so it lowers to `i32` (matching the header's `typedef int32_t`).
     /// * A `const` pointer is `*const`; a non-`const` pointer is `*mut`.
     pub fn render_rust(&self, prefix: &str) -> String {
         match self {
@@ -288,6 +311,14 @@ mod tests {
             name: "Color".into(),
         };
         assert_eq!(e.render_rust("weaveffi"), "i32");
+    }
+
+    #[test]
+    fn prims_map_to_their_scalar_types() {
+        assert_eq!(CType::of_prim(Prim::F64).render_c("p"), "double");
+        assert_eq!(CType::of_prim(Prim::U16).render_rust("p"), "u16");
+        assert_eq!(CType::of_prim(Prim::Bool), CType::Bool);
+        assert_eq!(CType::of_prim(Prim::String), CType::Uint8);
     }
 
     #[test]

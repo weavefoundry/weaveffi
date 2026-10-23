@@ -7,17 +7,46 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 package kitchen_sink
 
-/** Errors of the `KitchenErrors` domain. */
-sealed class KitchenErrorsException(code: Int, message: String) : FfiException(code, message) {
-    class NotFound(message: String = "Item not found") : KitchenErrorsException(1, message)
-    class InvalidInput(message: String = "Invalid input") : KitchenErrorsException(2, message)
+/**
+ * Errors of the `KitchenErrors` domain, one subclass per code.
+ *
+ * A code these bindings don't declare (from a newer library) is a plain `KitchenException`
+ * carrying that [code] and the library's message.
+ */
+open class KitchenException internal constructor(code: Int, message: String) : FfiException(code, message) {
+    class NotFound(message: String = "Item not found") : KitchenException(1, message)
+    class InvalidInput(message: String = "Invalid input") : KitchenException(2, message)
 
     internal companion object {
-        /** The exception for a raw code and its serialized payload. */
-        fun fromCode(code: Int, message: String, payload: ByteArray?): FfiException = when (code) {
+        /** The exception for a positive code and its serialized payload. */
+        fun fromCode(code: Int, message: String, payload: ByteArray?): KitchenException = when (code) {
             1 -> NotFound(message)
             2 -> InvalidInput(message)
-            else -> FfiException(code, message)
+            else -> KitchenException(code, message)
+        }
+    }
+}
+
+/**
+ * Errors of the `PantryError` domain, one subclass per code.
+ *
+ * A code these bindings don't declare (from a newer library) is a plain `PantryException`
+ * carrying that [code] and the library's message.
+ */
+open class PantryException internal constructor(code: Int, message: String) : FfiException(code, message) {
+    class OutOfStock(val item: String, message: String = "Out of stock") : PantryException(1, message) {
+        override fun encodePayload(): ByteArray = encodeBuffer { _w ->
+            _w.writeString(item)
+        }
+    }
+    class Spoiled(message: String = "Spoiled") : PantryException(2, message)
+
+    internal companion object {
+        /** The exception for a positive code and its serialized payload. */
+        fun fromCode(code: Int, message: String, payload: ByteArray?): PantryException = when (code) {
+            1 -> if (payload == null) PantryException(code, message) else decodeBuffer(payload) { _r -> OutOfStock(_r.readString(), message) }
+            2 -> Spoiled(message)
+            else -> PantryException(code, message)
         }
     }
 }
@@ -33,6 +62,7 @@ enum class Priority(val value: Int) {
 
     companion object {
         /** The variant whose ABI value is [value]. */
+        @JvmStatic
         fun fromValue(value: Int): Priority = entries.firstOrNull { it.value == value }
             ?: throw NativeBugException(-3, "unknown Priority value $value")
     }
@@ -60,9 +90,46 @@ data class Item(
     val priority: Priority,
     /** An optional object inside a record */
     val gadget: Gadget?,
-)
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is Item) return false
+        return id == other.id &&
+            name == other.name &&
+            count == other.count &&
+            enabled == other.enabled &&
+            ratio == other.ratio &&
+            nick == other.nick &&
+            payload.contentEquals(other.payload) &&
+            tags == other.tags &&
+            attrs == other.attrs &&
+            parent == other.parent &&
+            token == other.token &&
+            priority == other.priority &&
+            gadget == other.gadget
+    }
 
-internal fun packItem(_w: BufferWriter, _v: Item) {
+    override fun hashCode(): Int {
+        var result = id.hashCode()
+        result = 31 * result + name.hashCode()
+        result = 31 * result + count.hashCode()
+        result = 31 * result + enabled.hashCode()
+        result = 31 * result + ratio.hashCode()
+        result = 31 * result + nick.hashCode()
+        result = 31 * result + payload.contentHashCode()
+        result = 31 * result + tags.hashCode()
+        result = 31 * result + attrs.hashCode()
+        result = 31 * result + parent.hashCode()
+        result = 31 * result + token.hashCode()
+        result = 31 * result + priority.hashCode()
+        result = 31 * result + gadget.hashCode()
+        return result
+    }
+
+    override fun toString(): String = "Item(id=${id}, name=${name}, count=${count}, enabled=${enabled}, ratio=${ratio}, nick=${nick}, payload=${payload.contentToString()}, tags=${tags}, attrs=${attrs}, parent=${parent}, token=${token}, priority=${priority}, gadget=${gadget})"
+}
+
+internal fun pack_Item(_w: BufferWriter, _v: Item) {
     _w.writeI64(_v.id)
     _w.writeString(_v.name)
     _w.writeI32(_v.count)
@@ -70,15 +137,15 @@ internal fun packItem(_w: BufferWriter, _v: Item) {
     _w.writeF64(_v.ratio)
     _w.writeU32(_v.nick)
     _w.writeBytes(_v.payload)
-    packListOfString(_w, _v.tags)
-    packMapOfStringToString(_w, _v.attrs)
-    packOptionalOfI64(_w, _v.parent)
-    packToken(_w, _v.token)
+    pack_list_string(_w, _v.tags)
+    pack_map_string_string(_w, _v.attrs)
+    pack_opt_i64(_w, _v.parent)
+    pack_Token(_w, _v.token)
     _w.writeI32(_v.priority.value)
-    packOptionalOfGadget(_w, _v.gadget)
+    pack_opt_Gadget(_w, _v.gadget)
 }
 
-internal fun unpackItem(_r: BufferReader): Item = Item(
+internal fun unpack_Item(_r: BufferReader): Item = Item(
     _r.readI64(),
     _r.readString(),
     _r.readI32(),
@@ -86,12 +153,12 @@ internal fun unpackItem(_r: BufferReader): Item = Item(
     _r.readF64(),
     _r.readU32(),
     _r.readBytes(),
-    unpackListOfString(_r),
-    unpackMapOfStringToString(_r),
-    unpackOptionalOfI64(_r),
-    unpackToken(_r),
+    unpack_list_string(_r),
+    unpack_map_string_string(_r),
+    unpack_opt_i64(_r),
+    unpack_Token(_r),
     Priority.fromValue(_r.readI32()),
-    unpackOptionalOfGadget(_r),
+    unpack_opt_Gadget(_r),
 )
 
 /** Consumer-implemented observer of ready items */
@@ -105,8 +172,10 @@ interface ReadyListener {
     /**
      * A display label, failing with a kitchen error
      *
-     * Throw a [KitchenErrorsException] to report a typed error to the library.
+     * Throw a [KitchenException] to report a typed error to the library; anything else
+     * thrown reaches it as an untyped failure with its message.
      */
+    @Throws(KitchenException::class)
     fun label(): String
 
     /** The most recent item the listener kept, if any */
@@ -114,6 +183,29 @@ interface ReadyListener {
 
     /** The listener's favorite gadget */
     fun favorite(): Gadget
+}
+
+/** Consumer-implemented source of scalar samples */
+interface Sampler {
+    /** The cutoff for a level, if the sampler has one */
+    fun threshold(level: UInt?): Double?
+
+    /**
+     * Up to `limit` samples, failing when the pantry is empty
+     *
+     * Throw a [PantryException] to report a typed error to the library; anything else
+     * thrown reaches it as an untyped failure with its message.
+     */
+    @Throws(PantryException::class)
+    fun samples(limit: UInt?, weights: List<Double>): List<Short>
+
+    /**
+     * A free-form description, failing with an untyped error
+     *
+     * Anything thrown reaches the library as a failure with its message.
+     */
+    @Throws(Exception::class)
+    fun describe(): String
 }
 
 /** A pocket-sized interface exercising the object surface */
@@ -129,8 +221,15 @@ class Gadget private constructor(address: Long) : AutoCloseable {
     }
 
     /** Poke the gadget a number of times, failing on a negative count */
+    @Throws(KitchenException::class)
     fun poke(times: Int): Int = handle.borrow { _self ->
         JniBridge.kitchen_Gadget_poke(_self, times)
+    }
+
+    /** The gadget's sensor readings, optionally limited */
+    @Throws(FfiException::class)
+    fun readings(limit: UInt?): List<Double> = handle.borrow { _self ->
+        JniBridge.kitchen_Gadget_readings(_self, limit != null, limit?.toInt() ?: 0).asList()
     }
 
     /** Releases this wrapper's native reference; safe to call more than once. */
@@ -144,86 +243,170 @@ class Gadget private constructor(address: Long) : AutoCloseable {
         internal fun fromHandleOrNull(address: Long): Gadget? = if (address == 0L) null else Gadget(address)
 
         /** Create a gadget with the given id */
+        @JvmStatic
         operator fun invoke(id: Long): Gadget = Gadget.fromHandle(JniBridge.kitchen_Gadget_new(id))
 
         /** The gadget subsystem version string */
+        @JvmStatic
         fun version(): String = decodeUtf8(JniBridge.kitchen_Gadget_version())
     }
 }
 
 object Kitchen {
     /** Identity for bool */
+    @JvmStatic
     fun boolId(x: Boolean): Boolean = JniBridge.kitchen_bool_id(x)
 
+    @JvmStatic
     fun i32Id(x: Int): Int = JniBridge.kitchen_i32_id(x)
 
+    @JvmStatic
     fun u32Id(x: UInt): UInt = JniBridge.kitchen_u32_id(x.toInt()).toUInt()
 
+    @JvmStatic
     fun i64Id(x: Long): Long = JniBridge.kitchen_i64_id(x)
 
+    @JvmStatic
     fun f64Id(x: Double): Double = JniBridge.kitchen_f64_id(x)
 
+    @JvmStatic
     fun echoString(s: String): String = decodeUtf8(JniBridge.kitchen_echo_string(encodeUtf8(s)))
 
+    @JvmStatic
     fun echoBytes(b: ByteArray): ByteArray = JniBridge.kitchen_echo_bytes(b)
 
     /** Register a listener, returning how many are attached */
+    @JvmStatic
     fun subscribe(listener: ReadyListener): Int = JniBridge.kitchen_subscribe(listener)
 
     /** Register a listener if one is given */
+    @JvmStatic
     fun maybeSubscribe(listener: ReadyListener?): Boolean = JniBridge.kitchen_maybe_subscribe(listener)
 
     /** Optional object in both directions */
+    @JvmStatic
     fun maybeGadget(fallback: Gadget?): Gadget? = fallback?.handle.borrowOrNull { _h0 ->
         Gadget.fromHandleOrNull(JniBridge.kitchen_maybe_gadget(_h0))
     }
 
     /** A list of objects */
-    fun gadgets(): List<Gadget> = decodeBuffer(JniBridge.kitchen_gadgets()) { _r -> unpackListOfGadget(_r) }
+    @JvmStatic
+    fun gadgets(): List<Gadget> = decodeBuffer(JniBridge.kitchen_gadgets()) { _r -> unpack_list_Gadget(_r) }
 
     /** An iterator over objects */
-    fun streamGadgets(): NativeIterator<Gadget> = NativeIterator(JniBridge.kitchen_stream_gadgets(), JniBridge::kitchen_StreamGadgetsIterator_destroy) { _it ->
-        val _slot = LongArray(1)
-        if (JniBridge.kitchen_StreamGadgetsIterator_next(_it, _slot)) Gadget.fromHandle(_slot[0]) else NativeIterator.DONE
-    }
+    @JvmStatic
+    fun streamGadgets(): NativeIterator<Gadget> = NativeIterator(JniBridge.kitchen_stream_gadgets(), JniBridge::kitchen_StreamGadgetsIterator_destroy, JniBridge::kitchen_StreamGadgetsIterator_next) { Gadget.fromHandle(it as Long) }
 
     /** Optional struct return */
-    fun maybeItem(id: Long): Item? = decodeBuffer(JniBridge.kitchen_maybe_item(id)) { _r -> unpackOptionalOfItem(_r) }
+    @Throws(KitchenException::class)
+    @JvmStatic
+    fun maybeItem(id: Long): Item? = decodeBuffer(JniBridge.kitchen_maybe_item(id)) { _r -> unpack_opt_Item(_r) }
 
     /** List of structs */
-    fun listItems(): List<Item> = decodeBuffer(JniBridge.kitchen_list_items()) { _r -> unpackListOfItem(_r) }
+    @JvmStatic
+    fun listItems(): List<Item> = decodeBuffer(JniBridge.kitchen_list_items()) { _r -> unpack_list_Item(_r) }
 
     /** Map return type */
-    fun getAttrs(): Map<String, Int> = decodeBuffer(JniBridge.kitchen_get_attrs()) { _r -> unpackMapOfStringToI32(_r) }
+    @JvmStatic
+    fun getAttrs(): Map<String, Int> = decodeBuffer(JniBridge.kitchen_get_attrs()) { _r -> unpack_map_string_i32(_r) }
 
     /** Iterator return type */
-    fun streamItems(): NativeIterator<Item> = NativeIterator(JniBridge.kitchen_stream_items(), JniBridge::kitchen_StreamItemsIterator_destroy) { _it ->
-        val _item = JniBridge.kitchen_StreamItemsIterator_next(_it)
-        if (_item == null) NativeIterator.DONE else decodeBuffer(_item) { _r -> unpackItem(_r) }
-    }
+    @JvmStatic
+    fun streamItems(): NativeIterator<Item> = NativeIterator(JniBridge.kitchen_stream_items(), JniBridge::kitchen_StreamItemsIterator_destroy, JniBridge::kitchen_StreamItemsIterator_next) { decodeBuffer(it as ByteArray) { _r -> unpack_Item(_r) } }
 
     /** Returns the shared Token type from another module */
-    fun crossModuleToken(): Token = decodeBuffer(JniBridge.kitchen_cross_module_token()) { _r -> unpackToken(_r) }
+    @JvmStatic
+    fun crossModuleToken(): Token = decodeBuffer(JniBridge.kitchen_cross_module_token()) { _r -> unpack_Token(_r) }
 
     /** Async operation */
-    suspend fun doAsync(input: String): String = awaitNative(false, 0, { _raw -> decodeUtf8(_raw as ByteArray) }) { _, _done ->
+    @JvmStatic
+    suspend fun doAsync(input: String): String = awaitNative(false, 0, { decodeUtf8(it as ByteArray) }) { _, _done ->
         JniBridge.kitchen_do_async(encodeUtf8(input), _done)
     }
 
     /** Cancellable async operation */
-    suspend fun doCancellable(input: String): String = awaitNative(true, 0, { _raw -> decodeUtf8(_raw as ByteArray) }) { _token, _done ->
+    @JvmStatic
+    suspend fun doCancellable(input: String): String = awaitNative(true, 0, { decodeUtf8(it as ByteArray) }) { _token, _done ->
         JniBridge.kitchen_do_cancellable(encodeUtf8(input), _token, _done)
     }
 
     /** Legacy operation kept for compatibility */
-    @Deprecated("Use new_op instead")
+    @Deprecated("Use `newOp` instead")
+    @JvmStatic
     fun legacyOp(): Int = JniBridge.kitchen_legacy_op()
 
-    /** Replacement for legacy_op */
+    /** Replacement for `legacyOp` */
+    @JvmStatic
     fun newOp(): Int = JniBridge.kitchen_new_op()
+
+    /** Optional scalar in both directions */
+    @JvmStatic
+    fun optI32Id(x: Int?): Int? = JniBridge.kitchen_opt_i32_id(x != null, x ?: 0)
+
+    @JvmStatic
+    fun optBoolId(x: Boolean?): Boolean? = JniBridge.kitchen_opt_bool_id(x != null, x ?: false)
+
+    /** Optional C-style enum in both directions */
+    @JvmStatic
+    fun optPriority(p: Priority?): Priority? = JniBridge.kitchen_opt_priority(p != null, p?.value ?: 0)?.let { Priority.fromValue(it) }
+
+    /** Optional scalars next to ordinary parameters */
+    @JvmStatic
+    fun optMixed(base: Double, scale: Float?, offset: Long?, label: String?): UShort? = JniBridge.kitchen_opt_mixed(base, scale != null, scale ?: 0f, offset != null, offset ?: 0L, encodeBuffer { _w -> pack_opt_string(_w, label) })?.toUShort()
+
+    /** A typed-array parameter */
+    @JvmStatic
+    fun sumF64(xs: List<Double>): Double = JniBridge.kitchen_sum_f64(xs.toDoubleArray())
+
+    /** Typed arrays in both directions */
+    @JvmStatic
+    fun scaleI32(xs: List<Int>, factor: Int): List<Int> = JniBridge.kitchen_scale_i32(xs.toIntArray(), factor).asList()
+
+    @JvmStatic
+    fun idsU64(ids: List<ULong>): List<ULong> = JniBridge.kitchen_ids_u64(ids.toLongArrayBits()).toULongList()
+
+    /** Every slice element type */
+    @JvmStatic
+    fun mixedSlices(a: List<Byte>, b: List<Short>, c: List<UShort>, d: List<UInt>, e: List<Long>, f: List<Float>): List<UInt> = JniBridge.kitchen_mixed_slices(a.toByteArray(), b.toShortArray(), c.toShortArrayBits(), d.toIntArrayBits(), e.toLongArray(), f.toFloatArray()).toUIntList()
+
+    /** Async returning an optional scalar */
+    @JvmStatic
+    suspend fun asyncMaybeCount(): Long? = awaitNative(false, 0, { it as Long? }) { _, _done ->
+        JniBridge.kitchen_async_maybe_count(_done)
+    }
+
+    /** Async returning a typed array */
+    @JvmStatic
+    suspend fun asyncSamples(n: UInt): List<Float> = awaitNative(true, 0, { (it as FloatArray).asList() }) { _token, _done ->
+        JniBridge.kitchen_async_samples(n.toInt(), _token, _done)
+    }
+
+    /** Iterator of optional scalars */
+    @JvmStatic
+    fun streamMaybe(): NativeIterator<Int?> = NativeIterator(JniBridge.kitchen_stream_maybe(), JniBridge::kitchen_StreamMaybeIterator_destroy, JniBridge::kitchen_StreamMaybeIterator_next) { it as Int? }
+
+    /** Iterator of typed arrays */
+    @JvmStatic
+    fun streamChunks(): NativeIterator<List<Int>> = NativeIterator(JniBridge.kitchen_stream_chunks(), JniBridge::kitchen_StreamChunksIterator_destroy, JniBridge::kitchen_StreamChunksIterator_next) { (it as IntArray).asList() }
+
+    /** Drive a consumer-implemented sampler */
+    @Throws(PantryException::class)
+    @JvmStatic
+    fun sampleWith(sampler: Sampler, level: UInt?): List<Short> = JniBridge.kitchen_sample_with(sampler, level != null, level?.toInt() ?: 0).asList()
+
+    /** Fails with the second domain */
+    @Throws(PantryException::class)
+    @JvmStatic
+    fun takeFromPantry(item: String): Int = JniBridge.kitchen_take_from_pantry(encodeUtf8(item))
+
+    /** Fails with an untyped error */
+    @Throws(FfiException::class)
+    @JvmStatic
+    fun parseAny(text: String): Long = JniBridge.kitchen_parse_any(encodeUtf8(text))
 
     object Nested {
         /** Trivial nested-module function */
+        @JvmStatic
         fun hello(): String = decodeUtf8(JniBridge.kitchen_nested_hello())
     }
 }
