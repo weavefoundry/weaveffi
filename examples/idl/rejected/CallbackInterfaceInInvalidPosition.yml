@@ -1,0 +1,9 @@
+# rejected: CallbackInterfaceInInvalidPosition
+version: "0.13.0"
+callbacks:
+  - name: Listener
+    methods:
+      - { name: on_event, params: [{ name: id, type: i64 }] }
+functions:
+  - name: current_listener
+    return: Listener

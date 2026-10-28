@@ -1,0 +1,8 @@
+# ANCHOR: units
+version: "0.13.0"
+enums:
+  - name: Unit
+    variants:
+      - { name: Points }
+      - { name: Millimeters }
+# ANCHOR_END: units

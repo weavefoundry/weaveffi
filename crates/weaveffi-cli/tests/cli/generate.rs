@@ -140,8 +140,8 @@ fn quiet_flag_suppresses_output() {
     );
 }
 
-/// `weaveffi dev` builds the debug library, generates, and copies the
-/// library into the Python package, which loads a bundled copy first; the
+/// `weaveffi generate --dev` builds the debug library, generates, and copies
+/// the library into the Python package, which loads a bundled copy first; the
 /// targets that can't bundle it are told which variable to set.
 #[test]
 fn dev_bundles_the_debug_library_into_the_python_package() {
@@ -152,7 +152,7 @@ fn dev_bundles_the_debug_library_into_the_python_package() {
     let out_path = out_dir.path();
 
     let output = crate::weaveffi()
-        .args(["dev", input.to_str().unwrap(), "-o"])
+        .args(["generate", "--dev", input.to_str().unwrap(), "-o"])
         .arg(out_path)
         .args(["--target", "c,python,dotnet"])
         .output()

@@ -1,18 +1,19 @@
 //! Snapshot tests covering every generator.
 //!
 //! Five fixtures cover the whole IDL surface between them: `kitchen_sink`
-//! (every scalar and composite type, OptDirect and Slice values in every
-//! position, an interface with objects in optional, list, iterator, and
-//! record positions, two callback interfaces, two error domains, typed and
-//! untyped `throws`, iterators, async and cancellable functions,
-//! deprecation, and a nested submodule), `shapes` (rich enums and the full
-//! numeric primitive set), `nested_modules` (a three-deep module tree with
-//! cross-module references), `docs_everywhere` (doc comments on every
-//! declaration kind), and `edge_cases` (identifiers that are reserved words
-//! in some target, deeply nested composites, and every legal position of
-//! interfaces and callback interfaces).
+//! (every scalar and composite type, optional scalars and typed arrays in
+//! every position, an interface with objects in optional, list, iterator,
+//! and record positions, two callback interfaces, two error domains, typed
+//! and untyped `throws`, iterators, async and cancellable functions, and
+//! deprecation), `shapes` (rich enums and the full numeric primitive set),
+//! `imports` (an API split across three files, with references in every
+//! direction), `docs_everywhere` (doc comments on every declaration kind),
+//! and `edge_cases` (identifiers that are reserved words in some target,
+//! deeply nested composites, and every legal position of interfaces and
+//! callback interfaces).
 //!
-//! Every target renders all five fixtures. Each rendered file must carry the
+//! Every target renders all five fixtures, in its own test
+//! (`cargo test --test snapshots python`). Each rendered file must carry the
 //! WeaveFFI prelude, and a file that shares its name with a C target output
 //! (a target's copy of the C header) must be byte-equal to the C target's.
 //! Only `kitchen_sink` is snapshotted, as full files, and only the files
@@ -27,19 +28,18 @@
 //! `{target}_kitchen_sink__{path}`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::Path;
 
 use weaveffi_cli::targets::{self, Target, REGISTRY};
 use weaveffi_model::model::Model;
-use weaveffi_model::parse::parse_api_str;
+use weaveffi_model::parse::load_api;
 use weaveffi_model::pkg::Identity;
 use weaveffi_model::validate::validate;
 
 const FIXTURES: [&str; 5] = [
     "kitchen_sink",
     "shapes",
-    "nested_modules",
+    "imports",
     "docs_everywhere",
     "edge_cases",
 ];
@@ -76,11 +76,9 @@ fn load_model(stem: &str) -> Model {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(format!("{stem}.yml"));
-    let contents = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
-    let api = parse_api_str(&contents, "yaml")
-        .unwrap_or_else(|e| panic!("parse fixture {}: {e}", path.display()));
-    validate(&api, &Identity::named(stem), None)
+    let (api, sources) =
+        load_api(&path).unwrap_or_else(|e| panic!("load fixture {}: {e}", path.display()));
+    validate(&api, &Identity::named(stem), Some(&sources))
         .unwrap_or_else(|e| panic!("validate fixture {}: {e}", path.display()))
 }
 
@@ -177,10 +175,27 @@ fn run_snapshots(target: &dyn Target) {
     );
 }
 
-/// Every registered target, each with its default configuration.
-#[test]
-fn snapshot_every_target() {
-    for desc in REGISTRY {
-        run_snapshots(desc.build_default().as_ref());
-    }
+/// One test per target, with its default configuration.
+macro_rules! snapshot_tests {
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[test]
+            fn $name() {
+                let desc = targets::find(stringify!($name))
+                    .unwrap_or_else(|| panic!("{} isn't registered", stringify!($name)));
+                run_snapshots(desc.build_default().as_ref());
+            }
+        )*
+
+        /// Every registered target has a test above.
+        #[test]
+        fn every_target_has_a_snapshot_test() {
+            let tested = [$(stringify!($name)),*];
+            for desc in REGISTRY {
+                assert!(tested.contains(&desc.name), "add {} to snapshot_tests!", desc.name);
+            }
+        }
+    };
 }
+
+snapshot_tests!(c, cpp, swift, kotlin, node, wasm, python, dotnet, dart, go, ruby);

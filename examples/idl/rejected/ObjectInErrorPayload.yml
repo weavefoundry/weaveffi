@@ -1,0 +1,14 @@
+# rejected: ObjectInErrorPayload
+version: "0.13.0"
+interfaces:
+  - name: Store
+    methods:
+      - { name: count, return: u64 }
+errors:
+  - name: StoreError
+    codes:
+      - name: Locked
+        code: 1
+        message: the store is locked
+        fields:
+          - { name: holder, type: Store }

@@ -1,22 +1,17 @@
 //! In-memory intermediate representation: the data model a parsed WeaveFFI IDL
-//! document becomes.
+//! document, or a Rust producer's embedded metadata, becomes.
 //!
-//! This is the *document* model: [`Api`] is the root and owns a forest of
-//! [`Module`]s, each grouping [`Function`]s, [`InterfaceDef`]s,
-//! [`CallbackInterfaceDef`]s, [`StructDef`]s, [`EnumDef`]s, and
-//! [`ErrorDomain`]s. Types are referenced throughout by [`TypeRef`], which
-//! (de)serializes as a compact string (`i32`, `[string]`, `{string:i32}`,
-//! `Contact?`, and so on) rather than as a tagged object.
+//! [`Api`] is the root. A library is one namespace: it declares records,
+//! enums, error domains, interfaces, callback interfaces, and free functions
+//! side by side, and every name is unique across the library. Types are
+//! referenced by [`TypeRef`], which (de)serializes as a compact string (`i32`,
+//! `[string]`, `{string:i32}`, `Contact?`, and so on).
 //!
-//! The document model is deliberately *unresolved*: every user-defined type
-//! reference is a [`TypeRef::Named`] carrying the bare name exactly as
-//! written. Type names are global across the API, so a name alone identifies
-//! a declaration; there are no module-qualified (`a.b.T`) references.
-//! Whether that name is a record, an enum, an interface, or a callback
-//! interface is decided by the [validator](crate::validate), which lowers the
-//! document into the [`Model`](crate::model::Model) generators consume.
-//! Keeping the two representations distinct means an IDL document always
-//! round-trips losslessly through this module.
+//! The document model is *unresolved*: every user-defined type reference is a
+//! [`TypeRef::Named`] carrying the name exactly as written. Whether that name
+//! is a record, an enum, an interface, or a callback interface is decided by
+//! the [validator](crate::validate), which lowers the document into the
+//! [`Model`](crate::model::Model) generators consume.
 //!
 //! Package identity and per-generator options are not part of the IDL: they
 //! describe how bindings are *shipped*, not what the API *is*, and live in the
@@ -28,61 +23,83 @@ use serde::{Deserialize, Serialize};
 
 use crate::ty::Prim;
 
-/// The current IR schema version that the parser, validator, and every
-/// generator expect.
+/// The IR schema version the parser, the validator, and every generator
+/// expect.
 ///
-/// Pre-1.0 there is exactly one supported schema version: the current one.
-/// Older schema revisions are not accepted and have no automated migration
-/// path: update the `version` field and adjust the document to the current
-/// schema by hand. Post-1.0, schema bumps will ship with a migration tool and
-/// [`SUPPORTED_VERSIONS`] will widen accordingly.
-///
-/// See [`docs/src/stability.md`](https://github.com/weavefoundry/weaveffi/blob/main/docs/src/stability.md)
-/// for the full schema policy and the surfaces covered by SemVer.
-pub const CURRENT_SCHEMA_VERSION: &str = "0.12.0";
+/// Pre-1.0 there is exactly one supported schema version: the current one. A
+/// document declaring any other `version` is rejected; update the field and
+/// the document by hand. See the stability policy in the WeaveFFI book.
+pub const CURRENT_SCHEMA_VERSION: &str = "0.13.0";
 
-/// Every IR schema version the current tools accept.
-///
-/// Pre-1.0 this holds exactly one entry, [`CURRENT_SCHEMA_VERSION`]; a document
-/// declaring any other `version` is rejected. Post-1.0 it widens as migrations
-/// land, letting the parser accept a range of historical schema revisions.
-pub const SUPPORTED_VERSIONS: &[&str] = &[CURRENT_SCHEMA_VERSION];
-
-/// `skip_serializing_if` predicate for `bool` fields that default to `false`.
-/// Keeps the canonical IDL emitted by `weaveffi extract` minimal by omitting
-/// flags the user never set (for example `async: false`).
+/// `skip_serializing_if` predicate for `bool` fields that default to `false`,
+/// which keeps the IDL `weaveffi extract` prints minimal.
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// Top-level WeaveFFI API definition: the root of a parsed IDL document.
+/// A WeaveFFI API definition: the root of a parsed IDL document.
 ///
-/// This is the value an entire `.yml` or `.json` IDL file
-/// deserializes into (see [`crate::parse`]) and the single input the validator
-/// consumes. It pairs the schema version with the module forest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// An IDL file deserializes into this type (see [`crate::parse`]), and a Rust
+/// producer's metadata frames assemble into one (see [`crate::meta`]). Every
+/// declaration lives in the library's single namespace.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "idl", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(
     feature = "idl",
-    schemars(description = "Top-level WeaveFFI API definition.")
+    schemars(description = "A WeaveFFI API definition: one library's namespace.")
 )]
 pub struct Api {
-    /// IR schema version this document targets (for example `0.12.0`).
-    /// Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].
+    /// The IR schema version this document targets (`0.13.0`).
     pub version: String,
-    /// Top-level modules that make up the API surface. Each is an independent
-    /// namespace; modules may nest further through [`Module::modules`].
-    pub modules: Vec<Module>,
+    /// Documentation for the library as a whole, propagated to each
+    /// package's top-level doc comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+    /// Other IDL files whose declarations join this library's namespace,
+    /// as paths relative to this file. [`crate::parse::load_api`] resolves
+    /// them; a document assembled in memory has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<String>,
+    /// Records: plain data types with named fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub records: Vec<RecordDef>,
+    /// Enums, C-style or with data-carrying variants.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enums: Vec<EnumDef>,
+    /// Error domains: named, open sets of error codes that callables report
+    /// by naming the domain in their `throws`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<ErrorDomain>,
+    /// Interfaces: reference-counted object types with constructors,
+    /// methods, and statics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<InterfaceDef>,
+    /// Callback interfaces: method sets the consumer implements and the
+    /// producer calls.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callbacks: Vec<CallbackDef>,
+    /// Free functions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub functions: Vec<Function>,
 }
 
 impl Api {
+    /// An empty document of the current schema version.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            version: CURRENT_SCHEMA_VERSION.to_string(),
+            ..Self::default()
+        }
+    }
+
     /// Call `f` on every type reference written anywhere in the document:
     /// parameters and returns of every function, interface member, and
     /// callback method, and the fields of every record, enum variant, and
-    /// error code, in declaration order (outermost references only; use
-    /// [`TypeRef::walk`] to reach nested ones).
+    /// error code (outermost references only; use [`TypeRef::walk`] to reach
+    /// nested ones).
     pub fn for_each_type_ref<'a>(&'a self, f: &mut dyn FnMut(&'a TypeRef)) {
         fn functions<'a>(fs: &'a [Function], f: &mut dyn FnMut(&'a TypeRef)) {
             for func in fs {
@@ -94,263 +111,168 @@ impl Api {
                 }
             }
         }
-        fn fields<'a>(fields: &'a [StructField], f: &mut dyn FnMut(&'a TypeRef)) {
+        let fields = |fields: &'a [Field], f: &mut dyn FnMut(&'a TypeRef)| {
             for field in fields {
                 f(&field.ty);
             }
+        };
+        functions(&self.functions, f);
+        for i in &self.interfaces {
+            functions(&i.constructors, f);
+            functions(&i.methods, f);
+            functions(&i.statics, f);
         }
-        fn modules<'a>(ms: &'a [Module], f: &mut dyn FnMut(&'a TypeRef)) {
-            for m in ms {
-                functions(&m.functions, f);
-                for i in &m.interfaces {
-                    functions(&i.constructors, f);
-                    functions(&i.methods, f);
-                    functions(&i.statics, f);
-                }
-                for c in &m.callback_interfaces {
-                    functions(&c.methods, f);
-                }
-                for s in &m.structs {
-                    fields(&s.fields, f);
-                }
-                for v in m.enums.iter().flat_map(|e| &e.variants) {
-                    fields(&v.fields, f);
-                }
-                for c in m.errors.iter().flat_map(|d| &d.codes) {
-                    fields(&c.fields, f);
-                }
-                modules(&m.modules, f);
-            }
+        for c in &self.callbacks {
+            functions(&c.methods, f);
         }
-        modules(&self.modules, f);
+        for r in &self.records {
+            fields(&r.fields, f);
+        }
+        for v in self.enums.iter().flat_map(|e| &e.variants) {
+            fields(&v.fields, f);
+        }
+        for c in self.errors.iter().flat_map(|d| &d.codes) {
+            fields(&c.fields, f);
+        }
     }
 
-    /// Every type name the document references but doesn't declare: the
-    /// names a written type uses (`Named` references, at any depth) that no
-    /// record, enum, interface, callback interface, or error domain anywhere
-    /// in the document provides.
-    ///
-    /// The `#[weaveffi::module]` macro validates one module tree at a time,
-    /// so a record from a sibling tree is undeclared there; it passes these
-    /// names to [`Options::foreign`](crate::validate::Options::foreign)
-    /// explicitly.
-    #[must_use]
-    pub fn undeclared_type_names(&self) -> std::collections::BTreeSet<String> {
-        fn declared<'a>(ms: &'a [Module], out: &mut std::collections::BTreeSet<&'a str>) {
-            for m in ms {
-                out.extend(m.structs.iter().map(|d| d.name.as_str()));
-                out.extend(m.enums.iter().map(|d| d.name.as_str()));
-                out.extend(m.interfaces.iter().map(|d| d.name.as_str()));
-                out.extend(m.callback_interfaces.iter().map(|d| d.name.as_str()));
-                out.extend(m.errors.iter().map(|d| d.name.as_str()));
-                declared(&m.modules, out);
-            }
-        }
-        let mut names = std::collections::BTreeSet::new();
-        declared(&self.modules, &mut names);
-        let mut out = std::collections::BTreeSet::new();
-        self.for_each_type_ref(&mut |ty| {
-            ty.walk(&mut |t| {
-                if let TypeRef::Named(n) = t {
-                    if !names.contains(n.as_str()) {
-                        out.insert(n.clone());
-                    }
-                }
-            });
-        });
-        out
+    /// Append every declaration of `other` to this document (its `doc`,
+    /// `version`, and `imports` are ignored).
+    pub fn merge(&mut self, other: Api) {
+        self.records.extend(other.records);
+        self.enums.extend(other.enums);
+        self.errors.extend(other.errors);
+        self.interfaces.extend(other.interfaces);
+        self.callbacks.extend(other.callbacks);
+        self.functions.extend(other.functions);
     }
-}
 
-/// A module: a named namespace grouping related functions, types, callback
-/// interfaces, and error domains.
-///
-/// Modules are the IDL's unit of organization and map onto each target
-/// language's natural grouping construct (a namespace, a submodule, a symbol
-/// prefix, and so on). They may nest through [`modules`](Self::modules) to
-/// mirror a package hierarchy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "idl", derive(JsonSchema))]
-#[serde(deny_unknown_fields)]
-#[cfg_attr(
-    feature = "idl",
-    schemars(
-        description = "A WeaveFFI module: a named group of functions, types, callback interfaces, and errors."
-    )
-)]
-pub struct Module {
-    /// Module name, used as a namespace segment and a symbol-prefix component
-    /// in generated code (for example `contacts`).
-    pub name: String,
-    /// Human-readable documentation for the module as a whole, propagated to
-    /// the generated namespace, class, or file header. `None` when
-    /// undocumented.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub doc: Option<String>,
-    /// Free functions this module exports across the FFI boundary.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub functions: Vec<Function>,
-    /// Interface (object) types declared in this module: stateful resources
-    /// with constructors, methods, and static functions.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub interfaces: Vec<InterfaceDef>,
-    /// Callback interfaces declared in this module: method sets the consumer
-    /// implements and the producer calls.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub callback_interfaces: Vec<CallbackInterfaceDef>,
-    /// Record (struct) types declared in this module.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub structs: Vec<StructDef>,
-    /// Enum types, C-style or algebraic, declared in this module.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub enums: Vec<EnumDef>,
-    /// The error domains this module declares: named sets of codes that
-    /// fallible callables anywhere in the API report by naming the domain in
-    /// their `throws`. Domain names share the global type namespace.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub errors: Vec<ErrorDomain>,
-    /// Nested submodules, forming a tree that mirrors a package hierarchy.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub modules: Vec<Module>,
+    /// Every top-level declaration's name, in document order: records,
+    /// enums, error domains, interfaces, callback interfaces, then free
+    /// functions.
+    pub fn declaration_names(&self) -> impl Iterator<Item = &str> {
+        self.records
+            .iter()
+            .map(|d| d.name.as_str())
+            .chain(self.enums.iter().map(|d| d.name.as_str()))
+            .chain(self.errors.iter().map(|d| d.name.as_str()))
+            .chain(self.interfaces.iter().map(|d| d.name.as_str()))
+            .chain(self.callbacks.iter().map(|d| d.name.as_str()))
+            .chain(self.functions.iter().map(|d| d.name.as_str()))
+    }
 }
 
 /// A function exported across the FFI boundary.
 ///
-/// Each function becomes a C ABI entry point plus an idiomatic wrapper in every
-/// target language. The `async` and `cancellable` flags change how the symbol
-/// is lowered (a completion callback, an extra cancel-token parameter) without
-/// altering the parameter and return shape declared here. The same shape also
-/// describes an interface's constructors, methods, and statics (see
-/// [`InterfaceDef`]) and a callback interface's methods (see
-/// [`CallbackInterfaceDef`]).
+/// The same shape describes a free function, an interface's constructors,
+/// methods, and statics (see [`InterfaceDef`]), and a callback interface's
+/// methods (see [`CallbackDef`]). The `async` and `cancellable` flags change
+/// how the symbol is lowered (a completion callback, an extra cancel-token
+/// parameter) without changing the parameters and return declared here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "idl", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Function {
-    /// Function name, lowered to a per-language symbol (for example
-    /// `create_contact`).
+    /// The function name (for example `create_contact`).
     pub name: String,
-    /// Ordered parameter list; order is preserved in every generated signature.
+    /// The parameters, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<Param>,
-    /// Return type, or `None` for a function that returns nothing. Serialized
-    /// under the IDL key `return`.
+    /// The return type, or `None` for a function that returns nothing.
+    /// Serialized under the key `return`.
     #[serde(rename = "return", default, skip_serializing_if = "Option::is_none")]
     pub returns: Option<TypeRef>,
-    /// Human-readable documentation, propagated to the generated bindings' doc
-    /// comments. `None` when undocumented.
+    /// Documentation, propagated to the bindings' doc comments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-    /// How the function can fail. Absent for a function that can't, which
-    /// treats any reported error as a producer bug (a trap, not a typed
-    /// error); an error domain's name (`throws: KvError`) for one that
-    /// reports that domain's codes; or `any` (`throws: any`) for one that
-    /// fails with an untyped error, a message under the generic runtime code
-    /// `-1`.
+    /// How the function can fail: absent for a function that can't (any
+    /// reported error is a producer bug), an error domain's name for one
+    /// that reports that domain's codes, or `any` for one that fails with an
+    /// untyped error (runtime code `-1` and a message).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub throws: Option<Throws>,
-    /// Whether the function is asynchronous, lowering to a completion-callback
-    /// form rather than a blocking call. Serialized under the IDL key `async`.
+    /// Whether the function is asynchronous: it completes through a
+    /// callback instead of returning. Serialized under the key `async`.
     #[serde(default, rename = "async", skip_serializing_if = "is_false")]
     pub r#async: bool,
-    /// Whether an async call accepts a cancellation token so callers can request
-    /// that an in-flight operation stop early. Defaults to `false`.
+    /// Whether an async function accepts a cancel token.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cancellable: bool,
-    /// Deprecation notice; when set, generators emit a deprecation annotation
-    /// carrying this message. `None` means the function is current.
+    /// A deprecation notice, emitted as each language's deprecation marker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecated: Option<String>,
 }
 
-/// An interface: an opaque, stateful object type with constructors, instance
-/// methods, and static functions.
+impl Function {
+    /// A synchronous function with no parameters, return, or docs.
+    #[must_use]
+    pub fn named(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            params: Vec::new(),
+            returns: None,
+            doc: None,
+            throws: None,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+        }
+    }
+}
+
+/// An interface: an opaque, reference-counted object type with constructors,
+/// instance methods, and static functions.
 ///
-/// An interface value lives behind the FFI boundary and crosses it as an
-/// opaque pointer; consumers see a class (or the target's closest analogue)
-/// whose methods call back into the producer. This is the primary way to model
-/// resources with identity and behavior (stores, sessions, connections), in
-/// contrast to a [`StructDef`], which models a plain data record with fields.
-///
-/// Objects are reference counted by the producer. Every interface receives
-/// implicit `{tag}_clone` and `{tag}_destroy` symbols; generated wrappers hold
-/// one strong reference each and release it through their language's natural
-/// disposal hook (`Drop`, `__del__`, `Disposable`, finalizers, `close()`).
-/// Because the count lives in the producer, an interface value may appear
-/// anywhere a type can: as a parameter, a return, an iterator element, a record
-/// field, a list element, or a map value.
+/// An interface value lives behind the FFI boundary and crosses it as a
+/// pointer that carries one strong reference; consumers see a class whose
+/// methods call into the producer. An interface value may appear anywhere a
+/// type can: as a parameter, a return, an iterator element, a record field, a
+/// list element, or a map value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "idl", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
-#[cfg_attr(
-    feature = "idl",
-    schemars(
-        description = "An interface: an opaque object type with constructors, methods, and statics."
-    )
-)]
 pub struct InterfaceDef {
-    /// Interface type name (for example `Store`).
+    /// The interface name (for example `Store`).
     pub name: String,
-    /// Human-readable documentation, propagated to the generated bindings.
-    /// `None` when undocumented.
+    /// Documentation, propagated to the bindings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-    /// Deprecation notice for the whole type; when set, generators annotate
-    /// the emitted class. `None` means the interface is current.
+    /// A deprecation notice for the whole type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecated: Option<String>,
-    /// Constructors: static functions returning a new instance. A constructor
-    /// declares no `return` (the instance is implicit) and may not be `async`.
+    /// Constructors: functions returning a new instance. A constructor
+    /// declares no `return` (the instance is implicit) and isn't `async`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub constructors: Vec<Function>,
-    /// Instance methods. Each lowers with an implicit leading `self` slot
-    /// (a pointer to the interface object) before the declared parameters.
+    /// Instance methods, each called on an instance.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub methods: Vec<Function>,
-    /// Static functions namespaced under the interface but taking no `self`.
+    /// Static functions namespaced under the interface.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub statics: Vec<Function>,
 }
 
 /// A callback interface: a set of methods the **consumer** implements and the
-/// **producer** invokes.
+/// **producer** calls.
 ///
-/// A callback interface is the inverse of an [`InterfaceDef`]. A consumer
-/// passes an implementation (a class instance, a closure record, a trait
-/// object) wherever the type appears as a parameter; the producer keeps it
-/// alive as long as it needs to and calls its methods, possibly from any
-/// thread. At the C ABI it lowers to a context pointer plus a vtable of
-/// function pointers; see the C ABI contract.
-///
-/// Methods are synchronous (never `async` or `cancellable`) and return
-/// nothing or any type except an iterator or a callback interface; a string,
-/// bytes, slice, or buffer return is a run the consumer allocates and the
-/// producer adopts. A method may declare `throws` (a domain, letting the
-/// consumer report that domain's codes, or `any`). Parameters may use any
-/// type other than a callback interface or an iterator. A callback interface
-/// may itself be passed, bare or optional (`Listener?`), as a parameter of a
-/// function or interface member.
+/// A consumer passes an implementation wherever the type appears as a
+/// parameter (bare, or optional as `Listener?`); the producer may keep it and
+/// call its methods from any thread. Methods are synchronous, may return any
+/// value type, and may declare `throws`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "idl", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
-#[cfg_attr(
-    feature = "idl",
-    schemars(
-        description = "A callback interface: a set of methods the consumer implements and the producer calls."
-    )
-)]
-pub struct CallbackInterfaceDef {
-    /// Callback interface type name (for example `MessageListener`).
+pub struct CallbackDef {
+    /// The callback interface name (for example `Listener`).
     pub name: String,
-    /// Human-readable documentation, propagated to the generated bindings.
-    /// `None` when undocumented.
+    /// Documentation, propagated to the bindings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-    /// Deprecation notice for the whole type; when set, generators annotate
-    /// the emitted type. `None` means the callback interface is current.
+    /// A deprecation notice for the whole type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecated: Option<String>,
-    /// Methods the consumer implements, in vtable order. Must be non-empty.
+    /// The methods, in vtable order. Appending a method keeps every deployed
+    /// binding working; reordering or inserting one doesn't.
     pub methods: Vec<Function>,
 }
 
@@ -359,35 +281,31 @@ pub struct CallbackInterfaceDef {
 #[cfg_attr(feature = "idl", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Param {
-    /// Parameter name as it appears in generated signatures (for example `id`).
+    /// The parameter name (for example `id`).
     pub name: String,
-    /// Parameter type. Serialized under the IDL key `type`.
+    /// The parameter type. Serialized under the key `type`.
     #[serde(rename = "type")]
     pub ty: TypeRef,
-    /// Human-readable documentation for the parameter, propagated to the
-    /// generated bindings. `None` when undocumented.
+    /// Documentation for the parameter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
 }
 
 /// What a fallible callable reports: the IDL's `throws` value.
 ///
-/// Serialized as a string: the name of an error domain (`throws: KvError`)
-/// or the keyword `any` (`throws: any`). Domain names are global, so the
-/// named domain may be declared in any module.
+/// Serialized as a string: an error domain's name (`throws: KvError`) or the
+/// keyword `any` (`throws: any`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Throws {
-    /// The callable reports the codes of the named error domain, each a
-    /// positive code with an optional payload, plus the runtime's negative
-    /// codes.
+    /// The callable reports the codes of the named error domain, plus the
+    /// runtime's negative codes.
     Domain(String),
-    /// The callable fails with an untyped error: the generic runtime code
-    /// `-1` and a message, never a positive code.
+    /// The callable fails with an untyped error: code `-1` and a message.
     Any,
 }
 
 /// The `throws` keyword for an untyped error.
-const THROWS_ANY: &str = "any";
+pub const THROWS_ANY: &str = "any";
 
 impl Throws {
     /// The error domain's name for [`Throws::Domain`], or `None` for
@@ -397,6 +315,17 @@ impl Throws {
         match self {
             Throws::Domain(name) => Some(name),
             Throws::Any => None,
+        }
+    }
+
+    /// The value a `throws` spelling names: [`Any`](Self::Any) for `any`,
+    /// else the domain.
+    #[must_use]
+    pub fn parse(s: &str) -> Self {
+        if s == THROWS_ANY {
+            Throws::Any
+        } else {
+            Throws::Domain(s.to_string())
         }
     }
 }
@@ -425,35 +354,12 @@ impl<'de> Deserialize<'de> for Throws {
     where
         D: serde::Deserializer<'de>,
     {
-        struct Visitor;
-        impl serde::de::Visitor<'_> for Visitor {
-            type Value = Throws;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("an error domain name or `any`")
-            }
-
-            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Throws, E> {
-                Ok(if s == THROWS_ANY {
-                    Throws::Any
-                } else {
-                    Throws::Domain(s.to_string())
-                })
-            }
-
-            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Throws, E> {
-                Err(E::custom(
-                    "`throws` names the error domain the callable reports (`throws: KvError`) \
-                     or is `any` for an untyped error; boolean `throws` was removed in schema 0.12",
-                ))
-            }
-        }
-        deserializer.deserialize_any(Visitor)
+        let s = String::deserialize(deserializer)?;
+        Ok(Throws::parse(&s))
     }
 }
 
-/// Manual `JsonSchema` impl because [`Throws`] (de)serializes as a string:
-/// an error domain's name or `any`.
+/// Manual `JsonSchema` impl because [`Throws`] (de)serializes as a string.
 #[cfg(feature = "idl")]
 impl JsonSchema for Throws {
     fn schema_name() -> String {
@@ -465,67 +371,60 @@ impl JsonSchema for Throws {
     }
 
     fn json_schema(_generator: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-        let mut schema = schemars::schema::SchemaObject {
-            instance_type: Some(schemars::schema::InstanceType::String.into()),
-            ..Default::default()
-        };
-        let meta = schema.metadata();
-        meta.title = Some("Throws".to_string());
-        meta.description = Some(
-            "What a fallible callable reports: the name of an error domain declared in any \
-             module, or `any` for an untyped error (code -1 and a message)."
-                .to_string(),
-        );
-        schema.into()
+        string_schema(
+            "Throws",
+            "What a fallible callable reports: the name of an error domain, or `any` for an \
+             untyped error (code -1 and a message).",
+        )
     }
 }
 
-/// A reference to a type in the IDL, exactly as written.
+/// A string-typed JSON Schema with a title and description.
+#[cfg(feature = "idl")]
+fn string_schema(title: &str, description: &str) -> schemars::schema::Schema {
+    let mut schema = schemars::schema::SchemaObject {
+        instance_type: Some(schemars::schema::InstanceType::String.into()),
+        ..Default::default()
+    };
+    let meta = schema.metadata();
+    meta.title = Some(title.to_string());
+    meta.description = Some(description.to_string());
+    schema.into()
+}
+
+/// A reference to a type, exactly as written.
 ///
-/// Every user-defined type (record, enum, interface, or callback interface) is
-/// a [`Named`](Self::Named) reference at this level; the validator resolves the
-/// name against the declarations in scope and lowers it into the resolved kind
-/// generators consume. Keeping the document model unresolved is what makes an
-/// IDL round-trip losslessly.
-///
-/// There is no function-typed `TypeRef`. Consumer-implemented behavior is
-/// expressed as a [`CallbackInterfaceDef`] referenced by name, and
-/// asynchronous producer work uses `async: true`. Together these cover every
-/// pattern the FFI boundary needs and keep the type system free of values the
-/// C ABI can't represent uniformly.
+/// Every user-defined type (record, enum, interface, or callback interface)
+/// is a [`Named`](Self::Named) reference at this level; the validator
+/// resolves the name and lowers it into the resolved kind generators consume.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeRef {
     /// A built-in primitive (`i32`, `bool`, `string`, `bytes`, and so on).
-    /// Strings and bytes are borrowed when passed in and owned when returned.
     Prim(Prim),
-    /// A reference to a user-defined type (record, enum, interface, or
-    /// callback interface) by its bare name (`Contact`), exactly as parsed.
-    /// Resolution happens in the validator, which rejects a dotted
-    /// (module-qualified) name: type names are global.
+    /// A user-defined type by name (`Contact`).
     Named(String),
-    /// Optional value (`T?`): either the inner type or nothing.
+    /// An optional value (`T?`).
     Optional(Box<TypeRef>),
-    /// Homogeneous list (`[T]`) of the inner element type.
+    /// A list (`[T]`).
     List(Box<TypeRef>),
-    /// Map (`{K:V}`) from a key type to a value type.
+    /// A map (`{K:V}`).
     Map(Box<TypeRef>, Box<TypeRef>),
-    /// Lazy sequence (`iter<T>`) of the inner type, lowered to a next/destroy
-    /// iterator object rather than a materialized collection.
+    /// A lazy sequence (`iter<T>`), legal only as a return.
     Iterator(Box<TypeRef>),
 }
 
 /// Parse the IDL's compact type syntax into a [`TypeRef`].
 ///
 /// Handles primitive names (`i32`, `string`, `bytes`, and so on), iterators
-/// (`iter<T>`), lists (`[T]`), maps (`{K:V}`), and the optional suffix (`T?`).
-/// Any other bare identifier is taken to be a user-defined record, enum,
-/// interface, or callback interface name and returned as [`TypeRef::Named`].
+/// (`iter<T>`), lists (`[T]`, with `[u8]` canonicalized to `bytes`), maps
+/// (`{K:V}`), and the optional suffix (`T?`). Any other identifier is taken
+/// to be a user-defined type name.
 ///
 /// # Errors
 ///
-/// Returns an error message when `s` is empty or only whitespace, when a map
-/// type (`{K:V}`) is missing its `:` separator. The same errors propagate up
-/// from a malformed inner type of a list, map, optional, or iterator.
+/// Returns an error message when `s` is empty or only whitespace, or when a
+/// map type (`{K:V}`) is missing its `:` separator, including inside a
+/// nested type.
 pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -534,11 +433,8 @@ pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
     if s.starts_with('[') && s.ends_with(']') {
         let inner = &s[1..s.len() - 1];
         return parse_type_ref(inner).map(|t| match t {
-            // `[u8]` canonicalizes to `bytes`: the two encode identically
-            // inside value buffers (u32 count + raw bytes), and `bytes` is
-            // what Rust producers declare (`Vec<u8>`), so canonicalizing here
-            // keeps the top-level ABI slots consistent between an IDL-driven
-            // consumer and a macro-driven producer.
+            // `[u8]` and `bytes` cross identically, and `bytes` is what a
+            // Rust producer's `Vec<u8>` is, so the two are one type.
             TypeRef::Prim(Prim::U8) => TypeRef::Prim(Prim::Bytes),
             t => TypeRef::List(Box::new(t)),
         });
@@ -563,8 +459,8 @@ pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
     Ok(Prim::from_name(s).map_or_else(|| TypeRef::Named(s.to_string()), TypeRef::Prim))
 }
 
-/// The byte offset of the top-level `:` separating a map's key from its value,
-/// skipping any `:` nested inside a bracketed key such as `{ {a:b}: c }`.
+/// The byte offset of the top-level `:` separating a map's key from its
+/// value, skipping any `:` nested inside a bracketed key.
 fn map_separator(inner: &str) -> Option<usize> {
     let mut depth = 0usize;
     for (i, ch) in inner.char_indices() {
@@ -579,17 +475,8 @@ fn map_separator(inner: &str) -> Option<usize> {
 }
 
 impl TypeRef {
-    /// The referenced user-type name for a [`Named`](Self::Named) reference,
-    /// or `None` for every other type.
-    pub fn user_name(&self) -> Option<&str> {
-        match self {
-            TypeRef::Named(n) => Some(n),
-            _ => None,
-        }
-    }
-
-    /// Walk this type and every type nested inside it (optional payloads, list
-    /// elements, map keys and values, iterator items), outermost first.
+    /// Walk this type and every type nested inside it (optional payloads,
+    /// list elements, map keys and values, iterator items), outermost first.
     pub fn walk<'a>(&'a self, f: &mut dyn FnMut(&'a TypeRef)) {
         f(self);
         match self {
@@ -605,20 +492,17 @@ impl TypeRef {
     }
 }
 
-fn type_ref_to_string(ty: &TypeRef) -> String {
-    match ty {
-        TypeRef::Prim(p) => p.snake().to_string(),
-        TypeRef::Named(name) => name.clone(),
-        TypeRef::Optional(inner) => format!("{}?", type_ref_to_string(inner)),
-        TypeRef::List(inner) => format!("[{}]", type_ref_to_string(inner)),
-        TypeRef::Map(k, v) => format!("{{{}:{}}}", type_ref_to_string(k), type_ref_to_string(v)),
-        TypeRef::Iterator(inner) => format!("iter<{}>", type_ref_to_string(inner)),
-    }
-}
-
 impl std::fmt::Display for TypeRef {
+    /// Renders the IDL spelling.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&type_ref_to_string(self))
+        match self {
+            TypeRef::Prim(p) => f.write_str(p.snake()),
+            TypeRef::Named(name) => f.write_str(name),
+            TypeRef::Optional(inner) => write!(f, "{inner}?"),
+            TypeRef::List(inner) => write!(f, "[{inner}]"),
+            TypeRef::Map(k, v) => write!(f, "{{{k}:{v}}}"),
+            TypeRef::Iterator(inner) => write!(f, "iter<{inner}>"),
+        }
     }
 }
 
@@ -627,7 +511,7 @@ impl Serialize for TypeRef {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&type_ref_to_string(self))
+        serializer.collect_str(self)
     }
 }
 
@@ -642,8 +526,7 @@ impl<'de> Deserialize<'de> for TypeRef {
 }
 
 /// Manual `JsonSchema` impl because `TypeRef` (de)serializes as a string with
-/// custom syntax: primitive names (`i32`, `string`, ...), `iter<{T}>`,
-/// `[{T}]`, `{ {K}: {V} }`, `{name}?`, or a user-defined type's bare name.
+/// its own syntax.
 #[cfg(feature = "idl")]
 impl JsonSchema for TypeRef {
     fn schema_name() -> String {
@@ -655,64 +538,58 @@ impl JsonSchema for TypeRef {
     }
 
     fn json_schema(_generator: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-        let mut schema = schemars::schema::SchemaObject {
-            instance_type: Some(schemars::schema::InstanceType::String.into()),
-            ..Default::default()
-        };
-        let meta = schema.metadata();
-        meta.title = Some("TypeRef".to_string());
-        meta.description = Some(
-            "Reference to a type. Encoded as a string with custom syntax: \
-             primitives (`i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, \
-             `f32`, `f64`, `bool`, `string`, `bytes`), iterators (`iter<{T}>`), \
-             lists (`[{T}]`), maps (`{{K:V}}`), optionals (`{T}?`), or the bare \
-             (unqualified) name of a user-defined struct, enum, interface, or callback \
-             interface."
-                .to_string(),
-        );
-        schema.into()
+        string_schema(
+            "TypeRef",
+            "A type, as a string: a primitive (`i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, \
+             `u64`, `f32`, `f64`, `bool`, `string`, `bytes`), a list (`[T]`), a map \
+             (`{K:V}`), an optional (`T?`), an iterator (`iter<T>`), or the name of a record, \
+             enum, interface, or callback interface.",
+        )
     }
 }
 
-/// An enum type. C-style when every variant is a bare discriminant; an
-/// algebraic sum type when any variant declares fields (see
-/// [`is_rich`](Self::is_rich)).
+/// An enum: C-style when every variant is a bare discriminant, a sum type
+/// when any variant declares fields (see [`is_rich`](Self::is_rich)).
 ///
-/// A C-style enum lowers across the C ABI by value as an integer, while an
-/// algebraic enum is a value type that crosses the ABI serialized in a value
-/// buffer (an `i32` tag followed by the active variant's fields).
+/// A C-style enum crosses the C ABI as an `int32_t`; a rich enum crosses
+/// serialized in a value buffer (an `i32` tag, then the variant's fields).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "idl", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
-#[cfg_attr(
-    feature = "idl",
-    schemars(
-        description = "An enum type. C-style when every variant is a bare discriminant; an algebraic sum type when any variant declares fields."
-    )
-)]
 pub struct EnumDef {
-    /// Enum type name (for example `Color`).
+    /// The enum name (for example `Color`).
     pub name: String,
-    /// Human-readable documentation, propagated to the generated bindings.
-    /// `None` when undocumented.
+    /// Documentation, propagated to the bindings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-    /// Deprecation notice for the whole type; when set, generators annotate
-    /// the emitted enum. `None` means the enum is current.
+    /// A deprecation notice for the whole type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecated: Option<String>,
-    /// The variants in declaration order. Whether any of them carries fields
-    /// decides if this is a C-style or an algebraic enum.
+    /// The variants, in declaration order.
     pub variants: Vec<EnumVariant>,
 }
 
 impl EnumDef {
-    /// `true` when this is an *algebraic* enum (a sum type): at least one
-    /// variant carries associated data. Such enums cross the C ABI as value
-    /// buffers; a C-style enum (every variant a bare discriminant) lowers by
-    /// value as an integer.
+    /// `true` when at least one variant carries fields: the enum is a sum
+    /// type that crosses as a value buffer.
+    #[must_use]
     pub fn is_rich(&self) -> bool {
         self.variants.iter().any(|v| !v.fields.is_empty())
+    }
+
+    /// Every variant's discriminant: its declared `value`, or one more than
+    /// the previous variant's (`0` for the first), as in Rust and C.
+    #[must_use]
+    pub fn values(&self) -> Vec<i32> {
+        let mut next = 0i32;
+        self.variants
+            .iter()
+            .map(|v| {
+                let value = v.value.unwrap_or(next);
+                next = value.wrapping_add(1);
+                value
+            })
+            .collect()
     }
 }
 
@@ -721,59 +598,49 @@ impl EnumDef {
 #[cfg_attr(feature = "idl", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct EnumVariant {
-    /// Variant name (for example `Red`).
+    /// The variant name (for example `Red`).
     pub name: String,
-    /// Integer discriminant. Doubles as the C-style enum value and as the
-    /// runtime tag that distinguishes the variants of an algebraic enum.
-    pub value: i32,
-    /// Human-readable documentation, propagated to the generated bindings.
-    /// `None` when undocumented.
+    /// The discriminant: the C-style value, or a rich enum's buffer tag.
+    /// When absent it's one more than the previous variant's (`0` for the
+    /// first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<i32>,
+    /// Documentation, propagated to the bindings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-    /// Associated data carried by this variant. Empty for a unit variant or a
-    /// C-style enum; non-empty makes the owning enum a sum type (see
-    /// [`EnumDef::is_rich`]).
+    /// The variant's fields; non-empty makes the enum a sum type.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fields: Vec<StructField>,
+    pub fields: Vec<Field>,
 }
 
-/// A struct (record) type with named fields.
+/// A record: a plain data type with named fields, serialized across the ABI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "idl", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
-#[cfg_attr(
-    feature = "idl",
-    schemars(description = "A struct (record) type with named fields.")
-)]
-pub struct StructDef {
-    /// Struct type name (for example `Contact`).
+pub struct RecordDef {
+    /// The record name (for example `Contact`).
     pub name: String,
-    /// Human-readable documentation, propagated to the generated bindings.
-    /// `None` when undocumented.
+    /// Documentation, propagated to the bindings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-    /// Deprecation notice for the whole type; when set, generators annotate
-    /// the emitted record. `None` means the struct is current.
+    /// A deprecation notice for the whole type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecated: Option<String>,
-    /// The fields in declaration order; order is preserved in the generated
-    /// type, its constructors, and its serialized buffer encoding.
-    pub fields: Vec<StructField>,
+    /// The fields, in declaration (and wire) order.
+    pub fields: Vec<Field>,
 }
 
-/// A named field of a [`StructDef`], or the payload of an algebraic
-/// [`EnumVariant`].
+/// A named field of a [`RecordDef`], an [`EnumVariant`], or an [`ErrorCode`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "idl", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
-pub struct StructField {
-    /// Field name (for example `email`).
+pub struct Field {
+    /// The field name (for example `email`).
     pub name: String,
-    /// Field type. Serialized under the IDL key `type`.
+    /// The field type. Serialized under the key `type`.
     #[serde(rename = "type")]
     pub ty: TypeRef,
-    /// Human-readable documentation, propagated to the generated bindings.
-    /// `None` when undocumented.
+    /// Documentation, propagated to the bindings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
 }
@@ -781,19 +648,20 @@ pub struct StructField {
 /// An error domain: a named, open set of error codes that fallible callables
 /// report by naming the domain in their `throws`.
 ///
-/// A module may declare several. The domain's name is a type name (unique
-/// across the API); its code names are unique across the API too, and its
-/// code values are positive and unique within the domain. Domains are open:
+/// Code values are positive and unique within the domain. Domains are open:
 /// adding a code never breaks a deployed binding, which maps a positive code
 /// it doesn't know to the domain's base error type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "idl", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ErrorDomain {
-    /// Error domain name, used to name the generated error type (for example
-    /// `ContactError`). Callables name it in their `throws`.
+    /// The domain name, which names the generated error type (for example
+    /// `ContactError`).
     pub name: String,
-    /// The error codes that belong to this domain.
+    /// Documentation, propagated to the generated error type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+    /// The codes, in declaration order.
     pub codes: Vec<ErrorCode>,
 }
 
@@ -802,23 +670,19 @@ pub struct ErrorDomain {
 #[cfg_attr(feature = "idl", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ErrorCode {
-    /// Error code name, lowered to a variant or constant on the generated error
-    /// type (for example `not_found`).
+    /// The code name (for example `NotFound`).
     pub name: String,
-    /// Stable numeric value carried across the C ABI to identify this error.
-    /// Must be positive; non-positive codes are reserved for the runtime.
+    /// The stable positive value carried across the C ABI.
     pub code: i32,
-    /// Default human-readable message describing the error.
+    /// The default human-readable message.
     pub message: String,
-    /// Human-readable documentation, propagated to the generated bindings.
-    /// `None` when undocumented.
+    /// Documentation, propagated to the bindings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-    /// Structured payload fields this error carries beyond its code and
-    /// message, serialized across the ABI in the error's payload buffer.
-    /// Empty for a plain code.
+    /// Payload fields the error carries beyond its code and message,
+    /// serialized in the error's payload buffer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fields: Vec<StructField>,
+    pub fields: Vec<Field>,
 }
 
 #[cfg(test)]
@@ -833,32 +697,14 @@ mod tests {
 
     #[test]
     fn primitives_round_trip() {
-        let cases: &[(&str, TypeRef)] = &[
-            ("i8", TypeRef::Prim(Prim::I8)),
-            ("i16", TypeRef::Prim(Prim::I16)),
-            ("i32", TypeRef::Prim(Prim::I32)),
-            ("i64", TypeRef::Prim(Prim::I64)),
-            ("u8", TypeRef::Prim(Prim::U8)),
-            ("u16", TypeRef::Prim(Prim::U16)),
-            ("u32", TypeRef::Prim(Prim::U32)),
-            ("u64", TypeRef::Prim(Prim::U64)),
-            ("f32", TypeRef::Prim(Prim::F32)),
-            ("f64", TypeRef::Prim(Prim::F64)),
-            ("bool", TypeRef::Prim(Prim::Bool)),
-            ("string", TypeRef::Prim(Prim::String)),
-            ("bytes", TypeRef::Prim(Prim::Bytes)),
-        ];
-        for (s, expected) in cases {
-            assert_eq!(&rt(s), expected);
+        for p in Prim::ALL {
+            assert_eq!(rt(p.snake()), TypeRef::Prim(p));
         }
     }
 
     #[test]
     fn composites_round_trip() {
         assert_eq!(rt("Contact"), TypeRef::Named("Contact".into()));
-        // A dotted name parses as written; validation rejects it with a
-        // dedicated diagnostic (type names are global).
-        assert_eq!(rt("shared.Status"), TypeRef::Named("shared.Status".into()));
         assert_eq!(
             rt("Contact?"),
             TypeRef::Optional(Box::new(TypeRef::Named("Contact".into())))
@@ -878,28 +724,16 @@ mod tests {
             rt("iter<Contact>"),
             TypeRef::Iterator(Box::new(TypeRef::Named("Contact".into())))
         );
-        assert_eq!(
-            rt("[{string:[i32?]}]"),
-            TypeRef::List(Box::new(TypeRef::Map(
-                Box::new(TypeRef::Prim(Prim::String)),
-                Box::new(TypeRef::List(Box::new(TypeRef::Optional(Box::new(
-                    TypeRef::Prim(Prim::I32)
-                )))))
-            )))
-        );
+        rt("[{string:[i32?]}]");
     }
 
     #[test]
-    fn u8_list_canonicalizes_to_bytes() {
+    fn u8_lists_are_bytes_and_nested_colons_parse() {
         assert_eq!(parse_type_ref("[u8]").unwrap(), TypeRef::Prim(Prim::Bytes));
         assert_eq!(
             parse_type_ref("[[u8]]").unwrap(),
             TypeRef::List(Box::new(TypeRef::Prim(Prim::Bytes)))
         );
-    }
-
-    #[test]
-    fn map_separator_skips_nested_colons() {
         assert_eq!(
             parse_type_ref("{{string:i32}:bool}").unwrap(),
             TypeRef::Map(
@@ -914,11 +748,9 @@ mod tests {
 
     #[test]
     fn malformed_types_are_errors() {
-        assert!(parse_type_ref("").is_err());
-        assert!(parse_type_ref("   ").is_err());
-        assert!(parse_type_ref("{string}").is_err());
-        assert!(parse_type_ref("[]").is_err());
-        assert!(parse_type_ref("?").is_err());
+        for s in ["", "   ", "{string}", "[]", "?"] {
+            assert!(parse_type_ref(s).is_err(), "{s:?}");
+        }
     }
 
     #[test]
@@ -939,85 +771,75 @@ mod tests {
     }
 
     #[test]
+    fn enum_values_count_up_from_the_last_explicit_one() {
+        let e: EnumDef = serde_json::from_str(
+            r#"{"name":"E","variants":[{"name":"A"},{"name":"B","value":5},{"name":"C"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(e.values(), [0, 5, 6]);
+        assert!(!e.is_rich());
+    }
+
+    #[test]
     fn document_round_trips_through_yaml_and_json() {
         let yaml = r#"
-version: "0.12.0"
-modules:
-  - name: contacts
-    doc: Address book
-    structs:
-      - name: Contact
-        deprecated: use Person
-        fields:
-          - { name: name, type: string }
-          - { name: tags, type: "[string]" }
-          - { name: book, type: "Book?" }
-    enums:
-      - name: Shape
-        variants:
-          - { name: Circle, value: 0, fields: [{ name: r, type: f64 }] }
-          - { name: Dot, value: 1 }
-    interfaces:
-      - name: Book
-        constructors:
-          - { name: open, params: [{ name: path, type: string }], throws: BookError }
-        methods:
-          - { name: find, params: [{ name: q, type: string }], return: "Contact?" }
-          - { name: watch, params: [{ name: listener, type: ChangeListener }] }
-    callback_interfaces:
-      - name: ChangeListener
-        methods:
-          - { name: on_change, params: [{ name: id, type: i64 }] }
-          - { name: should_continue, params: [], return: bool, throws: any }
-    errors:
-      - name: BookError
-        codes:
-          - { name: NotFound, code: 1, message: missing, fields: [{ name: id, type: i64 }] }
-      - name: IoError
-        codes:
-          - { name: Disk, code: 1, message: disk }
-    functions:
-      - name: count
-        params: []
-        return: i64
-        async: true
-        cancellable: true
-        deprecated: gone
-    modules:
-      - name: inner
-        functions:
-          - { name: ping, params: [], return: string, throws: any }
+version: "0.13.0"
+doc: Address book
+records:
+  - name: Contact
+    deprecated: use Person
+    fields:
+      - { name: name, type: string }
+      - { name: book, type: "Book?" }
+enums:
+  - name: Shape
+    variants:
+      - { name: Circle, fields: [{ name: r, type: f64 }] }
+      - { name: Dot }
+errors:
+  - name: BookError
+    doc: Book failures.
+    codes:
+      - { name: NotFound, code: 1, message: missing, fields: [{ name: id, type: i64 }] }
+interfaces:
+  - name: Book
+    constructors:
+      - { name: open, params: [{ name: path, type: string }], throws: BookError }
+    methods:
+      - { name: find, params: [{ name: q, type: string }], return: "Contact?" }
+callbacks:
+  - name: ChangeListener
+    methods:
+      - { name: on_change, params: [{ name: id, type: i64 }] }
+      - { name: should_continue, return: bool, throws: any }
+functions:
+  - { name: count, return: i64, async: true, cancellable: true, deprecated: gone }
 "#;
         let api: Api = serde_saphyr::from_str(yaml).unwrap();
         assert_eq!(api.version, CURRENT_SCHEMA_VERSION);
-        let m = &api.modules[0];
-        assert_eq!(m.doc.as_deref(), Some("Address book"));
-        assert_eq!(m.structs[0].deprecated.as_deref(), Some("use Person"));
-        assert!(m.enums[0].is_rich());
+        assert_eq!(api.doc.as_deref(), Some("Address book"));
+        assert!(api.enums[0].is_rich());
+        assert_eq!(api.enums[0].values(), [0, 1]);
         assert_eq!(
-            m.interfaces[0].methods[0].returns,
-            Some(TypeRef::Optional(Box::new(TypeRef::Named(
-                "Contact".into()
-            ))))
-        );
-        assert_eq!(
-            m.interfaces[0].constructors[0].throws,
+            api.interfaces[0].constructors[0].throws,
             Some(Throws::Domain("BookError".into()))
         );
-        assert_eq!(m.callback_interfaces[0].methods.len(), 2);
+        assert_eq!(api.callbacks[0].methods[1].throws, Some(Throws::Any));
+        assert!(api.functions[0].r#async && api.functions[0].cancellable);
+        let names: Vec<&str> = api.declaration_names().collect();
         assert_eq!(
-            m.callback_interfaces[0].methods[1].throws,
-            Some(Throws::Any)
+            names,
+            [
+                "Contact",
+                "Shape",
+                "BookError",
+                "Book",
+                "ChangeListener",
+                "count"
+            ]
         );
-        assert_eq!(m.errors.len(), 2);
-        assert_eq!(m.errors[0].codes[0].fields.len(), 1);
-        assert!(m.functions[0].r#async && m.functions[0].cancellable);
-        assert_eq!(m.functions[0].throws, None);
-        assert_eq!(m.modules[0].functions[0].name, "ping");
 
         let json = serde_json::to_string(&api).unwrap();
-        assert!(json.contains(r#""throws":"BookError""#), "{json}");
-        assert!(json.contains(r#""throws":"any""#), "{json}");
         let back: Api = serde_json::from_str(&json).unwrap();
         assert_eq!(back, api);
         let yaml2 = serde_saphyr::to_string(&api).unwrap();
@@ -1026,65 +848,12 @@ modules:
     }
 
     #[test]
-    fn boolean_throws_is_rejected_with_a_pointer_to_the_new_syntax() {
-        let yaml = r#"
-version: "0.12.0"
-modules:
-  - name: m
-    functions: [{ name: f, throws: true }]
-"#;
-        let err = serde_saphyr::from_str::<Api>(yaml).unwrap_err();
-        assert!(err.to_string().contains("throws: KvError"), "{err}");
-    }
-
-    #[test]
-    fn undeclared_type_names_are_the_foreign_references() {
-        let yaml = r#"
-version: "0.12.0"
-modules:
-  - name: m
-    structs: [{ name: Local, fields: [{ name: other, type: "[Remote]" }] }]
-    functions:
-      - { name: f, params: [{ name: x, type: "{string:Elsewhere?}" }], return: Local }
-"#;
-        let api: Api = serde_saphyr::from_str(yaml).unwrap();
-        let names: Vec<String> = api.undeclared_type_names().into_iter().collect();
-        assert_eq!(names, ["Elsewhere", "Remote"]);
-    }
-
-    #[test]
     fn serialization_omits_defaulted_fields() {
-        let api = Api {
-            version: CURRENT_SCHEMA_VERSION.into(),
-            modules: vec![Module {
-                name: "m".into(),
-                doc: None,
-                functions: vec![Function {
-                    name: "f".into(),
-                    params: vec![],
-                    returns: None,
-                    doc: None,
-                    throws: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                }],
-                interfaces: vec![],
-                callback_interfaces: vec![],
-                structs: vec![],
-                enums: vec![],
-                errors: vec![],
-                modules: vec![],
-            }],
-        };
+        let mut api = Api::new();
+        api.functions.push(Function::named("f"));
         let yaml = serde_saphyr::to_string(&api).unwrap();
-        for noise in [
-            "null", "[]", "false", "async", "throws", "doc", "params", "errors",
-        ] {
-            assert!(
-                !yaml.contains(noise),
-                "{noise} leaked into canonical form:\n{yaml}"
-            );
+        for noise in ["null", "[]", "false", "async", "throws", "doc", "params"] {
+            assert!(!yaml.contains(noise), "{noise} leaked:\n{yaml}");
         }
     }
 
@@ -1093,11 +862,9 @@ modules:
     fn json_schema_types_are_strings() {
         let schema = schemars::schema_for!(Api);
         let json = serde_json::to_value(&schema).unwrap();
-        let type_ref = &json["definitions"]["TypeRef"];
-        assert_eq!(type_ref["type"], "string");
-        assert!(json["properties"].get("package").is_none());
-        assert!(json["properties"].get("generators").is_none());
-        assert!(json["definitions"].get("CallbackInterfaceDef").is_some());
+        assert_eq!(json["definitions"]["TypeRef"]["type"], "string");
         assert_eq!(json["definitions"]["Throws"]["type"], "string");
+        assert!(json["definitions"].get("CallbackDef").is_some());
+        assert!(json["properties"].get("modules").is_none());
     }
 }

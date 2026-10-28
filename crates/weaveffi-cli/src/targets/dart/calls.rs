@@ -2,29 +2,27 @@
 //! wrappers for sync, async, and iterator callables.
 //!
 //! FFI signatures come straight from the model's lowered [`AbiFn`]s, so they
-//! match the C header slot for slot. Parameter marshalling dispatches on the
-//! stored [`ArgPass`], results on [`RetPass`], [`ResultPass`], and
-//! [`ItemPass`], and error handling on [`ErrorStrategy`]; nothing here
-//! re-derives a transport from a type.
+//! match the C header slot for slot. Every value is one C value, marshalled
+//! by its [`Crossing`](crate::codegen::values::Crossing) through
+//! [`values`](super::values), and failures are mapped by the callable's
+//! [`ErrorStrategy`]; nothing here re-derives a transport from a type.
 //!
 //! Every call runs in its own `_Frame` (the runtime's pooled per-call
-//! scratch): its error slot, its return out slots, and the arena its
-//! arguments are staged in belong to that call alone, so a call made from a
-//! callback during another call never disturbs the outer one.
+//! scratch): its error slot, its out slot, and the arena its arguments are
+//! staged in belong to that call alone, so a call made from a callback
+//! during another call never disturbs the outer one.
 
 use crate::codegen::CodeWriter;
-use weaveffi_model::abi::{AbiParam, CType};
-use weaveffi_model::model::{AbiFn, AsyncBinding, FnBinding, IteratorBinding, Model};
-use weaveffi_model::plan::{ArgPass, ErrorStrategy, ItemPass, ResultPass, RetPass};
-use weaveffi_model::ty::{Prim, Ty};
+use weaveffi_model::abi::{AbiFn, AbiParam, CType};
+use weaveffi_model::model::{AsyncBinding, ErrorStrategy, FnBinding, IteratorBinding, Model};
+use weaveffi_model::ty::ParamTy;
 
 use crate::targets::dart::callbacks::{dispatch_fn, vtable_var};
-use crate::targets::dart::codec::{pack_fn, unpack_fn};
 use crate::targets::dart::docs::Docs;
 use crate::targets::dart::types::{
-    dart_class, dart_ident, dart_type, exception_class, ffi_type, ffi_typedef, ffi_var,
-    object_class, param_type, return_type, slice_fn, zero_literal,
+    dart_ident, dart_type, exception_class, ffi_type, ffi_typedef, ffi_var, param_type, return_type,
 };
+use crate::targets::dart::values::{is_struct, receive, stage, stages};
 
 /// How a callable's failures surface, resolved from its [`ErrorStrategy`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,7 +120,7 @@ impl DartDecl<'_> {
 pub(crate) fn emit_bindings(w: &mut CodeWriter, f: &FnBinding, leaf: bool) {
     if let Some(a) = f.async_binding() {
         let cb = ffi_typedef(&a.callback_type);
-        let (natives, _) = slot_types(&a.callback_params, None);
+        let (natives, _) = slot_types(&a.callback.params, None);
         w.blank();
         w.line(format!(
             "typedef {cb} = Void Function({});",
@@ -130,9 +128,9 @@ pub(crate) fn emit_bindings(w: &mut CodeWriter, f: &FnBinding, leaf: bool) {
         ));
         emit_lookup(w, &f.abi, false, Some(&cb));
     } else if let Some(it) = f.iterator() {
-        emit_lookup(w, &f.abi, false, None);
-        emit_lookup(w, &it.next, false, None);
-        emit_destroy(w, &it.destroy_symbol, false);
+        emit_lookup(w, &f.abi, leaf, None);
+        emit_lookup(w, &it.next, leaf, None);
+        emit_destroy(w, &it.destroy_symbol, leaf);
     } else {
         emit_lookup(w, &f.abi, leaf, None);
     }
@@ -159,8 +157,8 @@ pub(crate) fn emit_wrapper(
     }
 }
 
-/// The (native, Dart) FFI types of `params`, substituting `callback` for a
-/// bare named slot (an async launcher's completion callback).
+/// The (native, Dart) FFI types of `params`, substituting a pointer to
+/// `callback` for a bare named slot (an async launcher's completion).
 fn slot_types(params: &[AbiParam], callback: Option<&str>) -> (Vec<String>, Vec<String>) {
     params
         .iter()
@@ -264,10 +262,11 @@ impl Inputs {
 }
 
 /// Marshal `f`'s inputs. An instance method's call passes `_self` first.
-/// Callback registrations run last, after everything that can throw, so a
+/// Every value that can fail to stage is staged into a local first, and
+/// callback registrations run last, after everything that can throw, so a
 /// failed staging step never strands a registered implementation.
 fn marshal_inputs(f: &FnBinding) -> Inputs {
-    let mut stage = Vec::new();
+    let mut stage_lines = Vec::new();
     let mut registrations = Vec::new();
     let mut args = Vec::new();
     if f.has_self() {
@@ -275,196 +274,39 @@ fn marshal_inputs(f: &FnBinding) -> Inputs {
     }
     for p in &f.params {
         let name = dart_ident(&p.name);
-        let value = p.ty.value();
-        match &p.pass {
-            ArgPass::Direct { .. } => args.push(match value {
-                Some(Ty::Enum(_)) => format!("{name}.value"),
-                _ => name,
-            }),
-            ArgPass::OptDirect { inner, .. } => {
-                args.push(format!("{name} != null"));
-                args.push(match inner {
-                    Ty::Enum(_) => format!("{name}?.value ?? 0"),
-                    other => format!("{name} ?? {}", zero_literal(other)),
-                });
+        match &p.ty {
+            ParamTy::Value(ty) if stages(ty) => {
+                let local = format!("_{name}Arg");
+                stage_lines.push(format!("final {local} = {};", stage(ty, &name, "_f.arena")));
+                args.push(local);
             }
-            ArgPass::Slice { elem, .. } => {
-                args.push(format!("{}(_f.arena, {name})", slice_fn("stage", *elem)));
-                args.push(format!("{name}.length"));
-            }
-            ArgPass::String { .. } => {
-                stage.push(format!("final _{name}Bytes = utf8.encode({name});"));
-                args.push(format!("_stage(_f.arena, _{name}Bytes)"));
-                args.push(format!("_{name}Bytes.length"));
-            }
-            ArgPass::Bytes { .. } => {
-                args.push(format!("_stage(_f.arena, {name})"));
-                args.push(format!("{name}.length"));
-            }
-            ArgPass::Buffer { .. } => {
-                let ty = value.expect("a buffer parameter is a value");
-                stage.push(format!(
-                    "final _{name}Bytes = _encode({name}, {});",
-                    pack_fn(ty)
-                ));
-                args.push(format!("_stage(_f.arena, _{name}Bytes)"));
-                args.push(format!("_{name}Bytes.length"));
-            }
-            // The wrapper keeps its reference and is borrowed for the call.
-            ArgPass::Object { nullable, .. } => {
-                let ptr = format!("_{name}Ptr");
-                stage.push(if *nullable {
-                    format!("final {ptr} = {name} == null ? nullptr : _borrow(_f.arena, {name});")
-                } else {
-                    format!("final {ptr} = _borrow(_f.arena, {name});")
-                });
-                args.push(ptr);
-            }
-            // The producer owns the registration and releases it through the
-            // vtable's `free`; a null vtable means no implementation.
-            ArgPass::Callback {
+            ParamTy::Value(ty) => args.push(stage(ty, &name, "_f.arena")),
+            // The producer adopts the registration and releases it through
+            // the vtable's `free`; a null vtable means no implementation.
+            ParamTy::Callback {
+                name: interface,
                 nullable,
-                interface,
-                ..
             } => {
-                let ctx = format!("_{name}Ctx");
-                let register = format!("_registerCallback({name}, {})", dispatch_fn(interface));
-                let vtable = format!("{}.cast<Void>()", vtable_var(interface));
-                if *nullable {
-                    registrations.push(format!(
-                        "final {ctx} = {name} == null ? nullptr : {register};"
-                    ));
-                    args.push(ctx);
-                    args.push(format!("{name} == null ? nullptr : {vtable}"));
+                let local = format!("_{name}Arg");
+                let register = format!(
+                    "_registerCallback({name}, {}, {}.cast())",
+                    dispatch_fn(interface),
+                    vtable_var(interface)
+                );
+                registrations.push(if *nullable {
+                    format!("final {local} = {name} == null ? _noCallback() : {register};")
                 } else {
-                    registrations.push(format!("final {ctx} = {register};"));
-                    args.push(ctx);
-                    args.push(vtable);
-                }
+                    format!("final {local} = {register};")
+                });
+                args.push(local);
             }
         }
     }
-    stage.extend(registrations);
-    Inputs { stage, args }
-}
-
-/// How one value arrives from the producer: the expressions holding its
-/// slots, per its transport.
-pub(crate) enum Arrival {
-    /// A scalar (or C-style enum discriminant).
-    Direct(String),
-    /// A presence flag and a scalar (ignored when absent).
-    OptDirect {
-        /// The presence flag.
-        has: String,
-        /// The scalar.
-        value: String,
-    },
-    /// A typed array and its element count.
-    Slice {
-        /// The array pointer.
-        ptr: String,
-        /// The element count.
-        len: String,
-        /// The element type.
-        elem: Prim,
-    },
-    /// A UTF-8 run.
-    String {
-        /// The run pointer.
-        ptr: String,
-        /// The byte length.
-        len: String,
-    },
-    /// A byte run.
-    Bytes {
-        /// The run pointer.
-        ptr: String,
-        /// The byte length.
-        len: String,
-    },
-    /// A value buffer.
-    Buffer {
-        /// The run pointer.
-        ptr: String,
-        /// The byte length.
-        len: String,
-    },
-    /// An object reference (always owned by the receiver).
-    Object {
-        /// The object pointer.
-        ptr: String,
-        /// Whether a null pointer means no object.
-        nullable: bool,
-    },
-}
-
-/// The Dart expression turning an arriving value of type `ty` into its
-/// surface value. `owned` runs and arrays are copied and released; borrowed
-/// ones (a callback's arguments) are copied. Objects are always adopted.
-pub(crate) fn receive(ty: &Ty, arrival: Arrival, owned: bool) -> String {
-    let enum_of = |t: &Ty, v: &str| match t {
-        Ty::Enum(n) => format!("{}.fromValue({v})", dart_class(n)),
-        _ => v.to_string(),
-    };
-    match arrival {
-        Arrival::Direct(v) => enum_of(ty, &v),
-        Arrival::OptDirect { has, value } => {
-            let inner = match ty {
-                Ty::Optional(inner) => inner.as_ref(),
-                other => other,
-            };
-            format!("{has} ? {} : null", enum_of(inner, &value))
-        }
-        Arrival::Slice { ptr, len, elem } => {
-            let op = if owned { "take" } else { "copy" };
-            format!("{}({ptr}, {len})", slice_fn(op, elem))
-        }
-        Arrival::String { ptr, len } => {
-            let op = if owned { "_takeString" } else { "_readString" };
-            format!("{op}({ptr}, {len})")
-        }
-        Arrival::Bytes { ptr, len } => format!("{}({ptr}, {len})", bytes_fn(owned)),
-        Arrival::Buffer { ptr, len } => format!(
-            "_decode({}({ptr}, {len}), {})",
-            bytes_fn(owned),
-            unpack_fn(ty)
-        ),
-        Arrival::Object { ptr, nullable } => adopt_expr(&ptr, ty, nullable),
+    stage_lines.extend(registrations);
+    Inputs {
+        stage: stage_lines,
+        args,
     }
-}
-
-fn bytes_fn(owned: bool) -> &'static str {
-    if owned {
-        "_takeBytes"
-    } else {
-        "_copyBytes"
-    }
-}
-
-/// The expression adopting the owned object pointer `expr` into its wrapper;
-/// a null pointer becomes `null` when `nullable`.
-pub(crate) fn adopt_expr(expr: &str, ty: &Ty, nullable: bool) -> String {
-    let class = object_class(ty.interface_name().expect("objects are interfaces"));
-    if nullable {
-        format!("{expr} == nullptr ? null : {class}._({expr})")
-    } else {
-        format!("{class}._({expr})")
-    }
-}
-
-/// The Dart expression reading out slot `param` (a `T*`) through the frame
-/// slot `slot`.
-fn read_slot(slot: &str, param: &AbiParam) -> String {
-    match &param.ty {
-        CType::Ptr { pointee, .. } => format!("{slot}.cast<{}>().value", ffi_type(pointee).0),
-        other => unreachable!("out slot {} is a {other:?}, not a pointer", param.name),
-    }
-}
-
-/// The frame slot holding out slot number `i` of a call.
-fn frame_slot(f: &str, i: usize) -> String {
-    format!("{f}.slot{i}")
 }
 
 /// Write `body` inside the try/finally that scopes `_self` and frame `_f`.
@@ -485,24 +327,11 @@ fn framed(w: &mut CodeWriter, has_self: bool, body: impl FnOnce(&mut CodeWriter)
     w.line("}");
 }
 
-/// The value type of `f`'s return.
-fn ret_value(f: &FnBinding) -> &Ty {
-    f.ret
-        .as_ref()
-        .and_then(|r| r.value())
-        .expect("a value return")
-}
-
 /// A synchronous wrapper: stage, call, check, receive.
 fn render_sync(w: &mut CodeWriter, f: &FnBinding, kind: &DartDecl, name: &str, throws: &Throws) {
     let mut inputs = marshal_inputs(f);
-    let outs = f.ret_pass.out_slots();
-    for i in 0..outs.len() {
-        inputs.args.push(format!("{}.cast()", frame_slot("_f", i)));
-    }
     inputs.args.push("_f.err".into());
     let call = format!("{}({})", ffi_var(&f.abi.symbol), inputs.args.join(", "));
-    let slot = |i: usize| read_slot(&frame_slot("_f", i), outs[i]);
     w.block(
         kind.open_line(&return_type(f), name, &wrapper_params(f), ""),
         "}",
@@ -511,54 +340,24 @@ fn render_sync(w: &mut CodeWriter, f: &FnBinding, kind: &DartDecl, name: &str, t
                 for s in &inputs.stage {
                     w.line(s);
                 }
-                let result = match &f.ret_pass {
-                    RetPass::Void => {
+                match f.ret_value() {
+                    None => {
                         w.line(format!("{call};"));
                         w.line(throws.check("_f"));
-                        return;
                     }
-                    RetPass::Direct => Arrival::Direct("_result".into()),
-                    RetPass::OptDirect { .. } => Arrival::OptDirect {
-                        has: "_present".into(),
-                        value: slot(0),
-                    },
-                    RetPass::Slice { elem, .. } => Arrival::Slice {
-                        ptr: "_result".into(),
-                        len: slot(0),
-                        elem: *elem,
-                    },
-                    RetPass::String { .. } => Arrival::String {
-                        ptr: "_result".into(),
-                        len: slot(0),
-                    },
-                    RetPass::Bytes { .. } => Arrival::Bytes {
-                        ptr: "_result".into(),
-                        len: slot(0),
-                    },
-                    RetPass::Buffer { .. } => Arrival::Buffer {
-                        ptr: "_result".into(),
-                        len: slot(0),
-                    },
-                    RetPass::Object { nullable, .. } => Arrival::Object {
-                        ptr: "_result".into(),
-                        nullable: *nullable,
-                    },
-                    RetPass::Iterator(_) => unreachable!("iterators render separately"),
-                };
-                let local = match &result {
-                    Arrival::OptDirect { .. } => "_present",
-                    _ => "_result",
-                };
-                w.line(format!("final {local} = {call};"));
-                w.line(throws.check("_f"));
-                w.line(format!("return {};", receive(ret_value(f), result, true)));
+                    Some(ret) => {
+                        w.line(format!("final _result = {call};"));
+                        w.line(throws.check("_f"));
+                        w.line(format!("return {};", receive(ret, "_result", true)));
+                    }
+                }
             });
         },
     );
 }
 
 /// An async wrapper: a `Future` completed from a `NativeCallable.listener`
-/// the producer invokes exactly once, from any thread. Results and errors
+/// the producer invokes exactly once, from any thread. The result and error
 /// it receives are owned, so decoding them later on the event loop is safe.
 /// A cancellable call binds a native token to its `CancelToken` for the
 /// call's duration.
@@ -581,57 +380,16 @@ fn render_async(
     let call = format!("{}({});", ffi_var(&f.abi.symbol), inputs.args.join(", "));
 
     // The listener's parameters, named after the completion's slots:
-    // `context`, `err`, then the result's.
-    let (_, darts) = slot_types(&a.callback_params, None);
-    let names: Vec<String> = a
-        .callback_params
-        .iter()
-        .map(|p| dart_ident(&p.name))
-        .collect();
+    // `context`, `err`, then `result`.
+    let (_, darts) = slot_types(&a.callback.params, None);
     let listener_params: Vec<String> = darts
         .iter()
-        .zip(&names)
-        .map(|(d, n)| format!("{d} {n}"))
+        .zip(&a.callback.params)
+        .map(|(d, p)| format!("{d} {}", dart_ident(&p.name)))
         .collect();
-    let err = &names[1];
-    let n = |p: &AbiParam| dart_ident(&p.name);
-    let result = match &a.result {
-        ResultPass::Void => None,
-        ResultPass::Direct { result } => Some(Arrival::Direct(n(result))),
-        ResultPass::OptDirect { has, value } => Some(Arrival::OptDirect {
-            has: n(has),
-            value: n(value),
-        }),
-        ResultPass::Slice { ptr, len, elem } => Some(Arrival::Slice {
-            ptr: n(ptr),
-            len: n(len),
-            elem: *elem,
-        }),
-        ResultPass::String { ptr, len } => Some(Arrival::String {
-            ptr: n(ptr),
-            len: n(len),
-        }),
-        ResultPass::Bytes { ptr, len } => Some(Arrival::Bytes {
-            ptr: n(ptr),
-            len: n(len),
-        }),
-        ResultPass::Buffer { ptr, len } => Some(Arrival::Buffer {
-            ptr: n(ptr),
-            len: n(len),
-        }),
-        ResultPass::Object {
-            result, nullable, ..
-        } => Some(Arrival::Object {
-            ptr: n(result),
-            nullable: *nullable,
-        }),
-    };
-    let complete = match result {
+    let complete = match f.ret_value() {
         None => "_completer.complete();".to_string(),
-        Some(arrival) => format!(
-            "_completer.complete({});",
-            receive(ret_value(f), arrival, true)
-        ),
+        Some(ty) => format!("_completer.complete({});", receive(ty, "result", true)),
     };
 
     let open = kind.open_line(&format!("Future<{ret}>"), name, &wrapper_params(f), "");
@@ -658,7 +416,7 @@ fn render_async(
             w.line("try {");
             w.scope(|w| {
                 w.line(format!(
-                    "if ({err} != nullptr) throw _takeAsyncError({err}, {});",
+                    "if (err != nullptr) throw _takeAsyncError(err, {});",
                     throws.mapper()
                 ));
                 w.line(&complete);
@@ -722,40 +480,17 @@ fn render_iterator(
     let mut inputs = marshal_inputs(f);
     inputs.args.push("_f.err".into());
     let launch = format!("{}({})", ffi_var(&f.abi.symbol), inputs.args.join(", "));
-    let slots = it.item.slots();
-    let mut next_args = vec!["_iter".to_string()];
-    next_args.extend((0..slots.len()).map(|i| format!("{}.cast()", frame_slot("_step", i))));
-    next_args.push("_step.err".into());
-    let slot = |i: usize| read_slot(&frame_slot("_step", i), slots[i]);
-    let item = match &it.item {
-        ItemPass::Direct { .. } => Arrival::Direct(slot(0)),
-        ItemPass::OptDirect { .. } => Arrival::OptDirect {
-            has: slot(0),
-            value: slot(1),
-        },
-        ItemPass::Slice { elem, .. } => Arrival::Slice {
-            ptr: slot(0),
-            len: slot(1),
-            elem: *elem,
-        },
-        ItemPass::String { .. } => Arrival::String {
-            ptr: slot(0),
-            len: slot(1),
-        },
-        ItemPass::Bytes { .. } => Arrival::Bytes {
-            ptr: slot(0),
-            len: slot(1),
-        },
-        ItemPass::Buffer { .. } => Arrival::Buffer {
-            ptr: slot(0),
-            len: slot(1),
-        },
-        ItemPass::Object { nullable, .. } => Arrival::Object {
-            ptr: slot(0),
-            nullable: *nullable,
-        },
+    let out = &it.next.params[1];
+    let CType::Ptr { pointee, .. } = &out.ty else {
+        unreachable!("an iterator's out_item is a pointer");
     };
-    let item = receive(&it.elem, item, true);
+    let slot = format!("_step.out.cast<{}>()", ffi_type(pointee).0);
+    let read = if is_struct(&it.elem) {
+        format!("{slot}.ref")
+    } else {
+        format!("{slot}.value")
+    };
+    let item = receive(&it.elem, "_out", true);
     let destroy = ffi_var(&it.destroy_symbol);
 
     w.block(
@@ -782,12 +517,12 @@ fn render_iterator(
                     w.line("try {");
                     w.scope(|w| {
                         w.line(format!(
-                            "final _more = {}({});",
+                            "final _more = {}(_iter, _step.out.cast(), _step.err);",
                             ffi_var(&it.next.symbol),
-                            next_args.join(", ")
                         ));
                         w.line(throws.check("_step"));
                         w.line("if (_more == 0) break;");
+                        w.line(format!("final _out = {read};"));
                         w.line(format!("_item = {item};"));
                     });
                     w.line("} finally {");

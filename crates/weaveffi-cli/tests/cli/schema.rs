@@ -30,16 +30,16 @@ fn schema_emits_valid_json_schema() {
         .and_then(|v| v.as_object())
         .expect("schema output should include 'definitions'");
     for ty in [
-        "Module",
         "Function",
         "Param",
         "TypeRef",
-        "StructDef",
-        "StructField",
+        "Throws",
+        "RecordDef",
+        "Field",
         "EnumDef",
         "EnumVariant",
         "InterfaceDef",
-        "CallbackInterfaceDef",
+        "CallbackDef",
         "ErrorDomain",
         "ErrorCode",
     ] {

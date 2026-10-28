@@ -16,8 +16,9 @@
 // record and object parameters and returns; a `Scorer`; a `Loader` passed as
 // an optional callback with string, bytes, and optional-object returns),
 // objects in every buffered position, async calls with `AbortSignal`
-// cancellation, the nested `kv.stats` module, the sibling `report` root, and
-// leak-free teardown. `live(1)` (live callbacks) shows when the producer
+// cancellation, declarations from the producer's other Rust modules (`stats`
+// and `report`, with its own error domain) in the library's one namespace,
+// and leak-free teardown. `live(1)` (live callbacks) shows when the producer
 // released an implementation.
 //
 // On wasm32 the producer has no threads: compaction pauses for no time and
@@ -26,8 +27,10 @@
 
 import { expect, finish, isWasm, live, load, rejects, same, throws } from './harness.mjs';
 
+// Every declaration is a named export of the package.
 const api = await load('kvstore');
-const { kv, report, KvstoreError, CancelledError } = api;
+const kv = api;
+const { KvstoreError, CancelledError } = api;
 const { EntryKind, Store } = kv;
 const wasm = isWasm(api);
 
@@ -42,7 +45,7 @@ function put(store, key, value, kind = EntryKind.Persistent, ttl = null) {
 const keyNotFound = (key) => (e) =>
   e instanceof kv.KeyNotFoundError && e instanceof kv.KvError && e.code === 1001 && e.key === key;
 
-// 1. Load: the import checked the ABI revision and both contract tables.
+// 1. Load: the import checked the ABI revision and every declaration's contract.
 expect(live(-1) === 1n, 'the sample counts live resources');
 
 async function constructors() {
@@ -418,7 +421,7 @@ async function asyncCalls() {
   const other = Store.open('/other');
   put(other, 'a', '123');
   same(
-    await kv.stats.summarizeAll([s, other]),
+    await kv.summarizeAll([s, other]),
     { entries: 2, bytes: 4n, by_kind: { [EntryKind.Persistent]: 2 } },
     'summarizeAll',
   );
@@ -557,21 +560,21 @@ function statsAndReport() {
   put(s, 'a', '123');
   put(s, 'c', 'x', EntryKind.Encrypted);
   same(
-    kv.stats.summarize(s, null),
+    kv.summarize(s, null),
     { entries: 3, bytes: 6n, by_kind: { [EntryKind.Persistent]: 2, [EntryKind.Encrypted]: 1 } },
     'summarize',
   );
-  throws(() => kv.stats.summarize(s, 'q'), keyNotFound('q'), 'summarize a prefix that matches nothing');
+  throws(() => kv.summarize(s, 'q'), keyNotFound('q'), 'summarize a prefix that matches nothing');
   same(
-    report.renderReport([...s.entries(null)]),
+    kv.renderReport([...s.entries(null)]),
     ['a: 3 bytes, Persistent, v2', 'b: 2 bytes, Persistent', 'c: 1 bytes, Encrypted'],
     'renderReport',
   );
   throws(
-    () => report.renderReport([]),
+    () => kv.renderReport([]),
     (e) =>
-      e instanceof report.NothingToReportError &&
-      e instanceof report.ReportError &&
+      e instanceof kv.NothingToReportError &&
+      e instanceof kv.ReportError &&
       e.code === 2001 &&
       e.message === 'nothing to report',
     'renderReport([])',

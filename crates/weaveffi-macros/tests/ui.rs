@@ -1,4 +1,4 @@
-//! Compile-time contract of the `#[weaveffi::module]` family of macros.
+//! Compile-time contract of the producer macros.
 //!
 //! `ui/pass_*.rs` must expand and compile; `ui/fail_*.rs` must be rejected
 //! with the diagnostic pinned in the matching `.stderr` file. Regenerate the

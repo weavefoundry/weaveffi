@@ -7,31 +7,30 @@ everything here implements.
 
 ## The pipeline
 
-Every generating command (`generate`, including `--check`, `--diff`, and
-`--dry-run`, `dev`, and `package`) runs the same stages:
+Every generating command (`generate`, including `--check`, `--diff`,
+`--dry-run`, and `--dev`, and `package`) runs the same stages:
 
 ```text
 Rust producer crate                        IDL (.yml / .yaml / .json)
-  cargo rustc --crate-type cdylib, then         weaveffi_model::parse
-  the library's metadata frames                       |
-  (weaveffi_cli::library,                             |
-  weaveffi_model::meta::assemble)                     |
-            \                                        /
-             +------------>  Api (the IR)  <--------+
+  cargo rustc --crate-type cdylib             weaveffi_model::parse::load_api
+  (with the project's features), then         (the root document and every
+  the library's metadata frames               file it imports, merged)
+  (weaveffi_cli::library,                              |
+  weaveffi_model::meta::assemble)                      |
+            \                                         /
+             +------------>  Api (the IR)  <---------+
                                   |
                                   v
-   validate        weaveffi_model::validate::validate(&api, &identity, source):
-                   every rule, including the C symbol and slot tables under
-                   the library's real Identity (from weaveffi.toml / cargo
+   validate        weaveffi_model::validate::validate(&api, &identity, sources):
+                   every rule, including the C symbol table under the
+                   library's real Identity (from weaveffi.toml / cargo
                    metadata); reports all violations at once and builds the
                    Model exactly once
                                   |
                                   v
    Model           the identity, the schema version, the type index, and one
-                   binding per declaration with every C symbol, its lowered
-                   AbiFn, and its passing contracts (ArgPass, RetPass,
-                   ResultPass, ItemPass, CallbackRetPass, ErrorStrategy)
-                   already resolved
+                   flat list per declaration kind, each binding with its C
+                   names, its lowered AbiFn, and its Shape already resolved
                                   |
                                   v
    render          Target::render(&Model): each target returns its files in
@@ -41,33 +40,29 @@ Rust producer crate                        IDL (.yml / .yaml / .json)
                                   v
    orchestrate     Orchestrator::plan builds a Changeset against the output
                    directory; apply writes changed files, removes stale ones,
-                   and keeps generation records
+                   and keeps generation records in {out}/.weaveffi/
 ```
 
 `validate` stops once the model is built; `generate --check` and `--diff`
 plan without applying; `package` renders installable artifacts (wheels, npm
 tarballs, gems, ...) around the per-platform libraries `build` compiled.
 
-The **producer macro** runs the front half of the same pipeline inside the
-producer's build. `#[weaveffi::module]` lowers its module tree with its own
-extractor (`crates/weaveffi-macros/src/extract.rs`, which reads `syn`
-tokens and keeps a `SourceMap` of spans), validates it into a `Model` with
-the same validator the CLI uses (`validate_scoped`, whose `Options::foreign`
-lists the names declared outside the tree, `Api::undeclared_type_names`,
-which resolve as records or rich enums that the macro then asserts at compile
-time), with an identity named after `CARGO_CRATE_NAME`, and reports each
-validation error on the offending item through the `SourceMap`. It then
-computes the module's contract table with `weaveffi_model::contract::entries`
-and emits `extern "C"` thunks instead of rendering a binding, reading the
-same stored passing contracts a generator reads and wrapping each item's
-output in that item's `#[cfg]`. Finally it embeds the tree's IR in the
-library: one `weaveffi_model::meta::Frame` per declaration, in an exported
-`{PREFIX}_META_{HASH16}` static (the `weaveffi_meta` custom section on
-`wasm32`) carrying the same `#[cfg]`. The CLI reads those frames back out of
-the built library (see [Library Mode](guides/extract.md)), so it generates
-from exactly the declarations the build compiled, with the same validator,
-model, and contract function, and the symbols and contract entries a
-producer exports are exactly those its generated bindings expect.
+The **producer macros** run inside the producer's build, one item at a time.
+Each attribute (`#[weaveffi::export]`, `#[weaveffi::record]`, and the rest)
+expands on its own: it emits the item's `extern "C"` functions, typed
+through the runtime's value traits so rustc resolves every type wherever
+it's declared; one contract function per declaration, whose hash it
+computes at compile time from the canonical signature
+(`weaveffi_model::contract::Sig`) with each type's spelling filled in from
+its trait's `NAME`; and one `weaveffi_model::meta::Frame` describing the
+declaration, in an exported `{PREFIX}_META_{HASH16}` static (the
+`weaveffi_meta` custom section on `wasm32`). Every generated item repeats
+the declaration's `#[cfg]`. The CLI reads the frames back out of the built
+library (see [Library Mode](guides/extract.md)) and validates the assembled
+API with the same validator an IDL gets, so the rules that span items
+(unique names, symbol collisions) are checked once, for the whole library,
+and the contract a producer exports is the one its generated bindings
+expect.
 
 ## Crates
 
@@ -79,44 +74,43 @@ weaveffi ──► weaveffi-macros ────────┘   (proc macro, bu
 weaveffi-fuzz ──► weaveffi, weaveffi-model   (unpublished)
 ```
 
-The runtime (`weaveffi::abi`) depends on no other workspace crate at run
-time, so a producer never links the generators, and the generators never
-link the runtime. The ABI revision is therefore declared twice, in
-`weaveffi::abi::ABI_VERSION` and in the model
+The runtime (`weaveffi`'s hidden `__rt` module) depends on no other
+workspace crate at run time, so a producer never links the generators, and
+the generators never link the runtime. The ABI revision is therefore
+declared twice, in the runtime's `ABI_VERSION` and in the model
 (`weaveffi_model::model::ABI_VERSION`), and
 `crates/weaveffi-cli/tests/abi_version.rs` keeps them equal.
 
 | Crate | Owns |
 |-------|------|
-| `weaveffi-model` | Everything between a definition and code generation: the IR (`ir`), IDL parsing for YAML and JSON (`parse`, behind the default `idl` feature), library metadata frames (`meta`), validation and diagnostics (`validate`), types split by position and their families (`ty`), package identity (`pkg`), the model with the symbol table (`model`), C slot types and lowering (`abi`), the passing contracts (`plan`), error-type naming (`errors`), and contract tables (`contract`). It doesn't depend on `syn`; the macro uses it without the `idl` feature. |
-| `weaveffi-cli` | The library (`src/lib.rs`): the target framework and all eleven generators. Public: `targets` (the `Target` trait, its hook types, and the `REGISTRY`), `codegen` (the `Orchestrator`, its `Changeset`, `OutputFile`, and the `CodeWriter`), `config` (`weaveffi.toml`), `project` (locating a project, identity resolution, and loading its API), and `package` (the artifact types). Internal: the shared emitters (`codegen::{codecs, contract, errors, docs, common}`), `cabi` (the shared C declaration renderer), `record` (generation records), `lang` (keyword tables and escaping), `manifest` (JSON and XML escaping for package manifests), `cargo` (resolving a producer crate with `cargo metadata` and building its library), `build` (cross-compiling a producer per platform and prebuilding the Node.js and JNI glue), `platform` (the platform matrix and the glibc reader for manylinux tags), `library` (reading a built library's metadata), `utils` (generated-file banners), the target modules `targets::{c, cpp, swift, kotlin, node, wasm, python, dotnet, dart, go, ruby}` (plus `targets::js`, the JavaScript layer `node` and `wasm` share), and the hidden `commands` (one module per subcommand). The `weaveffi` binary (`src/main.rs`): argument parsing, dispatch, and error rendering. |
-| `weaveffi-macros` | `#[weaveffi::module]`, the marker attributes, and `export_runtime!`. `src/extract.rs` lowers a module tree to the IR; emission is split by concern under `src/codegen/` (`sync`, `async_fns`, `iterators`, `records`, `enums`, `errors`, `custom`, `interfaces`, `callbacks`, `contract`, `meta`, `foreign`, `diagnostics`, `helpers`, `lift`). |
-| `weaveffi` | The producer facade: re-exports the macros and the few runtime types a producer names. Its `abi` module is the runtime: the error struct and codes, run allocation (8-aligned) and `(ptr, len)` conversions, the `Scalar`, `Text`, and `Custom` lift and lower traits, the OptDirect and Slice helpers, reference-counted objects, cancel tokens, callback vtables (with the thread-affinity check) and foreign errors, iterators, the value-buffer codec, the async spawner (Tokio with the default `tokio` feature, else a thread per call) and `run_async`, contract tables, and leak counters (the `leak-check` feature). |
-| `weaveffi-fuzz` | `cargo-fuzz` targets for the YAML and JSON parsers, `parse_type_ref`, the validator, and the value-buffer decoder. |
+| `weaveffi-model` | Everything between a definition and code generation: the IR (`ir`), IDL parsing for YAML and JSON with `imports:` resolution (`parse`, behind the default `idl` feature), library metadata frames (`meta`), validation and diagnostics (`validate`), resolved types and their families (`ty`: `Ty`, `ParamTy`, `RetTy`, `Family`, `RunKind`), package identity (`pkg`), the model with its symbol table (`model`), the C type algebra and lowered signatures (`abi`: `CType`, `AbiFn`, `AbiParam`), error-type naming (`errors`), and the contract (`contract`). It doesn't depend on `syn`; the macros use it without the `idl` feature. |
+| `weaveffi-cli` | The library (`src/lib.rs`): the target framework and the generators. Public: `targets` (the `Target` trait, its hook types, and the `REGISTRY`), `codegen` (the `Orchestrator`, its `Changeset`, `OutputFile`, and the `CodeWriter`), `config` (`weaveffi.toml`), `project` (locating a project, identity resolution, and loading its API), and `package` (the artifact types). Internal: the shared emitters (`codegen::{values, codecs, contract, errors, docs, common}`), `cabi` (the shared C declaration renderer), `record` (generation records), `lang` (keyword tables and escaping), `manifest` (JSON and XML escaping for package manifests), `cargo` (resolving a producer crate with `cargo metadata`, its Cargo features, and building its library), `build` (cross-compiling a producer per platform), `platform` (the platform matrix and the glibc reader for manylinux tags), `library` (reading a built library's metadata), `utils` (generated-file banners), the target modules under `targets::`, and the hidden `commands` (one module per subcommand). The `weaveffi` binary (`src/main.rs`): argument parsing, dispatch, and error rendering. |
+| `weaveffi-macros` | The attributes and `export_runtime!`: `function` (`#[weaveffi::export]` on a function or an `impl` block), `types` (`record`, `enumeration`, `error`, `interface`, `custom`), `callback` (`callback_interface`), `runtime` (`export_runtime!`), `shape` (the little syntax still read from a signature: borrows, callback parameters, the cancel token, iterator returns), and `common` (the prefix, docs, `#[cfg]`, frames, and contract functions every expansion shares). |
+| `weaveffi` | The producer facade: re-exports the attributes and the few runtime types a producer names (`Iter`, `CancelToken`, `ForeignError`, `Error`, `set_spawner`). Its hidden `__rt` module is the runtime: the error struct and codes, runs and `Opt` (8-aligned allocation), the value traits (`FfiType`, `FfiRef`, `FfiReturn`, `ErrorType`, `CEnum`, `Codec`) and the value-buffer codec, reference-counted objects, callback vtables (open, with the thread-affinity check) and foreign errors, iterators, cancel tokens, the async spawner (Tokio with the default `tokio` feature, else a thread per call), metadata and contract hashing, and leak counters (the `leak-check` feature). |
+| `weaveffi-fuzz` | `cargo-fuzz` targets for the YAML and JSON parsers, `parse_type_ref`, the validator, metadata frames, and the value-buffer decoder. |
 
-The workspace denies `unsafe_code`; `weaveffi::abi` opts in, and the thunks
-the macro emits carry a scoped allowance, so a macro-based producer needs no
-`unsafe` of its own.
+The workspace denies `unsafe_code`; the runtime opts in, and the functions
+the attributes emit carry a scoped allowance, so a macro-based producer
+needs no `unsafe` of its own.
 
 ## Key invariants
 
 - **Generators consume the model only, and never re-derive it.** Symbol
-  names, slot lists, and passing contracts come from the bindings on the
-  `Model`; a target never matches on `Family`, never computes a slot name,
-  and never looks up a callable's error domain to decide how it fails
-  (`grep -rn "Family::" crates/weaveffi-cli/src/targets` is empty). Names
-  come from the `Identity` on the `Model`.
-- **Global names.** Type names (records, enums, interfaces, callback
-  interfaces, and error domains), free-function names, and error-code names
-  are unique across the API, so a `Ty` carries the bare name (`Store`) and
-  equality works across modules. Where a generator needs the declaring
-  module (for a C type name or a namespace path), it asks the model
-  (`Model::owner`, `Model::interface`, `Model::record`,
-  `Model::error_domain`, and so on); nothing splits a dotted string, and
-  every name a validated model's bindings mention resolves.
+  names and signatures come from the bindings on the `Model` (`abi.symbol`,
+  `c_tag`, `shape`); names come from its `Identity`.
+- **One crossing per value.** In ABI revision 6 a value's C type is a pure
+  function of its type (`CType::of`), so a target's call layer matches on
+  `codegen::values::Crossing` (scalar, enum, optional scalar, UTF-8, bytes,
+  typed array, buffer, object) and marshals a parameter, a return, an async
+  result, an iterator item, and a callback argument or return with the same
+  per-crossing code, varying only in who owns what.
+- **One namespace.** Declaration names are unique across the library, so a
+  `Ty` carries the bare name (`Store`) and every name a validated model
+  mentions resolves through the `TypeIndex` (`Model::interface`,
+  `Model::record`, `Model::error_domain`, and so on).
 - **One symbol table.** `Model::c_symbols` lists every C identifier with
-  its `SymbolOwner`, and validation rejects duplicates (`SymbolCollision`)
-  and two slots of one function with the same name (`SlotCollision`).
+  its `SymbolOwner`, and validation rejects duplicates and reserved families
+  (`SymbolCollision`).
 - **One naming rule for error types.** `weaveffi_model::errors::type_name`
   turns a domain or code name into a target's type name (`KitchenErrors`
   plus `Error` is `KitchenError`), and every target uses it.
@@ -124,73 +118,46 @@ the macro emits carry a scoped allowance, so a macro-based producer needs no
   types, and loader live as source files under `targets/<t>/runtime/`,
   included with `include_str!` and filled in with `{{PLACEHOLDER}}`
   substitution, so they read and lint as normal code.
+- **No generated glue.** Every target binds the C ABI with its language's
+  own foreign-function interface (Node.js through koffi, Kotlin through JNA,
+  and so on), so no target emits C code of its own to compile.
 - **Determinism.** No hash-map iteration reaches output; output is
   byte-identical across runs and platforms.
 - **No branding.** Nothing generated is named after WeaveFFI except the
-  generated-file header and runtime-version comments.
+  generated-file header and runtime-version comments, and the Swift
+  runtime's file name (`WeaveFFIRuntime.swift`).
 
-## The model and the plan
+## The model
 
-`validate` indexes every type declaration, checks every rule, and then walks
-the document once to produce the `Model`: the identity, the schema version,
-the type index (each name's kind and declaring module, plus the foreign
-names a scoped validation accepted), and one `ModuleBinding` per module.
-Modules are flattened into `Model::modules`, each with its segments, its
-underscore `path`, its dotted path, and `parent` and `children` indices
-(`Model::roots` and `Model::children` walk them), and each carries its own
-error domains (`errors: Vec<ErrorBinding>`). A top-level module's contract
-table is computed from the model on demand by
-`weaveffi_model::contract::entries`.
+`validate` indexes every declaration, checks every rule, and then lowers the
+document once into the `Model`: the identity, the schema version, the
+library's doc, the `TypeIndex`, and flat lists of `functions`, `records`,
+`enums`, `errors`, `interfaces`, and `callbacks`.
 
 Types are split by position, so nothing downstream handles a type where it
 can't occur:
 
 - `Ty` is a value type, legal everywhere including inside buffers: a
   primitive, a record, a C-style or rich enum, an interface, or an optional,
-  list, or map of value types. `Ty::family()` is its slot family
-  (`Direct`, `OptDirect`, `Slice(Prim)`, `String`, `Bytes`, `Buffer`, or
-  `Object` with nullability), and `Ty::wire()` its shape inside a value
-  buffer; both are total.
-- `ParamTy` is a value or a callback interface (`ParamTy::Callback { name,
-  nullable }`), legal only as a parameter of a function or interface member.
-- `RetTy` is a value or an iterator (`RetTy::Iterator(Ty)`), legal only as
-  the outermost return of a synchronous callable.
+  list, or map of value types. `Ty::family()` is its `Family` (`Direct`,
+  `OptDirect`, `Run(RunKind)`, or `Object { nullable }`, where `RunKind` is
+  `Utf8`, `Bytes`, `Slice(prim)`, or `Buffer`), and its wire shape inside a
+  value buffer is total too.
+- `ParamTy` is a value or a callback interface, legal only as a parameter of
+  a function or interface member.
+- `RetTy` is a value or an iterator, legal only as the outermost return of a
+  synchronous callable.
 
-Every callable binding stores its lowering, resolved once by the model
-(`weaveffi_model::plan`):
-
-- **`FnBinding`** (a function or interface member) carries its parameters
-  (`ParamBinding { name, ty: ParamTy, doc, pass: ArgPass }`), its `ret:
-  Option<RetTy>` and `ret_pass: RetPass`, its `error: ErrorStrategy`, its
-  `abi: AbiFn` (the C symbol to call, with its ordered slots: the sync
-  entry, the async launcher, or the iterator launcher), and its `shape:
-  CallShape` (`Sync` or `Async(AsyncBinding)`). An iterator function is a
-  `Sync` call whose `ret_pass` is `RetPass::Iterator(IteratorBinding)`.
-- **`ArgPass`** says how an argument crosses and names its slots: `Direct`,
-  `OptDirect { has, value, inner }`, `Slice { ptr, len, elem }`, `String`,
-  `Bytes`, `Buffer` (each `{ ptr, len }`), `Object { slot, nullable,
-  interface }`, or `Callback { ctx, vtable, nullable, interface }`.
-- **`RetPass`** says what the C return and its out slots mean: `Void`,
-  `Direct`, `OptDirect { out_value }`, `Slice { out_len, elem }`, `String`,
-  `Bytes`, `Buffer` (each `{ out_len }`), `Object { nullable, interface,
-  destroy_symbol }`, or `Iterator`.
-- **`ResultPass`** (on `AsyncBinding`, with the completion's
-  `callback_type`, its full `callback_params`, and the optional
-  `cancel_token` slot), **`ItemPass`** (on `IteratorBinding`, with its
-  `next` and `destroy_symbol`), and **`CallbackRetPass`** (on
-  `CallbackMethodBinding`) do the same for async results, iterator items,
-  and callback-method returns, each variant naming its own slots, so no
-  generator looks a slot up by position.
-- **`ErrorStrategy`** is `Trap` (no `throws`: a non-zero code is a bug),
-  `Domain(name)` (positive codes of that domain, open to codes added later;
-  `Model::error_domain(name)` gives its `ErrorBinding`), or `Untyped`
-  (`throws: any`: `-1` and a message).
-
-Callback methods are callables too: `CallbackMethodBinding` has value-typed
-parameters with their `ArgPass`, a `ret: Option<Ty>` with its
-`CallbackRetPass`, an `ErrorStrategy`, and an `AbiFn` whose symbol is the
-vtable field name (`ctx` first, `out_err` last). A generator renders these
-in its own syntax; it doesn't decide them.
+Every callable is an `FnBinding`: its parameters (`ParamBinding`), its
+return, its `ErrorStrategy` (`Trap`, `Domain(name)`, or `Untyped`), its
+`abi: AbiFn` (the C symbol with its ordered `AbiParam`s and return
+`CType`), and its `shape: Shape`: synchronous, async (an `AsyncBinding`
+with the completion's type and the optional cancel-token slot), or an
+iterator (an `IteratorBinding` with its type, `_next`, and `_destroy`).
+Callback methods are `CallbackMethodBinding`s with their vtable slot, and
+error codes carry their payload's C tag. The contract rows a binding embeds
+come from `codegen::contract::rows(model)`, computed with the same
+`weaveffi_model::contract` signatures the macros hash.
 
 ## Targets and the orchestrator
 
@@ -205,7 +172,6 @@ pub trait Target: Send + Sync {
     fn package(&self, model: &Model, ctx: &PackageContext<'_>) -> Result<Vec<Artifact>> { .. }
     fn finish_package(&self, dist: &Utf8Path, artifacts: &[Artifact], ctx: &PackageContext<'_>)
         -> Result<Vec<Utf8PathBuf>> { .. }
-    fn glue(&self, model: &Model) -> Option<Glue> { None }
     fn dev_bundle_dir(&self, model: &Model) -> Option<Utf8PathBuf> { None }
     fn linkage(&self) -> Linkage { Linkage::Runtime }
     fn fixed_files(&self) -> &'static [&'static str] { &[] }
@@ -218,26 +184,24 @@ drives `weaveffi.toml` parsing, `--target` validation, help, and
 completions, the snapshot and determinism tests, the benchmarks, and a test
 that the CI matrices, `scripts/check-fixtures.sh`, and `conformance/run.sh`
 list exactly the registry's targets. The hooks carry everything a command
-needs to know about a target (what `package` builds, which C glue `build`
-prebuilds, where `dev` copies the library, how `dev` tells the user to link
-it), so no command matches on a target's name.
+needs to know about a target (what `package` builds, where `generate --dev`
+copies the library, and whether the bindings load it at run time, link it,
+or need a `wasm32` build), so no command matches on a target's name.
 
 Targets render through the **shared emitters** in `codegen/` instead of
 keeping their own copies:
 
-- `codecs::composites(model)` lists every optional, list, and map that
-  crosses inside a value buffer, deduplicated and in dependency order, and
-  `codecs::stem(&ty)` is its one canonical mangled name (`list_i32`,
-  `opt_Item`, `map_string_list_i64`). OptDirect and Slice values at a call
-  boundary aren't composites; the same types nested in a record are.
-- `contract::tables(model)` and `contract::rows(model, root)` give each
-  top-level module's contract rows (id, hash, path, and canonical
-  signature), including one per error code and per callback method.
-- `errors::tables(model, suffix)` gives every domain with its codes and
-  their type names under the shared naming rule.
-- `docs::Doc` and `docs::ApiNames` render doc and deprecation text with
-  backticked API identifiers (`` `new_op` ``) rewritten to the target's
-  spelling.
+- `values::crossing(ty)` gives the `Crossing` every call layer matches on;
+  its module docs have the ownership table for each direction.
+- `codecs` lists every optional, list, and map that crosses inside a value
+  buffer, deduplicated and in dependency order, with its one canonical stem
+  (`list_i32`, `opt_Item`, `map_string_list_i64`).
+- `contract::rows(model)` gives the contract rows (id, hash, path, and
+  canonical signature) every binding embeds and checks at load.
+- `errors` gives every domain with its codes and their type names under the
+  shared naming rule.
+- `docs` renders doc and deprecation text with backticked API identifiers
+  rewritten to the target's spelling.
 - `common` holds doc-comment emission, prose wrapping, and `PascalCase`;
   `CodeWriter` is the indentation-aware writer.
 
@@ -246,15 +210,11 @@ The `Orchestrator` runs the selected targets:
 1. **Render.** Every target renders in parallel (rayon), in memory.
 2. **Plan.** Each file is compared with the output directory, and each
    target's file list with its record from the previous run,
-   `{out}/.weaveffi-cache/{target}.json`, giving a `Changeset`: the files
-   that would be added, modified, or removed.
+   `{out}/.weaveffi/{target}.json`, giving a `Changeset`: the files that
+   would be added, modified, or removed.
 3. **Apply.** Each file is written only if its contents differ, files
    recorded by the previous run but no longer produced are deleted, and the
    record is updated.
-
-`weaveffi generate --check` reports the plan and exits `1` if it isn't
-empty, `--diff` prints it as a unified diff, and `--dry-run` lists every
-rendered file; none of them applies it.
 
 ## The CLI
 
@@ -263,36 +223,35 @@ The library's `config` module holds `ProjectConfig` (the `[project]`,
 resolution). Its `project` module is the front half every command runs:
 `Project` locates the project and its input (an IDL, a crate, or a library
 alone), builds a crate's library with `cargo rustc --lib --crate-type
-cdylib --profile <p>` and reads its frames, resolves the identity, and
-validates the API into the `Model` once. A `build.rs` can use `Project` and
-the `Orchestrator` too. The commands live in the library's hidden
-`commands` module, one per subcommand: `init`, `generate`, `dev`,
-`validate`, `extract`, `build`, `package` (`schema` and `completions` are
-handled in the binary); every command that takes an input shares one
-argument group (the input, `--config`, and, where it reads a library,
-`--library` and `--profile`). Commands return an exit code; the library
-reports errors with `miette`, and the binary renders them.
+cdylib --profile <p>` and the project's Cargo features and reads its
+frames, resolves the identity, and validates the API into the `Model` once.
+A `build.rs` can use `Project` and the `Orchestrator` too. The commands live
+in the library's hidden `commands` module, one per subcommand: `init`,
+`generate`, `validate`, `extract`, `build`, and `package` (`schema` and
+`completions` are handled in the binary). Every command that takes an input
+shares one argument group (the input and `--config`), and every command
+that builds the producer takes `--profile` and the feature flags. Commands
+return an exit code; the library reports errors with `miette`, and the
+binary renders them.
 
 ## Adding a generator
 
 1. Add `crates/weaveffi-cli/src/targets/<lang>/` following an existing
    target's layout: `mod.rs` (the config struct, the generator struct that
-   owns it, `From<Config>`, and the `Target` impl), `types.rs`, `codec.rs`,
-   `calls.rs`, `entities.rs`, `package.rs`, a `runtime/` directory of fixed
-   source, and `tests.rs`.
-2. Implement `Target`. Take every name from the model and the identity, and
-   every transport decision from the stored contracts (`ArgPass`,
-   `RetPass`, `ResultPass`, `ItemPass`, `CallbackRetPass`,
-   `ErrorStrategy`); render composites, contract rows, error tables, and
-   doc text through the shared emitters. Bind to `{library}` (and, if the
-   language loads it at run time, accept a full path in
-   `{PREFIX}_LIBRARY`); check the ABI revision and every top-level module's
-   contract table at load, reporting a failure as a catchable error; read
-   the error message as `(ptr, len)`; map an unknown positive code of a
-   domain to the domain's base error; follow the
+   owns it, and the `Target` impl), the files that render types, calls,
+   codecs, and packaging, a `runtime/` directory of fixed source, and
+   `tests.rs`.
+2. Implement `Target`. Take every name from the model and the identity;
+   marshal every value by its `Crossing`; render composites, contract rows,
+   error tables, and doc text through the shared emitters. Bind to
+   `{library}` (and, if the language loads it at run time, accept a full
+   path in `{P}_LIBRARY`); check `{p}_abi_version()` and every contract row
+   once at load, reporting a failure as a catchable error that names the
+   row's path; read the error message as `(ptr, len)`; map an unknown
+   positive code of a domain to the domain's base error; follow the
    [trap policy](guides/errors-and-memory.md#the-trap-policy); surface
    cancellation idiomatically; keep objects alive across calls; allocate
-   callback returns with `{prefix}_alloc`; and set the vtable's
+   callback returns with `{p}_alloc`; set the vtable's `size`, and its
    thread-affine flag only if the language needs it. Implement `package` if
    the ecosystem has an installable artifact, and the other hooks the
    target needs.
@@ -318,22 +277,22 @@ usually has to pass all of them.
 
 | Layer | Where | What it pins |
 |-------|-------|--------------|
-| Unit tests | `#[cfg(test)]` modules; `tests.rs` in each target | Parsing, validation rules, `Ty` classification, lowering and the stored contracts, contract strings, naming helpers, metadata frames (`meta`); per target, only target-specific naming, escaping, and configuration |
+| Unit tests | `#[cfg(test)]` modules; `tests.rs` in each target | Parsing and imports, validation rules, `Ty` classification and lowering, contract signatures, naming helpers, metadata frames; per target, its naming, escaping, and configuration |
 | Validation tests | `crates/weaveffi-model/src/validate/tests.rs` | Every `ValidationError` with its source span |
-| Property tests | `crates/weaveffi/tests/buffer_proptest.rs` | Codec laws: round trips, self-delimiting encodings, rejected trailing bytes |
-| Runtime tests | `crates/weaveffi/tests/` | Exported runtime symbols, run alignment, OptDirect and Slice lifting, thread-affine vtables, cancellation and dropped futures, foreign-error routing, leak counters |
-| Macro tests | `crates/weaveffi-macros/tests/ui/` (`trybuild`) | `pass_*.rs` compile; `fail_*.rs` fail with the pinned `.stderr` |
+| Runtime tests | `crates/weaveffi/tests/` | Exported runtime symbols, run alignment, value traits, thread-affine vtables, cancellation and dropped futures, foreign-error routing, leak counters, and codec laws (property tests) |
 | Snapshots | `crates/weaveffi-cli/tests/snapshots.rs` (`insta`) | Every registered target renders all five fixtures; the `kitchen_sink` output is snapshotted file by file (except each target's `fixed_files`), and any copy of the C header must equal the C target's own |
-| CLI tests | `crates/weaveffi-cli/tests/cli/`, `crates/weaveffi-cli/tests/abi_version.rs`, `crates/weaveffi-cli/tests/c_buffer.rs` | Every subcommand's behavior and exit codes, library mode (the `tests/fixtures/producer` crate extracts to its `expected.yml`, and generating from its library equals generating from that IDL), determinism, the registry against CI and scripts, no stub markers in output, the ABI revision lockstep, every fixture's C headers compiling as C11 and C++17 |
+| CLI tests | `crates/weaveffi-cli/tests/cli/`, `abi_version.rs`, `c_buffer.rs` | Every subcommand's behavior and exit codes, library mode (the `tests/fixtures/producer` crate extracts to its `expected.yml`, generating from its library equals generating from that IDL, and feature flags reach the build), determinism, the registry against CI and scripts, the ABI revision lockstep, the C buffer helpers |
+| Examples | `examples/` | The book's examples: each producer crate's tests call its C functions, and `examples/idl`'s tests validate every IDL the book includes |
 | Fixture compile checks | `scripts/check-fixtures.sh <target>` | Every fixture's generated tree compiles or type-checks with the target's toolchain |
 | Conformance | `conformance/run.sh` | Real consumers in every language against every sample, with leak counters at zero |
-| Fuzzing | `crates/weaveffi-fuzz` | Parsers and the validator never panic; value-buffer decoders reject malformed bytes cleanly |
+| Fuzzing | `crates/weaveffi-fuzz` | Parsers, the validator, and frame decoding never panic; value-buffer decoders reject malformed bytes cleanly |
 
-The fixtures are `kitchen_sink` (every feature, including OptDirect and
-Slice values in every position, several error domains, and `throws: any`),
-`edge_cases` (reserved words, deep nesting, objects in every legal
-position), `nested_modules` (cross-module references and name clashes),
-`docs_everywhere` (doc-comment emission), and `shapes` (rich enums). Only
+The fixtures are `kitchen_sink` (every feature, including optional scalars
+and typed arrays in every position, several error domains, and `throws:
+any`), `edge_cases` (reserved words, deep nesting, objects and callbacks in
+every legal position), `imports` (an API split across three files, with
+references in every direction), `docs_everywhere` (doc-comment emission),
+and `shapes` (rich enums and the full numeric primitive set). Only
 `kitchen_sink` is snapshotted; the other four are covered by the fixture
 compile checks, the determinism test, and targeted assertions. Snapshots
 redact the CLI version, so a version bump doesn't touch them.
@@ -346,6 +305,7 @@ just test                        # every test; fails on snapshot drift
 just snapshots                   # accept reviewed snapshot changes
 just fixtures swift              # fixture compile check for one target
 ONLY=python just conformance     # conformance lanes for one language
+just docs                        # build this book
 ```
 
 See [CONTRIBUTING.md](https://github.com/weavefoundry/weaveffi/blob/main/CONTRIBUTING.md)

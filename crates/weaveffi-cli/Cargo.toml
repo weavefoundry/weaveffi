@@ -44,12 +44,13 @@ weaveffi-model = { workspace = true, features = ["idl"] }
 rayon = { workspace = true }
 heck = { workspace = true }
 serde-saphyr = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
 similar = { workspace = true }
 tempfile = { workspace = true }
 schemars = { workspace = true }
 flate2 = "1"
-crc32fast = "1"
+base64 = "0.22"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 tar = { version = "0.4", default-features = false }
 object = { version = "0.37", default-features = false, features = ["read", "wasm", "std"] }
@@ -62,6 +63,7 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 insta = { workspace = true }
 criterion = { workspace = true }
+proptest = "1.11.0"
 # Only for the ABI-revision lockstep test. Path-only, so `cargo publish`
 # strips it and this crate never has to wait for `weaveffi` on crates.io.
 weaveffi = { path = "../weaveffi" }

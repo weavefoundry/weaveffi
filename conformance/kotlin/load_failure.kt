@@ -1,7 +1,9 @@
 // Conformance check: a failed load is a catchable `LinkageError`, Kotlin
-// (JVM via JNI) target, calculator sample.
+// (JVM over JNA) target, calculator sample.
 //
-// Run with `CALCULATOR_LIBRARY` naming a library that doesn't exist.
+// Run with `CALCULATOR_LIBRARY` naming a library that doesn't exist (mode
+// `missing`) or one that isn't a calculator library (mode `incompatible`,
+// the codec sample, which lacks `calculator_abi_version`).
 // `NativeLibrary.load()` throws `UnsatisfiedLinkError` with the reason, and
 // the same again on every later call; the first binding call throws that
 // error too, and every later one `NoClassDefFoundError`. Both are
@@ -11,10 +13,19 @@
 import calculator.Calculator
 import calculator.NativeLibrary
 
-fun main() {
+fun main(args: Array<String>) {
+    val mode = args.firstOrNull() ?: "missing"
+    val expected = when (mode) {
+        "missing" -> "does-not-exist"
+        "incompatible" -> "isn't a calculator library"
+        else -> error("unknown mode $mode")
+    }
     val first = thrownBy { NativeLibrary.load() }
     expect(first is UnsatisfiedLinkError, "load() raises UnsatisfiedLinkError (got $first)")
-    expect(first?.message?.contains("does-not-exist") == true, "the message names the library (got ${first?.message})")
+    expect(
+        first?.message?.contains(expected) == true,
+        "the message says what's wrong: $expected (got ${first?.message})",
+    )
     val second = thrownBy { NativeLibrary.load() }
     expect(
         second is UnsatisfiedLinkError && second.message == first?.message,
@@ -24,5 +35,5 @@ fun main() {
     expect(call is UnsatisfiedLinkError, "the first call raises UnsatisfiedLinkError (got $call)")
     val again = thrownBy { Calculator.add(1, 2) }
     expect(again is LinkageError, "a later call raises a LinkageError (got $again)")
-    println("kotlin/calculator load failure: OK")
+    println("kotlin/calculator load failure ($mode): OK")
 }

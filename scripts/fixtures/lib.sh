@@ -3,7 +3,7 @@
 #
 # `require <tool>...` stops the check when a tool isn't on PATH, and
 # `missing <what>` does the same for anything else a check needs (JDK
-# headers, a node-gyp header cache). Under CI (CI=true), where the
+# headers). Under CI (CI=true), where the
 # toolchains action installs everything, that's a failure. Elsewhere the
 # check prints a skip note and exits with SKIPPED, which check-fixtures.sh
 # reports as a skip rather than a pass.

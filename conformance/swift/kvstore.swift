@@ -1,10 +1,10 @@
-// Conformance consumer: kvstore sample, Swift target (ABI revision 5).
+// Conformance consumer: kvstore sample, Swift target (ABI revision 6).
 //
 // Drives the feature-complete producer through the generated `Kvstore`
 // module:
 //
-//   * the load check (ABI revision, the `kv` and `report` contract tables),
-//     through `KvstoreLibrary.check()`;
+//   * the load check (the ABI revision and every declaration's contract
+//     function), through `KvstoreLibrary.check()`;
 //   * the `Store` class: a throwing static factory and an `init`, methods,
 //     statics, the deprecated `size()`, records (`Entry`, `StoreInfo`), the
 //     C-style `EntryKind`, maps and optionals, and the logical clock;
@@ -28,13 +28,16 @@
 //   * async calls: an async free function returning an object, a cancellable
 //     method cancelled mid-pause by cancelling its task (throwing
 //     `CancellationError` while its background work stops, shown by
-//     `activeJobs()`), an async list, an async function in the nested
-//     `kv.stats` module, and concurrent calls;
-//   * the nested `kv.stats` module and the sibling `report` root;
-//   * the ABI 5 shapes: an optional scalar return (`expiresAt`), iterator
-//     item (`expirations`), and async result (`versionOf`); typed arrays as
-//     a return (`valueSizes`) and an async result (`versions`); a `usize`
-//     return and `throws: any` (`importLines`);
+//     `activeJobs()`), an async list, an async free function taking a list
+//     of objects, and concurrent calls;
+//   * free functions in the module's one namespace (`summarize`,
+//     `renderReport`), called qualified by the module name, and a second
+//     error domain (`ReportError`);
+//   * optional scalars and typed arrays in every position: an optional
+//     scalar return (`expiresAt`), iterator item (`expirations`), and async
+//     result (`versionOf`); typed arrays as a return (`valueSizes`), an async
+//     result (`versions`), and a callback argument and return (`rank`); a
+//     `usize` return and `throws: any` (`importLines`);
 //   * object identity: wrappers of one native object are `==` and hash
 //     alike, so records carrying objects are `Hashable` too.
 //
@@ -350,13 +353,13 @@ func constructors() async {
     expect(s.capacity() == Store.defaultCapacity() && Store.defaultCapacity() == 1_000_000, "capacity")
 
     do {
-        let opened = try await Kv.openStore(path: "/async")
+        let opened = try await Kvstore.openStore(path: "/async")
         expect(opened.path() == "/async", "openStore path")
     } catch {
         fail("openStore threw \(error)")
     }
     do {
-        _ = try await Kv.openStore(path: "")
+        _ = try await Kvstore.openStore(path: "")
         fail("openStore(\"\") returned")
     } catch let error as KvError {
         guard case let .invalidPath(message) = error else { fail("openStore(\"\") threw \(error)") }
@@ -639,10 +642,10 @@ func asyncCalls() async {
         expect(r.count == 3 && r[0]?.key == "keep" && r[1] == nil && r[2]?.key == "keep", "getMany result \(r)")
     }
 
-    // The nested module's async function: objects in a list in, a record out.
+    // An async free function: objects in a list in, a record out.
     let other = open("/other")
     put(other, "a", "123")
-    let stats = await Kv.Stats.summarizeAll(stores: [s, other])
+    let stats = await Kvstore.summarizeAll(stores: [s, other])
     expect(stats == Stats(entries: 2, bytes: 4, byKind: [.persistent: 2]), "summarizeAll \(stats)")
 }
 
@@ -710,25 +713,25 @@ func statsAndReport() {
     put(s, "a", "123")
     put(s, "c", "x", .encrypted)
 
-    // kv.stats.summarize: the parent's Store as a parameter, the parent's
-    // error domain for a prefix that matches nothing.
+    // summarize: a Store as a parameter, `KvError` for a prefix that matches
+    // nothing.
     do {
-        let stats = try Kv.Stats.summarize(store: s, prefix: nil)
+        let stats = try Kvstore.summarize(store: s, prefix: nil)
         expect(stats == Stats(entries: 3, bytes: 6, byKind: [.persistent: 2, .encrypted: 1]), "summarize \(stats)")
     } catch {
         fail("summarize threw \(error)")
     }
-    expectKvError("summarize(q)", { try Kv.Stats.summarize(store: s, prefix: "q") }, isKeyNotFound("q"))
+    expectKvError("summarize(q)", { try Kvstore.summarize(store: s, prefix: "q") }, isKeyNotFound("q"))
 
-    // report.render_report: the sibling root shares the Entry record.
+    // renderReport: a list of records in, a second error domain out.
     do {
-        let lines = try Report.renderReport(entries: Array(s.entries(prefix: nil)))
+        let lines = try Kvstore.renderReport(entries: Array(s.entries(prefix: nil)))
         expect(lines == ["a: 3 bytes, Persistent, v2", "b: 2 bytes, Persistent", "c: 1 bytes, Encrypted"], "renderReport \(lines)")
     } catch {
         fail("renderReport threw \(error)")
     }
     do {
-        _ = try Report.renderReport(entries: [])
+        _ = try Kvstore.renderReport(entries: [])
         fail("renderReport([]) returned")
     } catch let error as ReportError {
         guard case let .nothingToReport(message) = error else { fail("renderReport([]) threw \(error)") }
@@ -739,8 +742,8 @@ func statsAndReport() {
 }
 
 @MainActor
-func abi5Shapes() async {
-    let s = open("/abi5")
+func scalarsAndArrays() async {
+    let s = open("/shapes")
     put(s, "b", "12")
     _ = try! s.put(key: "a", value: Data([1, 2, 3]), kind: .volatile, ttlSeconds: 7)
     expect(s.count() == 2, "count")
@@ -807,9 +810,9 @@ loaders()
 await asyncCalls()
 objectGraph()
 statsAndReport()
-await abi5Shapes()
+await scalarsAndArrays()
 
-expect(kvstore_abi_version() == 5, "ABI revision 5")
+expect(kvstore_abi_version() == 6, "ABI revision 6")
 expect(kvstore_debug_live(-1) == 1, "the sample counts live resources")
 assertNoLeaks()
 expect(Released.tally["listener"] == 5, "every listener released (got \(Released.tally["listener"]))")

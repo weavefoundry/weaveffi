@@ -31,7 +31,7 @@
 //! * [`Ty::wire`]: how the type is encoded **inside a value buffer**. Every
 //!   backend's codec emitter dispatches on it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// A built-in primitive type: the fixed vocabulary the IDL's
@@ -96,7 +96,7 @@ impl Prim {
     ];
 
     /// The element types a list may have to cross a call boundary as a
-    /// typed array ([`Family::Slice`]): every integer and float but `u8`
+    /// typed array ([`RunKind::Slice`]): every integer and float but `u8`
     /// (`[u8]` is `bytes`).
     pub const SLICE_ELEMS: [Prim; 9] = [
         Prim::I8,
@@ -181,7 +181,7 @@ impl Prim {
     }
 
     /// `true` when `[self]` crosses a call boundary as a typed array
-    /// ([`Family::Slice`]); see [`SLICE_ELEMS`](Self::SLICE_ELEMS).
+    /// ([`RunKind::Slice`]); see [`SLICE_ELEMS`](Self::SLICE_ELEMS).
     #[must_use]
     pub fn is_slice_elem(self) -> bool {
         Prim::SLICE_ELEMS.contains(&self)
@@ -270,32 +270,41 @@ pub enum RetTy {
     Iterator(Ty),
 }
 
-/// How a value of some [`Ty`] crosses a **call boundary**: the one
-/// classification the ABI lowering and every stored passing contract agree
-/// on.
+/// How a value of some [`Ty`] crosses a **call boundary** (ABI revision 6):
+/// always as exactly one C value, in every position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Family {
-    /// One C slot passed by value: scalars, bools, and C-style enums.
+    /// The value itself: an integer, float, `bool`, or C-style enum
+    /// (`int32_t`). [`Ty::scalar`] names its primitive.
     Direct,
     /// An optional [`Direct`](Self::Direct) value (`i32?`, `bool?`,
-    /// `Color?`): a `bool` presence flag plus the value, with no buffer.
+    /// `Color?`): a `{prefix}_opt_{prim}` struct of a `bool` presence flag
+    /// and the value.
     OptDirect,
-    /// A list of a numeric primitive (`[i32]`, `[f64]`; see
-    /// [`Prim::SLICE_ELEMS`]): a typed array, a pointer to packed native
-    /// elements plus an element count.
-    Slice(Prim),
-    /// A `(ptr, len)` pair of UTF-8 bytes, never NUL-terminated.
-    String,
-    /// A `(ptr, len)` raw byte pair.
-    Bytes,
-    /// A `(ptr, len)` serialized value buffer: a record, a rich enum, or an
-    /// optional, list, or map that isn't one of the families above.
-    Buffer,
+    /// A `{prefix}_run` (`ptr`, byte `len`) holding the value's bytes as
+    /// [`RunKind`] says.
+    Run(RunKind),
     /// An object pointer to an interface.
     Object {
         /// `true` for `Interface?`: null is a legal "none" value.
         nullable: bool,
     },
+}
+
+/// What the bytes of a [`Family::Run`] hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunKind {
+    /// UTF-8 text, never NUL-terminated (`string`).
+    Utf8,
+    /// Raw bytes (`bytes`).
+    Bytes,
+    /// A typed array of a numeric primitive (`[i32]`, `[f64]`; see
+    /// [`Prim::SLICE_ELEMS`]): packed native elements, aligned for the
+    /// element, `len` a multiple of its size.
+    Slice(Prim),
+    /// A value buffer: a record, a rich enum, or an optional, list, or map
+    /// of any other family.
+    Buffer,
 }
 
 /// The closed set of shapes a value inside a value buffer can take.
@@ -335,8 +344,8 @@ impl Ty {
     #[must_use]
     pub fn family(&self) -> Family {
         match self {
-            Ty::Prim(Prim::String) => Family::String,
-            Ty::Prim(Prim::Bytes) => Family::Bytes,
+            Ty::Prim(Prim::String) => Family::Run(RunKind::Utf8),
+            Ty::Prim(Prim::Bytes) => Family::Run(RunKind::Bytes),
             Ty::Prim(_) | Ty::Enum(_) => Family::Direct,
             Ty::Interface(_) => Family::Object { nullable: false },
             Ty::Optional(inner) => match inner.family() {
@@ -344,21 +353,33 @@ impl Ty {
                 // `Interface?` stays a nullable pointer so the common
                 // "maybe an object" shape needs no encoding step.
                 Family::Object { nullable: false } => Family::Object { nullable: true },
-                _ => Family::Buffer,
+                _ => Family::Run(RunKind::Buffer),
             },
             Ty::List(inner) => match inner.as_ref() {
-                Ty::Prim(p) if p.is_slice_elem() => Family::Slice(*p),
-                _ => Family::Buffer,
+                Ty::Prim(p) if p.is_slice_elem() => Family::Run(RunKind::Slice(*p)),
+                _ => Family::Run(RunKind::Buffer),
             },
-            Ty::Record(_) | Ty::RichEnum(_) | Ty::Map(_, _) => Family::Buffer,
+            Ty::Record(_) | Ty::RichEnum(_) | Ty::Map(_, _) => Family::Run(RunKind::Buffer),
         }
     }
 
-    /// `true` when this type crosses a call boundary as a serialized value
-    /// buffer (`const uint8_t*` + `size_t`) rather than as dedicated C slots.
+    /// The scalar primitive of a [`Family::Direct`] value, or of the payload
+    /// of a [`Family::OptDirect`] one: the primitive itself, or `i32` for a
+    /// C-style enum. `None` for every other family.
+    #[must_use]
+    pub fn scalar(&self) -> Option<Prim> {
+        match self {
+            Ty::Prim(p) if p.is_scalar() => Some(*p),
+            Ty::Enum(_) => Some(Prim::I32),
+            Ty::Optional(inner) if self.family() == Family::OptDirect => inner.scalar(),
+            _ => None,
+        }
+    }
+
+    /// `true` when this type crosses a call boundary as a value buffer.
     #[must_use]
     pub fn is_buffered(&self) -> bool {
-        self.family() == Family::Buffer
+        self.family() == Family::Run(RunKind::Buffer)
     }
 
     /// The referenced user-type name for a record, rich enum, enum, or
@@ -403,6 +424,23 @@ impl Ty {
     #[must_use]
     pub fn contains_user_type(&self) -> bool {
         self.any(&|t| matches!(t, Ty::Record(_) | Ty::RichEnum(_)))
+    }
+
+    /// The canonical identifier fragment naming this type in codec names: a
+    /// primitive's IDL spelling (`i64`, `string`), a user type's name
+    /// (`Item`), or a composite's shape in prefix notation (`opt_i64`,
+    /// `list_string`, `map_string_Item`, `list_opt_i32`). Every target
+    /// derives its composite codec names from this one function, so a stem
+    /// never differs between two languages.
+    #[must_use]
+    pub fn stem(&self) -> String {
+        match self {
+            Ty::Prim(p) => p.snake().to_string(),
+            Ty::Record(n) | Ty::RichEnum(n) | Ty::Enum(n) | Ty::Interface(n) => n.clone(),
+            Ty::Optional(inner) => format!("opt_{}", inner.stem()),
+            Ty::List(inner) => format!("list_{}", inner.stem()),
+            Ty::Map(k, v) => format!("map_{}_{}", k.stem(), v.stem()),
+        }
     }
 
     /// `true` when this type is (or transitively contains) an interface, so
@@ -521,7 +559,7 @@ impl fmt::Display for RetTy {
 /// What kind of declaration a user type name refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeKind {
-    /// A `structs:` entry.
+    /// A `records:` entry.
     Record,
     /// An `enums:` entry with no payload-carrying variant.
     Enum,
@@ -529,71 +567,40 @@ pub enum TypeKind {
     RichEnum,
     /// An `interfaces:` entry.
     Interface,
-    /// A `callback_interfaces:` entry.
+    /// A `callbacks:` entry.
     CallbackInterface,
     /// An `errors:` entry (error domain names share the type namespace).
     ErrorDomain,
 }
 
-/// Where a user type is declared.
+/// Where a user type is declared: its kind and its position in the
+/// [`Model`](crate::model::Model)'s list for that kind (`records`, `enums`,
+/// `interfaces`, `callbacks`, or `errors`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypeDecl {
     /// The declaration kind.
     pub kind: TypeKind,
-    /// Position of the declaring module in
-    /// [`Model::modules`](crate::model::Model::modules).
-    pub module: usize,
-    /// Position of the declaration in its module's list for its kind
-    /// (`structs`, `enums`, `interfaces`, `callback_interfaces`, or
-    /// `errors`).
+    /// Position of the declaration in its kind's list.
     pub index: usize,
 }
 
-/// Every user type name in an API, mapped to its declaration.
-///
-/// Type names are unique across the whole API, so a bare name identifies
-/// one declaration. The [`Model`](crate::model::Model) owns the index and
-/// exposes typed lookups (`interface`, `record`, `error_domain`, `owner`,
-/// and so on) on top of it.
-///
-/// The index also records the **foreign** names a scoped validation
-/// accepted ([`Options::foreign`](crate::validate::Options::foreign)):
-/// records or rich enums declared outside the validated document, which
-/// resolve to [`Ty::Record`] and have no declaration here.
+/// Every user type name in an API, mapped to its declaration. Names are
+/// unique across the library, so a name identifies one declaration.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TypeIndex {
     decls: BTreeMap<String, TypeDecl>,
-    /// Underscore-joined C path of every module, by position.
-    module_paths: Vec<String>,
-    foreign: BTreeSet<String>,
 }
 
 impl TypeIndex {
-    /// Register a module (in [`Model::modules`](crate::model::Model::modules)
-    /// order) by its underscore-joined C path, returning its position.
-    pub(crate) fn push_module(&mut self, path: String) -> usize {
-        self.module_paths.push(path);
-        self.module_paths.len() - 1
-    }
-
     /// Record a declaration. The first declaration of a name wins;
     /// validation reports any later one.
-    pub(crate) fn declare(&mut self, name: &str, decl: TypeDecl) {
-        self.decls.entry(name.to_string()).or_insert(decl);
+    pub(crate) fn declare(&mut self, name: &str, kind: TypeKind, index: usize) {
+        self.decls
+            .entry(name.to_string())
+            .or_insert(TypeDecl { kind, index });
     }
 
-    /// Record the foreign names a scoped validation accepts. A name declared
-    /// in the document stays its declaration.
-    pub(crate) fn set_foreign(&mut self, names: &BTreeSet<String>) {
-        self.foreign = names
-            .iter()
-            .filter(|n| !self.decls.contains_key(n.as_str()))
-            .cloned()
-            .collect();
-    }
-
-    /// The declaration `name` refers to, or `None` for an undeclared (or
-    /// foreign) name.
+    /// The declaration `name` refers to, or `None` for an undeclared name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&TypeDecl> {
         self.decls.get(name)
@@ -603,29 +610,6 @@ impl TypeIndex {
     #[must_use]
     pub fn kind(&self, name: &str) -> Option<TypeKind> {
         self.get(name).map(|d| d.kind)
-    }
-
-    /// `true` when `name` is a foreign record or rich enum: declared outside
-    /// the validated document and accepted through
-    /// [`Options::foreign`](crate::validate::Options::foreign).
-    #[must_use]
-    pub fn is_foreign(&self, name: &str) -> bool {
-        self.foreign.contains(name)
-    }
-
-    /// Every foreign name, in sorted order.
-    pub fn foreign(&self) -> impl Iterator<Item = &str> {
-        self.foreign.iter().map(String::as_str)
-    }
-
-    /// The underscore-joined C path of the module declaring `name` (the
-    /// `outer_inner` in `{prefix}_outer_inner_Name`), or `None` for an
-    /// undeclared or foreign name.
-    #[must_use]
-    pub fn module_path(&self, name: &str) -> Option<&str> {
-        self.get(name)
-            .and_then(|d| self.module_paths.get(d.module))
-            .map(String::as_str)
     }
 }
 
@@ -645,12 +629,13 @@ mod tests {
     }
 
     #[test]
-    fn families_are_total_and_agree_with_the_abi_contract() {
+    fn every_value_is_one_slot_of_one_family() {
         assert_eq!(I32.family(), Family::Direct);
         assert_eq!(Ty::Prim(Prim::Bool).family(), Family::Direct);
         assert_eq!(Ty::Enum("Color".into()).family(), Family::Direct);
-        assert_eq!(STRING.family(), Family::String);
-        assert_eq!(Ty::Prim(Prim::Bytes).family(), Family::Bytes);
+        assert_eq!(Ty::Enum("Color".into()).scalar(), Some(Prim::I32));
+        assert_eq!(STRING.family(), Family::Run(RunKind::Utf8));
+        assert_eq!(Ty::Prim(Prim::Bytes).family(), Family::Run(RunKind::Bytes));
         for ty in [
             opt(I32),
             opt(Ty::Prim(Prim::Bool)),
@@ -659,15 +644,15 @@ mod tests {
             opt(Ty::Enum("Color".into())),
         ] {
             assert_eq!(ty.family(), Family::OptDirect, "{ty}");
+            assert!(ty.scalar().is_some());
         }
         for p in Prim::SLICE_ELEMS {
-            assert_eq!(list(Ty::Prim(p)).family(), Family::Slice(p));
+            assert_eq!(list(Ty::Prim(p)).family(), Family::Run(RunKind::Slice(p)));
         }
         for ty in [
             Ty::Record("C".into()),
             Ty::RichEnum("S".into()),
             list(Ty::Prim(Prim::Bool)),
-            list(Ty::Prim(Prim::U8)),
             list(STRING),
             list(list(I32)),
             list(opt(I32)),
@@ -679,8 +664,8 @@ mod tests {
             opt(list(I32)),
             opt(Ty::Record("C".into())),
         ] {
-            assert_eq!(ty.family(), Family::Buffer, "{ty}");
-            assert!(ty.is_buffered());
+            assert!(ty.is_buffered(), "{ty}");
+            assert_eq!(ty.scalar(), None);
         }
         assert_eq!(
             Ty::Interface("Store".into()).family(),

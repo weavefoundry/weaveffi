@@ -2,29 +2,31 @@
 //!
 //! Emits a self-contained Go module under `go/`: `go.mod`, a copy of the C
 //! header, `bindings.go` (the API), `runtime.go` (load-time checks, errors,
-//! strings, typed arrays, objects, callbacks, iterators, and async
+//! runs, optional scalars, objects, callbacks, iterators, and async
 //! plumbing), and `codec.go` (the value-buffer writer and reader). The
 //! module path defaults to the package name and the Go package name to the
 //! C prefix without underscores; the bindings link `-l{library}` at build
 //! time.
 //!
+//! The library is one namespace, so everything lands in one Go package.
 //! Records are value structs, rich enums sealed interfaces, and optionals,
-//! lists, and maps Go pointers, slices, and maps. Optional scalars cross as
-//! a presence flag and a value, numeric lists as typed arrays (a Go slice's
-//! own storage, on the way in), and everything else composite as one value
-//! buffer with one codec pair per type. Interfaces are reference-counted
-//! objects: each wrapper holds one strong reference released by `Close` or,
-//! as a backstop, a `runtime.AddCleanup` cleanup. Callback interfaces are Go
-//! interfaces the consumer implements, crossing as a handle-table context
-//! plus the address of one static vtable per interface, filled with
-//! exported trampolines. A function that declares an error domain returns
-//! that domain's code types (an unknown code is `Unknown{Domain}`), one
-//! that fails with any error returns an `*Error`, and any other panics on
-//! failure; async functions always return an error instead. Async
-//! functions block on a `context.Context`, and a cancellable one cancels
-//! its native token when the context is done. The first call checks the
-//! ABI revision and every top-level module's contract table, which `Check`
-//! reports as an error.
+//! lists, and maps Go pointers, slices, and maps. Every value crosses as
+//! one C value: a scalar converted, an optional scalar as its
+//! `{p}_opt_{prim}` struct, a string, bytes, typed array, or value buffer
+//! as one `{p}_run` (a parameter lends the Go memory itself; a returned run
+//! is copied and released), and an object as a pointer. Interfaces are
+//! reference-counted objects: each wrapper holds one strong reference
+//! released by `Close` or, as a backstop, a `runtime.AddCleanup` cleanup.
+//! Callback interfaces are Go interfaces the consumer implements, crossing
+//! as the `{p}_{Cb}` struct of a handle-table context and the address of
+//! one static vtable per interface, filled with exported trampolines. A
+//! function that declares an error domain returns that domain's code types
+//! (an unknown code is `Unknown{Domain}`), one that fails with any error
+//! returns an `*Error`, and any other panics on failure; async functions
+//! always return an error instead. Async functions block on a
+//! `context.Context`, and a cancellable one cancels its native token when
+//! the context is done. The first call checks the ABI revision and every
+//! declaration's contract function, which `Check` reports as an error.
 
 mod callbacks;
 mod calls;
@@ -37,6 +39,7 @@ mod runtime;
 #[cfg(test)]
 mod tests;
 mod types;
+mod values;
 
 use crate::codegen::{contract, CodeWriter, OutputFile};
 use crate::package::{Artifact, PackageContext};
@@ -46,15 +49,14 @@ use crate::utils::{render_prelude, render_trailer, CommentStyle};
 use camino::Utf8PathBuf;
 use miette::Result;
 use serde::{Deserialize, Serialize};
-use weaveffi_model::model::{Model, ModuleBinding};
-use weaveffi_model::plan::ErrorStrategy;
+use weaveffi_model::model::{ErrorStrategy, Model};
 
 use crate::targets::go::callbacks::{emit_preamble_decls, render_callback_interface};
 use crate::targets::go::calls::render_function;
 use crate::targets::go::codec::BufferTypes;
 use crate::targets::go::docs::DocNames;
 use crate::targets::go::entities::{
-    render_enum, render_error, render_interface, render_rich_enum, render_struct,
+    render_enum, render_error, render_interface, render_record, render_rich_enum,
 };
 use crate::targets::go::names::GoNames;
 use crate::targets::go::package::{package_files, render_go_mod, render_readme};
@@ -215,7 +217,7 @@ pub(crate) fn go_prelude() -> String {
 }
 
 /// Render `bindings.go`: the cgo preamble, the imports, the load-time
-/// checks, every module's declarations, and the composite codecs.
+/// checks, every declaration, and the composite codecs.
 pub(crate) fn render_bindings(model: &Model, names: &Names) -> String {
     let go_names = GoNames::new(model);
     let doc_names = DocNames::new(model, &go_names);
@@ -243,9 +245,7 @@ pub(crate) fn render_bindings(model: &Model, names: &Names) -> String {
     render_preamble(&mut w, model, names, &codecs);
     render_imports(&mut w, model);
     render_checks(&mut w, model);
-    for m in &model.modules {
-        render_module(&mut w, &ctx, m);
-    }
+    render_declarations(&mut w, &ctx);
     codecs.render_composites(&mut w);
 
     // Exactly one blank line before the trailer keeps the file gofmt-clean.
@@ -261,7 +261,7 @@ pub(crate) fn render_bindings(model: &Model, names: &Names) -> String {
 fn render_preamble(w: &mut CodeWriter, model: &Model, names: &Names, codecs: &BufferTypes) {
     w.line("/*");
     w.line(format!("#cgo LDFLAGS: -l{}", names.library));
-    if model.callables().any(|(_, f)| f.deprecated.is_some()) {
+    if model.callables().any(|f| f.deprecated.is_some()) {
         // The bindings call deprecated functions on the user's behalf; only
         // the user's own calls should warn, through Go's `Deprecated:` docs.
         w.line("#cgo CFLAGS: -Wno-deprecated-declarations");
@@ -290,7 +290,7 @@ fn render_imports(w: &mut CodeWriter, model: &Model) {
         (has_async, "context"),
         (model.has_iterators(), "iter"),
         (
-            model.has_interfaces() || model.has_callback_interfaces() || has_async,
+            !model.interfaces.is_empty() || !model.callbacks.is_empty() || has_async,
             "unsafe",
         ),
     ];
@@ -310,72 +310,55 @@ fn render_imports(w: &mut CodeWriter, model: &Model) {
     w.blank();
 }
 
-/// Write `wvCheckLibrary`, the load-time checks the Go `Check` runs: the ABI
-/// revision, then every top-level module's contract table against the rows
-/// these bindings were generated with.
+/// Write `wvCheckLibrary`, the load-time checks the Go `Check` runs: the
+/// ABI revision, then every declaration's contract function against the
+/// hash these bindings were generated with. The bindings link the library,
+/// so a declaration it lacks fails to link instead.
 fn render_checks(w: &mut CodeWriter, model: &Model) {
-    w.line("// wvCheckLibrary checks the linked library's ABI revision and every");
-    w.line("// top-level module's contract table.");
+    w.line("// wvCheckLibrary checks the linked library's ABI revision and the contract");
+    w.line("// of every declaration these bindings were generated with.");
     w.block("func wvCheckLibrary() error {", "}", |w| {
         w.block("if err := wvCheckABI(); err != nil {", "}", |w| {
             w.line("return err");
         });
-        for (i, table) in contract::tables(model).into_iter().enumerate() {
-            // The table is fetched before `n` is read: Go leaves the order
-            // of a call and a plain operand in one argument list open.
-            if i == 0 {
-                w.line("var n C.size_t");
-                w.line(format!("table := C.{}(&n)", table.symbol));
-            } else {
-                w.line(format!("table = C.{}(&n)", table.symbol));
+        w.block("return wvCheckContract([]wvContractRow{", "})", |w| {
+            for row in contract::rows(model) {
+                w.line(format!(
+                    "{{uint64(C.{}()), {}, {}}},",
+                    row.symbol,
+                    contract::hex(row.hash),
+                    go_str(&row.path)
+                ));
             }
-            w.block(
-                "if err := wvCheckContract(table, n, []wvContractEntry{",
-                "}); err != nil {",
-                |w| {
-                    for row in &table.rows {
-                        w.line(format!(
-                            "{{{}, {}, {}}},",
-                            contract::hex(row.id),
-                            contract::hex(row.hash),
-                            go_str(&row.path)
-                        ));
-                    }
-                },
-            );
-            w.indent();
-            w.line("return err");
-            w.dedent();
-            w.line("}");
-        }
-        w.line("return nil");
+        });
     });
     w.blank();
 }
 
-/// Render every declaration of `m`: its error domains, enums, records,
-/// callback interfaces, interfaces, and functions.
-fn render_module(w: &mut CodeWriter, ctx: &Ctx, m: &ModuleBinding) {
-    for e in &m.errors {
+/// Render every declaration: error domains, enums, records, callback
+/// interfaces, interfaces, and free functions.
+fn render_declarations(w: &mut CodeWriter, ctx: &Ctx) {
+    let model = ctx.model;
+    for e in &model.errors {
         render_error(w, ctx, e);
     }
-    for e in &m.enums {
+    for e in &model.enums {
         if e.is_rich() {
             render_rich_enum(w, ctx, e);
         } else {
             render_enum(w, ctx, e);
         }
     }
-    for s in &m.structs {
-        render_struct(w, ctx, s);
+    for r in &model.records {
+        render_record(w, ctx, r);
     }
-    for cb in &m.callback_interfaces {
+    for cb in &model.callbacks {
         render_callback_interface(w, ctx, cb);
     }
-    for i in &m.interfaces {
+    for i in &model.interfaces {
         render_interface(w, ctx, i);
     }
-    for f in &m.functions {
+    for f in &model.functions {
         render_function(w, ctx, f, ctx.names.function(f), None);
     }
 }

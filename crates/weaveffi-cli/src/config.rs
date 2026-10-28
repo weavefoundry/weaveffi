@@ -31,6 +31,8 @@
 
 use std::collections::BTreeMap;
 
+pub use crate::cargo::CargoFeatures;
+
 use crate::build::BuildSettings;
 use crate::targets::{self, Target, REGISTRY};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -89,6 +91,13 @@ pub struct BuildTable {
     pub ios_deployment_target: String,
     /// The minimum Android API level, which selects the NDK compiler.
     pub android_api: u32,
+    /// Cargo features every build of the producer enables, including the
+    /// host build library mode reads the API from.
+    pub features: Vec<String>,
+    /// Build the producer with `--all-features`.
+    pub all_features: bool,
+    /// Build the producer with `--no-default-features`.
+    pub no_default_features: bool,
 }
 
 impl Default for BuildTable {
@@ -101,18 +110,37 @@ impl Default for BuildTable {
             macos_deployment_target: settings.macos_deployment_target,
             ios_deployment_target: settings.ios_deployment_target,
             android_api: settings.android_api,
+            features: Vec::new(),
+            all_features: false,
+            no_default_features: false,
         }
     }
 }
 
 impl BuildTable {
-    /// The build settings, with `profile` (`--profile`) over the table's.
-    pub(crate) fn settings(&self, profile: Option<&str>) -> BuildSettings {
+    /// The build settings, with `profile` (`--profile`) over the table's
+    /// and `features` (the feature flags) over the table's features.
+    pub(crate) fn settings(
+        &self,
+        profile: Option<&str>,
+        features: Option<&CargoFeatures>,
+    ) -> BuildSettings {
         BuildSettings {
             profile: profile.unwrap_or(&self.profile).to_string(),
+            features: features.cloned().unwrap_or_else(|| self.cargo_features()),
             macos_deployment_target: self.macos_deployment_target.clone(),
             ios_deployment_target: self.ios_deployment_target.clone(),
             android_api: self.android_api,
+        }
+    }
+
+    /// The table's Cargo features.
+    #[must_use]
+    pub fn cargo_features(&self) -> CargoFeatures {
+        CargoFeatures {
+            features: self.features.clone(),
+            all_features: self.all_features,
+            no_default_features: self.no_default_features,
         }
     }
 }
@@ -381,9 +409,9 @@ mod tests {
             cfg.build.platforms.as_deref(),
             Some(&["darwin-arm64".to_string(), "ios-arm64".to_string()][..])
         );
-        let settings = cfg.build.settings(None);
+        let settings = cfg.build.settings(None, None);
         assert_eq!(settings.profile, "dev");
-        assert_eq!(cfg.build.settings(Some("bench")).profile, "bench");
+        assert_eq!(cfg.build.settings(Some("bench"), None).profile, "bench");
         assert_eq!(settings.macos_deployment_target, "12.0");
         assert_eq!(settings.ios_deployment_target, "13.0");
         assert_eq!(settings.android_api, 24);
@@ -400,7 +428,7 @@ mod tests {
     #[test]
     fn build_and_package_defaults() {
         let cfg = ProjectConfig::default();
-        let settings = cfg.build.settings(None);
+        let settings = cfg.build.settings(None, None);
         assert_eq!(settings.profile, "release");
         assert_eq!(settings.macos_deployment_target, "11.0");
         assert_eq!(settings.ios_deployment_target, "13.0");
@@ -410,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn removed_and_unknown_keys_are_errors() {
+    fn unknown_keys_are_errors() {
         let dir = tempfile::tempdir().unwrap();
         for (contents, needle) in [
             ("[global]\npre_generate = \"true\"\n", "global"),
@@ -428,23 +456,6 @@ mod tests {
             let cfg_path = write(dir.path(), CONFIG_FILE_NAME, contents);
             let err = ProjectConfig::from_file(&cfg_path).unwrap_err();
             assert!(format!("{err:?}").contains(needle), "{contents}: {err:?}");
-        }
-    }
-
-    #[test]
-    fn removed_strip_module_prefix_keys_are_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        for table in ["[package]", "[generators.python]"] {
-            let cfg_path = write(
-                dir.path(),
-                CONFIG_FILE_NAME,
-                &format!("{table}\nstrip_module_prefix = false\n"),
-            );
-            let err = ProjectConfig::from_file(&cfg_path).unwrap_err();
-            assert!(
-                format!("{err:?}").contains("strip_module_prefix"),
-                "{err:?}"
-            );
         }
     }
 
@@ -470,7 +481,7 @@ mod tests {
             CONFIG_FILE_NAME,
             "[package]\nname = \"found\"\n",
         );
-        let input = write(&nested, "api.yml", "version: \"0.12.0\"\nmodules: []\n");
+        let input = write(&nested, "api.yml", "version: \"0.13.0\"\n");
 
         let cfg = ProjectConfig::load(None, &input).unwrap();
         assert_eq!(cfg.package.identity.name.as_deref(), Some("found"));
@@ -479,7 +490,7 @@ mod tests {
     #[test]
     fn defaults_when_no_config_exists() {
         let dir = tempfile::tempdir().unwrap();
-        let input = write(dir.path(), "api.yml", "version: \"0.12.0\"\nmodules: []\n");
+        let input = write(dir.path(), "api.yml", "version: \"0.13.0\"\n");
         let cfg = ProjectConfig::load(None, &input).unwrap();
         assert!(cfg.source.is_none(), "unexpected config: {:?}", cfg.source);
         assert!(cfg.package.identity.name.is_none());
@@ -515,7 +526,7 @@ mod tests {
             CONFIG_FILE_NAME,
             "[project]\ninput = \"api.yml\"\nout = \"bindings\"\ntargets = [\"c\"]\n",
         );
-        write(dir.path(), "api.yml", "version: \"0.12.0\"\nmodules: []\n");
+        write(dir.path(), "api.yml", "version: \"0.13.0\"\n");
         let (cfg, input) = ProjectConfig::locate(Some(cfg_path.as_str()), None).unwrap();
         let root = cfg_path.parent().unwrap();
         assert_eq!(input, root.join("api.yml"));

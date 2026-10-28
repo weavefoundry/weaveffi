@@ -65,50 +65,36 @@ pub(crate) fn render_runtime(model: &Model, names: &Names) -> String {
 }
 
 /// Render `wvCheckContracts()`, which the runtime's load check calls after
-/// the ABI revision: every top-level module's contract table against the
-/// rows these bindings were generated with.
+/// the ABI revision: every declaration's contract function against the hash
+/// these bindings were generated with. The functions are linked, so a
+/// declaration the library lacks fails to link instead.
 pub(crate) fn render_contract_checks(w: &mut CodeWriter, model: &Model, library_type: &str) {
-    let tables = contract::tables(model);
+    let rows = contract::rows(model);
     w.line("// MARK: - Contract");
     w.blank();
     w.line("/// The first declaration these bindings were generated with that the library");
     w.line(format!(
-        "/// lacks or declares differently, checked once by `{library_type}.check()`."
+        "/// declares differently, checked once by `{library_type}.check()`."
     ));
     w.line(format!(
         "func wvCheckContracts() -> {library_type}.LoadError? {{"
     ));
     w.indent();
-    for (i, table) in tables.iter().enumerate() {
-        let last = i + 1 == tables.len();
-        let open = format!("wvCheckContract({}, [", table.symbol);
-        if last {
-            w.line(format!("return {open}"));
-        } else {
-            w.line(format!("if let failure = {open}"));
-        }
+    if rows.is_empty() {
+        w.line("nil");
+    } else {
+        w.line("wvCheckContract([");
         w.scope(|w| {
-            for row in &table.rows {
+            for row in &rows {
                 w.line(format!(
                     "({}, {}, \"{}\"),",
-                    hex(row.id),
+                    row.symbol,
                     hex(row.hash),
                     swift_str(&row.path)
                 ));
             }
         });
-        if last {
-            w.line("])");
-        } else {
-            w.line("]) {");
-            w.scope(|w| {
-                w.line("return failure");
-            });
-            w.line("}");
-        }
-    }
-    if tables.is_empty() {
-        w.line("return nil");
+        w.line("])");
     }
     w.dedent();
     w.line("}");

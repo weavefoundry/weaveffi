@@ -1,28 +1,27 @@
 // Conformance consumer: calculator sample, .NET target.
 //
 // CalculatorLibrary.Check() loads the producer and checks the ABI revision
-// and the `calculator` contract table up front. Covers wrapping addition,
+// and every declaration's contract up front. Covers wrapping addition,
 // division rounding toward zero (including i32::MIN / -1), the typed
 // CalcException.DivisionByZero (code 1, message "division by zero", no
-// fields), a second domain in the same module (ParseException.NotANumber,
-// also code 1, with its `text` field), a `throws: any` function (the root
-// NativeException with code -1), an optional scalar return (`double?`),
+// fields), a second domain (ParseException.NotANumber, also code 1, with
+// its `text` field), a `throws: any` function (the root NativeException
+// with code -1), an optional scalar return (`double?`, an opt struct),
 // typed arrays in and out (spans in, arrays out), and strings crossing as
-// UTF-8 (pointer, length) pairs: empty, non-ASCII, astral, and an interior
-// NUL. Ends by asserting the producer's leak counters are zero.
+// UTF-8 runs: empty, non-ASCII, astral, and an interior NUL. Ends by
+// asserting the producer's leak counters are zero.
 //
 // Run with EXPECT_LOAD_FAILURE=1 and CALCULATOR_LIBRARY naming a file that
 // doesn't exist, it checks instead that the load failure is a catchable
 // NativeLoadException, from Check() and from every later call.
 //
-// The namespace is `Calculator` and the module is also `calculator`, so the
-// free-function class is `Calculator.Calculator`; `using static` imports
-// its statics.
+// The free functions are statics of the library class,
+// `Calculator.CalculatorLibrary`; `using static` imports them.
 
 using System;
 using System.Linq;
 using Calculator;
-using static Calculator.Calculator;
+using static Calculator.CalculatorLibrary;
 
 internal static class Program
 {
@@ -133,7 +132,7 @@ internal static class Program
         }
         CalculatorLibrary.Check();
         CalculatorLibrary.Check();
-        Expect(CalculatorLibrary.AbiVersion == 5, "ABI revision 5");
+        Expect(CalculatorLibrary.AbiVersion == 6, "ABI revision 6");
 
         Arithmetic();
         SecondDomain();

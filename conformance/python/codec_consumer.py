@@ -1,10 +1,11 @@
-"""Conformance consumer: codec sample, Python target (ABI revision 5).
+"""Conformance consumer: codec sample, Python target (ABI revision 6).
 
 The shared-vector loop: for every vector the producer serves, decode it with
 the generated codecs, pass it back to `check_vector` (which re-decodes the
 generated encoding and compares), confirm it never matches its neighbor, and
 push each primitive vector's value through the matching direct-family
-`echo_*`, its optional (flag plus value) echo, and its typed-array echo.
+`echo_*`, its optional (`_Opt{Prim}` structure) echo, and its typed-array
+echo.
 Then vectors built from literals (so a symmetric encode/decode bug can't
 hide), spot checks of decoded values, the typed out-of-range error with its
 payload, malformed input rejected on both sides, object identity and
@@ -230,7 +231,7 @@ def check_raw(data: bytes) -> int:
     """Send `data` to check_vector through its bound C function, returning the
     error code."""
     err = impl._ErrorStruct()
-    impl._c_codec_check_vector(0, data, len(data), ctypes.byref(err))
+    impl._c_check_vector(0, impl._run_in(data), ctypes.byref(err))
     code = err.code
     impl._error_clear(ctypes.byref(err))
     return code
@@ -327,10 +328,9 @@ def optionals() -> None:
     exc = consumer.raises(codec.InternalError, lambda: codec.echo_opt_color(3),  # type: ignore[arg-type]
                           "echo_opt_color(3)")
     check(exc.code == -3, f"echo_opt_color(3) code {exc.code}")
-    out = ctypes.c_int32()
     err = impl._ErrorStruct()
-    present = impl._c_codec_echo_opt_color(False, 3, ctypes.byref(out), ctypes.byref(err))
-    check(not present and err.code == 0, "absent ignores the value slot")
+    got = impl._c_echo_opt_color(impl._OptI32(False, 3), ctypes.byref(err))
+    check(not got.has and got.value == 0 and err.code == 0, "absent ignores the value")
 
 
 def typed_arrays() -> None:

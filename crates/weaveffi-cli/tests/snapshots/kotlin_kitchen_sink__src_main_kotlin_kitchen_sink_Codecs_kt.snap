@@ -19,11 +19,11 @@ internal fun pack_opt_i64(_w: BufferWriter, _v: Long?) = _w.writeOptional(_v) { 
 
 internal fun unpack_opt_i64(_r: BufferReader): Long? = _r.readOptional { _r.readI64() }
 
-internal fun pack_opt_Gadget(_w: BufferWriter, _v: Gadget?) = _w.writeOptional(_v) { _w.writeObject(it.cloneHandle(), JniBridge::kitchen_Gadget_destroy) }
+internal fun pack_opt_Gadget(_w: BufferWriter, _v: Gadget?) = _w.writeOptional(_v) { _w.writeObject(it.cloneHandle(), Lib.c::kitchen_sink_Gadget_destroy) }
 
 internal fun unpack_opt_Gadget(_r: BufferReader): Gadget? = _r.readOptional { Gadget.fromHandle(_r.readObject()) }
 
-internal fun pack_list_Gadget(_w: BufferWriter, _v: List<Gadget>) = _w.writeList(_v) { _w.writeObject(it.cloneHandle(), JniBridge::kitchen_Gadget_destroy) }
+internal fun pack_list_Gadget(_w: BufferWriter, _v: List<Gadget>) = _w.writeList(_v) { _w.writeObject(it.cloneHandle(), Lib.c::kitchen_sink_Gadget_destroy) }
 
 internal fun unpack_list_Gadget(_r: BufferReader): List<Gadget> = _r.readList { Gadget.fromHandle(_r.readObject()) }
 

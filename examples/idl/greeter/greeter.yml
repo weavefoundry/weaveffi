@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=https://weaveffi.com/weaveffi.schema.json
+version: "0.13.0"
+doc: A greeter implemented in C.
+functions:
+  - name: add
+    doc: Add two integers, wrapping on overflow.
+    params:
+      - { name: a, type: i32 }
+      - { name: b, type: i32 }
+    return: i32
+  - name: greet
+    doc: Greet someone by name.
+    params:
+      - { name: name, type: string }
+    return: string

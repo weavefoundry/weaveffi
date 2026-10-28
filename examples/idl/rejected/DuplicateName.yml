@@ -1,0 +1,9 @@
+# rejected: DuplicateName
+version: "0.13.0"
+records:
+  - name: Stats
+    fields:
+      - { name: total, type: u64 }
+functions:
+  - name: Stats
+    return: u64

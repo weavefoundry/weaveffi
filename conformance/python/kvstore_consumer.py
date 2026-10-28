@@ -1,11 +1,11 @@
-"""Conformance consumer: kvstore sample, Python target (ABI revision 5).
+"""Conformance consumer: kvstore sample, Python target (ABI revision 6).
 
 Drives the feature-complete producer through the generated package:
 
-  * the load-time checks (importing checked the ABI revision and both
-    modules' contract tables; a doctored table is refused by name; a
-    library that can't be loaded, or isn't this one, raises
-    `LibraryLoadError`, an `ImportError`);
+  * the load-time checks (importing checked the ABI revision and every
+    declaration's contract function; a missing or changed declaration is
+    refused by its path; a library that can't be loaded, or isn't this one,
+    raises `LibraryLoadError`, an `ImportError`);
   * the `Store` interface: fallible and infallible constructors, methods,
     statics, the deprecated `size`, records (`Entry`, `StoreInfo`), the
     `EntryKind` enum, maps and optionals, and the logical clock;
@@ -22,15 +22,17 @@ Drives the feature-complete producer through the generated package:
     arriving as `CallbackFailed`), a `Loader` passed as an optional callback
     (string, bytes, and optional-object returns; typed errors decoded by the
     producer or passed through), and a `Scorer` taking and returning typed
-    arrays;
+    arrays (the methods returning a run or an optional scalar are libffi
+    closures, since a ctypes callback can't return a structure);
   * the direct transports: an optional `i64` return, a `u64` typed-array
     return, an iterator of optional `i64`s, and async optional `u32` and
     `u32`-array results;
   * `Store` objects in every position, compared by native identity;
   * coroutines: an async free function returning an object, a cancellable
-    method cancelled mid-pause, an async list, an async function in the
-    nested `kv.stats` module, and concurrent calls;
-  * the nested `kv.stats` module and the sibling `report` root.
+    method cancelled mid-pause, an async list, an async function taking a
+    list of objects, and concurrent calls;
+  * the free functions `summarize` and `render_report`, which throw a second
+    error domain.
 
 Ends with every callback released and the leak check (see harness.py).
 """
@@ -117,23 +119,26 @@ def load_failures() -> None:
 
 
 def load_checks() -> None:
-    # A table entry the library lacks, or one whose signature changed, is
+    # Every declaration has a row: its contract function, its hash, and its
+    # path.
+    paths = {path for _, _, path in impl._CONTRACT}
+    check({"Store", "Store.get", "Listener.on_change", "KvError.KeyNotFound", "Entry",
+           "summarize_all"} <= paths, f"contract rows {sorted(paths)!r}")
+    # A declaration the library lacks, or one whose signature changed, is
     # refused by its path.
-    saved = dict(impl._CONTRACTS)
-    symbol, entries = next(iter(saved.items()))
+    saved = list(impl._CONTRACT)
     try:
-        impl._CONTRACTS[symbol] = entries + [(1, 2, "kv.Store.vanished")]
-        exc = raises(kv.LibraryLoadError, impl._check_contract, "missing entry")
-        check(str(exc).startswith("kv.Store.vanished is missing from the library"), str(exc))
+        impl._CONTRACT.append(("kvstore_contract_0000000000000000", 2, "Store.vanished"))
+        exc = raises(kv.LibraryLoadError, impl._check_contract, "missing declaration")
+        check(str(exc).startswith("Store.vanished is missing from the library"), str(exc))
         check(isinstance(exc, ImportError) and exc.path == impl._lib._name, "an ImportError")
-        entry_id, entry_hash, path = entries[0]
-        impl._CONTRACTS[symbol] = [(entry_id, entry_hash ^ 1, path)]
-        exc = raises(ImportError, impl._check_contract, "changed entry")
+        symbol, expected, path = saved[0]
+        impl._CONTRACT[:] = [(symbol, expected ^ 1, path)]
+        exc = raises(ImportError, impl._check_contract, "changed declaration")
         check(str(exc).startswith(f"{path} changed since these bindings were generated"),
               str(exc))
     finally:
-        impl._CONTRACTS.clear()
-        impl._CONTRACTS.update(saved)
+        impl._CONTRACT[:] = saved
     impl._check_contract()
     load_failures()
 
@@ -601,8 +606,8 @@ class Scorer(kv.Scorer):
         return tuple(size * 1.0 for size in sizes)
 
 
-def abi5_shapes() -> None:
-    s = kv.Store.open("/abi5")
+def direct_shapes() -> None:
+    s = kv.Store.open("/direct")
     put(s, "b", "12")
     put(s, "a", "\x01\x02\x03", V, 7)
     check(s.count() == 2, "count")
@@ -664,7 +669,7 @@ def main() -> None:
     asyncio.run(async_calls())
     object_graph()
     stats_and_report()
-    abi5_shapes()
+    direct_shapes()
     check(held_callbacks() == 0, "every callback implementation released")
     consumer.finish()
 

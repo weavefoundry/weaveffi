@@ -14,6 +14,46 @@ use camino::{Utf8Path, Utf8PathBuf};
 use miette::{bail, IntoDiagnostic, Result, WrapErr};
 use serde::Deserialize;
 
+/// The Cargo features a producer is built with: `[build] features`,
+/// `all_features`, and `no_default_features`, or the `--features`,
+/// `--all-features`, and `--no-default-features` flags.
+///
+/// Every build of the producer uses the same set, the host build library
+/// mode reads the API from as much as each platform's build, so a
+/// declaration behind `#[cfg(feature = "...")]` is in the bindings exactly
+/// when it's in the libraries they load.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CargoFeatures {
+    /// Features to enable (`--features`).
+    pub features: Vec<String>,
+    /// Enable every feature (`--all-features`).
+    pub all_features: bool,
+    /// Disable the default features (`--no-default-features`).
+    pub no_default_features: bool,
+}
+
+impl CargoFeatures {
+    /// Whether this is Cargo's default (no flag to pass).
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Append the Cargo flags for this set to `cmd`.
+    pub(crate) fn apply(&self, cmd: &mut Command) {
+        if !self.features.is_empty() {
+            cmd.arg("--features").arg(self.features.join(","));
+        }
+        if self.all_features {
+            cmd.arg("--all-features");
+        }
+        if self.no_default_features {
+            cmd.arg("--no-default-features");
+        }
+    }
+}
+
 /// The facts about a Rust producer crate that building and packaging need,
 /// as `cargo metadata` reports them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,16 +158,22 @@ impl CargoCrate {
     }
 
     /// Build the crate's library for the host as a `cdylib` with `cargo
-    /// rustc --lib --crate-type cdylib --profile {profile}` (so the crate
-    /// needs no particular `crate-type`), forwarding Cargo's diagnostics to
-    /// stderr, and return the shared library it produced.
-    pub(crate) fn build_library(&self, profile: &str, quiet: bool) -> Result<Utf8PathBuf> {
+    /// rustc --lib --crate-type cdylib --profile {profile}` and `features`
+    /// (so the crate needs no particular `crate-type`), forwarding Cargo's
+    /// diagnostics to stderr, and return the shared library it produced.
+    pub(crate) fn build_library(
+        &self,
+        profile: &str,
+        features: &CargoFeatures,
+        quiet: bool,
+    ) -> Result<Utf8PathBuf> {
         let mut cmd = Command::new(cargo_bin());
         cmd.args(["rustc", "--lib", "--crate-type", "cdylib"])
             .args(["--profile", profile])
             .arg("--message-format=json-render-diagnostics")
             .arg("--manifest-path")
             .arg(self.manifest_path.as_str());
+        features.apply(&mut cmd);
         if quiet {
             cmd.arg("--quiet");
         }

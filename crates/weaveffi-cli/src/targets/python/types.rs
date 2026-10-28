@@ -4,7 +4,7 @@
 
 use crate::lang;
 use heck::ToSnakeCase;
-use weaveffi_model::abi::{CType, ConstPos};
+use weaveffi_model::abi::CType;
 use weaveffi_model::model::FieldBinding;
 use weaveffi_model::ty::{ParamTy, Prim, RetTy, Ty};
 
@@ -23,8 +23,7 @@ pub(crate) enum Dir {
 
 /// The Python typing hint for `ty` travelling in direction `dir`. The module
 /// starts with `from __future__ import annotations`, so user types are
-/// written bare even when declared later in the file; type names are
-/// global, and every module's declarations share one Python namespace.
+/// written bare even when declared later in the file.
 pub(crate) fn py_type_hint(ty: &Ty, dir: Dir) -> String {
     match ty {
         Ty::Prim(Prim::F32 | Prim::F64) => "float".into(),
@@ -119,151 +118,147 @@ pub(crate) fn prim_kind(p: Prim) -> &'static str {
     p.snake()
 }
 
-/// The runtime checker a direct integer slot of C type `ty` goes through
-/// before `ctypes` sees it (`ctypes` truncates an out-of-range integer
-/// silently): `_i32` for `int32_t` and every C-style enum, `_u64` for
-/// `uint64_t`, and so on. `None` for floats and `bool`, which need no check.
-pub(crate) fn int_checker(ty: &CType) -> Option<&'static str> {
-    Some(match ty {
-        CType::Int8 => "_i8",
-        CType::Int16 => "_i16",
-        CType::Int32 | CType::Enum { .. } => "_i32",
-        CType::Int64 => "_i64",
-        CType::Uint8 => "_u8",
-        CType::Uint16 => "_u16",
-        CType::Uint32 => "_u32",
-        CType::Uint64 | CType::Size => "_u64",
-        _ => return None,
+/// The runtime checker an integer of primitive `p` goes through before
+/// `ctypes` sees it (`ctypes` truncates an out-of-range integer silently):
+/// `_i32` for `i32` (and every C-style enum), `_u64` for `u64`, and so on.
+/// `None` for floats and `bool`, which need no range check.
+pub(crate) fn int_checker(p: Prim) -> Option<&'static str> {
+    Some(match p {
+        Prim::I8 => "_i8",
+        Prim::I16 => "_i16",
+        Prim::I32 => "_i32",
+        Prim::I64 => "_i64",
+        Prim::U8 => "_u8",
+        Prim::U16 => "_u16",
+        Prim::U32 => "_u32",
+        Prim::U64 => "_u64",
+        Prim::Bool | Prim::F32 | Prim::F64 | Prim::String | Prim::Bytes => return None,
     })
 }
 
-/// The C-style enum a direct slot of C type `ty` carries, whose class
-/// re-wraps a received integer (`Priority(x)`).
-pub(crate) fn enum_class(ty: &CType) -> Option<&str> {
-    match ty {
-        CType::Enum { name, .. } => Some(name),
-        _ => None,
+/// The runtime's `ctypes.Structure` mirroring the C `{prefix}_opt_{prim}`
+/// for the scalar `p`: `_OptI32`, `_OptF64`, `_OptBool`.
+pub(crate) fn opt_struct(p: Prim) -> String {
+    format!("_Opt{}", p.pascal())
+}
+
+/// The `ctypes.Structure` mirroring a callback interface's C argument
+/// struct `{prefix}_{name}` (`{ ctx, vtable }`): `_{name}Arg`.
+pub(crate) fn callback_arg_struct(name: &str) -> String {
+    format!("_{name}Arg")
+}
+
+/// The `ctypes` spelling of a scalar primitive (`ctypes.c_int32`).
+fn scalar_ctype(p: Prim) -> &'static str {
+    match p {
+        Prim::Bool => "ctypes.c_bool",
+        Prim::I8 => "ctypes.c_int8",
+        Prim::I16 => "ctypes.c_int16",
+        Prim::I32 => "ctypes.c_int32",
+        Prim::I64 => "ctypes.c_int64",
+        Prim::U8 => "ctypes.c_uint8",
+        Prim::U16 => "ctypes.c_uint16",
+        Prim::U32 => "ctypes.c_uint32",
+        Prim::U64 => "ctypes.c_uint64",
+        Prim::F32 => "ctypes.c_float",
+        Prim::F64 => "ctypes.c_double",
+        Prim::String | Prim::Bytes => unreachable!("{p} is not a scalar"),
     }
 }
 
-/// Maps a shared ABI [`CType`] onto the `ctypes` spelling of a parameter
-/// slot (an `argtypes` entry, or a parameter of a `CFUNCTYPE` the producer
-/// calls). The structural lowering (which slots exist, in what order) comes
-/// from the model; this is only the Python vocabulary applied to each slot.
-///
-/// - A borrowed `const uint8_t*` run the wrapper passes is `c_char_p`,
-///   which accepts a Python `bytes` object directly (interior NUL bytes
-///   included, since the length travels separately); one the producer
-///   passes to a trampoline is a raw `c_void_p` address, so exactly `len`
-///   bytes are copied.
-/// - A borrowed typed array (`const T*`) is a `c_void_p` address: the
-///   wrapper passes an `array.array`'s buffer, and a trampoline reads `len`
-///   elements from it.
-/// - An out slot (`T*`) is `POINTER(T)`, and an out slot for a run or an
-///   object (`T**`) is `POINTER(c_void_p)`.
-/// - Opaque object, iterator, vtable, and cancel-token pointers are
-///   `c_void_p`; `bool` is `c_bool`; enums are `c_int32`; the error struct
-///   is the runtime's `_ErrorStruct`.
-pub(crate) fn py_ctype(ty: &CType, outbound: bool) -> String {
+/// Who calls a C signature, which decides how its error pointer is
+/// spelled.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Caller {
+    /// Python calls the producer (an `argtypes` entry): the error slot is a
+    /// `POINTER(_ErrorStruct)` the wrapper passes `byref`.
+    Python,
+    /// The producer calls Python (a callback method or an async
+    /// completion): every pointer, the error slot included, arrives as a
+    /// plain `c_void_p` address.
+    Producer,
+}
+
+/// Maps a shared ABI [`CType`] onto its `ctypes` spelling. Every value is
+/// one C value: a scalar is its `ctypes` type (an enum is `c_int32`), an
+/// optional scalar the runtime's `_Opt{Prim}` structure, a run the
+/// runtime's `_Run` structure (both by value), a callback interface its
+/// `_{Name}Arg` structure, and every object, iterator, cancel-token, or
+/// context pointer a `c_void_p`. An out slot (an iterator's `T* out_item`)
+/// is `POINTER(T)`.
+pub(crate) fn py_ctype(ty: &CType, caller: Caller) -> String {
     match ty {
-        CType::Int8 => "ctypes.c_int8".into(),
-        CType::Int16 => "ctypes.c_int16".into(),
-        CType::Int32 | CType::Enum { .. } => "ctypes.c_int32".into(),
-        CType::Int64 => "ctypes.c_int64".into(),
-        CType::Uint8 => "ctypes.c_uint8".into(),
-        CType::Uint16 => "ctypes.c_uint16".into(),
-        CType::Uint32 => "ctypes.c_uint32".into(),
-        CType::Uint64 => "ctypes.c_uint64".into(),
-        CType::Float => "ctypes.c_float".into(),
-        CType::Double => "ctypes.c_double".into(),
-        CType::Bool => "ctypes.c_bool".into(),
+        CType::Scalar(p) => scalar_ctype(*p).into(),
         CType::Size => "ctypes.c_size_t".into(),
-        CType::Char => "ctypes.c_char".into(),
         CType::Void => "None".into(),
+        CType::Enum(_) => "ctypes.c_int32".into(),
+        CType::Opt(p) => opt_struct(*p),
+        CType::Run => "_Run".into(),
+        CType::Callback(name) => callback_arg_struct(name),
         CType::Error => "_ErrorStruct".into(),
-        CType::CancelToken
-        | CType::StructTag { .. }
-        | CType::VtableTag { .. }
-        | CType::Named(_) => "ctypes.c_void_p".into(),
-        CType::Ptr { konst, pointee } => match (konst, pointee.as_ref()) {
-            (ConstPos::West, CType::Uint8) if outbound => "ctypes.c_char_p".into(),
-            (_, CType::Error) => "ctypes.POINTER(_ErrorStruct)".into(),
-            (_, CType::Ptr { .. }) => "ctypes.POINTER(ctypes.c_void_p)".into(),
-            (ConstPos::None, scalar) if is_scalar(scalar) => {
-                format!("ctypes.POINTER({})", py_ctype(scalar, outbound))
+        CType::Object(_) | CType::Vtable(_) | CType::Named(_) | CType::CancelToken => {
+            "ctypes.c_void_p".into()
+        }
+        CType::Ptr { pointee, .. } => match pointee.as_ref() {
+            CType::Error if caller == Caller::Python => "ctypes.POINTER(_ErrorStruct)".into(),
+            CType::Scalar(_) | CType::Enum(_) | CType::Opt(_) | CType::Run => {
+                format!("ctypes.POINTER({})", py_ctype(pointee, caller))
             }
+            CType::Ptr { .. } => "ctypes.POINTER(ctypes.c_void_p)".into(),
             _ => "ctypes.c_void_p".into(),
         },
     }
 }
 
-/// Whether `ty` is a by-value number, `bool`, `size_t`, or enum.
-fn is_scalar(ty: &CType) -> bool {
-    matches!(
-        ty,
-        CType::Int8
-            | CType::Int16
-            | CType::Int32
-            | CType::Int64
-            | CType::Uint8
-            | CType::Uint16
-            | CType::Uint32
-            | CType::Uint64
-            | CType::Float
-            | CType::Double
-            | CType::Bool
-            | CType::Size
-            | CType::Enum { .. }
-    )
-}
-
-/// The `ctypes` spelling of a C return type (a `restype`). Every pointer
-/// return (a string, bytes, buffer, or typed-array run, an object, or an
-/// iterator handle) is a raw `c_void_p` address, so the wrapper can copy
-/// exactly what it owes and release it.
-pub(crate) fn py_restype(ty: &CType) -> String {
-    match ty {
-        CType::Ptr { .. } => "ctypes.c_void_p".into(),
-        other => py_ctype(other, false),
-    }
-}
-
-/// The `ctypes` type of the local a wrapper allocates for the out slot
-/// `slot` (a `T*` or `T**`) and passes by reference: the pointee, with a
-/// pointer pointee received as a raw `c_void_p` address.
+/// The `ctypes` type of the local a wrapper allocates for an out slot
+/// (`T* out_item`) and passes by reference: the pointee, with an object
+/// pointer received as a raw `c_void_p` address.
 pub(crate) fn py_out_local(slot: &CType) -> String {
     match slot {
         CType::Ptr { pointee, .. } => match pointee.as_ref() {
             CType::Ptr { .. } => "ctypes.c_void_p".into(),
-            scalar => py_ctype(scalar, true),
+            other => py_ctype(other, Caller::Python),
         },
         other => unreachable!("an out slot is a pointer, not {other:?}"),
     }
 }
 
-/// The Python type a `ctypes` callback receives for one C slot (a
-/// trampoline or completion parameter), as an annotation: integers and
-/// sizes are `int`, floats `float`, `bool` `bool`, an address `int | None`
-/// (`None` for null), and a typed pointer `Any`.
-pub(crate) fn py_slot_hint(ty: &CType) -> &'static str {
+/// The Python type `ctypes` hands a callback for one C slot (a callback
+/// method's or an async completion's parameter), as an annotation: integers
+/// and enums are `int`, floats `float`, `bool` `bool`, an optional scalar or
+/// a run its structure, and every pointer an address, `int | None` (`None`
+/// for null).
+pub(crate) fn py_slot_hint(ty: &CType) -> String {
     match ty {
-        CType::Float | CType::Double => "float",
-        CType::Bool => "bool",
-        CType::Void => "None",
-        CType::CancelToken
-        | CType::StructTag { .. }
-        | CType::VtableTag { .. }
-        | CType::Named(_) => "int | None",
-        CType::Error => "Any",
-        CType::Ptr { .. } => {
-            if py_ctype(ty, false) == "ctypes.c_void_p" {
-                "int | None"
-            } else {
-                "Any"
-            }
-        }
-        _ => "int",
+        CType::Scalar(Prim::F32 | Prim::F64) => "float".into(),
+        CType::Scalar(Prim::Bool) => "bool".into(),
+        CType::Void => "None".into(),
+        CType::Opt(p) => opt_struct(*p),
+        CType::Run => "_Run".into(),
+        CType::Callback(name) => callback_arg_struct(name),
+        CType::Error => "_ErrorStruct".into(),
+        CType::Ptr { .. }
+        | CType::Object(_)
+        | CType::Vtable(_)
+        | CType::Named(_)
+        | CType::CancelToken => "int | None".into(),
+        CType::Scalar(_) | CType::Size | CType::Enum(_) => "int".into(),
     }
+}
+
+/// The value a callback method returns after it failed, which the producer
+/// discards: `0`, `0.0`, `False`, an absent optional, the empty run, or a
+/// null pointer. `None` for a `void` method.
+pub(crate) fn zero_value(ty: &CType) -> Option<String> {
+    Some(match ty {
+        CType::Void => return None,
+        CType::Scalar(Prim::Bool) => "False".into(),
+        CType::Scalar(Prim::F32 | Prim::F64) => "0.0".into(),
+        CType::Scalar(_) | CType::Size | CType::Enum(_) => "0".into(),
+        CType::Opt(p) => format!("{}()", opt_struct(*p)),
+        CType::Run => "_Run()".into(),
+        _ => "None".into(),
+    })
 }
 
 /// Names a parameter must not take because wrapper and trampoline bodies
@@ -345,8 +340,7 @@ pub(crate) fn py_variant(name: &str) -> String {
 }
 
 /// The Python spelling of a callable name (a free function, method, static,
-/// or factory constructor): snake_case, keyword-escaped. Names are global,
-/// so a free function needs no module prefix.
+/// or factory constructor): snake_case, keyword-escaped.
 pub(crate) fn py_member_name(name: &str) -> String {
     lang::escape_ident(&name.to_snake_case(), lang::PYTHON_KEYWORDS)
 }

@@ -3,9 +3,10 @@
 
 use crate::codegen::CodeWriter;
 use weaveffi_model::model::{
-    EnumBinding, ErrorBinding, FieldBinding, InterfaceBinding, StructBinding,
+    EnumBinding, ErrorBinding, FieldBinding, InterfaceBinding, RecordBinding,
 };
-use weaveffi_model::plan::CallbackRetPass;
+
+use crate::codegen::values::{crossing, Crossing};
 
 use crate::targets::go::calls::{render_function, Receiver};
 use crate::targets::go::codec::{func, read_expr, write_stmt};
@@ -201,7 +202,7 @@ pub(crate) fn render_rich_enum(w: &mut CodeWriter, ctx: &Ctx, e: &EnumBinding) {
 
 /// Render a record as a value struct with exported fields, plus its codec
 /// pair: the fields in declaration order.
-pub(crate) fn render_struct(w: &mut CodeWriter, ctx: &Ctx, s: &StructBinding) {
+pub(crate) fn render_record(w: &mut CodeWriter, ctx: &Ctx, s: &RecordBinding) {
     let name = pascal(&s.name);
     let (doc, deprecated) = ctx.docs.of(&s.doc, &s.deprecated);
     GoDoc::decl(&name, doc).deprecated(deprecated).emit(w);
@@ -472,9 +473,11 @@ pub(crate) fn render_interface(w: &mut CodeWriter, ctx: &Ctx, iface: &InterfaceB
     w.blank();
 
     let in_buffers = ctx.codecs.has_interface(&iface.name);
-    let returned = ctx.model.callback_interfaces().any(|(_, cb)| {
+    let returned = ctx.model.callbacks.iter().any(|cb| {
         cb.methods.iter().any(|m| {
-            matches!(&m.ret_pass, CallbackRetPass::Object { interface, .. } if *interface == iface.name)
+            m.ret.as_ref().is_some_and(|ty| {
+                matches!(crossing(ty), Crossing::Object { interface, .. } if interface == iface.name)
+            })
         })
     });
     if in_buffers || returned {

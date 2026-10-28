@@ -8,13 +8,13 @@
 # Then vectors built from literals (so a symmetric encode/decode bug can't
 # hide), spot checks of decoded fields (64-bit integers exact, float bits,
 # astral text), the typed out-of-range error and its payload, malformed
-# buffers sent through the raw attached function (each rejected with -3)
-# and the encoder's own range checks, and object identity and reference
-# counting through buffers. Then the scalar optionals (a flag and a value,
-# no buffer), typed arrays in and out (range-checked, bit-exact floats, a
-# misaligned raw array rejected), `usize` and `char`, a custom type crossing
-# as a string, and an iterator of typed arrays. Ends with every leak counter
-# at zero.
+# buffers sent as raw runs through the attached function (each rejected
+# with -3) and the encoder's own range checks, and object identity and
+# reference counting through buffers. Then the scalar optionals (one
+# `{has, value}` struct, no buffer), typed arrays in and out (range-checked,
+# bit-exact floats, a misaligned, ragged, or null raw run rejected),
+# `usize` and `char`, a custom type crossing as a string, and an iterator
+# of typed arrays. Ends with every leak counter at zero.
 
 require_relative 'support'
 require 'codec'
@@ -71,10 +71,19 @@ def holder(primary, spare: nil, many: [], by_name: {})
   Codec::Holder.new(primary: primary, spare: spare, many: many, by_name: by_name)
 end
 
-# Sends a raw (malformed) Vector encoding to `check_vector` through the
-# attached C function, which must reject it as a marshalling failure.
+# Sends a raw (malformed) Vector encoding to `check_vector` as a run
+# through the attached C function, which must reject it as a marshalling
+# failure.
 def reject(bytes, what)
-  raw(what) { |err| native(Codec).codec_codec_check_vector(0, bytes, bytes.bytesize, err) }
+  raw(what) { |err| native(Codec).codec_check_vector(0, bridge(Codec).run(bytes), err) }
+end
+
+# A raw run of `len` bytes at `ptr`, which the encoder would never make.
+def raw_run(ptr, len)
+  run = native(Codec)::Run.new
+  run[:ptr] = ptr
+  run[:len] = len
+  run
 end
 
 # Runs a raw C call through the private Native module, which must fail with
@@ -237,7 +246,7 @@ def run_codec
   n
 end
 
-# The ABI 5 transports: scalar optionals, typed arrays, usize, char, a
+# The direct families: scalar optionals, typed arrays, usize, char, a
 # custom type, and an iterator of typed arrays.
 def run_direct_families
   i32_min = -(2**31)
@@ -252,9 +261,8 @@ def run_direct_families
   expect(Codec.echo_opt_color(Codec::Color::INFRARED) == -1 && Codec.echo_opt_color(Codec::Color::BLUE) == 7,
          'echo_opt_color')
   expect(Codec.echo_opt_color(nil).nil?, 'echo_opt_color(nil)')
-  out = FFI::MemoryPointer.new(:int32)
-  raw('a present undeclared Color') { |err| native(Codec).codec_codec_echo_opt_color(true, 3, out, err) }
-  marshal_error('an undeclared Color through the wrapper', '3 is not a valid Color') { Codec.echo_opt_color(3) }
+  raw('a present undeclared Color') { |err| native(Codec).codec_echo_opt_color(bridge(Codec).opt_arg(3, :i32), err) }
+  marshal_error('an undeclared Color through the wrapper', 'value: 3 is not a valid Color') { Codec.echo_opt_color(3) }
 
   floats = Codec.echo_f64s([Float::NAN, -0.0, 5e-324, Float::INFINITY])
   expect(floats.length == 4 && floats[0].nan?, 'echo_f64s keeps NaN')
@@ -267,10 +275,10 @@ def run_direct_families
          'echo_u64s')
   expect(Codec.echo_u64s([]) == [], 'echo_u64s([])')
   expect_raise(RangeError, 'a negative u64 element') { Codec.echo_u64s([-1]) }
-  misaligned = FFI::MemoryPointer.new(:uint8, 16) + 1
-  out_len = FFI::MemoryPointer.new(:size_t)
-  raw('a misaligned i32 array') { |err| native(Codec).codec_codec_echo_i32s(misaligned, 2, out_len, err) }
-  raw('a null array with a length') { |err| native(Codec).codec_codec_echo_i32s(nil, 2, out_len, err) }
+  memory = FFI::MemoryPointer.new(:uint8, 16)
+  raw('a misaligned i32 array') { |err| native(Codec).codec_echo_i32s(raw_run(memory + 1, 8), err) }
+  raw('a ragged i32 array') { |err| native(Codec).codec_echo_i32s(raw_run(memory, 6), err) }
+  raw('a null array with a length') { |err| native(Codec).codec_echo_i32s(raw_run(nil, 8), err) }
 
   expect(Codec.echo_usize(4_294_967_295) == 4_294_967_295 && Codec.echo_usize(U64_MAX) == U64_MAX, 'echo_usize')
   expect(Codec.echo_char('🦀') == '🦀' && Codec.echo_char('é') == 'é' && Codec.echo_char('a') == 'a', 'echo_char')

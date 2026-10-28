@@ -1,104 +1,59 @@
 # Async and Cancellation
 
 An async function returns immediately and delivers its result later, through
-the language's own async idiom: `async`/`await` in Swift, Python, JavaScript,
-C#, and Dart, a `suspend fun` in Kotlin, a `std::future` in C++, and a
-blocking call that honors a `context.Context` in Go. A cancellable async
-function is also cancelled through that idiom: cancelling the awaiting task,
-coroutine, or promise cancels the native call.
+the language's own async idiom: `async`/`await` in Swift, Python,
+JavaScript, C#, and Dart, a `suspend fun` in Kotlin, a `std::future` in C++,
+and a blocking call that honors a `context.Context` in Go. A cancellable
+async function is also cancelled through that idiom: cancelling the awaiting
+task, coroutine, or promise cancels the native call.
 
 ## Declaring async functions
 
-In Rust, write an `async fn` (a free function, method, or static). Add
-`#[weaveffi::cancellable]` and a final `weaveffi::CancelToken` parameter to
-make it cancellable. This is the `kvstore` sample's `Store::compact`:
+In Rust, write an `async fn` (a free function, method, or static). A final
+`weaveffi::CancelToken` parameter makes it cancellable. From the
+[macro tour](producer-macro.md):
 
-```rust
-#[weaveffi::interface]
-pub struct Store { /* ... */ }
-
-impl Store {
-    /// Remove every expired entry and complete with how many were removed,
-    /// after pausing for `pause_ms` on a thread that polls the token.
-    #[weaveffi::cancellable]
-    pub async fn compact(&self, pause_ms: u32, cancel: weaveffi::CancelToken) -> u32 {
-        Pause::start(pause_ms, &cancel).await;
-        self.sweep()
-    }
-}
+```rust,ignore
+{{#include ../../../examples/macro-tour/src/lib.rs:async}}
 ```
 
-In an IDL, set `async: true` and optionally `cancellable: true` on a
+In an IDL, set `async: true`, and optionally `cancellable: true`, on a
 function, method, or static:
 
 ```yaml
-version: "0.12.0"
-modules:
-  - name: kv
-    errors:
-      - name: KvError
-        codes:
-          - { name: InvalidPath, code: 1004, message: "invalid path" }
-    interfaces:
-      - name: Store
-        constructors:
-          - name: open
-            params:
-              - { name: path, type: string }
-            throws: KvError
-        methods:
-          - name: compact
-            params:
-              - { name: pause_ms, type: u32 }
-            return: u32
-            async: true
-            cancellable: true
-          - name: version_of
-            params:
-              - { name: key, type: string }
-            return: u32?
-            async: true
+{{#include ../../../examples/idl/contacts.yml:async}}
 ```
 
 `async` composes with `throws`, with object and buffered results, and with
-every parameter type. Constructors can't be async (`AsyncConstructor`):
-declare an async static that returns the interface instead, which in Rust is
-an `async fn` associated function returning `Self` (the macro reads only a
-synchronous one as a constructor). Async functions can't return iterators
-(`AsyncIteratorReturn`), and `cancellable` without `async` is a validation
-error (`CancellableNotAsync`).
+every parameter type. Constructors can't be async (`AsyncConstructor`), so
+an async factory is an async function or static that returns the interface.
+In Rust, an `async fn` in an exported `impl` that returns `Self` (or the
+interface) is exported as such a static, and a free `async fn` returning
+the object works too. Async functions
+can't return iterators (`AsyncIteratorReturn`), and `cancellable` without
+`async` is a validation error (`CancellableNotAsync`). A Rust `async fn`
+can't borrow an optional parameter (`Option<&T>`); take `Option<T>`.
 
 ## The C ABI shape
 
 An async function lowers to a launcher named after the function itself and a
-completion callback typedef named `{symbol}_callback`:
+completion callback type named `{symbol}_callback`:
 
 ```c
-typedef void (*kvstore_kv_Store_compact_callback)(
-    void* context, kvstore_error* err, uint32_t result);
+typedef void (*macro_tour_greet_later_callback)(void* context, macro_tour_error* err,
+                                                macro_tour_run result);
 
-void kvstore_kv_Store_compact(
-    const kvstore_kv_Store* self,
-    uint32_t pause_ms,
-    kvstore_cancel_token* cancel_token,     /* cancellable functions only */
-    kvstore_kv_Store_compact_callback callback,
-    void* context);
+void macro_tour_greet_later(macro_tour_run name, uint64_t delay,
+                            macro_tour_cancel_token* cancel_token,  /* cancellable only */
+                            macro_tour_greet_later_callback callback, void* context);
 ```
 
-The result slots follow the value's family:
-
-| Result | Completion slots after `context, err` |
-|--------|----------------------------------------|
-| none (`void`) | none |
-| Direct (scalar, `bool`, C-style enum) | `T result` |
-| OptDirect (`u32?`, `bool?`, `Color?`) | `bool has_result, T result` |
-| Slice (`[i32]`, `[f64]`, ...) | `const T* result_ptr, size_t result_len` (element count) |
-| string, bytes, value buffer | `const uint8_t* result_ptr, size_t result_len` |
-| object | `{tag}* result` (one strong reference) |
-
-`version_of` above completes through
-`void (*)(void* context, kvstore_error* err, bool has_result, uint32_t
-result)`. On failure every result slot is zero (`false`, `0`, `NULL`). The
+`result` is the return's one C value, exactly as for a synchronous return (a
+scalar, a `{p}_opt_*`, a run, or an object pointer), and is absent for a
+function that returns nothing: the completion is then `void (*)(void*
+context, {p}_error* err)`. kvstore's async `Store.version_of(key: string) ->
+u32?` completes through `void (*)(void* context, kvstore_error* err,
+kvstore_opt_u32 result)`. On failure `result` is the zero value. The
 launcher has no `out_err`: every failure, including a marshalling failure of
 an input, arrives through the callback.
 
@@ -110,21 +65,21 @@ The runtime guarantees these for every launch:
    domain error, on a marshalling failure (`-3`), on a panic (`-2`, including
    one while the launcher lifts its inputs), on a consumer callback failure
    (`-4`), on cancellation (`-5`), and when the executor can't take the call
-   (`-1`).
+   (`-1`). It may fire before the launcher returns, and a null `callback`
+   discards the result.
 2. **From any thread.** It runs on whatever thread completes the future: an
    executor thread, a Tokio worker, or (on `wasm32`) the caller's own stack.
    Each binding hops back to its own scheduler before touching consumer state.
-3. **Owned results.** `err` is `NULL` on success; otherwise it's heap-boxed,
-   owned by the consumer, and released with `{prefix}_error_free`. A string,
-   bytes, or buffered result is owned by the consumer and released with
-   `{prefix}_free_bytes(result_ptr, result_len)` after decoding; a typed
-   array with `{prefix}_free_bytes((uint8_t*)result_ptr, result_len *
-   sizeof(T))`. An OptDirect or Direct result is copied, and an object
-   result transfers one strong reference.
-4. **Dropped futures complete.** If the executor drops a future before it
-   finishes (a runtime shutting down, say), the drop guard completes the call
-   with `-5`.
-5. **Spawn failures complete.** If the executor can't take the future (a
+3. **Inputs taken at launch.** The launcher copies runs and retains objects
+   and `self` before it returns, so the consumer may release its arguments
+   as soon as the launcher returns.
+4. **Owned results.** `err` is `NULL` on success; otherwise it's heap-boxed,
+   owned by the consumer, and released with `{p}_error_free`. A run result
+   is owned by the consumer and released with `{p}_run_free` after decoding,
+   and an object result moves one strong reference.
+5. **Dropped futures complete.** If the executor drops a future before it
+   finishes (a runtime shutting down, say), the call completes with `-5`.
+6. **Spawn failures complete.** If the executor can't take the future (a
    custom spawner panics, or the default executor can't start its threads),
    the call completes with `-1` and a message saying why.
 
@@ -136,45 +91,46 @@ or decode everything, free it, and adopt object pointers.
 The runtime surface provides reference-counted cancel tokens:
 
 ```c
-kvstore_cancel_token* token = kvstore_cancel_token_create();   /* refcount 1 */
-kvstore_kv_Store_compact(store, 100, token, on_done, ctx);
-kvstore_cancel_token_cancel(token);    /* any thread, any time; idempotent */
-kvstore_cancel_token_destroy(token);   /* drops the consumer's reference */
+macro_tour_cancel_token* token = macro_tour_cancel_token_create();  /* refcount 1 */
+macro_tour_greet_later(name, 60000, token, on_done, ctx);
+macro_tour_cancel_token_cancel(token);    /* any thread, any time; idempotent */
+macro_tour_cancel_token_destroy(token);   /* drops the consumer's reference */
 ```
 
 The launcher takes its own reference on the token, so the consumer may cancel
 and destroy its reference at any point after the launch, even before the
 call completes. Cancelling wakes the producer's future; the runtime then
 drops the future and completes the call with code `-5` and the message
-"cancelled", unless it had already completed. A null token means "never
+`cancelled`, unless it had already completed. A null token means "never
 cancelled".
 
 Producer code doesn't need to check the token: dropping the future cancels
 it at its next suspension point, and RAII guards run as usual. Poll
 `cancel.is_cancelled()` only for cooperative cleanup of work the future
-doesn't own, such as a thread it spawned. Note that a future that never
+doesn't own, such as a thread it spawned (the `kvstore` sample's
+`Store::compact` stops its background pause that way). A future that never
 suspends can't be interrupted; it runs to completion and its result wins.
 
 ## Per-target surface
 
-| Target | Async surface | Cancellation | `-5` raises |
-|--------|---------------|--------------|-------------|
-| [C](../generators/c.md) | launcher plus callback | `{prefix}_cancel_token*` slot | the code in `err` |
-| [C++](../generators/cpp.md) | `std::future<T>` | RAII `CancelToken` argument | a `Cancelled` exception |
-| [Swift](../generators/swift.md) | `async` (`async throws`) | cancelling the `Task` | `CancellationError` |
-| [Kotlin](../generators/kotlin.md) | `suspend fun` | cancelling the coroutine | `CancellationException` |
-| [Node.js](../generators/node.md) | `Promise<T>` | `AbortSignal` (`{ signal }`) | `CancelledError` |
-| [WebAssembly](../generators/wasm.md) | `Promise<T>` | `AbortSignal` (`{ signal }`) | `CancelledError` |
-| [Python](../generators/python.md) | awaitable | cancelling the awaiting task | `asyncio.CancelledError` |
-| [.NET](../generators/dotnet.md) | `Task<T>` | `CancellationToken` | `OperationCanceledException` |
-| [Dart](../generators/dart.md) | `Future<T>` | a generated cancel-token object | `CancelledException` |
-| [Go](../generators/go.md) | blocking call, `context.Context` first | `ctx` done | returns `ctx.Err()` |
-| [Ruby](../generators/ruby.md) | blocking call | `cancel:` keyword with a `CancelToken` | a `Cancelled` error |
+| Target | Async surface | Cancellation |
+|--------|---------------|--------------|
+| [C](../generators/c.md) | launcher plus callback | a `{p}_cancel_token*` argument |
+| [C++](../generators/cpp.md) | `std::future<T>` | a cancel-token argument |
+| [Swift](../generators/swift.md) | `async` (`async throws`) | cancelling the `Task` |
+| [Kotlin](../generators/kotlin.md) | `suspend fun` | cancelling the coroutine |
+| [Node.js](../generators/node.md) | `Promise<T>` | an `AbortSignal` |
+| [WebAssembly](../generators/wasm.md) | `Promise<T>` | an `AbortSignal` |
+| [Python](../generators/python.md) | awaitable | cancelling the awaiting task |
+| [.NET](../generators/dotnet.md) | `Task<T>` | a `CancellationToken` |
+| [Dart](../generators/dart.md) | `Future<T>` | a cancel-token object |
+| [Go](../generators/go.md) | blocking call with a `context.Context` | the context's cancellation |
+| [Ruby](../generators/ruby.md) | blocking call | a cancel-token keyword argument |
 
-Go and Ruby block the calling goroutine or thread until the completion fires
-(the native work still runs off-thread), so call them from a goroutine or
-`Thread` for concurrency. Exact type names and signatures are on each
-language page.
+A cancelled call raises the language's cancellation error. Go and Ruby block
+the calling goroutine or thread until the completion fires (the native work
+still runs off-thread), so call them from a goroutine or `Thread` for
+concurrency. The exact types and signatures are on each language page.
 
 ## Choosing an executor
 
@@ -187,8 +143,8 @@ runtime routes every future to the process-wide executor:
   library creates on first use (its threads are named `weaveffi-async`).
   That runtime enables every Tokio driver the build compiles in, so turn on
   the Tokio features your futures need (`time`, `net`, and so on) in your
-  own dependency on `tokio`. Use `tokio::task::spawn_blocking` for
-  synchronous work inside a future.
+  own dependency on `tokio`, as the macro tour does for `tokio::time::sleep`.
+  Use `tokio::task::spawn_blocking` for synchronous work inside a future.
 
   ```toml
   [dependencies]
@@ -214,25 +170,21 @@ runtime routes every future to the process-wide executor:
   async launch; it overrides both defaults. It accepts any
   `Fn(BoxFuture) + Send + Sync + 'static`:
 
-  ```rust
-  let handle = tokio::runtime::Handle::current();
-  weaveffi::set_spawner(move |fut| {
-      handle.spawn(fut);
-  })
-  .expect("spawner installed once");
+  ```rust,ignore
+  {{#include ../../../examples/macro-tour/src/lib.rs:spawner}}
   ```
 
-  The first call wins; later calls return `Err(SpawnerAlreadySet)`. The
-  spawner must not block, because the launcher calls it on the consumer's
-  thread. Every future it receives is already wrapped so a panic becomes a
-  `-2` completion, a spawner that drops a future still produces a `-5`
+  The first call wins; later calls return an error. The spawner must not
+  block, because the launcher calls it on the consumer's thread. Every
+  future it receives is already wrapped so a panic becomes a `-2`
+  completion, a spawner that drops a future still produces a `-5`
   completion, and a spawner that panics completes the call with `-1`.
 - **`wasm32`.** There are no threads (Tokio is never compiled in there, so
   the `tokio` feature has no effect), and the future is polled inline before
   the launcher returns. A future that finishes after bounded work is fine. A
   future that's still pending once nothing can wake it (it awaits a timer or
-  I/O) is dropped, and the call completes with `-1` and the message "async
-  function suspended with no executor on wasm32" rather than hanging the
+  I/O) is dropped, and the call completes with `-1` and the message `async
+  function suspended with no executor on wasm32` rather than hanging the
   module. A call usually completes before an `AbortSignal` can fire, so on
   this target cancellation mostly matters for a signal that's already
   aborted when the call starts.
@@ -249,9 +201,6 @@ runtime routes every future to the process-wide executor:
   future at a suspension point. Long synchronous loops should yield or check
   `is_cancelled()`.
 - **Clearing an async error.** `err` is boxed; release it with
-  `{prefix}_error_free`, not `error_clear`.
-- **Leaking a result buffer.** A raw C callback that only copies the result
-  must still free it (a typed array's length times `sizeof(T)`).
-- **Async functions with no return value.** Valid, but `weaveffi validate
-  --warn` flags an async free function that returns nothing
-  (`AsyncVoidFunction`), since it's usually a missing return type.
+  `{p}_error_free`, not `error_clear`.
+- **Leaking a result run.** A raw C callback that only copies the result
+  must still free it with `{p}_run_free`.

@@ -19,15 +19,15 @@ func wvEncode[T any](v T, write func(*wvWriter, T)) []byte {
 }
 
 // wvDecode decodes one value from a returned value buffer, checks that
-// nothing trails it, and releases the native allocation.
-func wvDecode[T any](ptr *C.uint8_t, n C.size_t, read func(*wvReader) T) T {
-	return wvDecodeBytes(wvTakeBytes(ptr, n), read)
+// nothing trails it, and releases the run.
+func wvDecode[T any](r C.{{PREFIX}}_run, read func(*wvReader) T) T {
+	return wvDecodeBytes(wvTakeBytes(r), read)
 }
 
 // wvDecodeBorrowed is wvDecode for a buffer the native library only lends
 // (a callback argument).
-func wvDecodeBorrowed[T any](ptr *C.uint8_t, n C.size_t, read func(*wvReader) T) T {
-	return wvDecodeBytes(wvBorrowBytes(ptr, n), read)
+func wvDecodeBorrowed[T any](r C.{{PREFIX}}_run, read func(*wvReader) T) T {
+	return wvDecodeBytes(wvBorrowBytes(r), read)
 }
 
 func wvDecodeBytes[T any](b []byte, read func(*wvReader) T) T {

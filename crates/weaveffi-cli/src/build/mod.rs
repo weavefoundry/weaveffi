@@ -9,11 +9,9 @@
 //! name becomes `@rpath/lib{library}.dylib`, a Linux or Android library's
 //! soname `lib{library}.so`), sets Apple deployment targets and the Android
 //! NDK toolchain, and lays the results out in
-//! `{target_dir}/weaveffi/<platform>/`, where [`glue`] adds the prebuilt
-//! Node.js addon and JNI shim and `weaveffi package` reads them back as a
-//! [`BinarySet`](crate::platform::BinarySet).
+//! `{target_dir}/weaveffi/<platform>/`, where `weaveffi package` reads them
+//! back as a [`BinarySet`](crate::platform::BinarySet).
 
-pub(crate) mod glue;
 pub(crate) mod ndk;
 
 use std::process::{Command, Stdio};
@@ -22,7 +20,7 @@ use std::sync::OnceLock;
 use camino::Utf8PathBuf;
 use miette::{bail, IntoDiagnostic, Result, WrapErr};
 
-use crate::cargo::{cargo_bin, CargoCrate};
+use crate::cargo::{cargo_bin, CargoCrate, CargoFeatures};
 use crate::platform::{NativeBinary, Os, Platform};
 
 use self::ndk::Ndk;
@@ -32,6 +30,8 @@ use self::ndk::Ndk;
 pub(crate) struct BuildSettings {
     /// The Cargo profile to build with (`--profile`).
     pub(crate) profile: String,
+    /// The Cargo features to build with.
+    pub(crate) features: CargoFeatures,
     /// The minimum macOS version (`MACOSX_DEPLOYMENT_TARGET`).
     pub(crate) macos_deployment_target: String,
     /// The minimum iOS version (`IPHONEOS_DEPLOYMENT_TARGET`).
@@ -45,6 +45,7 @@ impl Default for BuildSettings {
     fn default() -> Self {
         Self {
             profile: "release".into(),
+            features: CargoFeatures::default(),
             macos_deployment_target: "11.0".into(),
             ios_deployment_target: "13.0".into(),
             android_api: 21,
@@ -191,6 +192,7 @@ impl<'a> Builder<'a> {
             .arg(self.krate.manifest_path.as_str())
             .args(["--target", triple, "--crate-type", crate_types]);
         cmd.args(["--profile", &self.settings.profile]);
+        self.settings.features.apply(&mut cmd);
         if self.quiet {
             cmd.arg("--quiet");
         }
@@ -283,4 +285,12 @@ impl<'a> Builder<'a> {
         }
         Ok(binary)
     }
+}
+
+/// An error and its causes on one line, for a skip warning.
+pub(crate) fn one_line(e: &miette::Report) -> String {
+    e.chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }

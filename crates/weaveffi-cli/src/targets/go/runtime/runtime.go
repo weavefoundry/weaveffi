@@ -8,7 +8,6 @@ static void* wvRuntimeHandlePtr(uintptr_t h) { return (void*)h; }
 import "C"
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -16,7 +15,6 @@ import (
 	"reflect"
 	"runtime"
 	"runtime/cgo"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -51,7 +49,7 @@ func (e *Error) Error() string {
 }
 
 // DebugLive reports how many resources of one kind the native library holds:
-// 0 objects, 1 callbacks, 2 iterators, 3 cancel tokens, 4 byte runs. Kind -1
+// 0 objects, 1 callbacks, 2 iterators, 3 cancel tokens, 4 runs. Kind -1
 // reports 1 when the library counts at all. Every count is 0 unless the
 // library was built with leak checks enabled; tests use it to assert that
 // nothing leaked.
@@ -65,9 +63,9 @@ func DebugLive(kind int32) uint64 {
 var wvLoad = sync.OnceValue(wvCheckLibrary)
 
 // Check reports whether the linked native library is the one these bindings
-// were generated for: it must implement the same C ABI revision, and its
-// contract tables must hold every declaration the bindings use, unchanged.
-// Declarations only the library has are fine.
+// were generated for: it must implement the same C ABI revision, and every
+// declaration the bindings use must be unchanged. Declarations only the
+// library has are fine.
 //
 // The checks run once, on the first call to Check or to any function of the
 // package, and Check returns their result from then on. Call it at startup
@@ -94,27 +92,20 @@ func wvCheckABI() error {
 	return nil
 }
 
-// wvContractEntry is one declaration these bindings were generated with:
-// the FNV-1a hashes of its dotted path and of its signature.
-type wvContractEntry struct {
-	id, hash uint64
-	path     string
+// wvContractRow is one declaration these bindings were generated with: the
+// hash the library's contract function for it returned, the hash of the
+// signature the bindings expect, and its dotted path.
+type wvContractRow struct {
+	have, want uint64
+	path       string
 }
 
-// wvCheckContract fails unless every entry in want is in the library's
-// contract table for one top-level module (n entries sorted by id) with an
-// equal signature hash.
-func wvCheckContract(table *C.{{PREFIX}}_contract_entry, n C.size_t, want []wvContractEntry) error {
-	have := unsafe.Slice(table, int(n))
-	for _, w := range want {
-		i, found := slices.BinarySearchFunc(have, w.id, func(e C.{{PREFIX}}_contract_entry, id uint64) int {
-			return cmp.Compare(uint64(e.id), id)
-		})
-		if !found {
-			return fmt.Errorf("{{PACKAGE}}: %s is missing from the library", w.path)
-		}
-		if uint64(have[i].hash) != w.hash {
-			return fmt.Errorf("{{PACKAGE}}: %s changed since these bindings were generated", w.path)
+// wvCheckContract fails at the first row whose library hash differs from
+// the expected one. A declaration the library lacks fails to link instead.
+func wvCheckContract(rows []wvContractRow) error {
+	for _, r := range rows {
+		if r.have != r.want {
+			return fmt.Errorf("{{PACKAGE}}: %s changed since these bindings were generated", r.path)
 		}
 	}
 	return nil
@@ -137,10 +128,10 @@ func (f wvFailure) err() error {
 func wvCopyFailure(cErr *C.{{PREFIX}}_error) wvFailure {
 	f := wvFailure{
 		code:    int32(cErr.code),
-		message: wvBorrowString(cErr.message_ptr, cErr.message_len),
+		message: wvBorrowString(C.{{PREFIX}}_run{ptr: cErr.message_ptr, len: cErr.message_len}),
 	}
 	if cErr.payload_ptr != nil {
-		f.payload = wvBorrowBytes(cErr.payload_ptr, cErr.payload_len)
+		f.payload = wvBorrowBytes(C.{{PREFIX}}_run{ptr: cErr.payload_ptr, len: cErr.payload_len})
 	}
 	return f
 }
@@ -187,11 +178,11 @@ type wvDomainError interface {
 // wvSetError reports a failure through a callback's error slot. The native
 // library copies the message and payload, so both are only borrowed.
 func wvSetError(outErr *C.{{PREFIX}}_error, code int32, message string, payload []byte) {
-	ptr, n := wvStr(message)
-	C.{{PREFIX}}_error_set(outErr, C.int32_t(code), ptr, n)
+	m := wvStrRun(message)
+	C.{{PREFIX}}_error_set(outErr, C.int32_t(code), m.ptr, m.len)
 	if len(payload) > 0 {
-		ptr, n := wvBytes(payload)
-		C.{{PREFIX}}_error_set_payload(outErr, ptr, n)
+		p := wvBytesRun(payload)
+		C.{{PREFIX}}_error_set_payload(outErr, p.ptr, p.len)
 	}
 }
 
@@ -278,128 +269,104 @@ func wvFreeCallback(ctx unsafe.Pointer) {
 	cgo.Handle(uintptr(ctx)).Delete()
 }
 
-// ── Strings and bytes ──
+// ── Runs ──
 
-// wvStr returns a borrowed (pointer, length) view of s's UTF-8 bytes for the
-// duration of one call. Strings may contain NUL bytes.
-func wvStr(s string) (*C.uint8_t, C.size_t) {
-	return (*C.uint8_t)(unsafe.Pointer(unsafe.StringData(s))), C.size_t(len(s))
+// wvStrRun lends s's UTF-8 bytes to the library for one call, with no copy.
+// Strings may contain NUL bytes.
+func wvStrRun(s string) C.{{PREFIX}}_run {
+	return C.{{PREFIX}}_run{ptr: (*C.uint8_t)(unsafe.Pointer(unsafe.StringData(s))), len: C.size_t(len(s))}
 }
 
-// wvBytes returns a borrowed (pointer, length) view of b for the duration of
-// one call.
-func wvBytes(b []byte) (*C.uint8_t, C.size_t) {
-	return (*C.uint8_t)(unsafe.Pointer(unsafe.SliceData(b))), C.size_t(len(b))
+// wvBytesRun lends b (raw bytes or an encoded value buffer) to the library
+// for one call, with no copy.
+func wvBytesRun(b []byte) C.{{PREFIX}}_run {
+	return wvSliceRun(b)
 }
 
-// wvBorrowString copies a borrowed UTF-8 run into a Go string. A run of
-// length 0 is never read.
-func wvBorrowString(ptr *C.uint8_t, n C.size_t) string {
-	if n == 0 {
+// wvSliceRun lends a numeric slice's own storage to the library as a typed
+// array for one call: the elements hold no Go pointers, and cgo keeps the
+// memory in place until the call returns. The run's length counts bytes.
+func wvSliceRun[T any](s []T) C.{{PREFIX}}_run {
+	var zero T
+	size := uintptr(len(s)) * unsafe.Sizeof(zero)
+	return C.{{PREFIX}}_run{ptr: (*C.uint8_t)(unsafe.Pointer(unsafe.SliceData(s))), len: C.size_t(size)}
+}
+
+// wvBorrowString copies a borrowed UTF-8 run into a Go string. An empty run
+// is never read.
+func wvBorrowString(r C.{{PREFIX}}_run) string {
+	if r.len == 0 {
 		return ""
 	}
-	return string(unsafe.Slice((*byte)(unsafe.Pointer(ptr)), n))
+	return string(unsafe.Slice((*byte)(unsafe.Pointer(r.ptr)), int(r.len)))
 }
 
-// wvTakeString copies a returned UTF-8 run into a Go string and releases the
-// native allocation.
-func wvTakeString(ptr *C.uint8_t, n C.size_t) string {
-	s := wvBorrowString(ptr, n)
-	C.{{PREFIX}}_free_bytes(ptr, n)
+// wvTakeString copies a returned UTF-8 run into a Go string and releases
+// the run.
+func wvTakeString(r C.{{PREFIX}}_run) string {
+	s := wvBorrowString(r)
+	C.{{PREFIX}}_run_free(r)
 	return s
 }
 
-// wvBorrowBytes copies a borrowed byte run into Go memory. A run of length
-// 0 copies to an empty slice.
-func wvBorrowBytes(ptr *C.uint8_t, n C.size_t) []byte {
-	return wvBorrowSlice[byte](ptr, n)
+// wvBorrowBytes copies a borrowed byte run into a new, non-nil slice.
+func wvBorrowBytes(r C.{{PREFIX}}_run) []byte {
+	return wvBorrowSlice[byte](r)
 }
 
 // wvTakeBytes copies a returned byte run into Go memory and releases the
-// native allocation.
-func wvTakeBytes(ptr *C.uint8_t, n C.size_t) []byte {
-	b := wvBorrowBytes(ptr, n)
-	C.{{PREFIX}}_free_bytes(ptr, n)
-	return b
+// run.
+func wvTakeBytes(r C.{{PREFIX}}_run) []byte {
+	return wvTakeSlice[byte](r)
 }
 
-// wvHandOverString copies s into a run allocated with the native library's
-// allocator and writes it to a callback's return slots; the library adopts
-// the run.
-func wvHandOverString(s string, outPtr **C.uint8_t, outLen *C.size_t) {
-	wvHandOverSlice(unsafe.Slice(unsafe.StringData(s), len(s)), outPtr, outLen)
-}
-
-// wvHandOverBytes is wvHandOverString for a byte slice (raw bytes or an
-// encoded value buffer).
-func wvHandOverBytes(b []byte, outPtr **C.uint8_t, outLen *C.size_t) {
-	wvHandOverSlice(b, outPtr, outLen)
-}
-
-// ── Optional scalars and typed arrays ──
-
-// wvPresent splits an optional scalar into the presence flag and value a
-// call passes: (false, zero) for nil.
-func wvPresent[T any](v *T) (bool, T) {
-	if v == nil {
-		var zero T
-		return false, zero
-	}
-	return true, *v
-}
-
-// wvOptional joins a presence flag and value the library passed into an
-// optional scalar: nil when absent.
-func wvOptional[T any](present bool, v T) *T {
-	if !present {
-		return nil
-	}
-	return &v
-}
-
-// wvSliceIn returns a borrowed (pointer, count) view of s as an array of
-// the C element type E, which has T's size and layout, for the duration of
-// one call. The elements hold no Go pointers, and cgo keeps the memory in
-// place until the call returns.
-func wvSliceIn[E, T any](s []T) (*E, C.size_t) {
-	return (*E)(unsafe.Pointer(unsafe.SliceData(s))), C.size_t(len(s))
-}
-
-// wvBorrowSlice copies a borrowed array of n elements into a new slice. An
-// array of length 0 is never read.
-func wvBorrowSlice[T, E any](ptr *E, n C.size_t) []T {
-	out := make([]T, int(n))
+// wvBorrowSlice copies a borrowed typed array into a new, non-nil slice of
+// its elements. The library aligns the run for the element and sizes it in
+// whole elements; an empty run is never read.
+func wvBorrowSlice[T any](r C.{{PREFIX}}_run) []T {
+	var zero T
+	n := int(uintptr(r.len) / unsafe.Sizeof(zero))
+	out := make([]T, n)
 	if n > 0 {
-		copy(out, unsafe.Slice((*T)(unsafe.Pointer(ptr)), int(n)))
+		copy(out, unsafe.Slice((*T)(unsafe.Pointer(r.ptr)), n))
 	}
 	return out
 }
 
-// wvTakeSlice copies a returned array of n elements into a new slice and
-// releases the native allocation (n times the element size).
-func wvTakeSlice[T, E any](ptr *E, n C.size_t) []T {
-	out := wvBorrowSlice[T](ptr, n)
-	var elem E
-	C.{{PREFIX}}_free_bytes((*C.uint8_t)(unsafe.Pointer(ptr)), n*C.size_t(unsafe.Sizeof(elem)))
+// wvTakeSlice copies a returned typed array into a new slice and releases
+// the run.
+func wvTakeSlice[T any](r C.{{PREFIX}}_run) []T {
+	out := wvBorrowSlice[T](r)
+	C.{{PREFIX}}_run_free(r)
 	return out
 }
 
-// wvHandOverSlice copies v into a run allocated with the native library's
-// allocator and writes it and its element count to a callback's return
-// slots; the library adopts the run.
-func wvHandOverSlice[T, E any](v []T, outPtr **E, outLen *C.size_t) {
-	var elem E
-	size := C.size_t(len(v)) * C.size_t(unsafe.Sizeof(elem))
-	run := C.{{PREFIX}}_alloc(size)
+// wvAllocSlice copies v into a run allocated with the library's allocator,
+// which a callback method returns and the library adopts.
+func wvAllocSlice[T any](v []T) C.{{PREFIX}}_run {
+	var zero T
+	size := uintptr(len(v)) * unsafe.Sizeof(zero)
+	run := C.{{PREFIX}}_alloc(C.size_t(size))
 	if size > 0 {
 		if run == nil {
 			panic("{{PACKAGE}}: the native library couldn't allocate a callback result")
 		}
 		copy(unsafe.Slice((*T)(unsafe.Pointer(run)), len(v)), v)
 	}
-	*outPtr, *outLen = (*E)(unsafe.Pointer(run)), C.size_t(len(v))
+	return C.{{PREFIX}}_run{ptr: run, len: C.size_t(size)}
 }
 
+// wvAllocString is wvAllocSlice for a string's UTF-8 bytes.
+func wvAllocString(s string) C.{{PREFIX}}_run {
+	return wvAllocSlice(unsafe.Slice(unsafe.StringData(s), len(s)))
+}
+
+// ── Optional scalars ──
+
+// The converters between an optional scalar held as a Go pointer (nil for
+// absent) and the C optional the library passes ({has, value}).
+
+{{OPTIONALS}}
 // ── Objects ──
 
 // wvRef owns one strong reference to a native object. Calls borrow the

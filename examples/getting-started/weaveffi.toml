@@ -1,0 +1,6 @@
+# ANCHOR: config
+[project]
+input = "."
+out = "bindings"
+targets = ["c", "python"]
+# ANCHOR_END: config

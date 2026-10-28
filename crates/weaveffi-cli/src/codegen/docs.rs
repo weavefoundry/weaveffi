@@ -3,7 +3,7 @@
 //! IDL docs and deprecation messages name API declarations in backticks:
 //! `` deprecated: "Use `new_op` instead" ``. A target spells `new_op` its own
 //! way (`newOp` in Swift and Kotlin, `NewOp` in Go and .NET,
-//! `kv_kitchen_new_op` in C), so a message copied verbatim points at a name
+//! `kv_new_op` in C), so a message copied verbatim points at a name
 //! that doesn't exist in the generated API. [`rewrite`] replaces each
 //! backticked identifier through a closure the target supplies;
 //! [`ApiNames`] tells the closure what the identifier names, and [`Doc`]
@@ -42,14 +42,12 @@ use weaveffi_model::model::Model;
 /// What an API identifier names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum IdentKind {
-    /// A module (`kitchen`).
-    Module,
     /// A record, enum, interface, or callback interface (`Item`).
     Type,
     /// An error domain (`KitchenErrors`), which targets name through
     /// [`weaveffi_model::errors::type_name`].
     ErrorDomain,
-    /// A module-level function (`new_op`).
+    /// A free function (`new_op`).
     Function,
     /// An interface constructor, method, or static (`describe`).
     Member,
@@ -71,9 +69,8 @@ pub(crate) struct ApiName {
     /// What it is.
     pub(crate) kind: IdentKind,
     /// Its C ABI spelling, when it has its own: a callable's symbol, a
-    /// type's tag (a callback interface's vtable type), or an enum
-    /// variant's or error code's constant. `None` for modules, fields,
-    /// parameters, and callback methods.
+    /// type's tag, or an enum variant's or error code's constant. `None` for
+    /// fields, parameters, and callback methods.
     pub(crate) c_name: Option<String>,
 }
 
@@ -92,55 +89,52 @@ impl ApiNames {
     #[must_use]
     pub(crate) fn new(model: &Model) -> Self {
         let mut index = Self::default();
-        for m in &model.modules {
-            index.add(&m.name, IdentKind::Module, None);
-            for d in &m.errors {
-                index.add(&d.name, IdentKind::ErrorDomain, Some(&d.c_tag));
-                for c in &d.codes {
-                    index.add(&c.name, IdentKind::ErrorCode, Some(&c.c_const));
-                    for f in &c.fields {
-                        index.add(&f.name, IdentKind::Field, None);
-                    }
-                }
-            }
-            for e in &m.enums {
-                index.add(&e.name, IdentKind::Type, Some(&e.c_tag));
-                for v in &e.variants {
-                    index.add(&v.name, IdentKind::Variant, Some(&v.c_const));
-                    for f in &v.fields {
-                        index.add(&f.name, IdentKind::Field, None);
-                    }
-                }
-            }
-            for s in &m.structs {
-                index.add(&s.name, IdentKind::Type, Some(&s.c_tag));
-                for f in &s.fields {
+        for d in &model.errors {
+            index.add(&d.name, IdentKind::ErrorDomain, Some(&d.c_tag));
+            for c in &d.codes {
+                index.add(&c.name, IdentKind::ErrorCode, Some(&c.c_const));
+                for f in &c.fields {
                     index.add(&f.name, IdentKind::Field, None);
                 }
             }
-            for cb in &m.callback_interfaces {
-                index.add(&cb.name, IdentKind::Type, Some(&cb.vtable_tag));
-                for meth in &cb.methods {
-                    index.add(&meth.name, IdentKind::CallbackMethod, None);
-                    for p in &meth.params {
-                        index.add(&p.name, IdentKind::Param, None);
-                    }
+        }
+        for e in &model.enums {
+            index.add(&e.name, IdentKind::Type, Some(&e.c_tag));
+            for v in &e.variants {
+                index.add(&v.name, IdentKind::Variant, Some(&v.c_const));
+                for f in &v.fields {
+                    index.add(&f.name, IdentKind::Field, None);
                 }
             }
-            for i in &m.interfaces {
-                index.add(&i.name, IdentKind::Type, Some(&i.c_tag));
+        }
+        for r in &model.records {
+            index.add(&r.name, IdentKind::Type, Some(&r.c_tag));
+            for f in &r.fields {
+                index.add(&f.name, IdentKind::Field, None);
             }
-            let members = m.interfaces.iter().flat_map(|i| i.members());
-            let callables = m
-                .functions
-                .iter()
-                .map(|f| (f, IdentKind::Function))
-                .chain(members.map(|f| (f, IdentKind::Member)));
-            for (f, kind) in callables {
-                index.add(&f.name, kind, Some(&f.abi.symbol));
-                for p in &f.params {
+        }
+        for cb in &model.callbacks {
+            index.add(&cb.name, IdentKind::Type, Some(&cb.c_tag));
+            for meth in &cb.methods {
+                index.add(&meth.name, IdentKind::CallbackMethod, None);
+                for p in &meth.params {
                     index.add(&p.name, IdentKind::Param, None);
                 }
+            }
+        }
+        for i in &model.interfaces {
+            index.add(&i.name, IdentKind::Type, Some(&i.c_tag));
+        }
+        let members = model.interfaces.iter().flat_map(|i| i.members());
+        let callables = model
+            .functions
+            .iter()
+            .map(|f| (f, IdentKind::Function))
+            .chain(members.map(|f| (f, IdentKind::Member)));
+        for (f, kind) in callables {
+            index.add(&f.name, kind, Some(&f.abi.symbol));
+            for p in &f.params {
+                index.add(&p.name, IdentKind::Param, None);
             }
         }
         index
@@ -308,34 +302,31 @@ mod tests {
     fn indexes_every_declaration_kind() {
         let model = test_model(
             r#"
-version: "0.12.0"
-modules:
-  - name: kv
-    errors:
-      - name: KvError
-        codes: [{ name: NotFound, code: 1, message: missing }]
-    enums:
-      - name: Mode
-        variants: [{ name: Fast, value: 0 }]
-    structs:
-      - name: Entry
-        fields: [{ name: key, type: string }]
-    interfaces:
-      - name: Store
-        methods:
-          - { name: get, params: [{ name: key, type: string }], return: Entry }
-    functions:
-      - { name: open, params: [{ name: path, type: string }], return: Store }
+version: "0.13.0"
+errors:
+  - name: KvError
+    codes: [{ name: NotFound, code: 1, message: missing }]
+enums:
+  - name: Mode
+    variants: [{ name: Fast }]
+records:
+  - name: Entry
+    fields: [{ name: key, type: string }]
+interfaces:
+  - name: Store
+    methods:
+      - { name: get, params: [{ name: key, type: string }], return: Entry }
+functions:
+  - { name: open, params: [{ name: path, type: string }], return: Store }
 "#,
         );
         let names = ApiNames::new(&model);
-        assert_eq!(names.kind("kv"), Some(IdentKind::Module));
         assert_eq!(names.kind("KvError"), Some(IdentKind::ErrorDomain));
-        assert_eq!(names.c_name("NotFound"), Some("kv_kv_KvError_NotFound"));
-        assert_eq!(names.c_name("Fast"), Some("kv_kv_Mode_Fast"));
-        assert_eq!(names.c_name("Store"), Some("kv_kv_Store"));
-        assert_eq!(names.c_name("get"), Some("kv_kv_Store_get"));
-        assert_eq!(names.c_name("open"), Some("kv_kv_open"));
+        assert_eq!(names.c_name("NotFound"), Some("kv_KvError_NotFound"));
+        assert_eq!(names.c_name("Fast"), Some("kv_Mode_Fast"));
+        assert_eq!(names.c_name("Store"), Some("kv_Store"));
+        assert_eq!(names.c_name("get"), Some("kv_Store_get"));
+        assert_eq!(names.c_name("open"), Some("kv_open"));
         // `key` is both a field and a parameter.
         assert_eq!(names.get("key").len(), 2);
         assert_eq!(names.kind("key"), None);

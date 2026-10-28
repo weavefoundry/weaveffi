@@ -14,9 +14,8 @@
 //! * the RubyGems platform string (`arm64-darwin`, …).
 //!
 //! A [`BinarySet`] records, per [`Platform`], the files `weaveffi build` laid
-//! out in `target/weaveffi/<platform>/`: the producer library plus any
-//! prebuilt glue (the Node.js addon, the JNI shim, the static library an
-//! `XCFramework` needs). The [`crate::package`] driver and every packaging
+//! out in `target/weaveffi/<platform>/`: the producer library plus the
+//! static library an `XCFramework` needs and the import library MSVC links. The [`crate::package`] driver and every packaging
 //! backend consume it.
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -428,20 +427,6 @@ impl Platform {
     }
 }
 
-/// The Node.js addon's base name for a library: `{library}_node`, built as
-/// `{library}_node.node`.
-#[must_use]
-pub fn node_addon_name(library: &str) -> String {
-    format!("{library}_node")
-}
-
-/// The JNI shim's base name for a library: `{library}_jni`, built as
-/// `lib{library}_jni.so` (or `.dylib`, or `.dll`).
-#[must_use]
-pub fn jni_shim_name(library: &str) -> String {
-    format!("{library}_jni")
-}
-
 /// The newest glibc version the Linux shared library at `path` needs, read
 /// from the `GLIBC_2.x` version needs in its `.gnu.version_r` section, and
 /// never older than 2.17 (the oldest glibc Rust supports).
@@ -518,10 +503,6 @@ pub struct NativeBinary {
     /// The import library (`{library}.dll.lib`) MSVC links a DLL through, on
     /// Windows.
     pub import_library: Option<Utf8PathBuf>,
-    /// The prebuilt Node.js addon (`{library}_node.node`).
-    pub node_addon: Option<Utf8PathBuf>,
-    /// The prebuilt JNI shim (`lib{library}_jni.so`, `.dylib`, or `.dll`).
-    pub jni_shim: Option<Utf8PathBuf>,
 }
 
 impl NativeBinary {
@@ -532,8 +513,6 @@ impl NativeBinary {
             library: library.into(),
             staticlib: None,
             import_library: None,
-            node_addon: None,
-            jni_shim: None,
         }
     }
 
@@ -557,10 +536,6 @@ impl NativeBinary {
         };
         if platform.os() == Os::Windows {
             binary.import_library = existing(format!("{lib_name}.dll.lib"));
-        }
-        binary.node_addon = existing(format!("{}.node", node_addon_name(lib_name)));
-        if !matches!(platform.os(), Os::Ios | Os::Wasm) {
-            binary.jni_shim = existing(platform.lib_filename(&jni_shim_name(lib_name)));
         }
         Some(binary)
     }
@@ -798,12 +773,7 @@ mod tests {
         let linux = root.join("linux-x64");
         std::fs::create_dir_all(&mac).unwrap();
         std::fs::create_dir_all(&linux).unwrap();
-        for f in [
-            "libcontacts.dylib",
-            "libcontacts.a",
-            "contacts_node.node",
-            "libcontacts_jni.dylib",
-        ] {
+        for f in ["libcontacts.dylib", "libcontacts.a"] {
             std::fs::write(mac.join(f), b"x").unwrap();
         }
         std::fs::write(linux.join("libcontacts.so"), b"x").unwrap();
@@ -815,9 +785,8 @@ mod tests {
             m.staticlib.as_deref(),
             Some(mac.join("libcontacts.a").as_path())
         );
-        assert!(m.node_addon.is_some() && m.jni_shim.is_some());
         let l = set.get(Platform::LinuxX64).unwrap();
-        assert!(l.staticlib.is_none() && l.node_addon.is_none() && l.jni_shim.is_none());
+        assert!(l.staticlib.is_none());
 
         let err = BinarySet::read_dir(root, "contacts", Some(&[Platform::WindowsX64])).unwrap_err();
         assert!(err.to_string().contains("contacts.dll"), "{err}");

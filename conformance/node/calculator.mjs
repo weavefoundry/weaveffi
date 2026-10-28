@@ -9,8 +9,9 @@
 
 import { expect, finish, live, load, same, throws } from './harness.mjs';
 
-const api = await load('calculator');
-const { calculator, CalculatorError } = api;
+// Every declaration is a named export of the package.
+const calculator = await load('calculator');
+const { CalculatorError } = calculator;
 
 const I32_MAX = 2147483647;
 const I32_MIN = -2147483648;

@@ -1,5 +1,7 @@
-error[E0432]: unresolved import `crate`
- --> tests/ui/fail_missing_export_runtime.rs:5:9
+error[E0433]: cannot find `__weaveffi` in the crate root
+ --> tests/ui/fail_missing_export_runtime.rs:4:1
   |
-5 | pub mod api {
-  |         ^^^ no `__weaveffi_runtime` in the root
+4 | #[weaveffi::export]
+  | ^^^^^^^^^^^^^^^^^^^ could not find `__weaveffi` in the crate root
+  |
+  = note: this error originates in the attribute macro `weaveffi::export` (in Nightly builds, run with -Z macro-backtrace for more info)

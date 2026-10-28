@@ -1,11 +1,10 @@
-#[weaveffi::module]
-mod bad {
-    pub struct Token;
+//! A raw pointer has no owner the ABI can name; an object is an interface.
 
-    #[weaveffi::export]
-    pub fn open() -> *mut Token {
-        std::ptr::null_mut()
-    }
+pub struct Token;
+
+#[weaveffi::export]
+pub fn open() -> *mut Token {
+    std::ptr::null_mut()
 }
 
 weaveffi::export_runtime!();

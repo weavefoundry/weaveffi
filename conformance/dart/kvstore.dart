@@ -2,8 +2,8 @@
 //
 // Drives the feature-complete producer through the generated bindings:
 //
-//   * the load-time checks (ABI revision, both modules' contract tables),
-//     which loading the bindings performs;
+//   * the load-time checks (ABI revision, every declaration's contract
+//     function), which loading the bindings performs;
 //   * `Store`: fallible and infallible constructors (`Store.open`, `Store()`),
 //     methods, statics, the deprecated `size()`, the `Entry` and `StoreInfo`
 //     value classes, the `EntryKind` enum, maps and optionals, the logical
@@ -33,10 +33,10 @@
 //     method cancelled mid-pause (completing at once with
 //     `CancelledException` while its background work stops cooperatively,
 //     shown by `activeJobs`), an async list launched concurrently, async
-//     optional-scalar and typed-array results, and an async function in the
-//     nested `kv.stats` module;
-//   * the sibling `report` root (the shared `Entry` record and its own error
-//     domain).
+//     optional-scalar and typed-array results, and an async free function
+//     taking a list of objects;
+//   * the stats and report functions (the shared `Entry` record and a second
+//     error domain).
 //
 // Releases of consumer callbacks are observed through the producer's
 // callback counter (`debug_live(1)`). Ends by asserting the producer's leak
@@ -725,7 +725,7 @@ Future<void> asyncCalls() async {
     );
   }
 
-  // The nested module's async function: objects in a list in, a record out.
+  // An async free function: objects in a list in, a record out.
   final other = Store.open('/other');
   other.putText('a', '123');
   final st = await summarizeAll([s, other]);
@@ -900,7 +900,7 @@ void statsAndReport() {
   s.putText('a', '123');
   s.putText('c', 'x', EntryKind.encrypted);
 
-  // kv.stats: the parent's Store as a parameter, the parent's error domain.
+  // summarize: a Store as a parameter, the KvError domain.
   final st = summarize(s, null);
   expect(
     st ==
@@ -913,7 +913,7 @@ void statsAndReport() {
   );
   expectKeyNotFound('q', () => summarize(s, 'q'));
 
-  // report: the sibling root shares the Entry record.
+  // renderReport: the shared Entry record and the ReportError domain.
   final lines = renderReport(s.entries(null).toList());
   expect(
     listEquals(lines, [

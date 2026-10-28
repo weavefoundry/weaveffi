@@ -9,7 +9,7 @@
 //! what `generate --check` reports, and what `generate --diff` prints. A
 //! plan rewrites only files whose contents changed and removes files a
 //! previous run wrote that the current run no longer produces (see the
-//! generation records in `.weaveffi-cache/`).
+//! generation records in `.weaveffi/`).
 //!
 //! The submodules are the **shared emitters** every target renders through
 //! instead of keeping its own copy:
@@ -23,9 +23,9 @@
 //! - `common`: doc-comment emission, prose wrapping, and `PascalCase`.
 //! - [`CodeWriter`]: the indentation-aware writer.
 //!
-//! None of them matches on a value's family or re-derives lowering: the
-//! passing contracts (`ArgPass`, `RetPass`, `ErrorStrategy`, ...) stored on
-//! the [`Model`] say how every value crosses.
+//! In ABI revision 6 every value crosses as one C value chosen by its
+//! [`Family`](weaveffi_model::ty::Family), so a target marshals each value
+//! by its type alone.
 
 use std::fmt::Write as _;
 
@@ -43,6 +43,7 @@ pub(crate) mod common;
 pub(crate) mod contract;
 pub(crate) mod docs;
 pub(crate) mod errors;
+pub(crate) mod values;
 mod writer;
 
 pub use writer::CodeWriter;
@@ -459,6 +460,7 @@ fn plan_target(target: &dyn Target, model: &Model, out_dir: &Utf8Path) -> Result
 
 /// Parse and validate a YAML IDL for a unit test, with identity `kv`.
 #[cfg(test)]
+#[track_caller]
 pub(crate) fn test_model(yaml: &str) -> Model {
     let api = weaveffi_model::parse::parse_api_str(yaml, "yaml").expect("valid YAML");
     let identity = weaveffi_model::pkg::Identity::named("kv");
@@ -470,7 +472,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use weaveffi_model::ir::{Api, Module};
+    use weaveffi_model::ir::{Api, Function};
 
     struct Counting {
         name: &'static str,
@@ -490,27 +492,18 @@ mod tests {
                 .unwrap()
                 .iter()
                 .map(|f| {
-                    OutputFile::new(*f, format!("{} {}", model.prefix(), model.modules[0].name))
+                    OutputFile::new(
+                        *f,
+                        format!("{} {}", model.prefix(), model.functions[0].name),
+                    )
                 })
                 .collect()
         }
     }
 
     fn model_named(name: &str) -> Model {
-        let api = Api {
-            version: weaveffi_model::ir::CURRENT_SCHEMA_VERSION.into(),
-            modules: vec![Module {
-                name: name.into(),
-                doc: None,
-                functions: vec![],
-                interfaces: vec![],
-                structs: vec![],
-                enums: vec![],
-                callback_interfaces: vec![],
-                errors: Vec::new(),
-                modules: vec![],
-            }],
-        };
+        let mut api = Api::new();
+        api.functions.push(Function::named(name));
         let identity = weaveffi_model::pkg::Identity::named("api");
         weaveffi_model::validate::validate(&api, &identity, None).unwrap()
     }

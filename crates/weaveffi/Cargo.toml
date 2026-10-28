@@ -12,6 +12,7 @@ categories = ["development-tools::ffi"]
 
 [dependencies]
 weaveffi-macros = { workspace = true }
+anyhow = { version = "1", optional = true }
 
 # Tokio has no multi-thread runtime on wasm32, where async calls are polled
 # inline instead, so the dependency (and the `tokio` feature's effect) is
@@ -31,6 +32,8 @@ leak-check = []
 # runtime created on first use. Without it, each call runs on a thread of
 # its own. `set_spawner` overrides either.
 tokio = ["dep:tokio"]
+# Let an exported function return `Result<T, anyhow::Error>` (`throws any`).
+anyhow = ["dep:anyhow"]
 
 [dev-dependencies]
 # The leak-counter test needs counting on. A path-only self dependency turns
@@ -39,6 +42,9 @@ tokio = ["dep:tokio"]
 # `--no-default-features` tests the thread-per-call executor.
 weaveffi = { path = ".", default-features = false, features = ["leak-check"] }
 proptest = "1.11.0"
+# The contract tests compare each contract function with the hash the
+# model computes from the same API in the IDL.
+weaveffi-model = { workspace = true, features = ["idl"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
 
 [lints]

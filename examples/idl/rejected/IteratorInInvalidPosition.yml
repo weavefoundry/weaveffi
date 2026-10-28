@@ -1,0 +1,6 @@
+# rejected: IteratorInInvalidPosition
+version: "0.13.0"
+functions:
+  - name: consume
+    params:
+      - { name: items, type: "iter<i32>" }

@@ -1,5 +1,47 @@
-error: weaveffi: `Box` cannot cross the FFI boundary; objects and callback interfaces are shared, so spell them as `Arc<T>` / `Arc<dyn Trait>`
- --> tests/ui/fail_box_param.rs:7:20
+error[E0277]: `Box<Widget>` can't cross the WeaveFFI C ABI
+ --> tests/ui/fail_box_param.rs:8:16
   |
-7 |     pub fn take(w: Box<Widget>) {
-  |                    ^^^
+8 | pub fn take(w: Box<Widget>) {
+  |                ^^^ not a WeaveFFI value type
+  |
+  = help: the trait `weaveffi::rt::types::FfiType<Tag>` is not implemented for `Box<Widget>`
+  = note: a value is a scalar (`i32`, `f64`, `bool`, `usize`, ...), `char`, `String`, `Vec<T>`, `Option<T>`, a `HashMap` or `BTreeMap`, a `#[weaveffi::record]`, a `#[weaveffi::enumeration]`, a `#[weaveffi::custom]` type, or a `#[weaveffi::interface]` as `Arc<T>`
+  = note: a parameter may also be borrowed (`&str`, `&[T]`, `&T`), and only a whole return may be a `weaveffi::Iter<T>`
+help: the trait `weaveffi::rt::types::FfiType<Tag>` is implemented for `Arc<Widget>`
+ --> tests/ui/fail_box_param.rs:4:1
+  |
+4 | #[weaveffi::interface]
+  | ^^^^^^^^^^^^^^^^^^^^^^
+  = note: this error originates in the macro `::weaveffi::__weaveffi_interface` which comes from the expansion of the attribute macro `weaveffi::interface` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `Box<Widget>` can't cross the WeaveFFI C ABI
+ --> tests/ui/fail_box_param.rs:8:16
+  |
+8 | pub fn take(w: Box<Widget>) {
+  |                ^^^^^^^^^^^ not a WeaveFFI value type
+  |
+  = help: the trait `weaveffi::rt::types::FfiType<Tag>` is not implemented for `Box<Widget>`
+  = note: a value is a scalar (`i32`, `f64`, `bool`, `usize`, ...), `char`, `String`, `Vec<T>`, `Option<T>`, a `HashMap` or `BTreeMap`, a `#[weaveffi::record]`, a `#[weaveffi::enumeration]`, a `#[weaveffi::custom]` type, or a `#[weaveffi::interface]` as `Arc<T>`
+  = note: a parameter may also be borrowed (`&str`, `&[T]`, `&T`), and only a whole return may be a `weaveffi::Iter<T>`
+help: the trait `weaveffi::rt::types::FfiType<Tag>` is implemented for `Arc<Widget>`
+ --> tests/ui/fail_box_param.rs:4:1
+  |
+4 | #[weaveffi::interface]
+  | ^^^^^^^^^^^^^^^^^^^^^^
+  = note: this error originates in the macro `::weaveffi::__weaveffi_interface` which comes from the expansion of the attribute macro `weaveffi::interface` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `Box<Widget>` can't cross the WeaveFFI C ABI
+ --> tests/ui/fail_box_param.rs:7:1
+  |
+7 | #[weaveffi::export]
+  | ^^^^^^^^^^^^^^^^^^^ not a WeaveFFI value type
+  |
+  = help: the trait `weaveffi::rt::types::FfiType<Tag>` is not implemented for `Box<Widget>`
+  = note: a value is a scalar (`i32`, `f64`, `bool`, `usize`, ...), `char`, `String`, `Vec<T>`, `Option<T>`, a `HashMap` or `BTreeMap`, a `#[weaveffi::record]`, a `#[weaveffi::enumeration]`, a `#[weaveffi::custom]` type, or a `#[weaveffi::interface]` as `Arc<T>`
+  = note: a parameter may also be borrowed (`&str`, `&[T]`, `&T`), and only a whole return may be a `weaveffi::Iter<T>`
+help: the trait `weaveffi::rt::types::FfiType<Tag>` is implemented for `Arc<Widget>`
+ --> tests/ui/fail_box_param.rs:4:1
+  |
+4 | #[weaveffi::interface]
+  | ^^^^^^^^^^^^^^^^^^^^^^
+  = note: this error originates in the attribute macro `weaveffi::export` which comes from the expansion of the attribute macro `weaveffi::interface` (in Nightly builds, run with -Z macro-backtrace for more info)

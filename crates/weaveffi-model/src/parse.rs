@@ -1,10 +1,16 @@
 //! Multi-format IDL parsing: turn YAML or JSON source text into an [`Api`].
 //!
-//! [`parse_api_str`] is the entry point. On failure it returns a [`ParseError`]
-//! that carries the source text and, where available, a `miette` span, so the
-//! CLI can render a caret-annotated diagnostic at the offending line and column.
+//! [`parse_api_str`] parses one document. [`load_api`] reads a document from
+//! disk with every file it imports, merged into one [`Api`]. On failure each
+//! returns a [`ParseError`] that carries the source text and, where
+//! available, a `miette` span, so the CLI can render a caret-annotated
+//! diagnostic at the offending line and column.
 
-use crate::ir::Api;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use crate::ir::{Api, CURRENT_SCHEMA_VERSION};
+use crate::validate::Sources;
 use miette::{Diagnostic, SourceSpan};
 
 /// Everything that can go wrong while turning IDL source text into an [`Api`].
@@ -56,6 +62,42 @@ pub enum ParseError {
         /// Byte span of the offending location within `src`, when known.
         #[label("here")]
         span: Option<SourceSpan>,
+    },
+    /// An IDL file couldn't be read.
+    #[error("failed to read {path}: {message}")]
+    #[diagnostic(help("check that the file exists and is readable"))]
+    Io {
+        /// The file.
+        path: String,
+        /// The I/O error.
+        message: String,
+    },
+    /// The file's extension names no IDL format.
+    #[error("{path} isn't an IDL file")]
+    #[diagnostic(help("an IDL file ends in .yml, .yaml, or .json"))]
+    UnknownExtension {
+        /// The file.
+        path: String,
+    },
+    /// An import chain leads back to a file it started from.
+    #[error("import cycle: {chain}")]
+    #[diagnostic(help(
+        "an imported file can't import, directly or indirectly, a file importing it"
+    ))]
+    ImportCycle {
+        /// The files of the cycle, joined with ` -> `.
+        chain: String,
+    },
+    /// An imported file declares a schema version other than its importer's.
+    #[error("{path} declares schema version {found}, but this tool reads {expected}")]
+    #[diagnostic(help("every file of an API declares the current schema version"))]
+    ImportVersion {
+        /// The imported file.
+        path: String,
+        /// The version it declares.
+        found: String,
+        /// The version this tool reads.
+        expected: String,
     },
 }
 
@@ -148,78 +190,141 @@ pub fn parse_api_str(s: &str, format: &str) -> Result<Api, ParseError> {
     }
 }
 
+/// The IDL format of a file, from its extension (`yaml` for `.yml` and
+/// `.yaml`, `json` for `.json`).
+#[must_use]
+pub fn format_of(path: &Path) -> Option<&'static str> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("yml" | "yaml") => Some("yaml"),
+        Some("json") => Some("json"),
+        _ => None,
+    }
+}
+
+/// Read the IDL document at `path` and every file it imports, recursively,
+/// merged into one [`Api`] (the root's `version`, `doc`, and `imports`,
+/// every file's declarations), with the [`Sources`] that locate each
+/// declaration's diagnostics. A file imported twice is read once.
+///
+/// # Errors
+///
+/// Returns an error when a file can't be read, has no IDL extension, fails
+/// to parse, declares another schema version than the root, or imports a
+/// file importing it.
+pub fn load_api(path: &Path) -> Result<(Api, Sources), ParseError> {
+    let mut sources = Sources::default();
+    let mut done = BTreeSet::new();
+    let mut chain = Vec::new();
+    let root = load(path, &mut sources, &mut done, &mut chain)?;
+    let mut api = root.0;
+    for imported in root.1 {
+        api.merge(imported);
+    }
+    Ok((api, sources))
+}
+
+/// Load `path` (recording it in `sources`) and every file it imports,
+/// returning its own document and the flattened imported documents.
+fn load(
+    path: &Path,
+    sources: &mut Sources,
+    done: &mut BTreeSet<PathBuf>,
+    chain: &mut Vec<PathBuf>,
+) -> Result<(Api, Vec<Api>), ParseError> {
+    let display = path.display().to_string();
+    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if chain.contains(&key) {
+        let mut names: Vec<String> = chain.iter().map(|p| p.display().to_string()).collect();
+        names.push(key.display().to_string());
+        return Err(ParseError::ImportCycle {
+            chain: names.join(" -> "),
+        });
+    }
+    let format = format_of(path).ok_or_else(|| ParseError::UnknownExtension {
+        path: display.clone(),
+    })?;
+    let text = std::fs::read_to_string(path).map_err(|e| ParseError::Io {
+        path: display.clone(),
+        message: e.to_string(),
+    })?;
+    let api = parse_api_str(&text, format)?;
+    let index = sources.files.len();
+    for name in api.declaration_names() {
+        sources.origin.entry(name.to_string()).or_insert(index);
+    }
+    sources.files.push((display, text));
+    done.insert(key.clone());
+    chain.push(key);
+    let base = path.parent().unwrap_or_else(|| Path::new(""));
+    let mut imported = Vec::new();
+    for import in &api.imports {
+        let child = base.join(import);
+        let child_key = child.canonicalize().unwrap_or_else(|_| child.clone());
+        if done.contains(&child_key) && !chain.contains(&child_key) {
+            continue;
+        }
+        let (doc, nested) = load(&child, sources, done, chain)?;
+        if doc.version != CURRENT_SCHEMA_VERSION {
+            return Err(ParseError::ImportVersion {
+                path: child.display().to_string(),
+                found: doc.version,
+                expected: CURRENT_SCHEMA_VERSION.to_string(),
+            });
+        }
+        imported.push(doc);
+        imported.extend(nested);
+    }
+    chain.pop();
+    Ok((api, imported))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{Function, Module, Param, TypeRef, CURRENT_SCHEMA_VERSION};
+    use crate::ir::{Function, Param, TypeRef};
     use crate::ty::Prim;
 
     fn expected_api() -> Api {
-        Api {
-            version: CURRENT_SCHEMA_VERSION.to_string(),
-            modules: vec![Module {
-                name: "math".to_string(),
-                doc: None,
-                functions: vec![Function {
-                    name: "add".to_string(),
-                    params: vec![
-                        Param {
-                            name: "a".to_string(),
-                            ty: TypeRef::Prim(Prim::I32),
-                            doc: None,
-                        },
-                        Param {
-                            name: "b".to_string(),
-                            ty: TypeRef::Prim(Prim::I32),
-                            doc: None,
-                        },
-                    ],
-                    returns: Some(TypeRef::Prim(Prim::I32)),
-                    doc: Some("Adds two numbers".to_string()),
-                    throws: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                }],
-                interfaces: vec![],
-                callback_interfaces: vec![],
-                structs: vec![],
-                enums: vec![],
-                errors: vec![],
-                modules: vec![],
-            }],
-        }
+        let mut api = Api::new();
+        api.functions.push(Function {
+            params: vec![
+                Param {
+                    name: "a".to_string(),
+                    ty: TypeRef::Prim(Prim::I32),
+                    doc: None,
+                },
+                Param {
+                    name: "b".to_string(),
+                    ty: TypeRef::Prim(Prim::I32),
+                    doc: None,
+                },
+            ],
+            returns: Some(TypeRef::Prim(Prim::I32)),
+            doc: Some("Adds two numbers".to_string()),
+            ..Function::named("add")
+        });
+        api
     }
 
     #[test]
     fn every_format_parses_the_same_document() {
         let yaml = r#"
-version: "0.12.0"
-modules:
-  - name: math
-    functions:
-      - name: add
-        params:
-          - name: a
-            type: i32
-          - name: b
-            type: i32
-        return: i32
-        doc: "Adds two numbers"
+version: "0.13.0"
+functions:
+  - name: add
+    params:
+      - { name: a, type: i32 }
+      - { name: b, type: i32 }
+    return: i32
+    doc: "Adds two numbers"
 "#;
         let json = r#"{
-            "version": "0.12.0",
-            "modules": [{
-                "name": "math",
-                "functions": [{
-                    "name": "add",
-                    "params": [
-                        {"name": "a", "type": "i32"},
-                        {"name": "b", "type": "i32"}
-                    ],
-                    "return": "i32",
-                    "doc": "Adds two numbers"
-                }]
+            "version": "0.13.0",
+            "functions": [{
+                "name": "add",
+                "params": [{"name": "a", "type": "i32"}, {"name": "b", "type": "i32"}],
+                "return": "i32",
+                "doc": "Adds two numbers"
             }]
         }"#;
         assert_eq!(parse_api_str(yaml, "yaml").unwrap(), expected_api());
@@ -232,10 +337,6 @@ modules:
         assert!(matches!(
             parse_api_str("", "xml"),
             Err(ParseError::UnsupportedFormat(f)) if f == "xml"
-        ));
-        assert!(matches!(
-            parse_api_str("version = \"0.12.0\"", "toml"),
-            Err(ParseError::UnsupportedFormat(f)) if f == "toml"
         ));
     }
 
@@ -251,7 +352,7 @@ modules:
 
     #[test]
     fn parse_errors_carry_spans() {
-        let yaml = "version: \"0.12.0\"\nmodules:\n  - name: [oops\n";
+        let yaml = "version: \"0.13.0\"\nfunctions:\n  - name: [oops\n";
         match parse_api_str(yaml, "yaml").unwrap_err() {
             ParseError::Yaml { line, span, .. } => {
                 assert!(line > 0);
@@ -263,12 +364,49 @@ modules:
             ParseError::Json { line, column, .. } => assert!(line > 0 && column > 0),
             other => panic!("expected JSON error, got {other:?}"),
         }
+        let yaml = "version: \"0.13.0\"\nfunctions:\n  - name: f\n    params: [{ name: x, type: \"{string}\" }]\n";
+        let err = parse_api_str(yaml, "yaml").unwrap_err();
+        assert!(err.to_string().contains("map type missing"), "{err}");
     }
 
     #[test]
-    fn unknown_type_syntax_is_a_parse_error() {
-        let yaml = "version: \"0.12.0\"\nmodules:\n  - name: m\n    functions:\n      - name: f\n        params: [{ name: x, type: \"{string}\" }]\n";
-        let err = parse_api_str(yaml, "yaml").unwrap_err();
-        assert!(err.to_string().contains("map type missing"), "{err}");
+    fn imports_merge_into_one_namespace_and_cycles_are_errors() {
+        let dir = std::env::temp_dir().join(format!("weaveffi-imports-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let write = |name: &str, text: &str| std::fs::write(dir.join(name), text).unwrap();
+        write(
+            "api.yml",
+            "version: \"0.13.0\"\nimports: [sub/types.yml, other.yml]\nfunctions: [{ name: get, return: Item }]\n",
+        );
+        write(
+            "sub/types.yml",
+            "version: \"0.13.0\"\nimports: [../other.yml]\nrecords: [{ name: Item, fields: [{ name: id, type: u64 }] }]\n",
+        );
+        write(
+            "other.yml",
+            "version: \"0.13.0\"\nfunctions: [{ name: ping }]\n",
+        );
+        let (api, sources) = load_api(&dir.join("api.yml")).unwrap();
+        let names: Vec<&str> = api.declaration_names().collect();
+        assert_eq!(names, ["Item", "get", "ping"]);
+        assert_eq!(sources.files.len(), 3);
+        assert!(sources
+            .file_of(Some("Item"))
+            .unwrap()
+            .0
+            .ends_with("types.yml"));
+        assert!(sources
+            .file_of(Some("ping"))
+            .unwrap()
+            .0
+            .ends_with("other.yml"));
+
+        write(
+            "other.yml",
+            "version: \"0.13.0\"\nimports: [api.yml]\nfunctions: [{ name: ping }]\n",
+        );
+        let err = load_api(&dir.join("api.yml")).unwrap_err();
+        assert!(matches!(err, ParseError::ImportCycle { .. }), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

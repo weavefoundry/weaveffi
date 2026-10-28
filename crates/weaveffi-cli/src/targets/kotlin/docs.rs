@@ -24,8 +24,8 @@ impl<'a> Speller<'a> {
     }
 
     /// The Kotlin spelling of `ident`, or `None` to keep it as written (an
-    /// identifier naming several kinds of declaration, a module, a variant,
-    /// or an error code).
+    /// identifier naming several kinds of declaration, a variant, or an
+    /// error code).
     pub(crate) fn spell(&self, ident: &str) -> Option<String> {
         match self.api.kind(ident)? {
             IdentKind::Function | IdentKind::Member | IdentKind::CallbackMethod => {
@@ -34,7 +34,7 @@ impl<'a> Speller<'a> {
             IdentKind::Param | IdentKind::Field => Some(kt_param(ident)),
             IdentKind::Type => Some(self.names.ty(ident)),
             IdentKind::ErrorDomain => Some(self.names.exception(ident).to_string()),
-            IdentKind::Module | IdentKind::Variant | IdentKind::ErrorCode => None,
+            IdentKind::Variant | IdentKind::ErrorCode => None,
         }
     }
 

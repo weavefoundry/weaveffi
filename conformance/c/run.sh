@@ -41,17 +41,20 @@ c_producer_exports() {
         || { echo "producer compile failed" >&2; return 1; }
     local syms
     syms=$(nm -g --defined-only "$lib" 2>/dev/null) || syms=$(nm -gU "$lib" 2>/dev/null)
+    # Every contract function the header declares (one per declaration).
+    local contracts
+    contracts=$(grep -o 'calculator_contract_[0-9a-f]\{16\}' "$incdir/calculator.h" | sort -u)
+    [ -n "$contracts" ] || { echo "no contract functions in calculator.h" >&2; return 1; }
     local sym
-    for sym in calculator_calculator_add calculator_calculator_divide \
-        calculator_calculator_greet calculator_calculator_parse \
-        calculator_calculator_sqrt calculator_calculator_mean \
-        calculator_calculator_running_total \
-        calculator_abi_version calculator_calculator_contract \
+    # shellcheck disable=SC2086
+    for sym in calculator_add calculator_divide calculator_greet calculator_parse \
+        calculator_sqrt calculator_mean calculator_running_total \
+        calculator_abi_version \
         calculator_error_set calculator_error_set_payload calculator_error_clear \
-        calculator_error_free calculator_alloc calculator_free_bytes \
+        calculator_error_free calculator_alloc calculator_run_free \
         calculator_cancel_token_create \
         calculator_cancel_token_cancel calculator_cancel_token_is_cancelled \
-        calculator_cancel_token_destroy calculator_debug_live; do
+        calculator_cancel_token_destroy calculator_debug_live $contracts; do
         if ! printf '%s\n' "$syms" | grep -Eq "(^| )_?${sym}\$"; then
             echo "symbol '$sym' not exported under hidden visibility from $lib" >&2
             printf '%s\n' "$syms" | head -40 >&2

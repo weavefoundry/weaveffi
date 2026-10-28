@@ -1,16 +1,21 @@
-#[weaveffi::module]
-mod bad {
-    use std::cell::Cell;
+//! An object is shared across threads, so an interface must be `Send` and
+//! `Sync`.
 
-    #[weaveffi::interface]
-    pub struct Counter {
-        n: Cell<i32>,
+use std::cell::Cell;
+
+#[weaveffi::interface]
+pub struct Counter {
+    n: Cell<i32>,
+}
+
+#[weaveffi::export]
+impl Counter {
+    pub fn new() -> Self {
+        Self { n: Cell::new(0) }
     }
 
-    impl Counter {
-        pub fn new() -> Self {
-            Self { n: Cell::new(0) }
-        }
+    pub fn get(&self) -> i32 {
+        self.n.get()
     }
 }
 

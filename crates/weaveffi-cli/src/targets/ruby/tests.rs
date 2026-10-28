@@ -1,10 +1,10 @@
 //! Target-specific unit tests: the gem layout and configuration, the
-//! runtime's substitutions, Ruby naming and escaping, the private
-//! boundary, and packaging. The `kitchen_sink` snapshot pins everything
-//! else.
+//! runtime's substitutions, how each kind of value crosses, Ruby naming and
+//! escaping, the private boundary, and packaging. The `kitchen_sink`
+//! snapshot pins everything else.
 
-use weaveffi_model::ir::Api;
 use weaveffi_model::model::Model;
+use weaveffi_model::parse::parse_api_str;
 use weaveffi_model::pkg::Identity;
 use weaveffi_model::validate::validate;
 
@@ -16,45 +16,50 @@ use crate::targets::Target;
 
 /// An interface, a callback interface, a record and an error code with
 /// fields named like the methods records and errors rely on, types named
-/// like constants the bindings use, members named like wrapper methods, and
-/// a cancellable function with a `cancel` parameter.
+/// like constants the bindings use, members named like wrapper methods, a
+/// cancellable function with a `cancel` parameter, and one value of every
+/// crossing.
 const FIXTURE: &str = r#"
-version: "0.12.0"
-modules:
-  - name: shop
-    errors:
-      - name: Error
-        codes:
-          - { name: Broken, code: 1, message: "broken", fields: [{ name: code, type: i32 }, { name: message, type: string }] }
-    structs:
-      - name: Data
-        fields:
-          - { name: hash, type: i64 }
-          - { name: end, type: i32 }
-    interfaces:
-      - name: Cart
-        constructors:
-          - { name: allocate, params: [] }
-        methods:
-          - { name: close, params: [], return: bool }
-          - { name: initialize, params: [] }
-          - { name: name, params: [], return: string }
-        statics:
-          - { name: new, params: [], return: Cart }
-          - { name: label, params: [], return: string }
-    callback_interfaces:
-      - name: Watcher
-        methods:
-          - { name: hash, params: [{ name: end, type: i32 }], return: i64 }
-    functions:
+version: "0.13.0"
+errors:
+  - name: Error
+    codes:
+      - { name: Broken, code: 1, message: "broken", fields: [{ name: code, type: i32 }, { name: message, type: string }] }
+records:
+  - name: Data
+    fields:
+      - { name: hash, type: i64 }
+      - { name: end, type: i32 }
+enums:
+  - name: Mode
+    variants: [{ name: Fast }, { name: Slow, value: 7 }]
+interfaces:
+  - name: Cart
+    constructors:
+      - { name: allocate, params: [] }
+    methods:
+      - { name: close, params: [], return: bool }
+      - { name: initialize, params: [] }
       - { name: name, params: [], return: string }
-      - { name: watch, params: [{ name: watcher, type: Watcher }] }
-      - { name: wait, params: [{ name: cancel, type: i64 }], return: i64, async: true, cancellable: true }
-      - { name: fix, params: [{ name: d, type: Data }], return: Data, throws: Error }
+    statics:
+      - { name: new, params: [], return: Cart }
+      - { name: label, params: [], return: string }
+callbacks:
+  - name: Watcher
+    methods:
+      - { name: hash, params: [{ name: end, type: i32 }], return: i64 }
+      - { name: pick, params: [{ name: level, type: "u32?" }, { name: cart, type: Cart }], return: "[f64]", throws: Error }
+functions:
+  - { name: name, params: [], return: string }
+  - { name: watch, params: [{ name: watcher, type: Watcher }, { name: spare, type: "Watcher?" }] }
+  - { name: wait, params: [{ name: cancel, type: i64 }], return: "i64?", async: true, cancellable: true }
+  - { name: fix, params: [{ name: d, type: Data }], return: Data, throws: Error }
+  - { name: mix, params: [{ name: m, type: "Mode?" }, { name: xs, type: "[i16]" }, { name: b, type: bytes }, { name: c, type: "Cart?" }], return: "Mode?" }
+  - { name: walk, params: [{ name: from, type: Cart }], return: "iter<f32?>" }
 "#;
 
 fn model() -> Model {
-    let api: Api = serde_saphyr::from_str(FIXTURE).unwrap();
+    let api = parse_api_str(FIXTURE, "yaml").unwrap();
     validate(&api, &Identity::named("shop_kit"), None).unwrap()
 }
 
@@ -142,13 +147,74 @@ fn runtime_substitutes_the_identity_and_abi_revision() {
     assert_has(&rt, "'libshop_kit.dylib'");
     assert_has(&rt, "'libshop_kit.so'");
     assert_has(&rt, "'shop_kit.dll'");
-    assert_eq!(crate::cabi::ABI_VERSION, 5);
-    assert_has(&rt, "ABI_VERSION = 5\n");
+    assert_eq!(crate::cabi::ABI_VERSION, 6);
+    assert_has(&rt, "ABI_VERSION = 6\n");
     assert_has(
         &rt,
         "attach_function :shop_kit_error_set, [:pointer, :int32, :pointer, :size_t], :void",
     );
+    assert_has(
+        &rt,
+        "attach_function :shop_kit_run_free, [Run.by_value], :void",
+    );
     assert!(!rt.contains("{{"), "an unsubstituted placeholder:\n{rt}");
+}
+
+#[test]
+fn the_contract_is_one_function_per_declaration() {
+    let src = bindings();
+    let rows = crate::codegen::contract::rows(&model());
+    assert!(rows.len() > 10);
+    for row in &rows {
+        assert_has(
+            &src,
+            &format!(
+                "[:{}, {}, '{}'],",
+                row.symbol,
+                crate::codegen::contract::hex(row.hash),
+                row.path
+            ),
+        );
+    }
+    assert_has(&src, "'Cart.close'");
+    assert_has(&src, "'Watcher.pick'");
+    assert_has(&src, "'Error.Broken'");
+}
+
+#[test]
+fn every_value_is_one_c_argument() {
+    let src = bindings();
+    for needle in [
+        // Attachments: runs, optionals, and callback structs by value.
+        "attach_function :shop_kit_mix, [OptI32.by_value, Run.by_value, Run.by_value, :pointer, :pointer], OptI32.by_value, blocking: true\n",
+        "attach_function :shop_kit_watch, [Callback.by_value, Callback.by_value, :pointer], :void, blocking: true\n",
+        "attach_function :shop_kit_wait, [:int64, :pointer, :pointer, :pointer], :void, blocking: true\n",
+        "attach_function :shop_kit_WalkIterator_next, [:pointer, :pointer, :pointer], :int32, blocking: true\n",
+        "attach_function :shop_kit_Cart_name, [:pointer, :pointer], Run.by_value, blocking: true\n",
+        // Conversions, one per parameter.
+        "m = Bridge.opt_arg(m, :i32)\n",
+        "xs = Bridge.slice_arg(xs, :i16)\n",
+        "b = Bridge.bytes_arg(b)\n",
+        "Bridge.check_object(c, Cart, 'c', nullable: true)\n",
+        "Bridge.pin(c) do |c|\n",
+        "Bridge.call(nil, [:opt, :i32]) do |out_err|\n",
+        "Native.shop_kit_mix(m, xs, b, c, out_err)\n",
+        // Callback arguments are registered as the call is made.
+        "Bridge.present!(watcher, 'watcher')\n",
+        "Native.shop_kit_watch(\n        Bridge.register(watcher, Watcher),\n        Bridge.register(spare, Watcher),\n",
+        // A value buffer is sealed by the helper and yielded as a run.
+        "d = Bridge.encode(Data_, d)\n",
+        "Bridge.call(Error_, [:buffer, Data_], d) do |d, out_err|\n",
+        // Async and iterator shapes.
+        "Bridge.await_cancellable(nil, [:opt, :i64], cancel) do |cancel_token, callback, context|\n",
+        "Native.shop_kit_wait(cancel_, cancel_token, callback, context)\n",
+        "      [:opt, :f32],\n      :shop_kit_WalkIterator_next,\n      :shop_kit_WalkIterator_destroy,\n    ) do |out_err|\n      Bridge.pin(from) do |from|\n",
+        // The vtable is a row per method.
+        "[:hash_, nil, :i64, [:i32]],\n",
+        "[:pick, Error_, [:slice, :f64], [[:opt, :u32], [:object, Cart]]],\n",
+    ] {
+        assert_has(&src, needle);
+    }
 }
 
 #[test]
@@ -168,6 +234,10 @@ fn only_the_idiomatic_api_is_public() {
     assert!(
         !src.contains("FFI::Struct"),
         "a per-interface struct:\n{src}"
+    );
+    assert!(
+        !src.contains("FFI::Function"),
+        "a generated trampoline:\n{src}"
     );
 }
 
@@ -190,11 +260,10 @@ fn names_never_replace_what_the_bindings_rely_on() {
         "def name\n",
         "def self.new_\n",
         "def self.label\n",
-        // A module function named like Module#name.
+        // A library function named like Module#name.
         "def self.name_\n",
         // A callback method named like Object#hash.
         "def hash_(end_)\n",
-        ".hash_(end_)",
         // A parameter named like the cancellable keyword.
         "def self.wait(cancel_, cancel: nil)\n",
     ] {

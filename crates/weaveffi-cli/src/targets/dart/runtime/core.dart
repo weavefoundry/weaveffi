@@ -1,4 +1,4 @@
-// ── Errors, call frames, and memory ──
+// ── Errors, call frames, and runs ──
 
 /// The C `{{PREFIX}}_error` slot every fallible call writes. A non-zero
 /// `code` carries a producer-owned UTF-8 message run (not NUL-terminated;
@@ -15,20 +15,31 @@ final class _Error extends Struct {
   external int payloadLen;
 }
 
+/// The C `{{PREFIX}}_run`: a string's UTF-8, raw bytes, a typed array, or a
+/// value buffer, crossing by value in every position. `len` counts bytes,
+/// and null with length 0 is the empty run.
+final class _Run extends Struct {
+  external Pointer<Uint8> ptr;
+  @Size()
+  external int len;
+}
+
 final _errorClear = _lib.lookupFunction<Void Function(Pointer<_Error>),
     void Function(Pointer<_Error>)>('{{PREFIX}}_error_clear', isLeaf: true);
 
-final _freeBytes = _lib.lookupFunction<Void Function(Pointer<Uint8>, Size),
-    void Function(Pointer<Uint8>, int)>('{{PREFIX}}_free_bytes', isLeaf: true);
+/// `{{PREFIX}}_run_free`: releases a run the producer returned.
+final _runFree = _lib.lookupFunction<Void Function(_Run), void Function(_Run)>(
+    '{{PREFIX}}_run_free',
+    isLeaf: true);
 
 /// `{{PREFIX}}_alloc`: an 8-aligned, zero-filled run the producer adopts
 /// (and frees), for what a callback hands back.
 final _alloc = _lib.lookupFunction<Pointer<Uint8> Function(Size),
     Pointer<Uint8> Function(int)>('{{PREFIX}}_alloc', isLeaf: true);
 
-/// The native scratch of one call: its `{{PREFIX}}_error` slot, two 8-byte
-/// out slots for what it returns (an `out_len`, an `out_value`, an
-/// iterator's `out_item`), and an [Arena] for the arguments it stages.
+/// The native scratch of one call: its `{{PREFIX}}_error` slot, a 16-byte
+/// out slot (an iterator's `out_item`), and an [Arena] for the arguments it
+/// stages.
 ///
 /// Every call takes its own frame and gives it back when it returns, so a
 /// call made from a callback while another call is in progress never
@@ -42,7 +53,7 @@ final class _Frame implements Finalizable {
 
   static final _finalizer = NativeFinalizer(calloc.nativeFree);
 
-  /// The error slot, rounded up so the out slots are 8-aligned.
+  /// The error slot, rounded up so the out slot is 8-aligned.
   static final int _errorSize = (sizeOf<_Error>() + 7) & ~7;
   static final int _size = _errorSize + 16;
   static final List<_Frame> _pool = <_Frame>[];
@@ -56,11 +67,8 @@ final class _Frame implements Finalizable {
   /// The call's `out_err` slot.
   Pointer<_Error> get err => _base.cast();
 
-  /// The first out slot; `cast` it to the slot's C type.
-  Pointer<Int64> get slot0 => (_base + _errorSize).cast();
-
-  /// The second out slot; `cast` it to the slot's C type.
-  Pointer<Int64> get slot1 => (_base + _errorSize + 8).cast();
+  /// The out slot; `cast` it to the slot's C type.
+  Pointer<Uint8> get out => _base + _errorSize;
 
   /// The arena staged arguments live in until the call returns.
   Arena get arena => _arena ??= Arena();
@@ -156,8 +164,11 @@ NativeException _runtimeException(
 /// Builds the error [err] reports, using [map].
 Object _readError(Pointer<_Error> err, _ErrorMapper map) {
   final e = err.ref;
-  final message = _readString(e.messagePtr, e.messageLen);
-  return map(e.code, message, _copyBytes(e.payloadPtr, e.payloadLen));
+  final message = _readUtf8(e.messagePtr, e.messageLen);
+  final payload = e.payloadLen == 0
+      ? Uint8List(0)
+      : Uint8List.fromList(e.payloadPtr.asTypedList(e.payloadLen));
+  return map(e.code, message, payload);
 }
 
 /// Throws the error a synchronous call left in [err], clearing the slot
@@ -173,36 +184,64 @@ void _check(Pointer<_Error> err, [_ErrorMapper map = _trap]) {
   throw error;
 }
 
-/// Copies a borrowed native byte run into Dart memory. A run of length 0
-/// is never read (its pointer may dangle).
-Uint8List _copyBytes(Pointer<Uint8> ptr, int len) =>
-    len == 0 ? Uint8List(0) : Uint8List.fromList(ptr.asTypedList(len));
-
-/// Copies an owned native byte run and releases it.
-Uint8List _takeBytes(Pointer<Uint8> ptr, int len) {
-  if (len == 0) return Uint8List(0);
-  final bytes = Uint8List.fromList(ptr.asTypedList(len));
-  _freeBytes(ptr, len);
-  return bytes;
-}
-
-/// Decodes an owned UTF-8 run and releases it.
-String _takeString(Pointer<Uint8> ptr, int len) {
-  if (len == 0) return '';
-  final text = utf8.decode(ptr.asTypedList(len), allowMalformed: true);
-  _freeBytes(ptr, len);
-  return text;
-}
-
-/// Decodes a borrowed UTF-8 run.
-String _readString(Pointer<Uint8> ptr, int len) => len == 0
+String _readUtf8(Pointer<Uint8> ptr, int len) => len == 0
     ? ''
     : utf8.decode(ptr.asTypedList(len), allowMalformed: true);
 
-/// Copies [bytes] into [arena] memory for a borrowed `(ptr, len)` argument.
-Pointer<Uint8> _stage(Arena arena, List<int> bytes) {
-  if (bytes.isEmpty) return nullptr;
+/// A run of [len] bytes at [ptr].
+_Run _run(Pointer<Uint8> ptr, int len) => Struct.create<_Run>()
+  ..ptr = ptr
+  ..len = len;
+
+/// The empty run: what a failed callback returns.
+_Run _emptyRun() => _run(nullptr, 0);
+
+/// A view of a run's bytes, valid while the run is. The empty run is never
+/// read (its pointer may be null).
+Uint8List _viewRun(_Run run) =>
+    run.len == 0 ? Uint8List(0) : run.ptr.asTypedList(run.len);
+
+/// Copies a borrowed run's bytes into Dart memory.
+Uint8List _copyRun(_Run run) => Uint8List.fromList(_viewRun(run));
+
+/// Copies an owned run's bytes and releases the run.
+Uint8List _takeRun(_Run run) {
+  try {
+    return _copyRun(run);
+  } finally {
+    _runFree(run);
+  }
+}
+
+/// Decodes a borrowed UTF-8 run.
+String _readText(_Run run) => _readUtf8(run.ptr, run.len);
+
+/// Decodes an owned UTF-8 run and releases it.
+String _takeText(_Run run) {
+  try {
+    return _readText(run);
+  } finally {
+    _runFree(run);
+  }
+}
+
+/// Copies [bytes] into [arena] memory, borrowed by the producer for one
+/// call. Arena memory comes from `calloc`, so it's aligned for any element.
+_Run _stage(Arena arena, List<int> bytes) {
+  if (bytes.isEmpty) return _emptyRun();
   final ptr = arena<Uint8>(bytes.length);
   ptr.asTypedList(bytes.length).setAll(0, bytes);
-  return ptr;
+  return _run(ptr, bytes.length);
+}
+
+/// Stages [text]'s UTF-8 for one call.
+_Run _stageText(Arena arena, String text) => _stage(arena, utf8.encode(text));
+
+/// Hands [bytes] to the producer as a run allocated with `{{PREFIX}}_alloc`,
+/// which the producer adopts and frees: what a callback method returns.
+_Run _handOver(List<int> bytes) {
+  if (bytes.isEmpty) return _emptyRun();
+  final ptr = _alloc(bytes.length);
+  ptr.asTypedList(bytes.length).setAll(0, bytes);
+  return _run(ptr, bytes.length);
 }

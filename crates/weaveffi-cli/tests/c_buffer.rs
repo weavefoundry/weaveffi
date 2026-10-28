@@ -9,67 +9,63 @@ use std::process::Command;
 use camino::Utf8Path;
 use weaveffi_cli::targets;
 use weaveffi_model::model::Model;
-use weaveffi_model::parse::parse_api_str;
+use weaveffi_model::parse::{load_api, parse_api_str};
 use weaveffi_model::pkg::Identity;
 use weaveffi_model::validate::validate;
 
 const SHOP: &str = r#"
-version: "0.12.0"
-modules:
-  - name: shop
-    enums:
-      - name: Size
-        variants:
-          - { name: Small, value: 1 }
-          - { name: Large, value: 2 }
-      - name: Price
-        variants:
-          - { name: Free, value: 0 }
-          - name: Fixed
-            value: 1
-            fields:
-              - { name: cents, type: i64 }
-          - name: Note
-            value: 2
-            fields:
-              - { name: text, type: string }
-    structs:
-      - name: Item
+version: "0.13.0"
+enums:
+  - name: Size
+    variants:
+      - { name: Small, value: 1 }
+      - { name: Large, value: 2 }
+  - name: Price
+    variants:
+      - { name: Free, value: 0 }
+      - name: Fixed
+        value: 1
         fields:
-          - { name: name, type: string }
-          - { name: size, type: Size }
-          - { name: tags, type: "[string]" }
-          - { name: stock, type: "{string:i32}" }
-          - { name: discount, type: "i32?" }
-          - { name: price, type: Price }
-          - { name: blob, type: bytes }
-          - { name: matrix, type: "[[u8]]" }
-    errors:
-      - name: ShopError
-        codes:
-          - name: OutOfStock
-            code: 1
-            message: "out of stock"
-            fields:
-              - { name: missing, type: "[string]" }
-    functions:
-      - name: echo
-        params:
-          - { name: item, type: Item }
-        return: "Item?"
-        throws: ShopError
+          - { name: cents, type: i64 }
+      - name: Note
+        value: 2
+        fields:
+          - { name: text, type: string }
+records:
+  - name: Item
+    fields:
+      - { name: name, type: string }
+      - { name: size, type: Size }
+      - { name: tags, type: "[string]" }
+      - { name: stock, type: "{string:i32}" }
+      - { name: discount, type: "i32?" }
+      - { name: price, type: Price }
+      - { name: blob, type: bytes }
+      - { name: matrix, type: "[[u8]]" }
+errors:
+  - name: ShopError
+    codes:
+      - name: OutOfStock
+        code: 1
+        message: "out of stock"
+        fields:
+          - { name: missing, type: "[string]" }
+functions:
+  - name: echo
+    params:
+      - { name: item, type: Item }
+    return: "Item?"
+    throws: ShopError
 "#;
 
 const PLAIN: &str = r#"
-version: "0.12.0"
-modules:
-  - name: math
-    functions:
-      - name: add
-        params:
-          - { name: a, type: i32 }
-          - { name: b, type: i32 }
-        return: i32
+version: "0.13.0"
+functions:
+  - name: add
+    params:
+      - { name: a, type: i32 }
+      - { name: b, type: i32 }
+    return: i32
 "#;
 
 fn load(yaml: &str, name: &str) -> Model {
@@ -133,22 +129,24 @@ fn config_rejects_unknown_keys() {
 fn renders_structs_unions_and_payloads() {
     let h = buffer_header(SHOP, "shop");
     assert!(h.contains("#include \"shop.h\""));
-    assert!(h.contains("struct shop_shop_Item {\n    shop_str name;\n    shop_shop_Size size;"));
+    assert!(h.contains("struct shop_Item {\n    shop_str name;\n    shop_Size size;"));
     assert!(h.contains("    int32_t* discount;\n"));
-    assert!(h.contains("struct shop_list_string {\n    shop_str* items;\n    size_t len;\n};"));
-    assert!(h.contains("struct shop_map_string_i32 {\n    shop_str* keys;\n    int32_t* values;"));
-    assert!(h.contains("    shop_shop_Price_Tag tag;\n    union {"));
+    assert!(h.contains("struct shop_buf_list_string {\n    shop_str* items;\n    size_t len;\n};"));
+    assert!(
+        h.contains("struct shop_buf_map_string_i32 {\n    shop_str* keys;\n    int32_t* values;")
+    );
+    assert!(h.contains("    shop_Price_Tag tag;\n    union {"));
     assert!(h.contains("        struct {\n            int64_t cents;\n        } Fixed;"));
-    assert!(h.contains("struct shop_shop_ShopError_OutOfStock_payload {"));
+    assert!(h.contains("struct shop_ShopError_OutOfStock_payload {"));
     assert!(h.contains(
-        "static inline bool shop_shop_ShopError_OutOfStock_payload_decode(const uint8_t* ptr, size_t len, shop_shop_ShopError_OutOfStock_payload* out);"
+        "static inline bool shop_ShopError_OutOfStock_payload_decode(const uint8_t* ptr, size_t len, shop_ShopError_OutOfStock_payload* out);"
     ));
     assert!(h.contains(
-        "static inline void shop_opt_Item_write(shop_writer* w, const shop_shop_Item* v);"
+        "static inline void shop_buf_opt_Item_write(shop_writer* w, const shop_Item* v);"
     ));
     // The price union is defined before the record that embeds it.
-    let price = h.find("struct shop_shop_Price {").expect("price struct");
-    let item = h.find("struct shop_shop_Item {").expect("item struct");
+    let price = h.find("struct shop_Price {").expect("price struct");
+    let item = h.find("struct shop_Item {").expect("item struct");
     assert!(price < item);
     // Nothing is branded after the tool.
     assert!(!h.contains("weaveffi_"));
@@ -169,17 +167,17 @@ int main(void) {
     int32_t discount = 15;
     uint8_t row0[2] = {1, 2};
     shop_bytes rows[2] = {{row0, 2}, {NULL, 0}};
-    shop_shop_Item item;
+    shop_Item item;
     memset(&item, 0, sizeof item);
     item.name = shop_str_of("caf\xC3\xA9");
-    item.size = shop_shop_Size_Large;
+    item.size = shop_Size_Large;
     item.tags.items = tags;
     item.tags.len = 2;
     item.stock.keys = keys;
     item.stock.values = counts;
     item.stock.len = 1;
     item.discount = &discount;
-    item.price.tag = shop_shop_Price_Note;
+    item.price.tag = shop_Price_Note;
     item.price.as.Note.text = shop_str_of("half");
     item.blob = shop_bytes_of(row0, 2);
     item.matrix.items = rows;
@@ -187,50 +185,50 @@ int main(void) {
 
     shop_writer w;
     memset(&w, 0, sizeof w);
-    shop_opt_Item_write(&w, &item);
+    shop_buf_opt_Item_write(&w, &item);
     assert(!w.failed);
 
-    shop_shop_Item* back = NULL;
-    assert(shop_opt_Item_decode(w.ptr, w.len, &back));
+    shop_Item* back = NULL;
+    assert(shop_buf_opt_Item_decode(w.ptr, w.len, &back));
     assert(back != NULL);
     assert(back->name.len == 5 && memcmp(back->name.ptr, "caf\xC3\xA9", 5) == 0);
     assert(back->name.ptr[5] == '\0');
-    assert(back->size == shop_shop_Size_Large);
+    assert(back->size == shop_Size_Large);
     assert(back->tags.len == 2 && back->tags.items[0].len == 3);
     assert(memcmp(back->tags.items[0].ptr, "a\0b", 3) == 0);
     assert(back->tags.items[1].len == 0 && back->tags.items[1].ptr[0] == '\0');
     assert(back->stock.len == 1 && back->stock.values[0] == -7);
     assert(back->discount != NULL && *back->discount == 15);
-    assert(back->price.tag == shop_shop_Price_Note);
+    assert(back->price.tag == shop_Price_Note);
     assert(strcmp(back->price.as.Note.text.ptr, "half") == 0);
     assert(back->blob.len == 2 && back->blob.ptr[1] == 2);
     assert(back->matrix.len == 2 && back->matrix.items[0].len == 2 && back->matrix.items[1].len == 0);
-    shop_opt_Item_free(&back);
+    shop_buf_opt_Item_free(&back);
     assert(back == NULL);
 
     /* Truncation anywhere fails cleanly and leaves nothing allocated. */
     for (size_t cut = 0; cut < w.len; cut++) {
-        shop_shop_Item* partial = NULL;
-        assert(!shop_opt_Item_decode(w.ptr, cut, &partial));
+        shop_Item* partial = NULL;
+        assert(!shop_buf_opt_Item_decode(w.ptr, cut, &partial));
         assert(partial == NULL);
     }
     /* Trailing bytes are rejected. */
     shop_writer_put_u8(&w, 0);
-    assert(!shop_opt_Item_decode(w.ptr, w.len, &back));
+    assert(!shop_buf_opt_Item_decode(w.ptr, w.len, &back));
     shop_writer_free(&w);
 
     /* An absent optional, a bad presence byte, a bad tag, and a count the
        buffer can't hold. */
     const uint8_t absent[1] = {0};
-    assert(shop_opt_Item_decode(absent, 1, &back) && back == NULL);
+    assert(shop_buf_opt_Item_decode(absent, 1, &back) && back == NULL);
     const uint8_t bad_flag[1] = {2};
-    assert(!shop_opt_Item_decode(bad_flag, 1, &back));
+    assert(!shop_buf_opt_Item_decode(bad_flag, 1, &back));
     const uint8_t bad_tag[4] = {9, 0, 0, 0};
-    shop_shop_Price price;
-    assert(!shop_shop_Price_decode(bad_tag, 4, &price));
+    shop_Price price;
+    assert(!shop_Price_decode(bad_tag, 4, &price));
     const uint8_t huge[4] = {0xff, 0xff, 0xff, 0x7f};
-    shop_list_string list;
-    assert(!shop_list_string_decode(huge, 4, &list));
+    shop_buf_list_string list;
+    assert(!shop_buf_list_string_decode(huge, 4, &list));
     assert(list.items == NULL && list.len == 0);
 
     /* A string must be well-formed UTF-8: a stray continuation byte, an
@@ -241,30 +239,30 @@ int main(void) {
         {3, 0, 0, 0, 0xED, 0xA0, 0x80},
     };
     for (int i = 0; i < 3; i++) {
-        shop_list_string one;
+        shop_buf_list_string one;
         uint8_t buf[11] = {1, 0, 0, 0};
         memcpy(buf + 4, bad_utf8[i], 7);
-        assert(!shop_list_string_decode(buf, 11, &one));
+        assert(!shop_buf_list_string_decode(buf, 11, &one));
         assert(one.items == NULL && one.len == 0);
     }
     const uint8_t good_utf8[11] = {1, 0, 0, 0, 3, 0, 0, 0, 0xE2, 0x82, 0xAC};
-    shop_list_string euro;
-    assert(shop_list_string_decode(good_utf8, 11, &euro));
+    shop_buf_list_string euro;
+    assert(shop_buf_list_string_decode(good_utf8, 11, &euro));
     assert(euro.len == 1 && euro.items[0].len == 3);
-    shop_list_string_free(&euro);
+    shop_buf_list_string_free(&euro);
 
     /* Error payloads decode through their own struct. */
     shop_writer pw;
     memset(&pw, 0, sizeof pw);
-    shop_shop_ShopError_OutOfStock_payload payload;
+    shop_ShopError_OutOfStock_payload payload;
     memset(&payload, 0, sizeof payload);
     payload.missing.items = tags;
     payload.missing.len = 1;
-    shop_shop_ShopError_OutOfStock_payload_write(&pw, &payload);
-    shop_shop_ShopError_OutOfStock_payload decoded;
-    assert(shop_shop_ShopError_OutOfStock_payload_decode(pw.ptr, pw.len, &decoded));
+    shop_ShopError_OutOfStock_payload_write(&pw, &payload);
+    shop_ShopError_OutOfStock_payload decoded;
+    assert(shop_ShopError_OutOfStock_payload_decode(pw.ptr, pw.len, &decoded));
     assert(decoded.missing.len == 1 && decoded.missing.items[0].len == 3);
-    shop_shop_ShopError_OutOfStock_payload_free(&decoded);
+    shop_ShopError_OutOfStock_payload_free(&decoded);
     shop_writer_free(&pw);
 
     puts("ok");
@@ -344,7 +342,7 @@ fn fixture_headers_compile_in_c_and_cpp() {
     let fixtures = [
         "kitchen_sink",
         "shapes",
-        "nested_modules",
+        "imports",
         "docs_everywhere",
         "edge_cases",
     ];
@@ -355,8 +353,9 @@ fn fixture_headers_compile_in_c_and_cpp() {
         let path = Utf8Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
             .join(format!("{stem}.yml"));
-        let yaml = std::fs::read_to_string(&path).expect("read fixture");
-        let files = generate(&load(&yaml, stem), "");
+        let (api, sources) = load_api(path.as_std_path()).expect("load fixture");
+        let model = validate(&api, &Identity::named(stem), Some(&sources)).expect("validate");
+        let files = generate(&model, "");
         let include = files
             .iter()
             .map(|(n, _)| n.clone())

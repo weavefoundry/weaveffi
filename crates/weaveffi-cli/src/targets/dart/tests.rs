@@ -1,12 +1,14 @@
 //! Unit tests for what's specific to the Dart target: package naming and
-//! layout, identifier escaping, leaf calls, and the packaged loader. The
-//! `kitchen_sink` snapshot pins the rendered bindings themselves.
+//! layout, identifier escaping, how each value crosses, leaf calls, the
+//! contract rows, and the packaged loader. The `kitchen_sink` snapshot pins
+//! the rendered bindings themselves.
 
 use weaveffi_model::ir::Api;
 use weaveffi_model::model::Model;
 use weaveffi_model::pkg::Identity;
 use weaveffi_model::validate::validate;
 
+use crate::codegen::contract::{hex, rows};
 use crate::codegen::OutputFile;
 use crate::package::{FileContent, PackageContext};
 use crate::platform::{BinarySet, NativeBinary, Platform};
@@ -14,42 +16,52 @@ use crate::targets::Target;
 
 use super::{DartConfig, DartGenerator, MIN_DART_SDK};
 
-/// Two root modules (one named `runtime`, with a child), an error domain
-/// and a callback interface, and names that collide with Dart keywords,
-/// the runtime's types, and the wrapper's members.
+/// An error domain and a callback interface, and names that collide with
+/// Dart keywords, the runtime's types, and the wrapper's members.
 const FIXTURE: &str = r#"
-version: "0.12.0"
-modules:
-  - name: shop
-    errors:
-      - name: Native
-        codes: [{ name: Closed, code: 1, message: "closed" }]
-    structs:
-      - name: Int32List
-        fields: [{ name: class, type: i32 }]
-    interfaces:
-      - name: Cart
-        methods:
-          - { name: dispose, return: bool }
-    callback_interfaces:
-      - name: Watcher
-        methods:
-          - { name: seen, params: [{ name: count, type: i32 }], return: bool }
-    functions:
-      - { name: watch, params: [{ name: watcher, type: Watcher }] }
-      - name: wait
-        params: [{ name: cancelToken, type: i64 }]
-        return: i64
-        async: true
-        cancellable: true
-        throws: Native
-  - name: runtime
-    functions:
-      - { name: ping, return: i32 }
-    modules:
-      - name: loader
-        functions:
-          - { name: pong, return: i32 }
+version: "0.13.0"
+errors:
+  - name: Native
+    codes: [{ name: Closed, code: 1, message: "closed" }]
+records:
+  - name: Int32List
+    fields: [{ name: class, type: i32 }]
+interfaces:
+  - name: Cart
+    methods:
+      - { name: dispose, return: bool }
+callbacks:
+  - name: Watcher
+    methods:
+      - { name: seen, params: [{ name: count, type: i32 }], return: bool }
+functions:
+  - { name: watch, params: [{ name: watcher, type: "Watcher?" }] }
+  - name: wait
+    params: [{ name: cancelToken, type: i64 }]
+    return: i64
+    async: true
+    cancellable: true
+    throws: Native
+  - { name: ping, return: i32 }
+"#;
+
+/// Every family of value, in a library without callbacks.
+const VALUES: &str = r#"
+version: "0.13.0"
+enums:
+  - name: Kind
+    variants: [{ name: Hot }, { name: Cold }]
+interfaces:
+  - name: Store
+    methods:
+      - { name: label, params: [{ name: key, type: string }], return: "string?" }
+functions:
+  - { name: add, params: [{ name: a, type: i32 }, { name: b, type: i32 }], return: i32 }
+  - { name: echo, params: [{ name: s, type: string }], return: string }
+  - { name: maybe, params: [{ name: k, type: "Kind?" }, { name: n, type: "u32?" }], return: "f64?" }
+  - { name: sum, params: [{ name: xs, type: "[f64]" }], return: "[i64]" }
+  - { name: find, params: [{ name: s, type: "Store?" }], return: Store }
+  - { name: counts, return: "iter<u16?>" }
 "#;
 
 fn model_of(yaml: &str, name: &str) -> Model {
@@ -130,6 +142,7 @@ fn names_come_from_the_identity() {
     assert_has(loader, "? 'libshop_kit.dylib'");
     assert_has(loader, "? 'shop_kit.dll'");
     assert_has(loader, ": 'libshop_kit.so';");
+    assert_has(loader, "'shop_kit_abi_version'");
     assert!(
         !loader.contains("_openBundled"),
         "unpackaged bindings look for bundles"
@@ -148,9 +161,9 @@ fn names_come_from_the_identity() {
     };
     let files = render_with(config);
     assert_has(file(&files, "pubspec.yaml"), "name: custom\n");
-    assert_has(file(&files, "lib/custom.dart"), "part 'src/shop.dart';");
+    assert_has(file(&files, "lib/custom.dart"), "part 'src/api.dart';");
     assert_has(
-        file(&files, "lib/src/shop.dart"),
+        file(&files, "lib/src/api.dart"),
         "part of '../custom.dart';",
     );
 }
@@ -169,7 +182,7 @@ fn pubspec_states_the_minimum_sdk() {
 }
 
 #[test]
-fn one_library_with_a_part_per_module() {
+fn one_library_with_one_api_part() {
     let files = render_with(DartConfig::default());
     let main = file(&files, "lib/shop_kit.dart");
     let parts: Vec<&str> = main
@@ -187,11 +200,7 @@ fn one_library_with_a_part_per_module() {
             "src/runtime/async.dart",
             "src/runtime/cancel.dart",
             "src/runtime/callbacks.dart",
-            "src/shop.dart",
-            // A root module named `runtime` can't land among the runtime
-            // sections.
-            "src/runtime_.dart",
-            "src/runtime_/loader.dart",
+            "src/api.dart",
         ]
     );
     let mut rendered: Vec<&str> = files
@@ -210,54 +219,112 @@ fn one_library_with_a_part_per_module() {
             &format!("\npart of '{up}shop_kit.dart';\n"),
         );
     }
-    assert_has(file(&files, "lib/src/runtime_/loader.dart"), "int pong() {");
+    let api = file(&files, "lib/src/api.dart");
+    assert_has(api, "int ping() {");
+    assert_has(api, "('shop_kit_ping');");
 }
 
 #[test]
 fn colliding_names_gain_an_underscore() {
     let files = render_with(DartConfig::default());
-    let shop = file(&files, "lib/src/shop.dart");
+    let api = file(&files, "lib/src/api.dart");
     // A record named like a typed list, a field named like a keyword, a
     // domain whose exception is the runtime's, and a member named like the
     // wrapper's own.
-    assert_has(shop, "final class Int32List_ {");
-    assert_has(shop, "final int class_;");
-    assert_has(shop, "class NativeException_ extends NativeException {");
-    assert_has(shop, "bool dispose_() {");
+    assert_has(api, "final class Int32List_ {");
+    assert_has(api, "final int class_;");
+    assert_has(api, "class NativeException_ extends NativeException {");
+    assert_has(api, "bool dispose_() {");
     // A parameter named like the cancellation token keeps its name.
     assert_has(
-        shop,
+        api,
         "Future<int> wait(int cancelToken, {CancelToken? cancelToken_}) {",
     );
-    assert_has(shop, "_NativeCancel.bind(cancelToken_)");
+    assert_has(api, "_NativeCancel.bind(cancelToken_)");
+}
+
+#[test]
+fn every_value_is_one_c_value() {
+    let files = DartGenerator::from(DartConfig::default()).render(&model_of(VALUES, "kv"));
+    let api = file(&files, "lib/src/api.dart");
+    // Runs and optional scalars cross by value, objects as pointers.
+    assert_has(api, "_Run Function(_Run, Pointer<_Error>),");
+    assert_has(api, "_OptF64 Function(_OptI32, _OptU32, Pointer<_Error>),");
+    assert_has(api, "_optI32(k?.value), _optU32(n), _f.err");
+    assert_has(api, "return _result.has ? _result.value : null;");
+    assert_has(api, "final _sArg = _stageText(_f.arena, s);");
+    assert_has(api, "return _takeText(_result);");
+    assert_has(api, "final _xsArg = _stageF64s(_f.arena, xs);");
+    assert_has(api, "return _takeI64s(_result);");
+    assert_has(
+        api,
+        "final _sArg = s == null ? nullptr : _borrow(_f.arena, s);",
+    );
+    assert_has(api, "return Store._(_result);");
+    // An iterator's element arrives in the frame's out slot.
+    assert_has(
+        api,
+        "Int32 Function(Pointer<Void>, Pointer<_OptU16>, Pointer<_Error>),",
+    );
+    assert_has(api, "final _out = _step.out.cast<_OptU16>().ref;");
+    let main = file(&files, "lib/kv.dart");
+    for part in ["options", "arrays", "object", "codec", "iterator"] {
+        assert_has(main, &format!("part 'src/runtime/{part}.dart';"));
+    }
+    // An optional string is a value buffer.
+    assert_has(api, "return _takeDecoded(_result, _unpack_opt_string);");
+}
+
+#[test]
+fn callback_arguments_are_registered_last() {
+    let files = render_with(DartConfig::default());
+    let api = file(&files, "lib/src/api.dart");
+    assert_has(
+        api,
+        "final _watcherArg = watcher == null ? _noCallback() : _registerCallback(watcher, _watcherDispatch, _watcherVtable.cast());",
+    );
+    assert_has(api, "Void Function(_CallbackArg, Pointer<_Error>),");
+    assert_has(api, "Bool Function(Pointer<Void>, Int32, Pointer<_Error>);");
+    assert_has(api, "..flags = _vtableThreadAffine");
+}
+
+#[test]
+fn every_declaration_has_a_contract_row() {
+    let model = model();
+    let files = DartGenerator::from(DartConfig::default()).render(&model);
+    let contracts = file(&files, "lib/src/runtime/contracts.dart");
+    let rows = rows(&model);
+    assert!(rows.iter().any(|r| r.path == "Watcher.seen"));
+    for row in &rows {
+        assert_has(
+            contracts,
+            &format!("('{}', {}, '{}'),", row.symbol, hex(row.hash), row.path),
+        );
+        assert_has(contracts, &format!("// {}", row.signature));
+    }
 }
 
 #[test]
 fn calls_are_leaf_calls_without_callbacks() {
     let model = model_of(
         r#"
-version: "0.12.0"
-modules:
-  - name: math
-    functions:
-      - { name: add, params: [{ name: a, type: i32 }, { name: b, type: i32 }], return: i32 }
+version: "0.13.0"
+functions:
+  - { name: add, params: [{ name: a, type: i32 }, { name: b, type: i32 }], return: i32 }
 "#,
         "calc",
     );
     let files = DartGenerator::from(DartConfig::default()).render(&model);
-    let math = file(&files, "lib/src/math.dart");
-    assert_has(math, "Int32 Function(Int32, Int32, Pointer<_Error>),");
-    assert_has(math, "('calc_math_add', isLeaf: true);");
+    let api = file(&files, "lib/src/api.dart");
+    assert_has(api, "Int32 Function(Int32, Int32, Pointer<_Error>),");
+    assert_has(api, "('calc_add', isLeaf: true);");
     assert!(
         !file(&files, "lib/calc.dart").contains("dart:isolate"),
         "isolate glue without callbacks"
     );
     // With a callback interface, no call may be a leaf call.
-    for f in render_with(DartConfig::default()) {
-        if f.path.as_str().starts_with("lib/src/shop") {
-            assert!(!f.contents.contains("'shop_kit_shop_watch', isLeaf"));
-        }
-    }
+    let api = file(&render_with(DartConfig::default()), "lib/src/api.dart").to_string();
+    assert!(!api.contains("'shop_kit_watch', isLeaf"));
 }
 
 #[test]

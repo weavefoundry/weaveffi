@@ -8,7 +8,7 @@ _pending: dict[int, tuple[asyncio.AbstractEventLoop, asyncio.Future[Any]]] = {}
 _pending_lock = threading.Lock()
 _pending_next = 0
 
-_error_free = _bind("{{PREFIX}}_error_free", None, ctypes.POINTER(_ErrorStruct))
+_error_free = _bind("{{PREFIX}}_error_free", None, ctypes.c_void_p)
 
 
 def _async_begin() -> tuple[int, asyncio.Future[Any]]:
@@ -29,13 +29,13 @@ def _async_abandon(key: int) -> None:
         _pending.pop(key, None)
 
 
-def _async_error(err: Any, factory: Callable[[int, str, bytes], BaseException]) -> BaseException:
+def _async_error(err: int, factory: Callable[[int, str, bytes], BaseException]) -> BaseException:
     """Copy and release a heap-boxed completion error, then build the
     exception it reports. The cancelled code maps to CancelledError."""
-    e = err.contents
+    e = _ErrorStruct.from_address(err)
     code = e.code
-    message = _peek_bytes(e.message_ptr, e.message_len).decode("utf-8", "replace")
-    payload = _peek_bytes(e.payload_ptr, e.payload_len)
+    message = _peek(e.message_ptr, e.message_len).decode("utf-8", "replace")
+    payload = _peek(e.payload_ptr, e.payload_len)
     _error_free(err)
     if code == {{ERROR}}.CANCELLED_ERROR_CODE:
         return asyncio.CancelledError(message)

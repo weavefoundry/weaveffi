@@ -49,7 +49,9 @@ pub fn cmd_package(args: &PackageArgs<'_>) -> Result<ExitCode> {
     if selected.is_empty() {
         bail!("no targets selected to package");
     }
-    let settings = config.build.settings(args.locate.profile);
+    let settings = config
+        .build
+        .settings(args.locate.profile, args.locate.features);
     let skips = Skips::default();
 
     let (binaries, model) = match args.binaries {
@@ -70,7 +72,6 @@ pub fn cmd_package(args: &PackageArgs<'_>) -> Result<ExitCode> {
             let platforms = resolve_platforms(args.platforms, &project)?;
             let built = build_project(
                 &project,
-                &selected,
                 &platforms,
                 &settings,
                 args.manifest_path,

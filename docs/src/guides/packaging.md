@@ -22,9 +22,12 @@ identity's `library` field.
 project's crate, `[build] manifest`, or `--manifest-path`) and runs
 `cargo rustc --lib` once per platform with the artifact kinds that platform
 needs, so the crate's own `crate-type` doesn't matter. It builds with the
-`release` profile unless `--profile` (or `[build] profile`) names another. A Rust producer's API
-is then read from the first library it built (see [Library
-Mode](extract.md)), so nothing is compiled twice:
+`release` profile unless `--profile` (or `[build] profile`) names another,
+and with the project's Cargo features (`-F`/`--features`, `--all-features`,
+`--no-default-features`, or the `[build]` keys). A Rust producer's API is
+then read from the first library it built (see [Library Mode](extract.md)),
+so nothing is compiled twice. `build` produces only the producer's library:
+no target needs compiled glue of its own.
 
 | Platform | What `build` produces |
 |----------|------------------------|
@@ -42,38 +45,23 @@ configured API level. Everything lands in the Cargo target directory:
 
 ```text
 target/weaveffi/
-  darwin-arm64/  libkvstore.dylib  libkvstore.a  kvstore_node.node  libkvstore_jni.dylib
+  darwin-arm64/  libkvstore.dylib  libkvstore.a
   ios-arm64/     libkvstore.a
-  android-arm64/ libkvstore.so  libkvstore_jni.so
+  android-arm64/ libkvstore.so
   wasm32/        kvstore.wasm
 ```
 
-The Node.js and Kotlin targets reach the C ABI through C glue of their own
-(an N-API addon and a JNI shim). When those targets are selected (`--target`,
-else `[project] targets`, else all), `build` compiles the glue next to the
-library so packages ship it prebuilt:
-
-- **Node.js addon**, against the running Node.js's headers, for each
-  requested desktop platform the host can compile: both macOS architectures
-  on a macOS host, and the host's own architecture on a Linux host. Windows
-  isn't prebuilt (it links `node.lib`); the package compiles it at install
-  time.
-- **JNI shim** for every Android ABI (with the NDK) and for the same desktop
-  platforms as the addon (with the JDK headers from `JAVA_HOME`); never for
-  `windows-x64`, where the generated CMake project builds it.
-
-Glue a host can't compile is skipped with a warning, and the package falls
-back to compiling it. Every platform is checked before anything compiles; a
-platform this machine can't build (a missing rustup target, a missing NDK,
-or a host that can't build it: Apple platforms need macOS, Windows needs
-Windows) is skipped with a warning naming the fix, and the run fails only
-when no requested platform can be built.
+Every platform is checked before anything compiles; a platform this machine
+can't build (a missing rustup target, a missing NDK, or a host that can't
+build it: Apple platforms need macOS, Windows needs Windows) is skipped with
+a warning naming the fix, and the run fails only when no requested platform
+can be built.
 
 `build` and `package` follow one policy for a missing external tool (a C
-compiler, Node.js headers, a JDK, the NDK, Xcode, the .NET SDK): they warn,
-skip the artifact that needs it, finish everything else, and list every
-skipped artifact at the end. The run still exits `0`; pass `--strict` to
-exit `1` when anything was skipped (as CI should).
+compiler, the NDK, Xcode, the .NET SDK): they warn, skip the artifact that
+needs it, finish everything else, and list every skipped artifact at the
+end. The run still exits `0`; pass `--strict` to exit `1` when anything was
+skipped (as CI should).
 
 ## Package
 
@@ -87,27 +75,23 @@ from the first library in the directory.
 
 | Target | Artifacts | Publish with |
 |--------|-----------|--------------|
-| `python` | one `py3-none-{platform}.whl` per desktop platform, the library inside the import package | `twine upload dist/python/*.whl` |
-| `node` | `{name}-{os}-{cpu}-{version}.tgz` per desktop platform (library and prebuilt addon, gated by npm `os`/`cpu`) plus `{name}-{version}.tgz`, which lists them in `optionalDependencies` | `npm publish <tgz>` for each, platform packages first |
-| `wasm` | `{name}-{version}.tgz` with the `.wasm` module | `npm publish <tgz>` |
-| `ruby` | one `{gem}-{version}-{platform}.gem` per desktop platform | `gem push <gem>` |
-| `swift` | `C{Module}.xcframework.zip` (static libraries for every Apple platform built), its `.sha256`, and the SwiftPM package `swift/{Module}/` whose binary target points at the archive's URL and checksum | upload the archive, then commit and tag the package |
-| `dotnet` | the project `dotnet/{Namespace}/` with `runtimes/<rid>/native/` libraries, and the `.nupkg` that `dotnet pack` builds from it | `dotnet nuget push dist/dotnet/*.nupkg` |
-| `kotlin` | the Gradle project `kotlin/{name}/` with prebuilt `jniLibs/<abi>/` (library and shim) and desktop natives under `resources/natives/<platform>/` | `gradle publish` |
-| `dart` | the pub package `dart/{package}/` with desktop libraries under `native/<platform>/` | `dart pub publish` |
-| `go` | the module `go/{package}/` with libraries under `lib/<platform>/` and cgo flags that link the right one | push the module to its repository |
-| `c`, `cpp` | `{library}-{version}-c.tar.gz` and `-cpp.tar.gz`: headers, libraries under `lib/<platform>/`, and a `CMakeLists.txt` exposing the host's library as an imported target | attach to a release |
+| `python` | one platform wheel per desktop platform, the library inside the import package | `twine upload` |
+| `node` | one npm tarball per desktop platform (`{package}-{os}-{cpu}`) carrying only the library, plus the main package, which lists them as optional dependencies and depends on koffi | `npm publish` for each, platform packages first |
+| `wasm` | an npm tarball with the `.wasm` module | `npm publish` |
+| `ruby` | one platform gem per desktop platform | `gem push` |
+| `swift` | `C{Module}.xcframework.zip` (static libraries for every Apple platform built), its `.sha256`, and the SwiftPM package whose binary target points at the archive's URL and checksum | upload the archive, then commit and tag the package |
+| `dotnet` | a project with `runtimes/<rid>/native/` libraries, and the `.nupkg` that `dotnet pack` builds from it | `dotnet nuget push` |
+| `kotlin` | a Gradle project with the Android libraries under `src/main/jniLibs/<abi>/` and the desktop ones under JNA's `src/main/resources/<os>-<arch>/` | Gradle |
+| `dart` | a pub package with the desktop libraries under `native/<platform>/` | `dart pub publish` |
+| `go` | a module with the libraries and cgo flags that link the right one | push the module to its repository |
+| `c`, `cpp` | archives of the headers, the libraries per platform, and a `CMakeLists.txt` | attach to a release |
 
-Wheel tags carry the build's macOS deployment target
-(`macosx_11_0_arm64`) and, on Linux, the newest glibc the library actually
-links against (`manylinux_2_17_x86_64` or later), so `pip` only installs a
-wheel where the library loads. Each archive is deterministic (fixed
-timestamps and order), so the same builds always produce the same bytes and
-checksums.
-
+Each target's page under [Generators](../generators/README.md) documents its
+artifacts' names and layout. Each archive is deterministic (fixed timestamps
+and order), so the same builds always produce the same bytes and checksums.
 A target skips platforms its ecosystem has no slot for (a wheel has no
-Android tag, NuGet no `wasm32` runtime), and a target with nothing to ship is
-named in a note.
+Android tag, NuGet no `wasm32` runtime), and a target with nothing to ship
+is named in a note.
 
 ## Platforms
 
@@ -134,21 +118,12 @@ named in a note.
 `package` fuses the Apple static libraries into `C{Module}.xcframework`
 (iOS device, iOS simulator, and macOS slices, with a group's architectures
 fused by `lipo`), zips it, and writes its SHA-256 checksum. The packaged
-`Package.swift` declares the C module as
-`.binaryTarget(url:checksum:)`, so apps link the library with no flags.
-The URL comes from `[generators.swift] xcframework_url`; until you set it,
-it's a placeholder under `example.invalid`:
-
-```toml
-[generators.swift]
-xcframework_url = "https://github.com/acme/kvstore/releases/download/{version}/{file}"
-```
-
-To publish, upload the archive to that URL and commit `swift/{Module}/` to
-the repository consumers depend on. For local use, unzip the archive next to
-the packaged `Package.swift`; the manifest prefers a local
-`C{Module}.xcframework` over the URL. This step runs `xcodebuild`, so it
-needs macOS with Xcode; elsewhere the Swift package is skipped.
+`Package.swift` declares the C module as a `.binaryTarget(url:checksum:)`,
+so apps link the library with no flags. The URL comes from the Swift
+target's configuration (see [Swift](../generators/swift.md)); to publish,
+upload the archive to that URL and commit the package to the repository
+consumers depend on. This step runs `xcodebuild`, so it needs macOS with
+Xcode; elsewhere the Swift package is skipped.
 
 ## What still needs the ecosystem's tools
 
@@ -157,20 +132,11 @@ needs macOS with Xcode; elsewhere the Swift package is skipped.
 - **NuGet.** `package` runs `dotnet pack`, so the .NET SDK must be
   installed; without it the `.nupkg` is skipped (and `--strict` fails the
   run) after everything else is written.
-- **Kotlin.** The output is a Gradle project, not an `.aar` or `.jar`:
-  building one needs the Kotlin compiler, so run `gradle assembleRelease`
-  (Android) or `gradle jar` (JVM) on it. With prebuilt shims present, Gradle
-  skips the CMake build and needs no NDK.
-- **Node.js on Windows.** The addon isn't prebuilt for `windows-x64`, so
-  installing there compiles it with node-gyp.
+- **Kotlin.** The output is a Gradle project, not an `.aar` or `.jar`, so
+  build one with Gradle.
 - **Cross-architecture Linux.** Building `linux-arm64` on an x64 host needs a
-  cross linker (`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER`), and its glue
-  isn't prebuilt; use an arm64 runner instead.
-- **Dart.** The pub package's loader looks for `native/<platform>/` inside
-  the package itself (resolved through its `package:` URI), then relative to
-  the working directory, so a compiled app that no longer has the package
-  sources copies those libraries next to it. Flutter's native-assets build
-  isn't generated.
+  cross linker (`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER`); an arm64
+  runner is simpler.
 
 ## CI recipe
 
@@ -197,7 +163,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.targets }}
-      - uses: actions/setup-node@v4   # for the prebuilt Node.js addon
       - run: cargo install weaveffi-cli
       - run: weaveffi build --platforms ${{ matrix.platforms }} --strict
       - uses: actions/upload-artifact@v4

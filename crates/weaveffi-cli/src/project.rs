@@ -29,17 +29,17 @@
 //! IDL, or a library built beforehand that [`Project::library`] names.
 
 use camino::{Utf8Path, Utf8PathBuf};
-use miette::{bail, miette, IntoDiagnostic, Report, Result, WrapErr};
+use miette::{bail, miette, Report, Result};
 use weaveffi_model::ir::Api;
 use weaveffi_model::meta;
 use weaveffi_model::model::Model;
-use weaveffi_model::parse::parse_api_str;
+use weaveffi_model::parse::{load_api, ParseError};
 use weaveffi_model::pkg::{name_from_basename, Identity, Package};
 use weaveffi_model::validate::{
-    collect_warnings, validate, ValidationDiagnostics, ValidationWarning,
+    collect_warnings, validate, Sources, ValidationDiagnostics, ValidationWarning,
 };
 
-use crate::cargo::CargoCrate;
+use crate::cargo::{CargoCrate, CargoFeatures};
 use crate::config::{current_dir, discover, ProjectConfig, CONFIG_FILE_NAME};
 use crate::library;
 use crate::report::with_named_source;
@@ -66,6 +66,8 @@ pub struct Project {
     library: Option<Utf8PathBuf>,
     /// The Cargo profile a crate's library is built with.
     profile: String,
+    /// The Cargo features it's built with (default: `[build]`'s).
+    features: CargoFeatures,
     quiet: bool,
 }
 
@@ -77,8 +79,8 @@ pub struct Definition {
     pub api: Api,
     /// The library's identity.
     pub identity: Identity,
-    /// The IDL's file name and text, for diagnostics that quote it.
-    text: Option<(String, String)>,
+    /// The IDL files' names and texts, for diagnostics that quote them.
+    sources: Option<Sources>,
 }
 
 impl Definition {
@@ -88,8 +90,7 @@ impl Definition {
     ///
     /// Returns every validation error at once.
     pub fn validate(&self) -> Result<Model, ValidationDiagnostics> {
-        let source = self.text.as_ref().map(|(n, t)| (n.as_str(), t.as_str()));
-        validate(&self.api, &self.identity, source)
+        validate(&self.api, &self.identity, self.sources.as_ref())
     }
 
     /// The advisory warnings for the API.
@@ -173,11 +174,13 @@ impl Project {
             Some(input) => source_of(&input)?,
             None => Source::Library(Utf8PathBuf::from(library.unwrap_or_default())),
         };
+        let features = config.build.cargo_features();
         let mut project = Self {
             config,
             source,
             library: None,
             profile: "dev".into(),
+            features,
             quiet: false,
         };
         if let Some(library) = library {
@@ -215,6 +218,14 @@ impl Project {
         self
     }
 
+    /// Build a crate's library with `features` instead of the `[build]`
+    /// table's.
+    #[must_use]
+    pub fn features(mut self, features: CargoFeatures) -> Self {
+        self.features = features;
+        self
+    }
+
     /// Pass `--quiet` to Cargo.
     #[must_use]
     pub fn quiet(mut self, quiet: bool) -> Self {
@@ -225,6 +236,11 @@ impl Project {
     /// Whether Cargo runs with `--quiet`.
     pub(crate) fn is_quiet(&self) -> bool {
         self.quiet
+    }
+
+    /// Whether the input is a built library standing alone.
+    pub(crate) fn is_library(&self) -> bool {
+        matches!(self.source, Source::Library(_))
     }
 
     /// The producer crate, when the input is one.
@@ -254,7 +270,7 @@ impl Project {
                         krate.name
                     );
                 }
-                krate.build_library(&self.profile, self.quiet)
+                krate.build_library(&self.profile, &self.features, self.quiet)
             }
         }
     }
@@ -270,15 +286,18 @@ impl Project {
         let package = &self.config.package.identity;
         match &self.source {
             Source::Idl(path) => {
-                let contents = std::fs::read_to_string(path.as_std_path())
-                    .into_diagnostic()
-                    .wrap_err_with(|| format!("failed to read input file: {path}"))?;
-                let api = parse_api_str(&contents, idl_format(path)?)
-                    .map_err(|e| with_named_source(e, path.as_str(), &contents))?;
+                idl_format(path)?;
+                let (api, sources) = load_api(path.as_std_path()).map_err(|e| match &e {
+                    ParseError::Yaml { src, .. } | ParseError::Json { src, .. } => {
+                        let src = src.clone();
+                        with_named_source(e, path.as_str(), &src)
+                    }
+                    _ => Report::new(e),
+                })?;
                 Ok(Definition {
                     api,
                     identity: Identity::new(&name_from_basename(path.as_str()), package),
-                    text: Some((path.to_string(), contents)),
+                    sources: Some(sources),
                 })
             }
             Source::Crate(krate) => {
@@ -288,7 +307,7 @@ impl Project {
                 Ok(Definition {
                     api,
                     identity: crate_identity(krate, package),
-                    text: None,
+                    sources: None,
                 })
             }
             Source::Library(path) => {
@@ -300,7 +319,7 @@ impl Project {
                 Ok(Definition {
                     api,
                     identity: Identity::new(&prefix, &merged),
-                    text: None,
+                    sources: None,
                 })
             }
         }
@@ -376,7 +395,7 @@ fn rust_only_keys(package: &Package) -> Result<()> {
 }
 
 /// A Rust producer's identity: named after its package, with its library
-/// name as both the C prefix (what `#[weaveffi::module]` uses) and the
+/// name as both the C prefix (what the producer macros use) and the
 /// library, and `[package]` metadata over the crate's.
 fn crate_identity(krate: &CargoCrate, package: &Package) -> Identity {
     let mut merged = package.clone();
@@ -418,7 +437,7 @@ fn read_api(path: &Utf8Path, prefix: Option<&str>) -> Result<(Api, String)> {
         }
     };
     let api = meta::assemble(&frames, &prefix).map_err(|e| miette!("{path}: {e}"))?;
-    if api.modules.is_empty() {
+    if api.declaration_names().next().is_none() {
         return Err(no_metadata(
             path,
             Some((&prefix, prefixes.into_iter().collect())),
@@ -441,8 +460,9 @@ fn no_metadata(path: &Utf8Path, crate_prefix: Option<(&str, Vec<&str>)>) -> Repo
     };
     miette!(
         "{path} has no WeaveFFI metadata{whose}{others}. The API is read from the library the \
-         producer builds: annotate it with `#[weaveffi::module]`, call \
-         `weaveffi::export_runtime!();` once in the crate, and build it again"
+         producer builds: tag the items it exports (`#[weaveffi::export]` and the other \
+         attributes), call `weaveffi::export_runtime!();` once at the crate root, and build it \
+         again"
     )
 }
 

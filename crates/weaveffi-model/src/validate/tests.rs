@@ -1,9 +1,7 @@
 //! The validator's test suite.
 //!
 //! Every case is a short YAML document paired with the error variant it must
-//! (or must not) produce, so adding a rule means adding one table row and a
-//! few lines of IDL rather than forty lines of struct literals. Spans and
-//! snippets are exercised by the CLI tests against on-disk files.
+//! (or must not) produce, so adding a rule means adding one table row.
 
 use super::*;
 use crate::ir::CURRENT_SCHEMA_VERSION;
@@ -17,10 +15,11 @@ fn check(body: &str) -> Result<Model, ValidationDiagnostics> {
 }
 
 /// Validate a full YAML document with its source attached, returning the
-/// underlined text of every diagnostic.
+/// line and underlined text of every diagnostic.
 fn spans(doc: &str) -> Vec<(String, String)> {
     let api = parse_api_str(doc, "yaml").expect("fixture must parse");
-    let err = validate(&api, &Identity::named("api"), Some(("api.yml", doc))).unwrap_err();
+    let sources = Sources::single("api.yml", doc);
+    let err = validate(&api, &Identity::named("api"), Some(&sources)).unwrap_err();
     err.diagnostics
         .iter()
         .map(|d| {
@@ -34,7 +33,7 @@ fn spans(doc: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Variant discriminator names of every error the document produced.
+/// The variant names of every error the document produced.
 fn errors(body: &str) -> Vec<String> {
     match check(body) {
         Ok(_) => vec![],
@@ -42,1138 +41,271 @@ fn errors(body: &str) -> Vec<String> {
     }
 }
 
-/// The variant name of a [`ValidationError`] (the debug spelling up to the
-/// first `(` or ` {`).
+/// The variant name of a [`ValidationError`].
 fn variant(e: &ValidationError) -> String {
     let dbg = format!("{e:?}");
     dbg.split(['(', ' ']).next().unwrap_or(&dbg).to_string()
 }
 
-const MATH: &str = r#"
-modules:
-  - name: math
-    functions:
-      - name: add
-        params: [{ name: a, type: i32 }, { name: b, type: i32 }]
-        return: i32
-"#;
-
 #[test]
 fn valid_documents_pass() {
-    let ok: &[&str] = &[
-        MATH,
+    for body in [
+        "functions: [{ name: add, params: [{ name: a, type: i32 }, { name: b, type: i32 }], return: i32 }]",
         r#"
-modules:
-  - name: shared
-    enums:
-      - name: Status
-        variants: [{ name: Ok, value: 0 }, { name: Bad, value: 1 }]
-      - name: Shape
-        variants:
-          - { name: Dot, value: 0 }
-          - { name: Circle, value: 1, fields: [{ name: r, type: f64 }] }
-    structs:
-      - name: Point
-        fields:
-          - { name: x, type: f64 }
-          - { name: status, type: Status }
-          - { name: shape, type: "Shape?" }
-          - { name: tags, type: "[string]" }
-          - { name: by_status, type: "{Status:i32}" }
-  - name: geo
-    errors:
-      - name: GeoError
-        codes:
-          - { name: NotFound, code: 1, message: "missing" }
-          - { name: Bad, code: 2, message: "bad", fields: [{ name: why, type: string }] }
-    interfaces:
-      - name: Store
-        constructors: [{ name: open, params: [{ name: path, type: string }] }]
-        methods:
-          - { name: get, params: [{ name: k, type: string }], return: "Point?", throws: GeoError }
-          - { name: nearest, params: [{ name: limit, type: "u32?" }, { name: weights, type: "[f64]" }], return: "[i32]" }
-          - { name: scan, params: [], return: "iter<Point>" }
-          - { name: stores, params: [], return: "iter<Store>" }
-          - { name: sibling, params: [{ name: other, type: "Store?" }], return: Store }
-          - { name: children, params: [], return: "[Store]" }
-          - { name: by_name, params: [], return: "{string:Store}" }
-          - { name: watch, params: [{ name: listener, type: PointListener }] }
-        statics: [{ name: version, params: [], return: string }]
-    structs:
-      - name: Owner
-        fields: [{ name: store, type: "Store?" }, { name: all, type: "[Store]" }]
-    callback_interfaces:
-      - name: PointListener
-        methods:
-          - name: on_point
-            params: [{ name: p, type: Point }, { name: raw, type: bytes }, { name: from, type: Store }]
-          - { name: wants_more, params: [{ name: seen, type: u32 }], return: bool }
-          - { name: status, params: [], return: Status }
-          - { name: label, params: [], return: string, throws: GeoError }
-          - { name: guess, params: [{ name: hint, type: "i64?" }], return: "f64?", throws: any }
-          - { name: samples, params: [{ name: xs, type: "[u16]" }], return: "[i16]" }
-          - { name: nearest, params: [], return: "Point?" }
-          - { name: store, params: [], return: "Store?" }
-          - { name: payload, params: [], return: bytes }
-    functions:
-      - { name: fetch, params: [{ name: id, type: i64 }], return: "[Point]", async: true, cancellable: true }
-      - { name: subscribe, params: [{ name: l, type: PointListener }, { name: s, type: Store }] }
-      - { name: maybe_subscribe, params: [{ name: l, type: "PointListener?" }] }
-    modules:
-      - name: inner
-        functions:
-          - { name: fails, params: [], throws: GeoError }
-          - { name: anything, params: [], return: "bool?", throws: any }
-          - { name: later, params: [], return: "[f32]", async: true, throws: any }
-          - { name: chunks, params: [], return: "iter<[i32]>" }
-          - { name: maybe, params: [], return: "iter<i32?>" }
+records:
+  - { name: Node, fields: [{ name: children, type: "[Node]" }, { name: index, type: "{string:Node}" }] }
+interfaces:
+  - name: Store
+    constructors: [{ name: open }]
+    methods: [{ name: get, params: [{ name: key, type: string }], return: "Node?" }]
+callbacks:
+  - name: Listener
+    methods: [{ name: on_node, params: [{ name: node, type: Node }], return: "Store?" }]
+functions:
+  - { name: watch, params: [{ name: l, type: "Listener?" }], return: "iter<Node>" }
+  - { name: fetch, return: "[u64]", async: true, cancellable: true }
 "#,
-    ];
-    for doc in ok {
-        assert_eq!(errors(doc), Vec::<String>::new(), "{doc}");
+        // A recursive record with no object may sit in an error payload.
+        r#"
+records:
+  - { name: Tree, fields: [{ name: kids, type: "[Tree]" }, { name: label, type: string }] }
+errors:
+  - { name: E, codes: [{ name: Bad, code: 1, message: bad, fields: [{ name: at, type: Tree }] }] }
+"#,
+    ] {
+        check(body).unwrap_or_else(|e| panic!("{body}: {:?}", e.diagnostics));
     }
 }
 
 #[test]
 fn every_rule_fires() {
     let cases: &[(&str, &str)] = &[
+        ("ReservedKeyword", "functions: [{ name: match }]"),
+        ("ReservedKeyword", "errors: [{ name: any, codes: [{ name: A, code: 1, message: a }] }]"),
+        ("InvalidIdentifier", "functions: [{ name: 9lives }]"),
+        ("InvalidIdentifier", "records: [{ name: R, fields: [{ name: a-b, type: i32 }] }]"),
         (
-            "DuplicateModuleName",
-            "modules: [{ name: a, functions: [] }, { name: a, functions: [] }]",
+            "DuplicateName",
+            "records: [{ name: Thing, fields: [{ name: x, type: i32 }] }]\nfunctions: [{ name: Thing }]",
+        ),
+        ("DuplicateName", "functions: [{ name: f }, { name: f }]"),
+        (
+            "DuplicateErrorCodeName",
+            "errors:\n  - { name: A, codes: [{ name: Gone, code: 1, message: a }] }\n  - { name: B, codes: [{ name: Gone, code: 1, message: b }] }",
         ),
         (
-            "NoModuleName",
-            "modules: [{ name: '  ', functions: [] }]",
+            "SymbolCollision",
+            "functions: [{ name: f, async: true }, { name: f_callback }]",
         ),
         (
-            "InvalidModuleName",
-            "modules: [{ name: 9lives, functions: [] }]",
+            "SymbolCollision",
+            "interfaces: [{ name: Store, statics: [{ name: get }] }]\nfunctions: [{ name: Store_get }]",
         ),
+        ("SymbolCollision", "functions: [{ name: opt_i32 }]"),
+        ("SlotCollision", "functions: [{ name: f, params: [{ name: out_err, type: i32 }] }]"),
         (
-            "InvalidModuleName",
-            "modules: [{ name: async, functions: [] }]",
-        ),
-        (
-            "DuplicateFunctionName",
-            r#"
-modules:
-  - name: m
-    functions:
-      - { name: f, params: [] }
-      - { name: f, params: [] }
-"#,
-        ),
-        (
-            "DuplicateFunctionName",
-            r#"
-modules:
-  - name: a
-    functions: [{ name: open, params: [] }]
-  - name: b
-    modules:
-      - name: c
-        functions: [{ name: open, params: [] }]
-"#,
+            "SlotCollision",
+            "callbacks: [{ name: L, methods: [{ name: m, params: [{ name: ctx, type: i32 }] }] }]",
         ),
         (
             "DuplicateParamName",
-            r#"
-modules:
-  - name: m
-    functions:
-      - { name: f, params: [{ name: x, type: i32 }, { name: x, type: i32 }] }
-"#,
+            "functions: [{ name: f, params: [{ name: x, type: i32 }, { name: x, type: i32 }] }]",
         ),
-        (
-            "ReservedKeyword",
-            "modules: [{ name: m, functions: [{ name: match, params: [] }] }]",
-        ),
-        (
-            "InvalidIdentifier",
-            "modules: [{ name: m, functions: [{ name: 'has space', params: [] }] }]",
-        ),
-        (
-            "ErrorDomainMissingName",
-            r#"
-modules:
-  - name: m
-    errors: [{ name: ' ', codes: [] }]
-"#,
-        ),
-        (
-            "DuplicateErrorCodeName",
-            r#"
-modules:
-  - name: m
-    errors:
-      - name: E
-        codes:
-          - { name: A, code: 1, message: a }
-          - { name: A, code: 2, message: a }
-"#,
-        ),
+        ("CancellableNotAsync", "functions: [{ name: f, cancellable: true }]"),
+        ("UnknownErrorDomain", "functions: [{ name: f, throws: Nope }]"),
+        ("AsyncIteratorReturn", "functions: [{ name: f, return: \"iter<i32>\", async: true }]"),
         (
             "DuplicateErrorCode",
-            r#"
-modules:
-  - name: m
-    errors:
-      - name: E
-        codes:
-          - { name: A, code: 1, message: a }
-          - { name: B, code: 1, message: b }
-"#,
+            "errors: [{ name: E, codes: [{ name: A, code: 1, message: a }, { name: B, code: 1, message: b }] }]",
+        ),
+        ("InvalidErrorCode", "errors: [{ name: E, codes: [{ name: A, code: 0, message: a }] }]"),
+        ("EmptyRecord", "records: [{ name: R, fields: [] }]"),
+        (
+            "DuplicateRecordField",
+            "records: [{ name: R, fields: [{ name: x, type: i32 }, { name: x, type: i32 }] }]",
+        ),
+        ("RecursiveType", "records: [{ name: Node, fields: [{ name: next, type: Node }] }]"),
+        (
+            "RecursiveType",
+            "records:\n  - { name: A, fields: [{ name: b, type: \"B?\" }] }\n  - { name: B, fields: [{ name: a, type: A }] }",
         ),
         (
-            "InvalidErrorCode",
-            r#"
-modules:
-  - name: m
-    errors:
-      - name: E
-        codes: [{ name: A, code: 0, message: a }]
-"#,
+            "RecursiveType",
+            "enums: [{ name: Expr, variants: [{ name: Neg, fields: [{ name: e, type: Expr }] }] }]",
         ),
-        (
-            "InvalidErrorCode",
-            r#"
-modules:
-  - name: m
-    errors:
-      - name: E
-        codes: [{ name: A, code: -2, message: a }]
-"#,
-        ),
-        (
-            "NameCollisionWithErrorDomain",
-            r#"
-modules:
-  - name: m
-    functions: [{ name: E, params: [] }]
-    errors: [{ name: E, codes: [{ name: A, code: 1, message: a }] }]
-"#,
-        ),
-        (
-            "NameCollisionWithErrorDomain",
-            r#"
-modules:
-  - name: m
-    errors: [{ name: E, codes: [{ name: A, code: 1, message: a }] }]
-  - name: n
-    functions: [{ name: E, params: [] }]
-"#,
-        ),
-        (
-            "SymbolCollision",
-            r#"
-modules:
-  - name: m
-    functions:
-      - { name: foo, async: true, params: [{ name: a, type: i32 }] }
-      - { name: foo_callback, params: [] }
-"#,
-        ),
-        (
-            "SymbolCollision",
-            r#"
-modules:
-  - name: m
-    functions: [{ name: x_y, params: [] }]
-    modules:
-      - name: x
-        functions: [{ name: y, params: [] }]
-"#,
-        ),
-        (
-            "SymbolCollision",
-            r#"
-modules:
-  - name: m
-    functions: [{ name: x_y, params: [] }]
-  - name: m_x
-    functions: [{ name: y, params: [] }]
-"#,
-        ),
-        (
-            "SymbolCollision",
-            r#"
-modules:
-  - name: list
-    functions: [{ name: names, params: [] }]
-"#,
-        ),
-        (
-            "CancellableNotAsync",
-            r#"
-modules:
-  - name: m
-    functions: [{ name: f, cancellable: true, params: [] }]
-"#,
-        ),
-        (
-            "InvalidMapKey",
-            r#"
-modules:
-  - name: m
-    functions: [{ name: f, params: [{ name: x, type: "{f64:i32}" }] }]
-"#,
-        ),
-        (
-            "QualifiedTypeRef",
-            r#"
-modules:
-  - name: m
-    structs: [{ name: P, fields: [{ name: v, type: i32 }] }]
-    functions: [{ name: f, params: [{ name: p, type: m.P }] }]
-"#,
-        ),
-        (
-            "UnsupportedPrimitive",
-            "modules: [{ name: m, functions: [{ name: f, params: [{ name: n, type: usize }] }] }]",
-        ),
-        (
-            "UnsupportedPrimitive",
-            "modules: [{ name: m, structs: [{ name: S, fields: [{ name: c, type: '[char]' }] }] }]",
-        ),
-        (
-            "SymbolCollision",
-            r#"
-modules:
-  - name: m
-    functions: [{ name: Store_get, params: [] }]
-    interfaces:
-      - name: Store
-        methods: [{ name: get, params: [] }]
-"#,
-        ),
-        (
-            "SymbolCollision",
-            r#"
-modules:
-  - name: m
-    functions: [{ name: Store_destroy, params: [] }]
-    interfaces:
-      - name: Store
-        methods: [{ name: get, params: [] }]
-"#,
-        ),
-        (
-            "SymbolCollision",
-            r#"
-modules:
-  - name: m
-    functions: [{ name: Store_clone, params: [] }]
-    interfaces:
-      - name: Store
-        methods: [{ name: get, params: [] }]
-"#,
-        ),
-        (
-            "UnknownErrorDomain",
-            "modules: [{ name: m, functions: [{ name: f, params: [], throws: Nope }] }]",
-        ),
-        (
-            "UnknownErrorDomain",
-            r#"
-modules:
-  - name: m
-    structs: [{ name: S, fields: [{ name: x, type: i32 }] }]
-    functions: [{ name: f, throws: S }]
-"#,
-        ),
-        (
-            "ErrorDomainAsType",
-            r#"
-modules:
-  - name: m
-    errors: [{ name: E, codes: [{ name: A, code: 1, message: a }] }]
-    functions: [{ name: f, params: [{ name: e, type: "E?" }] }]
-"#,
-        ),
-        (
-            "ReservedKeyword",
-            "modules: [{ name: m, errors: [{ name: any, codes: [{ name: A, code: 1, message: a }] }] }]",
-        ),
-        (
-            "DuplicateTypeName",
-            r#"
-modules:
-  - name: a
-    errors: [{ name: Fault, codes: [{ name: A, code: 1, message: a }] }]
-  - name: b
-    interfaces: [{ name: Fault, methods: [{ name: m }] }]
-"#,
-        ),
-        (
-            "DuplicateTypeName",
-            r#"
-modules:
-  - name: a
-    errors:
-      - { name: E, codes: [{ name: A, code: 1, message: a }] }
-      - { name: E, codes: [{ name: B, code: 1, message: b }] }
-"#,
-        ),
-        (
-            "SlotCollision",
-            r#"
-modules:
-  - name: m
-    functions: [{ name: f, params: [{ name: name, type: string }, { name: name_ptr, type: i32 }] }]
-"#,
-        ),
-        (
-            "SlotCollision",
-            r#"
-modules:
-  - name: m
-    functions: [{ name: f, params: [{ name: x, type: "i32?" }, { name: has_x, type: bool }] }]
-"#,
-        ),
-        (
-            "SlotCollision",
-            "modules: [{ name: m, functions: [{ name: f, params: [{ name: out_err, type: i32 }] }] }]",
-        ),
-        (
-            "SlotCollision",
-            "modules: [{ name: m, functions: [{ name: f, params: [{ name: out_len, type: i32 }], return: string }] }]",
-        ),
-        (
-            "SlotCollision",
-            "modules: [{ name: m, functions: [{ name: f, params: [{ name: out_value, type: i32 }], return: 'i32?' }] }]",
-        ),
-        (
-            "SlotCollision",
-            "modules: [{ name: m, functions: [{ name: f, params: [{ name: callback, type: i32 }], async: true }] }]",
-        ),
-        (
-            "SlotCollision",
-            "modules: [{ name: m, functions: [{ name: f, params: [{ name: context, type: i32 }], async: true }] }]",
-        ),
-        (
-            "SlotCollision",
-            "modules: [{ name: m, functions: [{ name: f, params: [{ name: cancel_token, type: i32 }], async: true, cancellable: true }] }]",
-        ),
-        (
-            "SlotCollision",
-            "modules: [{ name: m, interfaces: [{ name: I, methods: [{ name: f, params: [{ name: self, type: i32 }] }] }] }]",
-        ),
-        (
-            "SlotCollision",
-            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: f, params: [{ name: ctx, type: i32 }] }] }] }]",
-        ),
-        (
-            "SlotCollision",
-            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: f, params: [{ name: out_ptr, type: i32 }], return: '[i32]' }] }] }]",
-        ),
-        (
-            "SlotCollision",
-            r#"
-modules:
-  - name: m
-    callback_interfaces: [{ name: L, methods: [{ name: a }] }]
-    functions: [{ name: f, params: [{ name: l, type: L }, { name: l_ctx, type: i32 }] }]
-"#,
-        ),
-        (
-            "DuplicateTypeName",
-            r#"
-modules:
-  - name: a
-    structs: [{ name: Config, fields: [{ name: x, type: i32 }] }]
-  - name: b
-    enums: [{ name: Config, variants: [{ name: A, value: 0 }] }]
-"#,
-        ),
-        (
-            "DuplicateTypeName",
-            r#"
-modules:
-  - name: a
-    structs: [{ name: E, fields: [{ name: x, type: i32 }] }]
-    errors: [{ name: E, codes: [{ name: A, code: 1, message: a }] }]
-"#,
-        ),
-        (
-            "DuplicateErrorCodeName",
-            r#"
-modules:
-  - name: a
-    errors: [{ name: AErr, codes: [{ name: NotFound, code: 1, message: a }] }]
-  - name: b
-    errors: [{ name: BErr, codes: [{ name: NotFound, code: 1, message: b }] }]
-"#,
-        ),
-        (
-            "DuplicateTypeName",
-            r#"
-modules:
-  - name: m
-    structs:
-      - { name: S, fields: [{ name: x, type: i32 }] }
-      - { name: S, fields: [{ name: x, type: i32 }] }
-"#,
-        ),
-        (
-            "DuplicateStructField",
-            r#"
-modules:
-  - name: m
-    structs:
-      - { name: S, fields: [{ name: x, type: i32 }, { name: x, type: i32 }] }
-"#,
-        ),
-        (
-            "EmptyStruct",
-            "modules: [{ name: m, structs: [{ name: S, fields: [] }] }]",
-        ),
-        (
-            "DuplicateTypeName",
-            r#"
-modules:
-  - name: m
-    enums:
-      - { name: E, variants: [{ name: A, value: 0 }] }
-      - { name: E, variants: [{ name: A, value: 0 }] }
-"#,
-        ),
-        (
-            "EmptyEnum",
-            "modules: [{ name: m, enums: [{ name: E, variants: [] }] }]",
-        ),
-        (
-            "DuplicateEnumVariant",
-            r#"
-modules:
-  - name: m
-    enums:
-      - { name: E, variants: [{ name: A, value: 0 }, { name: A, value: 1 }] }
-"#,
-        ),
+        ("EmptyEnum", "enums: [{ name: E, variants: [] }]"),
+        ("DuplicateEnumVariant", "enums: [{ name: E, variants: [{ name: A }, { name: A }] }]"),
         (
             "DuplicateEnumVariantField",
-            r#"
-modules:
-  - name: m
-    enums:
-      - name: E
-        variants:
-          - { name: A, value: 0, fields: [{ name: x, type: i32 }, { name: x, type: i32 }] }
-"#,
+            "enums: [{ name: E, variants: [{ name: A, fields: [{ name: x, type: i32 }, { name: x, type: i32 }] }] }]",
         ),
+        ("DuplicateEnumValue", "enums: [{ name: E, variants: [{ name: A, value: 1 }, { name: B, value: 0 }, { name: C }] }]"),
+        ("EmptyInterface", "interfaces: [{ name: I }]"),
+        ("DuplicateInterfaceMember", "interfaces: [{ name: I, methods: [{ name: m }], statics: [{ name: m }] }]"),
+        ("ConstructorHasReturn", "interfaces: [{ name: I, constructors: [{ name: new, return: i32 }] }]"),
+        ("AsyncConstructor", "interfaces: [{ name: I, constructors: [{ name: new, async: true }] }]"),
+        ("EmptyCallbackInterface", "callbacks: [{ name: L, methods: [] }]"),
+        ("DuplicateCallbackMethod", "callbacks: [{ name: L, methods: [{ name: m }, { name: m }] }]"),
+        ("InvalidCallbackMethod", "callbacks: [{ name: L, methods: [{ name: m, async: true }] }]"),
+        ("InvalidCallbackMethod", "callbacks: [{ name: L, methods: [{ name: m, return: \"iter<i32>\" }] }]"),
+        ("UnknownTypeRef", "functions: [{ name: f, return: Nope }]"),
         (
-            "DuplicateEnumValue",
-            r#"
-modules:
-  - name: m
-    enums:
-      - { name: E, variants: [{ name: A, value: 0 }, { name: B, value: 0 }] }
-"#,
+            "ErrorDomainAsType",
+            "errors: [{ name: E, codes: [{ name: A, code: 1, message: a }] }]\nfunctions: [{ name: f, return: E }]",
         ),
-        (
-            "DuplicateTypeName",
-            r#"
-modules:
-  - name: m
-    interfaces:
-      - { name: I, methods: [{ name: a, params: [] }] }
-      - { name: I, methods: [{ name: b, params: [] }] }
-"#,
-        ),
-        (
-            "DuplicateInterfaceMember",
-            r#"
-modules:
-  - name: m
-    interfaces:
-      - name: I
-        constructors: [{ name: a, params: [] }]
-        methods: [{ name: a, params: [] }]
-"#,
-        ),
-        (
-            "EmptyInterface",
-            "modules: [{ name: m, interfaces: [{ name: I }] }]",
-        ),
-        (
-            "ConstructorHasReturn",
-            r#"
-modules:
-  - name: m
-    interfaces:
-      - name: I
-        constructors: [{ name: new, params: [], return: i32 }]
-"#,
-        ),
-        (
-            "AsyncConstructor",
-            r#"
-modules:
-  - name: m
-    interfaces:
-      - name: I
-        constructors: [{ name: new, params: [], async: true }]
-"#,
-        ),
+        ("UnsupportedPrimitive", "functions: [{ name: f, return: usize }]"),
+        ("InvalidMapKey", "functions: [{ name: f, return: \"{f64:i32}\" }]"),
         (
             "InterfaceInInvalidPosition",
-            r#"
-modules:
-  - name: m
-    interfaces: [{ name: I, methods: [{ name: a, params: [] }] }]
-    functions: [{ name: f, params: [{ name: xs, type: "{I:i32}" }] }]
-"#,
+            "interfaces: [{ name: I, statics: [{ name: s }] }]\nfunctions: [{ name: f, return: \"{I:i32}\" }]",
         ),
         (
-            "InterfaceInInvalidPosition",
-            r#"
-modules:
-  - name: m
-    interfaces: [{ name: I, methods: [{ name: a, params: [] }] }]
-    structs: [{ name: S, fields: [{ name: m, type: "{I:i32}" }] }]
-"#,
+            "CallbackInterfaceInInvalidPosition",
+            "callbacks: [{ name: L, methods: [{ name: m }] }]\nfunctions: [{ name: f, return: L }]",
+        ),
+        (
+            "CallbackInterfaceInInvalidPosition",
+            "callbacks: [{ name: L, methods: [{ name: m }] }]\nrecords: [{ name: R, fields: [{ name: l, type: \"[L]\" }] }]",
         ),
         (
             "ObjectInErrorPayload",
-            r#"
-modules:
-  - name: m
-    interfaces: [{ name: I, methods: [{ name: a, params: [] }] }]
-    errors:
-      - name: E
-        codes: [{ name: C, code: 1, message: c, fields: [{ name: o, type: "[I?]" }] }]
-"#,
+            "interfaces: [{ name: I, statics: [{ name: s }] }]\nerrors: [{ name: E, codes: [{ name: A, code: 1, message: a, fields: [{ name: i, type: I }] }] }]",
+        ),
+        // Through a list of records holding an optional object.
+        (
+            "ObjectInErrorPayload",
+            "interfaces: [{ name: I, statics: [{ name: s }] }]\nrecords: [{ name: H, fields: [{ name: i, type: \"I?\" }] }]\nerrors: [{ name: E, codes: [{ name: A, code: 1, message: a, fields: [{ name: h, type: \"[H]\" }] }] }]",
+        ),
+        // Through records that contain each other, and a rich enum.
+        (
+            "ObjectInErrorPayload",
+            "interfaces: [{ name: I, statics: [{ name: s }] }]\nrecords: [{ name: D, fields: [{ name: f, type: \"[F]\" }] }, { name: F, fields: [{ name: d, type: \"[D]\" }, { name: i, type: \"I?\" }] }]\nerrors: [{ name: E, codes: [{ name: A, code: 1, message: a, fields: [{ name: d, type: D }] }] }]",
         ),
         (
             "ObjectInErrorPayload",
-            r#"
-modules:
-  - name: m
-    interfaces: [{ name: I, methods: [{ name: a, params: [] }] }]
-    structs:
-      - { name: Outer, fields: [{ name: inner, type: Inner }] }
-      - { name: Inner, fields: [{ name: o, type: I }] }
-    errors:
-      - name: E
-        codes: [{ name: C, code: 1, message: c, fields: [{ name: r, type: Outer }] }]
-"#,
+            "interfaces: [{ name: I, statics: [{ name: s }] }]\nenums: [{ name: V, variants: [{ name: N, fields: [{ name: v, type: \"[V]\" }] }, { name: O, fields: [{ name: i, type: I }] }] }]\nerrors: [{ name: E, codes: [{ name: A, code: 1, message: a, fields: [{ name: v, type: V }] }] }]",
         ),
-        (
-            "UnknownTypeRef",
-            "modules: [{ name: m, functions: [{ name: f, params: [], return: Nope }] }]",
-        ),
-        (
-            "UnknownTypeRef",
-            "modules: [{ name: m, functions: [{ name: f, params: [], return: '[Nope?]' }] }]",
-        ),
-        (
-            "InvalidMapKey",
-            r#"
-modules:
-  - name: m
-    structs: [{ name: S, fields: [{ name: x, type: i32 }] }]
-    functions: [{ name: f, params: [], return: "{S:i32}" }]
-"#,
-        ),
-        (
-            "InvalidMapKey",
-            r#"
-modules:
-  - name: m
-    enums:
-      - name: Rich
-        variants: [{ name: A, value: 0, fields: [{ name: x, type: i32 }] }]
-    functions: [{ name: f, params: [], return: "{Rich:i32}" }]
-"#,
-        ),
-        (
-            "InvalidMapKey",
-            "modules: [{ name: m, functions: [{ name: f, params: [], return: '{bytes:i32}' }] }]",
-        ),
-        (
-            "DuplicateTypeName",
-            r#"
-modules:
-  - name: m
-    callback_interfaces:
-      - { name: L, methods: [{ name: a, params: [] }] }
-      - { name: L, methods: [{ name: b, params: [] }] }
-"#,
-        ),
-        (
-            "EmptyCallbackInterface",
-            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [] }] }]",
-        ),
-        (
-            "DuplicateCallbackMethod",
-            r#"
-modules:
-  - name: m
-    callback_interfaces:
-      - { name: L, methods: [{ name: a, params: [] }, { name: a, params: [] }] }
-"#,
-        ),
-        (
-            "InvalidCallbackMethod",
-            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [], async: true }] }] }]",
-        ),
-        (
-            "UnknownErrorDomain",
-            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [], throws: Nope }] }] }]",
-        ),
-        (
-            "IteratorInInvalidPosition",
-            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [{ name: x, type: '[iter<i32>]' }] }] }] }]",
-        ),
-        (
-            "CallbackInterfaceInInvalidPosition",
-            r#"
-modules:
-  - name: m
-    callback_interfaces: [{ name: L, methods: [{ name: a, params: [] }] }]
-    functions: [{ name: f, params: [], return: "iter<L>" }]
-"#,
-        ),
-        (
-            "CallbackInterfaceInInvalidPosition",
-            r#"
-modules:
-  - name: m
-    callback_interfaces: [{ name: L, methods: [{ name: a, params: [] }] }]
-    functions: [{ name: f, params: [], return: "L?", async: true }]
-"#,
-        ),
-        (
-            "CallbackInterfaceInInvalidPosition",
-            r#"
-modules:
-  - name: m
-    callback_interfaces: [{ name: L, methods: [{ name: a, params: [] }] }]
-    functions: [{ name: f, params: [{ name: ls, type: "{string:L}" }] }]
-"#,
-        ),
-        (
-            "CallbackInterfaceInInvalidPosition",
-            r#"
-modules:
-  - name: m
-    callback_interfaces: [{ name: L, methods: [{ name: a, params: [] }] }]
-    errors: [{ name: E, codes: [{ name: A, code: 1, message: a, fields: [{ name: l, type: "L?" }] }] }]
-"#,
-        ),
-        (
-            "IteratorInInvalidPosition",
-            "modules: [{ name: m, functions: [{ name: f, params: [], return: '{string:iter<i32>}' }] }]",
-        ),
-        (
-            "IteratorInInvalidPosition",
-            "modules: [{ name: m, errors: [{ name: E, codes: [{ name: A, code: 1, message: a, fields: [{ name: x, type: 'iter<i32>' }] }] }] }]",
-        ),
-        (
-            "InvalidCallbackMethod",
-            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [], cancellable: true }] }] }]",
-        ),
-        (
-            "InvalidCallbackMethod",
-            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [], return: 'iter<i32>' }] }] }]",
-        ),
-        (
-            "CallbackInterfaceInInvalidPosition",
-            r#"
-modules:
-  - name: m
-    callback_interfaces: [{ name: L, methods: [{ name: a, params: [], return: "L?" }] }]
-"#,
-        ),
-        (
-            "CallbackInterfaceInInvalidPosition",
-            r#"
-modules:
-  - name: m
-    callback_interfaces: [{ name: L, methods: [{ name: a, params: [] }] }]
-    functions: [{ name: f, params: [], return: L }]
-"#,
-        ),
-        (
-            "CallbackInterfaceInInvalidPosition",
-            r#"
-modules:
-  - name: m
-    callback_interfaces: [{ name: L, methods: [{ name: a, params: [] }] }]
-    functions: [{ name: f, params: [{ name: l, type: "[L]" }] }]
-"#,
-        ),
-        (
-            "CallbackInterfaceInInvalidPosition",
-            r#"
-modules:
-  - name: m
-    callback_interfaces: [{ name: L, methods: [{ name: a, params: [] }] }]
-    structs: [{ name: S, fields: [{ name: l, type: L }] }]
-"#,
-        ),
-        (
-            "CallbackInterfaceInInvalidPosition",
-            r#"
-modules:
-  - name: m
-    callback_interfaces:
-      - { name: L, methods: [{ name: a, params: [{ name: other, type: L }] }] }
-"#,
-        ),
-        (
-            "IteratorInInvalidPosition",
-            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [{ name: x, type: 'iter<i32>' }] }] }] }]",
-        ),
-        (
-            "IteratorInInvalidPosition",
-            "modules: [{ name: m, functions: [{ name: f, params: [{ name: x, type: 'iter<i32>' }] }] }]",
-        ),
-        (
-            "IteratorInInvalidPosition",
-            "modules: [{ name: m, structs: [{ name: S, fields: [{ name: x, type: 'iter<i32>' }] }] }]",
-        ),
-        (
-            "IteratorInInvalidPosition",
-            "modules: [{ name: m, functions: [{ name: f, params: [], return: '[iter<i32>]' }] }]",
-        ),
-        (
-            "IteratorInInvalidPosition",
-            "modules: [{ name: m, functions: [{ name: f, params: [], return: 'iter<i32>?' }] }]",
-        ),
-        (
-            "IteratorInInvalidPosition",
-            "modules: [{ name: m, functions: [{ name: f, params: [], return: 'iter<iter<i32>>' }] }]",
-        ),
-        (
-            "AsyncIteratorReturn",
-            "modules: [{ name: m, functions: [{ name: f, params: [], return: 'iter<i32>', async: true }] }]",
-        ),
-        (
-            "ReservedKeyword",
-            "modules: [{ name: m, errors: [{ name: 'if', codes: [{ name: A, code: 1, message: a }] }] }]",
-        ),
-        (
-            "InvalidIdentifier",
-            "modules: [{ name: m, errors: [{ name: E, codes: [{ name: '1bad', code: 1, message: a }] }] }]",
-        ),
+        ("IteratorInInvalidPosition", "functions: [{ name: f, params: [{ name: x, type: \"iter<i32>\" }] }]"),
+        ("IteratorInInvalidPosition", "functions: [{ name: f, return: \"[iter<i32>]\" }]"),
     ];
-    for (expected, doc) in cases {
-        let got = errors(doc);
+    for (expected, body) in cases {
+        let got = errors(body);
         assert!(
             got.iter().any(|v| v == expected),
-            "expected {expected}, got {got:?} for:\n{doc}"
+            "{expected} expected from:\n{body}\ngot {got:?}"
         );
     }
 }
 
 #[test]
 fn unsupported_schema_version_short_circuits() {
-    let api = parse_api_str(
-        "version: '0.1.0'\nmodules: [{ name: a, functions: [] }, { name: a, functions: [] }]",
-        "yaml",
-    )
-    .unwrap();
+    let api = parse_api_str("version: \"0.12.0\"\nfunctions: [{ name: f }]", "yaml").unwrap();
     let err = validate(&api, &Identity::named("api"), None).unwrap_err();
     assert_eq!(err.diagnostics.len(), 1);
     assert!(matches!(
         &err.first().error,
-        ValidationError::UnsupportedSchemaVersion { version, .. } if version == "0.1.0"
+        ValidationError::UnsupportedSchemaVersion { version, .. } if version == "0.12.0"
     ));
 }
 
 #[test]
-fn all_violations_are_reported_together() {
-    let got = errors(
-        r#"
-modules:
-  - name: m
-    functions:
-      - { name: f, params: [], return: Nope }
-      - { name: f, params: [], throws: Missing }
-    structs: [{ name: S, fields: [] }]
-"#,
-    );
+fn all_violations_are_reported_together_and_display_shows_the_first() {
+    let err = check(
+        "functions:\n  - { name: f, return: Nope }\n  - { name: f, throws: Missing }\nrecords: [{ name: S, fields: [] }]",
+    )
+    .unwrap_err();
+    let got: Vec<String> = err.diagnostics.iter().map(|d| variant(&d.error)).collect();
     for expected in [
-        "DuplicateFunctionName",
+        "DuplicateName",
         "UnknownTypeRef",
         "UnknownErrorDomain",
-        "EmptyStruct",
+        "EmptyRecord",
     ] {
         assert!(
             got.iter().any(|v| v == expected),
-            "{expected} missing from {got:?}"
+            "{expected} missing: {got:?}"
         );
     }
-}
-
-#[test]
-fn diagnostics_render_every_message_and_related() {
-    let err = check("modules: [{ name: a, functions: [] }, { name: a, functions: [] }, { name: a, functions: [] }]")
-        .unwrap_err();
-    assert_eq!(err.diagnostics.len(), 2);
     let text = err.to_string();
-    assert_eq!(text.lines().count(), 2);
-    assert!(text.contains("duplicate module name: a"));
-    assert_eq!(err.related().map(Iterator::count), Some(1));
-    assert!(err.help().is_some());
-}
-
-#[test]
-fn global_duplicates_are_reported_once() {
-    let got = errors(
-        r#"
-modules:
-  - name: m
-    structs:
-      - { name: S, fields: [{ name: x, type: i32 }] }
-      - { name: S, fields: [{ name: x, type: i32 }] }
-    functions:
-      - { name: f, params: [] }
-      - { name: f, params: [] }
-    errors:
-      - name: E
-        codes:
-          - { name: A, code: 1, message: a }
-          - { name: A, code: 2, message: a }
-"#,
-    );
+    assert_eq!(text, err.first().to_string());
     assert_eq!(
-        got,
-        [
-            "DuplicateTypeName",
-            "DuplicateFunctionName",
-            "DuplicateErrorCodeName"
-        ]
+        miette::Diagnostic::related(&err).map(Iterator::count),
+        Some(err.diagnostics.len() - 1)
     );
 }
 
 #[test]
-fn symbol_collisions_use_the_real_prefix() {
-    // `acme_list_*` is reserved by the C buffer helpers only under the
-    // `acme` prefix the library actually uses.
-    let doc = format!(
-        "version: \"{CURRENT_SCHEMA_VERSION}\"\nmodules: [{{ name: list, functions: [{{ name: names }}] }}]"
-    );
-    let api = parse_api_str(&doc, "yaml").unwrap();
+fn reserved_families_use_the_real_prefix() {
+    let api = parse_api_str(
+        &format!("version: \"{CURRENT_SCHEMA_VERSION}\"\nfunctions: [{{ name: contract_x }}]"),
+        "yaml",
+    )
+    .unwrap();
     let err = validate(&api, &Identity::named("acme"), None).unwrap_err();
-    assert!(err.to_string().contains("'acme_list_names'"), "{err}");
+    assert!(err.to_string().contains("'acme_contract_x'"), "{err}");
 }
 
 #[test]
-fn buffer_header_structs_and_codecs_are_reserved_symbols() {
-    // The C buffer header declares a struct for every record, rich enum,
-    // and error code with fields, each with `_write`, `_read`, `_decode`,
-    // and `_free`; a function spelled like any of them would redefine it.
-    let cases = [
-        (
-            "errors: [{ name: E, codes: [{ name: Busy, code: 1, message: b, fields: [{ name: n, type: i32 }] }] }]\n    functions: [{ name: E_Busy_payload }]",
-            "'kv_m_E_Busy_payload'",
-            "the payload struct of error code 'm.E.Busy'",
-        ),
-        (
-            "errors: [{ name: E, codes: [{ name: Busy, code: 1, message: b, fields: [{ name: n, type: i32 }] }] }]\n    functions: [{ name: E_Busy_payload_read }]",
-            "'kv_m_E_Busy_payload_read'",
-            "codec 'read' of the payload struct of error code 'm.E.Busy'",
-        ),
-        (
-            "structs: [{ name: S, fields: [{ name: x, type: i32 }] }]\n    functions: [{ name: S_free }]",
-            "'kv_m_S_free'",
-            "of record 'm.S'",
-        ),
-        (
-            "enums: [{ name: Shape, variants: [{ name: Dot, value: 0, fields: [{ name: r, type: f64 }] }] }]\n    functions: [{ name: Shape_decode }]",
-            "'kv_m_Shape_decode'",
-            "of enum 'm.Shape'",
-        ),
-    ];
-    for (decls, symbol, origin) in cases {
-        let doc =
-            format!("version: \"{CURRENT_SCHEMA_VERSION}\"\nmodules:\n  - name: m\n    {decls}\n");
-        let api = parse_api_str(&doc, "yaml").unwrap();
-        let err = validate(&api, &Identity::named("kv"), None).unwrap_err();
-        let text = err.to_string();
-        assert!(text.contains(symbol) && text.contains(origin), "{text}");
-    }
-    // An error code without fields has no payload struct.
-    let doc = format!(
-        "version: \"{CURRENT_SCHEMA_VERSION}\"\nmodules:\n  - name: m\n    errors: [{{ name: E, codes: [{{ name: Busy, code: 1, message: b }}] }}]\n    functions: [{{ name: E_Busy_payload }}]\n"
-    );
-    let api = parse_api_str(&doc, "yaml").unwrap();
-    assert!(validate(&api, &Identity::named("kv"), None).is_ok());
-}
-
-#[test]
-fn source_spans_underline_the_offending_identifier() {
-    let src = format!(
-        "version: \"{CURRENT_SCHEMA_VERSION}\"\nmodules:\n  - name: \"dup\"\n  - name: \"dup\"\n"
-    );
-    let api = parse_api_str(&src, "yaml").unwrap();
-    let err = validate(&api, &Identity::named("api"), Some(("api.yml", &src))).unwrap_err();
-    let d = err.first();
-    let span = d.span.expect("span located");
-    assert_eq!(span.offset(), src.rfind("\"dup\"").unwrap());
-    assert_eq!(&src[span.offset()..span.offset() + span.len()], "\"dup\"");
-    assert!(d.labels().is_some());
-    assert!(d.source_code().is_some());
-}
-
-#[test]
-fn spans_are_scoped_to_the_enclosing_declaration() {
+fn spans_underline_the_offending_text_in_its_declaration() {
     let doc = format!(
         r#"version: "{CURRENT_SCHEMA_VERSION}"
-modules:
-  - name: a
-    structs:
-      - name: x
-        fields: [{{ name: Nope, type: i32 }}]
-    functions:
-      - name: f
-        params: [{{ name: x, type: i32 }}]
-      - name: g
-        params: [{{ name: x, type: i32 }}, {{ name: x, type: Nope }}]
-  - name: b
-    functions:
-      - name: h
-        params: [{{ name: s, type: a.x }}]
-        return: usize
-  - name: c
-    interfaces:
-      - name: Store
-        methods:
-          - {{ name: h }}
-          - {{ name: put, cancellable: true }}
-  - name: c
+records:
+  - name: x
+    fields: [{{ name: Nope, type: i32 }}]
+functions:
+  - name: f
+    params: [{{ name: x, type: i32 }}]
+  - name: g
+    params: [{{ name: x, type: i32 }}, {{ name: x, type: Nope }}]
+  - name: h
+    return: usize
+interfaces:
+  - name: Store
+    methods:
+      - {{ name: h }}
+      - {{ name: put, cancellable: true }}
 "#
     );
     assert_eq!(
         spans(&doc),
         [
-            ("DuplicateParamName".to_string(), "11:x".to_string()),
-            ("UnknownTypeRef".to_string(), "11:Nope".to_string()),
-            ("QualifiedTypeRef".to_string(), "15:a.x".to_string()),
-            ("UnsupportedPrimitive".to_string(), "16:usize".to_string()),
-            ("CancellableNotAsync".to_string(), "22:put".to_string()),
-            ("DuplicateModuleName".to_string(), "23:c".to_string()),
+            ("DuplicateParamName".to_string(), "9:x".to_string()),
+            ("UnknownTypeRef".to_string(), "9:Nope".to_string()),
+            ("UnsupportedPrimitive".to_string(), "11:usize".to_string()),
+            ("CancellableNotAsync".to_string(), "16:put".to_string()),
         ]
     );
 }
 
 #[test]
-fn model_resolves_bare_names() {
-    let model = check(
-        r#"
-modules:
-  - name: shared
-    enums: [{ name: Status, variants: [{ name: Ok, value: 0 }] }]
-    structs: [{ name: Point, fields: [{ name: x, type: f64 }] }]
-    interfaces: [{ name: Store, methods: [{ name: get, params: [] }] }]
-    callback_interfaces: [{ name: Watcher, methods: [{ name: on, params: [] }] }]
-  - name: orders
-    functions:
-      - name: f
-        params: [{ name: s, type: Store }, { name: st, type: Status }, { name: w, type: Watcher }]
-        return: "[Point]"
-"#,
-    )
-    .unwrap();
-    use crate::ty::{ParamTy, RetTy, Ty};
-    let f = &model.modules[1].functions[0];
-    assert_eq!(
-        f.params[0].ty,
-        ParamTy::Value(Ty::Interface("Store".into()))
+fn diagnostics_are_located_in_the_importing_file() {
+    let main = format!(
+        "version: \"{CURRENT_SCHEMA_VERSION}\"\nfunctions: [{{ name: f, return: Item }}]\n"
     );
-    assert_eq!(f.params[1].ty, ParamTy::Value(Ty::Enum("Status".into())));
-    assert_eq!(
-        f.params[2].ty,
-        ParamTy::Callback {
-            name: "Watcher".into(),
-            nullable: false
-        }
+    let types = format!(
+        "version: \"{CURRENT_SCHEMA_VERSION}\"\nrecords:\n  - name: Item\n    fields: [{{ name: a, type: Nope }}]\n"
     );
-    assert_eq!(
-        f.ret,
-        Some(RetTy::Value(Ty::List(Box::new(Ty::Record("Point".into())))))
-    );
-    assert_eq!(model.owner("Point").dot_path, "shared");
-    assert_eq!(model.prefix(), "api");
-    assert_eq!(model.version, CURRENT_SCHEMA_VERSION);
+    let mut api = parse_api_str(&main, "yaml").unwrap();
+    api.merge(parse_api_str(&types, "yaml").unwrap());
+    let mut sources = Sources::single("main.yml", &main);
+    sources.files.push(("types.yml".into(), types.clone()));
+    sources.origin.insert("Item".into(), 1);
+    let err = validate(&api, &Identity::named("api"), Some(&sources)).unwrap_err();
+    let d = err.first();
+    let span = d.span.expect("span located");
+    assert_eq!(&types[span.offset()..span.offset() + span.len()], "Nope");
 }
 
 #[test]
 fn warnings_are_advisory() {
-    let body = r#"
-modules:
-  - name: m
-    enums:
-      - name: Big
-        variants:
-          - { name: A, value: 0 }
-    functions:
-      - { name: deep, params: [{ name: x, type: "[[[[i32]]]]" }] }
-      - { name: fire, params: [], async: true }
-      - { name: old, params: [], deprecated: "use new" }
-    modules:
-      - name: documented
-        doc: Has a module doc.
-        functions: [{ name: f, params: [] }]
-"#;
-    check(body).unwrap();
-    let doc = format!("version: \"{CURRENT_SCHEMA_VERSION}\"\n{body}");
-    let warnings = collect_warnings(&parse_api_str(&doc, "yaml").unwrap());
-    let kinds: Vec<String> = warnings
-        .iter()
-        .map(|w| format!("{w:?}").split(' ').next().unwrap().to_string())
-        .collect();
-    assert_eq!(
-        kinds,
-        [
-            "DeepNesting",
-            "AsyncVoidFunction",
-            "DeprecatedFunction",
-            "EmptyModuleDoc"
-        ]
-    );
-    assert!(warnings[0].to_string().contains("depth 4"));
-    assert!(warnings[2].to_string().contains("use new"));
-}
-
-#[test]
-fn slot_collisions_name_the_callable_and_slot() {
-    let err = check(
-        r#"
-modules:
-  - name: m
-    interfaces:
-      - name: I
-        methods:
-          - { name: f, params: [{ name: name, type: string }, { name: name_len, type: u32 }] }
-"#,
+    let api = parse_api_str(
+        &format!("version: \"{CURRENT_SCHEMA_VERSION}\"\nfunctions: [{{ name: f, return: \"[[[[i32]]]]\" }}]"),
+        "yaml",
     )
-    .unwrap_err();
-    assert_eq!(err.diagnostics.len(), 1);
-    assert_eq!(
-        err.to_string(),
-        "C slot collision in 'm.I.f': two slots are named 'name_len'"
-    );
-}
-
-#[test]
-fn throws_spans_underline_the_domain_name() {
-    let doc = format!(
-        r#"version: "{CURRENT_SCHEMA_VERSION}"
-modules:
-  - name: a
-    errors:
-      - name: Real
-        codes: [{{ name: A, code: 1, message: a }}]
-    functions:
-      - {{ name: ok, throws: Real }}
-      - {{ name: bad, throws: Nope }}
-"#
-    );
-    assert_eq!(
-        spans(&doc),
-        [("UnknownErrorDomain".to_string(), "9:Nope".to_string())]
-    );
+    .unwrap();
+    assert!(validate(&api, &Identity::named("api"), None).is_ok());
+    let warnings = collect_warnings(&api);
+    assert!(warnings
+        .iter()
+        .any(|w| matches!(w, ValidationWarning::DeepNesting { depth: 4, .. })));
 }

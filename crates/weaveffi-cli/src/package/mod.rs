@@ -186,7 +186,7 @@ impl Artifact {
 /// An artifact skipped because an external tool it needs is missing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Skipped {
-    /// The artifact (`the NuGet package`, `the Node.js addon for linux-x64`).
+    /// The artifact (`the NuGet package`, `the linux-x64 library`).
     pub(crate) what: String,
     /// Why it was skipped.
     pub(crate) reason: String,

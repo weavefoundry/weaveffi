@@ -1,3 +1,7 @@
+# `cargo xtask <task>`: the repository's task runner (see xtask/src/main.rs).
+[alias]
+xtask = "run -q -p xtask --"
+
 # Wasm linker flags for WeaveFFI producers.
 #
 # The generated JS bindings need two things from a `wasm32-unknown-unknown`

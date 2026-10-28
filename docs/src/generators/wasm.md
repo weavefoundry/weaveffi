@@ -1,8 +1,9 @@
 # WebAssembly
 
 The WebAssembly target generates an npm package for a `wasm32-unknown-unknown`
-build of the library: an ES module with TypeScript declarations over glue
-that stages values in the module's linear memory. The JavaScript API is the
+build of the library: an ES module with TypeScript declarations over a
+transport that stages values in the module's linear memory and calls its
+[C ABI](../reference/abi.md) (revision 6). The JavaScript API is the
 [Node.js target](node.md)'s, so the sections there on names, types, objects,
 errors, callbacks, and iterators apply here unchanged; this page covers what
 differs.
@@ -18,7 +19,7 @@ For a library named `kvstore` (the snapshot fixtures use `kitchen_sink`):
 ```text
 wasm/
 ├── package.json   ES module manifest
-├── index.js       `init()`, the raw entry points, and the API
+├── index.js       the C signatures, `init()`, and the API
 ├── index.d.ts     TypeScript declarations
 ├── runtime.js     the shared runtime (codec, checks, errors, wrappers)
 ├── debug.js       the `./debug` export: leak counters for tests
@@ -28,14 +29,14 @@ wasm/
 ```
 
 The package name defaults to the package identity's `name`; set `name` under
-`[generators.wasm]` to override it. `weaveffi package` writes the npm tarball
-`wasm/{package}-{version}.tgz` with the module `weaveffi build` linked for
-`wasm32` as `{library}.wasm`.
+`[generators.wasm]` to override it. The package has no dependencies.
+`weaveffi package` writes the npm tarball `wasm/{package}-{version}.tgz` with
+the module `weaveffi build` linked for `wasm32` as `{library}.wasm`.
 
 ## Build the module
 
-The glue installs async completions and callback-interface methods in the
-module's function table, so link the module with an exported, growable
+The transport installs async completions and callback-interface methods in
+the module's function table, so link the module with an exported, growable
 table:
 
 ```sh
@@ -48,19 +49,19 @@ module to `target/weaveffi/wasm32/{library}.wasm`.
 
 ## Load
 
-`init()` loads the module and checks the contract before any other export
-works: the module must implement ABI revision 5, and each top-level module's
-contract table must hold every row the bindings were generated with (see
-the [Node.js page](node.md#load-time-checks)). A failed check rejects
-with an `Error` naming the declaration (`kvstore: kv.Store.put changed
-since these bindings were generated`). Until the promise resolves, every
-other call throws.
+`init()` loads the module and checks it before any other export works: the
+module must implement ABI revision 6 and export every declaration's contract
+function with the hash the bindings were generated with (see the
+[Node.js page](node.md#load-time-checks)). A failed check rejects with an
+`Error` naming the declaration (`kvstore: Store.put changed since these
+bindings were generated`). Until the promise resolves, every other call
+throws.
 
 ```js
-import { init, kv } from 'kvstore';
+import { init, Store } from 'kvstore';
 
 await init();
-const store = kv.Store.open('/tmp/data');
+const store = Store.open('/tmp/data');
 ```
 
 Without an argument, `init()` reads the file named by the `{PREFIX}_LIBRARY`
@@ -81,41 +82,48 @@ and a failed load can be retried.
 
 ## Transport
 
-Each C symbol gets one entry point in `index.js` that checks its arguments
-(range-checking integers), splits an optional scalar into its flag and
-value, copies strings, byte runs, and typed arrays into linear memory for
-the call, and copies returned strings, buffers, and typed arrays out before
-releasing them:
+`linear.js` binds the same C signatures (`$sigs`) the Node.js transport
+does, so the API above it is identical. Each bound function lowers its
+arguments to the module's C calling convention for `wasm32`, which Rust's
+`extern "C"` follows: integers of 32 bits or fewer, `bool`, `size_t`, and
+pointers are `i32`; `int64_t` and `uint64_t` are `i64`; `float` and
+`double` are `f32` and `f64`. A struct (a `{prefix}_run`, a
+`{prefix}_opt_*`, or a callback-interface argument) is passed indirectly, as
+the `i32` address of a copy the caller owns, and a struct return comes back
+through a hidden first `i32` parameter, the address the callee writes it to,
+with the function returning nothing. None of the ABI's structs is a single
+scalar, so none is passed directly. These are the export types a build of
+the samples has:
 
-```js
-    kitchen_sink_kitchen_echo_string: (a0) => {
-      let s0 = null;
-      try {
-        s0 = m.str(a0);
-        const r = x.kitchen_sink_kitchen_echo_string(s0[0], s0[1], m.len, m.err);
-        m.check();
-        return m.takeStr(r, m.outLen());
-      } finally {
-        m.unstage(s0);
-      }
-    },
+```text
+kvstore_Store_tick         (i32 self, i64 seconds, i32 out_err) -> i64
+kvstore_Store_open         (i32 path*, i32 out_err) -> i32
+kvstore_Store_put          (i32 ret*, i32 self, i32 key*, i32 value*, i32 kind, i32 ttl_seconds*, i32 out_err) -> ()
+kvstore_Store_expires_at   (i32 ret*, i32 self, i32 key*, i32 out_err) -> ()
+kvstore_Store_subscribe    (i32 self, i32 listener*, i32 out_err) -> i32
+kvstore_run_free           (i32 run*) -> ()
+codec_echo_opt_bool        (i32 ret*, i32 value*, i32 out_err) -> ()
 ```
 
-Staged arguments are runs from `{prefix}_alloc` (8-aligned, so a typed
-array's elements are aligned for their type), released with
-`{prefix}_free_bytes` once the call returns. The glue reads and writes
-multi-byte values through a `DataView`. One error slot and one each of the
-`out_len`, `out_value`, and iterator item slots are reused by every call;
-they and the callback vtables live in 8-byte-aligned blocks carved from
-arenas the glue allocates once and never frees. The `./debug` export's
-`debugLive(4)` leaves those arenas out of its count of byte runs. Object
-handles are linear-memory addresses.
+The copies live on a small stack the transport carves from linear memory,
+popped as each call returns. A run argument is staged in a run from
+`{prefix}_alloc` (8-aligned, so a typed array's elements are aligned for
+their type) and released with `{prefix}_run_free` once the call returns; a
+returned run is copied out and released the same way. The transport reads
+and writes multi-byte values through a `DataView`. One error slot and one
+iterator item slot are reused by every call; they, the stack, and the
+callback vtables live in 8-byte-aligned blocks carved from arenas the
+transport allocates once and never frees. The `./debug` export's
+`debugLive(4)` leaves those arenas out of its count of runs. Object handles
+are linear-memory addresses.
 
 Async completions and callback-interface methods are JavaScript functions
-installed in the module's function table. The glue uses
-`WebAssembly.Function` where the engine provides it and otherwise compiles a
-tiny module that imports the function with the needed signature and
-re-exports it, so no experimental flag is needed.
+installed in the module's function table, with the same lowering in
+reverse (a method returning a run or an optional scalar writes it through
+its hidden first parameter). The transport uses `WebAssembly.Function` where
+the engine provides it and otherwise compiles a tiny module that imports the
+function with the needed signature and re-exports it, so no experimental
+flag is needed.
 
 ## Type mapping
 
@@ -127,7 +135,8 @@ list argument may also be the matching typed array), maps are `Record`
 objects (a `Map` is accepted as an argument), and `iter<T>` is a lazy
 `NativeIterator<T>` with `close()`. Integer arguments are range-checked the
 same way, so a value that throws a `RangeError` on one target throws it on
-the other.
+the other. A `usize` is 32 bits on `wasm32`, so a wider value fails the
+producer's conversion with code -3.
 
 ## Async and cancellation
 
@@ -143,18 +152,17 @@ wasm32`). A cancelled call rejects with `CancelledError` (code -5).
 
 ## Callbacks and errors
 
-Callback interfaces work as on Node.js: returns of every family (a
-string, bytes, buffer, or typed-array return is copied into a run from
-`{prefix}_alloc` that the producer adopts, an optional scalar is the
-method's `bool` result plus the value behind its `out_value` slot, and an
-object return is a new reference), errors reported by each method's
-`throws` (a domain's codes with their fields, -1 for `throws: any`, -4 for
-a method that doesn't throw), and `null` for an optional callback (`Cb?`),
-which passes a null vtable. The vtable starts with its `size`, `flags` (0),
-and `free` entries, like any consumer's.
+Callback interfaces work as on Node.js: returns of every family (a string,
+bytes, buffer, or typed-array return is copied into a run from
+`{prefix}_alloc` that the producer adopts, an optional scalar is a
+`{prefix}_opt_*` struct, and an object return is a new reference), errors
+reported by each method's `throws` (a domain's codes with their fields, -1
+for `throws: any`, -4 for a method that doesn't throw), and `null` for an
+optional callback (`Cb?`), which passes a null vtable. The vtable starts
+with its `size`, `flags` (0), and `free` entries, like any consumer's.
 
 There are no threads, so a callback runs only while a call into the module
-is on the stack, on the calling thread, and the Node.js addon's threading
+is on the stack, on the calling thread, and the Node.js target's threading
 rules don't arise.
 
 ## Traps
@@ -177,4 +185,7 @@ page to recover.
   external event fails with code -1.
 - A producer panic traps rather than unwinding, and the instance is
   unusable afterward (see [Traps](#traps)).
+- Calls nested more than a few hundred deep (callbacks that call back into
+  the module) exhaust the transport's 16 KiB stack of struct copies and
+  throw a `RangeError`.
 - Only `wasm32-unknown-unknown` builds are supported.
