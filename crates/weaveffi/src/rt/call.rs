@@ -112,7 +112,12 @@ pub fn launch<UT, R, Fut>(
     let context = SendPtr(context);
     crate::rt::spawn::launch_async(
         || prepare().map(|(fut, token)| (async move { Ok::<R, FfiError>(fut.await) }, token)),
-        |value: R| value.lower_return().map(SendAbi),
+        move |value: R| match callback {
+            Some(_) => value.lower_return().map(SendAbi),
+            // Nobody receives the result: drop the Rust value instead of
+            // lowering it into a C value nothing would free.
+            None => Ok(SendAbi(R::ZERO)),
+        },
         move |err, result: SendAbi<R::Abi>| {
             let context = context;
             match callback {
