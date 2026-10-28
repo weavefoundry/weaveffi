@@ -212,11 +212,11 @@ mod tests {
     #[test]
     fn concurrent_next_yields_each_element_once_or_reports_busy() {
         let h = iter_into_raw(Iter::new(0..10_000u32));
-        let addr = h as usize;
         let threads: Vec<_> = (0..8)
             .map(|_| {
+                let shared = crate::rt::ThreadPtr(h);
                 std::thread::spawn(move || {
-                    let h = addr as *const IterHandle<u32>;
+                    let h = shared.get();
                     let mut got = Vec::new();
                     loop {
                         match unsafe { iter_next(h) } {
@@ -250,9 +250,8 @@ mod tests {
             Some(n)
         })));
         assert_eq!(next(h), Some(1));
-        let addr = h as usize;
         assert!(std::panic::catch_unwind(move || {
-            let _ = unsafe { iter_next(addr as *const IterHandle<i32>) };
+            let _ = unsafe { iter_next(h) };
         })
         .is_err());
         assert_eq!(next(h), Some(3));

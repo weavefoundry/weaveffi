@@ -23,6 +23,24 @@ pub mod run;
 pub mod spawn;
 pub mod types;
 
+/// A raw pointer a test moves to another thread. The handles the tests
+/// share are thread-safe; the wrapper only lets the pointer cross, keeping
+/// its provenance (unlike a round trip through `usize`).
+#[cfg(test)]
+pub(crate) struct ThreadPtr<P>(pub(crate) P);
+
+#[cfg(test)]
+// SAFETY: only thread-safe handles are wrapped.
+unsafe impl<P> Send for ThreadPtr<P> {}
+
+#[cfg(test)]
+impl<P: Copy> ThreadPtr<P> {
+    /// The pointer. A method, so a closure captures the whole wrapper.
+    pub(crate) fn get(&self) -> P {
+        self.0
+    }
+}
+
 pub use buffer::{BufferDecodeError, BufferReader, BufferWriter};
 pub use call::{call, iter_step, launch, launch_unit, ret, token, SendPtr};
 pub use callback::{

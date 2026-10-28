@@ -334,11 +334,12 @@ mod tests {
             },
             handle,
         );
-        let raw = token as usize;
+        let raw = crate::rt::ThreadPtr(token);
         let canceller = std::thread::spawn(move || {
+            let raw = raw.get();
             std::thread::sleep(std::time::Duration::from_millis(20));
-            unsafe { cancel_token_cancel(raw as *mut FfiCancelToken) };
-            unsafe { cancel_token_destroy(raw as *mut FfiCancelToken) };
+            unsafe { cancel_token_cancel(raw) };
+            unsafe { cancel_token_destroy(raw) };
         });
         assert!(block_on(fut).is_none());
         assert!(dropped.load(Ordering::SeqCst));
@@ -375,10 +376,10 @@ mod tests {
                 })
             })
             .collect();
-        let raw = token as usize;
+        let raw = crate::rt::ThreadPtr(token);
         let canceller = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(20));
-            unsafe { cancel_token_cancel(raw as *mut FfiCancelToken) };
+            unsafe { cancel_token_cancel(raw.get()) };
         });
         for call in calls {
             assert!(block_on(call).is_none());

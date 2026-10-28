@@ -50,7 +50,7 @@ tempfile = { workspace = true }
 schemars = { workspace = true }
 flate2 = "1"
 base64 = "0.22"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 tar = { version = "0.4", default-features = false }
 object = { version = "0.37", default-features = false, features = ["read", "wasm", "std"] }

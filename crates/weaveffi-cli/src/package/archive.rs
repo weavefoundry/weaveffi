@@ -480,7 +480,11 @@ mod tests {
                 let mut file = archive.by_index(i).unwrap();
                 let mut data = Vec::new();
                 file.read_to_end(&mut data).unwrap();
-                (file.name().to_string(), file.unix_mode().unwrap(), data)
+                (
+                    file.name().unwrap().to_string(),
+                    file.unix_mode().unwrap(),
+                    data,
+                )
             })
             .collect()
     }

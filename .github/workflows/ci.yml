@@ -58,9 +58,16 @@ jobs:
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      - run: cargo miri test -p weaveffi --lib
+      # `rust-toolchain.toml` pins stable, so name the nightly explicitly.
+      # Miri's default provenance model, not strict provenance: object
+      # tokens in value buffers are integers a consumer may write, so the
+      # runtime rebuilds those pointers through exposed provenance.
+      # `-Zmiri-ignore-leaks`: the default executor's detached threads can
+      # still be returning when the test binary exits. Object and run leaks
+      # are asserted by the conformance lanes' leak counters instead.
+      - run: cargo +nightly miri test -p weaveffi --lib
         env:
-          MIRIFLAGS: -Zmiri-strict-provenance
+          MIRIFLAGS: -Zmiri-ignore-leaks
 
   test:
     name: Test (${{ matrix.os }})
@@ -237,7 +244,9 @@ jobs:
           cargo run -q -p weaveffi-cli -- build samples/kvstore --platforms android-arm64 --strict
           readelf="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
           "$readelf" -d target/weaveffi/android-arm64/libkvstore.so | grep 'SONAME.*libkvstore.so'
-          "$readelf" --dyn-syms target/weaveffi/android-arm64/libkvstore.so | grep -q 'kvstore_contract_'
+          # Not `grep -q`: it exits at the first match, and under pipefail
+          # readelf's failed write to the closed pipe fails the step.
+          "$readelf" --dyn-syms target/weaveffi/android-arm64/libkvstore.so | grep 'kvstore_contract_' >/dev/null
 
   package-smoke:
     # `weaveffi package` must produce artifacts each ecosystem's own tool

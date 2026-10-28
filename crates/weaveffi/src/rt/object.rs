@@ -282,11 +282,13 @@ pub unsafe fn object_destroy<T>(ptr: *mut T) {
 
 /// The object token an interface value takes inside a value buffer: the
 /// [`lower_object`] pointer widened to `u64`. The token carries one strong
-/// reference; whoever decodes it adopts that reference.
+/// reference; whoever decodes it adopts that reference. The pointer's
+/// provenance is exposed, since a consumer may write the token and
+/// [`object_from_token`] rebuilds the pointer from the integer alone.
 #[must_use]
 pub fn object_to_token<T>(value: &Arc<T>) -> u64 {
     crate::rt::leak::track(crate::rt::leak::OBJECTS, 1);
-    Arc::into_raw(Arc::clone(value)) as usize as u64
+    Arc::into_raw(Arc::clone(value)).expose_provenance() as u64
 }
 
 /// Adopt the strong reference carried by an object token read from a value
@@ -299,7 +301,7 @@ pub fn object_to_token<T>(value: &Arc<T>) -> u64 {
 /// exactly once: adopting the same token twice double-frees.
 #[must_use]
 pub unsafe fn object_from_token<T>(token: u64) -> Option<Arc<T>> {
-    let ptr = token as usize as *const T;
+    let ptr = std::ptr::with_exposed_provenance::<T>(token as usize);
     if ptr.is_null() {
         return None;
     }
