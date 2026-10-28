@@ -126,7 +126,9 @@ pub fn gzip(bytes: &[u8]) -> Result<Vec<u8>> {
         .wrap_err("failed to gzip")
 }
 
-/// A zip archive of `entries`, each deflated, with Unix permissions.
+/// A zip archive of `entries`, each deflated, with Unix permissions. Every
+/// entry is marked as made on Unix, whatever the host, so the modes take
+/// effect when extracted and the bytes are the same on every host.
 ///
 /// # Errors
 ///
@@ -137,6 +139,7 @@ pub fn zip(entries: &[Entry<'_>]) -> Result<Vec<u8>> {
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
             .last_modified_time(zip_mtime())
+            .system(zip::System::Unix)
             .unix_permissions(entry.mode());
         writer
             .start_file(entry.path.as_str(), options)
