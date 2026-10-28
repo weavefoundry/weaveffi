@@ -131,12 +131,6 @@ pub trait FfiType<UT>: Sized {
     /// The IDL spelling (`i32`, `string`, `[Entry?]`).
     const NAME: Name;
 
-    /// Whether a value's buffer encoding can hold an object token: an
-    /// interface, directly or inside an optional, list, map, record, rich
-    /// enum, or custom repr. An error code's fields can't, because a
-    /// consumer that doesn't know the code discards its payload undecoded.
-    const CARRIES_OBJECTS: bool = false;
-
     /// The one C value the type crosses as.
     type Abi: Copy;
 
@@ -543,10 +537,6 @@ pub trait Codec<UT>: Sized {
     /// The type's IDL name.
     const NAME: Name;
 
-    /// Whether a field can hold an object token (see
-    /// [`FfiType::CARRIES_OBJECTS`]).
-    const CARRIES_OBJECTS: bool = false;
-
     /// Append the encoding.
     fn encode(&self, w: &mut BufferWriter);
 
@@ -570,7 +560,6 @@ macro_rules! __weaveffi_buffered {
     ($ut:ty, $t:ty) => {
         impl $crate::__rt::FfiType<$ut> for $t {
             const NAME: $crate::__rt::Name = <$t as $crate::__rt::Codec<$ut>>::NAME;
-            const CARRIES_OBJECTS: bool = <$t as $crate::__rt::Codec<$ut>>::CARRIES_OBJECTS;
             type Abi = $crate::__rt::Run;
             const ZERO: $crate::__rt::Run = $crate::__rt::Run::EMPTY;
             fn lower(self) -> $crate::__rt::Run {
@@ -773,7 +762,6 @@ macro_rules! __weaveffi_custom {
     ($ut:ty, $t:ty, $repr:ty, $lift:expr, $lower:expr) => {
         impl $crate::__rt::FfiType<$ut> for $t {
             const NAME: $crate::__rt::Name = <$repr as $crate::__rt::FfiType<$ut>>::NAME;
-            const CARRIES_OBJECTS: bool = <$repr as $crate::__rt::FfiType<$ut>>::CARRIES_OBJECTS;
             type Abi = <$repr as $crate::__rt::FfiType<$ut>>::Abi;
             const ZERO: Self::Abi = <$repr as $crate::__rt::FfiType<$ut>>::ZERO;
             fn lower(self) -> Self::Abi {
@@ -1248,7 +1236,6 @@ impl<UT, T: FfiType<UT>> FfiLend<UT> for [T] {
 
 impl<UT, T: FfiType<UT>> FfiType<UT> for Vec<T> {
     const NAME: Name = T::LIST_NAME;
-    const CARRIES_OBJECTS: bool = T::CARRIES_OBJECTS;
     type Abi = Run;
     const ZERO: Run = Run::EMPTY;
     fn lower(self) -> Run {
@@ -1278,7 +1265,6 @@ crate::__weaveffi_value_traits!([UT, T: FfiType<UT>] UT, Vec<T>);
 
 impl<UT, T: FfiType<UT>> FfiType<UT> for Option<T> {
     const NAME: Name = Name::optional(&T::NAME);
-    const CARRIES_OBJECTS: bool = T::CARRIES_OBJECTS;
     type Abi = T::OptAbi;
     const ZERO: T::OptAbi = T::OPT_ZERO;
     fn lower(self) -> T::OptAbi {
@@ -1315,7 +1301,6 @@ macro_rules! map_type {
     ($map:ident, [$($bound:tt)*], $with_capacity:expr) => {
         impl<UT, K: FfiType<UT> + $($bound)*, V: FfiType<UT>> FfiType<UT> for $map<K, V> {
             const NAME: Name = Name::map(&K::NAME, &V::NAME);
-            const CARRIES_OBJECTS: bool = K::CARRIES_OBJECTS || V::CARRIES_OBJECTS;
             type Abi = Run;
             const ZERO: Run = Run::EMPTY;
             fn lower(self) -> Run {

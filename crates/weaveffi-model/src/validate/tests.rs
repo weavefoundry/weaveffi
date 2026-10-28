@@ -65,6 +65,13 @@ functions:
   - { name: watch, params: [{ name: l, type: "Listener?" }], return: "iter<Node>" }
   - { name: fetch, return: "[u64]", async: true, cancellable: true }
 "#,
+        // A recursive record with no object may sit in an error payload.
+        r#"
+records:
+  - { name: Tree, fields: [{ name: kids, type: "[Tree]" }, { name: label, type: string }] }
+errors:
+  - { name: E, codes: [{ name: Bad, code: 1, message: bad, fields: [{ name: at, type: Tree }] }] }
+"#,
     ] {
         check(body).unwrap_or_else(|e| panic!("{body}: {:?}", e.diagnostics));
     }
@@ -163,6 +170,20 @@ fn every_rule_fires() {
         (
             "ObjectInErrorPayload",
             "interfaces: [{ name: I, statics: [{ name: s }] }]\nerrors: [{ name: E, codes: [{ name: A, code: 1, message: a, fields: [{ name: i, type: I }] }] }]",
+        ),
+        // Through a list of records holding an optional object.
+        (
+            "ObjectInErrorPayload",
+            "interfaces: [{ name: I, statics: [{ name: s }] }]\nrecords: [{ name: H, fields: [{ name: i, type: \"I?\" }] }]\nerrors: [{ name: E, codes: [{ name: A, code: 1, message: a, fields: [{ name: h, type: \"[H]\" }] }] }]",
+        ),
+        // Through records that contain each other, and a rich enum.
+        (
+            "ObjectInErrorPayload",
+            "interfaces: [{ name: I, statics: [{ name: s }] }]\nrecords: [{ name: D, fields: [{ name: f, type: \"[F]\" }] }, { name: F, fields: [{ name: d, type: \"[D]\" }, { name: i, type: \"I?\" }] }]\nerrors: [{ name: E, codes: [{ name: A, code: 1, message: a, fields: [{ name: d, type: D }] }] }]",
+        ),
+        (
+            "ObjectInErrorPayload",
+            "interfaces: [{ name: I, statics: [{ name: s }] }]\nenums: [{ name: V, variants: [{ name: N, fields: [{ name: v, type: \"[V]\" }] }, { name: O, fields: [{ name: i, type: I }] }] }]\nerrors: [{ name: E, codes: [{ name: A, code: 1, message: a, fields: [{ name: v, type: V }] }] }]",
         ),
         ("IteratorInInvalidPosition", "functions: [{ name: f, params: [{ name: x, type: \"iter<i32>\" }] }]"),
         ("IteratorInInvalidPosition", "functions: [{ name: f, return: \"[iter<i32>]\" }]"),

@@ -86,7 +86,6 @@ macro_rules! __weaveffi_interface {
     ($ut:ty, $t:ty, $name:expr) => {
         impl $crate::__rt::FfiType<$ut> for ::std::sync::Arc<$t> {
             const NAME: $crate::__rt::Name = $crate::__rt::Name::new($name);
-            const CARRIES_OBJECTS: bool = true;
             type Abi = *const $t;
             const ZERO: *const $t = ::core::ptr::null();
             fn lower(self) -> *const $t {

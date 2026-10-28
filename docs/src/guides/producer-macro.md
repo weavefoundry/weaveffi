@@ -174,7 +174,8 @@ BookError>`.
   positive, and unique within the domain. A variant may carry named fields,
   which travel as the error's payload (a [value buffer](../reference/value-buffers.md)
   of the fields); Rust then requires the enum to be `#[repr(i32)]`. A field
-  can't reach an interface (`ObjectInErrorPayload`).
+  can't reach an interface, directly or through a record or rich enum; the
+  CLI's validator reports it as `ObjectInErrorPayload`.
 - **Messages.** The macro generates `Display` and `std::error::Error`, so
   the enum must implement `Debug`. A variant's message is its
   `#[weaveffi(message = "...")]` template, which may interpolate the
@@ -225,8 +226,10 @@ fits in an `i32`, or one more than the previous variant's (`Kind::Other` is
 `11`); a rich enum's discriminants are the tags in its buffer encoding. A
 rich enum's variants use named fields or none (tuple variants are
 rejected). A field may be any value type, including `usize`, `char`, a
-custom type, and an object. Records, enums, error domains, interfaces, and
-callback interfaces can't be generic.
+custom type, and an object. A record or rich enum may contain itself (or a
+type that contains it) through a `Vec` or map, as in `children:
+Vec<Node>`. Records, enums, error domains, interfaces, and callback
+interfaces can't be generic.
 
 ## Custom types
 

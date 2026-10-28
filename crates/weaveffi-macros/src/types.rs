@@ -96,13 +96,6 @@ fn field_ir(fb: &mut FrameBuilder, fields: &[NamedField<'_>]) -> Vec<Field> {
         .collect()
 }
 
-/// Whether any of `tys` can hold an object token, as a `const` expression.
-fn carries_objects<'a>(tys: impl Iterator<Item = &'a syn::Type>) -> TokenStream {
-    let tag = tag();
-    let tys = tys.map(|t| quote!(<#t as ::weaveffi::__rt::FfiType<#tag>>::CARRIES_OBJECTS));
-    quote!(false #(|| #tys)*)
-}
-
 /// `#[weaveffi::record]`.
 pub(crate) fn record(attr: TokenStream, item: syn::ItemStruct) -> syn::Result<TokenStream> {
     no_args(&attr, "record")?;
@@ -127,12 +120,10 @@ pub(crate) fn record(attr: TokenStream, item: syn::ItemStruct) -> syn::Result<To
         quote!(#id: unsafe { <#fty as ::weaveffi::__rt::FfiType<#tag>>::read(r) }?)
     });
     let lit = name_lit(&name);
-    let carries = carries_objects(fields.iter().map(|f| f.ty));
     let codec = quote! {
         #[allow(unsafe_code, unused_unsafe)]
         impl ::weaveffi::__rt::Codec<#tag> for #ty {
             const NAME: ::weaveffi::__rt::Name = #lit;
-            const CARRIES_OBJECTS: bool = #carries;
             fn encode(&self, w: &mut ::weaveffi::__rt::BufferWriter) {
                 #(#writes)*
             }
@@ -253,12 +244,10 @@ pub(crate) fn enumeration(attr: TokenStream, item: syn::ItemEnum) -> syn::Result
             });
             quote!(#value => Self::#vid { #(#reads),* },)
         });
-        let carries = carries_objects(variants.iter().flat_map(|(_, f)| f.iter().map(|f| f.ty)));
         quote! {
             #[allow(unsafe_code, unused_unsafe)]
             impl ::weaveffi::__rt::Codec<#tag> for #ty {
                 const NAME: ::weaveffi::__rt::Name = #lit;
-                const CARRIES_OBJECTS: bool = #carries;
                 fn encode(&self, w: &mut ::weaveffi::__rt::BufferWriter) {
                     match self {
                         #(#writes)*
@@ -466,29 +455,11 @@ pub(crate) fn error(attr: TokenStream, mut item: syn::ItemEnum) -> syn::Result<T
     // The message is the domain's `Display`: spanned at the type, a missing
     // one (with `no_display`) is reported there.
     let to_string = quote_spanned!(ty.span()=> <#ty as ::std::string::ToString>::to_string);
-    let no_objects = codes.iter().flat_map(|(v, _, fields, ..)| {
-        let (name, tag) = (&name, &tag);
-        fields.iter().map(move |(id, fty, _)| {
-            let message = format!(
-                "weaveffi: field `{id}` of error code `{name}::{}` can carry an object, which \
-                 an error payload can't: a consumer that doesn't know the code discards the \
-                 payload undecoded, so the object would never be released",
-                v.ident
-            );
-            quote_spanned! {fty.span()=>
-                const _: () = ::core::assert!(
-                    !<#fty as ::weaveffi::__rt::FfiType<#tag>>::CARRIES_OBJECTS,
-                    #message
-                );
-            }
-        })
-    });
     let domain_impl = quote_spanned! {ty.span()=>
         #[allow(unsafe_code, unused_unsafe, unreachable_patterns)]
         impl ::weaveffi::__rt::ErrorType<#tag> for #ty
     };
     let mut impls = quote! {
-        #(#no_objects)*
         #domain_impl {
             const DOMAIN: ::weaveffi::__rt::Name = #lit;
             fn into_ffi(self) -> ::weaveffi::__rt::FfiError {
