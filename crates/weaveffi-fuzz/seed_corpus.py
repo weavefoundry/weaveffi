@@ -10,7 +10,7 @@ them cover the whole IDL surface:
 - fuzz_parse_yaml, fuzz_validate: each fixture as is
 - fuzz_parse_json: each fixture converted to JSON
 - fuzz_parse_type_ref: every distinct `type` and `return` string
-- fuzz_value_buffer: the committed seeds only
+- fuzz_value_buffer, fuzz_meta_frames: the committed seeds only
 
 Needs PyYAML (`pip install pyyaml`).
 """
@@ -74,7 +74,7 @@ def main():
             type_strings(load(fixture), types)
         for i, ty in enumerate(sorted(types)):
             (corpus / f"fixture_type_{i:03}.txt").write_text(ty)
-    elif target != "fuzz_value_buffer":
+    elif target not in ("fuzz_value_buffer", "fuzz_meta_frames"):
         sys.exit(f"unknown fuzz target: {target}")
 
     print(f"{target}: {len(list(corpus.iterdir()))} corpus inputs")
