@@ -7,6 +7,13 @@ by release-plz, and earlier ones by semantic-release.
 
 ## [Unreleased]
 
+## [0.26.0](https://github.com/weavefoundry/weaveffi/compare/v0.25.0...v0.26.0) - 2026-11-02
+
+### Features
+
+- [**breaking**] rebuild on C ABI 6 with one namespace per library ([#60](https://github.com/weavefoundry/weaveffi/pull/60))
+- [**breaking**] ship C ABI 5, model v2, and a simpler producer API ([#57](https://github.com/weavefoundry/weaveffi/pull/57))
+
 ## [0.25.0](https://github.com/weavefoundry/weaveffi/compare/v0.24.0...v0.25.0) - 2026-10-09
 
 ### Features
