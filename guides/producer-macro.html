@@ -1,0 +1,955 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>The Rust Producer Macros - WeaveFFI v0.26</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-1339018f.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-e1100732.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">WeaveFFI v0.26</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/weavefoundry/weaveffi" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="the-rust-producer-macros"><a class="header" href="#the-rust-producer-macros">The Rust Producer Macros</a></h1>
+<p>A Rust producer is an ordinary library crate. You tag the items you want to
+export with WeaveFFI’s attributes, wherever they are in the crate, and call
+<code>weaveffi::export_runtime!()</code> once at the crate root. Each attribute emits
+its item’s <code>extern "C"</code> functions, marshalling every value through the
+audited runtime inside the <code>weaveffi</code> crate, so the crate contains no
+<code>unsafe</code> glue. Each also embeds a description of its item in the compiled
+library, and the CLI reads the API from there (<code>weaveffi generate</code> builds the
+crate first), so the generated bindings describe exactly what the library
+was compiled with.</p>
+<p>Every example on this page is a region of
+<a href="https://github.com/weavefoundry/weaveffi/tree/main/examples/macro-tour"><code>examples/macro-tour</code></a>,
+a small address book whose tests call the generated C functions the way a
+consumer does.</p>
+<h2 id="setup"><a class="header" href="#setup">Setup</a></h2>
+<pre><code class="language-toml">[dependencies]
+weaveffi = "0.25"
+</code></pre>
+<p>The crate needs no <code>crate-type</code>: the CLI builds the C dynamic library itself
+with <code>cargo rustc --lib --crate-type cdylib</code>, and <code>weaveffi build</code> adds the
+<code>staticlib</code> an Apple build needs. Add <code>crate-type = ["cdylib", "rlib"]</code> only
+if you also want a plain <code>cargo build</code> to produce the dynamic library.</p>
+<p><strong>The prefix is the crate name.</strong> Every C symbol starts with the crate’s
+library name (<code>[lib] name</code>, else the package name with <code>-</code> mapped to <code>_</code>),
+which the attributes read from <code>CARGO_CRATE_NAME</code> as they expand. The CLI
+derives the same prefix from <code>cargo metadata</code>, and it isn’t configurable:
+setting <code>[package] c_prefix</code> or <code>library</code> in <code>weaveffi.toml</code> for a Rust
+producer is an error. The <code>macro-tour</code> crate exports <code>macro_tour_add</code>,
+<code>macro_tour_Book_new</code>, <code>macro_tour_error_clear</code>, and so on, and builds
+<code>libmacro_tour.so</code>.</p>
+<p><strong><code>export_runtime!()</code> exactly once,</strong> at the crate root:</p>
+<pre><code class="language-rust ignore">weaveffi::export_runtime!();</code></pre>
+<p>It takes no arguments and exports the
+<a href="../reference/abi.html#runtime-surface">runtime surface</a> under the crate’s
+prefix (<code>abi_version</code>, the error helpers, <code>alloc</code>, <code>run_free</code>, the cancel
+token functions, and <code>debug_live</code>). It also defines the crate’s hidden tag
+type, <code>crate::__weaveffi::Tag</code>, which every attribute’s expansion names, so
+a crate that forgets the call fails to compile at its first exported item
+with an unresolved <code>crate::__weaveffi</code>.</p>
+<p><strong>A library is one namespace.</strong> Rust modules organize the source; they
+don’t scope exported names. A declaration in any module or file joins the
+library’s one namespace, so every exported record, enum, error domain,
+interface, callback interface, and free function needs a name unique across
+the crate. Two items with the same name export the same contract and
+metadata symbols, so the build fails with a <code>symbol ... is already defined</code>
+error on the second one.</p>
+<p><strong>Each declaration carries its contract and its description.</strong> An
+attribute exports one contract function per declaration
+(<code>{prefix}_contract_{id}</code>, returning the hash of its canonical signature;
+see <a href="../reference/abi.html#the-contract">the contract</a>) and one metadata frame
+(see <a href="extract.html#how-the-api-is-embedded">Library Mode</a>). Both are computed
+from the same resolved types the CLI uses for the bindings, so a library and
+the bindings generated from it always agree.</p>
+<h2 id="the-attributes"><a class="header" href="#the-attributes">The attributes</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Attribute</th><th>On</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>#[weaveffi::export]</code></td><td>a <code>fn</code> or <code>async fn</code>; an inherent <code>impl</code> block of an interface</td><td>Exports a free function, or every <code>pub fn</code> of the block as a constructor, method, or static.</td></tr>
+<tr><td><code>#[weaveffi::record]</code></td><td>a struct with named fields</td><td>A record, crossing by value in a value buffer.</td></tr>
+<tr><td><code>#[weaveffi::enumeration]</code></td><td>an enum</td><td>A C-style enum (unit variants, crossing as an <code>int32_t</code>) or a rich enum (variants with named fields, crossing in a value buffer).</td></tr>
+<tr><td><code>#[weaveffi::error]</code></td><td>an enum with explicit positive discriminants</td><td>An error domain. Generates <code>Display</code> and <code>std::error::Error</code> unless written <code>#[weaveffi::error(no_display)]</code>.</td></tr>
+<tr><td><code>#[weaveffi::interface]</code></td><td>a struct</td><td>A reference-counted object type, which must be <code>Send + Sync</code>. Export its methods with <code>#[weaveffi::export]</code> on its <code>impl</code> blocks.</td></tr>
+<tr><td><code>#[weaveffi::callback_interface]</code></td><td>a <code>Send + Sync</code> trait</td><td>A method set the consumer implements, accepted as <code>Arc&lt;dyn Trait&gt;</code> or <code>Option&lt;Arc&lt;dyn Trait&gt;&gt;</code>.</td></tr>
+<tr><td><code>#[weaveffi::custom(repr = R, lift = f, lower = g)]</code></td><td>a type alias or a struct</td><td>A type that crosses the ABI as <code>R</code>.</td></tr>
+<tr><td><code>weaveffi::export_runtime!()</code></td><td>the crate root, once</td><td>The runtime symbols and the crate’s tag type.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Two helper attributes refine an item: <code>#[weaveffi(skip)]</code> leaves a <code>pub fn</code>
+of an exported <code>impl</code> block out of the bindings, and
+<code>#[weaveffi(message = "...")]</code> sets an error code’s message template. Doc
+comments flow into the IDL and every binding, and
+<code>#[deprecated(note = "...")]</code> becomes the IDL’s <code>deprecated:</code> text and each
+language’s deprecation marker.</p>
+<p>Only tagged items are exported; private helpers, <code>use</code> items, and state are
+left alone. Each attribute expands on its own, and every value is marshalled
+through its type’s traits, so a type is resolved by rustc wherever it’s
+declared: in another module, behind a type alias, or (for a custom type) in
+another crate.</p>
+<h2 id="types"><a class="header" href="#types">Types</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Rust</th><th>IDL</th><th>Crosses the ABI as</th></tr>
+</thead>
+<tbody>
+<tr><td><code>i8</code>..<code>i64</code>, <code>u8</code>..<code>u64</code>, <code>f32</code>, <code>f64</code>, <code>bool</code></td><td>same</td><td>the scalar; a <code>bool</code> is a C <code>bool</code>, checked to be <code>0</code> or <code>1</code></td></tr>
+<tr><td><code>usize</code>, <code>isize</code></td><td><code>u64</code>, <code>i64</code></td><td>the scalar, range-checked on the way in (out of range is <code>-3</code>)</td></tr>
+<tr><td><code>#[weaveffi::enumeration]</code> C-style enum</td><td>the enum</td><td><code>int32_t</code>, checked to be a declared value</td></tr>
+<tr><td><code>Option&lt;T&gt;</code> of any of those</td><td><code>T?</code></td><td>a <code>{p}_opt_{prim}</code> struct (an optional enum is a <code>{p}_opt_i32</code>)</td></tr>
+<tr><td><code>String</code>, <code>&amp;str</code></td><td><code>string</code></td><td>a <code>{p}_run</code> of UTF-8</td></tr>
+<tr><td><code>char</code></td><td><code>string</code></td><td>a run holding exactly one Unicode scalar value (anything else is <code>-3</code>)</td></tr>
+<tr><td><code>Vec&lt;u8&gt;</code>, <code>&amp;[u8]</code></td><td><code>bytes</code></td><td>a run of raw bytes</td></tr>
+<tr><td><code>Vec&lt;T&gt;</code> or <code>&amp;[T]</code> of <code>i8</code>, <code>i16</code>, <code>i32</code>, <code>i64</code>, <code>u16</code>, <code>u32</code>, <code>u64</code>, <code>f32</code>, <code>f64</code></td><td><code>[T]</code></td><td>a typed array: a run of packed elements</td></tr>
+<tr><td><code>#[weaveffi::record]</code> struct, rich enum</td><td>the type</td><td>a run holding a value buffer</td></tr>
+<tr><td>every other <code>Option&lt;T&gt;</code>, <code>Vec&lt;T&gt;</code>, <code>&amp;[T]</code>, and <code>HashMap&lt;K, V&gt;</code> or <code>BTreeMap&lt;K, V&gt;</code></td><td><code>T?</code>, <code>[T]</code>, <code>{K:V}</code></td><td>a run holding a value buffer</td></tr>
+<tr><td><code>&amp;T</code>, <code>Arc&lt;T&gt;</code>, <code>Option&lt;&amp;T&gt;</code>, <code>Option&lt;Arc&lt;T&gt;&gt;</code> of an interface <code>T</code>; <code>Self</code> or <code>T</code> as a return</td><td><code>T</code>, <code>T?</code></td><td>an object pointer</td></tr>
+<tr><td><code>Arc&lt;dyn Trait&gt;</code>, <code>Option&lt;Arc&lt;dyn Trait&gt;&gt;</code> of a callback interface</td><td><code>Trait</code>, <code>Trait?</code></td><td>a <code>{p}_{Trait}</code> <code>{ctx, vtable}</code> struct (parameters only)</td></tr>
+<tr><td><code>weaveffi::Iter&lt;T&gt;</code></td><td><code>iter&lt;T&gt;</code></td><td>an iterator pointer (returns only)</td></tr>
+<tr><td>a <code>#[weaveffi::custom]</code> type</td><td>its repr</td><td>as its repr</td></tr>
+<tr><td><code>weaveffi::CancelToken</code></td><td>none: it makes the function <code>cancellable</code></td><td>the launcher’s cancel-token slot</td></tr>
+</tbody>
+</table>
+</div>
+<p>How a type crosses never changes its IDL spelling or its surface type in a
+binding (<code>i64?</code> is an optional integer and <code>[f64]</code> a list of doubles in every
+language); only the transport differs, and inside a value buffer every type
+uses the buffer encoding. A reference (<code>&amp;str</code>, <code>&amp;[u8]</code>, <code>&amp;[f64]</code>,
+<code>&amp;Contact</code>, <code>&amp;Book</code>) is a calling convention, not an IDL distinction: the
+generated function lends the lifted argument for the call, and a <code>&amp;[T]</code> of a
+typed-array element reads the caller’s array in place. Objects compose with
+every buffered shape, so <code>Vec&lt;Arc&lt;T&gt;&gt;</code>, <code>Option&lt;Arc&lt;T&gt;&gt;</code>, an <code>Arc&lt;T&gt;</code> record
+field, and <code>weaveffi::Iter&lt;Arc&lt;T&gt;&gt;</code> all work.</p>
+<p>A parameter that fails these checks fails the call with <code>-3</code> and a message
+of the form <code>{param}: {message}</code>, where a rejected value is quoted (<code>value: "ab" is not a valid char</code>, <code>mode: 7 is not a valid Mode</code>).</p>
+<p>A type without a WeaveFFI crossing (<code>u128</code>, a raw pointer, a <code>Box&lt;T&gt;</code>, a
+struct without an attribute) fails to compile, with a trait error naming the
+type or, for the shapes the attributes recognize, a message saying what to
+use instead. For integers wider than 64 bits, declare a custom type with a
+<code>String</code> repr.</p>
+<h2 id="functions"><a class="header" href="#functions">Functions</a></h2>
+<pre><code class="language-rust ignore">/// Add two integers, wrapping on overflow.
+#[weaveffi::export]
+pub fn add(a: i32, b: i32) -&gt; i32 {
+    a.wrapping_add(b)
+}
+
+/// The number of words in `text`.
+#[weaveffi::export]
+pub fn word_count(text: &amp;str) -&gt; usize {
+    text.split_whitespace().count()
+}
+
+/// The arithmetic mean of `values`, or none for an empty list.
+#[weaveffi::export]
+pub fn mean(values: &amp;[f64]) -&gt; Option&lt;f64&gt; {
+    if values.is_empty() {
+        return None;
+    }
+    Some(values.iter().sum::&lt;f64&gt;() / values.len() as f64)
+}</code></pre>
+<p>A function’s parameters are plain names whose types are values (<code>T</code>),
+borrows (<code>&amp;str</code>, <code>&amp;[f64]</code>, <code>&amp;Contact</code>, <code>&amp;Book</code>, <code>Option&lt;&amp;T&gt;</code>), or callback
+interfaces. It returns nothing, a value, a <code>weaveffi::Iter&lt;T&gt;</code>, or a
+<code>Result</code> of one. These export <code>macro_tour_add</code>, <code>macro_tour_word_count</code>, and
+<code>macro_tour_mean</code>:</p>
+<pre><code class="language-c">int32_t macro_tour_add(int32_t a, int32_t b, macro_tour_error* out_err);
+uint64_t macro_tour_word_count(macro_tour_run text, macro_tour_error* out_err);
+macro_tour_opt_f64 macro_tour_mean(macro_tour_run values, macro_tour_error* out_err);
+</code></pre>
+<p>An exported function can’t be generic, and a parameter named <code>self</code>, <code>ctx</code>,
+<code>out_err</code>, <code>callback</code>, <code>context</code>, or <code>cancel_token</code> collides with a slot the
+C ABI adds (<code>SlotCollision</code>).</p>
+<h2 id="errors"><a class="header" href="#errors">Errors</a></h2>
+<p>A <code>Result&lt;T, E&gt;</code> return makes the callable fallible with return type <code>T</code>
+(<code>Result&lt;(), E&gt;</code> returns nothing), and <code>E</code> decides what it throws.</p>
+<h3 id="error-domains"><a class="header" href="#error-domains">Error domains</a></h3>
+<pre><code class="language-rust ignore">/// The address book's error domain. Each variant's value is its stable
+/// code, and its fields travel with the error as its payload.
+#[weaveffi::error]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(i32)]
+pub enum BookError {
+    /// contact not found
+    #[weaveffi(message = "no contact with id {id}")]
+    NotFound {
+        /// The id that was looked up.
+        id: u64,
+    } = 1,
+    /// the book is full
+    #[weaveffi(message = "the book is full ({capacity} contacts)")]
+    Full {
+        /// The book's capacity.
+        capacity: u32,
+    } = 2,
+    /// a contact needs a name
+    EmptyName = 3,
+    /// a listener rejected the contact
+    #[weaveffi(message = "a listener rejected {name}")]
+    Rejected {
+        /// The rejected contact's name.
+        name: String,
+    } = 4,
+    /// a listener failed
+    #[weaveffi(message = "{message}")]
+    ListenerFailed {
+        /// The listener's message.
+        message: String,
+    } = 5,
+}
+
+/// Any listener failure that isn't a `BookError` code arrives as a
+/// `ForeignError`; this keeps it typed for the original caller.
+impl From&lt;ForeignError&gt; for BookError {
+    fn from(e: ForeignError) -&gt; Self {
+        Self::ListenerFailed { message: e.message }
+    }
+}</code></pre>
+<p>When <code>E</code> is a <code>#[weaveffi::error]</code> enum, the callable is <code>throws: E</code> in the
+IDL, and every binding raises a typed error for each code, with the code’s
+fields as properties. <code>Book::add</code> below returns <code>Result&lt;Contact, BookError&gt;</code>.</p>
+<ul>
+<li><strong>Codes.</strong> Each variant’s discriminant is its stable code: explicit,
+positive, and unique within the domain. A variant may carry named fields,
+which travel as the error’s payload (a <a href="../reference/value-buffers.html">value buffer</a>
+of the fields); Rust then requires the enum to be <code>#[repr(i32)]</code>. A field
+can’t reach an interface, directly or through a record or rich enum; the
+CLI’s validator reports it as <code>ObjectInErrorPayload</code>.</li>
+<li><strong>Messages.</strong> The macro generates <code>Display</code> and <code>std::error::Error</code>, so
+the enum must implement <code>Debug</code>. A variant’s message is its
+<code>#[weaveffi(message = "...")]</code> template, which may interpolate the
+variant’s fields by name (<code>{id}</code>, or <code>{id:?}</code> for <code>Debug</code>), else the first
+line of its doc comment, else the variant name.
+<code>BookError::NotFound { id: 99 }.to_string()</code> is <code>no contact with id 99</code>,
+the message every binding’s error carries. To write <code>Display</code> yourself
+(with thiserror, say), write <code>#[weaveffi::error(no_display)]</code>; the enum
+must then implement <code>Display</code>, and the macro generates neither impl.</li>
+<li><strong>Names.</strong> Code values only need to be unique within their domain (two
+domains may both use <code>1</code>), but code names must be unique across the whole
+library (<code>DuplicateErrorCodeName</code>), because several targets flatten them
+into one namespace.</li>
+<li><strong>Open domains.</strong> Adding a code later never breaks a deployed binding,
+which reports an unknown code as the domain’s base error with its code and
+message.</li>
+</ul>
+<h3 id="untyped-errors"><a class="header" href="#untyped-errors">Untyped errors</a></h3>
+<pre><code class="language-rust ignore">/// Parse a decimal integer. Any `std::error::Error` converts into
+/// `weaveffi::Error` with `?`, so this function throws an untyped error
+/// carrying the parse error's message.
+#[weaveffi::export]
+pub fn parse_number(text: &amp;str) -&gt; Result&lt;i64, weaveffi::Error&gt; {
+    Ok(text.trim().parse()?)
+}
+
+/// The square root of `x`. A `String` error is untyped too.
+#[weaveffi::export]
+pub fn checked_sqrt(x: f64) -&gt; Result&lt;f64, String&gt; {
+    if x &lt; 0.0 {
+        return Err(format!("cannot take the square root of {x}"));
+    }
+    Ok(x.sqrt())
+}</code></pre>
+<p>When <code>E</code> is an untyped error, the callable is <code>throws: any</code>: a failure
+reports the runtime code <code>-1</code> with <code>E</code>’s <code>Display</code> text as the message, and
+bindings raise the library’s base error. The untyped errors are
+<code>weaveffi::Error</code>, <code>String</code>, <code>&amp;'static str</code>, <code>std::io::Error</code>,
+<code>Box&lt;dyn std::error::Error&gt;</code> (with or without <code>+ Send + Sync</code>),
+<code>weaveffi::ForeignError</code>, and, with the <code>weaveffi</code> crate’s <code>anyhow</code> feature,
+<code>anyhow::Error</code>. Every <code>std::error::Error</code> converts into <code>weaveffi::Error</code>
+with <code>?</code>, which is the easy way to return any other error type.</p>
+<p>A function that returns a plain <code>T</code> can’t fail. A panic in producer code is
+caught at the boundary and reported as code <code>-2</code>, which bindings treat as a
+bug (see <a href="errors-and-memory.html#the-trap-policy">Errors and Memory</a>).</p>
+<h2 id="records-and-enums"><a class="header" href="#records-and-enums">Records and enums</a></h2>
+<pre><code class="language-rust ignore">/// How a contact is filed: a C-style enum, which crosses as an `int32_t`.
+#[weaveffi::enumeration]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Kind {
+    /// Friends and family.
+    Personal,
+    /// Colleagues.
+    Work = 10,
+    /// Everyone else (`11`, one more than the previous variant).
+    Other,
+}
+
+/// One contact: a record, which crosses by value.
+#[weaveffi::record]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Contact {
+    /// The book-assigned id.
+    pub id: u64,
+    /// The display name.
+    pub name: String,
+    /// An email address, if known.
+    pub email: Option&lt;String&gt;,
+    /// How the contact is filed.
+    pub kind: Kind,
+    /// Free-form labels.
+    pub tags: Vec&lt;String&gt;,
+}
+
+/// A change to a book: a rich enum, whose variants carry fields.
+#[weaveffi::enumeration]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Change {
+    /// A contact was added.
+    Added {
+        /// The new contact.
+        contact: Contact,
+    },
+    /// A contact was removed.
+    Removed {
+        /// The removed contact's id.
+        id: u64,
+    },
+    /// Every contact was removed.
+    Cleared,
+}</code></pre>
+<p>A record or rich enum crosses as a value buffer; a C-style enum crosses as
+its <code>int32_t</code> discriminant, which the producer checks against the declared
+values (any other is a marshalling failure, <code>-3</code>). None of them exports a C
+function. A variant’s discriminant is its <code>= value</code>, an integer literal that
+fits in an <code>i32</code>, or one more than the previous variant’s (<code>Kind::Other</code> is
+<code>11</code>); a rich enum’s discriminants are the tags in its buffer encoding. A
+rich enum’s variants use named fields or none (tuple variants are
+rejected). A field may be any value type, including <code>usize</code>, <code>char</code>, a
+custom type, and an object. A record or rich enum may contain itself (or a
+type that contains it) through a <code>Vec</code> or map, as in <code>children: Vec&lt;Node&gt;</code>. Records, enums, error domains, interfaces, and callback
+interfaces can’t be generic.</p>
+<h2 id="custom-types"><a class="header" href="#custom-types">Custom types</a></h2>
+<p>A custom type crosses the ABI as another type, its <em>repr</em>, and converts at
+the boundary with two functions you name. Declare it on a type alias (which
+may name a foreign type, such as <code>std::time::Duration</code> or <code>uuid::Uuid</code>) or
+on a struct:</p>
+<pre><code class="language-rust ignore">/// A timeout: a `std::time::Duration`, crossing as whole milliseconds. The
+/// bindings see a `u64`.
+#[weaveffi::custom(repr = u64, lift = timeout_from_millis, lower = timeout_to_millis)]
+pub type Timeout = Duration;
+
+fn timeout_from_millis(ms: u64) -&gt; Result&lt;Duration, std::convert::Infallible&gt; {
+    Ok(Duration::from_millis(ms))
+}
+
+fn timeout_to_millis(timeout: &amp;Duration) -&gt; u64 {
+    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// An email address, crossing as its string. `lift` rejects a string
+/// without an `@`, which fails the call as a marshalling error.
+#[weaveffi::custom(repr = String, lift = Email::parse, lower = Email::to_text)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Email(String);
+
+impl Email {
+    fn parse(text: String) -&gt; Result&lt;Email, String&gt; {
+        if text.contains('@') {
+            Ok(Email(text))
+        } else {
+            Err(format!("{text:?} is not an email address"))
+        }
+    }
+
+    fn to_text(&amp;self) -&gt; String {
+        self.0.clone()
+    }
+}
+
+/// The domain of an email address (what follows the `@`).
+#[weaveffi::export]
+pub fn email_domain(email: Email) -&gt; String {
+    email.0.rsplit('@').next().unwrap_or_default().to_string()
+}</code></pre>
+<ul>
+<li><code>repr</code> is a type that crosses on its own (<code>String</code>, an integer,
+<code>Vec&lt;u8&gt;</code>, a record, …). The IDL, the contract, and every binding see
+the repr, so <code>email_domain</code> is <code>email_domain(email: string) -&gt; string</code> and
+a <code>Timeout</code> parameter is a <code>u64</code>.</li>
+<li><code>lift: fn(R) -&gt; Result&lt;T, E&gt;</code> with <code>E: Display</code> runs on the way in. A
+failure fails the call with the marshalling code <code>-3</code> and <code>E</code>’s message,
+prefixed with the parameter’s name (<code>email: "ada" is not an email address</code>).</li>
+<li><code>lower: fn(&amp;T) -&gt; R</code> runs on the way out.</li>
+</ul>
+<p>A custom type works in every position: parameters, returns, async results,
+iterator items, callback parameters and returns, record, rich-enum, and
+error-payload fields, and nested in <code>Option</code>, <code>Vec</code>, and maps. Bindings
+expose the repr; mapping it to a language’s own type is up to the consumer.</p>
+<h2 id="interfaces"><a class="header" href="#interfaces">Interfaces</a></h2>
+<p>An interface is shared across the boundary (by consumer wrappers, records,
+collections, and in-flight async calls), so the type must be <code>Send + Sync</code>
+and keeps mutable state behind interior mutability. Export its members with
+<code>#[weaveffi::export]</code> on an inherent <code>impl</code> block (not a trait <code>impl</code>, and
+not a generic one):</p>
+<pre><code class="language-rust ignore">/// An address book: an interface, a reference-counted object the bindings
+/// wrap in a class.
+#[weaveffi::interface]
+pub struct Book {
+    capacity: u32,
+    next_id: AtomicU64,
+    contacts: Mutex&lt;BTreeMap&lt;u64, Contact&gt;&gt;,
+    listeners: Mutex&lt;Vec&lt;Arc&lt;dyn Listener&gt;&gt;&gt;,
+}
+
+#[weaveffi::export]
+impl Book {
+    /// An empty book holding up to `capacity` contacts (a constructor: it
+    /// returns `Self`).
+    pub fn new(capacity: u32) -&gt; Self {
+        Self {
+            capacity,
+            next_id: AtomicU64::new(1),
+            contacts: Mutex::new(BTreeMap::new()),
+            listeners: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The capacity of a book made by `new_default` (a static: no receiver,
+    /// and it doesn't return the interface).
+    pub fn default_capacity() -&gt; u32 {
+        100
+    }
+
+    /// An empty book with the default capacity.
+    pub fn new_default() -&gt; Self {
+        Self::new(Self::default_capacity())
+    }
+
+    /// Add a contact, returning it with its new id. Fails with `EmptyName`,
+    /// `Full`, or `Rejected`, or with a listener's own error.
+    pub fn add(
+        &amp;self,
+        name: String,
+        email: Option&lt;Email&gt;,
+        kind: Kind,
+    ) -&gt; Result&lt;Contact, BookError&gt; {
+        if name.trim().is_empty() {
+            return Err(BookError::EmptyName);
+        }
+        let contact = Contact {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            name,
+            email: email.map(|e| e.0),
+            kind,
+            tags: Vec::new(),
+        };
+        // Never hold a lock while a consumer's callback runs: it may call
+        // back into the book.
+        for listener in self.listeners() {
+            if !listener.approve(&amp;contact)? {
+                return Err(BookError::Rejected { name: contact.name });
+            }
+        }
+        {
+            let mut contacts = lock(&amp;self.contacts);
+            if contacts.len() &gt;= self.capacity as usize {
+                return Err(BookError::Full {
+                    capacity: self.capacity,
+                });
+            }
+            contacts.insert(contact.id, contact.clone());
+        }
+        self.notify(&amp;Change::Added {
+            contact: contact.clone(),
+        });
+        Ok(contact)
+    }
+
+    /// The contact with `id`. Fails with `NotFound`.
+    pub fn get(&amp;self, id: u64) -&gt; Result&lt;Contact, BookError&gt; {
+        lock(&amp;self.contacts)
+            .get(&amp;id)
+            .cloned()
+            .ok_or(BookError::NotFound { id })
+    }
+
+    /// Remove the contact with `id`, returning whether it existed.
+    pub fn remove(&amp;self, id: u64) -&gt; bool {
+        let removed = lock(&amp;self.contacts).remove(&amp;id).is_some();
+        if removed {
+            self.notify(&amp;Change::Removed { id });
+        }
+        removed
+    }
+
+    /// The number of contacts.
+    pub fn count(&amp;self) -&gt; usize {
+        lock(&amp;self.contacts).len()
+    }
+
+    /// The number of contacts.
+    #[deprecated(note = "use `count`")]
+    pub fn size(&amp;self) -&gt; u32 {
+        u32::try_from(self.count()).unwrap_or(u32::MAX)
+    }
+
+    /// Another reference to this same book (a method taking
+    /// `self: Arc&lt;Self&gt;`).
+    pub fn share(self: Arc&lt;Self&gt;) -&gt; Arc&lt;Book&gt; {
+        self
+    }
+
+    /// Lock the contacts for Rust callers. Its return type can't cross the
+    /// boundary, so `skip` leaves it out of the bindings.
+    #[weaveffi(skip)]
+    pub fn contacts_mut(&amp;self) -&gt; MutexGuard&lt;'_, BTreeMap&lt;u64, Contact&gt;&gt; {
+        lock(&amp;self.contacts)
+    }
+
+    /// Remove every contact (exported only when the crate is built with
+    /// its `admin` feature).
+    #[cfg(feature = "admin")]
+    pub fn purge(&amp;self) -&gt; u32 {
+        let removed = std::mem::take(&amp;mut *lock(&amp;self.contacts));
+        self.notify(&amp;Change::Cleared);
+        u32::try_from(removed.len()).unwrap_or(u32::MAX)
+    }
+}</code></pre>
+<p>Each <code>pub fn</code> of the block is classified by its signature:</p>
+<ul>
+<li>a <strong>method</strong> takes <code>&amp;self</code> or <code>self: Arc&lt;Self&gt;</code> (<code>&amp;mut self</code> and <code>self</code> by
+value are rejected: objects are shared);</li>
+<li>a <strong>constructor</strong> has no receiver, isn’t <code>async</code>, and returns the
+interface: <code>Self</code>, <code>Arc&lt;Self&gt;</code>, or the type by name, optionally in a
+<code>Result</code>;</li>
+<li>a <strong>static</strong> has no receiver and returns anything else, or is an <code>async fn</code>.</li>
+</ul>
+<p>Constructors are synchronous, so an <code>async fn</code> without a receiver that
+returns the interface (<code>Self</code>, <code>Arc&lt;Self&gt;</code>, or the type by name, optionally
+in a <code>Result</code>) is an async static factory. A free <code>async fn</code> returning the
+object works too (the <code>kvstore</code> sample’s <code>open_store</code>).</p>
+<p>An object parameter <code>&amp;T</code> is borrowed for the call; <code>Arc&lt;T&gt;</code> (or
+<code>Option&lt;Arc&lt;T&gt;&gt;</code>) is a new strong reference taken for you, so you may store
+it. A by-value <code>T</code> parameter doesn’t compile. An object you return transfers
+one strong reference to the consumer. A private <code>fn</code>, or a <code>pub fn</code> marked
+<code>#[weaveffi(skip)]</code>, isn’t exported, so a public helper whose signature
+can’t cross the ABI (a guard, a closure, a borrowed iterator) stays usable
+from Rust. An interface may have several exported <code>impl</code> blocks; the
+sections below add <code>Book</code>’s iterator, callback, and async members that way.</p>
+<p>The attribute also exports <code>{prefix}_{Type}_clone</code> and <code>_destroy</code>, which add
+and release a reference. Every binding wraps the reference in a class that
+releases it exactly once:</p>
+<pre><code class="language-c">typedef struct macro_tour_Book macro_tour_Book;
+macro_tour_Book* macro_tour_Book_new(uint32_t capacity, macro_tour_error* out_err);
+macro_tour_run macro_tour_Book_add(const macro_tour_Book* self, macro_tour_run name,
+                                   macro_tour_run email, macro_tour_Kind kind,
+                                   macro_tour_error* out_err);
+macro_tour_Book* macro_tour_Book_clone(const macro_tour_Book* self);
+void macro_tour_Book_destroy(macro_tour_Book* self);
+</code></pre>
+<h2 id="iterators"><a class="header" href="#iterators">Iterators</a></h2>
+<p>Return <code>weaveffi::Iter&lt;T&gt;</code> (built with <code>Iter::new</code> from anything
+<code>IntoIterator</code> whose iterator is <code>Send + 'static</code>) when the consumer should
+pull elements lazily instead of receiving a materialized list:</p>
+<pre><code class="language-rust ignore">#[weaveffi::export]
+impl Book {
+    /// Every contact's name in id order, pulled lazily from a snapshot.
+    pub fn names(&amp;self) -&gt; weaveffi::Iter&lt;String&gt; {
+        let names: Vec&lt;String&gt; = lock(&amp;self.contacts)
+            .values()
+            .map(|c| c.name.clone())
+            .collect();
+        weaveffi::Iter::new(names)
+    }
+}</code></pre>
+<p>It may be wrapped in a <code>Result</code>, and <code>T</code> may be any value type, including an
+object, an optional scalar, or a typed array (<code>weaveffi::Iter&lt;Option&lt;i64&gt;&gt;</code>,
+<code>weaveffi::Iter&lt;Vec&lt;i32&gt;&gt;</code>). Iterators are returns of synchronous callables
+only: an <code>Iter</code> parameter, a nested <code>Iter</code>, and an async function returning
+one are rejected. Each binding pulls one element per step of its own
+iteration idiom and releases the iterator exactly once.</p>
+<h2 id="callback-interfaces"><a class="header" href="#callback-interfaces">Callback interfaces</a></h2>
+<p>A callback interface is the inverse of an interface: the consumer implements
+it and the producer calls it, from any thread, for as long as it holds the
+<code>Arc</code>. When the last clone drops, the consumer’s release hook runs exactly
+once (on whichever thread drops it).</p>
+<pre><code class="language-rust ignore">/// Approves the contacts a book adds and hears about its changes. The
+/// consumer implements it; the book calls it, from any thread.
+#[weaveffi::callback_interface]
+pub trait Listener: Send + Sync {
+    /// Whether `contact` may be added. A consumer may also fail with one of
+    /// `BookError`'s codes, which `add` then fails with.
+    fn approve(&amp;self, contact: &amp;Contact) -&gt; Result&lt;bool, BookError&gt;;
+
+    /// A change the book made.
+    fn on_change(&amp;self, change: &amp;Change) -&gt; Result&lt;(), ForeignError&gt;;
+}</code></pre>
+<p>Accept one as <code>Arc&lt;dyn Trait&gt;</code>, or <code>Option&lt;Arc&lt;dyn Trait&gt;&gt;</code> when the
+consumer may pass none:</p>
+<pre><code class="language-rust ignore">#[weaveffi::export]
+impl Book {
+    /// Subscribe `listener` until the book is released.
+    pub fn subscribe(&amp;self, listener: Arc&lt;dyn Listener&gt;) {
+        lock(&amp;self.listeners).push(listener);
+    }
+}</code></pre>
+<p>The rules:</p>
+<ul>
+<li>The trait is <code>Send + Sync</code> and not generic, and has at least one method.
+The receiver is <code>&amp;self</code>, and methods are synchronous.</li>
+<li>Parameters may be any value type, borrowed (<code>&amp;str</code>, <code>&amp;Contact</code>) or owned.
+Strings, bytes, typed arrays, and buffered values are lent to the consumer
+for the call; an object parameter moves one strong reference to the
+consumer, so it’s spelled <code>Arc&lt;T&gt;</code> (or <code>Option&lt;Arc&lt;T&gt;&gt;</code>). <code>&amp;mut</code>
+parameters are rejected.</li>
+<li>Every method returns <code>Result&lt;T, E&gt;</code>, because the consumer’s implementation
+can fail, and <code>E</code> must implement <code>From&lt;weaveffi::ForeignError&gt;</code>. <code>T</code> is
+<code>()</code> or any value type, including an object (<code>Arc&lt;T&gt;</code>, or
+<code>Option&lt;Arc&lt;T&gt;&gt;</code> when the consumer may return none). A plain <code>T</code> is a
+compile error. The consumer allocates a returned run with
+<code>{prefix}_alloc</code>, and the runtime adopts it for you.</li>
+<li>A callback interface is valid only as a parameter of a function or an
+interface member, never in a return, a record, a collection, or another
+callback.</li>
+</ul>
+<p><strong>The error type decides what the method throws.</strong> When <code>E</code> is a
+<code>#[weaveffi::error]</code> domain, the method is <code>throws: E</code> (<code>approve</code> above): the
+consumer may fail with one of <code>E</code>’s codes, fields included, and it arrives
+as that typed variant, its message rendered by your <code>Display</code> from the
+fields. Any other consumer failure (an untyped exception, a code <code>E</code>
+doesn’t declare) reaches <code>E</code> through <code>From&lt;ForeignError&gt;</code>. When <code>E</code> is
+anything else (<code>ForeignError</code> itself, as in <code>on_change</code>), the method is
+<code>throws: any</code>, and every consumer failure goes through
+<code>From&lt;ForeignError&gt;</code>.</p>
+<p><code>BookError</code> maps foreign failures into its own <code>ListenerFailed</code> code, so
+<code>Book::add</code> uses <code>?</code> on a listener’s typed <code>Rejected</code> and on any other
+listener failure alike, and the original caller sees a typed <code>BookError</code>
+either way.</p>
+<p><strong><code>ForeignError</code></strong> is what the runtime hands to <code>From</code>: a <code>code</code> (<code>-4</code> when
+the consumer’s implementation failed or, for a
+<a href="errors-and-memory.html#thread-affine-callbacks">thread-affine</a> vtable, was
+called off its thread; <code>-3</code> when it returned a value the runtime couldn’t
+accept) and the consumer’s <code>message</code>. It implements <code>Display</code>, so it’s a
+valid error type for an exported function too (which is then <code>throws: any</code>).</p>
+<p>Don’t hold a lock across a callback call: the consumer’s implementation may
+call back into your library and wait on the same lock. Snapshot the state
+you need, release the lock, then call out, as <code>Book::add</code> does.</p>
+<h2 id="async-functions-and-cancellation"><a class="header" href="#async-functions-and-cancellation">Async functions and cancellation</a></h2>
+<p>An <code>async fn</code> (a free function, method, or static) lowers to a launcher that
+returns immediately and a completion callback that fires exactly once. A
+trailing <code>weaveffi::CancelToken</code> parameter makes it cancellable:</p>
+<pre><code class="language-rust ignore">#[weaveffi::export]
+impl Book {
+    /// Every contact, in id order, collected on a producer thread.
+    pub async fn export_all(&amp;self) -&gt; Vec&lt;Contact&gt; {
+        lock(&amp;self.contacts).values().cloned().collect()
+    }
+}
+
+/// Greet `name` after `delay`. The trailing `CancelToken` makes the
+/// function cancellable: cancelling drops the future (and the sleep), and
+/// the call completes as cancelled.
+#[weaveffi::export]
+pub async fn greet_later(name: String, delay: Timeout, _cancel: CancelToken) -&gt; String {
+    tokio::time::sleep(delay).await;
+    format!("Hello, {name}!")
+}</code></pre>
+<p>When the consumer cancels, the runtime drops your future at its next
+suspension point and completes the call with code <code>-5</code>; you don’t need to
+poll the token. Call <code>cancel.is_cancelled()</code> only for cooperative cleanup,
+such as work running on another thread. Only an <code>async fn</code> takes a
+<code>CancelToken</code>, as its last parameter. An async function can’t borrow an
+optional parameter (take <code>Option&lt;T&gt;</code> by value), can’t return an iterator,
+and can’t be a constructor. <a href="async.html">Async and Cancellation</a> covers the
+executors and the C shape.</p>
+<h2 id="conditional-compilation-and-features"><a class="header" href="#conditional-compilation-and-features">Conditional compilation and features</a></h2>
+<p>A <code>#[cfg]</code> on an exported item (a function, an <code>impl</code> block, a record, enum,
+error domain, interface struct, callback trait, or custom type) or on a
+member of an exported <code>impl</code> block applies to everything generated for it:
+its C functions, its contract functions, and its metadata. An item a build
+compiles out has none of them, so the library never claims a declaration it
+doesn’t have. <code>Book::purge</code> above exists only in a build with the crate’s
+<code>admin</code> feature.</p>
+<p>Because <code>weaveffi generate</code> reads the API from the built library, the
+bindings follow the build’s <code>#[cfg]</code>. Every command that builds the
+producer takes <code>-F</code>/<code>--features</code>, <code>--all-features</code>, and
+<code>--no-default-features</code> (or <code>[build] features</code>, <code>all_features</code>, and
+<code>no_default_features</code> in <code>weaveffi.toml</code>), and passes them to every build:
+the one the API is read from and each platform’s in <code>weaveffi build</code>. So
+<code>weaveffi generate -F admin</code> generates bindings with <code>purge</code>, and they load
+only a library built with it: against one without it, the contract check
+fails with “<code>Book.purge</code> is missing from the library”. A library with extra
+declarations loads fine.</p>
+<h2 id="leak-checks"><a class="header" href="#leak-checks">Leak checks</a></h2>
+<p>The <code>weaveffi</code> crate’s <code>leak-check</code> feature counts live objects, foreign
+callbacks, iterators, cancel tokens, and runs (including error messages).
+<code>{prefix}_debug_live(kind)</code> reports them (<code>0</code> objects, <code>1</code> callbacks, <code>2</code>
+iterators, <code>3</code> tokens, <code>4</code> runs), and kind <code>-1</code> returns <code>1</code> to say the
+library counts. Without the feature the symbol still exists and returns <code>0</code>
+for every kind. Every sample enables it, and every conformance consumer
+asserts that all five counts are zero at exit.</p>
+<pre><code class="language-toml">[dependencies]
+weaveffi = { version = "0.25", features = ["leak-check"] }
+</code></pre>
+<h2 id="what-the-macros-reject"><a class="header" href="#what-the-macros-reject">What the macros reject</a></h2>
+<p>Each rejection is a compile error on the offending item:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Source</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td>a crate without <code>weaveffi::export_runtime!()</code></td><td>every expansion names the crate’s tag type, which the call defines</td></tr>
+<tr><td>a generic function, <code>impl</code> block, or type</td><td>each exported item has one C shape</td></tr>
+<tr><td><code>#[weaveffi::export]</code> on a trait <code>impl</code>, or on anything but a <code>fn</code> or an <code>impl</code></td><td>export an interface’s inherent <code>impl</code> block</td></tr>
+<tr><td>a parameter that isn’t a plain name (a pattern)</td><td>each parameter becomes one named C slot</td></tr>
+<tr><td><code>&amp;mut T</code>, <code>*const T</code>, <code>*mut T</code> parameters</td><td>take <code>&amp;T</code> or a value and return the result; declare a pointee as an interface</td></tr>
+<tr><td><code>Box&lt;dyn Trait&gt;</code></td><td>callbacks are shared: take <code>Arc&lt;dyn Trait&gt;</code></td></tr>
+<tr><td>an interface method on <code>self</code> or <code>&amp;mut self</code></td><td>use <code>&amp;self</code> or <code>self: Arc&lt;Self&gt;</code> with interior mutability</td></tr>
+<tr><td>an interface that isn’t <code>Send + Sync</code></td><td>objects are shared across threads; the compiler names the field</td></tr>
+<tr><td>two exported items with the same name, in any modules</td><td>a library is one namespace (the second fails with <code>symbol ... is already defined</code>)</td></tr>
+<tr><td>a <code>CancelToken</code> that isn’t the last parameter of an <code>async fn</code></td><td>cancellation belongs to async calls</td></tr>
+<tr><td>an <code>Iter</code> parameter, an async function returning an <code>Iter</code></td><td>iterators are returns of synchronous callables</td></tr>
+<tr><td>a callback method that’s <code>async</code>, takes <code>&amp;mut</code> parameters, or returns a plain <code>T</code></td><td>return <code>Result&lt;T, E&gt;</code> with <code>E: From&lt;weaveffi::ForeignError&gt;</code></td></tr>
+<tr><td>a callback trait without methods, an empty record, an enum without variants</td><td>each lowers to something with at least one member</td></tr>
+<tr><td>tuple fields in a record, variant, or error code</td><td>fields need names to appear in the IDL</td></tr>
+<tr><td>an error variant without an explicit positive discriminant</td><td>codes are stable values; <code>0</code> and negatives belong to the runtime</td></tr>
+<tr><td>a discriminant that isn’t an integer literal fitting an <code>i32</code></td><td>it crosses as an <code>int32_t</code></td></tr>
+<tr><td><code>#[weaveffi::error(no_display)]</code> on an enum without <code>Display</code></td><td>you opted out of the generated impl</td></tr>
+<tr><td><code>#[weaveffi::custom]</code> without <code>repr</code>, <code>lift</code>, or <code>lower</code></td><td>all three are required</td></tr>
+<tr><td>arguments to any other attribute</td><td>only <code>error</code> and <code>custom</code> take arguments</td></tr>
+</tbody>
+</table>
+</div>
+<p>The rest of the <a href="../reference/idl.html#validation">IDL’s rules</a> (error code
+names unique across domains, map key types, objects in error payloads,
+reserved names, and so on) are checked by the CLI’s validator when it reads
+the API, which every command does; run <code>weaveffi validate</code> or <code>weaveffi generate --check</code> in CI.</p>
+<h2 id="see-also"><a class="header" href="#see-also">See also</a></h2>
+<ul>
+<li><a href="../samples.html">Samples and Examples</a>: <code>kvstore</code> uses every feature on
+this page.</li>
+<li><a href="../reference/abi.html">C ABI Contract</a>: what the generated functions
+implement.</li>
+<li><a href="../api/rust.html">Rust API Map</a>: the items the <code>weaveffi</code> crate exports.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../getting-started.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../guides/errors-and-memory.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../getting-started.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../guides/errors-and-memory.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DEFAULT_NAME","DEFAULT_VERSION"],"fn":["c_ident","name_from_basename","pascal_ident"],"struct":["Identity","Package"]};

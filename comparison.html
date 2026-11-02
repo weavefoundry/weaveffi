@@ -1,0 +1,462 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Comparison - WeaveFFI v0.26</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "searchindex-1339018f.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-e1100732.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">WeaveFFI v0.26</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/weavefoundry/weaveffi" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="comparison"><a class="header" href="#comparison">Comparison</a></h1>
+<p>WeaveFFI sits in a crowded ecosystem of FFI tooling. This page is an honest,
+side-by-side look at how it compares to the projects you are most likely to
+evaluate against it: <strong>UniFFI</strong> (Mozilla’s multi-language generator),
+<strong>Diplomat</strong> (the Rust-to-many-languages tool behind ICU4X), <strong>cbindgen</strong> plus
+hand-written glue, the single-language bridges <strong>swift-bridge</strong>, <strong>napi-rs</strong>,
+and <strong>wasm-bindgen</strong>, and the C/C++-first generators <strong>SWIG</strong> and <strong>autocxx</strong>.
+A <a href="#other-tools">shorter section</a> covers <strong>interoptopus</strong>, <strong>flapigen</strong>,
+<strong>PyO3</strong> with <strong>maturin</strong>, and <strong>cxx</strong>.</p>
+<blockquote>
+<p>All comparisons reflect the public state of each project at the time of
+writing (WeaveFFI C ABI revision 6, schema <code>0.13.0</code>). If something here is
+out of date, please open a PR.</p>
+</blockquote>
+<h2 id="the-short-version"><a class="header" href="#the-short-version">The short version</a></h2>
+<p>WeaveFFI’s distinguishing bet is <em>one language-neutral IDL, one C ABI, eleven
+generators</em>. The producer can be Rust (with WeaveFFI’s attributes writing
+the ABI for you) or anything else that can export C symbols, and every generated
+package is standalone: consumers never install WeaveFFI. The object model is
+on par with the Rust-first tools: interface objects are reference counted
+(<code>Arc&lt;T&gt;</code>), can be shared between wrappers and nested inside records, lists,
+maps, optionals, iterators, and async results, and callback interfaces let
+the producer call consumer code through a vtable whose methods can return any
+value and raise typed errors. A Rust producer’s API is read from the library
+it compiled (library mode, as in UniFFI), and <code>weaveffi package</code> turns the
+builds into installable artifacts for every ecosystem. Every symbol and
+package is named after the library, never after WeaveFFI, so several
+WeaveFFI-built libraries coexist in one process.</p>
+<p>The honest flip side is that WeaveFFI is pre-1.0 and its type system is
+deliberately smaller than UniFFI’s: no user-defined generics or trait
+objects, custom types only on the producer side (bindings see the type’s
+builtin representation), and no async callback methods. The
+<a href="roadmap.html">roadmap</a> lists what’s planned.</p>
+<h2 id="at-a-glance"><a class="header" href="#at-a-glance">At a glance</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th style="text-align: center"><strong>WeaveFFI</strong></th><th style="text-align: center"><strong>UniFFI</strong></th><th style="text-align: center"><strong>Diplomat</strong></th><th style="text-align: center"><strong>cbindgen + glue</strong></th><th style="text-align: center"><strong>swift-bridge</strong></th><th style="text-align: center"><strong>napi-rs</strong></th><th style="text-align: center"><strong>wasm-bindgen</strong></th><th style="text-align: center"><strong>SWIG</strong></th><th style="text-align: center"><strong>autocxx</strong></th></tr>
+</thead>
+<tbody>
+<tr><td>Producer language</td><td style="text-align: center">Rust, C, C++, Zig (anything with a C ABI)</td><td style="text-align: center">Rust</td><td style="text-align: center">Rust</td><td style="text-align: center">Rust</td><td style="text-align: center">Rust</td><td style="text-align: center">Rust</td><td style="text-align: center">Rust</td><td style="text-align: center">C / C++</td><td style="text-align: center">C++ (consumed from Rust)</td></tr>
+<tr><td>Input</td><td style="text-align: center">YAML / JSON IDL (one or several files) or annotated Rust (read from the built library)</td><td style="text-align: center">UDL or proc-macros (library mode reads the built library)</td><td style="text-align: center">annotated Rust bridge crate</td><td style="text-align: center">Rust source</td><td style="text-align: center">annotated Rust bridge module</td><td style="text-align: center">annotated Rust</td><td style="text-align: center">annotated Rust</td><td style="text-align: center">C/C++ headers + <code>.i</code> file</td><td style="text-align: center">C++ headers</td></tr>
+<tr><td>Consumer languages</td><td style="text-align: center">C, C++, Swift, Kotlin, Node.js, Wasm/JS, Python, .NET, Dart, Go, Ruby</td><td style="text-align: center">Kotlin, Swift, Python, Ruby first-party; Go, C#, Dart, Kotlin Multiplatform, React Native (<code>uniffi-bindgen-react-native</code>) as external bindgens</td><td style="text-align: center">C, C++, JS/TS (Wasm), Dart, Kotlin (JNA), Python (nanobind)</td><td style="text-align: center">C (you write the rest)</td><td style="text-align: center">Swift</td><td style="text-align: center">Node.js</td><td style="text-align: center">JS/TS (Wasm)</td><td style="text-align: center">many (Python, Java, C#, Ruby, Lua, Perl, PHP, R, …)</td><td style="text-align: center">Rust</td></tr>
+<tr><td>Standalone C header</td><td style="text-align: center">✓ (the contract every target shares)</td><td style="text-align: center">✗ (private scaffolding ABI)</td><td style="text-align: center">✓ (C backend)</td><td style="text-align: center">✓ (its purpose)</td><td style="text-align: center">✓ (generated)</td><td style="text-align: center">✗</td><td style="text-align: center">✗</td><td style="text-align: center">✗</td><td style="text-align: center">n/a</td></tr>
+<tr><td><strong>Type system</strong></td><td style="text-align: center"></td><td style="text-align: center"></td><td style="text-align: center"></td><td style="text-align: center"></td><td style="text-align: center"></td><td style="text-align: center"></td><td style="text-align: center"></td><td style="text-align: center"></td><td style="text-align: center"></td></tr>
+<tr><td>Records / enums / optionals / lists / maps</td><td style="text-align: center">✓ (value buffers)</td><td style="text-align: center">✓</td><td style="text-align: center">✓ (structs, enums, <code>Option</code>, slices; no maps)</td><td style="text-align: center">manual</td><td style="text-align: center">✓ (transparent structs and enums, <code>Option</code>, <code>Vec</code>)</td><td style="text-align: center">✓ (serde objects)</td><td style="text-align: center">✓ (<code>serde-wasm-bindgen</code> or classes)</td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td>Objects with methods</td><td style="text-align: center">✓ reference counted, shareable, nestable</td><td style="text-align: center">✓ (<code>Arc&lt;T&gt;</code>)</td><td style="text-align: center">✓ (opaques, borrowed or owned)</td><td style="text-align: center">manual</td><td style="text-align: center">✓ (opaque types)</td><td style="text-align: center">✓ (<code>#[napi]</code> classes)</td><td style="text-align: center">✓ (classes)</td><td style="text-align: center">✓ (classes)</td><td style="text-align: center">✓ (C++ classes)</td></tr>
+<tr><td>Callback interfaces</td><td style="text-align: center">✓ (vtable; synchronous, any return, <code>throws</code>, optional, failures as <code>Result</code>)</td><td style="text-align: center">✓ (foreign traits; any return, <code>throws</code>, async)</td><td style="text-align: center">partial (Kotlin, C, C++; input-only)</td><td style="text-align: center">manual fn pointers</td><td style="text-align: center">partial (closures Rust to Swift)</td><td style="text-align: center">✓ (<code>ThreadsafeFunction</code>)</td><td style="text-align: center">✓ (closures)</td><td style="text-align: center">partial (directors)</td><td style="text-align: center">partial</td></tr>
+<tr><td>Typed error domains</td><td style="text-align: center">✓ (any number per library, open to new codes, payload fields; <code>throws</code> a domain or an untyped <code>any</code>)</td><td style="text-align: center">✓ (error enums)</td><td style="text-align: center">✓ (<code>Result</code>)</td><td style="text-align: center">manual</td><td style="text-align: center">✓ (<code>Result</code>)</td><td style="text-align: center">✓ (JS <code>Error</code>)</td><td style="text-align: center">✓ (<code>Result&lt;JsValue&gt;</code>)</td><td style="text-align: center">✗</td><td style="text-align: center">✗</td></tr>
+<tr><td>Async functions</td><td style="text-align: center">✓ (callback ABI, pluggable spawner, native cancellation on every target)</td><td style="text-align: center">✓ (poll-based, foreign executors)</td><td style="text-align: center">✗</td><td style="text-align: center">manual</td><td style="text-align: center">✓ (both directions)</td><td style="text-align: center">✓ (Tokio)</td><td style="text-align: center">✓ (<code>Promise</code>)</td><td style="text-align: center">✗</td><td style="text-align: center">✗</td></tr>
+<tr><td>Iterators</td><td style="text-align: center">✓ (<code>iter&lt;T&gt;</code>, lazy on every target)</td><td style="text-align: center">✗ (materialize or use a trait)</td><td style="text-align: center">partial (<code>DiplomatWrite</code>)</td><td style="text-align: center">manual</td><td style="text-align: center">✗</td><td style="text-align: center">✗</td><td style="text-align: center">✓ (JS iterators)</td><td style="text-align: center">partial</td><td style="text-align: center">✗</td></tr>
+<tr><td>Generics / trait objects</td><td style="text-align: center">✗ (fixed set of built-in shapes)</td><td style="text-align: center">partial (traits, no generics)</td><td style="text-align: center">partial (traits on some backends)</td><td style="text-align: center">✗</td><td style="text-align: center">partial</td><td style="text-align: center">✗</td><td style="text-align: center">✗</td><td style="text-align: center">✓ (templates via <code>%template</code>)</td><td style="text-align: center">✓</td></tr>
+<tr><td>Multi-file / multi-crate definitions</td><td style="text-align: center">partial (an IDL split across files with <code>imports:</code>, or one crate’s modules; no types shared between libraries)</td><td style="text-align: center">✓ (external types across crates)</td><td style="text-align: center">✓ (one bridge crate, many modules)</td><td style="text-align: center">n/a</td><td style="text-align: center">✗</td><td style="text-align: center">n/a</td><td style="text-align: center">n/a</td><td style="text-align: center">✓ (<code>%include</code>)</td><td style="text-align: center">✓</td></tr>
+<tr><td><strong>Workflow</strong></td><td style="text-align: center"></td><td style="text-align: center"></td><td style="text-align: center"></td><td style="text-align: center"></td><td style="text-align: center"></td><td style="text-align: center"></td><td style="text-align: center"></td><td style="text-align: center"></td><td style="text-align: center"></td></tr>
+<tr><td>Standalone CLI</td><td style="text-align: center">✓ (<code>cargo install weaveffi-cli</code>)</td><td style="text-align: center"><code>uniffi-bindgen</code> (build.rs or CLI)</td><td style="text-align: center"><code>diplomat-tool</code></td><td style="text-align: center">✓</td><td style="text-align: center"><code>swift-bridge-cli</code></td><td style="text-align: center"><code>napi</code> CLI (npm)</td><td style="text-align: center"><code>wasm-bindgen-cli</code></td><td style="text-align: center">system package</td><td style="text-align: center">cargo build</td></tr>
+<tr><td>Publishable per-ecosystem packages</td><td style="text-align: center">✓ (<code>weaveffi package</code>: wheels, npm tarballs, gems, an XCFramework SwiftPM package, a <code>.nupkg</code>; Gradle, pub, and Go as ready-to-publish directories)</td><td style="text-align: center">via companion tools (<code>cargo-swift</code>, <code>maturin</code>, <code>uniffi-bindgen-react-native</code>)</td><td style="text-align: center">partial</td><td style="text-align: center">n/a</td><td style="text-align: center">✓ (SwiftPM)</td><td style="text-align: center">✓ (npm)</td><td style="text-align: center">✓ (npm via wasm-pack)</td><td style="text-align: center">✗</td><td style="text-align: center">n/a</td></tr>
+<tr><td>Schema-checked IDL with JSON Schema</td><td style="text-align: center">✓</td><td style="text-align: center">✗</td><td style="text-align: center">n/a</td><td style="text-align: center">n/a</td><td style="text-align: center">n/a</td><td style="text-align: center">n/a</td><td style="text-align: center">n/a</td><td style="text-align: center">✗</td><td style="text-align: center">n/a</td></tr>
+<tr><td>Load-time ABI check</td><td style="text-align: center">✓ (ABI revision plus a contract function per declaration)</td><td style="text-align: center">✓ (checksums)</td><td style="text-align: center">✗</td><td style="text-align: center">✗</td><td style="text-align: center">✗</td><td style="text-align: center">✓ (N-API version)</td><td style="text-align: center">✗</td><td style="text-align: center">✗</td><td style="text-align: center">n/a</td></tr>
+<tr><td>Generated-output drift check in CI</td><td style="text-align: center">✓ (<code>weaveffi generate --check</code>)</td><td style="text-align: center">build-time</td><td style="text-align: center">build-time</td><td style="text-align: center">✓</td><td style="text-align: center">build-time</td><td style="text-align: center">build-time</td><td style="text-align: center">build-time</td><td style="text-align: center">✗</td><td style="text-align: center">build-time</td></tr>
+<tr><td>Maturity</td><td style="text-align: center">pre-1.0</td><td style="text-align: center">shipping in Firefox and Mozilla products since 2020</td><td style="text-align: center">shipping in ICU4X</td><td style="text-align: center">1.0+, widely deployed</td><td style="text-align: center">0.1.x, active</td><td style="text-align: center">2.x+, widely deployed</td><td style="text-align: center">0.2.x, ubiquitous</td><td style="text-align: center">30+ years</td><td style="text-align: center">pre-1.0</td></tr>
+<tr><td>License</td><td style="text-align: center">MIT OR Apache-2.0</td><td style="text-align: center">MPL-2.0</td><td style="text-align: center">MIT OR Apache-2.0</td><td style="text-align: center">MPL-2.0</td><td style="text-align: center">MIT OR Apache-2.0</td><td style="text-align: center">MIT</td><td style="text-align: center">MIT OR Apache-2.0</td><td style="text-align: center">GPL-3.0 (generated code exempt)</td><td style="text-align: center">MIT OR Apache-2.0</td></tr>
+</tbody>
+</table>
+</div>
+<p>Legend: ✓ = first-class support; <em>partial</em> = supported with caveats, on a
+subset of backends, or via extensions; ✗ = not supported; <em>manual</em> = you write
+it by hand; <em>n/a</em> = not applicable to that tool’s scope.</p>
+<h2 id="where-competitors-are-stronger"><a class="header" href="#where-competitors-are-stronger">Where competitors are stronger</a></h2>
+<p>Pick the right tool for the job. These are the places where another project
+is ahead of WeaveFFI today.</p>
+<ul>
+<li><strong>UniFFI has the richer type system and more production mileage.</strong> It
+ships in Firefox, Firefox Sync, Glean, and Nimbus and has years of
+battle-testing across iOS, Android, and desktop. Its foreign traits can be
+<code>async</code>; WeaveFFI’s callback-interface methods can return any type and
+<code>throw</code>, but are synchronous. UniFFI’s custom types can map to a
+consumer-side type in each language (WeaveFFI’s are converted only on
+the producer side), and it supports external types across crates, whereas a
+WeaveFFI library is one namespace (one IDL, possibly split across files, or
+one Rust producer crate). Its ecosystem of companion tools is larger
+too: <code>cargo-swift</code> builds the XCFramework and SwiftPM package, <code>maturin</code>
+builds Python wheels, and <code>uniffi-bindgen-react-native</code> targets React
+Native, where WeaveFFI’s <code>weaveffi package</code> covers the first two itself
+and has no React Native target. If your matrix is Kotlin, Swift, and
+Python and you want maximum maturity, UniFFI is the safer pick.</li>
+<li><strong>Diplomat has the more mature Kotlin and JS story for a Rust library.</strong>
+It powers ICU4X, its bridge-crate model keeps everything in Rust, and its
+C++ backend is polished for slotting into existing C++ builds. Its opaques
+support borrowed as well as owned references, which WeaveFFI does not
+model (every WeaveFFI object crossing is a strong reference). Diplomat has
+no async support and no maps, and callbacks exist only on some backends.</li>
+<li><strong>cbindgen is simpler if all you want is a C header.</strong> WeaveFFI generates
+a C header <em>and</em> ten other targets. If you only consume the C surface from
+C or C++ code, cbindgen has less ceremony, no IDL, and a smaller footprint.
+You write the object lifecycle, error channel, and any callback plumbing
+yourself.</li>
+<li><strong>swift-bridge, napi-rs, and wasm-bindgen are deeper in their one
+language.</strong> Each exposes idioms WeaveFFI’s common denominator can’t:
+swift-bridge bridges async functions in <em>both</em> directions and transparent
+Swift structs; napi-rs gives you the full N-API surface (<code>ThreadsafeFunction</code>,
+typed arrays, <code>AsyncTask</code>, class inheritance) and Tokio integration;
+wasm-bindgen talks to the whole Web platform through <code>web-sys</code> and
+<code>js-sys</code> and runs futures on the JS event loop. If you ship to exactly one
+of those ecosystems, the dedicated bridge is the better fit.</li>
+<li><strong>SWIG covers languages WeaveFFI doesn’t.</strong> Lua, Tcl, R, Octave, Perl, PHP,
+Java: if your target is exotic, SWIG probably has a generator, and it reads
+C and C++ headers directly so you author no IDL. It also handles C++
+templates.</li>
+<li><strong>autocxx is unmatched for “wrap an existing C++ library.”</strong> It reads your
+C++ headers and uses bindgen plus cxx under the hood. WeaveFFI does not
+parse C++; you describe the surface you want to expose and implement the
+generated header.</li>
+<li><strong>WeaveFFI’s Wasm target is single-threaded.</strong> The default
+<code>wasm32-unknown-unknown</code> build has no threads, so async functions are
+polled inline until they finish (a future that waits on something outside
+the call fails with <code>-1</code>, and there’s little for an <code>AbortSignal</code> to
+cancel), and callback-interface methods fire only while a call into the
+module is on the stack. wasm-bindgen’s <code>wasm-bindgen-futures</code> integrates
+with the JS event loop natively; WeaveFFI targets only
+<code>wasm32-unknown-unknown</code>, which has no threads.</li>
+<li><strong>The single-language tools package better for their one ecosystem.</strong>
+<code>maturin</code> (with PyO3) and napi-rs’s CLI build wheels and npm packages for
+every platform from one CI matrix with years of edge cases handled;
+<code>weaveffi package</code> is newer.</li>
+<li><strong>No formal stability guarantee yet.</strong> WeaveFFI is pre-1.0, and its
+schema and C ABI may change between minor releases (see
+<a href="stability.html">Stability</a>). Revision 6 is designed to grow additively, but
+UniFFI, cbindgen, napi-rs, wasm-bindgen, and SWIG offer stronger
+compatibility commitments today.</li>
+<li><strong>Not every target is equally mature.</strong> C, C++, Swift, Kotlin, Python,
+Node.js, and .NET are Tier 1; Go, Ruby, Dart, and WebAssembly are Tier 2
+and may lag new ABI work (see
+<a href="stability.html#target-tiers">Target tiers</a>).</li>
+</ul>
+<h2 id="when-to-choose-weaveffi"><a class="header" href="#when-to-choose-weaveffi">When to choose WeaveFFI</a></h2>
+<p>WeaveFFI is the right pick when you want:</p>
+<ol>
+<li><strong>One source of truth for many languages.</strong> If your library has to land in
+npm <em>and</em> SwiftPM <em>and</em> PyPI <em>and</em> NuGet <em>and</em> pub.dev <em>and</em> RubyGems
+<em>and</em> a Go module <em>and</em> a Gradle artifact, that’s the WeaveFFI sweet spot.
+UniFFI and Diplomat cover a smaller set out of the box; the
+single-language bridges don’t try.</li>
+<li><strong>A native library that isn’t (only) Rust.</strong> WeaveFFI works against
+anything that exposes a C ABI: Rust (with WeaveFFI’s attributes
+generating the ABI for you), C, C++, Zig, and so on. UniFFI, Diplomat,
+swift-bridge, napi-rs, and wasm-bindgen assume Rust; autocxx assumes C++.</li>
+<li><strong>Objects that behave the same everywhere.</strong> Reference-counted interfaces
+with deterministic release (<code>close()</code>, <code>Dispose()</code>, <code>deinit</code>, RAII) and a
+garbage-collector backstop on every managed target, and the ability to put
+an object inside a record, a list, a map, an optional, an iterator, or an
+async result on all eleven targets, from one declaration.</li>
+<li><strong>Callback interfaces without hand-written trampolines.</strong> Declare the
+methods once and each target gets a protocol, interface, or abstract class
+to implement; the producer receives an <code>Arc&lt;dyn Trait&gt;</code> it can retain and
+call from any thread. Methods can return strings, records, and objects,
+and a consumer-side exception reaches the producer as a typed domain
+error (when the method throws one) or through <code>From&lt;ForeignError&gt;</code>, which
+it can propagate to the original caller with <code>?</code>.</li>
+<li><strong>Standalone, publishable consumer packages.</strong> Generated packages are
+self-contained; <code>weaveffi build</code> cross-compiles the producer per platform
+and <code>weaveffi package</code> bundles it into wheels, npm tarballs, gems, an
+XCFramework SwiftPM package, a NuGet package, and Gradle, pub, Go, and
+C/C++ distributions. There is no “install WeaveFFI” step on the consumer
+side.</li>
+<li><strong>Idiomatic per-target output, not a lowest-common-denominator API.</strong>
+Async functions become <code>async/await</code> in Swift, <code>Promise</code>s in Node and
+Wasm, <code>suspend fun</code> in Kotlin, <code>async def</code> in Python, <code>Task&lt;T&gt;</code> in C#, and
+<code>Future&lt;T&gt;</code> in Dart, all from the same <code>async: true</code> flag; Rust producers
+can plug their own executor with <code>weaveffi::set_spawner</code>. Cancelling the
+awaiting task, coroutine, or promise cancels the native call.</li>
+<li><strong>A CI-first CLI.</strong> <code>validate</code>, <code>generate --check</code>, <code>extract</code>, <code>schema</code>,
+<code>build</code>, and <code>package</code> are designed to drop into pipelines, every
+generator’s output is
+byte-for-byte deterministic, and generated consumers refuse to load a
+producer built for a different ABI revision or from a different API
+definition (a contract function per declaration, so adding a declaration
+never breaks a deployed binding).</li>
+</ol>
+<h2 id="other-tools"><a class="header" href="#other-tools">Other tools</a></h2>
+<ul>
+<li><strong>interoptopus</strong> generates C#, C, and Python bindings from annotated Rust
+(<code>#[ffi_function]</code>, <code>#[ffi_type]</code>), with patterns for services, slices,
+options, and callbacks. It’s Rust-only on the producer side and covers
+fewer languages; its C# backend is especially polished.</li>
+<li><strong>flapigen</strong> (formerly rust_swig) generates Java (JNI) and C++ bindings
+from a declarative <code>foreign_class!</code> description in the producer’s build
+script. It’s a good fit when exactly those two consumers matter.</li>
+<li><strong>PyO3 with maturin</strong> builds a native CPython extension module from Rust:
+Python classes, exceptions, iterators, and async integration with direct
+access to the Python object model, and wheels for every platform. For a
+Python-only library it’s deeper and better integrated than any
+multi-language tool, WeaveFFI’s Python target included.</li>
+<li><strong>cxx</strong> is a safe, statically checked bridge between Rust and C++ in both
+directions (<code>#[cxx::bridge]</code>), sharing types like <code>String</code>, <code>Vec</code>, and
+<code>unique_ptr</code> without a C layer in between. If both sides are your own Rust
+and C++, it gives stronger guarantees than WeaveFFI’s C++ target, which
+wraps a C ABI.</li>
+</ul>
+<h2 id="when-to-choose-something-else"><a class="header" href="#when-to-choose-something-else">When to choose something else</a></h2>
+<ul>
+<li><strong>You only need Kotlin, Swift, and Python and want maximum stability, or
+you need async callbacks</strong>: use UniFFI.</li>
+<li><strong>You only need a C header for a Rust crate</strong>: use cbindgen.</li>
+<li><strong>You ship to exactly one of Swift, Node.js, Python, or the browser</strong>: use
+swift-bridge, napi-rs, PyO3 with maturin, or wasm-bindgen respectively.</li>
+<li><strong>You need Rust and C++ calling each other in one codebase</strong>: use cxx.</li>
+<li><strong>You need only C#, or only Java and C++</strong>: interoptopus or flapigen may
+be enough.</li>
+<li><strong>You’re wrapping a large existing C++ codebase from Rust</strong>: use autocxx (or
+cxx plus bindgen directly).</li>
+<li><strong>Your target language is Lua, Tcl, R, Octave, Perl, or PHP</strong>: use SWIG.</li>
+<li><strong>You want a Rust-only bridge crate with borrowed-reference semantics and a
+polished C++ backend</strong>: use Diplomat (<code>#[diplomat::bridge]</code>, from the
+<code>rust-diplomat/diplomat</code> repository).</li>
+</ul>
+<h2 id="migrating-to-or-from-weaveffi"><a class="header" href="#migrating-to-or-from-weaveffi">Migrating to or from WeaveFFI</a></h2>
+<p>WeaveFFI’s IDL is intentionally close to UniFFI’s UDL surface area (records,
+enums, interfaces, callback interfaces, error enums, <code>async</code>), which makes
+hand-porting straightforward in either direction. There is no automatic UDL
+to WeaveFFI converter today. Going the other way, <code>weaveffi extract</code> prints
+the IDL a Rust producer’s built library embeds, which is the
+starting point for reimplementing a Rust producer in another language. See
+<a href="guides/extract.html">Library Mode</a> for details, and the
+<a href="reference/abi.html">C ABI contract</a> if you’re bringing a non-Rust producer to
+the generated header.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="samples.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="faq.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="samples.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="faq.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-09f2665d.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

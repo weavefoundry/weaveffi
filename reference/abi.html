@@ -1,0 +1,689 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>C ABI Contract - WeaveFFI v0.26</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-1339018f.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-e1100732.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">WeaveFFI v0.26</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/weavefoundry/weaveffi" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="c-abi-contract"><a class="header" href="#c-abi-contract">C ABI Contract</a></h1>
+<p>This page is the normative description of the WeaveFFI C ABI, <strong>revision 6</strong>.
+The producer macros implement it, the C generator renders it as a header,
+and every other generator consumes it. Where another page disagrees with
+this one, this one wins.</p>
+<h2 id="vocabulary"><a class="header" href="#vocabulary">Vocabulary</a></h2>
+<ul>
+<li><strong>Producer</strong>: the native library implementing the symbols (a Rust cdylib
+built with the producer macros, or a C, C++, or Zig library implementing
+the header).</li>
+<li><strong>Consumer</strong>: generated bindings, or C code calling the header directly.</li>
+<li><strong><code>{p}</code></strong>: the library’s C symbol prefix from its <a href="naming.html">identity</a>, a
+lower-snake identifier (<code>kvstore</code>). <strong><code>{P}</code></strong> is the same prefix
+uppercased, used for macros (<code>KVSTORE</code>).</li>
+<li><strong>Run</strong>: a contiguous allocation of bytes that crosses the boundary (a
+string, bytes, a typed array, a value buffer, an error message or
+payload).</li>
+</ul>
+<p>A library is <strong>one namespace</strong>: every record, enum, error domain, interface,
+callback interface, and free function has a name unique across the library,
+and every identifier the ABI defines starts with <code>{p}_</code> (functions, types,
+constants) or <code>{P}_</code> (macros). There are no fixed <code>weaveffi_*</code> symbols, so
+any number of WeaveFFI libraries can link into one process, statically or
+dynamically.</p>
+<h2 id="one-value-one-c-value"><a class="header" href="#one-value-one-c-value">One value, one C value</a></h2>
+<p>Every value crosses as exactly <strong>one C value</strong>, in every position: a
+parameter, a return, an async result, an iterator item, and a callback
+method’s parameter and return. Which C value is decided by the value’s
+<strong>family</strong>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Family</th><th>IDL types</th><th>C type</th></tr>
+</thead>
+<tbody>
+<tr><td>Direct</td><td>integers, <code>f32</code>, <code>f64</code>, <code>bool</code>, C-style enums</td><td>the scalar (<code>int32_t</code>, <code>double</code>, <code>bool</code>, …); an enum’s <code>{p}_{E}</code> is <code>typedef int32_t</code></td></tr>
+<tr><td>OptDirect</td><td><code>T?</code> where <code>T</code> is Direct</td><td><code>{p}_opt_{prim}</code>: <code>struct { bool has; T value; }</code>; an optional enum is a <code>{p}_opt_i32</code></td></tr>
+<tr><td>Run</td><td><code>string</code>, <code>bytes</code>, <code>[i8]</code> … <code>[f64]</code> (typed arrays), records, rich enums, and every other optional, list, and map</td><td><code>{p}_run</code>: <code>struct { const uint8_t* ptr; size_t len; }</code></td></tr>
+<tr><td>Object</td><td>interfaces and <code>Interface?</code></td><td><code>const {p}_{I}*</code> as a callable’s parameter, <code>{p}_{I}*</code> elsewhere</td></tr>
+</tbody>
+</table>
+</div>
+<p>A run holds, by type:</p>
+<ul>
+<li><code>string</code>: UTF-8, never NUL-terminated;</li>
+<li><code>bytes</code>: raw bytes;</li>
+<li><code>[i8]</code>, <code>[i16]</code>, <code>[i32]</code>, <code>[i64]</code>, <code>[u16]</code>, <code>[u32]</code>, <code>[u64]</code>, <code>[f32]</code>,
+<code>[f64]</code> (a <strong>typed array</strong>): the packed native elements, <code>len</code> a multiple
+of the element size and <code>ptr</code> aligned for the element (<code>[bool]</code> and
+<code>[u8]</code> aren’t typed arrays: <code>[u8]</code> is <code>bytes</code>, and <code>[bool]</code> is a value
+buffer);</li>
+<li>anything else: a <a href="value-buffers.html">value buffer</a>.</li>
+</ul>
+<p><code>len</code> always counts <strong>bytes</strong>. Null with length <code>0</code> is the empty run, and a
+null pointer with a non-zero length is malformed.</p>
+<p>A <code>bool</code> (and an <code>OptDirect</code>’s <code>has</code>) is a C <code>bool</code>, one byte; the producer
+rejects any byte but <code>0</code> and <code>1</code> as a marshalling failure (<code>-3</code>). An
+<code>OptDirect</code>’s <code>value</code> is <code>0</code> when <code>has</code> is false.</p>
+<p>Two more kinds aren’t value types:</p>
+<ul>
+<li>A <strong>callback-interface parameter</strong> (<code>Cb</code> or <code>Cb?</code>, legal only as a
+parameter of a function or interface member) is a <code>{p}_{Cb}</code> struct,
+<code>struct { void* ctx; const {p}_{Cb}_vtable* vtable; }</code>, passed by value;
+a null <code>vtable</code> is none (<code>Cb?</code>).</li>
+<li>An <strong>iterator return</strong> (<code>iter&lt;T&gt;</code>, legal only as a return) is an opaque
+<code>{p}_{Iter}*</code> (see <a href="#iterators">Iterators</a>).</li>
+</ul>
+<h3 id="signatures"><a class="header" href="#signatures">Signatures</a></h3>
+<p>A synchronous callable is</p>
+<pre><code class="language-c">R {symbol}([const {p}_{I}* self,] &lt;one slot per parameter&gt;, {p}_error* out_err);
+</code></pre>
+<p>where <code>R</code> is the return’s C type (<code>void</code> for none), the receiver <code>self</code> is
+an instance method’s, and each parameter’s slot is named after the
+parameter. A parameter may not be named <code>self</code>, <code>ctx</code>, <code>out_err</code>,
+<code>callback</code>, <code>context</code>, or <code>cancel_token</code> (validation reports
+<code>SlotCollision</code>).</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Declaration</th><th>C identifier</th></tr>
+</thead>
+<tbody>
+<tr><td>function <code>f</code></td><td><code>{p}_f</code></td></tr>
+<tr><td>interface <code>I</code></td><td>type <code>{p}_I</code>; members <code>{p}_I_{member}</code>; <code>{p}_I_clone</code>, <code>{p}_I_destroy</code></td></tr>
+<tr><td>async function <code>f</code></td><td>launcher <code>{p}_f</code> (no suffix); completion type <code>{p}_f_callback</code></td></tr>
+<tr><td>iterator returned by <code>f</code></td><td>type <code>{p}_{Owner_}{PascalF}Iterator</code>, plus <code>{Iter}_next</code> and <code>{Iter}_destroy</code></td></tr>
+<tr><td>C-style enum <code>E</code>, variant <code>V</code></td><td>type <code>{p}_E</code> (<code>typedef int32_t</code>), constant <code>{p}_E_V</code></td></tr>
+<tr><td>rich enum <code>E</code>, variant <code>V</code></td><td>tag type <code>{p}_E_Tag</code> (<code>typedef int32_t</code>), constant <code>{p}_E_V</code>; struct <code>{p}_E</code> and its codecs in the buffer header</td></tr>
+<tr><td>record <code>S</code></td><td>struct <code>{p}_S</code> and its codecs in the buffer header</td></tr>
+<tr><td>error domain <code>D</code>, code <code>C</code></td><td>type <code>{p}_D</code> (<code>typedef int32_t</code>), constant <code>{p}_D_C</code>; for a code with fields, struct <code>{p}_D_C_payload</code> and its codecs in the buffer header</td></tr>
+<tr><td>callback interface <code>Cb</code></td><td>argument struct <code>{p}_Cb</code>, vtable type <code>{p}_Cb_vtable</code></td></tr>
+<tr><td>a declaration’s contract</td><td><code>{p}_contract_{id:016x}</code> (see <a href="#the-contract">The contract</a>)</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>{Owner_}</code> is empty for a free function and the interface name plus <code>_</code> for
+a member, and the function name is converted to PascalCase:
+<code>stream_items</code> is <code>kitchen_sink_StreamItemsIterator</code>, and <code>Store.keys</code> is
+<code>kvstore_Store_KeysIterator</code>.</p>
+<p>Enum, tag, and error-code types are <code>typedef int32_t</code> with their constants
+in an anonymous <code>enum</code>, never <code>typedef enum</code>: a C enum’s size is the
+compiler’s choice, and these values always cross as <code>int32_t</code>.</p>
+<pre><code class="language-c">typedef int32_t kvstore_Kind;
+enum { kvstore_Kind_Hot = 0, kvstore_Kind_Cold = 1 };
+</code></pre>
+<p>All names are computed once by the model and recorded in one symbol table;
+validation fails with <code>SymbolCollision</code> if two declarations would produce
+the same identifier, or one falls in a reserved family (<code>{p}_contract_*</code>,
+and the buffer header’s <code>{p}_reader_*</code>, <code>{p}_writer_*</code>, <code>{p}_str_*</code>, and
+<code>{p}_bytes_*</code>). The buffer header names its optional, list, and map codecs
+<code>{p}_buf_{stem}</code> (<code>{p}_buf_list_i32</code>); those exact names are reserved too.
+IDL spellings are never re-cased in C.</p>
+<h2 id="load-time-checks"><a class="header" href="#load-time-checks">Load-time checks</a></h2>
+<p>A consumer makes two checks once, when it loads the library, before any
+other call, and refuses to load if either fails (with the language’s load or
+import error, or a catchable check function where loading itself can’t
+fail, as in Swift and Go).</p>
+<p><strong>The revision.</strong> <code>{P}_ABI_VERSION</code> in the header and <code>{p}_abi_version()</code> in
+the library must be equal. The revision changes only when the runtime
+surface, the value-buffer encoding, or a calling convention changes
+incompatibly; it’s independent of the crate version and the IDL schema
+version.</p>
+<p>Revision 6 is designed to grow without a revision 7: new declarations, new
+callback methods (appended), and new error codes are additive.</p>
+<h2 id="the-contract"><a class="header" href="#the-contract">The contract</a></h2>
+<p>Every declaration has a <strong>contract function</strong>:</p>
+<pre><code class="language-c">uint64_t {p}_contract_{id:016x}(void);  /* returns the declaration's hash */
+</code></pre>
+<p>A declaration is a function, an interface, each interface member
+(constructor, method, or static), a record, an enum, a callback interface,
+each callback method, an error domain, or each error code. Its</p>
+<ul>
+<li><strong>id</strong> is the 64-bit FNV-1a hash of its dotted path, the name then a
+member, method, or code (<code>open_store</code>, <code>Store</code>, <code>Store.get</code>, <code>Listener</code>,
+<code>Listener.on_put</code>, <code>KvError</code>, <code>KvError.NotFound</code>), written as 16
+lower-case hex digits in the symbol;</li>
+<li><strong>hash</strong> is the 64-bit FNV-1a hash of its canonical signature string.</li>
+</ul>
+<p>FNV-1a 64 starts from <code>0xcbf29ce484222325</code> and, for each byte, XORs the byte
+in and multiplies by <code>0x100000001b3</code>, wrapping.</p>
+<p>The canonical signature is computed from resolved types, never from source
+spelling: type aliases are substituted, a custom type is its repr, <code>[u8]</code> is
+<code>bytes</code>, and each type is written in its IDL spelling (<code>i32</code>, <code>string</code>,
+<code>[Contact]</code>, <code>{string:i64}</code>, <code>Store?</code>, <code>Listener?</code>, <code>iter&lt;Item&gt;</code>).
+Parameter names, field names, documentation, deprecation text, and error
+messages are excluded.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Declaration</th><th>Canonical signature</th></tr>
+</thead>
+<tbody>
+<tr><td>function or interface member</td><td><code>{kind} {name}({type}, ...) -&gt; {type}</code>, where <code>kind</code> is <code>function</code>, <code>constructor</code>, <code>method</code>, or <code>static</code> and a missing return is <code>void</code>, followed by <code> throws {Domain}</code> or <code> throws any</code>, then <code> async</code>, then <code> cancellable</code>, each when set (a constructor’s return is its interface)</td></tr>
+<tr><td>interface</td><td><code>interface {name}</code> (each member has its own entry)</td></tr>
+<tr><td>record</td><td><code>record {name} {{type}, ...}</code>: field types only, in order</td></tr>
+<tr><td>enum</td><td><code>enum {name} {{Variant} = {value}, ...}</code>, a variant with fields followed by <code> {{type}, ...}</code></td></tr>
+<tr><td>callback interface</td><td><code>callback {name}</code> (each method has its own entry)</td></tr>
+<tr><td>callback method</td><td><code>callback_method #{slot} {name}({type}, ...) -&gt; {type}</code>, where <code>slot</code> is the method’s zero-based position in the vtable and a missing return is <code>void</code>, followed by <code> throws {Domain}</code> or <code> throws any</code> when set</td></tr>
+<tr><td>error domain</td><td><code>errors {name}</code> (each code has its own entry)</td></tr>
+<tr><td>error code</td><td><code>code {Code} = {value}</code>, a code with fields followed by <code> {{type}, ...}</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>For example, <code>fn get(&amp;self, key: String) -&gt; Result&lt;Entry, KvError&gt;</code> on
+interface <code>Store</code> has the path <code>Store.get</code> and the signature <code>method get(string) -&gt; Entry throws KvError</code>.</p>
+<p>A consumer checks <strong>every declaration it was generated with</strong>: it calls the
+declaration’s contract function and compares the result with the hash it
+was generated with. A missing function fails with “<code>Store.get</code> is missing
+from the library”; a different hash fails with “<code>Store.get</code> changed since
+these bindings were generated”. Declarations the library has and the
+consumer doesn’t are fine, so adding a declaration (a function, a method, a
+record, an error code, or a callback method at the end of its interface)
+never breaks a deployed binding. A consumer that links the library (C, C++,
+Swift, Go) calls the functions directly, so a missing declaration fails to
+link; one that loads it at run time resolves each function by name.</p>
+<p>Variant and code names stay in their signatures because they’re values a
+consumer sees; parameter and field names don’t affect the encoding, so
+renaming one is ABI-neutral. The flip side is that swapping two parameters or
+fields of the same type passes the check too; treat that as a breaking
+change even though the check can’t see it.</p>
+<p>The header declares every contract function, commented with its path and
+canonical signature, a checker, and a macro a hand-written producer defines
+them all with:</p>
+<pre><code class="language-c">KVSTORE_API uint64_t kvstore_contract_dc5ad183936cb6fc(void); /* Store.get: method get(string) -&gt; Entry throws KvError */
+static inline const char* kvstore_contract_check(void);  /* the path of the first mismatch, or NULL */
+#define KVSTORE_DEFINE_CONTRACT ...                       /* defines every contract function */
+</code></pre>
+<h2 id="runtime-surface"><a class="header" href="#runtime-surface">Runtime surface</a></h2>
+<p>Every producer exports these symbols (<code>weaveffi::export_runtime!()</code> emits
+them for a Rust producer):</p>
+<pre><code class="language-c">#define {P}_ABI_VERSION 6u
+uint32_t {p}_abi_version(void);
+
+typedef struct {p}_run { const uint8_t* ptr; size_t len; } {p}_run;
+typedef struct {p}_opt_i32 { bool has; int32_t value; } {p}_opt_i32;  /* and one per scalar */
+
+typedef struct {p}_error {
+    int32_t code;                /* 0 ok; &gt;0 domain code; &lt;0 runtime code */
+    const uint8_t* message_ptr;  /* UTF-8, NOT NUL-terminated, producer-owned */
+    size_t message_len;
+    const uint8_t* payload_ptr;  /* the code's fields as a value buffer, or NULL */
+    size_t payload_len;
+} {p}_error;
+void {p}_error_set({p}_error* err, int32_t code,
+                   const uint8_t* message_ptr, size_t message_len);          /* copies */
+void {p}_error_set_payload({p}_error* err, const uint8_t* ptr, size_t len);  /* copies */
+void {p}_error_clear({p}_error* err);  /* frees message and payload; code = 0 */
+void {p}_error_free({p}_error* err);   /* clear, then free a heap-boxed error */
+
+uint8_t* {p}_alloc(size_t len);      /* a zero-filled 8-aligned run, NULL for 0 */
+void {p}_run_free({p}_run run);      /* returned runs and {p}_alloc runs */
+
+typedef struct {p}_cancel_token {p}_cancel_token;
+{p}_cancel_token* {p}_cancel_token_create(void);           /* refcount 1 */
+void {p}_cancel_token_cancel({p}_cancel_token* token);      /* idempotent */
+bool {p}_cancel_token_is_cancelled(const {p}_cancel_token* token);
+void {p}_cancel_token_destroy({p}_cancel_token* token);     /* drops one reference */
+
+#define {P}_VTABLE_THREAD_AFFINE 1u  /* a callback vtable flag; see below */
+
+uint64_t {p}_debug_live(int32_t kind);  /* leak counters */
+</code></pre>
+<p>There is one <code>{p}_opt_{prim}</code> per scalar: <code>bool</code>, <code>i8</code>, <code>i16</code>, <code>i32</code>, <code>i64</code>,
+<code>u8</code>, <code>u16</code>, <code>u32</code>, <code>u64</code>, <code>f32</code>, and <code>f64</code>.</p>
+<p>Every function accepts null where a pointer is optional (<code>error_set</code>,
+<code>error_set_payload</code>, <code>error_clear</code>, <code>error_free</code>, the token functions,
+<code>_clone</code>, <code>_destroy</code>) and treats it as a no-op; a null token reads as never
+cancelled. <code>{p}_run_free</code> of the empty run is a no-op. <code>{p}_error_set</code> with
+a null <code>message_ptr</code> (whatever the length) sets an empty message, and a
+producer never fails on message bytes that aren’t UTF-8 (the Rust runtime
+replaces them with U+FFFD), so reporting a failure never fails.</p>
+<p>Every run the producer hands out (a string, bytes, typed-array, or value
+buffer return; an error’s message and payload) and every <code>{p}_alloc(len)</code>
+run is allocated with alignment 8, so a run can be read in place as any
+element type. The consumer releases a returned run with <code>{p}_run_free</code>,
+passing it back exactly as it got it; it never frees a run with its own
+allocator. A consumer allocates a run with <code>{p}_alloc(len)</code> when it hands
+memory <em>to</em> the producer (a callback method’s string, bytes, typed-array,
+or buffer return, which the producer adopts) or, on <code>wasm32</code>, when it
+stages an argument in the module’s linear memory. An error’s message and
+payload belong to the error struct and are released by <code>{p}_error_clear</code>
+or <code>{p}_error_free</code>, never by <code>{p}_run_free</code>.</p>
+<p><code>{p}_debug_live(kind)</code> reports live resources for leak checks: <code>0</code> objects,
+<code>1</code> foreign callbacks, <code>2</code> iterators, <code>3</code> cancel tokens, <code>4</code> runs (returned
+and allocated ones not yet freed or adopted). Kind <code>-1</code> returns <code>1</code> when the
+producer counts at all and <code>0</code> when it doesn’t, so a harness can tell
+“nothing is live” from “nothing is counted”; an unknown kind returns <code>0</code>. A
+Rust producer counts only with the <code>leak-check</code> feature; without it every
+kind but <code>-1</code> returns <code>0</code>.</p>
+<h2 id="errors"><a class="header" href="#errors">Errors</a></h2>
+<p>Every synchronous API symbol (a function or interface member, an iterator
+launcher, and an iterator’s <code>_next</code>) takes a trailing <code>{p}_error* out_err</code>
+after all inputs; <code>_clone</code>, <code>_destroy</code>, an iterator’s <code>_destroy</code>, async
+launchers, and the runtime surface don’t. The call <strong>overwrites</strong> the slot
+without reading it: on failure it stores the code, message, and payload and
+returns a zero value (<code>0</code>, <code>false</code>, <code>NULL</code>, the empty run, an absent
+optional) the caller must not use; on success it stores a cleared error. So
+the caller may pass uninitialized memory, and after reading a failure
+releases its message and payload with <code>{p}_error_clear</code> (a struct reused for
+many calls must be cleared after each failure, or its message leaks).</p>
+<p>The message is <code>message_len</code> bytes of UTF-8 at <code>message_ptr</code>, without a NUL
+terminator (a consumer that needs a C string copies it). An empty message is
+a null <code>message_ptr</code> with length <code>0</code>, even on failure.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Code</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>0</code></td><td>success; every pointer is null and every length <code>0</code></td></tr>
+<tr><td><code>&gt; 0</code></td><td>a code of the error domain the callable throws; <code>payload_ptr</code>/<code>payload_len</code> hold the code’s fields, if any</td></tr>
+<tr><td><code>-1</code></td><td>untyped: the failure of a <code>throws: any</code> callable, or an async call the executor couldn’t start</td></tr>
+<tr><td><code>-2</code></td><td>the producer panicked</td></tr>
+<tr><td><code>-3</code></td><td>marshalling failure: an argument couldn’t be lifted (a null run with a non-zero length, a null <code>self</code> or object where one is required, invalid UTF-8, a <code>bool</code> byte other than <code>0</code> or <code>1</code>, an out-of-range enum value or integer conversion, a misaligned or ragged typed array, a malformed buffer, a map with a repeated key, an incomplete vtable header, an iterator advanced concurrently)</td></tr>
+<tr><td><code>-4</code></td><td>a consumer’s callback-interface implementation failed, doesn’t implement the method called, or was called off its thread (see <a href="#callback-interfaces">Callback interfaces</a>)</td></tr>
+<tr><td><code>-5</code></td><td>cancelled (async completions only)</td></tr>
+</tbody>
+</table>
+</div>
+<p>What a callable may report depends on its <code>throws</code>:</p>
+<ul>
+<li><strong>No <code>throws</code>.</strong> Only runtime codes. A non-zero code is a producer bug or
+a failed callback; consumers trap on it rather than report a typed error
+(see <a href="../guides/errors-and-memory.html">Errors and memory</a>).</li>
+<li><strong><code>throws: {Domain}</code>.</strong> The domain’s positive codes plus runtime codes.
+<strong>Domains are open</strong>: a consumer that receives a positive code it wasn’t
+generated with (the producer gained a code since) maps it to the domain’s
+base error type with the code and message preserved, never to a crash or
+a generic failure. It discards that code’s payload without decoding it,
+which is why an error code’s fields never carry an object (validation
+reports <code>ObjectInErrorPayload</code>).</li>
+<li><strong><code>throws: any</code>.</strong> Code <code>-1</code> with a message, plus runtime codes; never a
+positive code.</li>
+</ul>
+<p>A producer lifts <strong>every</strong> argument of a call before it reports the first
+one that failed, so the inputs it adopts (a callback argument, the object
+tokens in a value buffer) are adopted and released even when another
+argument, or a null <code>self</code>, fails.</p>
+<h2 id="objects"><a class="header" href="#objects">Objects</a></h2>
+<p>Objects are <strong>reference counted by the producer</strong>. A <code>{p}_{I}*</code> is one
+strong reference. <code>_clone</code> returns another strong reference to the same
+object (the pointer value is unchanged); <code>_destroy</code> releases one, and the
+object is dropped with the last reference. A consumer may hold any number of
+references and use them from any thread.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Position</th><th>Rule</th></tr>
+</thead>
+<tbody>
+<tr><td>parameter (<code>const {p}_{I}*</code>)</td><td>borrowed for the call; the producer takes its own reference if it retains the object</td></tr>
+<tr><td>return, async result, iterator element</td><td>one strong reference moves to the consumer</td></tr>
+<tr><td>callback method argument</td><td>one strong reference moves to the consumer</td></tr>
+<tr><td>callback method return</td><td>one strong reference moves to the producer</td></tr>
+<tr><td>object token inside a value buffer</td><td>carries one strong reference; the reader adopts it</td></tr>
+</tbody>
+</table>
+</div>
+<p>A consumer encoding an object into a buffer writes a fresh reference from
+<code>_clone</code>. An in-flight async call holds its own reference, so releasing a
+wrapper while a call is pending is safe.</p>
+<h2 id="callback-interfaces"><a class="header" href="#callback-interfaces">Callback interfaces</a></h2>
+<pre><code class="language-c">typedef struct {p}_{Cb}_vtable {p}_{Cb}_vtable;
+typedef struct {p}_{Cb} { void* ctx; const {p}_{Cb}_vtable* vtable; } {p}_{Cb};
+
+struct {p}_{Cb}_vtable {
+    uint32_t size;            /* sizeof the vtable, as the consumer compiled it */
+    uint32_t flags;           /* 0, or {P}_VTABLE_THREAD_AFFINE */
+    void (*free)(void* ctx);  /* always first, at a fixed offset */
+    /* one entry per method, in declaration order: */
+    R (*{method})(void* ctx, &lt;one slot per parameter&gt;, {p}_error* out_err);
+};
+</code></pre>
+<p>A callback interface has no exported symbols; it lowers to an argument
+struct and a vtable type. The consumer passes a <code>ctx</code> it owns and a pointer
+to a vtable that outlives the producer’s use of it (in practice, one static
+vtable per interface), with <code>size</code> set to <code>sizeof</code> the vtable.</p>
+<p><strong>Vtables are open.</strong> The producer accepts any vtable whose header is
+complete (<code>size</code> at least the header’s), so a consumer generated before a
+method was appended keeps working: when the producer calls a method that
+lies past the consumer’s <code>size</code>, or whose entry is null, the call fails with
+<code>-4</code> and a message naming the method, without calling anything. A vtable
+shorter than its header fails the call that passed it with <code>-3</code>. Methods are
+only ever appended; reordering or inserting one moves slots and fails the
+contract check.</p>
+<p>The producer may call any entry, any number of times, from any thread, until
+it calls <code>free(ctx)</code> exactly once, after which it never touches <code>ctx</code> again.
+<code>free</code> may also run on any producer thread, and a null <code>free</code> is skipped.</p>
+<p><strong>Thread affinity.</strong> Bit 0 of <code>flags</code> is <code>{P}_VTABLE_THREAD_AFFINE</code>
+(<code>1u</code>); every other bit is reserved and <code>0</code>. With the flag set, a method
+that returns a value may only be called on the thread that passed the
+vtable to the producer. The producer records that thread when it adopts the
+vtable and fails such a call from any other thread with <code>-4</code> and the message
+<code>callback called off its thread</code>, without calling the method. <code>void</code>
+methods and <code>free</code> may still be called from any thread. The Dart target sets
+the flag; every other target passes <code>0</code>.</p>
+<p><strong>Arguments</strong> are lent for the duration of the call (runs are borrowed),
+except objects, which move one strong reference to the consumer.</p>
+<p><strong>Returns</strong> are the C return of the method. A run the consumer returns is one
+it allocated with <code>{p}_alloc(len)</code>, which the producer adopts and frees; an
+object it returns is a fresh strong reference (<code>_clone</code>) the producer
+adopts. The producer adopts whatever the method returned whether or not it
+failed, so a consumer that fails after allocating doesn’t leak. A return it
+can’t accept (a string that isn’t UTF-8, a null <code>I</code>, an out-of-range enum
+value, a malformed buffer) fails the method with <code>-3</code>.</p>
+<p><strong>Errors.</strong> A consumer implementation that fails reports it with
+<code>{p}_error_set(out_err, code, message_ptr, message_len)</code>, which copies a
+borrowed message with the producer’s allocator; it never writes the
+message itself. What it reports follows the method’s <code>throws</code>:</p>
+<ul>
+<li><code>throws: {Domain}</code>: a positive code of that domain, attaching the code’s
+fields encoded as a value buffer with <code>{p}_error_set_payload</code>, which
+reaches the producer as that typed error; or <code>-1</code> with a message for any
+other failure.</li>
+<li><code>throws: any</code>: <code>-1</code> with a message.</li>
+<li>No <code>throws</code>: <code>-4</code> with a message (any non-zero code is accepted).</li>
+</ul>
+<p>Anything but a declared code with a payload that decodes reaches the
+producer as a callback failure, <code>-4</code> with the consumer’s message, so a
+consumer bug can’t masquerade as a domain error. A Rust producer’s method
+returns <code>Result&lt;T, E&gt;</code>, its <code>E</code> built from a typed code or, for a callback
+failure, with <code>From&lt;weaveffi::ForeignError&gt;</code>.</p>
+<h2 id="async-functions"><a class="header" href="#async-functions">Async functions</a></h2>
+<pre><code class="language-c">typedef void (*{p}_{f}_callback)(void* context, {p}_error* err, R result);
+void {p}_{f}([self,] &lt;one slot per parameter&gt;, [{p}_cancel_token* cancel_token,]
+             {p}_{f}_callback callback, void* context);
+</code></pre>
+<p><code>result</code> is the return’s one C value, as for a synchronous return, and is
+absent for a function that returns nothing (the completion is then
+<code>void (*)(void* context, {p}_error* err)</code>). <code>err</code> is <code>NULL</code> on success;
+otherwise it’s heap-boxed, owned by the consumer, and released with
+<code>{p}_error_free</code>, and <code>result</code> is the zero value. The launcher has no
+<code>out_err</code>; every failure, including an input marshalling failure, is
+delivered through the completion.</p>
+<p>The runtime guarantees:</p>
+<ul>
+<li>The completion fires <strong>exactly once</strong>, from any thread, possibly before
+the launcher returns. A null <code>callback</code> discards the result.</li>
+<li>The launcher takes everything it needs before returning (it copies runs
+and retains objects and <code>self</code>), so the consumer may release its
+arguments as soon as it returns.</li>
+<li>If the executor can’t take the call (it failed to start, or a custom
+executor panicked), the completion fires with <code>-1</code> and a message.</li>
+<li>If the executor drops the future before it completes, the completion
+fires with <code>-5</code>.</li>
+<li>For a <code>cancellable</code> function, the producer takes its own reference on the
+token at launch; the consumer may cancel and destroy its reference at any
+time afterward. Cancelling wakes the future; the runtime then drops it and
+completes with <code>-5</code> and the message <code>cancelled</code>, unless it already
+completed. Producer code may still poll the token for cooperative cleanup.</li>
+</ul>
+<p>Which threads drive the futures is the producer’s business; see
+<a href="../guides/async.html">Async</a> for the Rust runtime’s executors.</p>
+<h2 id="iterators"><a class="header" href="#iterators">Iterators</a></h2>
+<pre><code class="language-c">{Iter}* launcher([self,] &lt;one slot per parameter&gt;, {p}_error* out_err);
+int32_t {Iter}_next({Iter}* iter, T* out_item, {p}_error* out_err);  /* 1 item, 0 done */
+void {Iter}_destroy({Iter}* iter);
+</code></pre>
+<p><code>T</code> is the element’s one C value, and each element follows the return rules
+of its family. <code>_next</code> checks that <code>out_item</code> is non-null before it pulls an
+element (failing with <code>-3</code> otherwise), so a bad call never loses one.
+<code>_next</code> never blocks on another <code>_next</code>: a call that arrives while the same
+iterator is being advanced (from another thread, or re-entrantly from inside
+the producer’s own <code>next</code>) fails with <code>-3</code>. The consumer calls <code>_destroy</code>
+exactly once, after exhaustion or to abandon the iteration.</p>
+<h2 id="value-buffers"><a class="header" href="#value-buffers">Value buffers</a></h2>
+<p>Buffers have one encoding, specified in <a href="value-buffers.html">Value Buffers</a>:
+little-endian, packed, <code>u32</code> lengths and counts, object tokens as <code>u64</code>.
+Error payloads use the same encoding, and so do optional scalars and
+numeric lists nested inside a buffer (a record’s <code>i64?</code> field is a presence
+byte and a value; its <code>[f64]</code> field is a count and packed elements).</p>
+<h2 id="producers-in-other-languages"><a class="header" href="#producers-in-other-languages">Producers in other languages</a></h2>
+<p>A producer implementing a generated header exports:</p>
+<ol>
+<li>every function the header declares for the API;</li>
+<li>every contract function, which the header’s <code>{P}_DEFINE_CONTRACT</code>
+defines;</li>
+<li>the runtime surface above, with <code>{p}_abi_version</code> returning
+<code>{P}_ABI_VERSION</code>.</li>
+</ol>
+<pre><code class="language-c">#define CALCULATOR_BUILD
+#include "calculator.h"
+
+CALCULATOR_DEFINE_CONTRACT
+</code></pre>
+<p>The producer owns every allocation it hands out and adopts every run a
+consumer allocates, so <code>error_clear</code>, <code>error_free</code>, <code>run_free</code>, and the
+adoption of a callback’s returned run must all use the allocator <code>alloc</code>
+uses, with alignment 8. It honors <code>{P}_VTABLE_THREAD_AFFINE</code> and accepts
+short vtables. When building the library, define <code>{P}_BUILD</code> so the
+header’s <code>{P}_API</code> macro exports symbols on Windows.
+<code>conformance/c/producer.c</code> is a complete example.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../reference/idl.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../reference/value-buffers.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../reference/idl.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../reference/value-buffers.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

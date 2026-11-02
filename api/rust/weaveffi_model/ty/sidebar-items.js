@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Family","ParamTy","Prim","RetTy","RunKind","Ty","TypeKind","WireType"],"struct":["TypeDecl","TypeIndex"]};

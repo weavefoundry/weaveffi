@@ -1,0 +1,584 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Node.js - WeaveFFI v0.26</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-1339018f.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-e1100732.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">WeaveFFI v0.26</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/weavefoundry/weaveffi" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="nodejs"><a class="header" href="#nodejs">Node.js</a></h1>
+<p>The Node.js target generates an npm package: an ES module with TypeScript
+declarations that loads the producer’s shared library with
+<a href="https://koffi.dev">koffi</a> and calls its <a href="../reference/abi.html">C ABI</a>
+(revision 6) directly. There’s no generated C, no addon, and nothing to
+compile at install time. The JavaScript API is shared with the
+<a href="wasm.html">WebAssembly target</a>; only the transport underneath differs, so
+code written against one runs against the other.</p>
+<p>Node.js is a <a href="../stability.html#target-tiers">Tier 1</a> target: it tracks every
+ABI revision as it lands and runs the full conformance suite in CI.</p>
+<h2 id="what-gets-generated"><a class="header" href="#what-gets-generated">What gets generated</a></h2>
+<p>For a library named <code>kvstore</code> (the snapshot fixtures use <code>kitchen_sink</code>):</p>
+<pre><code class="language-text">node/
+├── package.json   ES module manifest, depending on a pinned koffi release
+├── index.js       the C signatures, the load-time checks, and the API
+├── index.d.ts     TypeScript declarations
+├── runtime.js     the shared runtime (codec, checks, errors, wrappers, load-time checks)
+├── native.js      the transport: loading the library with koffi and binding its symbols
+├── debug.js       the `./debug` export: leak counters for tests
+├── debug.d.ts
+└── README.md
+</code></pre>
+<p>The package name defaults to the package identity’s <code>name</code>; set <code>name</code> under
+<code>[generators.node]</code> in <code>weaveffi.toml</code> to override it, and <code>node_engine</code> to
+change <code>engines.node</code> (default <code>&gt;=18</code>). The package’s one dependency is
+koffi, pinned to an exact release (3.3.2).</p>
+<h2 id="install-and-load"><a class="header" href="#install-and-load">Install and load</a></h2>
+<p>The generated directory is a complete package. Install it like any other,
+and npm fetches koffi (which ships prebuilt binaries for every platform it
+supports):</p>
+<pre><code class="language-sh">npm install ./node
+</code></pre>
+<p>Importing the package loads the library. The first of these that exists
+wins:</p>
+<ol>
+<li>the path in the <code>{PREFIX}_LIBRARY</code> environment variable
+(<code>KVSTORE_LIBRARY</code>), the library file or the directory holding it;</li>
+<li>the copy in the <code>{package}-{os}-{cpu}</code> package npm installed for this
+platform (see <a href="#packaging">Packaging</a>);</li>
+<li>a copy next to <code>index.js</code>, where <code>weaveffi generate --dev</code> puts it;</li>
+<li>the bare file name (<code>libkvstore.so</code>, <code>libkvstore.dylib</code>, <code>kvstore.dll</code>),
+which the system’s library search resolves (<code>LD_LIBRARY_PATH</code>,
+<code>DYLD_LIBRARY_PATH</code>, <code>PATH</code>).</li>
+</ol>
+<pre><code class="language-js">import { Store, EntryKind, KvstoreError } from 'kvstore';
+
+const store = Store.open('/tmp/data');
+store.put('greeting', new TextEncoder().encode('hi'), EntryKind.Volatile, null);
+store.close();
+</code></pre>
+<p>If no candidate loads, the import throws an <code>Error</code> that lists the paths it
+tried and names the environment variable.</p>
+<h2 id="load-time-checks"><a class="header" href="#load-time-checks">Load-time checks</a></h2>
+<p>Before any other call, the import checks that the library matches the
+bindings (see <a href="../reference/abi.html#load-time-checks">Load-time checks</a>): the
+library must implement ABI revision 6, and it must export every
+declaration’s contract function, returning the hash the bindings were
+generated with. <code>index.js</code> embeds one row per declaration, error code, and
+callback method, each with its canonical signature:</p>
+<pre><code class="language-js">const $contract = [
+  ['kitchen_sink_contract_784cfd093415f2b5', 0xffcf2bd3b04aa002n, 'Gadget.new'], // constructor new(i64) -&gt; Gadget
+  // ...
+];
+$verify($m, 'kitchen_sink', 6, $contract);
+</code></pre>
+<p>If a check fails, the import throws an <code>Error</code> naming the declaration:
+<code>kvstore: Store.put is missing from the library</code> or <code>kvstore: Store.put changed since these bindings were generated</code>. Declarations the library has
+and the bindings don’t are fine, so a library that only adds to its API
+(declarations, error codes, callback methods) keeps working with older
+bindings. Since the import fails the same way when the library can’t be
+found, <code>await import(...)</code> in a <code>try</code> can fall back.</p>
+<h2 id="names"><a class="header" href="#names">Names</a></h2>
+<p>A library is one namespace, and every declaration is a named export of the
+package: classes for interfaces and errors, frozen objects for C-style
+enums, functions, and types for records, rich enums, and callback
+interfaces.</p>
+<pre><code class="language-js">import * as kitchen from 'kitchen_sink';
+
+const gadget = new kitchen.Gadget(1n);
+kitchen.optI32Id(null);
+</code></pre>
+<p>Functions, methods, and parameters are camelCase. A free function or
+parameter whose name is a JavaScript reserved word gains a trailing
+underscore (a function <code>delete</code> becomes <code>delete_</code>), and so does a free
+function named <code>init</code>, which the WebAssembly target exports, so the two
+APIs stay the same. Methods keep reserved words, which are legal property
+names (<code>store.delete(key)</code>), except that an instance method named <code>close</code> or
+<code>constructor</code>, and a static named <code>name</code>, <code>length</code>, <code>prototype</code>, or
+<code>caller</code>, gains one too
+(<a href="../reference/naming.html#identifiers-in-generated-code">reserved member names</a>).
+Record fields keep their IDL spelling. Doc comments in <code>index.d.ts</code> name
+declarations in this spelling too: an IDL doc or deprecation message that
+says <code>`new_op`</code> reads <code>`newOp`</code> there.</p>
+<p>Inside <code>index.js</code>, each declaration is bound under its public name plus <code>$</code>
+(<code>Gadget$</code>) and exported under the public name, so no declaration can
+shadow a global the generated code uses, such as <code>Map</code> or <code>TypeError</code>.</p>
+<h2 id="type-mapping"><a class="header" href="#type-mapping">Type mapping</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>IDL type</th><th>TypeScript type</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>i8</code>, <code>i16</code>, <code>i32</code>, <code>u8</code>, <code>u16</code>, <code>u32</code></td><td><code>number</code></td><td>A fractional, non-finite, or out-of-range argument throws a <code>RangeError</code>; nothing wraps</td></tr>
+<tr><td><code>i64</code>, <code>u64</code></td><td><code>bigint</code></td><td>Integral numbers in range are accepted as arguments; anything else throws a <code>RangeError</code></td></tr>
+<tr><td><code>f32</code>, <code>f64</code></td><td><code>number</code></td><td>NaN, the infinities, and <code>-0</code> round-trip; an <code>f32</code> argument rounds as <code>Float32Array</code> does</td></tr>
+<tr><td><code>bool</code></td><td><code>boolean</code></td><td></td></tr>
+<tr><td><code>string</code></td><td><code>string</code></td><td>UTF-8 in a run, so interior NULs survive</td></tr>
+<tr><td><code>bytes</code></td><td><code>Uint8Array</code></td><td></td></tr>
+<tr><td>record</td><td><code>interface</code></td><td>A plain object; fields keep their IDL names</td></tr>
+<tr><td>C-style enum</td><td><code>enum</code></td><td>A frozen object with forward and reverse mappings (negative values too)</td></tr>
+<tr><td>rich enum</td><td>tagged union</td><td><code>{ tag: 'Circle', radius: 2.5 }</code></td></tr>
+<tr><td>interface</td><td><code>class</code></td><td>See <a href="#objects-and-lifetime">Objects and lifetime</a></td></tr>
+<tr><td>callback interface</td><td><code>interface</code></td><td>Any object with the methods; see <a href="#callback-interfaces">Callback interfaces</a></td></tr>
+<tr><td><code>T?</code></td><td><code>T | null</code></td><td><code>undefined</code> is accepted as <code>null</code>. An optional scalar or C-style enum crosses directly as a <code>{prefix}_opt_*</code> struct, with no buffer</td></tr>
+<tr><td><code>[T]</code></td><td><code>T[]</code></td><td>A list of <code>i8</code>, <code>i16</code>, <code>i32</code>, <code>i64</code>, <code>u16</code>, <code>u32</code>, <code>u64</code>, <code>f32</code>, or <code>f64</code> crosses as a typed array: an argument may be an array (checked element by element) or the matching typed array (<code>Float64Array</code> for <code>[f64]</code>, passed as is), and a result is a plain array</td></tr>
+<tr><td><code>{K: V}</code></td><td><code>Record&lt;string, V&gt;</code></td><td><code>Record&lt;number, V&gt;</code> for integer keys of 32 bits or fewer, <code>Partial&lt;Record&lt;E, V&gt;&gt;</code> for C-style enum keys; keys are property names (strings) at run time, and a <code>Map</code> is accepted as an argument</td></tr>
+<tr><td><code>iter&lt;T&gt;</code></td><td><code>NativeIterator&lt;T&gt;</code></td><td>Lazy; an <code>IterableIterator&lt;T&gt;</code> with <code>close()</code> and <code>[Symbol.dispose]()</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Arguments are checked before the native call: a value of the wrong type
+throws a <code>TypeError</code>, and an integer that is fractional or out of its type’s
+range a <code>RangeError</code>, whether it’s an argument, an element of a list, a
+field of a record, or a callback’s return value.</p>
+<p>Value buffers are encoded and decoded by one function per type: each record
+and rich enum (<code>$w$Entry</code>, <code>$r$Entry</code>), each interface carried as an object
+token, and each distinct optional, list, and map type in the API, named by
+its canonical stem (<code>$w_list_opt_Entry</code> writes <code>[Entry?]</code>). Call sites name
+these functions.</p>
+<h2 id="how-values-cross"><a class="header" href="#how-values-cross">How values cross</a></h2>
+<p><code>index.js</code> lists the C signature of every function it calls (<code>$sigs</code>), one
+slot kind per C value: a scalar (<code>i32</code>, <code>bool</code>, …), an optional scalar
+(<code>opt_i64</code>), a run (<code>run</code>), a pointer (<code>ptr</code>), a callback-interface argument
+(<code>cb</code>), and the slots the transport fills in itself (the error slot <code>err</code>,
+an iterator’s item slot <code>out:&lt;kind&gt;</code>, and an async launcher’s completion
+<code>done:&lt;kind&gt;</code> and context <code>ctx</code>):</p>
+<pre><code class="language-js">const $sigs = {
+  kitchen_sink_opt_mixed: ['opt_u16', ['f64', 'opt_f32', 'opt_i64', 'run', 'err']],
+  kitchen_sink_do_cancellable: ['void', ['run', 'ptr', 'done:run', 'ctx']],
+  kitchen_sink_StreamItemsIterator_next: ['i32', ['ptr', 'out:run', 'err']],
+  // ...
+};
+</code></pre>
+<p><code>native.js</code> declares the C structs (<code>{prefix}_run</code>, the <code>{prefix}_opt_*</code>
+structs, <code>{prefix}_error</code>, and the callback-interface argument) with koffi’s
+type syntax and binds each function by value, exactly as the header declares
+it. A bound function takes and returns one JavaScript value per C value: a
+<code>Uint8Array</code> for a run (lent for a parameter, and a copy for a return, whose
+run it then releases with <code>{prefix}_run_free</code>), the value or <code>null</code> for an
+optional scalar, a <code>bigint</code> handle or <code>null</code> for an object. After a
+synchronous call it reads the error slot, and on a failure it clears the
+slot and throws. The generated API above it does the rest: it encodes
+strings as UTF-8, checks and copies typed arrays, encodes and decodes
+buffers, and lends, adopts, and clones objects.</p>
+<pre><code class="language-js">  poke(times) {
+    const $self = $lend(this, Gadget$);
+    try {
+      const $a0 = $check.I32(times, 'times');
+      return $f.kitchen_sink_Gadget_poke($self, $a0);
+    } catch ($e) {
+      throw $from$KitchenErrors($e);
+    } finally {
+      $unlend(this);
+    }
+  }
+</code></pre>
+<p>A typed-array argument is lent to the library in place: its elements are
+aligned for their type, since a typed array’s offset is always a multiple of
+its element size.</p>
+<h2 id="objects-and-lifetime"><a class="header" href="#objects-and-lifetime">Objects and lifetime</a></h2>
+<p>An interface is a class whose instances each own one strong reference to the
+native object. <code>close()</code> releases it, and so does <code>[Symbol.dispose]()</code> (for
+<code>using</code> declarations); both are idempotent, and a wrapper that is garbage
+collected unclosed is released by a <code>FinalizationRegistry</code>. Every call lends
+the wrapper to the native side for its duration, so a <code>close()</code> that races
+the call (from a callback, or while an async method is pending) waits for it
+to return. Using a closed wrapper throws a code -3 error.</p>
+<p>The synchronous constructor named <code>new</code> is the class constructor; other
+constructors are static factories, and a class without one can’t be
+constructed directly. Objects returned, awaited, iterated, decoded from a
+record, or passed to a callback method are new wrappers the receiver owns.
+Two wrappers may share one native object.</p>
+<h2 id="errors"><a class="header" href="#errors">Errors</a></h2>
+<p>Every error extends the package’s root class, named after the package
+(here <code>KitchenSinkError</code>), which carries the ABI <code>code</code>. When the package’s
+own name is also a declaration’s (the <code>codec</code> sample’s error domain is
+<code>CodecError</code>), the root class adds <code>Library</code> (<code>CodecLibraryError</code>).</p>
+<ul>
+<li>Each error domain is a class, named by the shared rule (a domain
+<code>KitchenErrors</code> is <code>KitchenError</code>, <code>KvError</code> stays <code>KvError</code>, and
+<code>Failure</code> becomes <code>FailureError</code>), and each of its codes a subclass
+(<code>NotFoundError</code>) with a static <code>CODE</code> and the IDL message as its default
+message. Codes of different domains may share a value. Payload fields
+become properties. A code without fields is constructed as
+<code>new InvalidPathError(message?)</code>; a code with fields takes them first:
+<code>new RejectedError({ key, reason }, message?)</code>. A code whose class would
+take a name another export has gains its domain’s name first.</li>
+<li>A function declared <code>throws: SomeDomain</code> fails with that domain’s classes.
+Domains are open: a positive code the bindings don’t know (the library
+added it later) is an instance of the domain class itself, with its
+<code>code</code> and message.</li>
+<li>A function declared <code>throws: any</code> fails with the root class, code -1, and
+the library’s message.</li>
+<li>A cancelled call rejects with <code>CancelledError</code> (code -5).</li>
+<li>Other runtime failures throw the root class itself: -2 producer panic, -3
+marshalling failure, -4 a callback implementation failed.</li>
+</ul>
+<p>A failure of a function that doesn’t declare <code>throws</code> is a producer bug, and
+the binding throws the root class with the code and the producer’s message
+(see <a href="../guides/errors-and-memory.html#the-trap-policy">the trap policy</a>).</p>
+<h2 id="async-and-cancellation"><a class="header" href="#async-and-cancellation">Async and cancellation</a></h2>
+<p>An async function returns a <code>Promise</code>. Its completion is a JavaScript
+function koffi registered once per result type, and it may arrive on any
+producer thread; koffi runs it on the JavaScript thread, and it settles the
+promise. While any call is pending, the transport keeps the event loop
+alive, so a script that awaits nothing else still waits for it. A
+cancellable function takes an optional last argument with an <code>AbortSignal</code>:</p>
+<pre><code class="language-ts">export declare function doCancellable(input: string, options?: { signal?: AbortSignal }): Promise&lt;string&gt;;
+</code></pre>
+<p>Aborting the signal cancels the native token, and the call rejects with
+<code>CancelledError</code>. An already-aborted signal cancels the call before it
+starts.</p>
+<h2 id="callback-interfaces"><a class="header" href="#callback-interfaces">Callback interfaces</a></h2>
+<p>Any object with the interface’s methods implements it; the methods are
+camelCase. Arguments arrive converted: strings and bytes as <code>string</code> and
+<code>Uint8Array</code>, records decoded, and objects as new wrappers the
+implementation owns (close them, or let the garbage collector release
+them). A parameter of an optional callback interface (<code>Cb?</code>) takes <code>null</code>
+for none.</p>
+<p>An implementation crosses as the <code>{prefix}_{Cb}</code> struct: a context, an
+integer the package maps back to the implementation, and the interface’s
+static vtable. The vtable is built once per interface, the first time an
+implementation is passed, from JavaScript functions registered with koffi
+(<code>free</code> first, then one per method); it lives as long as the process, so the
+number of registered callbacks stays small however many implementations are
+live. The library’s call to <code>free</code> releases the implementation.</p>
+<p>A method’s return value is checked and handed to the library in its family’s
+form:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>IDL return</th><th>Return from JavaScript</th><th>What the library receives</th></tr>
+</thead>
+<tbody>
+<tr><td>direct (numbers, <code>bool</code>, C-style enums)</td><td>the value</td><td>the value (integers range-checked)</td></tr>
+<tr><td>optional scalar (<code>i32?</code>, <code>Mode?</code>, …)</td><td>the value, or <code>null</code></td><td>a <code>{prefix}_opt_*</code> struct</td></tr>
+<tr><td>numeric list (<code>[f64]</code>, …)</td><td>an array or the matching typed array</td><td>a copy in a run from <code>{prefix}_alloc</code>, which the library adopts</td></tr>
+<tr><td><code>string</code>, <code>bytes</code></td><td>a <code>string</code>, a <code>Uint8Array</code></td><td>a copy in a run the library adopts</td></tr>
+<tr><td>record, rich enum, other <code>T?</code>, <code>[T]</code>, <code>{K:V}</code></td><td>the value</td><td>its encoding, in a run the library adopts</td></tr>
+<tr><td><code>I</code></td><td>a wrapper (never <code>null</code>)</td><td>a new strong reference to its object</td></tr>
+<tr><td><code>I?</code></td><td>a wrapper or <code>null</code></td><td>a new strong reference, or null</td></tr>
+</tbody>
+</table>
+</div>
+<p>Nothing unwinds through native code; how a failure reaches the library
+follows the method’s <code>throws</code>:</p>
+<ul>
+<li>A method declared <code>throws: SomeDomain</code> may throw one of that domain’s
+errors, and the library receives its code and fields. (A Rust producer
+re-renders the message from the fields.) Any other exception is reported
+as code -1 with its message.</li>
+<li>A method declared <code>throws: any</code> reports any exception as code -1 with its
+message.</li>
+<li>A method that doesn’t declare <code>throws</code> reports an exception, or a return
+value of the wrong type, as code -4 with its message.</li>
+</ul>
+<pre><code class="language-js">const policy = {
+  ttlFor(key, requested) {
+    return key.startsWith('tmp/') ? 60n : requested;
+  },
+  admit(entry) {
+    if (entry.key.startsWith('secret')) {
+      throw new RejectedError({ key: entry.key, reason: 'no secrets' });
+    }
+    return { ...entry, tags: ['admitted'] };
+  },
+  route(key, home) {
+    return home;
+  },
+};
+store.setPolicy(policy);
+</code></pre>
+<h3 id="threading"><a class="header" href="#threading">Threading</a></h3>
+<p>The producer may call back from any thread, and every JavaScript call runs
+on the JavaScript thread:</p>
+<ul>
+<li>A call made on the JavaScript thread (because the JavaScript thread is
+inside a call into the library) runs directly, nested inside that call.</li>
+<li>A call made on any other thread is queued by koffi for the JavaScript
+thread and runs from its event loop, while the producer thread waits for
+it to return. Nothing runs while the JavaScript thread is busy, so such
+calls are delivered only once the current JavaScript task returns to the
+event loop.</li>
+<li>The library’s release of an implementation (its vtable’s <code>free</code>) may come
+from any thread and follows the same rules.</li>
+</ul>
+<p>The waiting in the second rule can deadlock: if the JavaScript thread is
+inside a synchronous call into the library that itself waits for the thread
+making the callback (joins it, or waits on a lock it holds), neither thread
+can proceed. So:</p>
+<ul>
+<li>Make calls that wait for callbacks from other threads <code>async</code>, or have
+the producer call back on the calling thread.</li>
+<li>Return to the event loop regularly while callbacks from other threads are
+expected: a long-running JavaScript task delays them.</li>
+</ul>
+<h2 id="iterators"><a class="header" href="#iterators">Iterators</a></h2>
+<p>An <code>iter&lt;T&gt;</code> result is a lazy <code>NativeIterator&lt;T&gt;</code>: each <code>next()</code> makes one
+native call. The native iterator is destroyed when it’s exhausted, when it
+fails, on <code>return()</code> (which <code>for...of</code> calls on <code>break</code>), on <code>close()</code> or a
+<code>using</code> declaration, or when the iterator is garbage collected.</p>
+<pre><code class="language-ts">using chunks = kitchen.streamChunks();
+const first = chunks.next(); // released when the block exits
+</code></pre>
+<h2 id="packaging"><a class="header" href="#packaging">Packaging</a></h2>
+<p><code>weaveffi package</code> writes npm tarballs in the esbuild-style layout: one
+<code>{package}-{os}-{cpu}</code> package per desktop platform, gated by npm <code>os</code> and
+<code>cpu</code> and carrying only that platform’s library, plus the main package,
+which lists them in <code>optionalDependencies</code>. <code>npm install</code> then fetches the
+main package, koffi, and the one platform package that matches, and the
+import loads the library from it. See <a href="../guides/packaging.html">Packaging</a>.</p>
+<h2 id="leak-counters"><a class="header" href="#leak-counters">Leak counters</a></h2>
+<p>The package’s <code>./debug</code> export reads the library’s live-resource counters,
+for tests of code that uses the bindings. It isn’t part of the API:</p>
+<pre><code class="language-js">import { debugLive } from 'kvstore/debug';
+
+debugLive(0); // live objects, as a bigint (1 callbacks, 2 iterators, 3 cancel tokens, 4 runs)
+</code></pre>
+<p>Kind -1 is <code>1n</code> when the library counts at all (built with <code>weaveffi</code>’s
+<code>leak-check</code> feature); otherwise every counter is <code>0n</code>.</p>
+<h2 id="known-limitations"><a class="header" href="#known-limitations">Known limitations</a></h2>
+<ul>
+<li>A callback from another thread waits for the JavaScript thread, so a
+synchronous call that waits for that callback’s thread deadlocks (see
+<a href="#threading">Threading</a>).</li>
+<li>A callback implementation that holds a wrapper of the object retaining it
+forms a cycle the garbage collector can’t see; close the wrapper or
+release the callback explicitly.</li>
+<li>The package runs on the platforms koffi supports, which ships prebuilt
+binaries for the desktop and server platforms Node.js runs on.</li>
+<li>A numeric list result is copied into a plain array. As an argument, the
+matching typed array is lent to the library without a copy, while a plain
+array is checked and copied first.</li>
+<li>The package is ESM only, and its declarations need TypeScript 5.2 or
+later (for <code>Symbol.dispose</code>).</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../generators/kotlin.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../generators/wasm.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../generators/kotlin.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../generators/wasm.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

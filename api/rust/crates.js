@@ -1,0 +1,2 @@
+window.ALL_CRATES = ["calculator","codec","kvstore","producer_fixture","weaveffi","weaveffi_cli","weaveffi_fuzz","weaveffi_macros","weaveffi_model","xtask"];
+//{"start":21,"fragment_lengths":[12,8,10,19,11,15,16,18,17,8]}

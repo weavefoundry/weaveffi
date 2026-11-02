@@ -1,0 +1,194 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `crates/weaveffi-cli/src/targets/dotnet/codec.rs`."><title>codec.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../../static.files/rustdoc-0c87338a.css"><meta name="rustdoc-vars" data-root-path="../../../../" data-static-root-path="../../../../static.files/" data-current-crate="weaveffi_cli" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.1 (58cf8f9c3 2026-10-13)" data-channel="1.99.1" data-search-js="search-cf4fc35e.js" data-stringdex-js="stringdex-b5109af9.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../../static.files/storage-41dd4d93.js"></script><script defer src="../../../../static.files/src-script-813739b1.js"></script><script defer src="../../../../src-files.js"></script><script defer src="../../../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../../../static.files/noscript-9f56287d.css"></noscript><link rel="alternate icon" type="image/png" href="../../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">weaveffi_cli/targets/dotnet/</div>codec.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="doccomment">//! Value-buffer codec and value equality expressions.
+<a href=#2 id=2 data-nosnippet>2</a>//!
+<a href=#3 id=3 data-nosnippet>3</a>//! Nothing here is monomorphized per composite type: optionals, lists, and
+<a href=#4 id=4 data-nosnippet>4</a>//! maps go through the runtime's generic `FfiBufferWriter.WriteList` /
+<a href=#5 id=5 data-nosnippet>5</a>//! `FfiBufferReader.ReadList` (and friends), handed a `static` lambda for
+<a href=#6 id=6 data-nosnippet>6</a>//! the element, so `[{string:[i32]}]` is three nested calls rather than a
+<a href=#7 id=7 data-nosnippet>7</a>//! generated method per shape. Records and rich enums carry their own
+<a href=#8 id=8 data-nosnippet>8</a>//! `WriteTo`/`ReadFrom` pair. An object token carries one strong reference:
+<a href=#9 id=9 data-nosnippet>9</a>//! writing one clones the wrapper's handle, and reading one adopts the
+<a href=#10 id=10 data-nosnippet>10</a>//! pointer into a new wrapper.
+<a href=#11 id=11 data-nosnippet>11</a>
+<a href=#12 id=12 data-nosnippet>12</a></span><span class="kw">use </span>weaveffi_model::ty::{Prim, Ty};
+<a href=#13 id=13 data-nosnippet>13</a>
+<a href=#14 id=14 data-nosnippet>14</a><span class="kw">use </span><span class="kw">crate</span>::targets::dotnet::types::{cs_type, is_value_type, Cx};
+<a href=#15 id=15 data-nosnippet>15</a>
+<a href=#16 id=16 data-nosnippet>16</a><span class="doccomment">/// The C# expression (a `void` call) writing `value`, the surface value of
+<a href=#17 id=17 data-nosnippet>17</a>/// `ty`, into the writer `writer`. `depth` numbers the lambda parameters of
+<a href=#18 id=18 data-nosnippet>18</a>/// nested composites so they never shadow each other.
+<a href=#19 id=19 data-nosnippet>19</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>write_call(ty: <span class="kw-2">&amp;</span>Ty, writer: <span class="kw-2">&amp;</span>str, value: <span class="kw-2">&amp;</span>str, depth: usize) -&gt; String {
+<a href=#20 id=20 data-nosnippet>20</a>    <span class="kw">match </span>ty {
+<a href=#21 id=21 data-nosnippet>21</a>        Ty::Prim(p) =&gt; <span class="macro">format!</span>(<span class="string">"{writer}.Write{}({value})"</span>, p.pascal()),
+<a href=#22 id=22 data-nosnippet>22</a>        Ty::Enum(<span class="kw">_</span>) =&gt; <span class="macro">format!</span>(<span class="string">"{writer}.WriteI32((int){value})"</span>),
+<a href=#23 id=23 data-nosnippet>23</a>        Ty::Interface(<span class="kw">_</span>) =&gt; <span class="macro">format!</span>(<span class="string">"{writer}.WriteObject({value}.CloneHandle())"</span>),
+<a href=#24 id=24 data-nosnippet>24</a>        Ty::Record(<span class="kw">_</span>) | Ty::RichEnum(<span class="kw">_</span>) =&gt; <span class="macro">format!</span>(<span class="string">"{value}.WriteTo({writer})"</span>),
+<a href=#25 id=25 data-nosnippet>25</a>        Ty::Optional(inner) =&gt; {
+<a href=#26 id=26 data-nosnippet>26</a>            <span class="kw">let </span>method = <span class="kw">if </span>is_value_type(inner) {
+<a href=#27 id=27 data-nosnippet>27</a>                <span class="string">"WriteOptionalValue"
+<a href=#28 id=28 data-nosnippet>28</a>            </span>} <span class="kw">else </span>{
+<a href=#29 id=29 data-nosnippet>29</a>                <span class="string">"WriteOptional"
+<a href=#30 id=30 data-nosnippet>30</a>            </span>};
+<a href=#31 id=31 data-nosnippet>31</a>            <span class="macro">format!</span>(<span class="string">"{writer}.{method}({value}, {})"</span>, write_lambda(inner, depth))
+<a href=#32 id=32 data-nosnippet>32</a>        }
+<a href=#33 id=33 data-nosnippet>33</a>        Ty::List(inner) =&gt; <span class="macro">format!</span>(
+<a href=#34 id=34 data-nosnippet>34</a>            <span class="string">"{writer}.WriteList({value}, {})"</span>,
+<a href=#35 id=35 data-nosnippet>35</a>            write_lambda(inner, depth)
+<a href=#36 id=36 data-nosnippet>36</a>        ),
+<a href=#37 id=37 data-nosnippet>37</a>        Ty::Map(k, v) =&gt; <span class="macro">format!</span>(
+<a href=#38 id=38 data-nosnippet>38</a>            <span class="string">"{writer}.WriteMap({value}, {}, {})"</span>,
+<a href=#39 id=39 data-nosnippet>39</a>            write_lambda(k, depth),
+<a href=#40 id=40 data-nosnippet>40</a>            write_lambda(v, depth)
+<a href=#41 id=41 data-nosnippet>41</a>        ),
+<a href=#42 id=42 data-nosnippet>42</a>    }
+<a href=#43 id=43 data-nosnippet>43</a>}
+<a href=#44 id=44 data-nosnippet>44</a>
+<a href=#45 id=45 data-nosnippet>45</a><span class="doccomment">/// A `static` lambda writing one value of `ty`: the element writer handed to
+<a href=#46 id=46 data-nosnippet>46</a>/// the runtime's generic composite methods.
+<a href=#47 id=47 data-nosnippet>47</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>write_lambda(ty: <span class="kw-2">&amp;</span>Ty, depth: usize) -&gt; String {
+<a href=#48 id=48 data-nosnippet>48</a>    <span class="kw">let </span>(w, v) = (<span class="macro">format!</span>(<span class="string">"w{depth}"</span>), <span class="macro">format!</span>(<span class="string">"v{depth}"</span>));
+<a href=#49 id=49 data-nosnippet>49</a>    <span class="macro">format!</span>(<span class="string">"static ({w}, {v}) =&gt; {}"</span>, write_call(ty, <span class="kw-2">&amp;</span>w, <span class="kw-2">&amp;</span>v, depth + <span class="number">1</span>))
+<a href=#50 id=50 data-nosnippet>50</a>}
+<a href=#51 id=51 data-nosnippet>51</a>
+<a href=#52 id=52 data-nosnippet>52</a><span class="doccomment">/// The C# expression reading a value of `ty` from the reader `reader`; the
+<a href=#53 id=53 data-nosnippet>53</a>/// inverse of [`write_call`]. An object token is adopted into a new
+<a href=#54 id=54 data-nosnippet>54</a>/// wrapper, which owes the reference's release.
+<a href=#55 id=55 data-nosnippet>55</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>read_expr(cx: Cx&lt;<span class="lifetime">'_</span>&gt;, ty: <span class="kw-2">&amp;</span>Ty, reader: <span class="kw-2">&amp;</span>str, depth: usize) -&gt; String {
+<a href=#56 id=56 data-nosnippet>56</a>    <span class="kw">match </span>ty {
+<a href=#57 id=57 data-nosnippet>57</a>        Ty::Prim(p) =&gt; <span class="macro">format!</span>(<span class="string">"{reader}.Read{}()"</span>, p.pascal()),
+<a href=#58 id=58 data-nosnippet>58</a>        Ty::Enum(name) =&gt; <span class="macro">format!</span>(<span class="string">"({}){reader}.ReadI32()"</span>, cx.ty(name)),
+<a href=#59 id=59 data-nosnippet>59</a>        Ty::Interface(name) =&gt; <span class="macro">format!</span>(<span class="string">"{}.Adopt({reader}.ReadObject())"</span>, cx.ty(name)),
+<a href=#60 id=60 data-nosnippet>60</a>        Ty::Record(name) | Ty::RichEnum(name) =&gt; <span class="macro">format!</span>(<span class="string">"{}.ReadFrom({reader})"</span>, cx.ty(name)),
+<a href=#61 id=61 data-nosnippet>61</a>        Ty::Optional(inner) =&gt; {
+<a href=#62 id=62 data-nosnippet>62</a>            <span class="kw">let </span>method = <span class="kw">if </span>is_value_type(inner) {
+<a href=#63 id=63 data-nosnippet>63</a>                <span class="string">"ReadOptionalValue"
+<a href=#64 id=64 data-nosnippet>64</a>            </span>} <span class="kw">else </span>{
+<a href=#65 id=65 data-nosnippet>65</a>                <span class="string">"ReadOptional"
+<a href=#66 id=66 data-nosnippet>66</a>            </span>};
+<a href=#67 id=67 data-nosnippet>67</a>            <span class="macro">format!</span>(<span class="string">"{reader}.{method}({})"</span>, read_lambda(cx, inner, depth))
+<a href=#68 id=68 data-nosnippet>68</a>        }
+<a href=#69 id=69 data-nosnippet>69</a>        Ty::List(inner) =&gt; <span class="macro">format!</span>(<span class="string">"{reader}.ReadList({})"</span>, read_lambda(cx, inner, depth)),
+<a href=#70 id=70 data-nosnippet>70</a>        <span class="comment">// A dictionary isn't covariant in its value type, so the reader
+<a href=#71 id=71 data-nosnippet>71</a>        // builds it with the surface types spelled out.
+<a href=#72 id=72 data-nosnippet>72</a>        </span>Ty::Map(k, v) =&gt; <span class="macro">format!</span>(
+<a href=#73 id=73 data-nosnippet>73</a>            <span class="string">"{reader}.ReadMap&lt;{}, {}&gt;({}, {})"</span>,
+<a href=#74 id=74 data-nosnippet>74</a>            cs_type(k),
+<a href=#75 id=75 data-nosnippet>75</a>            cs_type(v),
+<a href=#76 id=76 data-nosnippet>76</a>            read_lambda(cx, k, depth),
+<a href=#77 id=77 data-nosnippet>77</a>            read_lambda(cx, v, depth)
+<a href=#78 id=78 data-nosnippet>78</a>        ),
+<a href=#79 id=79 data-nosnippet>79</a>    }
+<a href=#80 id=80 data-nosnippet>80</a>}
+<a href=#81 id=81 data-nosnippet>81</a>
+<a href=#82 id=82 data-nosnippet>82</a><span class="doccomment">/// A `static` lambda reading one value of `ty`.
+<a href=#83 id=83 data-nosnippet>83</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>read_lambda(cx: Cx&lt;<span class="lifetime">'_</span>&gt;, ty: <span class="kw-2">&amp;</span>Ty, depth: usize) -&gt; String {
+<a href=#84 id=84 data-nosnippet>84</a>    <span class="kw">let </span>r = <span class="macro">format!</span>(<span class="string">"r{depth}"</span>);
+<a href=#85 id=85 data-nosnippet>85</a>    <span class="macro">format!</span>(<span class="string">"static {r} =&gt; {}"</span>, read_expr(cx, ty, <span class="kw-2">&amp;</span>r, depth + <span class="number">1</span>))
+<a href=#86 id=86 data-nosnippet>86</a>}
+<a href=#87 id=87 data-nosnippet>87</a>
+<a href=#88 id=88 data-nosnippet>88</a><span class="doccomment">/// True when the surface type of `ty` compares by reference in C# (a byte
+<a href=#89 id=89 data-nosnippet>89</a>/// array, a list, or a map, possibly optional), so a record's value
+<a href=#90 id=90 data-nosnippet>90</a>/// equality has to compare its contents explicitly.
+<a href=#91 id=91 data-nosnippet>91</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>needs_deep_equality(ty: <span class="kw-2">&amp;</span>Ty) -&gt; bool {
+<a href=#92 id=92 data-nosnippet>92</a>    <span class="kw">match </span>ty {
+<a href=#93 id=93 data-nosnippet>93</a>        Ty::Prim(Prim::Bytes) | Ty::List(<span class="kw">_</span>) | Ty::Map(..) =&gt; <span class="bool-val">true</span>,
+<a href=#94 id=94 data-nosnippet>94</a>        Ty::Optional(inner) =&gt; needs_deep_equality(inner),
+<a href=#95 id=95 data-nosnippet>95</a>        <span class="kw">_ </span>=&gt; <span class="bool-val">false</span>,
+<a href=#96 id=96 data-nosnippet>96</a>    }
+<a href=#97 id=97 data-nosnippet>97</a>}
+<a href=#98 id=98 data-nosnippet>98</a>
+<a href=#99 id=99 data-nosnippet>99</a><span class="doccomment">/// The C# expression comparing two values of `ty` by value: contents for
+<a href=#100 id=100 data-nosnippet>100</a>/// byte arrays, lists, and maps, default equality for everything else.
+<a href=#101 id=101 data-nosnippet>101</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>equal_expr(ty: <span class="kw-2">&amp;</span>Ty, a: <span class="kw-2">&amp;</span>str, b: <span class="kw-2">&amp;</span>str, depth: usize) -&gt; String {
+<a href=#102 id=102 data-nosnippet>102</a>    <span class="kw">match </span>ty {
+<a href=#103 id=103 data-nosnippet>103</a>        Ty::Prim(Prim::Bytes) =&gt; <span class="macro">format!</span>(<span class="string">"FfiEquality.Bytes({a}, {b})"</span>),
+<a href=#104 id=104 data-nosnippet>104</a>        Ty::Optional(inner) <span class="kw">if </span>needs_deep_equality(inner) =&gt; equal_expr(inner, a, b, depth),
+<a href=#105 id=105 data-nosnippet>105</a>        Ty::List(inner) =&gt; <span class="kw">match </span>equal_lambda(inner, depth) {
+<a href=#106 id=106 data-nosnippet>106</a>            <span class="prelude-val">Some</span>(eq) =&gt; <span class="macro">format!</span>(<span class="string">"FfiEquality.Lists({a}, {b}, {eq})"</span>),
+<a href=#107 id=107 data-nosnippet>107</a>            <span class="prelude-val">None </span>=&gt; <span class="macro">format!</span>(<span class="string">"FfiEquality.Lists({a}, {b})"</span>),
+<a href=#108 id=108 data-nosnippet>108</a>        },
+<a href=#109 id=109 data-nosnippet>109</a>        Ty::Map(<span class="kw">_</span>, v) =&gt; <span class="kw">match </span>equal_lambda(v, depth) {
+<a href=#110 id=110 data-nosnippet>110</a>            <span class="prelude-val">Some</span>(eq) =&gt; <span class="macro">format!</span>(<span class="string">"FfiEquality.Maps({a}, {b}, {eq})"</span>),
+<a href=#111 id=111 data-nosnippet>111</a>            <span class="prelude-val">None </span>=&gt; <span class="macro">format!</span>(<span class="string">"FfiEquality.Maps({a}, {b})"</span>),
+<a href=#112 id=112 data-nosnippet>112</a>        },
+<a href=#113 id=113 data-nosnippet>113</a>        <span class="kw">_ </span>=&gt; <span class="macro">format!</span>(<span class="string">"FfiEquality.Equal({a}, {b})"</span>),
+<a href=#114 id=114 data-nosnippet>114</a>    }
+<a href=#115 id=115 data-nosnippet>115</a>}
+<a href=#116 id=116 data-nosnippet>116</a>
+<a href=#117 id=117 data-nosnippet>117</a><span class="doccomment">/// The element comparer of a collection whose elements need content
+<a href=#118 id=118 data-nosnippet>118</a>/// equality, or `None` when default equality does.
+<a href=#119 id=119 data-nosnippet>119</a></span><span class="kw">fn </span>equal_lambda(ty: <span class="kw-2">&amp;</span>Ty, depth: usize) -&gt; <span class="prelude-ty">Option</span>&lt;String&gt; {
+<a href=#120 id=120 data-nosnippet>120</a>    needs_deep_equality(ty).then(|| {
+<a href=#121 id=121 data-nosnippet>121</a>        <span class="kw">let </span>(x, y) = (<span class="macro">format!</span>(<span class="string">"x{depth}"</span>), <span class="macro">format!</span>(<span class="string">"y{depth}"</span>));
+<a href=#122 id=122 data-nosnippet>122</a>        <span class="macro">format!</span>(<span class="string">"static ({x}, {y}) =&gt; {}"</span>, equal_expr(ty, <span class="kw-2">&amp;</span>x, <span class="kw-2">&amp;</span>y, depth + <span class="number">1</span>))
+<a href=#123 id=123 data-nosnippet>123</a>    })
+<a href=#124 id=124 data-nosnippet>124</a>}
+<a href=#125 id=125 data-nosnippet>125</a>
+<a href=#126 id=126 data-nosnippet>126</a><span class="doccomment">/// The C# expression a record's `GetHashCode` adds for one field: the value
+<a href=#127 id=127 data-nosnippet>127</a>/// itself, or a hash consistent with [`equal_expr`] for collections.
+<a href=#128 id=128 data-nosnippet>128</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>hash_expr(ty: <span class="kw-2">&amp;</span>Ty, value: <span class="kw-2">&amp;</span>str) -&gt; String {
+<a href=#129 id=129 data-nosnippet>129</a>    <span class="kw">match </span>ty {
+<a href=#130 id=130 data-nosnippet>130</a>        Ty::Prim(Prim::Bytes) =&gt; <span class="macro">format!</span>(<span class="string">"FfiEquality.BytesHash({value})"</span>),
+<a href=#131 id=131 data-nosnippet>131</a>        Ty::List(<span class="kw">_</span>) =&gt; <span class="macro">format!</span>(<span class="string">"FfiEquality.ListHash({value})"</span>),
+<a href=#132 id=132 data-nosnippet>132</a>        Ty::Map(..) =&gt; <span class="macro">format!</span>(<span class="string">"FfiEquality.MapHash({value})"</span>),
+<a href=#133 id=133 data-nosnippet>133</a>        Ty::Optional(inner) <span class="kw">if </span>needs_deep_equality(inner) =&gt; hash_expr(inner, value),
+<a href=#134 id=134 data-nosnippet>134</a>        <span class="kw">_ </span>=&gt; value.to_string(),
+<a href=#135 id=135 data-nosnippet>135</a>    }
+<a href=#136 id=136 data-nosnippet>136</a>}
+<a href=#137 id=137 data-nosnippet>137</a>
+<a href=#138 id=138 data-nosnippet>138</a><span class="attr">#[cfg(test)]
+<a href=#139 id=139 data-nosnippet>139</a></span><span class="kw">mod </span>tests {
+<a href=#140 id=140 data-nosnippet>140</a>    <span class="kw">use super</span>::<span class="kw-2">*</span>;
+<a href=#141 id=141 data-nosnippet>141</a>
+<a href=#142 id=142 data-nosnippet>142</a>    <span class="kw">fn </span>list(t: Ty) -&gt; Ty {
+<a href=#143 id=143 data-nosnippet>143</a>        Ty::List(Box::new(t))
+<a href=#144 id=144 data-nosnippet>144</a>    }
+<a href=#145 id=145 data-nosnippet>145</a>
+<a href=#146 id=146 data-nosnippet>146</a>    <span class="attr">#[test]
+<a href=#147 id=147 data-nosnippet>147</a>    </span><span class="kw">fn </span>nested_composites_are_nested_generic_calls() {
+<a href=#148 id=148 data-nosnippet>148</a>        <span class="kw">let </span>cx = Cx {
+<a href=#149 id=149 data-nosnippet>149</a>            ns: <span class="string">"Kv"</span>,
+<a href=#150 id=150 data-nosnippet>150</a>            base: <span class="string">"NativeException"</span>,
+<a href=#151 id=151 data-nosnippet>151</a>            bug: <span class="string">"NativeBugException"</span>,
+<a href=#152 id=152 data-nosnippet>152</a>        };
+<a href=#153 id=153 data-nosnippet>153</a>        <span class="kw">let </span>ty = Ty::Map(
+<a href=#154 id=154 data-nosnippet>154</a>            Box::new(Ty::Prim(Prim::String)),
+<a href=#155 id=155 data-nosnippet>155</a>            Box::new(list(Ty::Optional(Box::new(Ty::Prim(Prim::I32))))),
+<a href=#156 id=156 data-nosnippet>156</a>        );
+<a href=#157 id=157 data-nosnippet>157</a>        <span class="macro">assert_eq!</span>(
+<a href=#158 id=158 data-nosnippet>158</a>            write_call(<span class="kw-2">&amp;</span>ty, <span class="string">"writer"</span>, <span class="string">"Value"</span>, <span class="number">0</span>),
+<a href=#159 id=159 data-nosnippet>159</a>            <span class="string">"writer.WriteMap(Value, static (w0, v0) =&gt; w0.WriteString(v0), \
+<a href=#160 id=160 data-nosnippet>160</a>             static (w0, v0) =&gt; w0.WriteList(v0, static (w1, v1) =&gt; \
+<a href=#161 id=161 data-nosnippet>161</a>             w1.WriteOptionalValue(v1, static (w2, v2) =&gt; w2.WriteI32(v2))))"
+<a href=#162 id=162 data-nosnippet>162</a>        </span>);
+<a href=#163 id=163 data-nosnippet>163</a>        <span class="macro">assert_eq!</span>(
+<a href=#164 id=164 data-nosnippet>164</a>            read_expr(cx, <span class="kw-2">&amp;</span>ty, <span class="string">"reader"</span>, <span class="number">0</span>),
+<a href=#165 id=165 data-nosnippet>165</a>            <span class="string">"reader.ReadMap&lt;string, IReadOnlyList&lt;int?&gt;&gt;(static r0 =&gt; r0.ReadString(), \
+<a href=#166 id=166 data-nosnippet>166</a>             static r0 =&gt; r0.ReadList(static r1 =&gt; r1.ReadOptionalValue(static r2 =&gt; r2.ReadI32())))"
+<a href=#167 id=167 data-nosnippet>167</a>        </span>);
+<a href=#168 id=168 data-nosnippet>168</a>    }
+<a href=#169 id=169 data-nosnippet>169</a>
+<a href=#170 id=170 data-nosnippet>170</a>    <span class="attr">#[test]
+<a href=#171 id=171 data-nosnippet>171</a>    </span><span class="kw">fn </span>equality_compares_collection_contents() {
+<a href=#172 id=172 data-nosnippet>172</a>        <span class="kw">let </span>bytes = Ty::Prim(Prim::Bytes);
+<a href=#173 id=173 data-nosnippet>173</a>        <span class="macro">assert_eq!</span>(
+<a href=#174 id=174 data-nosnippet>174</a>            equal_expr(<span class="kw-2">&amp;</span>list(bytes.clone()), <span class="string">"A"</span>, <span class="string">"o.A"</span>, <span class="number">0</span>),
+<a href=#175 id=175 data-nosnippet>175</a>            <span class="string">"FfiEquality.Lists(A, o.A, static (x0, y0) =&gt; FfiEquality.Bytes(x0, y0))"
+<a href=#176 id=176 data-nosnippet>176</a>        </span>);
+<a href=#177 id=177 data-nosnippet>177</a>        <span class="macro">assert_eq!</span>(
+<a href=#178 id=178 data-nosnippet>178</a>            equal_expr(<span class="kw-2">&amp;</span>list(Ty::Prim(Prim::I32)), <span class="string">"A"</span>, <span class="string">"o.A"</span>, <span class="number">0</span>),
+<a href=#179 id=179 data-nosnippet>179</a>            <span class="string">"FfiEquality.Lists(A, o.A)"
+<a href=#180 id=180 data-nosnippet>180</a>        </span>);
+<a href=#181 id=181 data-nosnippet>181</a>        <span class="macro">assert_eq!</span>(
+<a href=#182 id=182 data-nosnippet>182</a>            equal_expr(<span class="kw-2">&amp;</span>Ty::Prim(Prim::F64), <span class="string">"A"</span>, <span class="string">"o.A"</span>, <span class="number">0</span>),
+<a href=#183 id=183 data-nosnippet>183</a>            <span class="string">"FfiEquality.Equal(A, o.A)"
+<a href=#184 id=184 data-nosnippet>184</a>        </span>);
+<a href=#185 id=185 data-nosnippet>185</a>        <span class="macro">assert!</span>(!needs_deep_equality(<span class="kw-2">&amp;</span>Ty::Optional(Box::new(Ty::Prim(
+<a href=#186 id=186 data-nosnippet>186</a>            Prim::I64
+<a href=#187 id=187 data-nosnippet>187</a>        )))));
+<a href=#188 id=188 data-nosnippet>188</a>        <span class="macro">assert_eq!</span>(
+<a href=#189 id=189 data-nosnippet>189</a>            hash_expr(<span class="kw-2">&amp;</span>Ty::Optional(Box::new(bytes)), <span class="string">"B"</span>),
+<a href=#190 id=190 data-nosnippet>190</a>            <span class="string">"FfiEquality.BytesHash(B)"
+<a href=#191 id=191 data-nosnippet>191</a>        </span>);
+<a href=#192 id=192 data-nosnippet>192</a>    }
+<a href=#193 id=193 data-nosnippet>193</a>}
+</code></pre></div></section></main></body></html>

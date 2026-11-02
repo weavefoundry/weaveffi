@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["exception_type_name","pascal","type_name"]};

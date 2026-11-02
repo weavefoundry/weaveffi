@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ShopError","Size"],"fn":["buy","discount","price_of"],"mod":["promo","receipt","stock"],"struct":["Cart","Item"],"trait":["Watcher"],"type":["Price"]};
