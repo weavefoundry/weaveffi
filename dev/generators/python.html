@@ -1,0 +1,597 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Python - WeaveFFI (dev)</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-1339018f.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-e1100732.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">WeaveFFI (dev)</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/weavefoundry/weaveffi" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="python"><a class="header" href="#python">Python</a></h1>
+<p>The Python target produces a pip-installable package of pure-Python
+<code>ctypes</code> bindings over the C ABI (revision 6). There’s no compilation step,
+no native extension, and no third-party runtime dependency; the package
+works on any Python 3.10+ interpreter that can load the producer library.
+The implementation module is fully annotated and the package ships
+<code>py.typed</code>, so type checkers read the bindings themselves (there’s no
+separate stub to drift out of date), and the generated code is written to
+pass <code>mypy --strict</code>.</p>
+<p>Every value crosses the boundary as one C value. Records and rich enums
+are frozen dataclasses that cross as value buffers. Interfaces are
+reference-counted wrapper classes with a context manager. Error domains
+are exception classes. Callback interfaces are abstract base classes the
+consumer subclasses. Async functions are coroutines whose cancellation
+cancels the native call, and <code>iter&lt;T&gt;</code> returns are lazy
+<code>NativeIterator[T]</code> objects.</p>
+<p>Python is a <a href="../stability.html#target-tiers">Tier 1</a> target: it tracks every
+ABI revision as it lands and runs the full conformance suite in CI.</p>
+<h2 id="what-gets-generated"><a class="header" href="#what-gets-generated">What gets generated</a></h2>
+<p>For the <code>kvstore</code> sample (package name <code>kvstore</code>, C prefix <code>kvstore</code>):</p>
+<pre><code class="language-text">python/
+├── pyproject.toml          # PEP 621 metadata, built with setuptools
+├── README.md
+└── kvstore/                # the import package, named after the C prefix
+    ├── __init__.py         # re-exports the module's __all__
+    ├── kvstore.py          # runtime, prototypes, and wrappers
+    └── py.typed            # PEP 561 marker
+</code></pre>
+<p>The distribution name is the package identity’s <code>name</code> and the import
+package is its C prefix, so a crate named <code>key-store</code> installs as
+<code>key-store</code> and imports as <code>key_store</code>. Both are configurable:</p>
+<pre><code class="language-toml">[generators.python]
+name = "kvstore-python"      # distribution name (default: package name)
+import_name = "kvstore_py"   # import package (default: C prefix)
+requires_python = "&gt;=3.12"   # default "&gt;=3.10"
+</code></pre>
+<p>A library is one namespace, and so is the package: every record, enum,
+error class, interface, callback interface, and free function is exported
+from the package itself under its IDL name (functions in snake case). The
+module lists its public names in <code>__all__</code> (the error classes,
+<code>LibraryLoadError</code>, <code>NativeIterator</code>, every type, and the free functions),
+so <code>from kvstore import *</code> and the package’s <code>__init__.py</code> export the API
+and none of the runtime’s helpers. Annotations use builtin generics and
+<code>X | None</code>.</p>
+<h2 id="install-and-load"><a class="header" href="#install-and-load">Install and load</a></h2>
+<pre><code class="language-bash">weaveffi generate -o bindings --target python   # in the producer crate
+pip install bindings/python
+</code></pre>
+<p>At import, the module loads the producer library from the first of:</p>
+<ol>
+<li>the path in <code>{PREFIX}_LIBRARY</code> (for example <code>KVSTORE_LIBRARY</code>),</li>
+<li>a library bundled inside the package directory (what <code>weaveffi package</code>
+produces, and where <code>weaveffi generate --dev</code> copies the debug build), and</li>
+<li>the system loader’s search path, by platform file name
+(<code>libkvstore.dylib</code>, <code>libkvstore.so</code>, or <code>kvstore.dll</code>).</li>
+</ol>
+<p>It then makes the two <a href="../reference/abi.html#load-time-checks">load-time checks</a>
+before binding anything else. <code>kvstore_abi_version()</code> must report revision
+6, and every declaration the bindings were generated with (every function,
+interface member, type, error code, and callback method) must have its
+contract function in the library, returning the hash the bindings embed.
+The module holds one row per declaration: the contract function, the
+hash, and the declaration’s path, with its canonical signature:</p>
+<pre><code class="language-python">_CONTRACT: list[tuple[str, int, str]] = [
+    ("kvstore_contract_c6c5d9ee1b7cfa9e", 0x36b344095a0f5bf9, "Store.rank"),  # method rank(Scorer) -&gt; [string] throws KvError
+    ...
+]
+</code></pre>
+<p>When the library can’t be loaded, or a check fails, the import raises
+<code>LibraryLoadError</code>, an <code>ImportError</code> subclass whose message says what went
+wrong and whose <code>path</code> names the library:</p>
+<pre><code class="language-text">kvstore.kvstore.LibraryLoadError: Store.put changed since these bindings were generated (/opt/lib/libkvstore.dylib)
+</code></pre>
+<p>The other messages are <code>Store.put is missing from the library</code>, a C ABI
+mismatch naming both revisions, a library that doesn’t export
+<code>kvstore_abi_version</code>, and the loader’s own error with a hint to set
+<code>KVSTORE_LIBRARY</code>. A stale binding never misreads a buffer at runtime.
+Declarations the library has and the bindings don’t are fine, so a library
+that grew new functions, error codes, or callback methods still loads.
+Since the failure happens during the import, catch it as <code>ImportError</code>
+around the <code>import</code> statement.</p>
+<p>Every C prototype is then bound once, in a module-level table:</p>
+<pre><code class="language-python">_c_Store_count = _bind("kvstore_Store_count", ctypes.c_uint64, ctypes.c_void_p, ctypes.POINTER(_ErrorStruct))
+</code></pre>
+<p>On macOS, the system <code>python3</code> strips <code>DYLD_LIBRARY_PATH</code>, so prefer
+<code>{PREFIX}_LIBRARY</code> there.</p>
+<h2 id="type-mapping"><a class="header" href="#type-mapping">Type mapping</a></h2>
+<p>Parameters accept abstract containers (any <code>Sequence</code> or <code>Mapping</code>) and
+returns hand out concrete ones (<code>list</code>, <code>dict</code>). Every value is one C value
+in every position (a parameter, a return, an async result, an iterator
+item, and a callback method’s arguments and return), and the runtime
+mirrors the C structures as <code>ctypes.Structure</code> subclasses passed and
+returned by value: <code>_Run</code> for <code>{prefix}_run</code> (a pointer and a byte length)
+and <code>_OptI32</code>, <code>_OptF64</code>, and so on for each <code>{prefix}_opt_{prim}</code> (a
+presence flag and a value).</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>IDL type</th><th>Python type</th><th>Crosses the ABI as</th></tr>
+</thead>
+<tbody>
+<tr><td><code>i8</code> to <code>u64</code></td><td><code>int</code></td><td><code>c_int8</code> to <code>c_uint64</code>, range-checked</td></tr>
+<tr><td><code>f32</code>, <code>f64</code></td><td><code>float</code></td><td><code>c_float</code>, <code>c_double</code></td></tr>
+<tr><td><code>bool</code></td><td><code>bool</code></td><td><code>c_bool</code></td></tr>
+<tr><td>C-style enum</td><td><code>IntEnum</code> subclass</td><td><code>c_int32</code></td></tr>
+<tr><td>scalar or enum <code>T?</code></td><td><code>T | None</code></td><td><code>_Opt{Prim}</code> (an enum’s is <code>_OptI32</code>)</td></tr>
+<tr><td><code>string</code></td><td><code>str</code></td><td><code>_Run</code> of UTF-8</td></tr>
+<tr><td><code>bytes</code></td><td><code>bytes</code></td><td><code>_Run</code> of the bytes</td></tr>
+<tr><td><code>[i8]</code> to <code>[u64]</code>, <code>[f32]</code>, <code>[f64]</code></td><td><code>Sequence[int]</code> or <code>Sequence[float]</code> in, <code>list</code> out</td><td><code>_Run</code> of the packed elements (a typed array)</td></tr>
+<tr><td>record</td><td>frozen <code>@dataclass</code></td><td><code>_Run</code> holding a value buffer</td></tr>
+<tr><td>rich enum</td><td>base class plus one frozen <code>@dataclass</code> per variant</td><td><code>_Run</code> holding a value buffer</td></tr>
+<tr><td>other <code>T?</code>, <code>[T]</code>, <code>{K:V}</code></td><td><code>T | None</code>, <code>Sequence[T]</code>, <code>Mapping[K, V]</code> in; <code>T | None</code>, <code>list[T]</code>, <code>dict[K, V]</code> out</td><td><code>_Run</code> holding a value buffer</td></tr>
+<tr><td>interface</td><td>wrapper class</td><td><code>c_void_p</code></td></tr>
+<tr><td>interface <code>?</code></td><td><code>... | None</code></td><td><code>c_void_p</code>, null for <code>None</code></td></tr>
+<tr><td>callback interface</td><td>subclass of the generated ABC</td><td><code>_{Name}Arg</code> (a context and a vtable)</td></tr>
+<tr><td>callback interface <code>?</code></td><td><code>... | None</code></td><td><code>_{Name}Arg</code> with a null vtable for <code>None</code></td></tr>
+<tr><td><code>iter&lt;T&gt;</code></td><td><code>NativeIterator[T]</code></td><td>iterator handle</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>ctypes</code> truncates an out-of-range integer to the parameter’s C width
+without a word, so every integer argument is checked first: a value out of
+range raises <code>OverflowError</code> naming the parameter
+(<code>a: 2147483648 is out of range for i32</code>), and a non-integer raises
+<code>TypeError</code>. The checks run before anything is lent or registered for the
+call, so a failed check leaks nothing.</p>
+<p>An optional scalar (<code>i64?</code>, <code>bool?</code>, <code>Priority?</code>) never touches a value
+buffer: <code>None</code> passes an absent <code>_Opt{Prim}</code>, and a returned one becomes
+the value or <code>None</code>. A numeric list parameter accepts any sequence or
+iterable of numbers (a <code>list</code>, a <code>tuple</code>, a <code>range</code>, a generator); it’s
+packed into an <code>array.array</code> with range checks, whose buffer Python aligns
+for every element type, and lent to the call. An <code>array.array</code> of the
+matching type code is lent as is, without a copy. A <code>str</code> or <code>bytes</code>
+argument is refused rather than reinterpreted. Returned typed arrays are
+copied into a <code>list</code> and released.</p>
+<p>Strings and bytes pass without per-byte loops: a <code>str</code> is encoded once and
+its bytes are lent to the call as a run, so interior NUL characters
+survive. Returned strings, bytes, typed arrays, and buffers are copied with
+<code>ctypes.string_at</code> and released with <code>{prefix}_run_free</code>.</p>
+<p>Every record and rich enum has one writer and one reader function
+(<code>_write_Entry</code>, <code>_read_Entry</code>), and so does every distinct composite type
+the API uses, named by the composite’s canonical stem
+(<code>_write_list_string</code>, <code>_read_map_string_Store</code>, <code>_read_opt_Entry</code>); a call
+site makes one call instead of inlining a loop. Lists of a fixed-width
+number type inside a buffer are packed and unpacked with one <code>struct</code> call.
+A value out of range for its field raises <code>OverflowError</code> while encoding. A
+decoded buffer that’s truncated, has trailing bytes, an invalid flag,
+invalid UTF-8, an undeclared enum value, or a repeated map key raises
+<code>InternalError</code> with code <code>-3</code>.</p>
+<p>Records are <code>@dataclass(frozen=True, slots=True)</code>: they compare and hash
+by value (a record holding a <code>list</code> or <code>dict</code> field compares by value but
+can’t be hashed), and a changed copy comes from <code>dataclasses.replace</code>:</p>
+<pre><code class="language-python">entry = store.get("alpha")
+renamed = dataclasses.replace(entry, tags=["archived"])
+</code></pre>
+<p>Rich-enum variants work with <code>isinstance</code> and with <code>match</code>:</p>
+<pre><code class="language-python">match change:
+    case kvstore.ChangePut(entry=entry, replaced=True):
+        print("replaced", entry.key)
+    case kvstore.ChangeRemoved(key=key):
+        print("removed", key)
+</code></pre>
+<p>The module starts with <code>from __future__ import annotations</code>, so
+annotations name types declared later in the file without quotes.
+Backticked identifiers in IDL docs and deprecation messages are rewritten
+to their Python spellings in docstrings and <code>DeprecationWarning</code>s.</p>
+<h2 id="objects-and-lifetime"><a class="header" href="#objects-and-lifetime">Objects and lifetime</a></h2>
+<p>An interface wrapper holds one strong reference and releases it exactly
+once: from <code>close()</code>, the <code>with</code> statement, or the <code>__del__</code> backstop.
+<code>close()</code> is idempotent, and using a closed wrapper raises <code>ValueError</code>.
+Each call lends the pointer for its duration, so <code>close()</code> from another
+thread while a call is in flight defers the release until the call
+returns. Two wrappers compare equal (and hash alike) when they hold the
+same native object, so <code>store.share() == store</code> and a record holding a
+<code>Store</code> compares by identity. An interface member named <code>close</code> is
+<code>close_</code>, so it never replaces the wrapper’s own (<a href="../reference/naming.html#identifiers-in-generated-code">reserved member
+names</a>).</p>
+<p>A constructor named <code>new</code> becomes <code>__init__</code>; other constructors are
+<code>@classmethod</code> factories:</p>
+<pre><code class="language-python">    @classmethod
+    def open(cls, path: str) -&gt; Store:
+        _err = _ErrorStruct()
+        _ret = _c_Store_open(_run_in(path.encode("utf-8")), ctypes.byref(_err))
+        if _err.code:
+            raise _kv_error_from(*_read_error(_err))
+        return cls._adopt(_required(_ret))
+</code></pre>
+<p>Objects returned by the producer, decoded from a buffer, or passed to a
+callback are adopted into new wrappers. Writing an object into a value
+buffer (a record field or a list element) mints a new reference only after
+the whole argument list has encoded, so a failed encoding leaks nothing.</p>
+<h2 id="errors"><a class="header" href="#errors">Errors</a></h2>
+<p>Every declared error derives from the package’s root <code>Error</code> (named
+<code>{PascalName}Error</code> if the API declares its own <code>Error</code> type), which
+carries <code>code</code> and <code>message</code>. Each error domain is a subclass named by the
+shared rule (<code>KvError</code> stays <code>KvError</code>, <code>KitchenErrors</code> becomes
+<code>KitchenError</code>, <code>Failure</code> becomes <code>FailureError</code>). Each code is a subclass
+of its domain named <code>{Code}Error</code> (<code>KeyNotFoundError</code>), also reachable as
+<code>KvError.KeyNotFound</code>, carrying its stable <code>CODE</code>. When <code>{Code}Error</code> would
+shadow a Python builtin (<code>TimeoutError</code>) or another declaration, it’s
+qualified with the domain’s stem (<code>KvTimeoutError</code>). A code’s payload
+fields are constructor arguments and attributes; a field named like an
+exception attribute (<code>message</code>, <code>code</code>, <code>args</code>) gets a trailing <code>_</code>:</p>
+<pre><code class="language-python">try:
+    store.get("nope")
+except kvstore.KvError.KeyNotFound as e:
+    print(e.code, e.key, e.message)  # 1001 nope key not found: nope
+</code></pre>
+<p>What a failed call raises follows its <code>throws</code>:</p>
+<ul>
+<li><code>throws: SomeDomain</code>: the code’s class. Codes are matched within the
+callable’s domain, so two domains may reuse a value. Domains are open: a
+positive code these bindings don’t know (from a newer library) raises the
+domain’s base class with its code and message.</li>
+<li><code>throws: any</code>: the root <code>Error</code> with code -1 and the producer’s message.</li>
+<li>A negative code on a throwing call (a panic, a marshalling failure, or a
+failed callback) raises the root <code>Error</code> with that code; the constants
+are <code>GENERIC_ERROR_CODE</code> (-1), <code>PANIC_ERROR_CODE</code> (-2),
+<code>MARSHAL_ERROR_CODE</code> (-3), and <code>FOREIGN_ERROR_CODE</code> (-4).</li>
+</ul>
+<p>A call that declares no errors can only fail through a bug, so it follows
+the <a href="../guides/errors-and-memory.html#the-trap-policy">trap policy</a>: it
+raises <code>InternalError</code>, a <code>RuntimeError</code> subclass outside the <code>Error</code>
+hierarchy whose message names the code and the producer’s message
+(<code>InternalError: (-3) ...</code>). A cancelled async call (-5) raises
+<code>asyncio.CancelledError</code> instead.</p>
+<p>Each call passes a fresh error slot, which the producer overwrites. Error
+messages cross as UTF-8 bytes plus a length, so they may contain any
+character; an empty message is <code>""</code>.</p>
+<h2 id="async-and-cancellation"><a class="header" href="#async-and-cancellation">Async and cancellation</a></h2>
+<p>An async function is an <code>async def</code> that must run on an <code>asyncio</code> event
+loop. The launcher receives a static completion trampoline and an integer
+key; the trampoline takes ownership of the result (one C value, like a
+sync return) on the producer’s thread and settles the future through
+<code>call_soon_threadsafe</code>:</p>
+<pre><code class="language-python">async def open_store(path: str) -&gt; Store:
+    _call, _future = _async_begin()
+    try:
+        _c_open_store(_run_in(path.encode("utf-8")), _open_store_completion, _call)
+    except BaseException:
+        _async_abandon(_call)
+        raise
+    _result: Store = await _future
+    return _result
+</code></pre>
+<p>The launcher copies everything it needs before it returns, so the
+arguments’ memory needn’t outlive the call.</p>
+<p>For a <code>cancellable</code> function, each call owns a native cancel token.
+Cancelling the awaiting task (directly, through <code>asyncio.wait_for</code>, or by
+cancelling a <code>gather</code>) cancels the token, waits for the producer’s
+cancelled completion, and raises <code>asyncio.CancelledError</code>. Cancelling the
+task awaiting a function that isn’t <code>cancellable</code> stops the wait only; the
+native call runs to completion and its result is dropped.</p>
+<h2 id="callbacks"><a class="header" href="#callbacks">Callbacks</a></h2>
+<p>A callback interface is an <code>abc.ABC</code> with one abstract method per IDL
+method. Passing an instance registers it in a handle table under an integer
+key, and the call passes the producer a <code>_{Name}Arg</code> structure holding that
+key as <code>ctx</code> and the address of the interface’s one vtable; <code>None</code> for an
+optional callback parameter passes a null vtable. The vtable is built the
+first time an implementation is passed and kept for the process lifetime.
+It starts with the header (its <code>size</code>, <code>flags</code>, and the shared <code>free</code>
+entry), and the producer’s <code>free(ctx)</code> removes the table entry, so an
+implementation lives exactly as long as the producer holds it. <code>flags</code> is
+0: the producer may call any method from any thread.</p>
+<p>Each method’s vtable entry is a trampoline that takes the method’s C
+arguments and returns its one C value. A <code>ctypes</code> callback can’t return a
+structure, so a method returning a <code>_Run</code> (a string, bytes, typed array, or
+buffered value) or an <code>_Opt{Prim}</code> is a libffi closure the runtime builds
+directly, through the libffi <code>ctypes</code> itself runs on; every other method is
+a plain <code>ctypes</code> callback.</p>
+<p>Trampolines run on whichever thread the producer calls from; <code>ctypes</code>
+acquires the GIL first. A trampoline adopts the object arguments first,
+converts the rest (an optional scalar arrives as <code>T | None</code>, a typed array
+as a <code>list</code>, and a run is copied, since it’s only lent), calls the method,
+and returns:</p>
+<ul>
+<li>a number, <code>bool</code>, or enum, checked for its type and range inside the
+trampoline (so a wrong return is reported as a failure rather than
+truncated);</li>
+<li>an optional scalar as its <code>_Opt{Prim}</code>;</li>
+<li>an object as a fresh strong reference the producer adopts (<code>None</code> is
+allowed only for <code>I?</code>);</li>
+<li>a <code>str</code>, <code>bytes</code>, typed array, record, or other buffered value as a run
+allocated with <code>{prefix}_alloc</code>, which the producer adopts and frees.</li>
+</ul>
+<pre><code class="language-python">def _Loader_load(ctx: int | None, key: _Run, out_err: int | None) -&gt; _Run:
+    try:
+        _ret = _callback_get(ctx).load(_peek_str(key))
+        return _alloc_run(bytes(_ret))
+    except BaseException as exc:
+        _callback_fail(out_err, exc, _GENERIC, KvError)
+        return _Run()
+</code></pre>
+<p>Nothing unwinds through C. A method that throws a domain may raise that
+domain’s codes, which reach the producer as that code with the fields as
+the error payload (<code>{prefix}_error_set</code> and <code>{prefix}_error_set_payload</code>):</p>
+<pre><code class="language-python">class EmptyLoader(kvstore.Loader):
+    def name(self) -&gt; str:
+        return "empty"
+
+    def fallback(self, key: str) -&gt; kvstore.Store | None:
+        return None
+
+    def load(self, key: str) -&gt; bytes:
+        raise kvstore.KeyNotFoundError(key=key)
+</code></pre>
+<p>A Rust producer decodes such a code into its typed error, so the caller of
+the original function sees the domain’s own message rendered from the
+fields. Any other exception, or a return of the wrong type, reaches the
+producer as code -1 with the exception’s message (-4 for a method that
+declares no errors); a Rust producer receives it as a <code>ForeignError</code>, which
+the kvstore sample turns into <code>KvError.CallbackFailed</code>.</p>
+<h2 id="iterators"><a class="header" href="#iterators">Iterators</a></h2>
+<p>An <code>iter&lt;T&gt;</code> return is a <code>NativeIterator[T]</code>, a lazy iterator: each
+<code>next()</code> makes one native <code>next</code> call through the pre-bound function,
+receiving the item in one out slot of its C type, and the handle is
+released on exhaustion, <code>close()</code>, the end of a <code>with</code> block, or garbage
+collection. A closed iterator is exhausted.</p>
+<pre><code class="language-python">for key in store.keys(None):
+    print(key)
+
+with store.entries("user.") as entries:
+    first = next(entries)   # the rest is released when the block ends
+</code></pre>
+<h2 id="packaging"><a class="header" href="#packaging">Packaging</a></h2>
+<p><code>weaveffi package --target python</code> writes one wheel per desktop platform
+built, <code>python/{name}-{version}-py3-none-{platform}.whl</code> (the distribution
+name escaped for a wheel file name, so <code>Key-Store</code> becomes <code>key_store</code>),
+with the producer library inside the import package. The platform tag
+matches the build: the <code>[build]</code> macOS deployment target
+(<code>macosx_11_0_arm64</code>), the newest glibc the library links against on Linux
+(<code>manylinux_2_17_x86_64</code> or later), or <code>win_amd64</code>. The wheels install
+with <code>pip</code> and upload with <code>twine</code>; Android, iOS, and <code>wasm32</code> builds have
+no wheel platform and are skipped. See <a href="../guides/packaging.html">Packaging</a>.</p>
+<h2 id="known-limitations"><a class="header" href="#known-limitations">Known limitations</a></h2>
+<ul>
+<li><code>ctypes</code> dispatch costs more per call than a compiled extension; hot
+loops that cross the boundary per element will feel it. The bindings
+keep the per-call work small (prototypes and vtable addresses are
+resolved once, and the error check is inline), but each call still
+allocates its error slot, and each integer argument costs a range check.</li>
+<li>A callback method that returns a structure needs libffi, which the
+runtime finds through the <code>_ctypes</code> extension or by name
+(<code>ctypes.util.find_library("ffi")</code>). A Python whose <code>ctypes</code> links libffi
+statically and hides its symbols, with no libffi installed, raises
+<code>OSError</code> the first time an implementation of such an interface is
+passed. The closures are built for the 64-bit platforms wheels target.</li>
+<li>A typed-array parameter is copied into an <code>array.array</code> unless it already
+is one of the matching type code; a NumPy array is copied element by
+element.</li>
+<li>The package’s namespace also holds the typing names the module imports
+(<code>Any</code>, <code>Callable</code>, <code>ClassVar</code>, <code>Iterable</code>, <code>Iterator</code>, <code>Mapping</code>,
+<code>Sequence</code>): a declared type with one of those names still works at run
+time, but type checkers reject the module.</li>
+<li>A long-running callback stalls the producer thread that called it, and a
+callback that waits for the thread blocked in the calling Python code
+deadlocks.</li>
+<li><code>LibraryLoadError</code> is raised during the import, so it can only be caught
+as <code>ImportError</code> (the package isn’t importable to name the class).</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../generators/wasm.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../generators/dotnet.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../generators/wasm.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../generators/dotnet.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

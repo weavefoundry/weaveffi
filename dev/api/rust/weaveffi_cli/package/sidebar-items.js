@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ArtifactKind","FileContent"],"struct":["Artifact","GemSpec","PackageContext","PackagedFile","WheelMeta"]};

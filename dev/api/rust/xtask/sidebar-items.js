@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["LANGS","SAMPLES","TARGETS"],"fn":["cargo","conformance","exe","fixtures","list","main","run"],"mod":["skew"],"struct":["Selection","Workspace"],"type":["Result"]};

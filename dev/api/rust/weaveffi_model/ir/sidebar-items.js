@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CURRENT_SCHEMA_VERSION","THROWS_ANY"],"enum":["Throws","TypeRef"],"fn":["parse_type_ref"],"struct":["Api","CallbackDef","EnumDef","EnumVariant","ErrorCode","ErrorDomain","Field","Function","InterfaceDef","Param","RecordDef"]};

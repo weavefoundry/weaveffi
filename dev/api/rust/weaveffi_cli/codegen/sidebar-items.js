@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ChangeKind"],"struct":["Change","Changeset","CodeWriter","GenerateReport","Orchestrator","OutputFile"]};

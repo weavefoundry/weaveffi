@@ -1,0 +1,591 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Go - WeaveFFI (dev)</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-1339018f.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-e1100732.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">WeaveFFI (dev)</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/weavefoundry/weaveffi" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="go"><a class="header" href="#go">Go</a></h1>
+<p>The Go target emits a self-contained cgo module that binds the library’s
+<a href="../reference/abi.html">C ABI</a>. Records and rich enums are plain Go values,
+interfaces are reference-counted wrappers with <code>Close</code>, calls that declare
+errors return <code>error</code> values you match with <code>errors.As</code>, async functions
+block on a <code>context.Context</code>, and <code>iter&lt;T&gt;</code> returns standard-library
+<code>iter.Seq</code> sequences. The module requires Go 1.24 or later.</p>
+<p>Go is a <a href="../stability.html#target-tiers">Tier 2</a> target: it may lag behind a
+new ABI revision for a while, but it runs the same conformance suite as
+every other target before a release.</p>
+<h2 id="whats-generated"><a class="header" href="#whats-generated">What’s generated</a></h2>
+<p>For a library whose identity is <code>kvstore</code>:</p>
+<pre><code class="language-text">go/
+  go.mod        module path (the package name, or `name`), go 1.24
+  README.md
+  kvstore.h     a copy of the C header
+  bindings.go   the API: types, wrappers, trampolines, load-time checks
+  runtime.go    Check, errors, runs, optional scalars, objects, callbacks,
+                iterators, async
+  codec.go      the value-buffer writer and reader
+</code></pre>
+<p>Every Go file carries the standard <code>// Code generated ... DO NOT EDIT.</code>
+line before its package clause, so linters skip it and editors warn before
+you change it.</p>
+<p>Every name comes from the package identity:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Default</th><th>Override</th></tr>
+</thead>
+<tbody>
+<tr><td>Module path</td><td>the package <code>name</code></td><td><code>[generators.go] name</code></td></tr>
+<tr><td>Package name</td><td>the C prefix without underscores (<code>kitchen_sink</code> is <code>kitchensink</code>)</td><td><code>[generators.go] package</code></td></tr>
+<tr><td>Linked library</td><td><code>-l{library}</code></td><td>none</td></tr>
+<tr><td>Header</td><td><code>{library}.h</code></td><td>none</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-toml">[generators.go]
+name = "github.com/example/kvstore"
+package = "kvstore"
+</code></pre>
+<p>A package name that’s a Go keyword gains a trailing underscore.</p>
+<p>A library is one namespace, so it renders into one Go package, and Go
+spells every exported name in PascalCase with Go’s initialisms (<code>user_id</code>
+is <code>UserID</code>, <code>ttl_seconds</code> is <code>TTLSeconds</code>):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Declaration</th><th>Go name</th></tr>
+</thead>
+<tbody>
+<tr><td>function <code>summarize</code></td><td><code>Summarize</code></td></tr>
+<tr><td>interface <code>Store</code></td><td><code>*Store</code></td></tr>
+<tr><td>constructor <code>Store.open</code></td><td><code>OpenStore</code> (and <code>new</code> is <code>NewStore</code>)</td></tr>
+<tr><td>method <code>Store.get_or_load</code></td><td><code>(*Store).GetOrLoad</code></td></tr>
+<tr><td>static <code>Store.default_capacity</code></td><td><code>StoreDefaultCapacity</code></td></tr>
+<tr><td>C-style enum <code>EntryKind</code>, variant <code>Volatile</code></td><td><code>EntryKind</code>, <code>EntryKindVolatile</code></td></tr>
+<tr><td>rich enum <code>Change</code>, variant <code>Put</code></td><td><code>Change</code>, <code>ChangePut</code></td></tr>
+<tr><td>error domain <code>KvError</code>, code <code>KeyNotFound</code></td><td><code>KvError</code>, <code>*KeyNotFoundError</code></td></tr>
+<tr><td>error domain <code>KitchenErrors</code></td><td><code>KitchenError</code> (one <code>Error</code> suffix, never doubled)</td></tr>
+</tbody>
+</table>
+</div>
+<p>A free function whose name would clash with a type, an enum constant, a
+constructor, a static, an error type, or the runtime’s <code>Check</code>, <code>Error</code>,
+or <code>DebugLive</code> gains a trailing underscore: the kvstore sample’s async
+<code>open_store</code> sits beside the <code>OpenStore</code> constructor, so it’s <code>OpenStore_</code>,
+and the codec sample’s <code>vector</code> function sits beside its <code>Vector</code> type, so
+it’s <code>Vector_</code>. Methods never clash this way, since each lives on its own
+type.</p>
+<p>Doc comments are the IDL’s docs. A package-level declaration’s comment
+starts with its name, as Go convention asks, so a doc that doesn’t is
+prefixed with <code>Name: </code>. Backticked API names become Go doc links
+(<code>`new_op`</code> is <code>[NewOp]</code>, a method <code>[Store.Get]</code>) or their Go spelling
+(a field <code>ExpiresAt</code>, a parameter <code>ttlSeconds</code>), and a deprecation becomes
+the final <code>Deprecated:</code> paragraph that Go tools recognize.</p>
+<h2 id="build-and-load"><a class="header" href="#build-and-load">Build and load</a></h2>
+<p>The bindings include the bundled header and link with
+<code>#cgo LDFLAGS: -l{library}</code>, so a consumer supplies only the library’s
+directory:</p>
+<pre><code class="language-sh">export CGO_LDFLAGS="-L/path/to/lib"
+export LD_LIBRARY_PATH="/path/to/lib"   # DYLD_LIBRARY_PATH on macOS
+go build ./...
+</code></pre>
+<p>cgo links the library into the program when it’s built, and the
+platform’s dynamic loader finds it when the program starts. The bindings
+never open the library themselves, so the <code>{PREFIX}_LIBRARY</code> override the
+other targets read at load time doesn’t exist for Go; to choose the library
+at run time, set the loader’s search path (<code>LD_LIBRARY_PATH</code>,
+<code>DYLD_LIBRARY_PATH</code>, or <code>PATH</code> on Windows). To record the directory in the
+binary instead, add an rpath when building:</p>
+<pre><code class="language-sh">export CGO_LDFLAGS="-L/path/to/lib -Wl,-rpath,/path/to/lib"
+</code></pre>
+<p><code>weaveffi package</code> writes the module to <code>go/{package}/</code> with each desktop
+platform’s library under <code>lib/&lt;platform&gt;/</code> and replaces the single link
+line with one per GOOS and GOARCH, so cgo picks the right library with no
+<code>CGO_LDFLAGS</code>:</p>
+<pre><code class="language-go">/*
+#cgo darwin,arm64 LDFLAGS: -L${SRCDIR}/lib/darwin-arm64 -Wl,-rpath,${SRCDIR}/lib/darwin-arm64
+#cgo linux,amd64 LDFLAGS: -L${SRCDIR}/lib/linux-x64 -Wl,-rpath,${SRCDIR}/lib/linux-x64
+#cgo windows,amd64 LDFLAGS: -L${SRCDIR}/lib/windows-x64
+#cgo LDFLAGS: -lkvstore
+*/
+</code></pre>
+<p><code>${SRCDIR}</code> expands to the module’s directory (in the module cache, for a
+dependency), so a program built on a machine runs there without a loader
+path. A binary you ship elsewhere still needs the library beside it or on
+the loader’s path: copy it and link with an rpath such as
+<code>-Wl,-rpath,$ORIGIN</code> (<code>@executable_path</code> on macOS). Windows has no rpath;
+put the DLL next to the executable or on <code>PATH</code>. Android, iOS, and
+<code>wasm32</code> libraries aren’t bundled. Publish the module by pushing the
+directory to the module path’s repository; see
+<a href="../guides/packaging.html">Packaging</a>.</p>
+<h2 id="load-time-checks"><a class="header" href="#load-time-checks">Load-time checks</a></h2>
+<p><code>Check() error</code> checks the library’s ABI revision and then
+<a href="../reference/abi.html#the-contract">the contract</a> of every declaration the
+bindings were generated with, including each error code and callback
+method: it calls the declaration’s <code>{p}_contract_{id}</code> function and compares
+the hash with the one embedded in <code>bindings.go</code>.</p>
+<pre><code class="language-go">if err := kvstore.Check(); err != nil {
+	log.Fatal(err) // kvstore: Store.put changed since these bindings were generated
+}
+</code></pre>
+<p>The checks run once, on the first call to <code>Check</code> or to any function of the
+package, and <code>Check</code> returns the same result from then on. Importing the
+package never panics. A function called after a failed check panics with
+the error <code>Check</code> returns, so call <code>Check</code> at startup when you’d rather
+handle a mismatched library as an error. The error names the first
+declaration whose hash differs. Because the bindings link the library, one
+that lacks a declaration fails to link (or, with a shared library swapped
+in later, to start) rather than failing the check. Declarations the library
+has and the bindings don’t are fine, so a library that only adds functions,
+error codes, or callback methods keeps working with older bindings.</p>
+<h2 id="type-mapping"><a class="header" href="#type-mapping">Type mapping</a></h2>
+<p>Every value crosses as one C value, whatever its position:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>IDL type</th><th>Go type</th><th>Crosses the ABI as</th></tr>
+</thead>
+<tbody>
+<tr><td><code>i8</code> to <code>i64</code>, <code>u8</code> to <code>u64</code></td><td><code>int8</code> to <code>int64</code>, <code>uint8</code> to <code>uint64</code></td><td>the C integer</td></tr>
+<tr><td><code>f32</code>, <code>f64</code></td><td><code>float32</code>, <code>float64</code></td><td><code>float</code>, <code>double</code></td></tr>
+<tr><td><code>bool</code></td><td><code>bool</code></td><td>C <code>bool</code></td></tr>
+<tr><td><code>string</code></td><td><code>string</code></td><td>a <code>{p}_run</code> of UTF-8</td></tr>
+<tr><td><code>bytes</code></td><td><code>[]byte</code></td><td>a <code>{p}_run</code> of the bytes</td></tr>
+<tr><td>C-style enum</td><td><code>type E int32</code> plus <code>E{Variant}</code> constants</td><td><code>int32_t</code></td></tr>
+<tr><td>rich enum</td><td>sealed <code>interface</code> plus one struct per variant</td><td>a value buffer in a <code>{p}_run</code></td></tr>
+<tr><td>record</td><td>plain struct with exported fields</td><td>a value buffer in a <code>{p}_run</code></td></tr>
+<tr><td>scalar <code>T?</code> (integer, float, <code>bool</code>, C-style enum)</td><td><code>*T</code></td><td>a <code>{p}_opt_{prim}</code> struct (<code>{p}_opt_i32</code> for an enum)</td></tr>
+<tr><td>other <code>T?</code></td><td><code>*T</code>; a slice, map, rich enum, <code>[]byte</code>, or wrapper stays as it is and nil is none</td><td>a value buffer in a <code>{p}_run</code></td></tr>
+<tr><td>numeric <code>[T]</code> (<code>i8</code> to <code>i64</code>, <code>u16</code> to <code>u64</code>, <code>f32</code>, <code>f64</code>)</td><td><code>[]T</code></td><td>a <code>{p}_run</code> of the packed elements</td></tr>
+<tr><td>other <code>[T]</code>, <code>{K: V}</code></td><td><code>[]T</code>, <code>map[K]V</code></td><td>a value buffer in a <code>{p}_run</code></td></tr>
+<tr><td>interface</td><td><code>*Iface</code></td><td>object pointer</td></tr>
+<tr><td><code>Iface?</code></td><td><code>*Iface</code> (nil is none)</td><td>object pointer or null</td></tr>
+<tr><td>callback interface</td><td>a Go <code>interface</code> you implement</td><td>a <code>{p}_{Cb}</code> struct of a handle and a static vtable</td></tr>
+<tr><td><code>Cb?</code></td><td>the same interface (nil is none)</td><td>the same struct with a null vtable for none</td></tr>
+<tr><td><code>iter&lt;T&gt;</code></td><td><code>iter.Seq[T]</code> or <code>iter.Seq2[T, error]</code></td><td>iterator handle</td></tr>
+</tbody>
+</table>
+</div>
+<p>A string, byte slice, or numeric slice parameter lends its own memory for
+the call, with no copy and no encoding: the run points into the Go string
+or the slice’s backing array (a sub-slice passes its own window), cgo keeps
+it in place until the call returns, and the library only reads it. Strings
+carry no NUL terminator, so they may contain <code>\x00</code>. A Go string can hold
+bytes that aren’t UTF-8; the library rejects them as a marshalling failure
+(<code>-3</code>).</p>
+<p>A returned run is copied into Go memory and released with <code>{p}_run_free</code>.
+An empty string, byte slice, or numeric slice result is empty and non-nil.
+Inside a record, list, or map, numeric lists and optional scalars use the
+value-buffer encoding like everything else; the Go types are the same
+either way.</p>
+<p>Each type that crosses inside a value buffer has one codec pair, shared by
+every parameter, result, field, and callback argument of that type. A
+composite is named after its shared stem (the same name every target uses):</p>
+<pre><code class="language-go">func wvWrite_map_string_Store(w *wvWriter, v map[string]*Store) {
+	wvWriteMap(w, v, (*wvWriter).writeString, wvWriteStore)
+}
+</code></pre>
+<h2 id="objects-and-lifetime"><a class="header" href="#objects-and-lifetime">Objects and lifetime</a></h2>
+<p>Each wrapper embeds the runtime’s object core, which owns one strong
+reference. <code>Close() error</code> releases it (so a wrapper satisfies
+<code>io.Closer</code>), and a <code>runtime.AddCleanup</code> cleanup releases it some time after
+an unclosed wrapper becomes unreachable. Every call borrows the native
+pointer for its duration:</p>
+<pre><code class="language-go">func (s *Store) Get(key string) (Entry, error) {
+	cSelf := s.native()
+	defer s.release()
+	var cErr C.kvstore_error
+	cRet := C.kvstore_Store_get(cSelf, wvStrRun(key), &amp;cErr)
+	if cErr.code != 0 {
+		return Entry{}, wvKvError(wvTakeError(&amp;cErr))
+	}
+	return wvDecode(cRet, wvReadEntry), nil
+}
+</code></pre>
+<p><code>Close</code> is idempotent and goroutine-safe. When it races a call in flight
+(even one that closes the wrapper from inside a callback), the reference is
+released as soon as that call returns, never mid-call. Using a wrapper after
+<code>Close</code>, or passing a nil <code>*Iface</code> where an object is required, panics. An
+object inside a record, list, or map crosses as a token that carries a
+fresh reference, so the wrapper you passed stays valid. Two wrappers may
+refer to the same object (a method that returns its receiver hands back a
+new wrapper); each is closed on its own.</p>
+<p>Because every wrapper has <code>Close</code>, an IDL method named <code>close</code> is
+<code>Close_</code> (<a href="../reference/naming.html#identifiers-in-generated-code">reserved member names</a>).</p>
+<h2 id="errors"><a class="header" href="#errors">Errors</a></h2>
+<p>A function’s <code>throws</code> decides its Go signature:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>IDL</th><th>Go signature</th><th>A failure is</th></tr>
+</thead>
+<tbody>
+<tr><td><code>throws: KvError</code></td><td><code>(T, error)</code></td><td>a code of the domain, or an <code>*Error</code> for a runtime code</td></tr>
+<tr><td><code>throws: any</code></td><td><code>(T, error)</code></td><td>an <code>*Error</code> with code <code>-1</code> and the library’s message</td></tr>
+<tr><td>no <code>throws</code></td><td><code>T</code></td><td>a bug: the wrapper panics with an <code>*Error</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>A domain code comes back as its code’s type, a pointer to a struct holding
+the code’s payload fields and a <code>Message</code>, and every code type of a domain
+implements the domain’s sealed interface:</p>
+<pre><code class="language-go">_, err := store.Get("missing")
+var missing *kvstore.KeyNotFoundError
+if errors.As(err, &amp;missing) {
+	fmt.Println(missing.Key, missing.Code()) // missing 1001
+}
+var kvErr kvstore.KvError
+if errors.As(err, &amp;kvErr) {
+	// any code of the domain
+}
+</code></pre>
+<p>Domains are open: a positive code the bindings don’t declare (from a newer
+library) comes back as the domain’s <code>*Unknown{Domain}</code> type
+(<code>*UnknownKvError</code>), which keeps the code and message and still matches the
+domain’s interface. Codes are unique only within a domain, so the
+calculator’s <code>CalcError.DivisionByZero</code> and <code>ParseError.NotANumber</code> can both
+be 1; each function maps codes through its own domain.</p>
+<p><code>Error()</code> returns the library’s message, or the code’s default message when
+<code>Message</code> is empty. A runtime code (<code>-1</code> generic, <code>-2</code> a panic in the
+library, <code>-3</code> a marshalling failure, <code>-4</code> a callback failure) comes back as
+the package’s <code>*Error</code>, which keeps the code and message and never matches a
+domain interface. A function that declares no errors panics with that
+<code>*Error</code> instead (see
+<a href="../guides/errors-and-memory.html#the-trap-policy">the trap policy</a>). The
+panic is an ordinary recoverable one, and its text names the code and the
+library’s message, as in <code>kvstore: &lt;message&gt; (code -3)</code>.</p>
+<h2 id="async-and-cancellation"><a class="header" href="#async-and-cancellation">Async and cancellation</a></h2>
+<p>Async functions take a <code>context.Context</code> first and always return an error;
+they never panic on a failure. A function with no <code>throws</code> reports its
+failure as an <code>*Error</code> like a <code>throws: any</code> one. They block the calling
+goroutine on a channel that a completion trampoline fills from the
+library’s thread; call them from a goroutine of your own for concurrency. A
+<code>cancellable</code> function creates a native cancel token, cancels it when the
+context is done, and returns <code>ctx.Err()</code> (<code>context.Canceled</code> or
+<code>context.DeadlineExceeded</code>) for the cancelled completion (code <code>-5</code>), or
+<code>context.Canceled</code> if the library cancelled the call on its own:</p>
+<pre><code class="language-go">ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+defer cancel()
+removed, err := store.Compact(ctx, 60000)
+if errors.Is(err, context.DeadlineExceeded) {
+	// The native call was cancelled.
+}
+</code></pre>
+<p>Any other async function returns <code>ctx.Err()</code> as soon as the context is done
+and discards the native result when it arrives. A context that’s already
+done never launches the call. The result is one C value like a sync
+return, so an optional scalar result is a <code>*T</code> and a numeric list result a
+<code>[]T</code>.</p>
+<h2 id="callbacks"><a class="header" href="#callbacks">Callbacks</a></h2>
+<p>A callback interface is a Go interface. Passing an implementation stores it
+in a handle table and hands the library the interface’s argument struct:
+the handle as the context, and the address of one static vtable per
+interface, with the header’s <code>size</code> and <code>flags</code> (0: Go may run a method on
+any thread), the <code>free</code> entry that deletes the handle once the library is
+done, and one <code>//export</code> trampoline per method. The library may call
+methods from any thread, and <code>free</code> may run on any thread too.</p>
+<pre><code class="language-go">type Policy interface {
+	// The TTL a write of `key` gets, given the TTL the caller
+	// requested (absent for none): ...
+	//
+	// Return a KvError to report one of its codes, with its fields, to the native
+	// caller; any other error reports code -1 with its text.
+	TTLFor(key string, requested *int64) (*int64, error)
+	Admit(entry Entry) (Entry, error)
+	Route(key string, home *Store) (*Store, error)
+}
+</code></pre>
+<ul>
+<li><strong>Arguments.</strong> Strings, bytes, typed arrays, and buffered values are lent
+for the call, so they’re copied or decoded into Go values, and an
+optional scalar is a <code>*T</code>. An object argument (<code>home</code> above) is a new
+wrapper that owns its own reference: keep it, return it, or <code>Close</code> it.</li>
+<li><strong>Returns.</strong> A method may return any type but an iterator or a callback
+interface. A scalar returns by value and an optional scalar as its C
+struct; a string, <code>[]byte</code>, typed array, or buffered value is copied
+into a run allocated with the library’s allocator, which the library
+adopts; an object returns a fresh reference to the wrapper’s object (the
+wrapper stays yours). Returning nil for a required object, or a value the
+library can’t read (text that isn’t UTF-8, an undeclared enum value),
+fails the call in progress.</li>
+<li><strong>Errors.</strong> A method that declares <code>throws</code> returns <code>(T, error)</code> or
+<code>error</code>. Returning one of its domain’s code types (for example
+<code>&amp;kvstore.RejectedError{Key: k, Reason: "no secrets"}</code>) reports that code
+and its payload fields, so the original caller can receive exactly that
+error. Any other error reports code <code>-1</code> with its text. A method that
+panics, throwing or not, is recovered and reported as <code>-4</code> with the
+panic’s text; nothing unwinds into the library. What the caller finally
+sees is the producer’s choice: a Rust producer renders a typed error’s
+message from its fields, and the kvstore sample turns every other
+callback failure into <code>KvError.CallbackFailed</code>.</li>
+<li><strong>Nil implementations.</strong> A <code>Cb?</code> parameter accepts nil, which passes no
+callback (a null vtable); so does a typed nil (an interface holding a nil
+pointer, map, slice, func, or channel), which would otherwise reach the
+library as an implementation whose every call panics. A required one
+panics on either.</li>
+</ul>
+<h2 id="iterators"><a class="header" href="#iterators">Iterators</a></h2>
+<p>An <code>iter&lt;T&gt;</code> return becomes a lazy sequence: each <code>range</code> launches the
+native iterator, pulls one element per step, and destroys the iterator when
+the loop ends, including on an early <code>break</code>. A function that declares
+errors returns an <code>iter.Seq2[T, error]</code> that yields its error as a final
+<code>(zero, err)</code> pair:</p>
+<pre><code class="language-go">for key, err := range store.Keys(nil) {
+	if err != nil {
+		return err
+	}
+	fmt.Println(key)
+}
+</code></pre>
+<p>Each element is one C value, so elements may be optional scalars
+(<code>iter.Seq[*int64]</code>), numeric lists (<code>iter.Seq[[]int32]</code>), records, or
+objects, each received like a return.</p>
+<h2 id="leak-checks"><a class="header" href="#leak-checks">Leak checks</a></h2>
+<p><code>DebugLive(kind)</code> reports the library’s live objects (0), callbacks (1),
+iterators (2), cancel tokens (3), and runs (4), and <code>DebugLive(-1)</code> is 1
+when the library counts at all. Every count is 0 unless the library was
+built with the <code>leak-check</code> feature. Wrappers you don’t close are released
+by cleanups, so run <code>runtime.GC()</code> (and give the cleanups a moment) before
+reading the counts.</p>
+<h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
+<ul>
+<li>The library is bound at link time, so there’s no run-time override of
+which library file loads beyond the platform loader’s search path, and
+<code>Check</code> reports a mismatched library only after the program has linked
+and started.</li>
+<li>A non-cancellable async call abandoned by its context keeps running in
+the library until it finishes.</li>
+<li>Vtables are never thread-affine, so a producer may call a Go callback
+from any thread; Go’s scheduler makes that safe.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../generators/dart.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../generators/ruby.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../generators/dart.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../generators/ruby.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

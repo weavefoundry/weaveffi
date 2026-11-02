@@ -1,0 +1,641 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Errors and Memory - WeaveFFI (dev)</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-1339018f.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-e1100732.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">WeaveFFI (dev)</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/weavefoundry/weaveffi" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="errors-and-memory"><a class="header" href="#errors-and-memory">Errors and Memory</a></h1>
+<p>This guide states who owns every value that crosses the C ABI and how
+failures travel back to the caller. The generated bindings follow these rules
+for you; they matter when you consume the C header directly, implement it by
+hand, or audit a binding. The <a href="../reference/abi.html">C ABI contract</a> is the
+normative text. Examples use the <code>kvstore</code> and <code>calculator</code> samples, whose
+prefixes are <code>kvstore</code> and <code>calculator</code>.</p>
+<h2 id="how-values-cross"><a class="header" href="#how-values-cross">How values cross</a></h2>
+<p>Every value crosses as exactly one C value, chosen by its family, in every
+position: a parameter, a return, an async result, an iterator item, and a
+callback method’s argument and return.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Family</th><th>IDL types</th><th>C value</th><th>Into the producer (parameter)</th><th>Out of the producer (return, async result, iterator item)</th><th>Callback argument</th><th>Callback return</th></tr>
+</thead>
+<tbody>
+<tr><td>Direct</td><td>integers, <code>f32</code>, <code>f64</code>, <code>bool</code>, C-style enums</td><td>the scalar (an enum is an <code>int32_t</code>)</td><td>copied</td><td>copied</td><td>copied</td><td>copied</td></tr>
+<tr><td>OptDirect</td><td><code>T?</code> of a Direct type</td><td><code>{p}_opt_{prim}</code> (<code>{bool has; T value;}</code>)</td><td>copied</td><td>copied</td><td>copied</td><td>copied</td></tr>
+<tr><td>Run</td><td><code>string</code>, <code>bytes</code>, typed arrays (<code>[i8]</code> … <code>[f64]</code>), and every record, rich enum, other optional, list, and map</td><td><code>{p}_run</code> (<code>{const uint8_t* ptr; size_t len;}</code>)</td><td>borrowed for the call</td><td>owned by the consumer: release with <code>{p}_run_free</code></td><td>borrowed for the call</td><td>allocated by the consumer with <code>{p}_alloc</code>; the producer adopts it</td></tr>
+<tr><td>Object</td><td>interfaces, <code>I?</code></td><td><code>const {p}_{I}*</code> as a parameter, <code>{p}_{I}*</code> elsewhere</td><td>borrowed for the call</td><td>one strong reference moves to the consumer: release with <code>{p}_{I}_destroy</code></td><td>one strong reference moves to the consumer</td><td>one strong reference (a fresh <code>_clone</code>) moves to the producer</td></tr>
+<tr><td>Callback</td><td>callback interfaces (parameters only)</td><td><code>{p}_{Cb}</code> (<code>{void* ctx; const vtable*}</code>)</td><td>the consumer’s; the producer calls <code>free(ctx)</code> once</td><td>never returned</td><td>never</td><td>never</td></tr>
+</tbody>
+</table>
+</div>
+<p><em>Borrowed</em> means the callee may read the value only until the call returns
+and copies anything it keeps. Everything a producer hands back belongs to the
+receiver, who releases it exactly once. The transfers in the other direction
+are a callback method’s return value, which the producer adopts, and an
+object passed to a callback, which the consumer adopts.</p>
+<h2 id="runs"><a class="header" href="#runs">Runs</a></h2>
+<p>Every string, bytes, typed array, and value buffer is a <strong>run</strong>: a pointer
+and a length in <strong>bytes</strong>, passed by value. The producer owns the allocator
+for every run it hands out (a return, an async result, an iterator item, an
+error’s message and payload), and two runtime functions manage runs:</p>
+<pre><code class="language-c">uint8_t* kvstore_alloc(size_t len);       /* a zero-filled, 8-aligned run; NULL for 0 */
+void kvstore_run_free(kvstore_run run);   /* returned runs and alloc runs */
+</code></pre>
+<p>Every run the producer allocates has alignment 8, so a consumer can read a
+returned run in place as any element type (a typed array of <code>double</code>, say)
+without copying it first.</p>
+<p>A consumer releases a returned run with <code>{p}_run_free</code>, passing it back
+exactly as it got it. It allocates a run with <code>{p}_alloc(len)</code> only when it
+hands bytes <em>to</em> the producer: a callback method’s string, bytes, typed
+array, or buffer return, which the producer adopts and frees, or (on
+<code>wasm32</code>) an argument staged in the module’s linear memory. Null with length
+<code>0</code> is the empty run everywhere: <code>{p}_alloc(0)</code> returns null, and freeing
+the empty run is a no-op; a null pointer with a non-zero length is
+malformed. Never free a run with the language’s own allocator, and never
+hand the producer memory that didn’t come from <code>{p}_alloc</code> where it adopts
+it. An error’s message and payload are released with the error
+(<code>{p}_error_clear</code> or <code>{p}_error_free</code>), never with <code>{p}_run_free</code>.</p>
+<h2 id="strings-bytes-and-typed-arrays"><a class="header" href="#strings-bytes-and-typed-arrays">Strings, bytes, and typed arrays</a></h2>
+<p>A <code>string</code> is UTF-8 and never NUL-terminated, so an interior NUL survives the
+trip. A string that isn’t valid UTF-8, or a run with a null pointer and a
+non-zero length, fails the call with the marshalling code <code>-3</code>.</p>
+<pre><code class="language-c">/* The calculator sample's `greet(name: string) -&gt; string`. */
+calculator_error err;
+calculator_run name = {(const uint8_t*)"Ada", 3};
+calculator_run text = calculator_greet(name, &amp;err);
+if (err.code == 0) {
+    printf("%.*s\n", (int)text.len, (const char*)text.ptr);
+    calculator_run_free(text);
+}
+</code></pre>
+<p>A list of <code>i8</code>, <code>i16</code>, <code>i32</code>, <code>i64</code>, <code>u16</code>, <code>u32</code>, <code>u64</code>, <code>f32</code>, or <code>f64</code> is
+a <strong>typed array</strong>: a run of the packed native elements. Its <code>len</code> still
+counts bytes (a multiple of the element size), and its pointer must be
+aligned for the element; a ragged or misaligned array fails with <code>-3</code>.
+<code>[u8]</code> is <code>bytes</code>, and <code>[bool]</code> is a value buffer, because its bytes must
+be checked.</p>
+<pre><code class="language-c">/* calculator's `running_total(values: [i32]) -&gt; [i32]`. */
+const int32_t xs[] = {1, 2, 3};
+calculator_run in = {(const uint8_t*)xs, sizeof xs};
+calculator_run out = calculator_running_total(in, &amp;err);
+const int32_t* totals = (const int32_t*)out.ptr;   /* {1, 3, 6}: out.len / 4 elements */
+calculator_run_free(out);
+</code></pre>
+<h2 id="optional-scalars"><a class="header" href="#optional-scalars">Optional scalars</a></h2>
+<p>An optional integer, float, <code>bool</code>, or C-style enum (<code>i64?</code>, <code>Kind?</code>) is a
+<code>{p}_opt_{prim}</code> struct, <code>{bool has; T value;}</code>, passed and returned by
+value; an optional enum is a <code>{p}_opt_i32</code>. <code>value</code> is <code>0</code> when <code>has</code> is
+false, and a present value is still range-checked, so an undeclared enum
+value fails with <code>-3</code>. Nothing is allocated, so nothing is freed.</p>
+<pre><code class="language-c">/* kvstore's `Store.expires_at(key: string) -&gt; i64?`. */
+kvstore_opt_i64 at = kvstore_Store_expires_at(store, key, &amp;err);
+if (err.code != 0) {
+    kvstore_error_clear(&amp;err);                          /* failed */
+} else if (at.has) {
+    printf("expires at %lld\n", (long long)at.value);
+}                                                       /* else: no expiry */
+</code></pre>
+<h2 id="value-buffers"><a class="header" href="#value-buffers">Value buffers</a></h2>
+<p>Records, rich enums, the remaining optionals (all but <code>Interface?</code>), lists,
+and maps cross as one serialized <a href="../reference/value-buffers.html">value buffer</a>
+in a run, however deep the nesting. A parameter is a run the caller encodes
+and frees itself. A return is one producer allocation the consumer decodes
+and then releases once with <code>{p}_run_free</code>; the strings and records it
+decodes are copies, so nothing inside is freed separately. The exception is
+an object token inside a buffer, which carries one strong reference the
+reader adopts. Inside a buffer, optional scalars and numeric lists use the
+buffer encoding like every other type.</p>
+<h2 id="objects"><a class="header" href="#objects">Objects</a></h2>
+<p>Interface objects are reference counted by the producer (an <code>Arc&lt;T&gt;</code> in a
+Rust producer). Each interface has two lifecycle functions:</p>
+<pre><code class="language-c">kvstore_Store* kvstore_Store_clone(const kvstore_Store* self);  /* +1 */
+void kvstore_Store_destroy(kvstore_Store* self);                /* -1 */
+</code></pre>
+<p>A pointer is a strong reference. <code>_clone</code> returns another reference to the
+same object (the pointer value is unchanged), <code>_destroy</code> releases one, and
+the object is dropped when the last reference goes. Both accept null as a
+no-op.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Position</th><th>Rule</th></tr>
+</thead>
+<tbody>
+<tr><td>parameter (<code>Store</code>, <code>Store?</code>)</td><td>borrowed for the call; the producer takes its own reference if it keeps the object</td></tr>
+<tr><td>return, async result, iterator element</td><td>one strong reference moves to the consumer</td></tr>
+<tr><td>callback method argument</td><td>one strong reference moves to the consumer</td></tr>
+<tr><td>callback method return</td><td>one strong reference moves to the producer</td></tr>
+<tr><td>token inside a value buffer (either direction)</td><td>carries one strong reference; the reader adopts it</td></tr>
+</tbody>
+</table>
+</div>
+<p>Two consequences follow. A consumer that encodes an object into a buffer
+must call <code>_clone</code> and write the new pointer, never the one its wrapper
+holds. And a buffer that contains objects is decoded exactly once, because
+each token is one reference.</p>
+<p>Every generated wrapper owns exactly one reference and releases it through
+the language’s disposal idiom (<code>close()</code>, <code>Dispose()</code>, <code>deinit</code>, a C++
+destructor, <code>Close()</code>), with a finalizer or cleaner backstop where the
+runtime has one. Each binding also keeps the wrapper alive for the duration
+of every native call, so a wrapper that becomes unreachable mid-call can’t
+free the object under it. An in-flight async call holds its own reference.</p>
+<h2 id="callback-interfaces"><a class="header" href="#callback-interfaces">Callback interfaces</a></h2>
+<p>A callback-interface parameter is one <code>{p}_{Cb}</code> struct passed by value:
+<code>{void* ctx; const {p}_{Cb}_vtable* vtable;}</code>. The consumer owns <code>ctx</code> (a
+generated binding uses a key into a table that keeps the implementation
+alive) and a static vtable per interface, whose header records its <code>size</code>,
+its <code>flags</code>, and its <code>free</code> hook, followed by one entry per method in
+declaration order. A null <code>vtable</code> is none (<code>Cb?</code>). From the
+<a href="producer-macro.html#callback-interfaces">macro tour</a>:</p>
+<pre><code class="language-c">typedef struct macro_tour_Listener { void* ctx; const macro_tour_Listener_vtable* vtable; } macro_tour_Listener;
+struct macro_tour_Listener_vtable {
+    uint32_t size;            /* sizeof the vtable, as the consumer compiled it */
+    uint32_t flags;           /* 0, or MACRO_TOUR_VTABLE_THREAD_AFFINE */
+    void (*free)(void* ctx);
+    bool (*approve)(void* ctx, macro_tour_run contact, macro_tour_error* out_err);
+    void (*on_change)(void* ctx, macro_tour_run change, macro_tour_error* out_err);
+};
+</code></pre>
+<p>The producer may call any entry, any number of times, from any thread
+(subject to <a href="#thread-affine-callbacks">thread affinity</a>), until it calls
+<code>free(ctx)</code> exactly once; <code>free</code> may also run on any producer thread.</p>
+<p><strong>Vtables are open.</strong> A consumer generated before a method was appended
+passes a shorter vtable, and the producer accepts it: calling a method past
+the consumer’s <code>size</code>, or one whose entry is null, fails with <code>-4</code> and a
+message naming the method, without calling anything. A vtable shorter than
+its header fails the call that passed it with <code>-3</code>.</p>
+<p><strong>Arguments</strong> to a callback method are lent for the call: runs must be
+copied or decoded before returning, and objects move one reference to the
+consumer. <strong>Returns</strong> move to the producer: a run the consumer returns is
+one it allocated with <code>{p}_alloc(len)</code>, which the producer adopts and frees,
+and an object is a fresh <code>_clone</code>. The producer adopts whatever the method
+returned even when it failed, so a consumer that fails after allocating
+doesn’t leak. A return the producer can’t accept (text that isn’t UTF-8, a
+null <code>I</code>, an out-of-range enum value, a malformed buffer, a misaligned
+array) fails the method with <code>-3</code>.</p>
+<h3 id="thread-affine-callbacks"><a class="header" href="#thread-affine-callbacks">Thread-affine callbacks</a></h3>
+<p>Some runtimes can only run a value-returning callback on one thread: a Dart
+callback that returns a value must run on its isolate’s thread. Such a
+binding sets bit 0 of the vtable’s <code>flags</code>, <code>{P}_VTABLE_THREAD_AFFINE</code>. The
+producer then records the thread that passed it the vtable, and a method
+that returns a value, called from any other thread, fails with <code>-4</code> and the
+message <code>callback called off its thread</code> without reaching the consumer.
+<code>void</code> methods and <code>free</code> may still run on any thread, and the binding
+forwards them to its own thread. In a Rust producer the failure arrives as a
+<code>ForeignError</code> converted into the method’s error type, like any other
+callback failure. Only the Dart target sets the flag; every other target
+passes <code>0</code>.</p>
+<h2 id="iterators"><a class="header" href="#iterators">Iterators</a></h2>
+<p>An <code>iter&lt;T&gt;</code> return is an opaque <code>{p}_..._Iterator*</code>. <code>_next(iter, &amp;item, &amp;err)</code> writes one element and returns <code>1</code>, or returns <code>0</code> at the end; each
+element is owned by the consumer under the return rules above. <code>_next</code>
+checks that <code>out_item</code> is non-null before it pulls an element, so a bad call
+never loses one. <code>_destroy</code> is called exactly once, on exhaustion or when the
+consumer abandons the iteration early. The generated wrappers do both. An
+iterator is advanced by one caller at a time: a <code>_next</code> that arrives while
+another is in progress on the same iterator (from another thread, or
+re-entrantly from a callback the producer’s <code>next</code> calls) fails with <code>-3</code>
+rather than blocking.</p>
+<pre><code class="language-c">/* kvstore's `Store.keys(prefix: string?) -&gt; iter&lt;string&gt;`. */
+kvstore_Store_KeysIterator* keys = kvstore_Store_keys(store, no_prefix, &amp;err);
+kvstore_run key;
+while (kvstore_Store_KeysIterator_next(keys, &amp;key, &amp;err) == 1) {
+    printf("%.*s\n", (int)key.len, (const char*)key.ptr);
+    kvstore_run_free(key);
+}
+kvstore_Store_KeysIterator_destroy(keys);
+</code></pre>
+<h2 id="errors"><a class="header" href="#errors">Errors</a></h2>
+<h3 id="the-error-struct"><a class="header" href="#the-error-struct">The error struct</a></h3>
+<p>Every synchronous function, interface member, iterator launcher, and
+iterator <code>_next</code> takes a trailing <code>{p}_error* out_err</code>:</p>
+<pre><code class="language-c">typedef struct kvstore_error {
+    int32_t code;                /* 0 success, &gt;0 domain code, &lt;0 runtime code */
+    const uint8_t* message_ptr;  /* UTF-8, NOT NUL-terminated, producer-owned */
+    size_t message_len;
+    const uint8_t* payload_ptr;  /* the code's fields as a value buffer, or NULL */
+    size_t payload_len;
+} kvstore_error;
+</code></pre>
+<p>The call <strong>overwrites</strong> the slot without reading it: on success it stores a
+cleared error, and on failure it stores the code, message, and payload and
+returns a zero value (<code>0</code>, <code>false</code>, <code>NULL</code>, the empty run, an absent
+optional) that must not be used or freed. So the caller may pass
+uninitialized memory, and after reading a failure it releases the message
+and payload with <code>{p}_error_clear(&amp;err)</code>. A struct reused for many calls must
+be cleared after each failure, or the message leaks.</p>
+<p>The message is <code>message_len</code> bytes of UTF-8 at <code>message_ptr</code>, with no NUL
+terminator, so print it with a length (<code>%.*s</code>) or copy it. An empty message
+is a null <code>message_ptr</code> with length <code>0</code>, even when <code>code</code> is non-zero.</p>
+<pre><code class="language-c">kvstore_error err;
+uint64_t n = kvstore_Store_count(store, &amp;err);
+if (err.code != 0) {
+    fprintf(stderr, "count failed (%d): %.*s\n",
+            err.code, (int)err.message_len, (const char*)err.message_ptr);
+    kvstore_error_clear(&amp;err);
+}
+</code></pre>
+<p>An async completion receives a heap-boxed error instead (or <code>NULL</code> on
+success), released with <code>{p}_error_free</code>, which also frees the box.
+<code>_clone</code>, <code>_destroy</code>, an iterator’s <code>_destroy</code>, and async launchers take no
+<code>out_err</code>.</p>
+<h3 id="codes"><a class="header" href="#codes">Codes</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Code</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>0</code></td><td>success</td></tr>
+<tr><td><code>&gt; 0</code></td><td>a code of the <a href="../reference/idl.html#error-domains">error domain</a> the callable throws</td></tr>
+<tr><td><code>-1</code></td><td>untyped: the failure of a <code>throws: any</code> callable, or an async call the executor couldn’t start</td></tr>
+<tr><td><code>-2</code></td><td>the producer panicked; the message carries the panic text</td></tr>
+<tr><td><code>-3</code></td><td>marshalling failure: a null run with a non-zero length, a null <code>self</code> or object where one is required, invalid UTF-8, a <code>bool</code> byte other than <code>0</code> or <code>1</code>, an out-of-range enum value or integer conversion (a <code>usize</code> that doesn’t fit, a <code>char</code> that isn’t one scalar), a ragged or misaligned typed array, a custom type’s <code>lift</code> rejecting its input, a malformed value buffer (including a map with a repeated key), an incomplete vtable header, an iterator advanced concurrently</td></tr>
+<tr><td><code>-4</code></td><td>a consumer’s callback-interface implementation failed, doesn’t implement the method called, or was called off its thread; the message is the consumer’s or names the method</td></tr>
+<tr><td><code>-5</code></td><td>cancelled: an async call’s cancel token fired, or its executor dropped it (async completions only)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Domain codes are positive, so the two ranges never collide. Code values are
+unique only within a domain (the calculator sample’s
+<code>CalcError.DivisionByZero</code> and <code>ParseError.NotANumber</code> are both <code>1</code>), so a
+binding interprets a positive code by the domain of the callable that
+reported it. The C header declares each domain as a <code>typedef int32_t</code> with
+its codes as constants (<code>kvstore_KvError_KeyNotFound = 1001</code>).</p>
+<h3 id="domain-errors-and-the-trap-channel"><a class="header" href="#domain-errors-and-the-trap-channel">Domain errors and the trap channel</a></h3>
+<p>Every callable has one error strategy, recorded on it in the model, and
+every target applies it the same way:</p>
+<ul>
+<li><strong>Domain</strong> (<code>throws: KvError</code>). A positive code is a typed domain error:
+an exception subclass, a Swift <code>Error</code> case, a Go <code>error</code> value, carrying
+the code, the producer’s message, and the payload fields as properties.
+<strong>Domains are open</strong>: a positive code the binding wasn’t generated with
+(the producer gained a code since) surfaces as the domain’s base error
+type with the code and message preserved, and its payload is discarded
+undecoded. A negative code surfaces as the package’s root error type with
+that code.</li>
+<li><strong>Untyped</strong> (<code>throws: any</code>). Failure is <code>-1</code> with a message, and surfaces
+as the package’s root error type carrying the message. There’s no code to
+match on. Negative runtime codes surface the same way.</li>
+<li><strong>Trap</strong> (no <code>throws</code>). The function can’t report an error, so any
+non-zero code is a bug, and the binding traps on it (see
+<a href="#the-trap-policy">the trap policy</a>). It never dresses the code up as a
+domain error.</li>
+</ul>
+<p>Under every strategy, <code>-5</code> on an async call surfaces as the language’s own
+cancellation error (see <a href="async.html">Async and Cancellation</a>).</p>
+<p>Error types are named after the IDL (each target’s root error has a fixed
+name or the package’s; see <a href="../reference/naming.html#errors">Naming</a>), never
+after WeaveFFI. Every target derives a domain’s type name from its IDL name with one shared
+rule (see <a href="../reference/naming.html#errors">Naming</a>): <code>KvError</code> stays
+<code>KvError</code> (or becomes <code>KvException</code>), and <code>Failure</code> becomes <code>FailureError</code>.</p>
+<p>A Rust producer’s domain error message is its <code>Display</code> output, generated
+from the variant’s <code>#[weaveffi(message = "...")]</code> template or doc comment.
+The IDL’s <code>message:</code> (a Rust variant’s template, else its doc comment’s
+first line) is the documented default that generated docs and consumer-side
+constructors use.</p>
+<h3 id="the-trap-policy"><a class="header" href="#the-trap-policy">The trap policy</a></h3>
+<p>A failure of a call that can’t report one is a producer bug (a panic, an
+argument the producer couldn’t lift, a callback failure it let through a
+call that can’t report one), and every binding treats it the same way: it
+raises the language’s unchecked error rather than a declared one, naming the
+runtime code and the producer’s message so the bug can be diagnosed from the
+report. In C, the caller reads <code>err.code</code> itself; Swift, which has no
+unchecked errors, stops with <code>fatalError</code>; Go panics; the other targets
+throw an error type outside the domain hierarchy. Each language page names
+its exact type. Cancellation (<code>-5</code>) isn’t a bug and always surfaces as the
+language’s cancellation error.</p>
+<h3 id="load-time-checks"><a class="header" href="#load-time-checks">Load-time checks</a></h3>
+<p>Before the first call, every binding checks the library’s ABI revision and
+the <a href="../reference/abi.html#load-time-checks">contract</a> of every declaration it
+was generated with. A failed check is a <strong>catchable</strong> error, never a crash,
+so an application can report a stale or mismatched library and carry on: the
+language’s load or import error where loading can fail, and a check function
+where it can’t (Swift and Go). A C consumer compares <code>{p}_abi_version()</code>
+with <code>{P}_ABI_VERSION</code> and calls <code>{p}_contract_check()</code> itself, as
+<a href="../getting-started.html#call-it-from-c">Getting Started</a> shows.</p>
+<p>The message names the declaration that’s missing or changed (“<code>Store.get</code>
+changed since these bindings were generated”). Declarations the library has
+and the bindings don’t are fine.</p>
+<h3 id="payloads"><a class="header" href="#payloads">Payloads</a></h3>
+<p>An error code may declare fields. When the producer raises it, the fields are
+serialized into <code>payload_ptr</code>/<code>payload_len</code> in the value-buffer format, and
+each binding exposes them as properties of the error it raises. A code with
+no fields leaves the payload null. <code>{p}_error_clear</code> and <code>{p}_error_free</code>
+release the payload with the message. A payload never carries an object (a
+binding that doesn’t know a code discards its payload undecoded).</p>
+<h3 id="when-a-callback-fails"><a class="header" href="#when-a-callback-fails">When a callback fails</a></h3>
+<p>A consumer’s callback implementation can fail in the consumer’s language. The
+binding catches the failure in its trampoline and reports it through the
+vtable entry’s <code>out_err</code> with the runtime surface:</p>
+<pre><code class="language-c">void kvstore_error_set(kvstore_error* err, int32_t code,
+                       const uint8_t* message_ptr, size_t message_len);
+void kvstore_error_set_payload(kvstore_error* err, const uint8_t* ptr, size_t len);
+</code></pre>
+<p>Both copy their arguments with the producer’s allocator; a consumer never
+stores its own allocation in the struct. What the consumer reports follows
+the method’s strategy:</p>
+<ul>
+<li>A method that throws a domain (<code>throws: KvError</code>) may report a positive
+code of that domain, attaching the code’s fields encoded as a value buffer
+with <code>{p}_error_set_payload</code>. Any other failure it reports as <code>-1</code> with a
+message.</li>
+<li>A method that throws <code>any</code> reports <code>-1</code> with a message.</li>
+<li>A method that declares no errors reports <code>-4</code> with a message (any non-zero
+code is accepted).</li>
+</ul>
+<p>On the producer’s side, a declared code whose payload decodes arrives as
+that typed error. Everything else (<code>-1</code>, a code the domain doesn’t declare,
+any failure of a method without a domain) reaches the producer as a callback
+failure, <code>-4</code> with the consumer’s message, so a consumer bug can’t
+impersonate a domain error.</p>
+<p>The producer decides what the failure means for the call in progress.
+Nothing unwinds and nothing is deferred: in a Rust producer every callback
+trait method returns <code>Result&lt;T, E&gt;</code> with <code>E: From&lt;weaveffi::ForeignError&gt;</code>,
+and the failure arrives as an <code>Err</code>. When <code>E</code> is the method’s domain, a
+typed code arrives as its variant (with the message re-rendered from its
+fields by the domain’s <code>Display</code>), and any other failure is converted from a
+<code>ForeignError</code>. A producer function propagates the failure with <code>?</code> into its
+own error type. Mapping <code>ForeignError</code> into a variant of the function’s
+domain (the <a href="producer-macro.html#callback-interfaces">macro tour</a>’s
+<code>BookError::ListenerFailed</code>) keeps the call typed for the original caller;
+returning <code>ForeignError</code> itself makes the function <code>throws: any</code>, so the
+original caller sees <code>-1</code> with the consumer’s message.</p>
+<h3 id="panics"><a class="header" href="#panics">Panics</a></h3>
+<p>A Rust producer’s generated functions catch panics and report them as <code>-2</code>.
+Destructors (<code>_destroy</code>) have no error slot, so a panic in a <code>Drop</code>
+implementation is swallowed rather than unwinding into C. Async functions
+report panics through the completion callback.</p>
+<h2 id="leak-checks"><a class="header" href="#leak-checks">Leak checks</a></h2>
+<p><code>{p}_debug_live(kind)</code> reports how many resources are live, so a test
+harness can assert that a consumer released everything: <code>0</code> objects, <code>1</code>
+foreign callbacks, <code>2</code> iterators, <code>3</code> cancel tokens, and <code>4</code> runs (returned
+runs, error messages and payloads not yet cleared, and <code>{p}_alloc</code> runs not
+yet freed or adopted). Kind <code>-1</code> returns <code>1</code> when the producer counts at all
+and <code>0</code> when it doesn’t, so a harness can tell “nothing is live” from
+“nothing is counted”. A Rust producer counts only with the <code>weaveffi</code>
+crate’s <code>leak-check</code> feature; without it every kind returns <code>0</code>. A consumer
+that keeps a failed error around without clearing it shows up as a live run.</p>
+<h2 id="thread-safety"><a class="header" href="#thread-safety">Thread safety</a></h2>
+<p>Every <code>#[weaveffi::interface]</code> type is <code>Send + Sync</code> (the macro asserts it),
+so a macro-built producer may be called from any thread, and the bindings add
+no thread restriction of their own. Callback methods and async completions
+may arrive on any producer thread; each binding hops to its own scheduler
+where the language requires it, and the Dart binding marks its vtables
+<a href="#thread-affine-callbacks">thread-affine</a>. A hand-written producer with
+thread-affine state should document it, and must honor the vtable flag.</p>
+<h2 id="pitfalls"><a class="header" href="#pitfalls">Pitfalls</a></h2>
+<ul>
+<li><strong>Treating <code>len</code> as an element count.</strong> A typed array’s <code>len</code> counts
+bytes, like every run’s.</li>
+<li><strong>Reading the message as a C string.</strong> It isn’t NUL-terminated and may be
+null; use <code>message_len</code>.</li>
+<li><strong>Freeing borrowed inputs.</strong> Parameters are the caller’s; never pass them
+to <code>run_free</code> or <code>_destroy</code>.</li>
+<li><strong>Misaligned typed arrays.</strong> A typed-array parameter must be aligned for
+its element; slicing a byte buffer at an odd offset fails the call with
+<code>-3</code>.</li>
+<li><strong>Encoding an object without <code>_clone</code>.</strong> The token hands away a reference
+your wrapper still needs; the later <code>_destroy</code> over-releases.</li>
+<li><strong>Decoding an object-carrying buffer twice.</strong> The second decode adopts
+references that no longer exist.</li>
+<li><strong>Not clearing an error after a failure.</strong> The message and payload leak.</li>
+<li><strong><code>error_clear</code> on an async error.</strong> It leaks the box; use <code>error_free</code>.</li>
+<li><strong>Freeing a callback’s returned run.</strong> A run a callback method returns
+belongs to the producer once returned; allocate it with <code>{p}_alloc</code> and
+don’t free it.</li>
+<li><strong>Holding a lock across a callback call.</strong> The consumer’s implementation
+may call back into the producer, which then waits on the lock you hold;
+snapshot state, release the lock, then call.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../guides/producer-macro.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../guides/async.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../guides/producer-macro.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../guides/async.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,676 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Swift - WeaveFFI (dev)</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-1339018f.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-e1100732.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">WeaveFFI (dev)</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/weavefoundry/weaveffi" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="swift"><a class="header" href="#swift">Swift</a></h1>
+<p>The Swift target emits a standalone SwiftPM package that wraps the
+<a href="../reference/abi.html">C ABI</a> (revision 6) in idiomatic Swift: <code>throws</code> with
+typed <code>Error</code> enums for declared errors, plain <code>Hashable</code> structs and enums
+for values, ARC-managed <code>final class</code> wrappers for objects, class-bound
+protocols for callback interfaces, <code>async</code> functions with task cancellation
+for async callables, and lazy <code>Sequence</code>s for iterators.</p>
+<p>Swift is a <a href="../stability.html#target-tiers">Tier 1</a> target: it tracks every
+ABI revision as it lands and runs the full conformance suite in CI.</p>
+<h2 id="what-gets-generated"><a class="header" href="#what-gets-generated">What gets generated</a></h2>
+<p>For a package named <code>kvstore</code>:</p>
+<pre><code class="language-text">swift/
+  Package.swift
+  Sources/
+    CKvstore/
+      kvstore.h              # copy of the C header
+      module.modulemap       # system library: links `kvstore`
+    Kvstore/
+      Kvstore.swift          # the wrapper API
+      WeaveFFIRuntime.swift  # runtime support: load check, codec, errors
+</code></pre>
+<p>The package, product, and Swift module are the package name in PascalCase
+(<code>key-store</code> becomes <code>KeyStore</code>); set <code>[generators.swift] name</code> to
+override it. The C module is always the Swift module’s name with a <code>C</code> prefix.
+The C symbol prefix and the native library name come from the package
+identity. <code>WeaveFFIRuntime.swift</code> depends only on those names, so it changes
+only when they do.</p>
+<p>A library is one namespace, and so is its Swift module. Records, enums,
+error domains, interfaces, and callback protocols sit at file scope, and
+each free function is a top-level <code>public func</code>. A consumer calls one
+unqualified, or qualified with the module name when another module declares
+the same name:</p>
+<pre><code class="language-swift">import Kvstore
+
+let store = try await Kvstore.openStore(path: "/data")
+let stats = try summarize(store: store, prefix: nil)
+</code></pre>
+<p>Parameters, methods, record fields, and enum cases are lowerCamelCase
+(<code>expiresAt</code>, <code>.keyNotFound</code>), and every argument is labeled
+(<code>summarize(store: store, prefix: nil)</code>). Doc comments carry over, with
+backticked API names in their Swift spelling (<code>`new_op`</code> becomes
+<code>`newOp`</code>), and deprecated declarations get
+<code>@available(*, deprecated, message:)</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>[generators.swift]</code> key</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>name</code></td><td><code>PascalCase(name)</code></td><td>Package, product, and module name</td></tr>
+<tr><td><code>min_macos</code>, <code>min_ios</code></td><td><code>"11.0"</code>, <code>"13.0"</code></td><td>The manifest’s <code>platforms:</code></td></tr>
+<tr><td><code>xcframework_url</code></td><td>a placeholder</td><td>Where the packaged binary target downloads <code>C{Module}.xcframework.zip</code>; <code>{version}</code> and <code>{file}</code> are substituted</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="build-and-link"><a class="header" href="#build-and-link">Build and link</a></h2>
+<p>The package builds as-is with SwiftPM 5.9 or later (its manifest declares
+<code>swift-tools-version:5.9</code>, so it compiles in the Swift 5 language mode); the
+sources also compile without warnings in the Swift 6 language mode, with
+complete concurrency checking. Depend on it by path or from a repository,
+and tell the linker where <code>libkvstore</code> lives:</p>
+<pre><code class="language-swift">dependencies: [.package(path: "bindings/swift")],
+targets: [
+    .executableTarget(name: "App", dependencies: [.product(name: "Kvstore", package: "swift")]),
+]
+</code></pre>
+<pre><code class="language-bash">swift build -Xlinker -L/path/to/lib
+</code></pre>
+<p>Swift binds the library at link time, so at run time the dynamic loader finds
+it the usual way (its install name, an rpath, or <code>DYLD_LIBRARY_PATH</code> and
+<code>LD_LIBRARY_PATH</code>). The <code>{PREFIX}_LIBRARY</code> variable other targets honor
+doesn’t apply. There’s no generated glue: the Swift module calls the C
+header’s functions directly.</p>
+<p>When a <code>CKvstore.xcframework</code> sits next to <code>Package.swift</code>, the manifest uses
+it as a binary target instead of the system library, so apps link without
+flags.</p>
+<p><code>weaveffi package</code> (on macOS) fuses the static libraries of every Apple
+platform built (macOS, iOS, the iOS simulator) into
+<code>CKvstore.xcframework.zip</code>, writes its SHA-256 checksum, and writes the
+package <code>swift/Kvstore/</code>, whose manifest declares <code>CKvstore</code> as
+<code>.binaryTarget(url:checksum:)</code> at <code>xcframework_url</code>. Upload the archive there
+and publish the package; apps on any Apple platform then link with no flags
+(see <a href="../guides/packaging.html#swift-and-the-xcframework">Packaging</a>).</p>
+<h2 id="load-time-checks"><a class="header" href="#load-time-checks">Load-time checks</a></h2>
+<p>Before the first call (the first constructor, static, or free function), the
+bindings check, once per process, that the library implements C ABI
+revision 6 and that every declaration they were generated with has the same
+<a href="../reference/abi.html#the-contract">contract</a>: each declaration’s contract
+function must return the hash of the signature the bindings saw. The rows
+are embedded in the wrapper, one per function, interface, member, record,
+enum, callback interface, callback method, error domain, and error code:</p>
+<pre><code class="language-swift">func wvCheckContracts() -&gt; KvstoreLibrary.LoadError? {
+    wvCheckContract([
+        (kvstore_contract_7b4181d5fd2958e8, 0x8d469dd20baca093, "Store.open"),
+        // ...one row per declaration
+    ])
+}
+</code></pre>
+<p>The contract functions are linked like every other symbol, so a library
+that lacks a declaration fails to link. Declarations, error codes, and
+callback methods the library adds are fine. To handle a mismatch, call
+<code>{Module}Library.check()</code> at startup. It runs the checks (or returns their
+cached result) and throws a <code>LoadError</code> naming the first mismatch:</p>
+<pre><code class="language-swift">do {
+    try KvstoreLibrary.check()
+} catch let error as KvstoreLibrary.LoadError {
+    // .abiMismatch(found:expected:) or .changed(declaration:)
+    print(error.localizedDescription)
+}
+</code></pre>
+<pre><code class="language-text">Kvstore: the native library 'kvstore' implements C ABI revision 5, but these bindings need revision 6
+Kvstore: Store.put changed since these bindings were generated; regenerate the bindings or rebuild the library 'kvstore'
+</code></pre>
+<p>A call made while the library doesn’t match stops the process with the same
+message, whether or not <code>check()</code> ran, since a stale binding would otherwise
+corrupt memory. <code>KvstoreLibrary.abiVersion</code> is the revision the bindings
+need.</p>
+<h2 id="type-mapping"><a class="header" href="#type-mapping">Type mapping</a></h2>
+<p>Every value crosses the C ABI as one C value, by value, in every position: a
+parameter, a return, an async result, an iterator item, and a callback
+method’s argument and return.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>IDL type</th><th>Swift type</th><th>At the ABI</th></tr>
+</thead>
+<tbody>
+<tr><td><code>i8</code> to <code>i64</code>, <code>u8</code> to <code>u64</code></td><td><code>Int8</code> to <code>Int64</code>, <code>UInt8</code> to <code>UInt64</code></td><td>The scalar</td></tr>
+<tr><td><code>f32</code>, <code>f64</code></td><td><code>Float</code>, <code>Double</code></td><td>The scalar</td></tr>
+<tr><td><code>bool</code></td><td><code>Bool</code></td><td>C <code>bool</code></td></tr>
+<tr><td><code>string</code></td><td><code>String</code></td><td>A run of UTF-8</td></tr>
+<tr><td><code>bytes</code></td><td><code>Data</code></td><td>A run of bytes</td></tr>
+<tr><td>C-style enum</td><td><code>enum E: Int32, CaseIterable, Sendable</code></td><td><code>int32_t</code></td></tr>
+<tr><td>Record</td><td><code>struct</code>, <code>Hashable</code> and <code>Sendable</code></td><td>A run holding a value buffer</td></tr>
+<tr><td>Rich enum</td><td><code>enum</code> with associated values, <code>Hashable</code> and <code>Sendable</code></td><td>A run holding a value buffer</td></tr>
+<tr><td><code>T?</code> of a number, <code>bool</code>, or C-style enum</td><td><code>T?</code></td><td>A <code>{prefix}_opt_{prim}</code> struct</td></tr>
+<tr><td><code>[T]</code> of a number other than <code>u8</code></td><td><code>[T]</code></td><td>A run holding the packed elements (a typed array)</td></tr>
+<tr><td>Any other <code>T?</code>, <code>[T]</code>, <code>{K: V}</code></td><td><code>T?</code>, <code>[T]</code>, <code>[K: V]</code></td><td>A run holding a value buffer</td></tr>
+<tr><td>Interface</td><td><code>final class</code>, <code>Hashable</code> by identity, <code>@unchecked Sendable</code></td><td>Object pointer</td></tr>
+<tr><td><code>Interface?</code></td><td>optional wrapper</td><td>Nullable pointer</td></tr>
+<tr><td>Callback interface</td><td><code>any P</code>, where <code>protocol P: AnyObject, Sendable</code></td><td>A <code>{prefix}_{P}</code> struct of a context and a vtable</td></tr>
+<tr><td><code>Callback?</code></td><td><code>(any P)?</code></td><td>The same struct, with a null vtable for <code>nil</code></td></tr>
+<tr><td><code>iter&lt;T&gt;</code></td><td><code>NativeSequence&lt;T&gt;</code></td><td>Iterator handle</td></tr>
+</tbody>
+</table>
+</div>
+<p>A run is the C header’s <code>{prefix}_run</code>, <code>{ ptr, len }</code> with <code>len</code> in bytes,
+which the runtime calls <code>WvRun</code>. A parameter lends the Swift value’s own
+storage for the call (<code>withUTF8</code>, <code>withUnsafeBytes</code>), or its encoding for a
+value buffer, with no copy; a returned run is copied once (or decoded in
+place) and then released with <code>{prefix}_run_free</code>. Strings cross as their
+UTF-8 bytes with a length, so interior NULs survive. An optional scalar
+(<code>Int64?</code>, <code>Bool?</code>, <code>Priority?</code>) crosses as its <code>{prefix}_opt_{prim}</code>
+struct (<code>has</code> and <code>value</code>) in every position, never through a buffer.
+Floats round-trip bit for bit, including NaN and <code>-0.0</code>. <code>usize</code> and
+<code>isize</code> in a Rust producer are <code>u64</code> and <code>i64</code> (<code>UInt64</code>, <code>Int64</code>); a
+<code>char</code> and a custom type cross as their IDL type (usually <code>String</code>).</p>
+<pre><code class="language-swift">public func get(key: String) throws -&gt; Entry {
+    var err = WvError()
+    let rv: WvRun = wvWithUTF8(key) { key_run in
+        kvstore_Store_get(self.ptr, key_run, &amp;err)
+    }
+    try wvCheck(&amp;err, KvError.self)
+    return wvTakeBuffer(rv, as: Entry.self)
+}
+</code></pre>
+<p>Every type that crosses inside a value buffer conforms to the internal
+<code>WvCodable</code> protocol: the primitives in the runtime, <code>Optional</code>, <code>Array</code>, and
+<code>Dictionary</code> generically, and each record, enum, and interface where it’s
+declared. A composite type such as <code>[String: [Entry?]]</code> therefore has one
+encoder and one decoder, the generic ones, rather than a loop at each use:</p>
+<pre><code class="language-swift">extension Entry: WvCodable {
+    static func wvRead(_ r: inout WvReader) -&gt; Entry {
+        Entry(key: r.read(), value: r.read(), kind: r.read(), version: r.read(), expiresAt: r.read(), tags: r.read(), metadata: r.read())
+    }
+
+    func wvWrite(_ w: inout WvWriter) {
+        w.write(self.key)
+        w.write(self.value)
+        // ...
+    }
+}
+</code></pre>
+<h2 id="objects-and-lifetime"><a class="header" href="#objects-and-lifetime">Objects and lifetime</a></h2>
+<p>An interface becomes a <code>final class</code> holding one strong reference. <code>deinit</code>
+releases it, a constructor named <code>new</code> becomes <code>init</code>, and other constructors
+and statics become <code>static func</code>s:</p>
+<pre><code class="language-swift">public final class Gadget: WvObject, Hashable, @unchecked Sendable {
+    let ptr: OpaquePointer
+
+    init(ptr: OpaquePointer) {
+        self.ptr = ptr
+    }
+
+    deinit {
+        kitchen_sink_Gadget_destroy(ptr)
+    }
+
+    func clonePtr() -&gt; OpaquePointer {
+        wvNonNull(kitchen_sink_Gadget_clone(ptr))
+    }
+
+    /// Whether two wrappers hold the same native object.
+    public static func == (lhs: Gadget, rhs: Gadget) -&gt; Bool {
+        lhs.ptr == rhs.ptr
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(ptr)
+    }
+
+    /// Create a gadget with the given id
+    public init(id: Int64) {
+        wvLoad()
+        var err = WvError()
+        let rv = kitchen_sink_Gadget_new(id, &amp;err)
+        wvTrap(&amp;err)
+        self.ptr = wvNonNull(rv)
+    }
+
+    /// Render the gadget as a human-readable string
+    public func describe() -&gt; String {
+        var err = WvError()
+        let rv = kitchen_sink_Gadget_describe(self.ptr, &amp;err)
+        wvTrap(&amp;err)
+        return wvTakeString(rv)
+    }
+}
+</code></pre>
+<p>Swift keeps every argument and the receiver alive for the whole call, so a
+wrapper can’t be freed mid-call. Writing an object into a value buffer or
+returning it from a callback method clones its reference, and reading one
+adopts the reference into a new wrapper, so two wrappers can share one native
+object. Wrappers are <code>Equatable</code> and <code>Hashable</code> by that native identity: two
+wrappers are <code>==</code> exactly when they hold the same object (<code>_clone</code> keeps the
+pointer value), whatever its state. So a record or enum carrying objects is
+<code>Hashable</code> too, and <code>store.share() == store</code>. There’s no <code>close()</code>: release
+happens when the last Swift reference goes away. An interface member spelled
+like one the class declares (<code>ptr</code>, <code>clonePtr</code>, <code>wvRead</code>, <code>wvWrite</code>) gains a
+trailing <code>_</code> (<a href="../reference/naming.html#identifiers-in-generated-code">reserved member
+names</a>).</p>
+<h2 id="errors"><a class="header" href="#errors">Errors</a></h2>
+<p>Each error domain becomes an <code>enum</code> conforming to <code>Error</code>, <code>LocalizedError</code>,
+<code>Hashable</code>, and <code>Sendable</code>, named through the shared naming rule: the
+domain’s name with one <code>Error</code> suffix (<code>KvError</code> stays <code>KvError</code>,
+<code>KitchenErrors</code> becomes <code>KitchenError</code>, <code>Failure</code> becomes <code>FailureError</code>).
+Each code is a case carrying the message (the code’s documented message when
+the library sends none) and the code’s fields; <code>errorCode</code> and <code>message</code>
+read them back:</p>
+<pre><code class="language-swift">public enum KvError: Error, LocalizedError, Hashable, Sendable {
+    /// key not found
+    case keyNotFound(message: String, key: String)
+    /// entry expired
+    case expired(message: String, key: String, expiredAt: Int64)
+    // ...
+    /// A code these bindings don't declare, from a newer library.
+    case unknown(code: Int32, message: String)
+}
+</code></pre>
+<p>Domains are open: a code the producer added after the bindings were
+generated arrives as <code>.unknown</code> with its code and message, never as a crash,
+so a <code>switch</code> over a domain needs that case (or a <code>default</code>). A field named
+<code>message</code> gains a trailing <code>_</code> (<code>case callbackFailed(message: String, message_: String)</code>), and so does a code spelled like a member of the enum
+(<code>errorCode</code>, <code>message</code>, <code>errorDescription</code>) or like <code>unknown</code> (the
+catch-all case then becomes <code>unknown_</code>).</p>
+<p>A function declared <code>throws: KvError</code> raises that enum for the domain’s codes
+and <code>{SwiftModule}RuntimeError</code> (<code>KvstoreRuntimeError</code>, with <code>errorCode</code> and
+<code>message</code>) for runtime failures: <code>-2</code> panic, <code>-3</code> marshalling, and <code>-4</code> when a
+callback implementation failed. A function declared <code>throws: any</code> raises the
+runtime error with code <code>-1</code> (<code>KvstoreRuntimeError.untypedCode</code>) and the
+producer’s message:</p>
+<pre><code class="language-swift">do {
+    _ = try store.importLines(text: "c=3\nbroken")
+} catch let error as KvstoreRuntimeError {
+    print(error.errorCode, error.message)  // -1 line 2: expected key=value
+}
+</code></pre>
+<p>Swift has no unchecked errors, so a function that doesn’t declare <code>throws</code>
+follows the <a href="../guides/errors-and-memory.html#the-trap-policy">trap policy</a>:
+it stops the process with <code>fatalError</code> when the library reports a failure,
+naming the function, the code, and the message:</p>
+<pre><code class="language-text">Kvstore.count() failed with code -2: &lt;the producer's panic message&gt;
+</code></pre>
+<h2 id="async-and-cancellation"><a class="header" href="#async-and-cancellation">Async and cancellation</a></h2>
+<p>An async function becomes an <code>async</code> function over a checked continuation;
+the library’s completion callback resumes it exactly once, from any thread,
+with the result as one C value. It’s marked <code>throws</code> only when the IDL
+function declares errors or is cancellable; otherwise a failure follows the
+trap policy (<code>summarizeAll(stores:)</code> is <code>async -&gt; Stats</code>). Optional scalars
+and typed arrays arrive the same way as from a synchronous call
+(<code>versionOf(key:) async -&gt; UInt32?</code>, <code>versions(keys:) async -&gt; [UInt32]</code>). A
+cancellable function runs inside <code>withTaskCancellationHandler</code>: it creates a
+native cancel token, passes it to the launch, and cancels it when the calling
+task is cancelled. A cancelled call (code <code>-5</code>) throws <code>CancellationError</code>,
+even when the task was cancelled before the call started:</p>
+<pre><code class="language-swift">public func doCancellable(input: String) async throws -&gt; String {
+    wvLoad()
+    let token = WvCancelToken()
+    return try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation&lt;String, Error&gt;) in
+            let context = Unmanaged.passRetained(WvContinuation(continuation)).toOpaque()
+            wvWithUTF8(input) { input_run in
+                kitchen_sink_do_cancellable(input_run, token.raw, { context, err, result in
+                    let cont = Unmanaged&lt;WvContinuation&lt;String, Error&gt;&gt;.fromOpaque(context!).takeRetainedValue().value
+                    if let err = err {
+                        cont.resume(throwing: wvTakeCancellation(err))
+                        return
+                    }
+                    cont.resume(returning: wvTakeString(result))
+                }, context)
+            }
+        }
+    } onCancel: {
+        token.cancel()
+    }
+}
+</code></pre>
+<p>The launcher copies its arguments before it returns, so lending them for the
+launch is enough. The token is released when the wrapper returns; the
+library holds its own reference for the call’s duration.</p>
+<h2 id="callback-interfaces"><a class="header" href="#callback-interfaces">Callback interfaces</a></h2>
+<p>A callback interface becomes a class-bound protocol. A requirement is
+<code>throws</code> when the IDL method declares errors (<code>throws: Domain</code> or
+<code>throws: any</code>), and plain otherwise:</p>
+<pre><code class="language-swift">public protocol Loader: AnyObject, Sendable {
+    /// The loader's name, recorded in a loaded entry's metadata under
+    /// `source`.
+    ///
+    /// - Throws: Any error, which fails the library's call with the error's
+    ///   description.
+    func name() throws -&gt; String
+
+    /// A store that may already hold `key`, consulted first, if any.
+    ///
+    /// - Throws: Any error, which fails the library's call with the error's
+    ///   description.
+    func fallback(key: String) throws -&gt; Store?
+
+    /// The value for `key`. Fail with `keyNotFound` naming
+    /// `key` when there's none.
+    ///
+    /// - Throws: ``KvError`` to fail the library's call with that error and
+    ///   its fields; any other error fails it with the error's description.
+    func load(key: String) throws -&gt; Data
+}
+</code></pre>
+<p>Implement it with a class and pass an instance (<code>any Loader</code>) where the API
+expects one. The library may call it from any thread, which is why the
+protocol requires <code>Sendable</code>; a class guarding its own state can declare
+<code>@unchecked Sendable</code>.</p>
+<p>The argument crosses as the <code>{prefix}_{Loader}</code> struct: a context that
+retains the implementation until the library calls the vtable’s <code>free</code>
+(which may happen on any library thread), and a pointer to one process-wide
+vtable per protocol. An optional parameter (<code>loader: (any Loader)?</code>) passes
+the zero struct, whose null vtable means none, for <code>nil</code>. The vtable sets
+<code>size</code> to its own size, so a newer library that appended a method knows this
+binding lacks it (that call fails with <code>-4</code>), and leaves the thread-affine
+flag clear. Each entry is a <code>@convention(c)</code> trampoline:</p>
+<pre><code class="language-swift">enum WvLoaderVtable {
+    static let shared = WvVtable(kvstore_Loader_vtable(
+        size: UInt32(MemoryLayout&lt;kvstore_Loader_vtable&gt;.size),
+        flags: 0,
+        free: { ctx in wvRelease(ctx, as: (any Loader).self) },
+        // ...
+        load: { ctx, a0, outErr in
+            wvInvoke(ctx, outErr, as: (any Loader).self, throwing: KvError.self, fallback: WvRun()) { wvImpl in
+                try wvHandOverBytes(wvImpl.load(key: wvBorrowString(a0)))
+            }
+        }
+    ))
+}
+</code></pre>
+<p>Arguments and returns follow the <a href="../reference/abi.html#callback-interfaces">ABI</a>:</p>
+<ul>
+<li>Strings, bytes, typed arrays, and value buffers arrive as copies of the
+library’s borrowed runs; an optional scalar arrives as <code>T?</code>; an object
+argument arrives as a wrapper that adopted the reference the library
+passed, which the implementation may keep.</li>
+<li>A returned number, <code>Bool</code>, or C-style enum crosses by value, and an
+optional one as its <code>{prefix}_opt_{prim}</code> struct; a returned object
+(<code>Store</code> or <code>Store?</code>) as a fresh reference the library adopts; and a
+returned string, <code>Data</code>, typed array, or value buffer (a record, a rich
+enum, an optional, a list, or a map) as a run allocated with
+<code>{prefix}_alloc</code>, which the library adopts.</li>
+<li>A requirement declared <code>throws: KvError</code> may throw that enum: the library
+receives its code, message, and fields as the payload, exactly as if the
+producer had raised it (a Rust producer then renders the message from the
+fields; a thrown <code>.unknown</code> sends its own code, which the producer treats
+as any other failure). Any other error, from any throwing requirement,
+reaches the library as an untyped failure (<code>-1</code>) with the error’s
+<code>errorDescription</code> (or its <code>String(describing:)</code>). Nothing unwinds
+through C.</li>
+</ul>
+<pre><code class="language-swift">final class FileLoader: Loader, @unchecked Sendable {
+    func name() throws -&gt; String { "files" }
+
+    func fallback(key: String) throws -&gt; Store? { nil }
+
+    func load(key: String) throws -&gt; Data {
+        guard let data = FileManager.default.contents(atPath: "/data/\(key)") else {
+            throw KvError.keyNotFound(message: "no file for \(key)", key: key)
+        }
+        return data
+    }
+}
+
+let entry = try store.getOrLoad(key: "settings", loader: FileLoader())
+</code></pre>
+<h2 id="iterators"><a class="header" href="#iterators">Iterators</a></h2>
+<p>An <code>iter&lt;T&gt;</code> return is a <code>NativeSequence&lt;T&gt;</code>, one generic class (a
+<code>Sequence</code> and its own <code>IteratorProtocol</code>) for every iterator in the API.
+Each <code>next()</code> pulls exactly one element from the library, received as one C
+value like a return of the same type; the native iterator is released as
+soon as the stream ends, or from <code>deinit</code> when iteration stops early. The
+sequence is single-pass. <code>next()</code> can’t throw, so for a throwing function an
+error reported mid-stream ends iteration and is kept in the sequence’s
+<code>error</code> property; <code>collect()</code> pulls the rest and throws it instead:</p>
+<pre><code class="language-swift">for key in try store.keys(prefix: "user.") { print(key) }
+
+let expirations: [Int64?] = try store.expirations().collect()
+</code></pre>
+<h2 id="known-limitations"><a class="header" href="#known-limitations">Known limitations</a></h2>
+<ul>
+<li>The library is linked at build time, so <code>{PREFIX}_LIBRARY</code> isn’t honored and
+library paths come from the linker and loader. A library the dynamic
+loader can’t find, or one that lacks a declaration, stops the process
+before <code>main</code>, before <code>check()</code> can report anything.</li>
+<li>Calls made while the library doesn’t match (whether or not <code>check()</code> ran),
+malformed value buffers, and failures of non-throwing calls stop the
+process instead of throwing.</li>
+<li>The runtime declares the public types <code>{Module}Library</code>,
+<code>{Module}RuntimeError</code>, and <code>NativeSequence</code>; an IDL type with one of
+those names doesn’t compile. Qualifying a free function with the module
+name (<code>Kvstore.openStore</code>) works only while no type in scope shares the
+module’s name.</li>
+<li>The manifest stays at <code>swift-tools-version:5.9</code> for Xcode 15 users, so
+SwiftPM compiles the package in the Swift 5 language mode even under a
+Swift 6 toolchain.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../generators/cpp.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../generators/kotlin.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../generators/cpp.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../generators/kotlin.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

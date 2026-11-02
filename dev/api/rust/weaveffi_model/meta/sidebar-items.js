@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["SECTION"],"enum":["Item","MetaError","Role"],"fn":["assemble","decode","frame_len","frames","is_symbol","symbol"],"struct":["Frame","Location","Member"]};

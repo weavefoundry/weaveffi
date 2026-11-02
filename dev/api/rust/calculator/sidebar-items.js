@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["CalcError","ParseError"],"fn":["add","divide","greet","mean","parse","running_total","sqrt"]};
