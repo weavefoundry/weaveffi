@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Change","EntryKind","KvError"],"fn":["open_store"],"mod":["report","stats"],"struct":["Entry","Store","StoreInfo"],"trait":["Listener","Loader","Policy","Scorer"]};

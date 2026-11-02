@@ -1,0 +1,95 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `crates/weaveffi-cli/src/codegen/codecs.rs`."><title>codecs.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-0c87338a.css"><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="weaveffi_cli" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.1 (58cf8f9c3 2026-10-13)" data-channel="1.99.1" data-search-js="search-cf4fc35e.js" data-stringdex-js="stringdex-b5109af9.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../../../static.files/src-script-813739b1.js"></script><script defer src="../../../src-files.js"></script><script defer src="../../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-9f56287d.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">weaveffi_cli/codegen/</div>codecs.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-2"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="doccomment">//! The value-buffer **composites** an API uses and their one canonical
+<a href=#2 id=2 data-nosnippet>2</a>//! **stem**.
+<a href=#3 id=3 data-nosnippet>3</a>//!
+<a href=#4 id=4 data-nosnippet>4</a>//! Records, rich enums, and error payloads get one codec each, named after
+<a href=#5 id=5 data-nosnippet>5</a>//! the type. Optionals, lists, and maps that cross inside a value buffer
+<a href=#6 id=6 data-nosnippet>6</a>//! (record fields, variant fields, error payload fields, and every
+<a href=#7 id=7 data-nosnippet>7</a>//! [`Buffer`](weaveffi_model::ty::RunKind::Buffer) run at a call boundary)
+<a href=#8 id=8 data-nosnippet>8</a>//! are the *composites*: each distinct shape gets one codec too,
+<a href=#9 id=9 data-nosnippet>9</a>//! and every target names it with [`stem`] so the shapes line up across
+<a href=#10 id=10 data-nosnippet>10</a>//! languages (`list_i32`, `opt_Item`, `map_string_list_i64`).
+<a href=#11 id=11 data-nosnippet>11</a>//!
+<a href=#12 id=12 data-nosnippet>12</a>//! An optional scalar (OptDirect) or numeric list (Slice) at a call boundary
+<a href=#13 id=13 data-nosnippet>13</a>//! isn't a composite: it crosses directly. The same type nested in a buffer
+<a href=#14 id=14 data-nosnippet>14</a>//! (a record's `i64?` field) is.
+<a href=#15 id=15 data-nosnippet>15</a>//!
+<a href=#16 id=16 data-nosnippet>16</a>//! # Example
+<a href=#17 id=17 data-nosnippet>17</a>//!
+<a href=#18 id=18 data-nosnippet>18</a>//! A target that writes one reader and writer function per composite:
+<a href=#19 id=19 data-nosnippet>19</a>//!
+<a href=#20 id=20 data-nosnippet>20</a>//! ```ignore
+<a href=#21 id=21 data-nosnippet>21</a>//! use crate::codegen::codecs;
+<a href=#22 id=22 data-nosnippet>22</a>//!
+<a href=#23 id=23 data-nosnippet>23</a>//! for ty in codecs::composites(model) {
+<a href=#24 id=24 data-nosnippet>24</a>//!     // Dependency order: `list_i32` comes before `opt_list_i32`, so a
+<a href=#25 id=25 data-nosnippet>25</a>//!     // language that needs definitions before use can emit in order.
+<a href=#26 id=26 data-nosnippet>26</a>//!     let stem = codecs::stem(&amp;ty);
+<a href=#27 id=27 data-nosnippet>27</a>//!     w.line(format!("def _write_{stem}(w, v): ..."));
+<a href=#28 id=28 data-nosnippet>28</a>//!     w.line(format!("def _read_{stem}(r): ..."));
+<a href=#29 id=29 data-nosnippet>29</a>//! }
+<a href=#30 id=30 data-nosnippet>30</a>//! ```
+<a href=#31 id=31 data-nosnippet>31</a>
+<a href=#32 id=32 data-nosnippet>32</a></span><span class="kw">use </span>weaveffi_model::model::Model;
+<a href=#33 id=33 data-nosnippet>33</a><span class="kw">use </span>weaveffi_model::ty::Ty;
+<a href=#34 id=34 data-nosnippet>34</a>
+<a href=#35 id=35 data-nosnippet>35</a><span class="doccomment">/// Every distinct optional, list, and map type that crosses inside a value
+<a href=#36 id=36 data-nosnippet>36</a>/// buffer anywhere in `model`, innermost first (see
+<a href=#37 id=37 data-nosnippet>37</a>/// [`Model::composites`]).
+<a href=#38 id=38 data-nosnippet>38</a></span><span class="attr">#[must_use]
+<a href=#39 id=39 data-nosnippet>39</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>composites(model: <span class="kw-2">&amp;</span>Model) -&gt; Vec&lt;Ty&gt; {
+<a href=#40 id=40 data-nosnippet>40</a>    model.composites()
+<a href=#41 id=41 data-nosnippet>41</a>}
+<a href=#42 id=42 data-nosnippet>42</a>
+<a href=#43 id=43 data-nosnippet>43</a><span class="doccomment">/// The canonical identifier fragment naming `ty` in codec names (see
+<a href=#44 id=44 data-nosnippet>44</a>/// [`Ty::stem`]).
+<a href=#45 id=45 data-nosnippet>45</a></span><span class="attr">#[must_use]
+<a href=#46 id=46 data-nosnippet>46</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>stem(ty: <span class="kw-2">&amp;</span>Ty) -&gt; String {
+<a href=#47 id=47 data-nosnippet>47</a>    ty.stem()
+<a href=#48 id=48 data-nosnippet>48</a>}
+<a href=#49 id=49 data-nosnippet>49</a>
+<a href=#50 id=50 data-nosnippet>50</a><span class="attr">#[cfg(test)]
+<a href=#51 id=51 data-nosnippet>51</a></span><span class="kw">mod </span>tests {
+<a href=#52 id=52 data-nosnippet>52</a>    <span class="kw">use super</span>::<span class="kw-2">*</span>;
+<a href=#53 id=53 data-nosnippet>53</a>    <span class="kw">use </span><span class="kw">crate</span>::codegen::test_model;
+<a href=#54 id=54 data-nosnippet>54</a>    <span class="kw">use </span>weaveffi_model::ty::Prim;
+<a href=#55 id=55 data-nosnippet>55</a>
+<a href=#56 id=56 data-nosnippet>56</a>    <span class="attr">#[test]
+<a href=#57 id=57 data-nosnippet>57</a>    </span><span class="kw">fn </span>stems_are_prefix_notation() {
+<a href=#58 id=58 data-nosnippet>58</a>        <span class="kw">let </span>i64s = Ty::List(Box::new(Ty::Prim(Prim::I64)));
+<a href=#59 id=59 data-nosnippet>59</a>        <span class="kw">let </span>map = Ty::Map(Box::new(Ty::Prim(Prim::String)), Box::new(i64s.clone()));
+<a href=#60 id=60 data-nosnippet>60</a>        <span class="macro">assert_eq!</span>(stem(<span class="kw-2">&amp;</span>map), <span class="string">"map_string_list_i64"</span>);
+<a href=#61 id=61 data-nosnippet>61</a>        <span class="kw">let </span>opt = Ty::Optional(Box::new(Ty::Record(<span class="string">"Item"</span>.into())));
+<a href=#62 id=62 data-nosnippet>62</a>        <span class="macro">assert_eq!</span>(stem(<span class="kw-2">&amp;</span>opt), <span class="string">"opt_Item"</span>);
+<a href=#63 id=63 data-nosnippet>63</a>        <span class="macro">assert_eq!</span>(stem(<span class="kw-2">&amp;</span>Ty::List(Box::new(opt))), <span class="string">"list_opt_Item"</span>);
+<a href=#64 id=64 data-nosnippet>64</a>    }
+<a href=#65 id=65 data-nosnippet>65</a>
+<a href=#66 id=66 data-nosnippet>66</a>    <span class="attr">#[test]
+<a href=#67 id=67 data-nosnippet>67</a>    </span><span class="kw">fn </span>composites_are_buffered_shapes_innermost_first() {
+<a href=#68 id=68 data-nosnippet>68</a>        <span class="kw">let </span>model = test_model(
+<a href=#69 id=69 data-nosnippet>69</a>            <span class="string">r#"
+<a href=#70 id=70 data-nosnippet>70</a>version: "0.13.0"
+<a href=#71 id=71 data-nosnippet>71</a>records:
+<a href=#72 id=72 data-nosnippet>72</a>  - name: R
+<a href=#73 id=73 data-nosnippet>73</a>    fields:
+<a href=#74 id=74 data-nosnippet>74</a>      - { name: a, type: "[i32]" }
+<a href=#75 id=75 data-nosnippet>75</a>      - { name: b, type: "{string:[i32]?}" }
+<a href=#76 id=76 data-nosnippet>76</a>functions:
+<a href=#77 id=77 data-nosnippet>77</a>  - { name: slice, params: [{ name: xs, type: "[i32]" }], return: "[i64]" }
+<a href=#78 id=78 data-nosnippet>78</a>  - { name: opt, params: [{ name: x, type: "i32?" }], return: "string?" }
+<a href=#79 id=79 data-nosnippet>79</a>  - { name: it, return: "iter&lt;[R]&gt;" }
+<a href=#80 id=80 data-nosnippet>80</a>"#</span>,
+<a href=#81 id=81 data-nosnippet>81</a>        );
+<a href=#82 id=82 data-nosnippet>82</a>        <span class="kw">let </span>stems: Vec&lt;String&gt; = composites(<span class="kw-2">&amp;</span>model).iter().map(stem).collect();
+<a href=#83 id=83 data-nosnippet>83</a>        <span class="macro">assert_eq!</span>(
+<a href=#84 id=84 data-nosnippet>84</a>            stems,
+<a href=#85 id=85 data-nosnippet>85</a>            [
+<a href=#86 id=86 data-nosnippet>86</a>                <span class="string">"list_i32"</span>,
+<a href=#87 id=87 data-nosnippet>87</a>                <span class="string">"opt_list_i32"</span>,
+<a href=#88 id=88 data-nosnippet>88</a>                <span class="string">"map_string_opt_list_i32"</span>,
+<a href=#89 id=89 data-nosnippet>89</a>                <span class="string">"opt_string"</span>,
+<a href=#90 id=90 data-nosnippet>90</a>                <span class="string">"list_R"</span>,
+<a href=#91 id=91 data-nosnippet>91</a>            ]
+<a href=#92 id=92 data-nosnippet>92</a>        );
+<a href=#93 id=93 data-nosnippet>93</a>    }
+<a href=#94 id=94 data-nosnippet>94</a>}
+</code></pre></div></section></main></body></html>

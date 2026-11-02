@@ -1,0 +1,125 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="WeaveFFI: write safe Rust, get a stable C ABI and bindings for 11 languages."><title>weaveffi - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-0c87338a.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="weaveffi" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.1 (58cf8f9c3 2026-10-13)" data-channel="1.99.1" data-search-js="search-cf4fc35e.js" data-stringdex-js="stringdex-b5109af9.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-9f56287d.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate weaveffi</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../weaveffi/index.html">weaveffi</a><span class="version">0.26.0</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#what-you-get" title="What you get">What you get</a></li><li><a href="#features" title="Features">Features</a></li></ul><h3><a href="#macros">Crate Items</a></h3><ul class="block"><li><a href="#macros" title="Macros">Macros</a></li><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#traits" title="Traits">Traits</a></li><li><a href="#functions" title="Functions">Functions</a></li><li><a href="#types" title="Type Aliases">Type Aliases</a></li><li><a href="#attributes" title="Attribute Macros">Attribute Macros</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1>Crate <span>weaveffi</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/weaveffi/lib.rs.html#1-128">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>WeaveFFI: write safe Rust, get a stable C ABI and bindings for 11
+languages.</p>
+<p>This is the one crate a Rust producer depends on. Tag the items you want
+to export, anywhere in the crate, and call <a href="macro.export_runtime.html" title="macro weaveffi::export_runtime"><code>export_runtime!</code></a> once at
+the crate root. Every expansion emits the <code>extern "C"</code> functions the
+generated bindings call, marshalling each value through the audited
+runtime, so you never write <code>unsafe</code> glue. Every C symbol starts with the
+crate’s name (<code>calculator_add</code> below).</p>
+
+<div class="example-wrap ignore"><a href="#" class="tooltip" title="This example is not tested">ⓘ</a><pre class="rust rust-example-rendered"><code><span class="doccomment">/// The library's error domain. Its `Display` comes from the docs.
+</span><span class="attr">#[weaveffi::error]
+#[derive(Debug)]
+</span><span class="kw">pub enum </span>MathError {
+    <span class="doccomment">/// division by zero
+    </span>DivisionByZero = <span class="number">1</span>,
+}
+
+<span class="doccomment">/// Add two integers.
+</span><span class="attr">#[weaveffi::export]
+</span><span class="kw">pub fn </span>add(a: i32, b: i32) -&gt; i32 {
+    a + b
+}
+
+<span class="doccomment">/// Divide, reporting division by zero through the ABI's error channel.
+</span><span class="attr">#[weaveffi::export]
+</span><span class="kw">pub fn </span>div(a: i32, b: i32) -&gt; <span class="prelude-ty">Result</span>&lt;i32, MathError&gt; {
+    a.checked_div(b).ok_or(MathError::DivisionByZero)
+}
+
+<span class="doccomment">/// Parse an integer; any error converts into `weaveffi::Error`
+/// (`throws any`).
+</span><span class="attr">#[weaveffi::export]
+</span><span class="kw">pub fn </span>parse(text: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Result</span>&lt;i64, weaveffi::Error&gt; {
+    <span class="prelude-val">Ok</span>(text.parse()<span class="question-mark">?</span>)
+}
+
+<span class="comment">// The runtime symbols (memory, errors, cancel tokens), once per crate.
+</span><span class="macro">weaveffi::export_runtime!</span>();</code></pre></div>
+<p>The attributes also embed the API in the built library, which is what
+<code>weaveffi generate</code> reads to emit the header and bindings, so the
+producer and the bindings can’t drift: the bindings describe exactly what
+the library was compiled with. A library is one namespace: every
+exported name is unique across the crate.</p>
+<h2 id="what-you-get"><a class="doc-anchor" href="#what-you-get">§</a>What you get</h2>
+<ul>
+<li><a href="attr.export.html" title="attr weaveffi::export"><code>export</code></a>: export a free function, or every <code>pub fn</code> of an
+<code>impl</code> block of an interface (constructors return <code>Self</code>; methods take
+<code>&amp;self</code>). An <code>async fn</code> is asynchronous; a <code>Result</code>-returning function
+throws its error type, a <a href="attr.error.html" title="attr weaveffi::error"><code>error</code></a> domain or an untyped error
+(<a href="struct.Error.html" title="struct weaveffi::Error"><code>Error</code></a>, <code>String</code>, <code>std::io::Error</code>, …). An <code>async fn</code> whose last
+parameter is a <a href="struct.CancelToken.html" title="struct weaveffi::CancelToken"><code>CancelToken</code></a> is cancellable.</li>
+<li><a href="attr.record.html" title="attr weaveffi::record"><code>record</code></a>: a struct crossing by value.</li>
+<li><a href="attr.enumeration.html" title="attr weaveffi::enumeration"><code>enumeration</code></a>: a C-style enum, or one with data-carrying
+variants.</li>
+<li><a href="attr.interface.html" title="attr weaveffi::interface"><code>interface</code></a>: a reference-counted object type, passed as <code>&amp;T</code>
+or <code>Arc&lt;T&gt;</code> and returned as <code>Self</code>, <code>T</code>, or <code>Arc&lt;T&gt;</code>.</li>
+<li><a href="attr.error.html" title="attr weaveffi::error"><code>error</code></a>: an error domain, with a generated <code>Display</code> (from
+<code>#[weaveffi(message = "...")]</code> templates or the variants’ docs) and
+<code>std::error::Error</code>.</li>
+<li><a href="attr.callback_interface.html" title="attr weaveffi::callback_interface"><code>callback_interface</code></a>: a trait the consumer implements, accepted
+as <code>Arc&lt;dyn Trait&gt;</code> (or <code>Option&lt;Arc&lt;dyn Trait&gt;&gt;</code>).</li>
+<li><a href="attr.custom.html" title="attr weaveffi::custom"><code>custom</code></a>: a type that crosses as another (its repr), converted
+with your functions; it may be a foreign type such as <code>uuid::Uuid</code>.</li>
+<li><a href="fn.set_spawner.html" title="fn weaveffi::set_spawner"><code>set_spawner</code></a>: install the executor async exports run on.</li>
+<li><a href="macro.export_runtime.html" title="macro weaveffi::export_runtime"><code>export_runtime!</code></a>: the runtime symbols and the crate’s tag type,
+once, at the crate root.</li>
+</ul>
+<h2 id="features"><a class="doc-anchor" href="#features">§</a>Features</h2>
+<ul>
+<li><code>tokio</code> (default) runs exported <code>async fn</code>s on Tokio: the current
+runtime when a launcher is called from inside one, otherwise a
+multi-thread runtime created on first use. Without it, each async call
+runs on a thread of its own. <a href="fn.set_spawner.html" title="fn weaveffi::set_spawner"><code>set_spawner</code></a> overrides either. On
+<code>wasm32</code> calls are polled inline.</li>
+<li><code>leak-check</code> counts live objects, callbacks, iterators, cancel tokens,
+and runs, reported by <code>{prefix}_debug_live</code> so a test harness can
+assert a consumer released everything.</li>
+<li><code>anyhow</code> lets a function return <code>Result&lt;T, anyhow::Error&gt;</code>.</li>
+</ul>
+</div></details><h2 id="macros" class="section-header">Macros<a href="#macros" class="anchor">§</a></h2><dl class="item-table"><dt><a class="macro" href="macro.export_runtime.html" title="macro weaveffi::export_runtime">export_<wbr>runtime</a></dt><dd>Emit the runtime symbols every WeaveFFI library exports, prefixed with
+the crate’s name (<code>{prefix}_abi_version</code>, <code>{prefix}_error_set</code>,
+<code>{prefix}_error_set_payload</code>, <code>{prefix}_error_clear</code>,
+<code>{prefix}_error_free</code>, <code>{prefix}_alloc</code>, <code>{prefix}_run_free</code>, the four
+<code>{prefix}_cancel_token_*</code> functions, and <code>{prefix}_debug_live</code>), and the
+crate’s tag type. Invoke it exactly once, at the crate root.</dd></dl><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.CancelToken.html" title="struct weaveffi::CancelToken">Cancel<wbr>Token</a></dt><dd>The producer’s handle on a consumer’s cancel token, the final parameter
+of a cancellable <code>async fn</code>. When the consumer cancels, the runtime drops
+the function’s future and completes the call with the cancelled code;
+poll <a href="struct.CancelToken.html#method.is_cancelled" title="method weaveffi::CancelToken::is_cancelled"><code>is_cancelled</code></a> only for cooperative
+cleanup (work on other threads, say).
+The producer’s handle on a consumer’s cancel token, accepted as the final
+parameter of a cancellable <code>async fn</code>.</dd><dt><a class="struct" href="struct.Error.html" title="struct weaveffi::Error">Error</a></dt><dd>An untyped error that any <code>std::error::Error</code> converts into with <code>?</code>.
+An untyped error: any failure, reported to the consumer as <code>throws any</code>
+(code <code>-1</code>) with its <code>Display</code> text.</dd><dt><a class="struct" href="struct.ForeignError.html" title="struct weaveffi::ForeignError">Foreign<wbr>Error</a></dt><dd>A consumer’s callback-interface implementation failed. A callback
+method’s error type converts from it (<code>E: From&lt;ForeignError&gt;</code>), and it’s
+a valid error type itself.
+A failure a consumer’s callback-interface implementation reported, or a
+value it returned that the producer couldn’t accept.</dd><dt><a class="struct" href="struct.Iter.html" title="struct weaveffi::Iter">Iter</a></dt><dd>An owned, lazily pulled iterator, returned by a function whose bindings
+see <code>iter&lt;T&gt;</code>. Build one from any iterator with <a href="struct.Iter.html#method.new" title="associated function weaveffi::Iter::new"><code>Iter::new</code></a>.
+An owned, type-erased iterator returned by a producer function whose IDL
+return type is <code>iter&lt;T&gt;</code>.</dd></dl><h2 id="traits" class="section-header">Traits<a href="#traits" class="anchor">§</a></h2><dl class="item-table"><dt><a class="trait" href="trait.Spawner.html" title="trait weaveffi::Spawner">Spawner</a></dt><dd>The executor hook <a href="fn.set_spawner.html" title="fn weaveffi::set_spawner"><code>set_spawner</code></a> accepts.
+An executor hook that drives the futures produced by async exports.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.set_spawner.html" title="fn weaveffi::set_spawner">set_<wbr>spawner</a></dt><dd>Install the process-wide executor exported <code>async fn</code>s run on. Call it
+once at startup, before the first async export is launched.
+Install the process-wide spawner async exports run on.</dd></dl><h2 id="types" class="section-header">Type Aliases<a href="#types" class="anchor">§</a></h2><dl class="item-table"><dt><a class="type" href="type.BoxFuture.html" title="type weaveffi::BoxFuture">BoxFuture</a></dt><dd>The type-erased <code>Send + 'static</code> future a <a href="trait.Spawner.html" title="trait weaveffi::Spawner"><code>Spawner</code></a> receives.
+The type-erased future a <a href="trait.Spawner.html" title="trait weaveffi::Spawner"><code>Spawner</code></a> receives.</dd></dl><h2 id="attributes" class="section-header">Attribute Macros<a href="#attributes" class="anchor">§</a></h2><dl class="item-table"><dt><a class="attr" href="attr.callback_interface.html" title="attr weaveffi::callback_interface">callback_<wbr>interface</a></dt><dd>Declare a callback interface: a <code>Send + Sync</code> trait whose <code>&amp;self</code>
+methods the consumer implements. Producers accept one as
+<code>Arc&lt;dyn Trait&gt;</code> (or <code>Option&lt;Arc&lt;dyn Trait&gt;&gt;</code>). Every method returns
+<code>Result&lt;T, E&gt;</code> with <code>E: From&lt;weaveffi::ForeignError&gt;</code>; when <code>E</code> is a
+<code>#[weaveffi::error]</code> domain, the consumer’s typed errors arrive as its
+variants.</dd><dt><a class="attr" href="attr.custom.html" title="attr weaveffi::custom">custom</a></dt><dd>Declare a custom type,
+<code>#[weaveffi::custom(repr = R, lift = f, lower = g)] pub type Name = T;</code>
+(or on a struct): <code>T</code> crosses the ABI as <code>R</code> (bindings see <code>R</code>),
+converted with <code>f: fn(R) -&gt; Result&lt;T, E: Display&gt;</code> on the way in (a
+failure is a marshalling error carrying the message) and
+<code>g: fn(&amp;T) -&gt; R</code> on the way out. <code>T</code> may be a foreign type, such as
+<code>uuid::Uuid</code>.</dd><dt><a class="attr" href="attr.enumeration.html" title="attr weaveffi::enumeration">enumeration</a></dt><dd>Declare an enum: C-style (every variant a unit, crossing as an <code>int32_t</code>)
+or rich (variants with named fields, crossing as a value buffer). A
+variant’s discriminant is its <code>= value</code>, or one more than the previous
+variant’s.</dd><dt><a class="attr" href="attr.error.html" title="attr weaveffi::error">error</a></dt><dd>Declare an error domain from an enum whose variants have explicit
+positive values (the stable codes) and optional named fields (the
+code’s payload). The macro generates <code>Display</code> (each variant’s
+<code>#[weaveffi(message = "...")]</code> template, which may name its fields in
+braces, else the first line of its docs) and <code>std::error::Error</code>, unless
+written <code>#[weaveffi::error(no_display)]</code>.</dd><dt><a class="attr" href="attr.export.html" title="attr weaveffi::export">export</a></dt><dd>Export a function, or every <code>pub fn</code> of an interface’s <code>impl</code> block.</dd><dt><a class="attr" href="attr.interface.html" title="attr weaveffi::interface">interface</a></dt><dd>Declare an interface: a reference-counted object type, which must be
+<code>Send + Sync</code>. Export its <code>impl</code> block with <code>#[weaveffi::export]</code>.</dd><dt><a class="attr" href="attr.record.html" title="attr weaveffi::record">record</a></dt><dd>Declare a record: a struct with named fields that crosses the ABI by
+value (serialized in a value buffer).</dd></dl></section></div></main></body></html>

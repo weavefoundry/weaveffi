@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ValidationError","ValidationWarning"],"fn":["collect_warnings","validate","validate_scoped"],"struct":["Sources","ValidationDiagnostic","ValidationDiagnostics"],"type":["Found"]};

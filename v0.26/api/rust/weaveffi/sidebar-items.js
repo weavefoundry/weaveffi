@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"attr":["callback_interface","custom","enumeration","error","export","interface","record"],"fn":["set_spawner"],"macro":["export_runtime"],"struct":["CancelToken","Error","ForeignError","Iter"],"trait":["Spawner"],"type":["BoxFuture"]};
