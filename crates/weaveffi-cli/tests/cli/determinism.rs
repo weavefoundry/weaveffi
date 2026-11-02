@@ -9,12 +9,13 @@ use weaveffi_model::model::Model;
 use weaveffi_model::parse::load_api;
 use weaveffi_model::validate::validate;
 
-const FIXTURES: [&str; 5] = [
+const FIXTURES: [&str; 6] = [
     "kitchen_sink",
     "shapes",
     "imports",
     "docs_everywhere",
     "edge_cases",
+    "recursive",
 ];
 
 fn load(stem: &str) -> Model {

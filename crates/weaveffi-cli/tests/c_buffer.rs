@@ -345,6 +345,7 @@ fn fixture_headers_compile_in_c_and_cpp() {
         "imports",
         "docs_everywhere",
         "edge_cases",
+        "recursive",
     ];
     let compilers = [("cc", "c", "-std=c11"), ("c++", "cpp", "-std=c++17")];
     let tmp = tempfile::tempdir().expect("tempdir");

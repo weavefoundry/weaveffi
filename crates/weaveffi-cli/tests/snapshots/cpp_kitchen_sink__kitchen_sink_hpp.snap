@@ -1096,7 +1096,7 @@ struct Token {
     std::string label{};
 
     /** Memberwise equality; interface members compare by identity. */
-    friend bool operator==(const Token& a, const Token& b) { return a.id == b.id && a.label == b.label; }
+    friend bool operator==(const Token& a, const Token& b);
     friend bool operator!=(const Token& a, const Token& b) { return !(a == b); }
 };
 
@@ -1124,23 +1124,27 @@ struct Item {
     std::optional<Gadget> gadget{};
 
     /** Memberwise equality; interface members compare by identity. */
-    friend bool operator==(const Item& a, const Item& b) {
-        return a.id == b.id
-            && a.name == b.name
-            && a.count == b.count
-            && a.enabled == b.enabled
-            && a.ratio == b.ratio
-            && a.nick == b.nick
-            && a.payload == b.payload
-            && a.tags == b.tags
-            && a.attrs == b.attrs
-            && a.parent == b.parent
-            && a.token == b.token
-            && a.priority == b.priority
-            && a.gadget == b.gadget;
-    }
+    friend bool operator==(const Item& a, const Item& b);
     friend bool operator!=(const Item& a, const Item& b) { return !(a == b); }
 };
+
+inline bool operator==(const Token& a, const Token& b) { return a.id == b.id && a.label == b.label; }
+
+inline bool operator==(const Item& a, const Item& b) {
+    return a.id == b.id
+        && a.name == b.name
+        && a.count == b.count
+        && a.enabled == b.enabled
+        && a.ratio == b.ratio
+        && a.nick == b.nick
+        && a.payload == b.payload
+        && a.tags == b.tags
+        && a.attrs == b.attrs
+        && a.parent == b.parent
+        && a.token == b.token
+        && a.priority == b.priority
+        && a.gadget == b.gadget;
+}
 
 namespace detail {
 

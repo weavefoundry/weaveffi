@@ -339,3 +339,57 @@ functions:
     assert_contains(&h, "    std::vector<Holder> many{};\n");
     assert_contains(&h, "    uint8_t n{};\n");
 }
+
+/// From C++20, comparing or `{}`-initializing an optional list of an
+/// incomplete type doesn't compile, so types that hold each other define
+/// equality after every value type and leave that initializer out.
+#[test]
+fn types_that_hold_each_other_wait_for_complete_types() {
+    let model = test_model(
+        r#"
+version: "0.13.0"
+records:
+  - name: Tree
+    fields: [{ name: kids, type: "[Tree]?" }]
+  - name: Dir
+    fields: [{ name: files, type: "[File]?" }]
+  - name: File
+    fields: [{ name: dirs, type: "[Dir]?" }]
+enums:
+  - name: Expr
+    variants: [{ name: Sum, fields: [{ name: terms, type: "[Expr]" }] }]
+functions:
+  - { name: f, params: [{ name: d, type: Dir }, { name: t, type: Tree }, { name: e, type: Expr }] }
+"#,
+    );
+    let h = header(&model);
+    // A type is complete for its own members, and whichever of the pair is
+    // defined second can use the first.
+    assert_contains(&h, "    std::optional<std::vector<Tree>> kids{};\n");
+    assert_contains(&h, "    std::optional<std::vector<Dir>> dirs;\n");
+    assert_contains(&h, "    std::optional<std::vector<File>> files{};\n");
+    assert_contains(
+        &h,
+        "    friend bool operator==(const Dir& a, const Dir& b);\n",
+    );
+    assert_contains(
+        &h,
+        "inline bool operator==(const Dir& a, const Dir& b) { return a.files == b.files; }\n",
+    );
+    assert_contains(
+        &h,
+        "inline bool operator==(const Expr::Sum& a, const Expr::Sum& b) { return a.terms == b.terms; }\n",
+    );
+    assert_contains(
+        &h,
+        "inline bool operator==(const Expr& a, const Expr& b) { return a.value == b.value; }\n",
+    );
+    let last_struct = h.find("struct Expr {").expect("Expr is defined");
+    let first_equality = h
+        .find("inline bool operator==(const ")
+        .expect("equality is defined");
+    assert!(
+        first_equality > last_struct,
+        "equality follows every struct"
+    );
+}

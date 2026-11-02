@@ -52,6 +52,8 @@ mod package;
 mod runtime;
 mod types;
 
+use std::collections::HashSet;
+
 use crate::codegen::CodeWriter;
 use crate::codegen::OutputFile;
 use crate::package::{per_platform_libraries, Artifact, PackageContext, PackagedFile};
@@ -241,7 +243,8 @@ impl Target for CppGenerator {
 ///    callback-interface class;
 /// 4. interface classes (the handle plus member *declarations*), so records
 ///    can hold objects by value;
-/// 5. value types (records and rich enums) in dependency order;
+/// 5. value types (records and rich enums) in dependency order, then their
+///    `operator==` definitions, which need every value type complete;
 /// 6. the codec overloads of every value type;
 /// 7. error domains and their `detail::Errors` policies;
 /// 8. callback-interface abstract classes and their `detail::Callbacks`;
@@ -337,8 +340,15 @@ pub(crate) fn render_cpp_header(
         render_cpp_interface_class(&mut w, &ctx, i);
     }
     let values = value_types_in_order(model);
+    // A type counts as complete for its own members: their initializers
+    // are compiled once the class is.
+    let mut complete = HashSet::new();
     for def in &values {
-        def.render(&mut w, &ctx);
+        complete.insert(def.name());
+        def.render(&mut w, &ctx, &complete);
+    }
+    for def in &values {
+        def.render_equality(&mut w);
     }
     render_codecs(&mut w, &values);
     for table in errors::tables(model, "Error") {

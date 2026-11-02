@@ -1,6 +1,6 @@
 //! Snapshot tests covering every generator.
 //!
-//! Five fixtures cover the whole IDL surface between them: `kitchen_sink`
+//! Six fixtures cover the whole IDL surface between them: `kitchen_sink`
 //! (every scalar and composite type, optional scalars and typed arrays in
 //! every position, an interface with objects in optional, list, iterator,
 //! and record positions, two callback interfaces, two error domains, typed
@@ -8,11 +8,12 @@
 //! deprecation), `shapes` (rich enums and the full numeric primitive set),
 //! `imports` (an API split across three files, with references in every
 //! direction), `docs_everywhere` (doc comments on every declaration kind),
-//! and `edge_cases` (identifiers that are reserved words in some target,
-//! deeply nested composites, and every legal position of interfaces and
-//! callback interfaces).
+//! `edge_cases` (identifiers that are reserved words in some target, deeply
+//! nested composites, and every legal position of interfaces and callback
+//! interfaces), and `recursive` (value types that contain themselves or each
+//! other).
 //!
-//! Every target renders all five fixtures, in its own test
+//! Every target renders all six fixtures, in its own test
 //! (`cargo test --test snapshots python`). Each rendered file must carry the
 //! WeaveFFI prelude, and a file that shares its name with a C target output
 //! (a target's copy of the C header) must be byte-equal to the C target's.
@@ -36,12 +37,13 @@ use weaveffi_model::parse::load_api;
 use weaveffi_model::pkg::Identity;
 use weaveffi_model::validate::validate;
 
-const FIXTURES: [&str; 5] = [
+const FIXTURES: [&str; 6] = [
     "kitchen_sink",
     "shapes",
     "imports",
     "docs_everywhere",
     "edge_cases",
+    "recursive",
 ];
 
 /// The one fixture whose outputs are snapshotted. It exercises every

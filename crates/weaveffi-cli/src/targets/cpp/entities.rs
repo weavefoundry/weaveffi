@@ -2,7 +2,7 @@
 //! enums), error domains, and interface wrapper classes, plus the dependency
 //! ordering that keeps by-value members complete before use.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::codegen::common::DocCommentStyle;
 use crate::codegen::docs::Doc;
@@ -99,12 +99,32 @@ impl ValueDef<'_> {
         deps
     }
 
-    /// Append the type's definition.
-    pub(crate) fn render(&self, w: &mut CodeWriter, ctx: &Ctx<'_>) {
+    /// Append the type's definition. `complete` names the value types
+    /// defined so far (see [`member_decl`]).
+    pub(crate) fn render(&self, w: &mut CodeWriter, ctx: &Ctx<'_>, complete: &HashSet<&str>) {
         match self {
-            ValueDef::Record(s) => render_cpp_record(w, ctx, s),
-            ValueDef::Rich(e) => render_cpp_rich_enum(w, ctx, e),
+            ValueDef::Record(s) => render_cpp_record(w, ctx, s, complete),
+            ValueDef::Rich(e) => render_cpp_rich_enum(w, ctx, e, complete),
         }
+    }
+
+    /// Append the definitions of the type's `operator==` (and its variant
+    /// payloads'), which need every value type complete.
+    pub(crate) fn render_equality(&self, w: &mut CodeWriter) {
+        match self {
+            ValueDef::Record(s) => render_equality_definition(w, &s.name, &s.fields),
+            ValueDef::Rich(e) => {
+                let name = &e.name;
+                for v in &e.variants {
+                    let payload = format!("{name}::{}", cpp_ident(&v.name));
+                    render_equality_definition(w, &payload, &v.fields);
+                }
+                w.line(format!(
+                    "inline bool operator==(const {name}& a, const {name}& b) {{ return a.value == b.value; }}"
+                ));
+            }
+        }
+        w.blank();
     }
 }
 
@@ -179,8 +199,18 @@ pub(crate) fn value_types_in_order(model: &Model) -> Vec<ValueDef<'_>> {
 /// a record that holds one, has none, and an initializer must provide it.
 /// Every other member has a default, so a braced initializer may stop after
 /// the members it needs without `-Wmissing-field-initializers` warnings.
-fn member_decl(ctx: &Ctx<'_>, f: &FieldBinding) -> String {
-    let init = if defaultable(ctx.model, &f.ty) {
+///
+/// The exception is an optional holding a value type not yet in `complete`
+/// (two types can hold each other): from C++20, `{}` instantiates
+/// `std::optional`'s `constexpr` constructor, which needs the type complete.
+/// Without it the member still starts empty.
+fn member_decl(ctx: &Ctx<'_>, f: &FieldBinding, complete: &HashSet<&str>) -> String {
+    let incomplete_optional = matches!(f.ty, Ty::Optional(_)) && {
+        let mut deps = Vec::new();
+        collect_value_deps(&f.ty, &mut deps);
+        deps.iter().any(|d| !complete.contains(d.as_str()))
+    };
+    let init = if defaultable(ctx.model, &f.ty) && !incomplete_optional {
         "{}"
     } else {
         ""
@@ -198,41 +228,59 @@ fn is_scalar(ty: &Ty) -> bool {
     }
 }
 
-/// Append the hidden-friend `operator==` and `operator!=` of a value
-/// struct: memberwise, in declaration order. Floating-point members compare
-/// as IEEE values, and interface members by identity.
+/// Append the friend declaration of a value struct's `operator==` and its
+/// inline `operator!=`. [`render_equality_definition`] defines `==` once
+/// every value type is complete: comparing a list of a type that's still
+/// incomplete (two types can hold each other) doesn't compile from C++20,
+/// where `std::vector`'s comparison is `constexpr`.
 fn render_equality(w: &mut CodeWriter, name: &str, fields: &[FieldBinding]) {
     w.line("/** Memberwise equality; interface members compare by identity. */");
     if fields.is_empty() {
         w.line(format!(
-            "friend bool operator==(const {name}&, const {name}&) noexcept {{ return true; }}"
+            "friend bool operator==(const {name}&, const {name}&) noexcept;"
         ));
     } else {
-        let cmp: Vec<String> = fields
-            .iter()
-            .map(|f| {
-                let n = cpp_ident(&f.name);
-                format!("a.{n} == b.{n}")
-            })
-            .collect();
-        let head = format!("friend bool operator==(const {name}& a, const {name}& b) {{");
-        if cmp.len() <= 2 {
-            w.line(format!("{head} return {}; }}", cmp.join(" && ")));
-        } else {
-            w.block(head, "}", |w| {
-                w.line(format!("return {}", cmp[0]));
-                w.scope(|w| {
-                    for (i, c) in cmp.iter().enumerate().skip(1) {
-                        let end = if i + 1 == cmp.len() { ";" } else { "" };
-                        w.line(format!("&& {c}{end}"));
-                    }
-                });
-            });
-        }
+        w.line(format!(
+            "friend bool operator==(const {name}& a, const {name}& b);"
+        ));
     }
     w.line(format!(
         "friend bool operator!=(const {name}& a, const {name}& b) {{ return !(a == b); }}"
     ));
+}
+
+/// Append the definition of a value struct's `operator==`, for `name` as
+/// spelled at namespace scope: memberwise, in declaration order.
+/// Floating-point members compare as IEEE values, and interface members by
+/// identity.
+fn render_equality_definition(w: &mut CodeWriter, name: &str, fields: &[FieldBinding]) {
+    if fields.is_empty() {
+        w.line(format!(
+            "inline bool operator==(const {name}&, const {name}&) noexcept {{ return true; }}"
+        ));
+        return;
+    }
+    let cmp: Vec<String> = fields
+        .iter()
+        .map(|f| {
+            let n = cpp_ident(&f.name);
+            format!("a.{n} == b.{n}")
+        })
+        .collect();
+    let head = format!("inline bool operator==(const {name}& a, const {name}& b) {{");
+    if cmp.len() <= 2 {
+        w.line(format!("{head} return {}; }}", cmp.join(" && ")));
+    } else {
+        w.block(head, "}", |w| {
+            w.line(format!("return {}", cmp[0]));
+            w.scope(|w| {
+                for (i, c) in cmp.iter().enumerate().skip(1) {
+                    let end = if i + 1 == cmp.len() { ";" } else { "" };
+                    w.line(format!("&& {c}{end}"));
+                }
+            });
+        });
+    }
 }
 
 /// Render a record as a plain C++ aggregate: typed members in declaration
@@ -240,7 +288,12 @@ fn render_equality(w: &mut CodeWriter, name: &str, fields: &[FieldBinding]) {
 /// equality. An interface-typed member is the RAII wrapper held by value,
 /// so copying the record shares the object and destroying it releases one
 /// reference.
-fn render_cpp_record(w: &mut CodeWriter, ctx: &Ctx<'_>, s: &RecordBinding) {
+fn render_cpp_record(
+    w: &mut CodeWriter,
+    ctx: &Ctx<'_>,
+    s: &RecordBinding,
+    complete: &HashSet<&str>,
+) {
     w.doc(
         &type_doc(ctx, &s.doc, &s.deprecated),
         DocCommentStyle::Javadoc,
@@ -248,7 +301,7 @@ fn render_cpp_record(w: &mut CodeWriter, ctx: &Ctx<'_>, s: &RecordBinding) {
     w.block(format!("struct {} {{", s.name), "};", |w| {
         for f in &s.fields {
             w.doc(&field_doc(ctx, &f.doc), DocCommentStyle::Javadoc);
-            w.line(member_decl(ctx, f));
+            w.line(member_decl(ctx, f, complete));
         }
         if !s.fields.is_empty() {
             w.blank();
@@ -262,7 +315,12 @@ fn render_cpp_record(w: &mut CodeWriter, ctx: &Ctx<'_>, s: &RecordBinding) {
 /// struct per variant, a `value` member holding the active payload, a nested
 /// `Tag` enum mirroring the wire discriminants, a `tag()` reader, and
 /// equality. Construct one as `Shape{Shape::Circle{2.0}}`.
-fn render_cpp_rich_enum(w: &mut CodeWriter, ctx: &Ctx<'_>, e: &EnumBinding) {
+fn render_cpp_rich_enum(
+    w: &mut CodeWriter,
+    ctx: &Ctx<'_>,
+    e: &EnumBinding,
+    complete: &HashSet<&str>,
+) {
     let name = &e.name;
     w.doc(
         &type_doc(ctx, &e.doc, &e.deprecated),
@@ -284,7 +342,7 @@ fn render_cpp_rich_enum(w: &mut CodeWriter, ctx: &Ctx<'_>, e: &EnumBinding) {
             w.block(format!("struct {vn} {{"), "};", |w| {
                 for f in &v.fields {
                     w.doc(&field_doc(ctx, &f.doc), DocCommentStyle::Javadoc);
-                    w.line(member_decl(ctx, f));
+                    w.line(member_decl(ctx, f, complete));
                 }
                 if !v.fields.is_empty() {
                     w.blank();
@@ -309,7 +367,7 @@ fn render_cpp_rich_enum(w: &mut CodeWriter, ctx: &Ctx<'_>, e: &EnumBinding) {
         w.blank();
         w.line("/** Equal when the same variant is active with equal payloads. */");
         w.line(format!(
-            "friend bool operator==(const {name}& a, const {name}& b) {{ return a.value == b.value; }}"
+            "friend bool operator==(const {name}& a, const {name}& b);"
         ));
         w.line(format!(
             "friend bool operator!=(const {name}& a, const {name}& b) {{ return !(a == b); }}"

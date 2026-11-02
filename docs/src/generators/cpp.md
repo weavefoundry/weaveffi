@@ -141,7 +141,10 @@ scalars and enums, empty otherwise), so a partial initializer compiles
 without `-Wmissing-field-initializers` warnings. An interface wrapper has no
 empty state, so a member holding one by value (or holding a record that
 does) has no default, and a record with such a member has no default
-constructor. Records and rich enums compare with `==` and `!=` memberwise:
+constructor. An optional holding a type defined later (two types can hold
+each other) also has no default member initializer, because C++20 needs the
+type complete for one; it still starts empty, but a partial initializer that
+skips it can warn. Records and rich enums compare with `==` and `!=` memberwise:
 floating-point members as IEEE values (a NaN member is unequal to itself),
 and interface members by identity.
 
