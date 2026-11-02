@@ -1,7 +1,7 @@
 // Conformance consumer: kvstore sample, .NET target (feature-complete).
 //
-// Loading the generated project checks the ABI revision and the `kv` and
-// `report` contract tables. Then it drives the generated Kvstore project:
+// Loading the generated project checks the ABI revision and every
+// declaration's contract. Then it drives the generated Kvstore project:
 //
 //   * the Store class: the throwing Open factory and the infallible
 //     constructor, methods, statics, the deprecated Size, records (Entry,
@@ -26,10 +26,9 @@
 //     object (and failing with a typed error), a cancellable method
 //     cancelled through a CancellationToken mid-pause (an
 //     OperationCanceledException at once, its background work stopping
-//     cooperatively), 32 concurrent async lists, and the nested module's
-//     async function;
-//   * the nested KvStats class and the sibling Report root;
-//   * the ABI 5 shapes: an optional scalar (`long?`) parameter, return,
+//     cooperatively), 32 concurrent async lists, and an async summary;
+//   * the free functions, statics of the KvstoreLibrary class;
+//   * the one-C-value shapes: an optional scalar (`long?`) parameter, return,
 //     iterator item, async result, and callback parameter and return; typed
 //     arrays as a return, an async result, and a callback parameter (a
 //     span) and return (an array); `usize` counts (`ulong`); a `throws:
@@ -295,11 +294,11 @@ internal static class Program
             Expect(memory.Path() == "memory", "new Store() path");
             Expect(memory.Capacity() == Store.DefaultCapacity() && Store.DefaultCapacity() == 1_000_000, "default capacity");
         }
-        using (var opened = await Kv.OpenStore("/async"))
+        using (var opened = await KvstoreLibrary.OpenStore("/async"))
         {
             Expect(opened.Path() == "/async", "OpenStore path");
         }
-        var rejected = await ThrowsAsync<KvException.InvalidPath>(() => Kv.OpenStore(""), "OpenStore(\"\")");
+        var rejected = await ThrowsAsync<KvException.InvalidPath>(() => KvstoreLibrary.OpenStore(""), "OpenStore(\"\")");
         Expect(rejected.Message == "invalid path", "async InvalidPath message");
     }
 
@@ -596,23 +595,22 @@ internal static class Program
             Expect(got.Count == 3 && got[0] != null && got[1] == null && got[2]?.Key == "keep", "get_many");
         }
 
-        // The nested module's async free function: objects in a list in, a
-        // record out.
+        // An async free function: objects in a list in, a record out.
         using var other = Store.Open("/other");
         Put(other, "a", "123");
-        var st = await KvStats.SummarizeAll(new[] { s, other });
+        var st = await KvstoreLibrary.SummarizeAll(new[] { s, other });
         Expect(st.Entries == 2 && st.Bytes == 4, "summarize_all totals");
         Expect(st.ByKind.Count == 1 && st.ByKind[EntryKind.Persistent] == 2, "summarize_all by_kind");
 
         // A call that can't be cancelled stops waiting when its token fires;
         // the native call finishes and its result (here a Store) is released.
-        await ThrowsAsync<OperationCanceledException>(() => Kv.OpenStore("/never", new CancellationToken(true)),
+        await ThrowsAsync<OperationCanceledException>(() => KvstoreLibrary.OpenStore("/never", new CancellationToken(true)),
             "pre-cancelled open_store");
         var abandoned = 0;
         for (var i = 0; i < 32; i++)
         {
             using var cts = new CancellationTokenSource();
-            var pending = Kv.OpenStore("/abandoned", cts.Token);
+            var pending = KvstoreLibrary.OpenStore("/abandoned", cts.Token);
             cts.Cancel();
             try
             {
@@ -697,16 +695,16 @@ internal static class Program
         Put(s, "c", "x", EntryKind.Encrypted);
 
         // kv.stats.summarize: the parent's Store and error domain.
-        var st = KvStats.Summarize(s, null);
+        var st = KvstoreLibrary.Summarize(s, null);
         Expect(st.Entries == 3 && st.Bytes == 6 && st.ByKind.Count == 2, "summarize totals");
         Expect(st.ByKind[EntryKind.Persistent] == 2 && st.ByKind[EntryKind.Encrypted] == 1, "summarize by_kind");
-        ExpectKeyNotFound(() => KvStats.Summarize(s, "q"), "q", "summarize(q)");
+        ExpectKeyNotFound(() => KvstoreLibrary.Summarize(s, "q"), "q", "summarize(q)");
 
         // report.render_report: the sibling root shares the Entry record.
-        var lines = Report.RenderReport(s.Entries(null).ToArray());
+        var lines = KvstoreLibrary.RenderReport(s.Entries(null).ToArray());
         Expect(lines.SequenceEqual(new[] { "a: 3 bytes, Persistent, v2", "b: 2 bytes, Persistent", "c: 1 bytes, Encrypted" }),
             $"render_report (got [{string.Join("; ", lines)}])");
-        var nothing = Throws<ReportException.NothingToReport>(() => Report.RenderReport(Array.Empty<Entry>()), "empty report");
+        var nothing = Throws<ReportException.NothingToReport>(() => KvstoreLibrary.RenderReport(Array.Empty<Entry>()), "empty report");
         Expect(nothing.Code == 2001 && nothing.Message == "nothing to report", "NothingToReport");
     }
 

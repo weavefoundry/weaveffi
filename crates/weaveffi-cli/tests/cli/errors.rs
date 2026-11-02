@@ -60,19 +60,17 @@ fn parse_error_json_shows_filename_and_location() {
 }
 
 #[test]
-fn validation_error_duplicate_module_shows_suggestion() {
+fn validation_error_duplicate_name_shows_suggestion() {
     let dir = tempfile::tempdir().unwrap();
     let yaml = r#"
-version: "0.12.0"
-modules:
+version: "0.13.0"
+interfaces:
   - name: foo
-    functions:
-      - name: bar
-        params: []
+    methods:
+      - { name: bar, params: [] }
+functions:
   - name: foo
-    functions:
-      - name: baz
-        params: []
+    params: []
 "#;
     let path = write_temp_file(&dir, "dup.yml", yaml);
 
@@ -84,7 +82,7 @@ modules:
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(
-        stderr.contains("duplicate module name"),
+        stderr.contains("duplicate name 'foo'"),
         "expected rule violation message, got: {stderr}"
     );
     assert!(
@@ -92,7 +90,7 @@ modules:
         "expected miette help section, got: {stderr}"
     );
     assert!(
-        stderr.contains("module names must be unique"),
+        stderr.contains("shares one namespace"),
         "expected fix suggestion text, got: {stderr}"
     );
 }
@@ -101,13 +99,11 @@ modules:
 fn async_function_validates_successfully() {
     let dir = tempfile::tempdir().unwrap();
     let yaml = r#"
-version: "0.12.0"
-modules:
-  - name: mymod
-    functions:
-      - name: do_stuff
-        params: []
-        async: true
+version: "0.13.0"
+functions:
+  - name: do_stuff
+    params: []
+    async: true
 "#;
     let path = write_temp_file(&dir, "async.yml", yaml);
 
@@ -127,14 +123,12 @@ modules:
 fn validation_error_duplicate_function_shows_suggestion() {
     let dir = tempfile::tempdir().unwrap();
     let yaml = r#"
-version: "0.12.0"
-modules:
-  - name: mymod
-    functions:
-      - name: do_stuff
-        params: []
-      - name: do_stuff
-        params: []
+version: "0.13.0"
+functions:
+  - name: do_stuff
+    params: []
+  - name: do_stuff
+    params: []
 "#;
     let path = write_temp_file(&dir, "dupfn.yml", yaml);
 
@@ -146,11 +140,11 @@ modules:
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(
-        stderr.contains("duplicate function name"),
+        stderr.contains("duplicate name 'do_stuff'"),
         "expected rule violation message, got: {stderr}"
     );
     assert!(
-        stderr.contains("function names must be unique"),
+        stderr.contains("shares one namespace"),
         "expected fix suggestion text, got: {stderr}"
     );
 }
@@ -187,16 +181,15 @@ fn generate_parse_error_shows_filename_and_suggestion() {
 fn generate_validation_error_shows_suggestion() {
     let dir = tempfile::tempdir().unwrap();
     let yaml = r#"
-version: "0.12.0"
-modules:
+version: "0.13.0"
+records:
   - name: dup
-    functions:
-      - name: f
-        params: []
+    fields:
+      - { name: n, type: i32 }
+enums:
   - name: dup
-    functions:
-      - name: g
-        params: []
+    variants:
+      - { name: A, value: 0 }
 "#;
     let path = write_temp_file(&dir, "dup_gen.yml", yaml);
     let out_dir = dir.path().join("out");
@@ -214,7 +207,7 @@ modules:
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(
-        stderr.contains("duplicate module name"),
+        stderr.contains("duplicate name 'dup'"),
         "expected rule violation in generate, got: {stderr}"
     );
     assert!(
@@ -227,12 +220,10 @@ modules:
 fn validate_with_warnings() {
     let dir = tempfile::tempdir().unwrap();
     let yaml = r#"
-version: "0.12.0"
-modules:
-  - name: nodocs
-    functions:
-      - name: do_stuff
-        params: []
+version: "0.13.0"
+functions:
+  - name: do_stuff
+    params: []
 "#;
     let path = write_temp_file(&dir, "nodocs.yml", yaml);
 
@@ -248,11 +239,11 @@ modules:
         "expected warning prefix in stderr, got: {stderr}"
     );
     assert!(
-        stderr.contains("nodocs"),
-        "expected module name in warning, got: {stderr}"
+        stderr.contains("do_stuff"),
+        "expected the function's name in warning, got: {stderr}"
     );
     assert!(
-        stderr.contains("has no doc comment"),
+        stderr.contains("has no documentation"),
         "expected doc comment warning text, got: {stderr}"
     );
 }

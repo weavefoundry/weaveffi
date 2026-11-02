@@ -25,7 +25,7 @@ fn write_temp_file(dir: &tempfile::TempDir, name: &str, contents: &str) -> std::
 #[test]
 fn parse_yaml_error_includes_line() {
     let dir = tempfile::tempdir().unwrap();
-    let yaml = "version: \"0.12.0\"\nmodules:\n  - name: [bad\n";
+    let yaml = "version: \"0.13.0\"\nfunctions:\n  - name: [bad\n";
     let path = write_temp_file(&dir, "broken.yml", yaml);
 
     let output = cargo_bin()
@@ -56,14 +56,12 @@ fn parse_yaml_error_includes_line() {
 #[test]
 fn validate_unknown_typeref_includes_offending_name() {
     let dir = tempfile::tempdir().unwrap();
-    let yaml = r#"version: "0.12.0"
-modules:
-  - name: m
-    functions:
-      - name: f
-        params:
-          - name: x
-            type: NotARealType
+    let yaml = r#"version: "0.13.0"
+functions:
+  - name: f
+    params:
+      - name: x
+        type: NotARealType
 "#;
     let path = write_temp_file(&dir, "unknown.yml", yaml);
 
@@ -89,21 +87,19 @@ modules:
     );
 }
 
-/// A duplicate module name should be flagged with the offending name in the
-/// rendered diagnostic, along with the filename.
+/// Two declarations with one name should be flagged with the offending name
+/// in the rendered diagnostic, along with the filename.
 #[test]
-fn validate_duplicate_module_includes_offending_name() {
+fn validate_duplicate_name_includes_offending_name() {
     let dir = tempfile::tempdir().unwrap();
-    let yaml = r#"version: "0.12.0"
-modules:
+    let yaml = r#"version: "0.13.0"
+records:
   - name: alpha
-    functions:
-      - name: f
-        params: []
+    fields:
+      - { name: n, type: i32 }
+functions:
   - name: alpha
-    functions:
-      - name: g
-        params: []
+    params: []
 "#;
     let path = write_temp_file(&dir, "dup.yml", yaml);
 
@@ -117,11 +113,11 @@ modules:
 
     assert!(
         stderr.contains("alpha"),
-        "expected offending module name 'alpha' in diagnostic, got:\n{stderr}"
+        "expected offending name 'alpha' in diagnostic, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("duplicate module name"),
-        "expected duplicate module name message, got:\n{stderr}"
+        stderr.contains("duplicate name 'alpha'"),
+        "expected duplicate name message, got:\n{stderr}"
     );
     assert!(
         stderr.contains("dup.yml"),
@@ -134,7 +130,7 @@ modules:
 #[test]
 fn parse_json_error_includes_line() {
     let dir = tempfile::tempdir().unwrap();
-    let json = "{\n  \"version\": \"0.7.0\",\n  \"modules\": [ broken\n}\n";
+    let json = "{\n  \"version\": \"0.13.0\",\n  \"functions\": [ broken\n}\n";
     let path = write_temp_file(&dir, "broken.json", json);
 
     let output = cargo_bin()

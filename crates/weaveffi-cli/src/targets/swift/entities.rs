@@ -1,16 +1,16 @@
 //! Entity rendering: error domains, enums, rich enums, records, interfaces,
-//! and the recursive module walk emitting them (callback interfaces render
-//! through [`crate::targets::swift::callbacks`], value-buffer codecs through
-//! [`crate::targets::swift::codec`]).
+//! and free functions, all in the Swift module's one namespace (callback
+//! interfaces render through [`crate::targets::swift::callbacks`],
+//! value-buffer codecs through [`crate::targets::swift::codec`]).
 
 use crate::codegen::common::DocCommentStyle;
+use crate::codegen::errors;
 use crate::codegen::errors::ErrorTable;
 use crate::codegen::CodeWriter;
 use crate::lang;
-use heck::ToUpperCamelCase;
-use weaveffi_model::model::{EnumBinding, InterfaceBinding, Model, ModuleBinding, StructBinding};
+use weaveffi_model::model::{EnumBinding, InterfaceBinding, Model, RecordBinding};
 
-use crate::targets::swift::callbacks::render_swift_callback_interface;
+use crate::targets::swift::callbacks::render_swift_callback;
 use crate::targets::swift::calls::{render_callable, Receiver};
 use crate::targets::swift::codec::{
     render_c_enum_codec, render_record_codec, render_rich_enum_codec,
@@ -35,7 +35,7 @@ const MESSAGE_LABEL: &str = "message";
 /// Domain codes are validated positive; a failed call maps every negative
 /// (runtime) code to the runtime error before it gets here.
 fn render_swift_error(w: &mut CodeWriter, table: &ErrorTable, ctx: &SwiftCtx) {
-    let ty = ctx.ty_name(&table.type_name);
+    let ty = &table.type_name;
     let cases: Vec<String> = table
         .codes
         .iter()
@@ -48,10 +48,7 @@ fn render_swift_error(w: &mut CodeWriter, table: &ErrorTable, ctx: &SwiftCtx) {
     // A field named like the leading message gets a `_`.
     let field_label = |name: &str| lang::escape_member(&swift_ident(name), &[MESSAGE_LABEL]);
 
-    w.line(format!(
-        "/// The `{}` error domain of the `{}` module.",
-        table.domain.name, table.module.dot_path
-    ));
+    w.line(format!("/// The `{}` error domain.", table.domain.name));
     w.line("///");
     w.line("/// Every case carries the message the library reported (the code's");
     w.line("/// documented message when it sent none) and the code's fields.");
@@ -239,7 +236,7 @@ fn render_swift_rich_enum(w: &mut CodeWriter, e: &EnumBinding, ctx: &SwiftCtx) {
 /// per field and an explicit public memberwise initializer (the synthesized
 /// one is internal), plus its codec. Every field type is `Hashable`
 /// (interface wrappers by identity), so every record is.
-fn render_swift_struct(w: &mut CodeWriter, s: &StructBinding, ctx: &SwiftCtx) {
+fn render_swift_struct(w: &mut CodeWriter, s: &RecordBinding, ctx: &SwiftCtx) {
     emit_decl_doc(w, ctx, &s.doc, &s.deprecated);
     w.line(format!("public struct {}: Hashable, Sendable {{", s.name));
     w.indent();
@@ -344,68 +341,38 @@ fn render_swift_interface(w: &mut CodeWriter, iface: &InterfaceBinding, ctx: &Sw
         .chain(iface.statics.iter().map(|f| (f, Receiver::Static)));
     for (f, receiver) in members {
         w.blank();
-        render_callable(w, f, &swift_member(&f.name), receiver, ctx);
+        render_callable(w, f, &swift_member(&f.name), receiver, true, ctx);
     }
     w.dedent();
     w.line("}");
     w.blank();
 }
 
-/// Emit every error domain of the API.
-pub(crate) fn render_swift_errors(w: &mut CodeWriter, tables: &[ErrorTable], ctx: &SwiftCtx) {
-    for table in tables {
+/// Emit the whole API into the Swift module's one namespace: every error
+/// domain, enum, record, callback interface, and interface, then every free
+/// function as a top-level `func`.
+pub(crate) fn render_swift_api(w: &mut CodeWriter, model: &Model, ctx: &SwiftCtx) {
+    for table in &errors::tables(model, "Error") {
         render_swift_error(w, table, ctx);
     }
-}
-
-/// Emit every file-scope type one module contributes: enums and records
-/// with their codecs, callback-interface protocols with their vtables, and
-/// interface classes.
-pub(crate) fn render_swift_module_types(w: &mut CodeWriter, mb: &ModuleBinding, ctx: &SwiftCtx) {
-    for e in &mb.enums {
+    for e in &model.enums {
         if e.is_rich() {
             render_swift_rich_enum(w, e, ctx);
         } else {
             render_swift_enum(w, e, ctx);
         }
     }
-    for s in &mb.structs {
-        render_swift_struct(w, s, ctx);
+    for r in &model.records {
+        render_swift_struct(w, r, ctx);
     }
-    for cb in &mb.callback_interfaces {
-        render_swift_callback_interface(w, cb, ctx);
+    for cb in &model.callbacks {
+        render_swift_callback(w, cb, ctx);
     }
-    for i in &mb.interfaces {
+    for i in &model.interfaces {
         render_swift_interface(w, i, ctx);
     }
-}
-
-/// Emit one module's namespace `enum`: its function wrappers, then one
-/// nested namespace per submodule.
-pub(crate) fn render_swift_namespace(
-    w: &mut CodeWriter,
-    model: &Model,
-    mb: &ModuleBinding,
-    ctx: &SwiftCtx,
-) {
-    w.doc(&ctx.doc(&mb.doc), DocCommentStyle::TripleSlash);
-    w.line(format!("public enum {} {{", mb.name.to_upper_camel_case()));
-    w.indent();
-    let mut first = true;
-    for f in &mb.functions {
-        if !first {
-            w.blank();
-        }
-        first = false;
-        render_callable(w, f, &swift_ident(&f.name), Receiver::Static, ctx);
+    for f in &model.functions {
+        render_callable(w, f, &swift_ident(&f.name), Receiver::Static, false, ctx);
+        w.blank();
     }
-    for sub in model.children(mb) {
-        if !first {
-            w.blank();
-        }
-        first = false;
-        render_swift_namespace(w, model, sub, ctx);
-    }
-    w.dedent();
-    w.line("}");
 }

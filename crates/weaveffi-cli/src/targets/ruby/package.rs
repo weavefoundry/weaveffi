@@ -17,7 +17,8 @@ pub(crate) struct GemNames<'a> {
     pub identity: &'a Identity,
     /// The gem name (`{name}` unless configured).
     pub gem: String,
-    /// The top-level Ruby module (`PascalCase(name)` unless configured).
+    /// The Ruby module holding the bindings (`PascalCase(name)` unless
+    /// configured).
     pub module: String,
 }
 

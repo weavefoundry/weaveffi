@@ -18,11 +18,15 @@ check:
 
 # Run the end-to-end conformance harness (ONLY=python just conformance)
 conformance:
-    bash conformance/run.sh
+    cargo xtask conformance
 
 # Compile-check every snapshot fixture with each language's toolchain
 fixtures *targets:
-    bash scripts/check-fixtures.sh {{targets}}
+    cargo xtask fixtures {{targets}}
+
+# Check bindings against a library of a different version
+skew:
+    cargo xtask skew
 
 # Build the mdBook site
 docs:

@@ -1,164 +1,113 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Api",
-  "description": "Top-level WeaveFFI API definition.",
+  "description": "A WeaveFFI API definition: one library's namespace.",
   "type": "object",
   "required": [
-    "modules",
     "version"
   ],
   "properties": {
     "version": {
-      "description": "IR schema version this document targets (for example `0.12.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
+      "description": "The IR schema version this document targets (`0.13.0`).",
       "type": "string"
     },
-    "modules": {
-      "description": "Top-level modules that make up the API surface. Each is an independent namespace; modules may nest further through [`Module::modules`].",
+    "doc": {
+      "description": "Documentation for the library as a whole, propagated to each package's top-level doc comment.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "imports": {
+      "description": "Other IDL files whose declarations join this library's namespace, as paths relative to this file. [`crate::parse::load_api`] resolves them; a document assembled in memory has none.",
       "type": "array",
       "items": {
-        "$ref": "#/definitions/Module"
+        "type": "string"
+      }
+    },
+    "records": {
+      "description": "Records: plain data types with named fields.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/RecordDef"
+      }
+    },
+    "enums": {
+      "description": "Enums, C-style or with data-carrying variants.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/EnumDef"
+      }
+    },
+    "errors": {
+      "description": "Error domains: named, open sets of error codes that callables report by naming the domain in their `throws`.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ErrorDomain"
+      }
+    },
+    "interfaces": {
+      "description": "Interfaces: reference-counted object types with constructors, methods, and statics.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/InterfaceDef"
+      }
+    },
+    "callbacks": {
+      "description": "Callback interfaces: method sets the consumer implements and the producer calls.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CallbackDef"
+      }
+    },
+    "functions": {
+      "description": "Free functions.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Function"
       }
     }
   },
   "additionalProperties": false,
   "definitions": {
-    "Module": {
-      "description": "A WeaveFFI module: a named group of functions, types, callback interfaces, and errors.",
+    "RecordDef": {
+      "description": "A record: a plain data type with named fields, serialized across the ABI.",
       "type": "object",
       "required": [
+        "fields",
         "name"
       ],
       "properties": {
         "name": {
-          "description": "Module name, used as a namespace segment and a symbol-prefix component in generated code (for example `contacts`).",
+          "description": "The record name (for example `Contact`).",
           "type": "string"
         },
         "doc": {
-          "description": "Human-readable documentation for the module as a whole, propagated to the generated namespace, class, or file header. `None` when undocumented.",
+          "description": "Documentation, propagated to the bindings.",
           "type": [
             "string",
             "null"
           ]
-        },
-        "functions": {
-          "description": "Free functions this module exports across the FFI boundary.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Function"
-          }
-        },
-        "interfaces": {
-          "description": "Interface (object) types declared in this module: stateful resources with constructors, methods, and static functions.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/InterfaceDef"
-          }
-        },
-        "callback_interfaces": {
-          "description": "Callback interfaces declared in this module: method sets the consumer implements and the producer calls.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/CallbackInterfaceDef"
-          }
-        },
-        "structs": {
-          "description": "Record (struct) types declared in this module.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/StructDef"
-          }
-        },
-        "enums": {
-          "description": "Enum types, C-style or algebraic, declared in this module.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/EnumDef"
-          }
-        },
-        "errors": {
-          "description": "The error domains this module declares: named sets of codes that fallible callables anywhere in the API report by naming the domain in their `throws`. Domain names share the global type namespace.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/ErrorDomain"
-          }
-        },
-        "modules": {
-          "description": "Nested submodules, forming a tree that mirrors a package hierarchy.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Module"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
-    "Function": {
-      "description": "A function exported across the FFI boundary.\n\nEach function becomes a C ABI entry point plus an idiomatic wrapper in every target language. The `async` and `cancellable` flags change how the symbol is lowered (a completion callback, an extra cancel-token parameter) without altering the parameter and return shape declared here. The same shape also describes an interface's constructors, methods, and statics (see [`InterfaceDef`]) and a callback interface's methods (see [`CallbackInterfaceDef`]).",
-      "type": "object",
-      "required": [
-        "name"
-      ],
-      "properties": {
-        "name": {
-          "description": "Function name, lowered to a per-language symbol (for example `create_contact`).",
-          "type": "string"
-        },
-        "params": {
-          "description": "Ordered parameter list; order is preserved in every generated signature.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Param"
-          }
-        },
-        "return": {
-          "description": "Return type, or `None` for a function that returns nothing. Serialized under the IDL key `return`.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/TypeRef"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "doc": {
-          "description": "Human-readable documentation, propagated to the generated bindings' doc comments. `None` when undocumented.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "throws": {
-          "description": "How the function can fail. Absent for a function that can't, which treats any reported error as a producer bug (a trap, not a typed error); an error domain's name (`throws: KvError`) for one that reports that domain's codes; or `any` (`throws: any`) for one that fails with an untyped error, a message under the generic runtime code `-1`.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/Throws"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "async": {
-          "description": "Whether the function is asynchronous, lowering to a completion-callback form rather than a blocking call. Serialized under the IDL key `async`.",
-          "type": "boolean"
-        },
-        "cancellable": {
-          "description": "Whether an async call accepts a cancellation token so callers can request that an in-flight operation stop early. Defaults to `false`.",
-          "type": "boolean"
         },
         "deprecated": {
-          "description": "Deprecation notice; when set, generators emit a deprecation annotation carrying this message. `None` means the function is current.",
+          "description": "A deprecation notice for the whole type.",
           "type": [
             "string",
             "null"
           ]
+        },
+        "fields": {
+          "description": "The fields, in declaration (and wire) order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Field"
+          }
         }
       },
       "additionalProperties": false
     },
-    "Param": {
-      "description": "A single parameter of a [`Function`].",
+    "Field": {
+      "description": "A named field of a [`RecordDef`], an [`EnumVariant`], or an [`ErrorCode`].",
       "type": "object",
       "required": [
         "name",
@@ -166,11 +115,11 @@
       ],
       "properties": {
         "name": {
-          "description": "Parameter name as it appears in generated signatures (for example `id`).",
+          "description": "The field name (for example `email`).",
           "type": "string"
         },
         "type": {
-          "description": "Parameter type. Serialized under the IDL key `type`.",
+          "description": "The field type. Serialized under the key `type`.",
           "allOf": [
             {
               "$ref": "#/definitions/TypeRef"
@@ -178,7 +127,7 @@
           ]
         },
         "doc": {
-          "description": "Human-readable documentation for the parameter, propagated to the generated bindings. `None` when undocumented.",
+          "description": "Documentation, propagated to the bindings.",
           "type": [
             "string",
             "null"
@@ -189,167 +138,11 @@
     },
     "TypeRef": {
       "title": "TypeRef",
-      "description": "Reference to a type. Encoded as a string with custom syntax: primitives (`i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `bool`, `string`, `bytes`), iterators (`iter<{T}>`), lists (`[{T}]`), maps (`{{K:V}}`), optionals (`{T}?`), or the bare (unqualified) name of a user-defined struct, enum, interface, or callback interface.",
+      "description": "A type, as a string: a primitive (`i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `bool`, `string`, `bytes`), a list (`[T]`), a map (`{K:V}`), an optional (`T?`), an iterator (`iter<T>`), or the name of a record, enum, interface, or callback interface.",
       "type": "string"
-    },
-    "Throws": {
-      "title": "Throws",
-      "description": "What a fallible callable reports: the name of an error domain declared in any module, or `any` for an untyped error (code -1 and a message).",
-      "type": "string"
-    },
-    "InterfaceDef": {
-      "description": "An interface: an opaque object type with constructors, methods, and statics.",
-      "type": "object",
-      "required": [
-        "name"
-      ],
-      "properties": {
-        "name": {
-          "description": "Interface type name (for example `Store`).",
-          "type": "string"
-        },
-        "doc": {
-          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "deprecated": {
-          "description": "Deprecation notice for the whole type; when set, generators annotate the emitted class. `None` means the interface is current.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "constructors": {
-          "description": "Constructors: static functions returning a new instance. A constructor declares no `return` (the instance is implicit) and may not be `async`.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Function"
-          }
-        },
-        "methods": {
-          "description": "Instance methods. Each lowers with an implicit leading `self` slot (a pointer to the interface object) before the declared parameters.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Function"
-          }
-        },
-        "statics": {
-          "description": "Static functions namespaced under the interface but taking no `self`.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Function"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
-    "CallbackInterfaceDef": {
-      "description": "A callback interface: a set of methods the consumer implements and the producer calls.",
-      "type": "object",
-      "required": [
-        "methods",
-        "name"
-      ],
-      "properties": {
-        "name": {
-          "description": "Callback interface type name (for example `MessageListener`).",
-          "type": "string"
-        },
-        "doc": {
-          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "deprecated": {
-          "description": "Deprecation notice for the whole type; when set, generators annotate the emitted type. `None` means the callback interface is current.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "methods": {
-          "description": "Methods the consumer implements, in vtable order. Must be non-empty.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Function"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
-    "StructDef": {
-      "description": "A struct (record) type with named fields.",
-      "type": "object",
-      "required": [
-        "fields",
-        "name"
-      ],
-      "properties": {
-        "name": {
-          "description": "Struct type name (for example `Contact`).",
-          "type": "string"
-        },
-        "doc": {
-          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "deprecated": {
-          "description": "Deprecation notice for the whole type; when set, generators annotate the emitted record. `None` means the struct is current.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "fields": {
-          "description": "The fields in declaration order; order is preserved in the generated type, its constructors, and its serialized buffer encoding.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/StructField"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
-    "StructField": {
-      "description": "A named field of a [`StructDef`], or the payload of an algebraic [`EnumVariant`].",
-      "type": "object",
-      "required": [
-        "name",
-        "type"
-      ],
-      "properties": {
-        "name": {
-          "description": "Field name (for example `email`).",
-          "type": "string"
-        },
-        "type": {
-          "description": "Field type. Serialized under the IDL key `type`.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/TypeRef"
-            }
-          ]
-        },
-        "doc": {
-          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "additionalProperties": false
     },
     "EnumDef": {
-      "description": "An enum type. C-style when every variant is a bare discriminant; an algebraic sum type when any variant declares fields.",
+      "description": "An enum: C-style when every variant is a bare discriminant, a sum type when any variant declares fields (see [`is_rich`](Self::is_rich)).\n\nA C-style enum crosses the C ABI as an `int32_t`; a rich enum crosses serialized in a value buffer (an `i32` tag, then the variant's fields).",
       "type": "object",
       "required": [
         "name",
@@ -357,25 +150,25 @@
       ],
       "properties": {
         "name": {
-          "description": "Enum type name (for example `Color`).",
+          "description": "The enum name (for example `Color`).",
           "type": "string"
         },
         "doc": {
-          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
+          "description": "Documentation, propagated to the bindings.",
           "type": [
             "string",
             "null"
           ]
         },
         "deprecated": {
-          "description": "Deprecation notice for the whole type; when set, generators annotate the emitted enum. `None` means the enum is current.",
+          "description": "A deprecation notice for the whole type.",
           "type": [
             "string",
             "null"
           ]
         },
         "variants": {
-          "description": "The variants in declaration order. Whether any of them carries fields decides if this is a C-style or an algebraic enum.",
+          "description": "The variants, in declaration order.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/EnumVariant"
@@ -388,38 +181,40 @@
       "description": "A single variant of an [`EnumDef`].",
       "type": "object",
       "required": [
-        "name",
-        "value"
+        "name"
       ],
       "properties": {
         "name": {
-          "description": "Variant name (for example `Red`).",
+          "description": "The variant name (for example `Red`).",
           "type": "string"
         },
         "value": {
-          "description": "Integer discriminant. Doubles as the C-style enum value and as the runtime tag that distinguishes the variants of an algebraic enum.",
-          "type": "integer",
+          "description": "The discriminant: the C-style value, or a rich enum's buffer tag. When absent it's one more than the previous variant's (`0` for the first).",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "int32"
         },
         "doc": {
-          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
+          "description": "Documentation, propagated to the bindings.",
           "type": [
             "string",
             "null"
           ]
         },
         "fields": {
-          "description": "Associated data carried by this variant. Empty for a unit variant or a C-style enum; non-empty makes the owning enum a sum type (see [`EnumDef::is_rich`]).",
+          "description": "The variant's fields; non-empty makes the enum a sum type.",
           "type": "array",
           "items": {
-            "$ref": "#/definitions/StructField"
+            "$ref": "#/definitions/Field"
           }
         }
       },
       "additionalProperties": false
     },
     "ErrorDomain": {
-      "description": "An error domain: a named, open set of error codes that fallible callables report by naming the domain in their `throws`.\n\nA module may declare several. The domain's name is a type name (unique across the API); its code names are unique across the API too, and its code values are positive and unique within the domain. Domains are open: adding a code never breaks a deployed binding, which maps a positive code it doesn't know to the domain's base error type.",
+      "description": "An error domain: a named, open set of error codes that fallible callables report by naming the domain in their `throws`.\n\nCode values are positive and unique within the domain. Domains are open: adding a code never breaks a deployed binding, which maps a positive code it doesn't know to the domain's base error type.",
       "type": "object",
       "required": [
         "codes",
@@ -427,11 +222,18 @@
       ],
       "properties": {
         "name": {
-          "description": "Error domain name, used to name the generated error type (for example `ContactError`). Callables name it in their `throws`.",
+          "description": "The domain name, which names the generated error type (for example `ContactError`).",
           "type": "string"
         },
+        "doc": {
+          "description": "Documentation, propagated to the generated error type.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "codes": {
-          "description": "The error codes that belong to this domain.",
+          "description": "The codes, in declaration order.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/ErrorCode"
@@ -450,30 +252,215 @@
       ],
       "properties": {
         "name": {
-          "description": "Error code name, lowered to a variant or constant on the generated error type (for example `not_found`).",
+          "description": "The code name (for example `NotFound`).",
           "type": "string"
         },
         "code": {
-          "description": "Stable numeric value carried across the C ABI to identify this error. Must be positive; non-positive codes are reserved for the runtime.",
+          "description": "The stable positive value carried across the C ABI.",
           "type": "integer",
           "format": "int32"
         },
         "message": {
-          "description": "Default human-readable message describing the error.",
+          "description": "The default human-readable message.",
           "type": "string"
         },
         "doc": {
-          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
+          "description": "Documentation, propagated to the bindings.",
           "type": [
             "string",
             "null"
           ]
         },
         "fields": {
-          "description": "Structured payload fields this error carries beyond its code and message, serialized across the ABI in the error's payload buffer. Empty for a plain code.",
+          "description": "Payload fields the error carries beyond its code and message, serialized in the error's payload buffer.",
           "type": "array",
           "items": {
-            "$ref": "#/definitions/StructField"
+            "$ref": "#/definitions/Field"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "InterfaceDef": {
+      "description": "An interface: an opaque, reference-counted object type with constructors, instance methods, and static functions.\n\nAn interface value lives behind the FFI boundary and crosses it as a pointer that carries one strong reference; consumers see a class whose methods call into the producer. An interface value may appear anywhere a type can: as a parameter, a return, an iterator element, a record field, a list element, or a map value.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "description": "The interface name (for example `Store`).",
+          "type": "string"
+        },
+        "doc": {
+          "description": "Documentation, propagated to the bindings.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deprecated": {
+          "description": "A deprecation notice for the whole type.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "constructors": {
+          "description": "Constructors: functions returning a new instance. A constructor declares no `return` (the instance is implicit) and isn't `async`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Function"
+          }
+        },
+        "methods": {
+          "description": "Instance methods, each called on an instance.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Function"
+          }
+        },
+        "statics": {
+          "description": "Static functions namespaced under the interface.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Function"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Function": {
+      "description": "A function exported across the FFI boundary.\n\nThe same shape describes a free function, an interface's constructors, methods, and statics (see [`InterfaceDef`]), and a callback interface's methods (see [`CallbackDef`]). The `async` and `cancellable` flags change how the symbol is lowered (a completion callback, an extra cancel-token parameter) without changing the parameters and return declared here.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "description": "The function name (for example `create_contact`).",
+          "type": "string"
+        },
+        "params": {
+          "description": "The parameters, in order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Param"
+          }
+        },
+        "return": {
+          "description": "The return type, or `None` for a function that returns nothing. Serialized under the key `return`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TypeRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "doc": {
+          "description": "Documentation, propagated to the bindings' doc comments.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "throws": {
+          "description": "How the function can fail: absent for a function that can't (any reported error is a producer bug), an error domain's name for one that reports that domain's codes, or `any` for one that fails with an untyped error (runtime code `-1` and a message).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Throws"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "async": {
+          "description": "Whether the function is asynchronous: it completes through a callback instead of returning. Serialized under the key `async`.",
+          "type": "boolean"
+        },
+        "cancellable": {
+          "description": "Whether an async function accepts a cancel token.",
+          "type": "boolean"
+        },
+        "deprecated": {
+          "description": "A deprecation notice, emitted as each language's deprecation marker.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Param": {
+      "description": "A single parameter of a [`Function`].",
+      "type": "object",
+      "required": [
+        "name",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "description": "The parameter name (for example `id`).",
+          "type": "string"
+        },
+        "type": {
+          "description": "The parameter type. Serialized under the key `type`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TypeRef"
+            }
+          ]
+        },
+        "doc": {
+          "description": "Documentation for the parameter.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Throws": {
+      "title": "Throws",
+      "description": "What a fallible callable reports: the name of an error domain, or `any` for an untyped error (code -1 and a message).",
+      "type": "string"
+    },
+    "CallbackDef": {
+      "description": "A callback interface: a set of methods the **consumer** implements and the **producer** calls.\n\nA consumer passes an implementation wherever the type appears as a parameter (bare, or optional as `Listener?`); the producer may keep it and call its methods from any thread. Methods are synchronous, may return any value type, and may declare `throws`.",
+      "type": "object",
+      "required": [
+        "methods",
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "description": "The callback interface name (for example `Listener`).",
+          "type": "string"
+        },
+        "doc": {
+          "description": "Documentation, propagated to the bindings.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deprecated": {
+          "description": "A deprecation notice for the whole type.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "methods": {
+          "description": "The methods, in vtable order. Appending a method keeps every deployed binding working; reordering or inserting one doesn't.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Function"
           }
         }
       },

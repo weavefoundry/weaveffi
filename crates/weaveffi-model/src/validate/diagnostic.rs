@@ -2,8 +2,8 @@
 //! snippet and best-effort span for fancy miette rendering.
 //!
 //! The span is located within the error's enclosing declaration: the
-//! validator records the declaration path (module segments, then declaration
-//! and member names), and the search walks that path through the source,
+//! validator records the declaration path (the declaration, then member
+//! names), and the search walks that path through the source,
 //! finding each name as the value of a `name` key, before looking for the
 //! offending text. So a duplicate parameter `x` underlines the second `x`
 //! of the right function, not the first `x` anywhere in the file.
@@ -134,9 +134,6 @@ enum Needle<'a> {
     Text(&'a str),
     /// The innermost declaration of the scope itself.
     Scope,
-    /// The second declaration of the scope's innermost name (a duplicate
-    /// sibling).
-    SecondScope,
 }
 
 #[cfg(feature = "idl")]
@@ -144,59 +141,34 @@ impl ValidationError {
     /// The text a diagnostic underlines, or `None` when no one spot in the
     /// source is to blame.
     fn needle(&self) -> Option<Needle<'_>> {
-        use Needle::{Decl, Scope, Second, SecondScope, Text};
-        /// A same-module duplicate is the second declaration in scope; a
-        /// cross-module one is the first declaration in the second module.
-        fn duplicate<'a>(name: &'a str, first: &str, second: &str) -> Needle<'a> {
-            if first == second {
-                Second(name)
-            } else {
-                Decl(name)
-            }
-        }
+        use Needle::{Decl, Scope, Second, Text};
         Some(match self {
             Self::UnsupportedSchemaVersion { version, .. } => Text(version),
-            Self::DuplicateModuleName { .. } => SecondScope,
-            Self::InvalidModuleName { name, .. }
-            | Self::ReservedKeyword { name }
+            Self::ReservedKeyword { name }
             | Self::InvalidIdentifier { name, .. }
-            | Self::NameCollisionWithErrorDomain { name, .. }
             | Self::InvalidErrorCode { name, .. }
-            | Self::EmptyStruct { name, .. }
-            | Self::EmptyEnum { name, .. }
-            | Self::EmptyInterface { name, .. }
-            | Self::EmptyCallbackInterface { name, .. } => Decl(name),
-            Self::DuplicateTypeName {
-                name,
-                first,
-                second,
-            }
-            | Self::DuplicateFunctionName {
-                name,
-                first,
-                second,
-            }
-            | Self::DuplicateErrorCodeName {
-                name,
-                first,
-                second,
-            } => duplicate(name, first, second),
-            Self::DuplicateParamName { param: name, .. }
-            | Self::DuplicateStructField { field: name, .. }
+            | Self::DuplicateErrorCodeName { name, .. } => Decl(name),
+            Self::SlotCollision { slot: name, .. } => Decl(name),
+            Self::DuplicateName { name, .. }
+            | Self::DuplicateParamName { param: name, .. }
+            | Self::DuplicateRecordField { field: name, .. }
             | Self::DuplicateEnumVariant { variant: name, .. }
             | Self::DuplicateEnumVariantField { field: name, .. }
             | Self::DuplicateInterfaceMember { name, .. }
             | Self::DuplicateCallbackMethod { name, .. } => Second(name),
             Self::CancellableNotAsync { .. }
             | Self::AsyncIteratorReturn { .. }
-            | Self::SlotCollision { .. } => Scope,
+            | Self::EmptyRecord { .. }
+            | Self::EmptyEnum { .. }
+            | Self::EmptyInterface { .. }
+            | Self::EmptyCallbackInterface { .. }
+            | Self::RecursiveType { .. }
+            | Self::DuplicateEnumValue { .. } => Scope,
             Self::UnknownErrorDomain { domain, .. } => Text(domain),
-            Self::DuplicateEnumValue { enum_name, .. } => Decl(enum_name),
             Self::ConstructorHasReturn { constructor, .. }
             | Self::AsyncConstructor { constructor, .. } => Decl(constructor),
             Self::InvalidCallbackMethod { method, .. } => Decl(method),
             Self::UnknownTypeRef { name }
-            | Self::QualifiedTypeRef { name }
             | Self::UnsupportedPrimitive { name }
             | Self::ErrorDomainAsType { name }
             | Self::InterfaceInInvalidPosition { name, .. }
@@ -204,10 +176,7 @@ impl ValidationError {
             | Self::ObjectInErrorPayload { name, .. } => Text(name),
             Self::InvalidMapKey { key_type } => Text(key_type),
             Self::IteratorInInvalidPosition { .. } => Text("iter"),
-            Self::NoModuleName
-            | Self::SymbolCollision { .. }
-            | Self::ErrorDomainMissingName { .. }
-            | Self::DuplicateErrorCode { .. } => return None,
+            Self::SymbolCollision { .. } | Self::DuplicateErrorCode { .. } => return None,
         })
     }
 }
@@ -220,8 +189,7 @@ fn locate(src: &str, scope: &[String], needle: Needle<'_>) -> Option<SourceSpan>
     // within the scope around it.
     let (scope, needle) = match (needle, scope.split_last()) {
         (Needle::Scope, Some((last, outer))) => (outer, Needle::Decl(last)),
-        (Needle::SecondScope, Some((last, outer))) => (outer, Needle::Second(last)),
-        (Needle::Scope | Needle::SecondScope, None) => return None,
+        (Needle::Scope, None) => return None,
         _ => (scope, needle),
     };
     let mut from = 0;
@@ -239,7 +207,7 @@ fn locate(src: &str, scope: &[String], needle: Needle<'_>) -> Option<SourceSpan>
                 .or_else(|| find_decl(src, from, name)),
         ),
         Needle::Text(text) => (text, find_token(src, from, text)),
-        Needle::Scope | Needle::SecondScope => unreachable!("resolved above"),
+        Needle::Scope => unreachable!("resolved above"),
     };
     let at = scoped.or_else(|| find_token(src, 0, text))?;
     Some(span(src, at, text.len()))

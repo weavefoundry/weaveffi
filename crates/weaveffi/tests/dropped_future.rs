@@ -8,18 +8,21 @@ use std::os::raw::c_void;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use weaveffi::abi::{self, FfiError};
+use weaveffi::__rt::{self as abi, FfiError};
 
-#[weaveffi::module]
-pub mod work {
-    /// Would answer 42, if the executor ever ran it.
-    #[weaveffi::export]
-    pub async fn answer() -> i32 {
-        42
-    }
+/// Would answer 42, if the executor ever ran it.
+#[weaveffi::export]
+pub async fn answer() -> i32 {
+    42
 }
 
 weaveffi::export_runtime!();
+
+type Done = extern "C" fn(*mut c_void, *mut FfiError, i32);
+
+unsafe extern "C" {
+    fn dropped_future_answer(callback: Option<Done>, context: *mut c_void);
+}
 
 extern "C" fn done(ctx: *mut c_void, err: *mut FfiError, result: i32) {
     // Clone the sender before sending: the test may free the context as soon
@@ -41,7 +44,7 @@ fn a_dropped_future_completes_with_the_cancelled_code_once() {
 
     let (tx, rx) = mpsc::channel::<(i32, i32)>();
     let ctx: *mut c_void = Box::into_raw(Box::new(tx)).cast();
-    unsafe { work::dropped_future_work_answer(done, ctx) };
+    unsafe { dropped_future_answer(Some(done), ctx) };
     assert_eq!(
         rx.recv_timeout(Duration::from_secs(30)).unwrap(),
         (abi::CANCELLED_ERROR_CODE, 0)

@@ -3,10 +3,11 @@
 # Conformance consumer: calculator sample, Ruby target.
 #
 # The minimal surface: the load-time checks (requiring the gem checked the
-# ABI revision and the contract table; here a stale entry is shown to fail
-# with the declaration's path), the private boundary (no raw C function on
-# the public module), i32 arithmetic that wraps, two error domains in one
-# module whose codes share a value (dispatched by the callable's domain),
+# ABI revision and every declaration's contract function; here a missing
+# and a stale one are shown to fail with the declaration's path), the
+# private boundary (no raw C function on the public module), i32 arithmetic
+# that wraps, two error domains whose codes share a value (dispatched by
+# the callable's domain),
 # a `throws: any` function, an optional scalar return, typed arrays in and
 # out, and strings that keep non-ASCII text, astral characters, and
 # interior NULs. The gem is installed from the generated tree; the cdylib
@@ -19,17 +20,20 @@ I32_MAX = (2**31) - 1
 I32_MIN = -(2**31)
 
 run_and_check_leaks(Calculator) do
-  expect(Calculator::ABI_VERSION == 5, 'bindings target ABI revision 5')
+  expect(Calculator::ABI_VERSION == 6, 'bindings target ABI revision 6')
   expect(Calculator::LoadError < ::LoadError, 'load failures are LoadErrors')
-  missing = expect_raise(Calculator::LoadError, 'an entry the library lacks') do
-    bridge(Calculator).check_contract!(calculator_calculator_contract: [[1, 2, 'calculator.gone']])
+  missing = expect_raise(Calculator::LoadError, 'a declaration the library lacks') do
+    bridge(Calculator).check_contract!([[contract_symbol('calculator', 'gone'), 2, 'gone']])
   end
-  expect(missing.message.end_with?('calculator.gone is missing from the library'), missing.message)
-  stale = expect_raise(Calculator::LoadError, 'an entry whose signature changed') do
-    bridge(Calculator).check_contract!(calculator_calculator_contract: [[fnv1a64('calculator.add'), 0, 'calculator.add']])
+  expect(missing.message.end_with?('gone is missing from the library'), missing.message)
+  stale = expect_raise(Calculator::LoadError, 'a declaration whose signature changed') do
+    bridge(Calculator).check_contract!([[contract_symbol('calculator', 'add'), 0, 'add']])
   end
-  expect(stale.message.end_with?('calculator.add changed since these bindings were generated'), stale.message)
-  expect(!Calculator.respond_to?(:calculator_calculator_add), 'raw C functions are private')
+  expect(stale.message.end_with?('add changed since these bindings were generated'), stale.message)
+  bridge(Calculator).check_contract!(
+    [[contract_symbol('calculator', 'add'), fnv1a64('function add(i32, i32) -> i32'), 'add']]
+  )
+  expect(!Calculator.respond_to?(:calculator_add), 'raw C functions are private')
   expect_raise(NameError, 'the native module is private') { Calculator::Native }
   expect_raise(NameError, 'the runtime module is private') { Calculator::Bridge }
 

@@ -174,20 +174,11 @@ pub(crate) fn dart_in_type(ty: &Ty) -> String {
 
 fn surface(ty: &Ty, bytes: &str) -> String {
     match ty {
-        Ty::Prim(
-            Prim::I8
-            | Prim::I16
-            | Prim::I32
-            | Prim::I64
-            | Prim::U8
-            | Prim::U16
-            | Prim::U32
-            | Prim::U64,
-        ) => "int".into(),
         Ty::Prim(Prim::F32 | Prim::F64) => "double".into(),
         Ty::Prim(Prim::Bool) => "bool".into(),
         Ty::Prim(Prim::String) => "String".into(),
         Ty::Prim(Prim::Bytes) => bytes.into(),
+        Ty::Prim(_) => "int".into(),
         Ty::Enum(n) | Ty::Record(n) | Ty::RichEnum(n) | Ty::Interface(n) => dart_class(n),
         Ty::Optional(inner) => format!("{}?", surface(inner, bytes)),
         Ty::List(inner) => format!("List<{}>", surface(inner, bytes)),
@@ -219,59 +210,85 @@ pub(crate) fn return_type(f: &FnBinding) -> String {
     }
 }
 
-/// The wrapper class of an interface.
-pub(crate) fn object_class(interface: &str) -> String {
-    dart_class(interface)
-}
-
 /// The `dart:ffi` (native, Dart) type pair of one C ABI slot or return.
 ///
-/// Opaque pointees (objects, iterators, vtables, cancel tokens, `void*`) are
-/// `Pointer<Void>`; byte runs are `Pointer<Uint8>`; typed arrays point at
-/// their element type; the error slot is `Pointer<_Error>`. A bare
-/// [`CType::Named`] (an async completion callback) has no generic spelling,
-/// so callers substitute the callback typedef.
+/// A run is the runtime's `_Run` struct, an optional scalar its
+/// `_Opt{Prim}` struct, and a callback-interface argument the shared
+/// `_CallbackArg` struct, each by value. Opaque pointees (objects,
+/// iterators, cancel tokens, `void*`) are `Pointer<Void>`, and the error
+/// slot is `Pointer<_Error>`. A bare [`CType::Named`] (an async completion
+/// callback) has no generic spelling, so callers substitute the completion's
+/// typedef.
 pub(crate) fn ffi_type(ct: &CType) -> (String, String) {
-    let scalar = |native: &str, dart: &str| (native.to_string(), dart.to_string());
+    let same = |t: String| (t.clone(), t);
     match ct {
-        CType::Int8 => scalar("Int8", "int"),
-        CType::Int16 => scalar("Int16", "int"),
-        CType::Int32 | CType::Enum { .. } => scalar("Int32", "int"),
-        CType::Int64 => scalar("Int64", "int"),
-        CType::Uint8 => scalar("Uint8", "int"),
-        CType::Uint16 => scalar("Uint16", "int"),
-        CType::Uint32 => scalar("Uint32", "int"),
-        CType::Uint64 => scalar("Uint64", "int"),
-        CType::Size => scalar("Size", "int"),
-        CType::Float => scalar("Float", "double"),
-        CType::Double => scalar("Double", "double"),
-        CType::Bool => scalar("Bool", "bool"),
-        CType::Void => scalar("Void", "void"),
-        CType::Ptr { pointee, .. } => {
-            let ptr = format!("Pointer<{}>", pointee_type(pointee));
-            (ptr.clone(), ptr)
-        }
-        CType::Char
-        | CType::CancelToken
+        CType::Scalar(p) => (scalar_native(*p).into(), scalar_dart(*p).into()),
+        CType::Enum(_) => ("Int32".into(), "int".into()),
+        CType::Size => ("Size".into(), "int".into()),
+        CType::Void => ("Void".into(), "void".into()),
+        CType::Opt(p) => same(opt_struct(*p)),
+        CType::Run => same("_Run".into()),
+        CType::Callback(_) => same("_CallbackArg".into()),
+        CType::Ptr { pointee, .. } => same(format!("Pointer<{}>", pointee_type(pointee))),
+        CType::Object(_)
+        | CType::Vtable(_)
+        | CType::Named(_)
         | CType::Error
-        | CType::StructTag { .. }
-        | CType::VtableTag { .. }
-        | CType::Named(_) => unreachable!("{ct:?} only appears behind a pointer"),
+        | CType::CancelToken => {
+            unreachable!("{ct:?} only appears behind a pointer")
+        }
     }
 }
 
 /// The `dart:ffi` type a pointer slot points at.
 fn pointee_type(ct: &CType) -> String {
     match ct {
-        CType::Char => "Utf8".into(),
         CType::Error => "_Error".into(),
         CType::Void
         | CType::CancelToken
-        | CType::StructTag { .. }
-        | CType::VtableTag { .. }
+        | CType::Object(_)
+        | CType::Vtable(_)
         | CType::Named(_) => "Void".into(),
         other => ffi_type(other).0,
     }
+}
+
+/// The `dart:ffi` native type of a scalar primitive.
+fn scalar_native(p: Prim) -> &'static str {
+    match p {
+        Prim::Bool => "Bool",
+        Prim::I8 => "Int8",
+        Prim::I16 => "Int16",
+        Prim::I32 => "Int32",
+        Prim::I64 => "Int64",
+        Prim::U8 => "Uint8",
+        Prim::U16 => "Uint16",
+        Prim::U32 => "Uint32",
+        Prim::U64 => "Uint64",
+        Prim::F32 => "Float",
+        Prim::F64 => "Double",
+        Prim::String | Prim::Bytes => unreachable!("{p} is not a scalar"),
+    }
+}
+
+/// The Dart type of a scalar primitive.
+fn scalar_dart(p: Prim) -> &'static str {
+    match p {
+        Prim::Bool => "bool",
+        Prim::F32 | Prim::F64 => "double",
+        _ => "int",
+    }
+}
+
+/// The runtime's `_Opt{Prim}` struct mirroring `{p}_opt_{prim}`.
+pub(crate) fn opt_struct(p: Prim) -> String {
+    format!("_Opt{}", p.pascal())
+}
+
+/// The runtime's `_opt{Prim}` function building an `_Opt{Prim}` from a
+/// nullable Dart value.
+pub(crate) fn opt_fn(p: Prim) -> String {
+    format!("_opt{}", p.pascal())
 }
 
 /// The runtime's typed-array helper for `elem` and operation `op`
@@ -306,13 +323,12 @@ pub(crate) fn ffi_typedef(c_name: &str) -> String {
     format!("_{}", c_name.to_upper_camel_case())
 }
 
-/// The zero value of a scalar type: the placeholder an absent optional
-/// scalar passes, and what a callback trampoline returns when its
+/// The zero value of a scalar: what a callback trampoline returns when its
 /// implementation threw.
-pub(crate) fn zero_literal(ty: &Ty) -> &'static str {
-    match ty {
-        Ty::Prim(Prim::Bool) => "false",
-        Ty::Prim(Prim::F32 | Prim::F64) => "0.0",
+pub(crate) fn zero_literal(p: Prim) -> &'static str {
+    match p {
+        Prim::Bool => "false",
+        Prim::F32 | Prim::F64 => "0.0",
         _ => "0",
     }
 }
@@ -380,22 +396,33 @@ mod tests {
     }
 
     #[test]
-    fn pointers_map_to_opaque_typed_or_byte_pointers() {
-        let ptr = |t| CType::ptr(t);
+    fn slots_map_to_runtime_structs_and_pointers() {
+        let ptr = CType::ptr;
         assert_eq!(ffi_type(&ptr(CType::Error)).0, "Pointer<_Error>");
+        assert_eq!(ffi_type(&CType::Run).0, "_Run");
+        assert_eq!(ffi_type(&ptr(CType::Run)).0, "Pointer<_Run>");
+        assert_eq!(ffi_type(&CType::Opt(Prim::U32)).0, "_OptU32");
         assert_eq!(
-            ffi_type(&ptr(ptr(CType::Uint8))).0,
-            "Pointer<Pointer<Uint8>>"
+            ffi_type(&CType::Callback("Listener".into())).0,
+            "_CallbackArg"
         );
         assert_eq!(
-            ffi_type(&ptr(ptr(CType::Double))).0,
-            "Pointer<Pointer<Double>>"
-        );
-        assert_eq!(
-            ffi_type(&ptr(CType::Named("kv_ScanIterator".into()))).0,
+            ffi_type(&ptr(CType::Named("ScanIterator".into()))).0,
             "Pointer<Void>"
         );
-        assert_eq!(ffi_type(&CType::Size), ("Size".into(), "int".into()));
+        assert_eq!(
+            ffi_type(&ptr(ptr(CType::Object("Store".into())))).0,
+            "Pointer<Pointer<Void>>"
+        );
+        assert_eq!(
+            ffi_type(&CType::Scalar(Prim::F32)),
+            ("Float".into(), "double".into())
+        );
+        assert_eq!(
+            ffi_type(&CType::Enum("Kind".into())),
+            ("Int32".into(), "int".into())
+        );
         assert_eq!(slice_fn("take", Prim::U64), "_takeU64s");
+        assert_eq!(opt_fn(Prim::Bool), "_optBool");
     }
 }

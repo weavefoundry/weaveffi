@@ -5,11 +5,13 @@
 # against one sample and must exit 0.
 #
 # Each lane installs the generated package the way an npm user would: `npm
-# pack` it, then `npm install` the tarball into a scratch project, which
-# builds the N-API addon with node-gyp. `{PREFIX}_LIBRARY` points the build
-# at the sample's library (node-gyp fetches Node.js headers on first use).
-# The consumers in this directory are shared with the wasm lanes, since both
-# targets generate the same JavaScript API.
+# pack` it, then `npm install` the tarball into a scratch project under the
+# cargo target directory, which fetches the package's one dependency, the
+# pinned koffi release, from the npm registry (nothing is compiled). The
+# consumer then runs with `{PREFIX}_LIBRARY` naming the sample's library,
+# which the package loads with koffi. The consumers in this directory are
+# shared with the wasm lanes, since both targets generate the same
+# JavaScript API.
 set -uo pipefail
 . "$(dirname "$0")/../lib.sh"
 require_tools node node npm
@@ -23,10 +25,9 @@ node_consumer() {
         || { echo "npm pack failed" >&2; return 1; }
     printf '{ "name": "consumer", "private": true, "type": "module" }\n' > "$dir/package.json"
     cp "$ROOT/conformance/node/harness.mjs" "$ROOT/conformance/node/$src" "$dir/"
-    ( cd "$dir" && env "$(library_env "$sample")=$(sample_lib "$sample")" \
-        npm install --no-audit --no-fund --loglevel=error "./$tarball" ) \
-        || { echo "npm install (node-gyp build) failed" >&2; return 1; }
-    ( cd "$dir" && node --expose-gc "$src" )
+    ( cd "$dir" && npm install --no-audit --no-fund --loglevel=error "./$tarball" ) \
+        || { echo "npm install failed" >&2; return 1; }
+    ( cd "$dir" && env "$(library_env "$sample")=$(sample_lib "$sample")" node --expose-gc "$src" )
 }
 
 node_calculator() { node_consumer calculator calculator.mjs; }

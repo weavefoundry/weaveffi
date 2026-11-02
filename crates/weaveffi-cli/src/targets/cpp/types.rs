@@ -1,15 +1,15 @@
-//! C++ spellings: identifier escaping, name casing, namespace paths, the
-//! IR-to-C++ type mapping, the exception a call throws, and the doc-text
-//! spelling of backticked API identifiers.
+//! C++ spellings: identifier escaping, name casing, the IR-to-C++ type
+//! mapping, the exception a call throws, and the doc-text spelling of
+//! backticked API identifiers.
 
 use crate::cabi::c_param_name;
 use crate::codegen::docs::{ApiNames, IdentKind};
+use crate::codegen::values::{crossing, Crossing};
 use crate::lang::{self, CPP_KEYWORDS};
 use heck::ToSnakeCase;
-use weaveffi_model::abi::{AbiParam, CType};
+use weaveffi_model::abi::AbiParam;
 use weaveffi_model::errors;
-use weaveffi_model::model::{Model, ModuleBinding};
-use weaveffi_model::plan::{ArgPass, ErrorStrategy};
+use weaveffi_model::model::{ErrorStrategy, Model};
 use weaveffi_model::ty::{ParamTy, Prim, RetTy, Ty};
 
 /// What every renderer needs: the model, its C prefix, and the identifier
@@ -38,11 +38,12 @@ impl<'m> Ctx<'m> {
     /// codes as their exception classes.
     pub(crate) fn spell(&self, ident: &str) -> Option<String> {
         match self.names.kind(ident)? {
-            IdentKind::Function | IdentKind::CallbackMethod => Some(cpp_fn_name(ident)),
+            IdentKind::Function => Some(cpp_free_fn_name(ident)),
+            IdentKind::CallbackMethod => Some(cpp_fn_name(ident)),
             IdentKind::Member => Some(cpp_member_name(ident)),
             IdentKind::Param | IdentKind::Field => Some(cpp_ident(ident)),
             IdentKind::ErrorDomain | IdentKind::ErrorCode => Some(cpp_error_class(ident)),
-            IdentKind::Module | IdentKind::Type | IdentKind::Variant => None,
+            IdentKind::Type | IdentKind::Variant => None,
         }
     }
 }
@@ -122,6 +123,57 @@ pub(crate) fn cpp_fn_name(name: &str) -> String {
     cpp_ident(&name.to_snake_case())
 }
 
+/// Names the generated code relies on at namespace scope in the snake_case
+/// space free functions and parameters share: the `adopt` tag and its type,
+/// `check_library()`, the `detail` namespace, and `std`.
+const NAMESPACE_MEMBERS: &[&str] = &["adopt", "adopt_t", "check_library", "detail", "std"];
+
+/// The C++ spelling of a free function: [`cpp_fn_name`], with a trailing
+/// underscore when it would collide with a name the runtime declares in the
+/// same namespace (`detail` is `detail_`).
+pub(crate) fn cpp_free_fn_name(name: &str) -> String {
+    lang::escape_member(&cpp_fn_name(name), NAMESPACE_MEMBERS)
+}
+
+/// The C++ spelling of a wrapper parameter: [`cpp_ident`], with a trailing
+/// underscore when it would hide a namespace-scope name the wrapper body
+/// uses (`detail` is `detail_`).
+pub(crate) fn cpp_param_name(name: &str) -> String {
+    lang::escape_member(&cpp_ident(name), NAMESPACE_MEMBERS)
+}
+
+/// The `detail` helpers a callback trampoline calls unqualified, plus
+/// `vtable()` beside them, `adopt`, and `std`: a trampoline or its C
+/// parameter spelled like one would hide it.
+const TRAMPOLINE_NAMES: &[&str] = &[
+    "adopt",
+    "adopt_optional",
+    "borrow_bytes",
+    "borrow_slice",
+    "borrow_string",
+    "callback",
+    "clone_of",
+    "decode",
+    "encode",
+    "from_opt",
+    "give_buffer",
+    "give_bytes",
+    "give_slice",
+    "give_string",
+    "implementation",
+    "release",
+    "std",
+    "to_opt",
+    "vtable",
+];
+
+/// The spelling of a name declared inside a `detail::Callbacks<I>`
+/// specialization (a trampoline or one of its C parameters): `name`, with a
+/// trailing underscore when it would hide a name the trampolines use.
+pub(crate) fn trampoline_ident(name: &str) -> String {
+    lang::escape_member(name, TRAMPOLINE_NAMES)
+}
+
 /// Names every interface wrapper class declares besides its members: the
 /// `raw_type` alias, the `handle()` and `clone_handle()` readers, and the
 /// private `traits` struct. (The private `raw_` field can't collide: a
@@ -134,18 +186,6 @@ const OBJECT_MEMBERS: &[&str] = &["clone_handle", "handle", "raw_type", "traits"
 /// collide with a name the wrapper class declares (`handle` is `handle_`).
 pub(crate) fn cpp_member_name(name: &str) -> String {
     lang::escape_member(&cpp_fn_name(name), OBJECT_MEMBERS)
-}
-
-/// The nested C++ namespace path for a module: each IDL segment converted to
-/// snake case and keyword-escaped, joined with `::` (`kv.stats` becomes
-/// `kv::stats`).
-pub(crate) fn cpp_namespace_path(module: &ModuleBinding) -> String {
-    module
-        .segments
-        .iter()
-        .map(|s| cpp_ident(&s.to_snake_case()))
-        .collect::<Vec<_>>()
-        .join("::")
 }
 
 /// The C++ spelling of one ABI slot name: the IDL-chosen identifier with the
@@ -161,17 +201,8 @@ pub(crate) fn slot_decl(p: &AbiParam, prefix: &str) -> String {
     format!("{} {}", p.ty.render_c(prefix), slot_name(p))
 }
 
-/// The C type an out slot (`T* out_value`, `T** out_item`) points to: the
-/// type of the local the wrapper passes the address of.
-pub(crate) fn pointee(p: &AbiParam, prefix: &str) -> String {
-    match &p.ty {
-        CType::Ptr { pointee, .. } => pointee.render_c(prefix),
-        other => other.render_c(prefix),
-    }
-}
-
 /// The C++ spelling of a primitive.
-fn cpp_prim(p: Prim) -> &'static str {
+pub(crate) fn cpp_prim(p: Prim) -> &'static str {
     match p {
         Prim::I8 => "int8_t",
         Prim::I16 => "int16_t",
@@ -212,30 +243,30 @@ pub(crate) fn cpp_ret_type(ret: &RetTy) -> String {
 
 /// One C++ parameter declaration (`<type> <name>`) for a wrapper signature,
 /// per how the argument crosses: scalars, enums, and optional scalars by
-/// value; strings as `std::string_view` (the ABI passes a pointer and a
-/// length, so interior NULs survive); typed arrays, bytes, buffered values,
-/// and objects by const reference (the array's storage is passed as is); a
+/// value; strings as `std::string_view` (the run carries a length, so
+/// interior NULs survive); typed arrays, bytes, buffered values, and
+/// objects by const reference (a vector's storage is passed as is); a
 /// callback interface as a `std::shared_ptr` by value, which the wrapper
 /// moves into the box it hands the producer.
-pub(crate) fn cpp_param_decl(ty: &ParamTy, pass: &ArgPass, name: &str) -> String {
-    match (ty, pass) {
-        (ParamTy::Callback { name: iface, .. }, _) => format!("std::shared_ptr<{iface}> {name}"),
-        (ParamTy::Value(ty), pass) => cpp_value_param_decl(ty, pass, name),
+pub(crate) fn cpp_param_decl(ty: &ParamTy, name: &str) -> String {
+    match ty {
+        ParamTy::Callback { name: iface, .. } => format!("std::shared_ptr<{iface}> {name}"),
+        ParamTy::Value(ty) => cpp_value_param_decl(ty, name),
     }
 }
 
 /// [`cpp_param_decl`] for a value-typed argument, shared with callback
 /// methods' parameters except for objects (see [`cpp_cb_param_decl`]).
-fn cpp_value_param_decl(ty: &Ty, pass: &ArgPass, name: &str) -> String {
+fn cpp_value_param_decl(ty: &Ty, name: &str) -> String {
     let cpp = cpp_type(ty);
-    match pass {
-        ArgPass::Direct { .. } | ArgPass::OptDirect { .. } => format!("{cpp} {name}"),
-        ArgPass::String { .. } => format!("std::string_view {name}"),
-        ArgPass::Slice { .. }
-        | ArgPass::Bytes { .. }
-        | ArgPass::Buffer { .. }
-        | ArgPass::Object { .. }
-        | ArgPass::Callback { .. } => format!("const {cpp}& {name}"),
+    match crossing(ty) {
+        Crossing::Scalar(_) | Crossing::Enum(_) | Crossing::OptScalar(_) | Crossing::OptEnum(_) => {
+            format!("{cpp} {name}")
+        }
+        Crossing::Utf8 => format!("std::string_view {name}"),
+        Crossing::Bytes | Crossing::Slice(_) | Crossing::Buffer(_) | Crossing::Object { .. } => {
+            format!("const {cpp}& {name}")
+        }
     }
 }
 
@@ -245,10 +276,10 @@ fn cpp_value_param_decl(ty: &Ty, pass: &ArgPass, name: &str) -> String {
 /// trampoline's copy; objects transfer one strong reference, so they arrive
 /// by value as the wrapper (or `std::optional` of it) the implementation
 /// now owns.
-pub(crate) fn cpp_cb_param_decl(ty: &Ty, pass: &ArgPass, name: &str) -> String {
-    match pass {
-        ArgPass::Object { .. } => format!("{} {name}", cpp_type(ty)),
-        _ => cpp_value_param_decl(ty, pass, name),
+pub(crate) fn cpp_cb_param_decl(ty: &Ty, name: &str) -> String {
+    match crossing(ty) {
+        Crossing::Object { .. } => format!("{} {name}", cpp_type(ty)),
+        _ => cpp_value_param_decl(ty, name),
     }
 }
 
@@ -264,6 +295,14 @@ mod tests {
         assert_eq!(cpp_member_name("traits"), "traits_");
         assert_eq!(cpp_member_name("delete"), "delete_");
         assert_eq!(cpp_member_name("close"), "close");
+    }
+
+    #[test]
+    fn free_functions_avoid_the_runtime_names() {
+        assert_eq!(cpp_free_fn_name("detail"), "detail_");
+        assert_eq!(cpp_free_fn_name("check_library"), "check_library_");
+        assert_eq!(cpp_free_fn_name("adopt"), "adopt_");
+        assert_eq!(cpp_free_fn_name("newOne"), "new_one");
     }
 
     #[test]

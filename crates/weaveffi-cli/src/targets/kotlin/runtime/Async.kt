@@ -1,5 +1,8 @@
 package {{PACKAGE}}
 
+import com.sun.jna.Pointer
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -7,34 +10,34 @@ import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.suspendCancellableCoroutine
 
 /**
- * Bridges one native async call to a suspended coroutine. The JNI shim pins
- * this object with a global reference and calls exactly one `on*` method,
- * from whichever producer thread completes the call. [convert] lifts the
- * boxed JNI result into the public value.
+ * Bridges one native async call to a suspended coroutine. The library calls
+ * the call's completion exactly once, from whichever thread completes it, and
+ * [PendingCalls] hands the outcome here. [lift] turns the raw C result into
+ * the public value (and releases what it owns).
  */
 internal class NativeCompletion<T>(
     private val cont: CancellableContinuation<T>,
     private val domain: Int,
-    private val convert: (Any?) -> T,
+    private val lift: (Any?) -> T,
     cancellable: Boolean,
 ) {
-    // The native cancel token, or 0 when the call isn't cancellable or has
+    // The native cancel token, or null when the call isn't cancellable or has
     // completed. Guarded by `this` so a late cancel never touches a freed
     // token; a completion that lands inside `cancel` (on the same thread)
     // defers the release until the cancel returns.
-    private var token: Long = if (cancellable) JniBridge.cancel_token_create() else 0L
+    private var token: Pointer? = if (cancellable) Lib.c.{{PREFIX}}_cancel_token_create() else null
     private var cancelling = false
     private var released = false
 
-    val cancelToken: Long
+    val cancelToken: Pointer?
         get() = synchronized(this) { token }
 
     fun cancel() {
         synchronized(this) {
-            if (token == 0L) return
+            val t = token ?: return
             cancelling = true
             try {
-                JniBridge.cancel_token_cancel(token)
+                Lib.c.{{PREFIX}}_cancel_token_cancel(t)
             } finally {
                 cancelling = false
             }
@@ -49,57 +52,90 @@ internal class NativeCompletion<T>(
     }
 
     private fun destroyToken() {
-        if (token != 0L) JniBridge.cancel_token_destroy(token)
-        token = 0L
+        token?.let { Lib.c.{{PREFIX}}_cancel_token_destroy(it) }
+        token = null
     }
 
-    /** The call succeeded with [raw]: the result in its JNI form, boxed. */
-    fun onValue(raw: Any?) {
+    /** The call completed: with the boxed error [err], or with [result]. */
+    fun complete(err: Pointer?, result: Any?) {
         releaseToken()
-        val result = try {
-            convert(raw)
+        if (err != null) {
+            val error = NativeError(err)
+            val code = error.code
+            val message = error.message()
+            val payload = error.payload()
+            Lib.c.{{PREFIX}}_error_free(err)
+            cont.resumeWithException(
+                if (code == -5) CancellationException(message.ifEmpty { "cancelled" })
+                else nativeError(domain, code, message, payload),
+            )
+            return
+        }
+        val value = try {
+            lift(result)
         } catch (t: Throwable) {
             cont.resumeWithException(t)
             return
         }
-        cont.resume(result)
+        cont.resume(value)
+    }
+}
+
+/**
+ * The async calls in flight, by the context pointer each passes the
+ * library. The completion callbacks (one static instance per result type,
+ * so they stay reachable for as long as the library can call them) look the
+ * call up here.
+ */
+internal object PendingCalls {
+    private val calls = ConcurrentHashMap<Long, NativeCompletion<*>>()
+    private val ids = AtomicLong()
+
+    fun add(call: NativeCompletion<*>): Pointer {
+        val id = ids.incrementAndGet()
+        calls[id] = call
+        return Pointer(id)
     }
 
-    /** The call failed with a native error (code -5 is a cancellation). */
-    fun onError(code: Int, message: ByteArray?, payload: ByteArray?) {
-        releaseToken()
-        val error = if (code == -5) {
-            CancellationException(message?.let(::decodeUtf8) ?: "cancelled")
-        } else {
-            JniBridge.error(domain, code, message ?: ByteArray(0), payload)
+    fun remove(context: Pointer) {
+        calls.remove(Pointer.nativeValue(context))
+    }
+
+    /** A completion fired: hands its outcome to the call's coroutine. */
+    fun complete(context: Pointer?, err: Pointer?, result: Any?) {
+        try {
+            val call = context?.let { calls.remove(Pointer.nativeValue(it)) }
+            if (call != null) {
+                call.complete(err, result)
+            } else {
+                Lib.c.{{PREFIX}}_error_free(err)
+                if (result is Run) freeRun(result)
+            }
+        } catch (ignored: Throwable) {
+            // Nothing may unwind into the library.
         }
-        cont.resumeWithException(error)
-    }
-
-    /** The JVM couldn't take the result (out of memory, typically). */
-    fun onFailure(error: Throwable) {
-        releaseToken()
-        cont.resumeWithException(error)
     }
 }
 
 /**
  * Starts a native async call and suspends until it completes. [launch] gets
- * the cancel token (0 unless [cancellable]) and the completion to hand to the
- * shim. Cancelling the coroutine cancels the native call; a cancelled call
- * (code -5) resumes with [CancellationException].
+ * the cancel token (null unless [cancellable]) and the context the call's
+ * completion carries. Cancelling the coroutine cancels the native call; a
+ * cancelled call (code -5) resumes with [CancellationException].
  */
 internal suspend fun <T> awaitNative(
     cancellable: Boolean,
     domain: Int,
-    convert: (Any?) -> T,
-    launch: (Long, NativeCompletion<T>) -> Unit,
+    lift: (Any?) -> T,
+    launch: (Pointer?, Pointer) -> Unit,
 ): T = suspendCancellableCoroutine { cont ->
-    val completion = NativeCompletion(cont, domain, convert, cancellable)
+    val completion = NativeCompletion(cont, domain, lift, cancellable)
+    val context = PendingCalls.add(completion)
     cont.invokeOnCancellation { completion.cancel() }
     try {
-        launch(completion.cancelToken, completion)
+        launch(completion.cancelToken, context)
     } catch (t: Throwable) {
+        PendingCalls.remove(context)
         completion.releaseToken()
         throw t
     }

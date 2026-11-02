@@ -1,18 +1,18 @@
-//! C# type mapping: the surface type of every IR type in every position,
-//! the blittable spelling of every C ABI type, identifier escaping, and
+//! C# type mapping: the surface type of every value in every position, the
+//! blittable spelling of every C ABI type, identifier escaping, and
 //! string-literal escaping.
 //!
 //! Value types have one surface everywhere (a list is an
-//! `IReadOnlyList<T>`, a map an `IReadOnlyDictionary<K, V>`). The families
-//! that cross the boundary without a value buffer refine it there: a typed
-//! array (`[f64]`) or `bytes` parameter is a `ReadOnlySpan<T>` pinned in
+//! `IReadOnlyList<T>`, a map an `IReadOnlyDictionary<K, V>`). The values
+//! that cross as a typed array or raw bytes refine it at a call boundary: a
+//! `[f64]` or `bytes` the caller passes is a `ReadOnlySpan<T>` pinned in
 //! place, and the same types come back as arrays.
 
+use crate::codegen::values::{crossing, Crossing};
 use crate::lang;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_model::abi::{AbiParam, CType};
-use weaveffi_model::plan::{ArgPass, CallbackRetPass, ItemPass, ResultPass, RetPass};
-use weaveffi_model::ty::{Prim, Ty};
+use weaveffi_model::ty::{ParamTy, Prim, Ty};
 
 /// The names every renderer shares.
 #[derive(Clone, Copy)]
@@ -46,7 +46,7 @@ pub(crate) fn vtable_class_cs(name: &str) -> String {
     format!("Ffi{name}Vtable")
 }
 
-/// The C# keyword or BCL name of a scalar primitive.
+/// The C# keyword or BCL name of a primitive.
 pub(crate) fn prim_cs(p: Prim) -> &'static str {
     match p {
         Prim::I8 => "sbyte",
@@ -65,13 +65,18 @@ pub(crate) fn prim_cs(p: Prim) -> &'static str {
     }
 }
 
+/// The runtime struct of an optional scalar, `{p}_opt_{prim}`
+/// (`FfiOptI32`).
+pub(crate) fn opt_struct(p: Prim) -> String {
+    format!("FfiOpt{}", p.pascal())
+}
+
 /// The surface type of a value type, as a record field, a buffered
 /// parameter or return, and every nested position.
 pub(crate) fn cs_type(ty: &Ty) -> String {
     match ty {
         Ty::Prim(p) => prim_cs(*p).into(),
-        // Records, rich enums, C-style enums, and interfaces surface under
-        // their (global) name, because every module shares one namespace.
+        // Every user type lives in the one namespace, under its own name.
         Ty::Record(name) | Ty::RichEnum(name) | Ty::Enum(name) | Ty::Interface(name) => name.into(),
         Ty::Optional(inner) => format!("{}?", cs_type(inner)),
         Ty::List(inner) => format!("IReadOnlyList<{}>", cs_type(inner)),
@@ -89,72 +94,40 @@ pub(crate) fn is_value_type(ty: &Ty) -> bool {
     }
 }
 
-/// The element type of a typed array.
-fn array_of(elem: Prim) -> String {
-    format!("{}[]", prim_cs(elem))
+/// The type of a value passed into the native library (a parameter, or a
+/// callback method's argument): typed arrays and bytes as spans, borrowed
+/// for the call.
+pub(crate) fn lent_cs(ty: &Ty) -> String {
+    match crossing(ty) {
+        Crossing::Slice(p) => format!("ReadOnlySpan<{}>", prim_cs(p)),
+        Crossing::Bytes => "ReadOnlySpan<byte>".into(),
+        _ => cs_type(ty),
+    }
 }
 
-/// The type of a parameter the caller passes: typed arrays and bytes as a
-/// span pinned for the call, a callback interface as its C# interface.
-pub(crate) fn param_cs(pass: &ArgPass, value: Option<&Ty>) -> String {
-    match pass {
-        ArgPass::Slice { elem, .. } => format!("ReadOnlySpan<{}>", prim_cs(*elem)),
-        ArgPass::Bytes { .. } => "ReadOnlySpan<byte>".into(),
-        ArgPass::Callback {
-            interface,
-            nullable,
-            ..
-        } => {
-            let iface = callback_interface_cs(interface);
+/// The type of a value one side hands the other to keep (a return, an
+/// async result, an iterator item, or a callback method's return): typed
+/// arrays as arrays.
+pub(crate) fn owned_cs(ty: &Ty) -> String {
+    match crossing(ty) {
+        Crossing::Slice(p) => format!("{}[]", prim_cs(p)),
+        _ => cs_type(ty),
+    }
+}
+
+/// The type of a callable's parameter: a value as [`lent_cs`], or a
+/// callback interface as its C# interface.
+pub(crate) fn param_cs(ty: &ParamTy) -> String {
+    match ty {
+        ParamTy::Value(ty) => lent_cs(ty),
+        ParamTy::Callback { name, nullable } => {
+            let iface = callback_interface_cs(name);
             if *nullable {
                 format!("{iface}?")
             } else {
                 iface
             }
         }
-        _ => cs_type(value.expect("only callback parameters have no value type")),
-    }
-}
-
-/// The type a sync call returns.
-pub(crate) fn ret_cs(pass: &RetPass, ty: &Ty) -> String {
-    match pass {
-        RetPass::Slice { elem, .. } => array_of(*elem),
-        _ => cs_type(ty),
-    }
-}
-
-/// The type an async call's task carries.
-pub(crate) fn result_cs(pass: &ResultPass, ty: &Ty) -> String {
-    match pass {
-        ResultPass::Slice { elem, .. } => array_of(*elem),
-        _ => cs_type(ty),
-    }
-}
-
-/// The type an iterator yields.
-pub(crate) fn item_cs(pass: &ItemPass, ty: &Ty) -> String {
-    match pass {
-        ItemPass::Slice { elem, .. } => array_of(*elem),
-        _ => cs_type(ty),
-    }
-}
-
-/// The type a callback-interface method receives: typed arrays and bytes
-/// as spans borrowed for the call.
-pub(crate) fn callback_param_cs(pass: &ArgPass, ty: &Ty) -> String {
-    match pass {
-        ArgPass::Slice { elem, .. } => format!("ReadOnlySpan<{}>", prim_cs(*elem)),
-        ArgPass::Bytes { .. } => "ReadOnlySpan<byte>".into(),
-        _ => cs_type(ty),
-    }
-}
-
-/// The type a callback-interface method returns.
-pub(crate) fn callback_ret_cs(pass: &CallbackRetPass, ty: &Ty) -> String {
-    match pass {
-        CallbackRetPass::Slice { elem, .. } => array_of(*elem),
-        _ => cs_type(ty),
     }
 }
 
@@ -163,42 +136,32 @@ pub(crate) fn callback_ret_cs(pass: &CallbackRetPass, ty: &Ty) -> String {
 fn is_opaque(ty: &CType) -> bool {
     matches!(
         ty,
-        CType::StructTag { .. }
-            | CType::VtableTag { .. }
-            | CType::CancelToken
-            | CType::Named(_)
-            | CType::Void
+        CType::Object(_) | CType::Vtable(_) | CType::CancelToken | CType::Named(_) | CType::Void
     )
 }
 
 /// The blittable C# spelling of one C ABI type, qualified with `ns` for the
-/// API's enums. Every pointer to an opaque type is an `IntPtr`; every other
-/// pointer is a real C# pointer (`byte*`, `FfiError*`, `double**`), so no
-/// runtime marshalling is involved.
+/// API's enums. A C `bool` is a `byte` (one byte, `0` or `1`), never C#'s
+/// `bool`, so no slot depends on how the runtime marshals one. Every pointer
+/// to an opaque type is an `IntPtr`; every other pointer is a real C#
+/// pointer (`FfiError*`, `FfiRun*`, `IntPtr*`).
 pub(crate) fn cs_ctype(ns: &str, ty: &CType) -> String {
     match ty {
-        CType::Int8 => "sbyte".into(),
-        CType::Int16 => "short".into(),
-        CType::Int32 => "int".into(),
-        CType::Int64 => "long".into(),
-        CType::Uint8 | CType::Char => "byte".into(),
-        CType::Bool => "bool".into(),
-        CType::Uint16 => "ushort".into(),
-        CType::Uint32 => "uint".into(),
-        CType::Uint64 => "ulong".into(),
-        CType::Float => "float".into(),
-        CType::Double => "double".into(),
+        CType::Scalar(Prim::Bool) => "byte".into(),
+        CType::Scalar(p) => prim_cs(*p).into(),
         CType::Size => "nuint".into(),
         CType::Void => "void".into(),
-        CType::Error => "FfiError".into(),
         // A C# enum is an `int` underneath, the same as the C typedef.
-        CType::Enum { name, .. } => format!("global::{ns}.{name}"),
+        CType::Enum(name) => format!("global::{ns}.{name}"),
+        CType::Opt(p) => opt_struct(*p),
+        CType::Run => "FfiRun".into(),
+        CType::Callback(_) => "FfiCallback".into(),
+        CType::Error => "FfiError".into(),
         CType::Ptr { pointee, .. } if is_opaque(pointee) => "IntPtr".into(),
         CType::Ptr { pointee, .. } => format!("{}*", cs_ctype(ns, pointee)),
-        CType::StructTag { .. }
-        | CType::VtableTag { .. }
-        | CType::CancelToken
-        | CType::Named(_) => "IntPtr".into(),
+        CType::Object(_) | CType::Vtable(_) | CType::Named(_) | CType::CancelToken => {
+            "IntPtr".into()
+        }
     }
 }
 
@@ -268,6 +231,10 @@ const OBJECT_MEMBERS: &[&str] = &[
     "ToString",
 ];
 
+/// Members the library class declares or inherits besides the free
+/// functions: the load check, the ABI revision, and `object`'s statics.
+const LIBRARY_MEMBERS: &[&str] = &["AbiVersion", "Check", "Equals", "ReferenceEquals"];
+
 /// Members every record (and rich-enum variant) declares or inherits: the
 /// synthesized record members, `object`'s members, and the codec pair.
 const RECORD_MEMBERS: &[&str] = &[
@@ -325,6 +292,12 @@ pub(crate) fn cs_member(name: &str, class: &str) -> String {
     member_in(name, class, OBJECT_MEMBERS)
 }
 
+/// The C# name of a free function, a static method of the library class
+/// `class` (`check` is `Check_`).
+pub(crate) fn function_cs(name: &str, class: &str) -> String {
+    member_in(name, class, LIBRARY_MEMBERS)
+}
+
 /// The C# property of a record or rich-enum variant field (`to_string` is
 /// `ToString_`, a `token` field of a `Token` record is `Token_`).
 pub(crate) fn field_cs(name: &str, class: &str) -> String {
@@ -347,6 +320,9 @@ mod tests {
         assert_eq!(cs_member("handle", "Store"), "Handle_");
         assert_eq!(cs_member("store", "Store"), "Store_");
         assert_eq!(cs_member("close", "Store"), "Close");
+        assert_eq!(function_cs("check", "KvLibrary"), "Check_");
+        assert_eq!(function_cs("kv_library", "KvLibrary"), "KvLibrary_");
+        assert_eq!(function_cs("open", "KvLibrary"), "Open");
         assert_eq!(field_cs("token", "Token"), "Token_");
         assert_eq!(field_cs("equality_contract", "Item"), "EqualityContract_");
         assert_eq!(field_cs("label", "Item"), "Label");
@@ -359,5 +335,31 @@ mod tests {
         assert_eq!(cs_str("a\"b\\c\nd\0"), "a\\\"b\\\\c\\nd\\0");
         assert_eq!(camel("class"), "@class");
         assert_eq!(camel("ttl_seconds"), "ttlSeconds");
+    }
+
+    #[test]
+    fn every_c_type_is_blittable() {
+        let ns = "Kv";
+        assert_eq!(cs_ctype(ns, &CType::Scalar(Prim::Bool)), "byte");
+        assert_eq!(cs_ctype(ns, &CType::Opt(Prim::F64)), "FfiOptF64");
+        assert_eq!(cs_ctype(ns, &CType::Run), "FfiRun");
+        assert_eq!(cs_ctype(ns, &CType::Callback("L".into())), "FfiCallback");
+        assert_eq!(cs_ctype(ns, &CType::Enum("Mode".into())), "global::Kv.Mode");
+        assert_eq!(
+            cs_ctype(ns, &CType::const_ptr(CType::Object("Store".into()))),
+            "IntPtr"
+        );
+        assert_eq!(
+            cs_ctype(ns, &CType::ptr(CType::ptr(CType::Object("Store".into())))),
+            "IntPtr*"
+        );
+        assert_eq!(cs_ctype(ns, &CType::ptr(CType::Run)), "FfiRun*");
+        let list = Ty::List(Box::new(Ty::Prim(Prim::F64)));
+        assert_eq!(lent_cs(&list), "ReadOnlySpan<double>");
+        assert_eq!(owned_cs(&list), "double[]");
+        assert_eq!(lent_cs(&Ty::Prim(Prim::Bytes)), "ReadOnlySpan<byte>");
+        assert_eq!(owned_cs(&Ty::Prim(Prim::Bytes)), "byte[]");
+        let strings = Ty::List(Box::new(Ty::Prim(Prim::String)));
+        assert_eq!(lent_cs(&strings), "IReadOnlyList<string>");
     }
 }

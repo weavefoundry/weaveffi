@@ -78,12 +78,11 @@ pending snapshots.
 ### Fixture compile checks
 
 Snapshots prove the text didn't change, not that it compiles.
-`scripts/check-fixtures.sh <target>` generates every fixture and compiles or
+`cargo xtask fixtures <target>` generates every fixture and compiles or
 type-checks it with the target language's toolchain (through
 `scripts/fixtures/<target>.sh`). Run it for any target whose output you
 change; CI runs one job per target. A missing tool (including `mypy` 1.x for
-Python and the node-gyp headers from `npx node-gyp install` for Node.js) is
-reported as a skip locally and fails the check when `CI=true`. The Python
+Python) is reported as a skip locally and fails the check when `CI=true`. The Python
 and Ruby checks (and conformance lanes) need Python 3.10 and Ruby 3.2 or
 newer: they use the `python3` and `ruby` on PATH when those are new enough,
 and otherwise look for a `python3.N` on PATH or Homebrew's Ruby (see
@@ -91,7 +90,7 @@ and otherwise look for a `python3.N` on PATH or Homebrew's Ruby (see
 
 ### Conformance
 
-`conformance/run.sh` builds the three sample producers (`calculator`,
+`cargo xtask conformance` (or `conformance/run.sh`) builds the three sample producers (`calculator`,
 `codec`, and `kvstore`; see [Samples](docs/src/samples.md)) with leak counters
 on, generates bindings, and runs real consumers in every language against
 them: one lane per sample per language, named `<lang>-<sample>`, with its
@@ -101,14 +100,22 @@ counter at zero. A new feature belongs in `samples/kvstore` (or in
 every language's consumer.
 
 ```bash
-ONLY=python bash conformance/run.sh             # one language
-ONLY=c,go-kvstore bash conformance/run.sh       # a language plus one lane
-SKIP=wasm SKIP_GEN=1 bash conformance/run.sh    # skip lanes; reuse generated bindings
+cargo xtask conformance --only python            # one language
+cargo xtask conformance --only c,go-kvstore       # a language plus one lane
+cargo xtask conformance --skip wasm --no-gen      # skip lanes; reuse generated bindings
 ```
 
-`LANE_TIMEOUT` sets the per-lane limit in seconds (default 300). A missing
-toolchain skips its language with a note locally and fails it when
-`CI=true`.
+`--lane-timeout` (or `LANE_TIMEOUT`) sets the per-lane limit in seconds
+(default 300), and `ONLY`, `SKIP`, and `SKIP_GEN` in the environment work as
+the flags do. A missing toolchain skips its language with a note locally and
+fails it when `CI=true`.
+
+`cargo xtask skew` checks bindings against a library of a different version:
+bindings older than the library load it, a changed declaration is reported
+by its path, and a declaration the library lacks fails to link.
+
+`crates/weaveffi-cli/tests/generator_proptest.rs` renders random valid APIs
+with every registered target and compiles the C header for each.
 
 ## Documentation
 
@@ -129,13 +136,14 @@ Preview the book with `mdbook serve docs -p 3000 -n 127.0.0.1`.
 Read the [architecture guide](docs/src/architecture.md) first; its "Adding a
 generator" section is the checklist. In short: add
 `crates/weaveffi-cli/src/targets/<lang>/` implementing `Target` (rendering
-from the passing contracts stored on the model and through the shared
-emitters in `codegen/`, never matching on a type's family), register
+from the bindings stored on the model, dispatching each value on its
+`Crossing` from `codegen/values.rs`, and using the shared emitters in
+`codegen/`), register
 it with one entry in `REGISTRY` in `crates/weaveffi-cli/src/targets/mod.rs`
 (which also adds it to `--target`, the config tables, and the snapshot
 tests), add `scripts/fixtures/<lang>.sh` and `conformance/<lang>/` and list
-the target in the CI matrices, `scripts/check-fixtures.sh`, and
-`conformance/run.sh` (a test checks that every list matches the registry),
+the target in the CI matrices and in `TARGETS` and `LANGS` in
+`xtask/src/main.rs` (a test checks that every list matches the registry),
 and document it, with its tier, under `docs/src/generators/`.
 
 ## Fuzzing
@@ -305,7 +313,7 @@ ci/add-wasm-workflow
 build/update-clap
 refactor/extract-template-engine
 test/calculator-fixtures
-fix/android-jni-crash
+fix/android-load-crash
 ```
 
 ## CI
@@ -315,13 +323,14 @@ fix/android-jni-crash
   checks on Linux, macOS, and Windows; `weaveffi generate --check` on
   every sample, the JSON Schema drift check, and a `wasm32` build of every sample
   whose embedded metadata must match the native build's; the fixture compile
-  check per target; the conformance harness per language on Linux and macOS;
-  an Android job that links the Kotlin JNI shim with the NDK and runs
-  `weaveffi build` for Android; and a package install smoke test
+  check per target; the conformance harness per language on Linux and macOS
+  (and, for Python, .NET, and Node.js, on Windows); the version-skew check;
+  an MSRV build; Miri over the runtime's unit tests; an Android job that
+  runs `weaveffi build` with the NDK; and a package install smoke test
   (`scripts/package-smoke.sh`) on Linux and macOS.
 - **Quality** (`quality.yml`): `cargo deny`, `cargo audit`, `cargo machete`,
   coverage with `cargo llvm-cov`, and the docs link check.
-- **Docs** (`docs.yml`): builds and deploys the mdBook and rustdoc.
+- **Docs** (`docs.yml`): builds and deploys the mdBook and rustdoc, under `/dev/` from `main` and under `/v<major>.<minor>/` (and the site root) from a release tag.
 - **Bench** (`bench.yml`): a weekly sampled benchmark run, uploaded as an
   artifact. Pull requests run each benchmark once in `ci.yml`.
 - **Fuzz** (`fuzz.yml`): a daily 60-second run of every fuzz target from a

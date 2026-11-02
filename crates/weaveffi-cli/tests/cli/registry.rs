@@ -1,6 +1,6 @@
 //! The target registry is the one list of targets: every place outside the
-//! crate that enumerates them (the CI matrices, the fixture compile check,
-//! and the conformance driver) must list exactly the registered targets.
+//! crate that enumerates them (the CI matrices and the `xtask` fixture and
+//! conformance drivers) must list exactly the registered targets.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -75,29 +75,33 @@ fn workflow_matrices_list_every_target() {
     );
 }
 
-/// The words of the shell assignment starting with `prefix` in `script`,
-/// up to the closing `quote`.
-fn shell_list(script: &str, prefix: &str, quote: char) -> BTreeSet<String> {
-    let path = repo_root().join(script);
+/// The string literals of the `const {name}: [&str; N] = [...]` array in
+/// `xtask/src/main.rs`.
+fn xtask_list(name: &str) -> BTreeSet<String> {
+    let path = repo_root().join("xtask/src/main.rs");
     let text = std::fs::read_to_string(&path).unwrap();
-    let line = text
-        .lines()
-        .find_map(|l| l.trim().strip_prefix(prefix))
-        .unwrap_or_else(|| panic!("no `{prefix}` line in {script}"));
-    let end = line.find(quote).unwrap_or(line.len());
-    line[..end].split_whitespace().map(str::to_string).collect()
+    let start = text
+        .find(&format!("const {name}: [&str;"))
+        .unwrap_or_else(|| panic!("no `{name}` in xtask/src/main.rs"));
+    let body = &text[start..];
+    let body = &body[body.find("= [").expect("an array") + 3..];
+    let body = &body[..body.find("];").expect("the array's end")];
+    body.split(',')
+        .map(|s| s.trim().trim_matches('"').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 #[test]
-fn scripts_list_every_target() {
+fn xtask_lists_every_target() {
     assert_eq!(
-        shell_list("scripts/check-fixtures.sh", "TARGETS=${*:-", '}'),
+        xtask_list("TARGETS"),
         registry(),
-        "scripts/check-fixtures.sh's default TARGETS"
+        "xtask's TARGETS (fixture checks)"
     );
     assert_eq!(
-        shell_list("conformance/run.sh", "LANGS=\"", '"'),
+        xtask_list("LANGS"),
         registry(),
-        "conformance/run.sh's LANGS"
+        "xtask's LANGS (conformance)"
     );
 }

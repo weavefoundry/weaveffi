@@ -1,19 +1,24 @@
 //! .NET binding generator.
 //!
-//! Emits a standalone C# project over the C ABI, revision 5: a `.csproj`,
+//! Emits a standalone C# project over the C ABI, revision 6: a `.csproj`,
 //! the generated API (`{Namespace}.cs`), the fixed runtime (`Runtime.cs`,
-//! from `runtime/Runtime.cs`), and a README.
+//! from `runtime/Runtime.cs`), and a README. The whole library is one C#
+//! namespace.
 //!
 //! * Native calls use source-generated `[LibraryImport]` declarations over
 //!   blittable slots with runtime marshalling disabled, so the bindings are
-//!   trim- and AOT-friendly. Strings cross as pooled UTF-8 `(ptr, len)`
-//!   pairs, typed arrays and bytes as pinned spans, and optional scalars as
-//!   a presence flag plus the value.
+//!   trim- and AOT-friendly. Every value is one C value: a string, bytes, a
+//!   typed array, or a value buffer is an `FfiRun` (`{p}_run`) by value over
+//!   pinned memory, an optional scalar an `FfiOpt*` struct (`{p}_opt_*`),
+//!   a C `bool` one `byte`, an object its `SafeHandle`, and a callback
+//!   interface an `FfiCallback` (`{p}_{Cb}`).
 //! * Every import resolves through a `DllImportResolver` that loads the
-//!   library (honoring `{PREFIX}_LIBRARY`) and checks its ABI revision and
-//!   every top-level module's contract table once; a failure is a
-//!   `NativeLoadException` every call throws, and `{Namespace}Library.Check()`
-//!   runs the check up front.
+//!   library (honoring `{PREFIX}_LIBRARY`) and, once, checks its ABI
+//!   revision and calls every declaration's contract function; a failure
+//!   is a `NativeLoadException` every call throws, and
+//!   `{Namespace}Library.Check()` runs the check up front.
+//! * Free functions are static methods of `{Namespace}Library`, the static
+//!   class that also holds `Check()` and `AbiVersion`.
 //! * Records are positional `sealed record`s whose list and map fields are
 //!   `IReadOnlyList<T>`/`IReadOnlyDictionary<K, V>`, compared by content;
 //!   rich enums are closed record hierarchies. Values are encoded by
@@ -22,7 +27,7 @@
 //! * Interfaces are sealed `IDisposable` wrappers over a `SafeHandle`
 //!   subclass whose `ReleaseHandle` calls `_destroy`. Every import takes the
 //!   handle itself, so the interop stub keeps the object alive for the call.
-//! * A call's [`ErrorStrategy`](weaveffi_model::plan::ErrorStrategy) picks
+//! * A call's [`ErrorStrategy`](weaveffi_model::model::ErrorStrategy) picks
 //!   its exceptions: a domain's hierarchy (one nested class per code; an
 //!   unknown code is the domain class itself), the root `NativeException`
 //!   for `throws: any` and runtime codes, or `NativeBugException` for a call
@@ -59,7 +64,7 @@ use serde::{Deserialize, Serialize};
 use weaveffi_model::model::Model;
 
 use crate::targets::dotnet::callbacks::render_callback_interface;
-use crate::targets::dotnet::calls::render_module_class;
+use crate::targets::dotnet::calls::render_functions;
 use crate::targets::dotnet::docs::Docs;
 use crate::targets::dotnet::entities::{
     render_enum, render_interface, render_record, render_rich_enum,
@@ -195,8 +200,8 @@ impl Target for DotnetGenerator {
     }
 }
 
-/// Render the generated API file: typed exceptions, every module's entities,
-/// the per-module static classes, and the generated half of
+/// Render the generated API file: typed exceptions, the entities, the free
+/// functions (in the library class), and the generated half of
 /// `NativeMethods`.
 pub(crate) fn render_csharp(
     model: &Model,
@@ -228,27 +233,23 @@ pub(crate) fn render_csharp(
     w.blank();
 
     render_domains(&mut w, model, &docs, cx);
-    for m in &model.modules {
-        for e in &m.enums {
-            if e.is_rich() {
-                render_rich_enum(&mut w, cx, &docs, e);
-            } else {
-                render_enum(&mut w, &docs, e);
-            }
-        }
-        for s in &m.structs {
-            render_record(&mut w, cx, &docs, s);
-        }
-        for cb in &m.callback_interfaces {
-            render_callback_interface(&mut w, model, &docs, cb, cx);
-        }
-        for i in &m.interfaces {
-            render_interface(&mut w, model, &docs, i, cx);
+    for e in &model.enums {
+        if e.is_rich() {
+            render_rich_enum(&mut w, cx, &docs, e);
+        } else {
+            render_enum(&mut w, &docs, e);
         }
     }
-    for m in &model.modules {
-        render_module_class(&mut w, model, &docs, m, cx);
+    for s in &model.records {
+        render_record(&mut w, cx, &docs, s);
     }
+    for cb in &model.callbacks {
+        render_callback_interface(&mut w, model, &docs, cb, cx);
+    }
+    for i in &model.interfaces {
+        render_interface(&mut w, model, &docs, i, cx);
+    }
+    render_functions(&mut w, model, &docs, &names.library_class, cx);
     render_native_methods(&mut w, model, namespace);
 
     let mut out = render_prelude(CommentStyle::DoubleSlash);

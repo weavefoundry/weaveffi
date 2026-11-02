@@ -43,8 +43,34 @@ extern "C" {
 /* The C ABI revision this header was generated against. The producer
    exports kitchen_sink_abi_version() so a consumer can refuse to load a
    library built for a different revision. */
-#define KITCHEN_SINK_ABI_VERSION 5u
+#define KITCHEN_SINK_ABI_VERSION 6u
 KITCHEN_SINK_API uint32_t kitchen_sink_abi_version(void);
+
+/* A run of bytes: a string's UTF-8 (never NUL-terminated), raw bytes, a
+   typed array (`len` is its size in bytes, a multiple of the element's,
+   and `ptr` is aligned for it), or a value buffer. NULL with length 0 is
+   the empty run. A run passed to the producer is borrowed for the call;
+   one it returns belongs to the consumer, who releases it with
+   kitchen_sink_run_free. Every run the producer allocates is 8-aligned. */
+typedef struct kitchen_sink_run {
+    const uint8_t* ptr;
+    size_t len;
+} kitchen_sink_run;
+
+/* An optional scalar: `has` is true when `value` is present (and
+   `value` is 0 when it isn't). An optional C-style enum
+   crosses as kitchen_sink_opt_i32. */
+typedef struct kitchen_sink_opt_bool { bool has; bool value; } kitchen_sink_opt_bool;
+typedef struct kitchen_sink_opt_i8 { bool has; int8_t value; } kitchen_sink_opt_i8;
+typedef struct kitchen_sink_opt_i16 { bool has; int16_t value; } kitchen_sink_opt_i16;
+typedef struct kitchen_sink_opt_i32 { bool has; int32_t value; } kitchen_sink_opt_i32;
+typedef struct kitchen_sink_opt_i64 { bool has; int64_t value; } kitchen_sink_opt_i64;
+typedef struct kitchen_sink_opt_u8 { bool has; uint8_t value; } kitchen_sink_opt_u8;
+typedef struct kitchen_sink_opt_u16 { bool has; uint16_t value; } kitchen_sink_opt_u16;
+typedef struct kitchen_sink_opt_u32 { bool has; uint32_t value; } kitchen_sink_opt_u32;
+typedef struct kitchen_sink_opt_u64 { bool has; uint64_t value; } kitchen_sink_opt_u64;
+typedef struct kitchen_sink_opt_f32 { bool has; float value; } kitchen_sink_opt_f32;
+typedef struct kitchen_sink_opt_f64 { bool has; double value; } kitchen_sink_opt_f64;
 
 /* Error slot written by every fallible call. `code` is 0 on success,
    positive for an error domain's code, and negative for a runtime
@@ -53,7 +79,8 @@ KITCHEN_SINK_API uint32_t kitchen_sink_abi_version(void);
    -5 cancelled. The message is `message_len` bytes of UTF-8 at
    `message_ptr`, NOT NUL-terminated. `payload_ptr`/`payload_len` hold
    the code's fields in the value buffer format (NULL when it declares
-   none). The producer owns both runs; kitchen_sink_error_clear releases them. */
+   none). A call overwrites the slot without reading it; after reading a
+   failure, release it with kitchen_sink_error_clear. */
 typedef struct kitchen_sink_error {
     int32_t code;
     const uint8_t* message_ptr;
@@ -80,15 +107,14 @@ KITCHEN_SINK_API void kitchen_sink_error_clear(kitchen_sink_error* err);
 KITCHEN_SINK_API void kitchen_sink_error_free(kitchen_sink_error* err);
 
 /* Allocate a zero-filled, 8-aligned run of `len` bytes (NULL for 0). A
-   callback method returns a string, bytes, buffer, or typed array as
-   such a run, which the producer adopts. */
+   callback method returns a string, bytes, typed array, or buffer as a
+   run allocated this way, which the producer adopts. */
 KITCHEN_SINK_API uint8_t* kitchen_sink_alloc(size_t len);
-/* Release a run the producer returned (a string, bytes, value buffer,
-   or typed array: `len` is its size in bytes, `count * sizeof(T)` for
-   a typed array) or one from kitchen_sink_alloc. NULL or 0 is a no-op. */
-KITCHEN_SINK_API void kitchen_sink_free_bytes(uint8_t* ptr, size_t len);
+/* Release a run the producer returned, or one from kitchen_sink_alloc. The empty
+   run is a no-op. */
+KITCHEN_SINK_API void kitchen_sink_run_free(kitchen_sink_run run);
 
-/* Cancellation for `cancellable` async functions. A token starts with
+/* Cancellation for cancellable async functions. A token starts with
    one reference owned by the consumer; the producer takes its own for
    each call it is passed to, so the consumer may cancel and destroy its
    reference at any time. A cancelled call completes with code -5. */
@@ -99,405 +125,483 @@ KITCHEN_SINK_API bool kitchen_sink_cancel_token_is_cancelled(const kitchen_sink_
 KITCHEN_SINK_API void kitchen_sink_cancel_token_destroy(kitchen_sink_cancel_token* token);
 
 /* A callback interface vtable's `flags` bit: the methods that return a
-   value (a non-void C return or any out slot) may only be called on
-   the thread that passed the vtable to the producer, which fails such
-   a call from any other thread with -4 without calling it. */
+   value may only be called on the thread that passed the vtable to the
+   producer, which fails such a call from any other thread with -4
+   without calling it. */
 #define KITCHEN_SINK_VTABLE_THREAD_AFFINE 1u
 
 /* Live-allocation counters for leak checks in tests: 0 objects,
-   1 callbacks, 2 iterators, 3 cancel tokens, 4 returned allocations.
-   Kind -1 is 1 when the producer counts at all (its `leak-check`
-   feature) and 0 when every counter reads 0 regardless. */
+   1 callbacks, 2 iterators, 3 cancel tokens, 4 runs. Kind -1 is 1 when
+   the producer counts at all (its `leak-check` feature) and 0 when every
+   counter reads 0 regardless. */
 KITCHEN_SINK_API uint64_t kitchen_sink_debug_live(int32_t kind);
 
-/* One declaration's fingerprint in a module's contract table: FNV-1a 64
-   of its dotted path and of its canonical signature. */
-typedef struct kitchen_sink_contract_entry {
-    uint64_t id;
-    uint64_t hash;
-} kitchen_sink_contract_entry;
+/* The contract: one function per declaration, returning the FNV-1a 64
+   hash of its canonical signature. A consumer checks every one it was
+   generated with once, before any other call: a library that lacks a
+   declaration doesn't link, and one that changed it fails the check.
+   Declarations the library has and the consumer doesn't are fine. */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_07055ed9d3ef8987(void); /* PantryError.Spoiled: code Spoiled = 2 */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_093696260e3767ef(void); /* Sampler: callback Sampler */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_15de761502d6b0f7(void); /* ids_u64: function ids_u64([u64]) -> [u64] */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_1ab4ac8d3595af9e(void); /* Sampler.threshold: callback_method #0 threshold(u32?) -> f64? */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_1ad5b1c1cb5b7b0f(void); /* ReadyListener.on_ready: callback_method #0 on_ready(i32, string) -> void */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_1b068c8d584a3666(void); /* mixed_slices: function mixed_slices([i8], [i16], [u16], [u32], [i64], [f32]) -> [u32] */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_1c905aa8cc074ab9(void); /* opt_i32_id: function opt_i32_id(i32?) -> i32? */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_2288b6ba9247f3fa(void); /* stream_items: function stream_items() -> iter<Item> */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_262973c2f9754366(void); /* list_items: function list_items() -> [Item] */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_29fb7143db10b460(void); /* sample_with: function sample_with(Sampler, u32?) -> [i16] throws PantryError */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_2a3cca9903035fc1(void); /* opt_bool_id: function opt_bool_id(bool?) -> bool? */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_2b411bd19468fe38(void); /* echo_bytes: function echo_bytes(bytes) -> bytes */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_30d1f6e5606a39a1(void); /* parse_any: function parse_any(string) -> i64 throws any */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_3545d44146da2693(void); /* maybe_item: function maybe_item(i64) -> Item? throws KitchenErrors */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_355964ddca795015(void); /* ReadyListener.latest: callback_method #3 latest() -> Item? */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_3f36f640360df807(void); /* opt_priority: function opt_priority(Priority?) -> Priority? */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_40306466cd73f71b(void); /* bool_id: function bool_id(bool) -> bool */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_46a82538b4fd65b3(void); /* KitchenErrors.InvalidInput: code InvalidInput = 2 */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_49db162e058b9fa4(void); /* ReadyListener: callback ReadyListener */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_4bae2c564d268fab(void); /* stream_gadgets: function stream_gadgets() -> iter<Gadget> */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_4e03769b2b65f3ee(void); /* Sampler.describe: callback_method #2 describe() -> string throws any */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_52cfa1d198476806(void); /* Item: record Item {i64, string, i32, bool, f64, u32, bytes, [string], {string:string}, i64?, Token, Priority, Gadget?} */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_5cda1b5d810fe743(void); /* subscribe: function subscribe(ReadyListener) -> i32 */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_5ec87ece39394738(void); /* async_maybe_count: function async_maybe_count() -> i64? async */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_6084dc628fdb0d02(void); /* ReadyListener.favorite: callback_method #4 favorite() -> Gadget */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_632ae5cd56d2f5fc(void); /* maybe_subscribe: function maybe_subscribe(ReadyListener?) -> bool */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_6b91c75a2b38364c(void); /* Gadget.readings: method readings(u32?) -> [f64] throws any */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_6c14076d12124cfd(void); /* new_op: function new_op() -> i32 */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_777c1f6342492998(void); /* maybe_gadget: function maybe_gadget(Gadget?) -> Gadget? */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_77f7c86a80aa8b81(void); /* PantryError: errors PantryError */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_784cfd093415f2b5(void); /* Gadget.new: constructor new(i64) -> Gadget */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_7e1071dd9fa68834(void); /* ReadyListener.label: callback_method #2 label() -> string throws KitchenErrors */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_7edf409e8ac33025(void); /* make_token: function make_token() -> Token */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_8400c9a27c8c432b(void); /* do_async: function do_async(string) -> string async */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_87133f22c66bac36(void); /* i64_id: function i64_id(i64) -> i64 */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_878316bb56b5eacc(void); /* PantryError.OutOfStock: code OutOfStock = 1 {string} */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_8cbd66b05c30c00e(void); /* Sampler.samples: callback_method #1 samples(u32?, [f64]) -> [i16] throws PantryError */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_8e374aef14935b0d(void); /* KitchenErrors.NotFound: code NotFound = 1 */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_94e2dad4408a7687(void); /* ReadyListener.on_item: callback_method #1 on_item(Item, Gadget) -> bool */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_996a3929498216f3(void); /* i32_id: function i32_id(i32) -> i32 */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_9ab72c28265c60e4(void); /* KitchenErrors: errors KitchenErrors */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_a430d84680aabd0b(void); /* hello: function hello() -> string */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_a4e407b3a0fe4669(void); /* Priority: enum Priority {Low = 0, Normal = 1, High = 2} */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_a529e4a4e0e26d47(void); /* u32_id: function u32_id(u32) -> u32 */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_a717c034ba23905d(void); /* Gadget: interface Gadget */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_a9590de6f773a9a4(void); /* scale_i32: function scale_i32([i32], i32) -> [i32] */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_ac26813984c811d0(void); /* Gadget.poke: method poke(i32) -> i32 throws KitchenErrors */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_b08395f5e5678b0e(void); /* opt_mixed: function opt_mixed(f64, f32?, i64?, string?) -> u16? */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_b66eb0792245db7c(void); /* echo_string: function echo_string(string) -> string */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_b985fff5c1b5382c(void); /* legacy_op: function legacy_op() -> i32 */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_bf30e00dc53307a9(void); /* ping: function ping() -> string */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_c1ceb5fe42730211(void); /* f64_id: function f64_id(f64) -> f64 */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_c9e1d6b030b1f854(void); /* Gadget.describe: method describe() -> string */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_cea95e3a6107f209(void); /* do_cancellable: function do_cancellable(string) -> string async cancellable */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_d06c00826f2918d3(void); /* async_samples: function async_samples(u32) -> [f32] async cancellable */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_da96f2dc9f83015b(void); /* sum_f64: function sum_f64([f64]) -> f64 */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_e68398e3c2c760b2(void); /* Token: record Token {i64, string} */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_ea2a5b33b86fb660(void); /* take_from_pantry: function take_from_pantry(string) -> i32 throws PantryError */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_eb66fcdc777f75ca(void); /* gadgets: function gadgets() -> [Gadget] */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_eea763c41fa7d198(void); /* stream_chunks: function stream_chunks() -> iter<[i32]> */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_f24fd5a4569f91f3(void); /* Gadget.version: static version() -> string */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_fe26cde50070f9a2(void); /* stream_maybe: function stream_maybe() -> iter<i32?> */
+KITCHEN_SINK_API uint64_t kitchen_sink_contract_ff329711a0bd4978(void); /* get_attrs: function get_attrs() -> {string:i32} */
 
-/* The contract of module `shared`: one entry per declaration, sorted by
-   id. The producer's table comes from the function below; a consumer
-   checks each entry it was generated with against it once, before any
-   other call (producer entries it doesn't know are fine). */
-KITCHEN_SINK_API const kitchen_sink_contract_entry* kitchen_sink_shared_contract(size_t* out_len);
-#define KITCHEN_SINK_SHARED_CONTRACT_LEN 2
-#define KITCHEN_SINK_SHARED_CONTRACT { \
-    {0x709e234caa962446ull, 0x3894f2ca452e9f98ull}, /* shared.ping: function ping() -> string */ \
-    {0xcfb306fa5801ee5bull, 0x18e9fc204a13df6full}, /* shared.Token: record Token {i64, string} */ \
-}
-/* The id of the first expected entry the loaded library lacks or
-   declares differently, or 0 when these bindings match it. */
-static inline uint64_t kitchen_sink_shared_contract_check(void) {
-    static const kitchen_sink_contract_entry expected[] = KITCHEN_SINK_SHARED_CONTRACT;
-    size_t len = 0;
-    const kitchen_sink_contract_entry* table = kitchen_sink_shared_contract(&len);
-    for (size_t i = 0; i < KITCHEN_SINK_SHARED_CONTRACT_LEN; i++) {
-        size_t lo = 0, hi = len;
-        while (lo < hi) {
-            size_t mid = lo + (hi - lo) / 2;
-            if (table[mid].id < expected[i].id) lo = mid + 1; else hi = mid;
-        }
-        if (lo == len || table[lo].id != expected[i].id || table[lo].hash != expected[i].hash) {
-            return expected[i].id;
-        }
+/* The path of the first declaration the loaded library declares
+   differently from these bindings, or NULL when they match. */
+static inline const char* kitchen_sink_contract_check(void) {
+    static const struct { uint64_t (*hash)(void); uint64_t expected; const char* path; } rows[] = {
+        {kitchen_sink_contract_07055ed9d3ef8987, 0x6c4b78c7d3f858c1ull, "PantryError.Spoiled"},
+        {kitchen_sink_contract_093696260e3767ef, 0x18848e701962912eull, "Sampler"},
+        {kitchen_sink_contract_15de761502d6b0f7, 0xb64587477022696bull, "ids_u64"},
+        {kitchen_sink_contract_1ab4ac8d3595af9e, 0x18ea1a42036c96a0ull, "Sampler.threshold"},
+        {kitchen_sink_contract_1ad5b1c1cb5b7b0f, 0xe1d32e38b766e623ull, "ReadyListener.on_ready"},
+        {kitchen_sink_contract_1b068c8d584a3666, 0x1c4e79d60a20e74full, "mixed_slices"},
+        {kitchen_sink_contract_1c905aa8cc074ab9, 0x071e29abee823f17ull, "opt_i32_id"},
+        {kitchen_sink_contract_2288b6ba9247f3fa, 0x01b3e8e0c9a10e23ull, "stream_items"},
+        {kitchen_sink_contract_262973c2f9754366, 0x11c4d2b28abe07bbull, "list_items"},
+        {kitchen_sink_contract_29fb7143db10b460, 0xa9bcb8bacedb036cull, "sample_with"},
+        {kitchen_sink_contract_2a3cca9903035fc1, 0x38eaafdb350559e1ull, "opt_bool_id"},
+        {kitchen_sink_contract_2b411bd19468fe38, 0x1506cfe6f548fac4ull, "echo_bytes"},
+        {kitchen_sink_contract_30d1f6e5606a39a1, 0xfea12b6bc219fc46ull, "parse_any"},
+        {kitchen_sink_contract_3545d44146da2693, 0xb374accf14676d90ull, "maybe_item"},
+        {kitchen_sink_contract_355964ddca795015, 0x65a325cfc772296bull, "ReadyListener.latest"},
+        {kitchen_sink_contract_3f36f640360df807, 0xcddf6fede09b2e7full, "opt_priority"},
+        {kitchen_sink_contract_40306466cd73f71b, 0xcde022fe6bc3b1bfull, "bool_id"},
+        {kitchen_sink_contract_46a82538b4fd65b3, 0x0f86001cac0c21e8ull, "KitchenErrors.InvalidInput"},
+        {kitchen_sink_contract_49db162e058b9fa4, 0xe1020573f084dc1dull, "ReadyListener"},
+        {kitchen_sink_contract_4bae2c564d268fab, 0xda8de7aeb2dbb8a3ull, "stream_gadgets"},
+        {kitchen_sink_contract_4e03769b2b65f3ee, 0xa59d0f32a66dc7a2ull, "Sampler.describe"},
+        {kitchen_sink_contract_52cfa1d198476806, 0x74b131724dd0d867ull, "Item"},
+        {kitchen_sink_contract_5cda1b5d810fe743, 0xcc034cf506cae182ull, "subscribe"},
+        {kitchen_sink_contract_5ec87ece39394738, 0x11a24c4b50d11996ull, "async_maybe_count"},
+        {kitchen_sink_contract_6084dc628fdb0d02, 0x25d5d88a30fe0a79ull, "ReadyListener.favorite"},
+        {kitchen_sink_contract_632ae5cd56d2f5fc, 0x5dae036b8a6aed30ull, "maybe_subscribe"},
+        {kitchen_sink_contract_6b91c75a2b38364c, 0x14c4ecac97bdfc9bull, "Gadget.readings"},
+        {kitchen_sink_contract_6c14076d12124cfd, 0xa192f5a7298adb39ull, "new_op"},
+        {kitchen_sink_contract_777c1f6342492998, 0xcc570a2649bbf7dcull, "maybe_gadget"},
+        {kitchen_sink_contract_77f7c86a80aa8b81, 0x3f857851ab75366cull, "PantryError"},
+        {kitchen_sink_contract_784cfd093415f2b5, 0xffcf2bd3b04aa002ull, "Gadget.new"},
+        {kitchen_sink_contract_7e1071dd9fa68834, 0x89681e305b55a4f4ull, "ReadyListener.label"},
+        {kitchen_sink_contract_7edf409e8ac33025, 0x2a3ae79e1a476b7aull, "make_token"},
+        {kitchen_sink_contract_8400c9a27c8c432b, 0xb13cb8d39e702c79ull, "do_async"},
+        {kitchen_sink_contract_87133f22c66bac36, 0x6bdb4ccea2841d5eull, "i64_id"},
+        {kitchen_sink_contract_878316bb56b5eacc, 0xa4515a6d00d7c600ull, "PantryError.OutOfStock"},
+        {kitchen_sink_contract_8cbd66b05c30c00e, 0x2cfa679ea1373e09ull, "Sampler.samples"},
+        {kitchen_sink_contract_8e374aef14935b0d, 0x471a34aa4c09ae2bull, "KitchenErrors.NotFound"},
+        {kitchen_sink_contract_94e2dad4408a7687, 0x4af6ce5b4f9fa508ull, "ReadyListener.on_item"},
+        {kitchen_sink_contract_996a3929498216f3, 0x78be3203bcd10727ull, "i32_id"},
+        {kitchen_sink_contract_9ab72c28265c60e4, 0x05e35a563089bf7dull, "KitchenErrors"},
+        {kitchen_sink_contract_a430d84680aabd0b, 0xbca7a9e5eb26f3a6ull, "hello"},
+        {kitchen_sink_contract_a4e407b3a0fe4669, 0x452a3e573d57f6dbull, "Priority"},
+        {kitchen_sink_contract_a529e4a4e0e26d47, 0x97c32b764693f2cbull, "u32_id"},
+        {kitchen_sink_contract_a717c034ba23905d, 0x248bf8404a5823b4ull, "Gadget"},
+        {kitchen_sink_contract_a9590de6f773a9a4, 0x8c71141a931906f6ull, "scale_i32"},
+        {kitchen_sink_contract_ac26813984c811d0, 0x417e4a2acd3210b3ull, "Gadget.poke"},
+        {kitchen_sink_contract_b08395f5e5678b0e, 0x36127462f8b0969full, "opt_mixed"},
+        {kitchen_sink_contract_b66eb0792245db7c, 0xa713dbd1be707752ull, "echo_string"},
+        {kitchen_sink_contract_b985fff5c1b5382c, 0xc40560e5411ff392ull, "legacy_op"},
+        {kitchen_sink_contract_bf30e00dc53307a9, 0x3894f2ca452e9f98ull, "ping"},
+        {kitchen_sink_contract_c1ceb5fe42730211, 0x357fd9b65ad879a9ull, "f64_id"},
+        {kitchen_sink_contract_c9e1d6b030b1f854, 0xbe3b69464672af46ull, "Gadget.describe"},
+        {kitchen_sink_contract_cea95e3a6107f209, 0x627bf01ab365b209ull, "do_cancellable"},
+        {kitchen_sink_contract_d06c00826f2918d3, 0x6540bdb74246420cull, "async_samples"},
+        {kitchen_sink_contract_da96f2dc9f83015b, 0x55815247f895bd45ull, "sum_f64"},
+        {kitchen_sink_contract_e68398e3c2c760b2, 0x18e9fc204a13df6full, "Token"},
+        {kitchen_sink_contract_ea2a5b33b86fb660, 0x0710d6c9a4de93daull, "take_from_pantry"},
+        {kitchen_sink_contract_eb66fcdc777f75ca, 0xfa049f78b77e146aull, "gadgets"},
+        {kitchen_sink_contract_eea763c41fa7d198, 0xcf1bc6bb37872798ull, "stream_chunks"},
+        {kitchen_sink_contract_f24fd5a4569f91f3, 0x07e272f09c41fffcull, "Gadget.version"},
+        {kitchen_sink_contract_fe26cde50070f9a2, 0xd88e2753503b36dfull, "stream_maybe"},
+        {kitchen_sink_contract_ff329711a0bd4978, 0xc9047a95bdf49e93ull, "get_attrs"},
+    };
+    for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++) {
+        if (rows[i].hash() != rows[i].expected) return rows[i].path;
     }
-    return 0;
+    return NULL;
 }
 
-/* The contract of module `kitchen`: one entry per declaration, sorted by
-   id. The producer's table comes from the function below; a consumer
-   checks each entry it was generated with against it once, before any
-   other call (producer entries it doesn't know are fine). */
-KITCHEN_SINK_API const kitchen_sink_contract_entry* kitchen_sink_kitchen_contract(size_t* out_len);
-#define KITCHEN_SINK_KITCHEN_CONTRACT_LEN 61
-#define KITCHEN_SINK_KITCHEN_CONTRACT { \
-    {0x01d4f09bbddc986full, 0xffcf2bd3b04aa002ull}, /* kitchen.Gadget.new: constructor new(i64) -> Gadget */ \
-    {0x02bbd5f31c953704ull, 0x2cfa679ea1373e09ull}, /* kitchen.Sampler.samples: callback_method #1 samples(u32?, [f64]) -> [i16] throws PantryError */ \
-    {0x10472d8fe748c2eeull, 0xcc570a2649bbf7dcull}, /* kitchen.maybe_gadget: function maybe_gadget(Gadget?) -> Gadget? */ \
-    {0x11368eec07a74078ull, 0xfa049f78b77e146aull}, /* kitchen.gadgets: function gadgets() -> [Gadget] */ \
-    {0x137f08a29cde6021ull, 0xda8de7aeb2dbb8a3ull}, /* kitchen.stream_gadgets: function stream_gadgets() -> iter<Gadget> */ \
-    {0x184bfc4ab0e3fe45ull, 0xb64587477022696bull}, /* kitchen.ids_u64: function ids_u64([u64]) -> [u64] */ \
-    {0x2111b54980826dd7ull, 0x627bf01ab365b209ull}, /* kitchen.do_cancellable: function do_cancellable(string) -> string async cancellable */ \
-    {0x21c70f9371374d74ull, 0x25d5d88a30fe0a79ull}, /* kitchen.ReadyListener.favorite: callback_method #4 favorite() -> Gadget */ \
-    {0x23de5bd597372f46ull, 0xcf1bc6bb37872798ull}, /* kitchen.stream_chunks: function stream_chunks() -> iter<[i32]> */ \
-    {0x249f1ddaec6a6cbeull, 0x0710d6c9a4de93daull}, /* kitchen.take_from_pantry: function take_from_pantry(string) -> i32 throws PantryError */ \
-    {0x29dddbc60bf8d7dbull, 0x452a3e573d57f6dbull}, /* kitchen.Priority: enum Priority {Low = 0, Normal = 1, High = 2} */ \
-    {0x2b227003b74a0d16ull, 0x5dae036b8a6aed30ull}, /* kitchen.maybe_subscribe: function maybe_subscribe(ReadyListener?) -> bool */ \
-    {0x2dd66cb0064f0494ull, 0x74b131724dd0d867ull}, /* kitchen.Item: record Item {i64, string, i32, bool, f64, u32, bytes, [string], {string:string}, i64?, Token, Priority, Gadget?} */ \
-    {0x33c265bbf079b0e9ull, 0x97c32b764693f2cbull}, /* kitchen.u32_id: function u32_id(u32) -> u32 */ \
-    {0x33e6381d01660dfeull, 0x05e35a563089bf7dull}, /* kitchen.KitchenErrors: errors KitchenErrors */ \
-    {0x3d969ae76db6cb23ull, 0x65a325cfc772296bull}, /* kitchen.ReadyListener.latest: callback_method #3 latest() -> Item? */ \
-    {0x3f5fc99d73504b76ull, 0x417e4a2acd3210b3ull}, /* kitchen.Gadget.poke: method poke(i32) -> i32 throws KitchenErrors */ \
-    {0x4082f0085db28781ull, 0x18848e701962912eull}, /* kitchen.Sampler: callback Sampler */ \
-    {0x4340a6b1e7ec8c50ull, 0xa59d0f32a66dc7a2ull}, /* kitchen.Sampler.describe: callback_method #2 describe() -> string throws any */ \
-    {0x4c5764cf109528d1ull, 0xb374accf14676d90ull}, /* kitchen.maybe_item: function maybe_item(i64) -> Item? throws KitchenErrors */ \
-    {0x4de17dfb93fd494dull, 0x78be3203bcd10727ull}, /* kitchen.i32_id: function i32_id(i32) -> i32 */ \
-    {0x504e95b7f7e65570ull, 0x01b3e8e0c9a10e23ull}, /* kitchen.stream_items: function stream_items() -> iter<Item> */ \
-    {0x5dafabb7775fcb2dull, 0x6c4b78c7d3f858c1ull}, /* kitchen.PantryError.Spoiled: code Spoiled = 2 */ \
-    {0x5e0a8f6be4b00600ull, 0x18ea1a42036c96a0ull}, /* kitchen.Sampler.threshold: callback_method #0 threshold(u32?) -> f64? */ \
-    {0x5ec0af1d4ecc6fedull, 0x6540bdb74246420cull}, /* kitchen.async_samples: function async_samples(u32) -> [f32] async cancellable */ \
-    {0x61a358b0571e0a4eull, 0x11a24c4b50d11996ull}, /* kitchen.async_maybe_count: function async_maybe_count() -> i64? async */ \
-    {0x68cdb9a4bd3e3dd5ull, 0xcde022fe6bc3b1bfull}, /* kitchen.bool_id: function bool_id(bool) -> bool */ \
-    {0x69e7cd703d16eb85ull, 0xb13cb8d39e702c79ull}, /* kitchen.do_async: function do_async(string) -> string async */ \
-    {0x70865079ce41be82ull, 0xbe3b69464672af46ull}, /* kitchen.Gadget.describe: method describe() -> string */ \
-    {0x71c5a1116cb7c49aull, 0x1506cfe6f548fac4ull}, /* kitchen.echo_bytes: function echo_bytes(bytes) -> bytes */ \
-    {0x735ee1e0049ee91aull, 0xa713dbd1be707752ull}, /* kitchen.echo_string: function echo_string(string) -> string */ \
-    {0x76d7fc58f4e41d84ull, 0x6bdb4ccea2841d5eull}, /* kitchen.i64_id: function i64_id(i64) -> i64 */ \
-    {0x78d91fd617e162b8ull, 0xd88e2753503b36dfull}, /* kitchen.stream_maybe: function stream_maybe() -> iter<i32?> */ \
-    {0x79abfe1aa960fd6aull, 0xbca7a9e5eb26f3a6ull}, /* kitchen.nested.hello: function hello() -> string */ \
-    {0x7b3865b536da998cull, 0x1c4e79d60a20e74full}, /* kitchen.mixed_slices: function mixed_slices([i8], [i16], [u16], [u32], [i64], [f32]) -> [u32] */ \
-    {0x7ba266dc26a58989ull, 0x0f86001cac0c21e8ull}, /* kitchen.KitchenErrors.InvalidInput: code InvalidInput = 2 */ \
-    {0x7d3dd7d5cf6749e3ull, 0xa192f5a7298adb39ull}, /* kitchen.new_op: function new_op() -> i32 */ \
-    {0x81ded69adee0abf2ull, 0x8c71141a931906f6ull}, /* kitchen.scale_i32: function scale_i32([i32], i32) -> [i32] */ \
-    {0x81fa72769330fed6ull, 0x89681e305b55a4f4ull}, /* kitchen.ReadyListener.label: callback_method #2 label() -> string throws KitchenErrors */ \
-    {0x89a5e664bc25c67bull, 0x357fd9b65ad879a9ull}, /* kitchen.f64_id: function f64_id(f64) -> f64 */ \
-    {0x8cfdbdcecac5f7f1ull, 0x07e272f09c41fffcull}, /* kitchen.Gadget.version: static version() -> string */ \
-    {0x8dc42397e47614b9ull, 0xcddf6fede09b2e7full}, /* kitchen.opt_priority: function opt_priority(Priority?) -> Priority? */ \
-    {0x92f060ef68961fc1ull, 0x4af6ce5b4f9fa508ull}, /* kitchen.ReadyListener.on_item: callback_method #1 on_item(Item, Gadget) -> bool */ \
-    {0x974b9f3e823c1738ull, 0xb81b91e975695f27ull}, /* kitchen.cross_module_token: function cross_module_token() -> Token */ \
-    {0x9f0f001aa85f97d5ull, 0x55815247f895bd45ull}, /* kitchen.sum_f64: function sum_f64([f64]) -> f64 */ \
-    {0xab2a29fd1ef5458bull, 0x471a34aa4c09ae2bull}, /* kitchen.KitchenErrors.NotFound: code NotFound = 1 */ \
-    {0xaca0655fac15d230ull, 0x11c4d2b28abe07bbull}, /* kitchen.list_items: function list_items() -> [Item] */ \
-    {0xb57c8e6ae3fb4383ull, 0x3f857851ab75366cull}, /* kitchen.PantryError: errors PantryError */ \
-    {0xbdc795b195edd428ull, 0x36127462f8b0969full}, /* kitchen.opt_mixed: function opt_mixed(f64, f32?, i64?, string?) -> u16? */ \
-    {0xbe4821ab3c340e71ull, 0xe1d32e38b766e623ull}, /* kitchen.ReadyListener.on_ready: callback_method #0 on_ready(i32, string) -> void */ \
-    {0xc2ad53f2a6a36323ull, 0x071e29abee823f17ull}, /* kitchen.opt_i32_id: function opt_i32_id(i32?) -> i32? */ \
-    {0xc7ab409554fd3d7bull, 0xfea12b6bc219fc46ull}, /* kitchen.parse_any: function parse_any(string) -> i64 throws any */ \
-    {0xc82a7f2d85f99f4eull, 0xa9bcb8bacedb036cull}, /* kitchen.sample_with: function sample_with(Sampler, u32?) -> [i16] throws PantryError */ \
-    {0xc883b4afae20543eull, 0xc40560e5411ff392ull}, /* kitchen.legacy_op: function legacy_op() -> i32 */ \
-    {0xd180bf646bff59e2ull, 0xa4515a6d00d7c600ull}, /* kitchen.PantryError.OutOfStock: code OutOfStock = 1 {string} */ \
-    {0xe6778df0f5c1b82bull, 0x38eaafdb350559e1ull}, /* kitchen.opt_bool_id: function opt_bool_id(bool?) -> bool? */ \
-    {0xf2f7753e6e1dffc2ull, 0xc9047a95bdf49e93ull}, /* kitchen.get_attrs: function get_attrs() -> {string:i32} */ \
-    {0xfae25d3391922eadull, 0xcc034cf506cae182ull}, /* kitchen.subscribe: function subscribe(ReadyListener) -> i32 */ \
-    {0xfd0059b05cb2fcfbull, 0x248bf8404a5823b4ull}, /* kitchen.Gadget: interface Gadget */ \
-    {0xfed9c551fb9fd2d6ull, 0xe1020573f084dc1dull}, /* kitchen.ReadyListener: callback ReadyListener */ \
-    {0xff3a99b52597dee2ull, 0x14c4ecac97bdfc9bull}, /* kitchen.Gadget.readings: method readings(u32?) -> [f64] throws any */ \
-}
-/* The id of the first expected entry the loaded library lacks or
-   declares differently, or 0 when these bindings match it. */
-static inline uint64_t kitchen_sink_kitchen_contract_check(void) {
-    static const kitchen_sink_contract_entry expected[] = KITCHEN_SINK_KITCHEN_CONTRACT;
-    size_t len = 0;
-    const kitchen_sink_contract_entry* table = kitchen_sink_kitchen_contract(&len);
-    for (size_t i = 0; i < KITCHEN_SINK_KITCHEN_CONTRACT_LEN; i++) {
-        size_t lo = 0, hi = len;
-        while (lo < hi) {
-            size_t mid = lo + (hi - lo) / 2;
-            if (table[mid].id < expected[i].id) lo = mid + 1; else hi = mid;
-        }
-        if (lo == len || table[lo].id != expected[i].id || table[lo].hash != expected[i].hash) {
-            return expected[i].id;
-        }
-    }
-    return 0;
-}
+/* A producer implementing this header defines every contract function
+   with this macro (in one source file). */
+#define KITCHEN_SINK_DEFINE_CONTRACT \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_07055ed9d3ef8987(void) { return 0x6c4b78c7d3f858c1ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_093696260e3767ef(void) { return 0x18848e701962912eull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_15de761502d6b0f7(void) { return 0xb64587477022696bull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_1ab4ac8d3595af9e(void) { return 0x18ea1a42036c96a0ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_1ad5b1c1cb5b7b0f(void) { return 0xe1d32e38b766e623ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_1b068c8d584a3666(void) { return 0x1c4e79d60a20e74full; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_1c905aa8cc074ab9(void) { return 0x071e29abee823f17ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_2288b6ba9247f3fa(void) { return 0x01b3e8e0c9a10e23ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_262973c2f9754366(void) { return 0x11c4d2b28abe07bbull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_29fb7143db10b460(void) { return 0xa9bcb8bacedb036cull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_2a3cca9903035fc1(void) { return 0x38eaafdb350559e1ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_2b411bd19468fe38(void) { return 0x1506cfe6f548fac4ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_30d1f6e5606a39a1(void) { return 0xfea12b6bc219fc46ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_3545d44146da2693(void) { return 0xb374accf14676d90ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_355964ddca795015(void) { return 0x65a325cfc772296bull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_3f36f640360df807(void) { return 0xcddf6fede09b2e7full; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_40306466cd73f71b(void) { return 0xcde022fe6bc3b1bfull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_46a82538b4fd65b3(void) { return 0x0f86001cac0c21e8ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_49db162e058b9fa4(void) { return 0xe1020573f084dc1dull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_4bae2c564d268fab(void) { return 0xda8de7aeb2dbb8a3ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_4e03769b2b65f3ee(void) { return 0xa59d0f32a66dc7a2ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_52cfa1d198476806(void) { return 0x74b131724dd0d867ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_5cda1b5d810fe743(void) { return 0xcc034cf506cae182ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_5ec87ece39394738(void) { return 0x11a24c4b50d11996ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_6084dc628fdb0d02(void) { return 0x25d5d88a30fe0a79ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_632ae5cd56d2f5fc(void) { return 0x5dae036b8a6aed30ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_6b91c75a2b38364c(void) { return 0x14c4ecac97bdfc9bull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_6c14076d12124cfd(void) { return 0xa192f5a7298adb39ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_777c1f6342492998(void) { return 0xcc570a2649bbf7dcull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_77f7c86a80aa8b81(void) { return 0x3f857851ab75366cull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_784cfd093415f2b5(void) { return 0xffcf2bd3b04aa002ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_7e1071dd9fa68834(void) { return 0x89681e305b55a4f4ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_7edf409e8ac33025(void) { return 0x2a3ae79e1a476b7aull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_8400c9a27c8c432b(void) { return 0xb13cb8d39e702c79ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_87133f22c66bac36(void) { return 0x6bdb4ccea2841d5eull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_878316bb56b5eacc(void) { return 0xa4515a6d00d7c600ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_8cbd66b05c30c00e(void) { return 0x2cfa679ea1373e09ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_8e374aef14935b0d(void) { return 0x471a34aa4c09ae2bull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_94e2dad4408a7687(void) { return 0x4af6ce5b4f9fa508ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_996a3929498216f3(void) { return 0x78be3203bcd10727ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_9ab72c28265c60e4(void) { return 0x05e35a563089bf7dull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_a430d84680aabd0b(void) { return 0xbca7a9e5eb26f3a6ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_a4e407b3a0fe4669(void) { return 0x452a3e573d57f6dbull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_a529e4a4e0e26d47(void) { return 0x97c32b764693f2cbull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_a717c034ba23905d(void) { return 0x248bf8404a5823b4ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_a9590de6f773a9a4(void) { return 0x8c71141a931906f6ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_ac26813984c811d0(void) { return 0x417e4a2acd3210b3ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_b08395f5e5678b0e(void) { return 0x36127462f8b0969full; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_b66eb0792245db7c(void) { return 0xa713dbd1be707752ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_b985fff5c1b5382c(void) { return 0xc40560e5411ff392ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_bf30e00dc53307a9(void) { return 0x3894f2ca452e9f98ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_c1ceb5fe42730211(void) { return 0x357fd9b65ad879a9ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_c9e1d6b030b1f854(void) { return 0xbe3b69464672af46ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_cea95e3a6107f209(void) { return 0x627bf01ab365b209ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_d06c00826f2918d3(void) { return 0x6540bdb74246420cull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_da96f2dc9f83015b(void) { return 0x55815247f895bd45ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_e68398e3c2c760b2(void) { return 0x18e9fc204a13df6full; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_ea2a5b33b86fb660(void) { return 0x0710d6c9a4de93daull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_eb66fcdc777f75ca(void) { return 0xfa049f78b77e146aull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_eea763c41fa7d198(void) { return 0xcf1bc6bb37872798ull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_f24fd5a4569f91f3(void) { return 0x07e272f09c41fffcull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_fe26cde50070f9a2(void) { return 0xd88e2753503b36dfull; } \
+    KITCHEN_SINK_API uint64_t kitchen_sink_contract_ff329711a0bd4978(void) { return 0xc9047a95bdf49e93ull; } \
+    /* end of the contract */
 
 /*
- * How values cross. A parameter `v` becomes, by its type:
- *   integer, float, bool, C-style enum   T v
- *   optional of one of those (T?)       bool has_v, T v (v is 0 and ignored
- *                                       when has_v is false)
- *   [i8] [i16] [i32] [i64] [u16] [u32]  const T* v_ptr, size_t v_len
- *   [u64] [f32] [f64] (typed arrays)    (v_len counts elements; v_ptr is
- *                                       aligned for T, NULL when v_len is 0)
- *   string, bytes, and every other      const uint8_t* v_ptr, size_t v_len
- *   record, enum, list, map, optional
- *   interface                           const Tag* v (borrowed; NULL for an
- *                                       absent optional)
- *   callback interface                  void* v_ctx, const Tag_vtable* v_vtable
+ * How values cross. Every value is one C value in every position
+ * (parameter, return, async result, iterator item, callback argument):
+ *   integer, float, bool, C-style enum   the value (an enum is int32_t)
+ *   optional of one of those (T?)       kitchen_sink_opt_T: { bool has; T value; }
+ *   string, bytes, [i8] .. [f64]        kitchen_sink_run: { ptr, len }, len in bytes
+ *   (typed arrays), and every record,   (typed arrays are aligned for their
+ *   rich enum, list, map, optional      element); the rest is a value buffer
+ *   interface                           const Tag* as a parameter (borrowed),
+ *                                       Tag* elsewhere (one reference moves)
+ *   callback interface                  kitchen_sink_Cb: { ctx, vtable }
  * Strings are UTF-8 without a NUL terminator; NULL with length 0 is the
- * empty value. Everything in the (ptr, len) row past bytes is a value
- * buffer in the little-endian format; when generated, kitchen_sink_buffer.h
- * declares a C struct and codec for each such type.
- *
- * A return of type T is the C return, except: T? returns `bool` (present)
- * with the value in a trailing `T* out_value`; a typed array returns `T*`
- * with its element count in `size_t* out_len`, released with
- * kitchen_sink_free_bytes((uint8_t*)ptr, len * sizeof(T)); a string, bytes, or
- * buffer returns `const uint8_t*` with `size_t* out_len`, released with
- * kitchen_sink_free_bytes(ptr, len); an interface returns an owned reference,
- * released with its `_destroy`. Every producer run is 8-aligned. Every
- * sync call ends with `kitchen_sink_error* out_err`.
+ * empty run. When generated, kitchen_sink_buffer.h declares a C struct and codec for
+ * every value-buffer type. A run the producer returns is released with
+ * kitchen_sink_run_free, and every one it allocates is 8-aligned. Every sync
+ * call ends with `kitchen_sink_error* out_err`, which it overwrites.
  */
 
 /** Task priority levels */
-typedef int32_t kitchen_sink_kitchen_Priority;
+typedef int32_t kitchen_sink_Priority;
 enum {
     /** Low priority */
-    kitchen_sink_kitchen_Priority_Low = 0,
+    kitchen_sink_Priority_Low = 0,
     /** Normal priority */
-    kitchen_sink_kitchen_Priority_Normal = 1,
+    kitchen_sink_Priority_Normal = 1,
     /** High priority */
-    kitchen_sink_kitchen_Priority_High = 2
+    kitchen_sink_Priority_High = 2
 };
 /**
- * Error codes of the `KitchenErrors` domain of module `kitchen`
- * (`KitchenError` in the language bindings), which a function declared
- * `throws: KitchenErrors` reports in `kitchen_sink_error.code`. Domains are
- * open: a newer library may report a positive code not listed here, which
- * keeps its message.
+ * Error codes of the `KitchenErrors` domain (`KitchenError` in the language
+ * bindings), which a function declared `throws: KitchenErrors` reports in
+ * `kitchen_sink_error.code`. Domains are open: a newer library may report a
+ * positive code not listed here, which keeps its message.
  */
-typedef int32_t kitchen_sink_kitchen_KitchenErrors;
-enum { kitchen_sink_kitchen_KitchenErrors_NotFound = 1, kitchen_sink_kitchen_KitchenErrors_InvalidInput = 2 };
+typedef int32_t kitchen_sink_KitchenErrors;
+enum { kitchen_sink_KitchenErrors_NotFound = 1, kitchen_sink_KitchenErrors_InvalidInput = 2 };
 /**
- * Error codes of the `PantryError` domain of module `kitchen` (`PantryError`
- * in the language bindings), which a function declared `throws: PantryError`
- * reports in `kitchen_sink_error.code`. Domains are open: a newer library may
- * report a positive code not listed here, which keeps its message.
+ * Error codes of the `PantryError` domain (`PantryError` in the language
+ * bindings), which a function declared `throws: PantryError` reports in
+ * `kitchen_sink_error.code`. Domains are open: a newer library may report a
+ * positive code not listed here, which keeps its message.
  */
-typedef int32_t kitchen_sink_kitchen_PantryError;
-enum { kitchen_sink_kitchen_PantryError_OutOfStock = 1, kitchen_sink_kitchen_PantryError_Spoiled = 2 };
-typedef struct kitchen_sink_kitchen_Gadget kitchen_sink_kitchen_Gadget;
-typedef struct kitchen_sink_kitchen_StreamGadgetsIterator kitchen_sink_kitchen_StreamGadgetsIterator;
-typedef struct kitchen_sink_kitchen_StreamItemsIterator kitchen_sink_kitchen_StreamItemsIterator;
-typedef struct kitchen_sink_kitchen_StreamMaybeIterator kitchen_sink_kitchen_StreamMaybeIterator;
-typedef struct kitchen_sink_kitchen_StreamChunksIterator kitchen_sink_kitchen_StreamChunksIterator;
+typedef int32_t kitchen_sink_PantryError;
+enum { kitchen_sink_PantryError_OutOfStock = 1, kitchen_sink_PantryError_Spoiled = 2 };
+typedef struct kitchen_sink_Gadget kitchen_sink_Gadget;
+typedef struct kitchen_sink_StreamGadgetsIterator kitchen_sink_StreamGadgetsIterator;
+typedef struct kitchen_sink_StreamItemsIterator kitchen_sink_StreamItemsIterator;
+typedef struct kitchen_sink_StreamMaybeIterator kitchen_sink_StreamMaybeIterator;
+typedef struct kitchen_sink_StreamChunksIterator kitchen_sink_StreamChunksIterator;
+typedef struct kitchen_sink_ReadyListener_vtable kitchen_sink_ReadyListener_vtable;
+/** A `ReadyListener` argument: the consumer's context and vtable (a NULL vtable is none). */
+typedef struct kitchen_sink_ReadyListener { void* ctx; const kitchen_sink_ReadyListener_vtable* vtable; } kitchen_sink_ReadyListener;
+typedef struct kitchen_sink_Sampler_vtable kitchen_sink_Sampler_vtable;
+/** A `Sampler` argument: the consumer's context and vtable (a NULL vtable is none). */
+typedef struct kitchen_sink_Sampler { void* ctx; const kitchen_sink_Sampler_vtable* vtable; } kitchen_sink_Sampler;
 /**
  * Consumer-implemented observer of ready items
  *
- * A consumer-implemented callback interface. The consumer passes a context
- * pointer and a pointer to a vtable that outlives it, with `size` set to
- * `sizeof` the vtable (the producer rejects a smaller one) and `flags` to 0 or
- * `KITCHEN_SINK_VTABLE_THREAD_AFFINE`. The producer may call any method from
- * any thread (with `KITCHEN_SINK_VTABLE_THREAD_AFFINE`, a method that returns
- * a value only from the thread that passed the vtable) until it calls
- * `free(ctx)` exactly once, also from any thread. A method reports failure
- * with `kitchen_sink_error_set(out_err, ...)`. It returns a string, bytes,
- * buffer, or typed array as a run it allocates with `kitchen_sink_alloc` and
- * stores in `*out_ptr` and `*out_len` (an element count for a typed array),
- * which the producer adopts, and an optional scalar as a `bool` C return
- * (present) with the value in `*out_value`.
+ * A consumer-implemented callback interface, passed as a
+ * `kitchen_sink_ReadyListener`: a context pointer and a pointer to a vtable
+ * that outlives it, with `size` set to `sizeof` the vtable and `flags` to 0 or
+ * `KITCHEN_SINK_VTABLE_THREAD_AFFINE`. Vtables are open: the producer accepts
+ * a shorter vtable (a binding generated before a method was appended), and a
+ * call to a method past its `size`, or a NULL entry, fails with -4. The
+ * producer may call any method from any thread (with
+ * `KITCHEN_SINK_VTABLE_THREAD_AFFINE`, a method that returns a value only from
+ * the thread that passed the vtable) until it calls `free(ctx)` exactly once,
+ * also from any thread. A method reports failure with
+ * `kitchen_sink_error_set(out_err, ...)`, and returns a run it allocates with
+ * `kitchen_sink_alloc`, which the producer adopts whether or not the method
+ * failed.
  */
-typedef struct kitchen_sink_kitchen_ReadyListener_vtable {
+struct kitchen_sink_ReadyListener_vtable {
     uint32_t size;
     uint32_t flags;
     void (*free)(void* ctx);
     /** Fires when an item is ready */
-    void (*on_ready)(void* ctx, int32_t code, const uint8_t* msg_ptr, size_t msg_len, kitchen_sink_error* out_err);
+    void (*on_ready)(void* ctx, int32_t code, kitchen_sink_run msg, kitchen_sink_error* out_err);
     /** Receives the item itself and says whether to keep listening */
-    bool (*on_item)(void* ctx, const uint8_t* item_ptr, size_t item_len, kitchen_sink_kitchen_Gadget* gadget, kitchen_sink_error* out_err);
+    bool (*on_item)(void* ctx, kitchen_sink_run item, kitchen_sink_Gadget* gadget, kitchen_sink_error* out_err);
     /**
      * A display label, failing with a kitchen error
      *
-     * May fail with a `kitchen_sink_kitchen_KitchenErrors` code (attaching its
-     * fields with `kitchen_sink_error_set_payload` when it declares any).
+     * May fail with a `kitchen_sink_KitchenErrors` code (attaching its fields with
+     * `kitchen_sink_error_set_payload` when it declares any).
      */
-    void (*label)(void* ctx, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err);
+    kitchen_sink_run (*label)(void* ctx, kitchen_sink_error* out_err);
     /** The most recent item the listener kept, if any */
-    void (*latest)(void* ctx, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err);
+    kitchen_sink_run (*latest)(void* ctx, kitchen_sink_error* out_err);
     /** The listener's favorite gadget */
-    kitchen_sink_kitchen_Gadget* (*favorite)(void* ctx, kitchen_sink_error* out_err);
-} kitchen_sink_kitchen_ReadyListener_vtable;
+    kitchen_sink_Gadget* (*favorite)(void* ctx, kitchen_sink_error* out_err);
+};
 /**
  * Consumer-implemented source of scalar samples
  *
- * A consumer-implemented callback interface. The consumer passes a context
- * pointer and a pointer to a vtable that outlives it, with `size` set to
- * `sizeof` the vtable (the producer rejects a smaller one) and `flags` to 0 or
- * `KITCHEN_SINK_VTABLE_THREAD_AFFINE`. The producer may call any method from
- * any thread (with `KITCHEN_SINK_VTABLE_THREAD_AFFINE`, a method that returns
- * a value only from the thread that passed the vtable) until it calls
- * `free(ctx)` exactly once, also from any thread. A method reports failure
- * with `kitchen_sink_error_set(out_err, ...)`. It returns a string, bytes,
- * buffer, or typed array as a run it allocates with `kitchen_sink_alloc` and
- * stores in `*out_ptr` and `*out_len` (an element count for a typed array),
- * which the producer adopts, and an optional scalar as a `bool` C return
- * (present) with the value in `*out_value`.
+ * A consumer-implemented callback interface, passed as a
+ * `kitchen_sink_Sampler`: a context pointer and a pointer to a vtable that
+ * outlives it, with `size` set to `sizeof` the vtable and `flags` to 0 or
+ * `KITCHEN_SINK_VTABLE_THREAD_AFFINE`. Vtables are open: the producer accepts
+ * a shorter vtable (a binding generated before a method was appended), and a
+ * call to a method past its `size`, or a NULL entry, fails with -4. The
+ * producer may call any method from any thread (with
+ * `KITCHEN_SINK_VTABLE_THREAD_AFFINE`, a method that returns a value only from
+ * the thread that passed the vtable) until it calls `free(ctx)` exactly once,
+ * also from any thread. A method reports failure with
+ * `kitchen_sink_error_set(out_err, ...)`, and returns a run it allocates with
+ * `kitchen_sink_alloc`, which the producer adopts whether or not the method
+ * failed.
  */
-typedef struct kitchen_sink_kitchen_Sampler_vtable {
+struct kitchen_sink_Sampler_vtable {
     uint32_t size;
     uint32_t flags;
     void (*free)(void* ctx);
     /** The cutoff for a level, if the sampler has one */
-    bool (*threshold)(void* ctx, bool has_level, uint32_t level, double* out_value, kitchen_sink_error* out_err);
+    kitchen_sink_opt_f64 (*threshold)(void* ctx, kitchen_sink_opt_u32 level, kitchen_sink_error* out_err);
     /**
      * Up to `limit` samples, failing when the pantry is empty
      *
-     * May fail with a `kitchen_sink_kitchen_PantryError` code (attaching its
-     * fields with `kitchen_sink_error_set_payload` when it declares any).
+     * May fail with a `kitchen_sink_PantryError` code (attaching its fields with
+     * `kitchen_sink_error_set_payload` when it declares any).
      */
-    void (*samples)(void* ctx, bool has_limit, uint32_t limit, const double* weights_ptr, size_t weights_len, int16_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err);
+    kitchen_sink_run (*samples)(void* ctx, kitchen_sink_opt_u32 limit, kitchen_sink_run weights, kitchen_sink_error* out_err);
     /**
      * A free-form description, failing with an untyped error
      *
      * May fail with code -1 and a message.
      */
-    void (*describe)(void* ctx, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err);
-} kitchen_sink_kitchen_Sampler_vtable;
-typedef void (*kitchen_sink_kitchen_do_async_callback)(void* context, kitchen_sink_error* err, const uint8_t* result_ptr, size_t result_len);
-typedef void (*kitchen_sink_kitchen_do_cancellable_callback)(void* context, kitchen_sink_error* err, const uint8_t* result_ptr, size_t result_len);
-typedef void (*kitchen_sink_kitchen_async_maybe_count_callback)(void* context, kitchen_sink_error* err, bool has_result, int64_t result);
-typedef void (*kitchen_sink_kitchen_async_samples_callback)(void* context, kitchen_sink_error* err, const float* result_ptr, size_t result_len);
+    kitchen_sink_run (*describe)(void* ctx, kitchen_sink_error* out_err);
+};
+typedef void (*kitchen_sink_do_async_callback)(void* context, kitchen_sink_error* err, kitchen_sink_run result);
+typedef void (*kitchen_sink_do_cancellable_callback)(void* context, kitchen_sink_error* err, kitchen_sink_run result);
+typedef void (*kitchen_sink_async_maybe_count_callback)(void* context, kitchen_sink_error* err, kitchen_sink_opt_i64 result);
+typedef void (*kitchen_sink_async_samples_callback)(void* context, kitchen_sink_error* err, kitchen_sink_run result);
 
-// Module: shared
-/** Trivial cross-module helper */
-KITCHEN_SINK_API const uint8_t* kitchen_sink_shared_ping(size_t* out_len, kitchen_sink_error* out_err);
-
-// Module: kitchen
 /** A pocket-sized interface exercising the object surface */
 /** Create a gadget with the given id */
-KITCHEN_SINK_API kitchen_sink_kitchen_Gadget* kitchen_sink_kitchen_Gadget_new(int64_t id, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_Gadget* kitchen_sink_Gadget_new(int64_t id, kitchen_sink_error* out_err);
 /** The gadget subsystem version string */
-KITCHEN_SINK_API const uint8_t* kitchen_sink_kitchen_Gadget_version(size_t* out_len, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_run kitchen_sink_Gadget_version(kitchen_sink_error* out_err);
 /** Render the gadget as a human-readable string */
-KITCHEN_SINK_API const uint8_t* kitchen_sink_kitchen_Gadget_describe(const kitchen_sink_kitchen_Gadget* self, size_t* out_len, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_run kitchen_sink_Gadget_describe(const kitchen_sink_Gadget* self, kitchen_sink_error* out_err);
 /**
  * Poke the gadget a number of times, failing on a negative count
  *
- * Fails with a `kitchen_sink_kitchen_KitchenErrors` code (and its fields as a
- * payload when it declares any).
+ * Fails with a `kitchen_sink_KitchenErrors` code (and its fields as a payload
+ * when it declares any).
  */
-KITCHEN_SINK_API int32_t kitchen_sink_kitchen_Gadget_poke(const kitchen_sink_kitchen_Gadget* self, int32_t times, kitchen_sink_error* out_err);
+KITCHEN_SINK_API int32_t kitchen_sink_Gadget_poke(const kitchen_sink_Gadget* self, int32_t times, kitchen_sink_error* out_err);
 /**
  * The gadget's sensor readings, optionally limited
  *
  * Fails with code -1 and a message.
  */
-KITCHEN_SINK_API double* kitchen_sink_kitchen_Gadget_readings(const kitchen_sink_kitchen_Gadget* self, bool has_limit, uint32_t limit, size_t* out_len, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_run kitchen_sink_Gadget_readings(const kitchen_sink_Gadget* self, kitchen_sink_opt_u32 limit, kitchen_sink_error* out_err);
 /** Returns a new strong reference to the same object (the pointer value is unchanged). Null is a no-op returning null. */
-KITCHEN_SINK_API kitchen_sink_kitchen_Gadget* kitchen_sink_kitchen_Gadget_clone(const kitchen_sink_kitchen_Gadget* self);
+KITCHEN_SINK_API kitchen_sink_Gadget* kitchen_sink_Gadget_clone(const kitchen_sink_Gadget* self);
 /** Releases one strong reference; the object is dropped when the last reference is released. Null is a no-op. */
-KITCHEN_SINK_API void kitchen_sink_kitchen_Gadget_destroy(kitchen_sink_kitchen_Gadget* self);
+KITCHEN_SINK_API void kitchen_sink_Gadget_destroy(kitchen_sink_Gadget* self);
 
+/** A trivial helper */
+KITCHEN_SINK_API kitchen_sink_run kitchen_sink_ping(kitchen_sink_error* out_err);
 /** Identity for bool */
-KITCHEN_SINK_API bool kitchen_sink_kitchen_bool_id(bool x, kitchen_sink_error* out_err);
-KITCHEN_SINK_API int32_t kitchen_sink_kitchen_i32_id(int32_t x, kitchen_sink_error* out_err);
-KITCHEN_SINK_API uint32_t kitchen_sink_kitchen_u32_id(uint32_t x, kitchen_sink_error* out_err);
-KITCHEN_SINK_API int64_t kitchen_sink_kitchen_i64_id(int64_t x, kitchen_sink_error* out_err);
-KITCHEN_SINK_API double kitchen_sink_kitchen_f64_id(double x, kitchen_sink_error* out_err);
-KITCHEN_SINK_API const uint8_t* kitchen_sink_kitchen_echo_string(const uint8_t* s_ptr, size_t s_len, size_t* out_len, kitchen_sink_error* out_err);
-KITCHEN_SINK_API const uint8_t* kitchen_sink_kitchen_echo_bytes(const uint8_t* b_ptr, size_t b_len, size_t* out_len, kitchen_sink_error* out_err);
+KITCHEN_SINK_API bool kitchen_sink_bool_id(bool x, kitchen_sink_error* out_err);
+KITCHEN_SINK_API int32_t kitchen_sink_i32_id(int32_t x, kitchen_sink_error* out_err);
+KITCHEN_SINK_API uint32_t kitchen_sink_u32_id(uint32_t x, kitchen_sink_error* out_err);
+KITCHEN_SINK_API int64_t kitchen_sink_i64_id(int64_t x, kitchen_sink_error* out_err);
+KITCHEN_SINK_API double kitchen_sink_f64_id(double x, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_run kitchen_sink_echo_string(kitchen_sink_run s, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_run kitchen_sink_echo_bytes(kitchen_sink_run b, kitchen_sink_error* out_err);
 /** Register a listener, returning how many are attached */
-KITCHEN_SINK_API int32_t kitchen_sink_kitchen_subscribe(void* listener_ctx, const kitchen_sink_kitchen_ReadyListener_vtable* listener_vtable, kitchen_sink_error* out_err);
+KITCHEN_SINK_API int32_t kitchen_sink_subscribe(kitchen_sink_ReadyListener listener, kitchen_sink_error* out_err);
 /** Register a listener if one is given */
-KITCHEN_SINK_API bool kitchen_sink_kitchen_maybe_subscribe(void* listener_ctx, const kitchen_sink_kitchen_ReadyListener_vtable* listener_vtable, kitchen_sink_error* out_err);
+KITCHEN_SINK_API bool kitchen_sink_maybe_subscribe(kitchen_sink_ReadyListener listener, kitchen_sink_error* out_err);
 /** Optional object in both directions */
-KITCHEN_SINK_API kitchen_sink_kitchen_Gadget* kitchen_sink_kitchen_maybe_gadget(const kitchen_sink_kitchen_Gadget* fallback, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_Gadget* kitchen_sink_maybe_gadget(const kitchen_sink_Gadget* fallback, kitchen_sink_error* out_err);
 /** A list of objects */
-KITCHEN_SINK_API const uint8_t* kitchen_sink_kitchen_gadgets(size_t* out_len, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_run kitchen_sink_gadgets(kitchen_sink_error* out_err);
 /** An iterator over objects */
-KITCHEN_SINK_API kitchen_sink_kitchen_StreamGadgetsIterator* kitchen_sink_kitchen_stream_gadgets(kitchen_sink_error* out_err);
-KITCHEN_SINK_API int32_t kitchen_sink_kitchen_StreamGadgetsIterator_next(kitchen_sink_kitchen_StreamGadgetsIterator* iter, kitchen_sink_kitchen_Gadget** out_item, kitchen_sink_error* out_err);
-KITCHEN_SINK_API void kitchen_sink_kitchen_StreamGadgetsIterator_destroy(kitchen_sink_kitchen_StreamGadgetsIterator* iter);
+KITCHEN_SINK_API kitchen_sink_StreamGadgetsIterator* kitchen_sink_stream_gadgets(kitchen_sink_error* out_err);
+KITCHEN_SINK_API int32_t kitchen_sink_StreamGadgetsIterator_next(kitchen_sink_StreamGadgetsIterator* iter, kitchen_sink_Gadget** out_item, kitchen_sink_error* out_err);
+KITCHEN_SINK_API void kitchen_sink_StreamGadgetsIterator_destroy(kitchen_sink_StreamGadgetsIterator* iter);
 /**
  * Optional struct return
  *
- * Fails with a `kitchen_sink_kitchen_KitchenErrors` code (and its fields as a
- * payload when it declares any).
+ * Fails with a `kitchen_sink_KitchenErrors` code (and its fields as a payload
+ * when it declares any).
  */
-KITCHEN_SINK_API const uint8_t* kitchen_sink_kitchen_maybe_item(int64_t id, size_t* out_len, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_run kitchen_sink_maybe_item(int64_t id, kitchen_sink_error* out_err);
 /** List of structs */
-KITCHEN_SINK_API const uint8_t* kitchen_sink_kitchen_list_items(size_t* out_len, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_run kitchen_sink_list_items(kitchen_sink_error* out_err);
 /** Map return type */
-KITCHEN_SINK_API const uint8_t* kitchen_sink_kitchen_get_attrs(size_t* out_len, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_run kitchen_sink_get_attrs(kitchen_sink_error* out_err);
 /** Iterator return type */
-KITCHEN_SINK_API kitchen_sink_kitchen_StreamItemsIterator* kitchen_sink_kitchen_stream_items(kitchen_sink_error* out_err);
-KITCHEN_SINK_API int32_t kitchen_sink_kitchen_StreamItemsIterator_next(kitchen_sink_kitchen_StreamItemsIterator* iter, const uint8_t** out_item, size_t* out_len, kitchen_sink_error* out_err);
-KITCHEN_SINK_API void kitchen_sink_kitchen_StreamItemsIterator_destroy(kitchen_sink_kitchen_StreamItemsIterator* iter);
-/** Returns the shared Token type from another module */
-KITCHEN_SINK_API const uint8_t* kitchen_sink_kitchen_cross_module_token(size_t* out_len, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_StreamItemsIterator* kitchen_sink_stream_items(kitchen_sink_error* out_err);
+KITCHEN_SINK_API int32_t kitchen_sink_StreamItemsIterator_next(kitchen_sink_StreamItemsIterator* iter, kitchen_sink_run* out_item, kitchen_sink_error* out_err);
+KITCHEN_SINK_API void kitchen_sink_StreamItemsIterator_destroy(kitchen_sink_StreamItemsIterator* iter);
+/** Returns the shared Token record */
+KITCHEN_SINK_API kitchen_sink_run kitchen_sink_make_token(kitchen_sink_error* out_err);
 /** Async operation */
-KITCHEN_SINK_API void kitchen_sink_kitchen_do_async(const uint8_t* input_ptr, size_t input_len, kitchen_sink_kitchen_do_async_callback callback, void* context);
+KITCHEN_SINK_API void kitchen_sink_do_async(kitchen_sink_run input, kitchen_sink_do_async_callback callback, void* context);
 /** Cancellable async operation */
-KITCHEN_SINK_API void kitchen_sink_kitchen_do_cancellable(const uint8_t* input_ptr, size_t input_len, kitchen_sink_cancel_token* cancel_token, kitchen_sink_kitchen_do_cancellable_callback callback, void* context);
+KITCHEN_SINK_API void kitchen_sink_do_cancellable(kitchen_sink_run input, kitchen_sink_cancel_token* cancel_token, kitchen_sink_do_cancellable_callback callback, void* context);
 /** Legacy operation kept for compatibility */
-KITCHEN_SINK_DEPRECATED("Use `kitchen_sink_kitchen_new_op` instead")
-KITCHEN_SINK_API int32_t kitchen_sink_kitchen_legacy_op(kitchen_sink_error* out_err);
-/** Replacement for `kitchen_sink_kitchen_legacy_op` */
-KITCHEN_SINK_API int32_t kitchen_sink_kitchen_new_op(kitchen_sink_error* out_err);
+KITCHEN_SINK_DEPRECATED("Use `kitchen_sink_new_op` instead")
+KITCHEN_SINK_API int32_t kitchen_sink_legacy_op(kitchen_sink_error* out_err);
+/** Replacement for `kitchen_sink_legacy_op` */
+KITCHEN_SINK_API int32_t kitchen_sink_new_op(kitchen_sink_error* out_err);
 /** Optional scalar in both directions */
-KITCHEN_SINK_API bool kitchen_sink_kitchen_opt_i32_id(bool has_x, int32_t x, int32_t* out_value, kitchen_sink_error* out_err);
-KITCHEN_SINK_API bool kitchen_sink_kitchen_opt_bool_id(bool has_x, bool x, bool* out_value, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_opt_i32 kitchen_sink_opt_i32_id(kitchen_sink_opt_i32 x, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_opt_bool kitchen_sink_opt_bool_id(kitchen_sink_opt_bool x, kitchen_sink_error* out_err);
 /** Optional C-style enum in both directions */
-KITCHEN_SINK_API bool kitchen_sink_kitchen_opt_priority(bool has_p, kitchen_sink_kitchen_Priority p, kitchen_sink_kitchen_Priority* out_value, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_opt_i32 kitchen_sink_opt_priority(kitchen_sink_opt_i32 p, kitchen_sink_error* out_err);
 /** Optional scalars next to ordinary parameters */
-KITCHEN_SINK_API bool kitchen_sink_kitchen_opt_mixed(double base, bool has_scale, float scale, bool has_offset, int64_t offset, const uint8_t* label_ptr, size_t label_len, uint16_t* out_value, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_opt_u16 kitchen_sink_opt_mixed(double base, kitchen_sink_opt_f32 scale, kitchen_sink_opt_i64 offset, kitchen_sink_run label, kitchen_sink_error* out_err);
 /** A typed-array parameter */
-KITCHEN_SINK_API double kitchen_sink_kitchen_sum_f64(const double* xs_ptr, size_t xs_len, kitchen_sink_error* out_err);
+KITCHEN_SINK_API double kitchen_sink_sum_f64(kitchen_sink_run xs, kitchen_sink_error* out_err);
 /** Typed arrays in both directions */
-KITCHEN_SINK_API int32_t* kitchen_sink_kitchen_scale_i32(const int32_t* xs_ptr, size_t xs_len, int32_t factor, size_t* out_len, kitchen_sink_error* out_err);
-KITCHEN_SINK_API uint64_t* kitchen_sink_kitchen_ids_u64(const uint64_t* ids_ptr, size_t ids_len, size_t* out_len, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_run kitchen_sink_scale_i32(kitchen_sink_run xs, int32_t factor, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_run kitchen_sink_ids_u64(kitchen_sink_run ids, kitchen_sink_error* out_err);
 /** Every slice element type */
-KITCHEN_SINK_API uint32_t* kitchen_sink_kitchen_mixed_slices(const int8_t* a_ptr, size_t a_len, const int16_t* b_ptr, size_t b_len, const uint16_t* c_ptr, size_t c_len, const uint32_t* d_ptr, size_t d_len, const int64_t* e_ptr, size_t e_len, const float* f_ptr, size_t f_len, size_t* out_len, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_run kitchen_sink_mixed_slices(kitchen_sink_run a, kitchen_sink_run b, kitchen_sink_run c, kitchen_sink_run d, kitchen_sink_run e, kitchen_sink_run f, kitchen_sink_error* out_err);
 /** Async returning an optional scalar */
-KITCHEN_SINK_API void kitchen_sink_kitchen_async_maybe_count(kitchen_sink_kitchen_async_maybe_count_callback callback, void* context);
+KITCHEN_SINK_API void kitchen_sink_async_maybe_count(kitchen_sink_async_maybe_count_callback callback, void* context);
 /** Async returning a typed array */
-KITCHEN_SINK_API void kitchen_sink_kitchen_async_samples(uint32_t n, kitchen_sink_cancel_token* cancel_token, kitchen_sink_kitchen_async_samples_callback callback, void* context);
+KITCHEN_SINK_API void kitchen_sink_async_samples(uint32_t n, kitchen_sink_cancel_token* cancel_token, kitchen_sink_async_samples_callback callback, void* context);
 /** Iterator of optional scalars */
-KITCHEN_SINK_API kitchen_sink_kitchen_StreamMaybeIterator* kitchen_sink_kitchen_stream_maybe(kitchen_sink_error* out_err);
-KITCHEN_SINK_API int32_t kitchen_sink_kitchen_StreamMaybeIterator_next(kitchen_sink_kitchen_StreamMaybeIterator* iter, bool* out_has_item, int32_t* out_item, kitchen_sink_error* out_err);
-KITCHEN_SINK_API void kitchen_sink_kitchen_StreamMaybeIterator_destroy(kitchen_sink_kitchen_StreamMaybeIterator* iter);
+KITCHEN_SINK_API kitchen_sink_StreamMaybeIterator* kitchen_sink_stream_maybe(kitchen_sink_error* out_err);
+KITCHEN_SINK_API int32_t kitchen_sink_StreamMaybeIterator_next(kitchen_sink_StreamMaybeIterator* iter, kitchen_sink_opt_i32* out_item, kitchen_sink_error* out_err);
+KITCHEN_SINK_API void kitchen_sink_StreamMaybeIterator_destroy(kitchen_sink_StreamMaybeIterator* iter);
 /** Iterator of typed arrays */
-KITCHEN_SINK_API kitchen_sink_kitchen_StreamChunksIterator* kitchen_sink_kitchen_stream_chunks(kitchen_sink_error* out_err);
-KITCHEN_SINK_API int32_t kitchen_sink_kitchen_StreamChunksIterator_next(kitchen_sink_kitchen_StreamChunksIterator* iter, int32_t** out_item, size_t* out_len, kitchen_sink_error* out_err);
-KITCHEN_SINK_API void kitchen_sink_kitchen_StreamChunksIterator_destroy(kitchen_sink_kitchen_StreamChunksIterator* iter);
+KITCHEN_SINK_API kitchen_sink_StreamChunksIterator* kitchen_sink_stream_chunks(kitchen_sink_error* out_err);
+KITCHEN_SINK_API int32_t kitchen_sink_StreamChunksIterator_next(kitchen_sink_StreamChunksIterator* iter, kitchen_sink_run* out_item, kitchen_sink_error* out_err);
+KITCHEN_SINK_API void kitchen_sink_StreamChunksIterator_destroy(kitchen_sink_StreamChunksIterator* iter);
 /**
  * Drive a consumer-implemented sampler
  *
- * Fails with a `kitchen_sink_kitchen_PantryError` code (and its fields as a
- * payload when it declares any).
+ * Fails with a `kitchen_sink_PantryError` code (and its fields as a payload
+ * when it declares any).
  */
-KITCHEN_SINK_API int16_t* kitchen_sink_kitchen_sample_with(void* sampler_ctx, const kitchen_sink_kitchen_Sampler_vtable* sampler_vtable, bool has_level, uint32_t level, size_t* out_len, kitchen_sink_error* out_err);
+KITCHEN_SINK_API kitchen_sink_run kitchen_sink_sample_with(kitchen_sink_Sampler sampler, kitchen_sink_opt_u32 level, kitchen_sink_error* out_err);
 /**
  * Fails with the second domain
  *
- * Fails with a `kitchen_sink_kitchen_PantryError` code (and its fields as a
- * payload when it declares any).
+ * Fails with a `kitchen_sink_PantryError` code (and its fields as a payload
+ * when it declares any).
  */
-KITCHEN_SINK_API int32_t kitchen_sink_kitchen_take_from_pantry(const uint8_t* item_ptr, size_t item_len, kitchen_sink_error* out_err);
+KITCHEN_SINK_API int32_t kitchen_sink_take_from_pantry(kitchen_sink_run item, kitchen_sink_error* out_err);
 /**
  * Fails with an untyped error
  *
  * Fails with code -1 and a message.
  */
-KITCHEN_SINK_API int64_t kitchen_sink_kitchen_parse_any(const uint8_t* text_ptr, size_t text_len, kitchen_sink_error* out_err);
-
-// Module: kitchen_nested
-/** Trivial nested-module function */
-KITCHEN_SINK_API const uint8_t* kitchen_sink_kitchen_nested_hello(size_t* out_len, kitchen_sink_error* out_err);
-
+KITCHEN_SINK_API int64_t kitchen_sink_parse_any(kitchen_sink_run text, kitchen_sink_error* out_err);
+/** A trivial function returning a string */
+KITCHEN_SINK_API kitchen_sink_run kitchen_sink_hello(kitchen_sink_error* out_err);
 
 #ifdef __cplusplus
 }

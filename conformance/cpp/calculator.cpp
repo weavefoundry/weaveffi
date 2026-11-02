@@ -1,13 +1,13 @@
-// Conformance consumer: calculator sample, C++ target (ABI revision 5).
+// Conformance consumer: calculator sample, C++ target (ABI revision 6).
 //
 // The getting-started surface: the load-time check, a direct-value call
-// (wrapping), throwing calls whose typed exceptions come from two domains of
-// one module (`CalcError` and `ParseError`, whose code 1 values differ and
-// whose `NotANumberError` carries a field), an untyped (`throws: any`)
-// failure thrown as the root `Error` with code -1, a string in and out
-// through `std::string_view` (non-ASCII text, an astral character, and an
-// interior NUL survive the pointer-and-length ABI), an optional scalar
-// return (`std::optional<double>`), and typed arrays in both directions
+// (wrapping), throwing calls whose typed exceptions come from two domains
+// (`CalcError` and `ParseError`, whose code 1 values differ and whose
+// `NotANumberError` carries a field), an untyped (`throws: any`) failure
+// thrown as the root `Error` with code -1, a string in and out through
+// `std::string_view` (non-ASCII text, an astral character, and an interior
+// NUL survive the run, which carries a length), an optional scalar return
+// (`std::optional<double>`), and typed arrays in both directions
 // (`std::vector` storage passed as is). Invalid UTF-8 is a producer-side
 // marshalling failure on a call that declares no errors, so it throws
 // InternalError, which is an Error too. Ends by asserting the producer's
@@ -22,7 +22,7 @@
 #include "calculator.hpp"
 #include "check.hpp"
 
-namespace calc = ::calculator::calculator;
+namespace calc = ::calculator;
 using calculator::CalcError;
 using calculator::DivisionByZeroError;
 using calculator::Error;

@@ -1,11 +1,11 @@
 # Dart
 
 The Dart target generates a standalone Dart package that calls the
-producer's C ABI (revision 5) through `dart:ffi`. It works in Dart
-command-line apps and in Flutter apps on the desktop, Android, and iOS.
-Records become value classes, rich enums sealed class hierarchies,
-interfaces disposable wrapper classes, async functions `Future`s, and
-callback interfaces abstract classes you implement.
+producer's [C ABI](../reference/abi.md) (revision 6) through `dart:ffi`. It
+works in Dart command-line apps and in Flutter apps on the desktop, Android,
+and iOS. Records become value classes, rich enums sealed class hierarchies,
+interfaces disposable wrapper classes, async functions `Future`s, iterators
+lazy `Iterable`s, and callback interfaces abstract classes you implement.
 
 Dart is a [Tier 2](../stability.md#target-tiers) target: it may lag behind
 new ABI work, but it's held to the same conformance suite as every other
@@ -18,17 +18,16 @@ dart/
   pubspec.yaml               package `{package}`, depends on `ffi`
   README.md
   lib/{package}.dart         the library: its imports and parts
-  lib/src/runtime/*.dart     the runtime (loader, errors, codecs, ...) and contract tables
-  lib/src/{module}.dart      one part per module (`kv.dart`, `kv/stats.dart`)
+  lib/src/runtime/*.dart     the runtime (loader, errors, codecs, ...) and contract rows
+  lib/src/api.dart           every declaration of the library
 ```
 
 The whole binding is one Dart library split into parts, so you import a
-single file. The package name defaults to the library's C prefix
-(`kvstore` for the kvstore sample), so consumers write
-`import 'package:kvstore/kvstore.dart';`. Module-level functions use their
-bare names (`openStore`, `renderReport`), which global names keep unique.
-Runtime sections the API doesn't use (async, callbacks, typed arrays, ...)
-aren't emitted.
+single file. A library is one namespace, and so is its Dart package: every
+type and function is a top-level name. The package name defaults to the
+library's C prefix (`kvstore` for the kvstore sample), so consumers write
+`import 'package:kvstore/kvstore.dart';`. Runtime sections the API doesn't
+use (async, callbacks, typed arrays, optional scalars, ...) aren't emitted.
 
 ## Configuration
 
@@ -75,17 +74,17 @@ all of them. See [Packaging](../guides/packaging.md).
 Before any other call, the bindings check the library and throw a
 `NativeLibraryException` if it can't be opened or doesn't match:
 
-- `kvstore_abi_version()` must report revision 5.
-- For every top-level module, the bindings embed the contract entries they
-  were generated with (one `(id, hash, path)` record per declaration, error
-  code, and callback method, each with its canonical signature as a
-  comment), call `kvstore_{module}_contract`, and require each entry to be
-  present with an equal hash. A missing entry fails with "kvstore:
-  kv.Store.put is missing from the library"; a different hash with
-  "kvstore: kv.Store.put changed since these bindings were generated".
-  Entries the library has and the bindings don't are fine, so adding a
-  function, an error code, or a callback method never breaks a deployed
-  binding.
+- `kvstore_abi_version()` must report revision 6.
+- The bindings embed one contract row per declaration they were generated
+  with (each function, interface, interface member, record, enum, callback
+  interface, callback method, error domain, and error code): the
+  declaration's contract function, the hash of its canonical signature, and
+  its path, with the signature as a comment. Each row's function must exist
+  and return the row's hash. A missing one fails with "kvstore: Store.put
+  is missing from the library"; a different hash with "kvstore: Store.put
+  changed since these bindings were generated". Declarations the library
+  has and the bindings don't are fine, so adding a function, an error code,
+  or a callback method never breaks a deployed binding.
 
 `NativeLibraryException` is an `Exception`, thrown from whichever call into
 the library comes first, so an app can catch it and report a broken install.
@@ -93,33 +92,41 @@ The load isn't cached when it fails: the next call tries again.
 
 ## Type mapping
 
+Every value crosses the C ABI as one C value, in every position (a
+parameter, a return, an async result, an iterator element, and a callback
+method's arguments and return):
+
 | IDL type | Dart type | Crosses the C ABI as |
 |---|---|---|
 | `i8` to `i64`, `u8` to `u64` | `int` | by value (`u64` as its two's-complement bit pattern) |
 | `f32`, `f64` | `double` | by value |
 | `bool` | `bool` | C `bool` |
-| `string` | `String` | UTF-8 `(ptr, len)`, so interior NULs survive |
-| `bytes` | `Uint8List`; a parameter takes any `List<int>` | `(ptr, len)` |
-| Record | a `final class` with final fields, named constructor arguments, and value equality | value buffer |
 | Plain enum | an enhanced `enum` with `value` and `fromValue` | `int32_t` |
-| Rich enum | a `sealed` class with one `final` subclass per variant | value buffer |
-| Interface | a `final class` wrapper | object pointer |
-| `T?` of a scalar or plain enum | `T?` | a presence flag and the value (no buffer) |
-| `[T]` of a number (`i8` to `i64`, `u16` to `u64`, `f32`, `f64`) | `List<int>` or `List<double>` | a C array and its element count (no buffer) |
-| Any other `T?` | `T?` | value buffer (`Interface?` is a nullable pointer, `Cb?` a null vtable) |
-| Any other `[T]`, `{K:V}` | `List<T>`, `Map<K, V>` | value buffer |
+| `T?` of a scalar or plain enum | `T?` | a `{p}_opt_{prim}` struct (`{has, value}`) by value |
+| `string` | `String` | a `{p}_run` of UTF-8, so interior NULs survive |
+| `bytes` | `Uint8List`; a parameter takes any `List<int>` | a `{p}_run` of the bytes |
+| `[T]` of a number (`i8` to `i64`, `u16` to `u64`, `f32`, `f64`) | `List<int>` or `List<double>` | a `{p}_run` of the packed elements |
+| Record | a `final class` with final fields, named constructor arguments, and value equality | a `{p}_run` holding a value buffer |
+| Rich enum | a `sealed` class with one `final` subclass per variant | a `{p}_run` holding a value buffer |
+| Any other `T?`, `[T]`, `{K:V}` | `T?`, `List<T>`, `Map<K, V>` | a `{p}_run` holding a value buffer |
+| Interface | a `final class` wrapper | object pointer (`Interface?` is a nullable pointer) |
 | `iter<T>` | `Iterable<T>` | native iterator |
-| Callback interface | an `abstract class` you implement | `ctx` plus vtable |
+| Callback interface | an `abstract class` you implement | a `{p}_{Cb}` struct (`{ctx, vtable}`) by value; `Cb?` passes a null vtable for none |
 
-A numeric list argument is copied into native memory for the call (a typed
-list such as `Int32List` is copied as is; any other list is converted
-first). A returned numeric list is a fixed-length typed list behind the
-`List<int>` or `List<double>` type (`Int32List`, `Float64List`, and so on),
-copied out of the producer's array before it's released. A `bytes` value
-the bindings return, decode, or pass to a callback is always a `Uint8List`;
-a `bytes` parameter (or a callback's `bytes` return) takes any `List<int>`,
-so a list literal works too. Inside records and other value buffers,
-optionals and lists keep the value-buffer encoding.
+The runtime mirrors each C struct with a private `dart:ffi` `Struct`
+(`_Run`, `_OptI32`, `_CallbackArg`), passed and returned by value, so the
+generated `lookupFunction` signatures match the header slot for slot.
+
+A run argument (a string, bytes, a numeric list, or a value buffer) is
+copied into native memory for the call (a typed list such as `Int32List` is
+copied as is; any other list is converted first). A returned run is copied
+into Dart memory and released with `{p}_run_free`. A returned numeric list is
+a fixed-length typed list behind the `List<int>` or `List<double>` type
+(`Int32List`, `Float64List`, and so on). A `bytes` value the bindings return,
+decode, or pass to a callback is always a `Uint8List`; a `bytes` parameter
+(or a callback's `bytes` return) takes any `List<int>`, so a list literal
+works too. Inside records and other value buffers, optionals and lists keep
+the value-buffer encoding.
 
 Records and rich-enum variants implement `==`, `hashCode`, and `toString`:
 lists, maps, and byte arrays compare element by element, and interface
@@ -180,7 +187,7 @@ try {
 }
 ```
 
-A module may declare several domains, and a function names the one it
+A library may declare several domains, and a function names the one it
 throws; codes are only unique within a domain, so the bindings decode a
 failure by the function's domain (calculator's `CalcError.DivisionByZero`
 and `ParseError.NotANumber` are both code 1).
@@ -207,9 +214,10 @@ such a function (codec's `echoChar('ab')`) is a `NativeError` with
 
 ## Async and cancellation
 
-An async function returns a `Future`. The producer completes it from a
-worker thread through a `NativeCallable.listener`, and the result is
-decoded on the event loop.
+An async function returns a `Future`. The producer completes it exactly
+once, from any thread, through a `NativeCallable.listener` that stays open
+until then; the result (which the bindings own) is decoded on the event
+loop.
 
 A cancellable function takes an optional named `CancelToken`:
 
@@ -227,7 +235,8 @@ try {
 One token can serve any number of calls, a token that's already cancelled
 cancels a call at launch, and cancelling after completion does nothing. The
 bindings create a native token for each call, cancel it when the
-`CancelToken` is cancelled, and destroy it when the call completes.
+`CancelToken` is cancelled, and destroy their reference when the call
+completes.
 
 ## Callbacks
 
@@ -256,16 +265,16 @@ class AdmitAll implements Policy {
 store.setPolicy(AdmitAll());
 ```
 
-A method that returns a value hands it to the producer in the shape the ABI
-expects: a scalar by value; an optional scalar as a presence flag and an out
-value; an object as a fresh strong reference the producer adopts; and a
-string, bytes, numeric list, or record as a run the bindings allocate with
-`{prefix}_alloc` and the producer frees. Arguments arrive copied (a numeric
-list as a typed list), and object arguments are owned by the
-implementation; call `dispose()` on them when you're done (or let the
-finalizer release them). A method may call back into the library: every
-call has its own error and out slots, so a call made from inside a callback
-never disturbs the call that's waiting on it.
+A method that returns a value returns it as one C value: a scalar by value,
+an optional scalar as its `{p}_opt_{prim}` struct, an object as a fresh
+strong reference the producer adopts, and a string, bytes, numeric list, or
+record as a run the bindings allocate with `{p}_alloc` and the producer
+frees. Arguments are copied before the method runs (a numeric list into a
+typed list), and object arguments are owned by the implementation; call
+`dispose()` on them when you're done (or let the finalizer release them). A
+method may call back into the library: every call has its own error and out
+slots, so a call made from inside a callback never disturbs the call that's
+waiting on it.
 
 Exceptions never unwind into the producer. In a method declared to throw a
 domain, throwing that domain's exception (here a `KvException` subclass)
@@ -294,16 +303,21 @@ How a method runs depends on its return type:
   every call made before it.
 
 Every vtable the bindings pass is flagged thread-affine
-(`{PREFIX}_VTABLE_THREAD_AFFINE`, ABI section 1.7). The producer records the
-thread that passed it and refuses to call a value-returning method from any
-other thread: the method doesn't run, and the producer sees it fail with
-`foreignCode` (-4) and the message "callback called off its thread". Without
-the flag, the Dart VM would abort the process, since only an `isolateLocal`
-callable can run the isolate's code synchronously and the VM aborts before
-any Dart code runs when one is called from a thread that isn't running the
-isolate. In the kvstore sample, `compact` tells listeners from a worker
-thread: a Dart `Listener`'s `accepts` is refused there, so the listener is
-detached, and compaction carries on.
+(`{PREFIX}_VTABLE_THREAD_AFFINE`; see
+[Callback interfaces](../reference/abi.md#callback-interfaces)). The producer
+records the thread that passed it and refuses to call a value-returning
+method from any other thread: the method doesn't run, and the producer sees
+it fail with `foreignCode` (-4) and the message "callback called off its
+thread". Without the flag, the Dart VM would abort the process, since only
+an `isolateLocal` callable can run the isolate's code synchronously, and the
+VM aborts before any Dart code runs when one is called from a thread that
+isn't running the isolate. In the kvstore sample, `compact` tells listeners
+from a worker thread: a Dart `Listener`'s `accepts` is refused there, so the
+listener is detached, and compaction carries on.
+
+The vtables are static and sized as the bindings were generated, so a
+library that later appends a callback method keeps working with them: the
+producer fails a call to the method the bindings lack with -4.
 
 ## Iterators
 
@@ -320,15 +334,16 @@ for (final key in store.keys('user.')) {
 
 ## Performance notes
 
-Every call takes a frame from a per-isolate pool: the native error slot, the
-return's out slots, and an `Arena` for staged arguments. A call made from a
-callback takes a frame of its own, and a frame goes back to the pool when
-its call returns, so steady-state calls allocate no native memory for their
-slots. Optional scalars and numeric lists skip the value buffer entirely.
-When the API declares no callback interfaces, synchronous calls are bound as
-leaf calls (`isLeaf: true`), which skips the VM's safepoint transition; a
-leaf call blocks this isolate group's garbage collector until it returns, so
-it suits fast functions.
+Every call takes a frame from a per-isolate pool: the native error slot, an
+out slot for an iterator's element, and an `Arena` for staged arguments. A
+call made from a callback takes a frame of its own, and a frame goes back to
+the pool when its call returns, so steady-state calls allocate no native
+memory for their slots. Optional scalars cross as small structs and numeric
+lists as packed runs, skipping the value buffer entirely. When the API
+declares no callback interfaces, synchronous calls are bound as leaf calls
+(`isLeaf: true`), which skips the VM's safepoint transition; a leaf call
+blocks this isolate group's garbage collector until it returns, so it suits
+fast functions.
 
 ## Known limitations
 

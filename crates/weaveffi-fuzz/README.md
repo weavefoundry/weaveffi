@@ -15,7 +15,8 @@ locally and in CI.
 | `fuzz_parse_json` | `weaveffi_model::parse::parse_api_str(..., "json")` |
 | `fuzz_parse_type_ref` | `weaveffi_model::ir::parse_type_ref` |
 | `fuzz_validate` | parses YAML, then runs `weaveffi_model::validate::validate` on success |
-| `fuzz_value_buffer` | `weaveffi::abi::decode_value` over several value-buffer shapes; a successful decode must re-encode to the same bytes |
+| `fuzz_value_buffer` | the runtime's value-buffer decoders (`FfiType::read`) over several shapes; a successful decode must re-encode to the same bytes |
+| `fuzz_meta_frames` | the library-metadata decoder (`meta::decode`, then `meta::assemble`) that library mode runs on whatever binary it reads |
 
 Seed inputs for each target live in `fuzz/seeds/<target>/` and are committed
 to git. `seed_corpus.py <target> <dir>` copies them into a corpus directory

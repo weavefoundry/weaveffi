@@ -1,8 +1,9 @@
 // The runtime shared by every binding in this package: the error classes,
-// the value-buffer codec, the object and iterator wrappers, cancellation, and
-// the load-time contract check. The generated `index.js` imports it; the
-// native transport (an N-API addon or a WebAssembly instance) never sees it,
-// except for `$Fault`, the shape every native failure arrives in.
+// the value-buffer codec, argument checks, the object and iterator wrappers,
+// callback implementations, cancellation, and the load-time contract check.
+// The generated `index.js` imports it, and so does the native transport,
+// which reports every failure as a `$Fault` and hands a released callback
+// implementation back through `$release`.
 
 /**
  * The root of every error these bindings throw. `code` is the ABI error
@@ -103,7 +104,7 @@ export function $untyped(e) {
 }
 
 /** The message of a thrown value: an error's message (or name), else its text. */
-function $messageOf(e) {
+export function $messageOf(e) {
   if (e instanceof Error) return e.message || e.name;
   try {
     return String(e);
@@ -182,8 +183,8 @@ function $float(v, what) {
  * throws a `TypeError`, and an integer that is fractional or out of its
  * kind's range a `RangeError` (64-bit kinds take a `bigint` or an integral
  * `number` and return a `bigint`). `what` names the value in the message.
- * The value-buffer writer, callback returns, and typed-array arguments all
- * check through these, so a value never wraps silently.
+ * Arguments, the value-buffer writer, callback returns, and typed-array
+ * elements all check through these, so a value never wraps silently.
  */
 export const $check = Object.freeze({
   Bool(v, what) {
@@ -245,8 +246,32 @@ export const $slice = Object.freeze({
   F64: $typed(Float64Array, $check.F64),
 });
 
-const $utf8 = new TextEncoder();
+const $encoder = new TextEncoder();
+const $decoder = new TextDecoder();
 const $utf8Strict = new TextDecoder('utf-8', { fatal: true });
+
+/** A string's UTF-8 run, after checking it is a string. */
+export function $utf8(v, what) {
+  return $encoder.encode($check.String(v, what));
+}
+
+/** The string a UTF-8 run holds. */
+export function $text(bytes) {
+  return bytes.length === 0 ? '' : $decoder.decode(bytes);
+}
+
+/** The bytes of a typed array (a view, not a copy). */
+export function $bytesOf(typed) {
+  return new Uint8Array(typed.buffer, typed.byteOffset, typed.byteLength);
+}
+
+/** The elements of a typed-array run of `Typed`, as a plain array. */
+export function $array(bytes, Typed) {
+  const aligned = bytes.byteOffset % Typed.BYTES_PER_ELEMENT === 0 ? bytes : bytes.slice();
+  return Array.from(
+    new Typed(aligned.buffer, aligned.byteOffset, aligned.byteLength / Typed.BYTES_PER_ELEMENT),
+  );
+}
 
 /**
  * Writes the value-buffer wire format: little-endian, packed, no alignment.
@@ -293,7 +318,7 @@ export class $Writer {
     $check.String(v);
     // UTF-8 never needs more than three bytes per UTF-16 code unit.
     this.reserve(4 + v.length * 3);
-    const { written } = $utf8.encodeInto(v, this.buf.subarray(this.len + 4));
+    const { written } = $encoder.encodeInto(v, this.buf.subarray(this.len + 4));
     this.view.setUint32(this.len, written, true);
     this.len += 4 + written;
   }
@@ -494,7 +519,7 @@ export const $dispose = typeof Symbol.dispose === 'symbol' ? Symbol.dispose : Sy
 // The held value never references the wrapper, so it can't keep it alive.
 const $objects = new FinalizationRegistry((held) => held.destroy(held.handle));
 
-function $release(o) {
+function $releaseObject(o) {
   const handle = o.$h;
   o.$h = null;
   o.constructor.$destroy(handle);
@@ -513,7 +538,7 @@ export class $Object {
     if (this.$closed !== false) return;
     this.$closed = true;
     $objects.unregister(this);
-    if (this.$calls === 0) $release(this);
+    if (this.$calls === 0) $releaseObject(this);
   }
 
   [$dispose]() {
@@ -559,12 +584,13 @@ export function $lendOpt(o, cls) {
 /** End one loan of `o`, completing a `close()` deferred by the loan. */
 export function $unlend(o) {
   if (o === null || o === undefined) return;
-  if (--o.$calls === 0 && o.$closed) $release(o);
+  if (--o.$calls === 0 && o.$closed) $releaseObject(o);
 }
 
 /**
  * A second strong reference to `o`'s native object, for an object token
- * written into a value buffer (the native side adopts it).
+ * written into a value buffer or an object a callback returns (the native
+ * side adopts it).
  */
 export function $clone(o, cls) {
   const handle = $lend(o, cls);
@@ -587,8 +613,9 @@ const $iterators = new FinalizationRegistry((held) => held.destroy(held.handle))
  * native call. The native iterator is destroyed exactly once: when it is
  * exhausted or fails, by `return()` (which `for...of` calls on `break`), by
  * `close()` or a `using` declaration, or when the iterator is collected.
- * `spec` supplies `next`, `destroy`, `map` (the error mapping), and
- * `convert` (or `null` when elements need no conversion).
+ * `spec` supplies `next` (an element, or `undefined` once exhausted),
+ * `destroy`, `map` (the error mapping), and `convert` (or `null` when
+ * elements need no conversion).
  */
 export class $Iterator {
   constructor(handle, spec) {
@@ -668,6 +695,11 @@ export function $cancellable(signal, tokens, launch) {
   return pending.finally(done);
 }
 
+/** The constructor of an interface without a public one. */
+export function $noConstructor(name) {
+  throw new TypeError(`${name} has no public constructor; use its factory functions`);
+}
+
 /** Check a callback interface implementation. */
 export function $impl(impl, what) {
   if (impl === null || (typeof impl !== 'object' && typeof impl !== 'function')) {
@@ -676,41 +708,51 @@ export function $impl(impl, what) {
   return impl;
 }
 
+// Callback implementations the native library holds, by the integer it
+// knows them by (the `ctx` of their argument struct), until it calls the
+// vtable's `free`.
+const $callbacks = new Map();
+let $nextCallback = 1;
+
+/** Hold `adapter` for the native library and return its `ctx`. */
+export function $register(adapter) {
+  const ctx = $nextCallback++;
+  $callbacks.set(ctx, adapter);
+  return ctx;
+}
+
+/** The adapter the native library knows as `ctx`. */
+export function $adapter(ctx) {
+  const adapter = $callbacks.get(ctx);
+  if (adapter === undefined) throw new Error('callback implementation was already released');
+  return adapter;
+}
+
+/** Drop the adapter `ctx` (the vtable's `free`). */
+export function $release(ctx) {
+  $callbacks.delete(ctx);
+}
+
 /**
- * The load-time checks: the native library must implement ABI revision
- * `abi`, and, for every top-level module, its contract table must hold each
- * entry these bindings were generated with. `contract` lists
- * `[tableFunction, [[id, hash, path], ...]]` per module; the native side
- * returns a module's table as a `BigUint64Array` of `id, hash` pairs.
- * Entries the library has and the bindings don't are fine.
+ * The load-time checks, run once before any other call: the native library
+ * must implement ABI revision `abi`, and export every declaration's contract
+ * function in `contract` (`[symbol, hash, path]` rows) returning the hash
+ * these bindings were generated with. Declarations the library has and the
+ * bindings don't are fine. `native` is the loaded transport.
  */
-export function $verify(raw, library, prefix, abi, contract) {
-  const version = raw[`${prefix}_abi_version`];
-  if (typeof version !== 'function') {
-    throw new Error(`${library}: the native library does not export ${prefix}_abi_version`);
-  }
-  const found = Number(version());
+export function $verify(native, library, abi, contract) {
+  const found = native.abiVersion();
   if (found !== abi) {
     throw new Error(
       `${library}: the native library implements ABI revision ${found}, but these bindings require revision ${abi}`,
     );
   }
-  for (const [symbol, expected] of contract) {
-    const table = raw[symbol];
-    if (typeof table !== 'function') {
-      throw new Error(`${library}: the native library does not export ${symbol}`);
+  for (const [symbol, hash, path] of contract) {
+    if (!native.has(symbol)) {
+      throw new Error(`${library}: ${path} is missing from the library`);
     }
-    const pairs = table();
-    const hashes = new Map();
-    for (let i = 0; i + 1 < pairs.length; i += 2) hashes.set(pairs[i], pairs[i + 1]);
-    for (const [id, hash, path] of expected) {
-      const got = hashes.get(id);
-      if (got === undefined) {
-        throw new Error(`${library}: ${path} is missing from the library`);
-      }
-      if (got !== hash) {
-        throw new Error(`${library}: ${path} changed since these bindings were generated`);
-      }
+    if (native.contract(symbol) !== hash) {
+      throw new Error(`${library}: ${path} changed since these bindings were generated`);
     }
   }
 }

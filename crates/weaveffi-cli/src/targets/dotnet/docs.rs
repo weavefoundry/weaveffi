@@ -21,13 +21,11 @@ pub(crate) struct Docs {
 impl Docs {
     /// Index every identifier `model` declares.
     pub(crate) fn new(model: &Model) -> Self {
-        let callbacks = model
-            .callback_interfaces()
-            .map(|(_, cb)| cb.name.clone())
-            .collect();
+        let callbacks = model.callbacks.iter().map(|cb| cb.name.clone()).collect();
         let codes = model
-            .error_domains()
-            .flat_map(|(_, d)| {
+            .errors
+            .iter()
+            .flat_map(|d| {
                 let exc = errors::exception_type_name(&d.name);
                 d.codes
                     .iter()
@@ -42,7 +40,7 @@ impl Docs {
     }
 
     /// The C# spelling of an API identifier, or `None` to keep it as
-    /// written (an ambiguous name, or a module).
+    /// written (an ambiguous name).
     fn spell(&self, ident: &str) -> Option<String> {
         Some(match self.names.kind(ident)? {
             IdentKind::Function
@@ -53,7 +51,7 @@ impl Docs {
             IdentKind::Type if self.callbacks.contains(ident) => callback_interface_cs(ident),
             IdentKind::ErrorDomain => errors::exception_type_name(ident),
             IdentKind::ErrorCode => self.codes.get(ident)?.clone(),
-            IdentKind::Type | IdentKind::Variant | IdentKind::Module => return None,
+            IdentKind::Type | IdentKind::Variant => return None,
         })
     }
 
@@ -123,19 +121,17 @@ mod tests {
     fn identifiers_take_their_csharp_spelling() {
         let model = test_model(
             r#"
-version: "0.12.0"
-modules:
-  - name: kv
-    errors:
-      - name: KvError
-        codes: [{ name: not_found, code: 1, message: missing }]
-    callback_interfaces:
-      - name: Listener
-        methods: [{ name: on_put, params: [{ name: new_key, type: string }] }]
-    functions:
-      - name: new_op
-        params: [{ name: the_key, type: string }]
-        return: i32
+version: "0.13.0"
+errors:
+  - name: KvError
+    codes: [{ name: not_found, code: 1, message: missing }]
+callbacks:
+  - name: Listener
+    methods: [{ name: on_put, params: [{ name: new_key, type: string }] }]
+functions:
+  - name: new_op
+    params: [{ name: the_key, type: string }]
+    return: i32
 "#,
         );
         let docs = Docs::new(&model);

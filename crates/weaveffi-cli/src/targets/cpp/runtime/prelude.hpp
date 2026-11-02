@@ -146,7 +146,7 @@ struct ErrorFree {
 /**
  * Settles the `std::promise<T>` an async call passed as `context`, exactly
  * once: with the `E` exception for a failure, else with `value()` (which
- * takes ownership of the result slots). Releases the boxed error. Runs on
+ * takes ownership of the result). Releases the boxed error. Runs on
  * a producer thread inside a C frame, so nothing unwinds out of it.
  */
 template <typename E, typename T, typename F>
@@ -181,89 +181,110 @@ auto callback(error* out_err, F&& body) noexcept -> decltype(body()) {
     if constexpr (!std::is_void_v<decltype(body())>) return decltype(body()){};
 }
 
-/** Releases a producer run (a string, bytes, value buffer, or typed array) on scope exit. */
-struct Run {
-    const void* ptr;
-    size_t len;
-    ~Run() {
-        if (ptr != nullptr) {{PREFIX}}_free_bytes(static_cast<uint8_t*>(const_cast<void*>(ptr)), len);
-    }
+/** The C value of a string, bytes, typed array, or value buffer: a run of bytes. */
+using run = {{PREFIX}}_run;
+
+/** Releases a run the producer returned (a string, bytes, typed array, or value buffer) on scope exit. */
+struct OwnedRun {
+    run value;
+    ~OwnedRun() { {{PREFIX}}_run_free(value); }
 };
 
-/** The byte size of `count` elements of `T`, failing with -3 when it overflows. */
+/** A borrowed run over a string argument's UTF-8 bytes (no terminator, so interior NULs survive). */
+inline run string_run(std::string_view s) noexcept {
+    return run{reinterpret_cast<const uint8_t*>(s.data()), s.size()};
+}
+
+/** A borrowed run over a bytes argument. */
+inline run bytes_run(const std::vector<uint8_t>& v) noexcept { return run{v.data(), v.size()}; }
+
+/** A borrowed run over a typed-array argument's storage: `len` counts bytes. */
 template <typename T>
-size_t byte_size(size_t count) {
-    if (count > SIZE_MAX / sizeof(T)) throw Error(-3, "array is too large");
-    return count * sizeof(T);
+run slice_run(const std::vector<T>& v) noexcept {
+    return run{reinterpret_cast<const uint8_t*>(v.data()), v.size() * sizeof(T)};
 }
 
-/** Copies a producer-returned UTF-8 run into a string, then releases it. */
-inline std::string take_string(const uint8_t* ptr, size_t len) {
-    Run run{ptr, len};
-    if (ptr == nullptr) return std::string();
-    return std::string(reinterpret_cast<const char*>(ptr), len);
-}
-
-/** Copies a producer-returned byte run into a vector, then releases it. */
-inline std::vector<uint8_t> take_bytes(const uint8_t* ptr, size_t len) {
-    Run run{ptr, len};
-    if (ptr == nullptr) return std::vector<uint8_t>();
-    return std::vector<uint8_t>(ptr, ptr + len);
-}
-
-/** Copies a producer-returned typed array of `len` elements into a vector, then releases it. */
-template <typename T>
-std::vector<T> take_slice(const T* ptr, size_t len) {
-    Run run{ptr, len * sizeof(T)};
-    if (ptr == nullptr) return std::vector<T>();
-    return std::vector<T>(ptr, ptr + len);
-}
-
-/** Views a borrowed UTF-8 run as a string_view (a zero-length run may be dangling). */
-inline std::string_view borrow_string(const uint8_t* ptr, size_t len) noexcept {
-    if (len == 0) return std::string_view();
-    return std::string_view(reinterpret_cast<const char*>(ptr), len);
+/** Views a borrowed UTF-8 run as a string_view, valid while the run is. */
+inline std::string_view borrow_string(run r) noexcept {
+    if (r.len == 0) return std::string_view();
+    return std::string_view(reinterpret_cast<const char*>(r.ptr), r.len);
 }
 
 /** Copies a borrowed byte run into a vector. */
-inline std::vector<uint8_t> borrow_bytes(const uint8_t* ptr, size_t len) {
-    if (len == 0) return std::vector<uint8_t>();
-    return std::vector<uint8_t>(ptr, ptr + len);
+inline std::vector<uint8_t> borrow_bytes(run r) {
+    if (r.len == 0) return std::vector<uint8_t>();
+    return std::vector<uint8_t>(r.ptr, r.ptr + r.len);
 }
 
-/** Copies a borrowed typed array of `len` elements into a vector. */
+/** Copies a borrowed typed array into a vector, failing with -3 when its length isn't a whole number of elements. */
 template <typename T>
-std::vector<T> borrow_slice(const T* ptr, size_t len) {
-    if (len == 0) return std::vector<T>();
-    return std::vector<T>(ptr, ptr + len);
+std::vector<T> borrow_slice(run r) {
+    if (r.len % sizeof(T) != 0) throw InternalError(-3, "typed array length is not a multiple of its element size");
+    std::vector<T> v(r.len / sizeof(T));
+    if (r.len != 0) std::memcpy(v.data(), r.ptr, r.len);
+    return v;
 }
 
-/** The data pointer of a string argument, as the C ABI expects it. */
-inline const uint8_t* utf8(std::string_view s) noexcept {
-    return reinterpret_cast<const uint8_t*>(s.data());
+/** Copies a producer-returned UTF-8 run into a string, then releases it. */
+inline std::string take_string(run r) {
+    OwnedRun owned{r};
+    return std::string(borrow_string(r));
 }
 
-/** The C value of a scalar or C-style enum: an enum crosses as its `int32_t` discriminant. */
+/** Copies a producer-returned byte run into a vector, then releases it. */
+inline std::vector<uint8_t> take_bytes(run r) {
+    OwnedRun owned{r};
+    return borrow_bytes(r);
+}
+
+/** Copies a producer-returned typed array into a vector, then releases it. */
 template <typename T>
-constexpr auto to_c(T value) noexcept {
-    if constexpr (std::is_enum_v<T>) {
-        return static_cast<std::underlying_type_t<T>>(value);
-    } else {
-        return value;
+std::vector<T> take_slice(run r) {
+    OwnedRun owned{r};
+    return borrow_slice<T>(r);
+}
+
+/**
+ * Hands `len` bytes from `data` to the producer as a callback method's
+ * return: copies them into a run from {{PREFIX}}_alloc, which the producer
+ * adopts and frees.
+ */
+inline run give_run(const void* data, size_t len) {
+    if (len == 0) return run{nullptr, 0};
+    uint8_t* ptr = {{PREFIX}}_alloc(len);
+    if (ptr == nullptr) throw std::bad_alloc();
+    std::memcpy(ptr, data, len);
+    return run{ptr, len};
+}
+
+/** Hands a callback's string return to the producer. */
+inline run give_string(std::string_view value) { return give_run(value.data(), value.size()); }
+
+/** Hands a callback's bytes return to the producer. */
+inline run give_bytes(const std::vector<uint8_t>& value) { return give_run(value.data(), value.size()); }
+
+/** Hands a callback's typed-array return to the producer. */
+template <typename T>
+run give_slice(const std::vector<T>& value) {
+    return give_run(value.data(), value.size() * sizeof(T));
+}
+
+/** The C value of an optional scalar or C-style enum (`O` is its `{{PREFIX}}_opt_*` struct). */
+template <typename O, typename T>
+O to_opt(const std::optional<T>& value) noexcept {
+    O out{};
+    if (value.has_value()) {
+        out.has = true;
+        out.value = static_cast<decltype(out.value)>(*value);
     }
+    return out;
 }
 
-/** The C value slot of an optional scalar or enum argument: its value, or zero when absent. */
-template <typename T>
-constexpr auto value_or_zero(const std::optional<T>& value) noexcept {
-    return to_c(value.has_value() ? *value : T{});
-}
-
-/** An optional scalar or enum from its C presence flag and value. */
-template <typename T, typename C>
-std::optional<T> lift_optional(bool present, C value) noexcept {
-    if (!present) return std::nullopt;
-    return std::optional<T>(static_cast<T>(value));
+/** An optional scalar or C-style enum from its `{{PREFIX}}_opt_*` struct. */
+template <typename T, typename O>
+std::optional<T> from_opt(const O& value) noexcept {
+    if (!value.has) return std::nullopt;
+    return std::optional<T>(static_cast<T>(value.value));
 }
 
 /** A wrapper adopting a returned object reference, or none for null. */
@@ -283,48 +304,6 @@ const typename T::raw_type* handle_of(const std::optional<T>& object) noexcept {
 template <typename T>
 typename T::raw_type* clone_of(const std::optional<T>& object) noexcept {
     return object.has_value() ? object->clone_handle() : nullptr;
-}
-
-/** Hands a callback's optional scalar or enum return to the producer: writes the value, returns presence. */
-template <typename T, typename C>
-bool give_optional(const std::optional<T>& value, C* out_value) noexcept {
-    if (!value.has_value()) return false;
-    *out_value = static_cast<C>(*value);
-    return true;
-}
-
-/**
- * Hands `len` bytes from `data` to the producer through a callback method's
- * out slots: copies them into a run from {{PREFIX}}_alloc, which the
- * producer adopts and frees.
- */
-template <typename T>
-void give_run(const void* data, size_t len, T** out_ptr, size_t* out_len) {
-    uint8_t* run = nullptr;
-    if (len > 0) {
-        run = {{PREFIX}}_alloc(len);
-        if (run == nullptr) throw std::bad_alloc();
-        std::memcpy(run, data, len);
-    }
-    *out_ptr = reinterpret_cast<T*>(run);
-    *out_len = len;
-}
-
-/** Hands a callback's string return to the producer. */
-inline void give(std::string_view value, uint8_t** out_ptr, size_t* out_len) {
-    give_run(value.data(), value.size(), out_ptr, out_len);
-}
-
-/** Hands a callback's bytes return to the producer. */
-inline void give(const std::vector<uint8_t>& value, uint8_t** out_ptr, size_t* out_len) {
-    give_run(value.data(), value.size(), out_ptr, out_len);
-}
-
-/** Hands a callback's typed-array return to the producer; `out_len` receives the element count. */
-template <typename T>
-void give_slice(const std::vector<T>& value, T** out_ptr, size_t* out_len) {
-    give_run(value.data(), byte_size<T>(value.size()), out_ptr, out_len);
-    *out_len = value.size();
 }
 
 /** The implementation a callback interface's `ctx` boxes. */
@@ -556,44 +535,30 @@ private:
 
 namespace detail {
 
-/** One declaration this header was generated with: its contract id and hash, and its dotted path. */
-struct ContractEntry {
-    /** FNV-1a 64 of the declaration's dotted path. */
-    uint64_t id;
-    /** FNV-1a 64 of the declaration's canonical signature. */
-    uint64_t hash;
-    /** The declaration's dotted path (`kv.Store.put`). */
+/**
+ * One declaration this header was generated with: the library's contract
+ * function for it, the hash of its canonical signature, and its dotted path.
+ */
+struct ContractRow {
+    /** The library's `{{PREFIX}}_contract_*` function, which returns the declaration's hash. */
+    uint64_t (*hash)();
+    /** FNV-1a 64 of the declaration's canonical signature, as generated. */
+    uint64_t expected;
+    /** The declaration's dotted path (`Store.put`). */
     const char* path;
 };
 
 /**
- * Why the contract table `contract` returns doesn't satisfy `expected`,
- * naming the first declaration it lacks or declares differently, or an empty
- * string when it has them all. Entries the producer has and `expected`
- * doesn't are fine.
+ * Why the linked library doesn't match `rows`, naming the first declaration
+ * it declares differently, or an empty string when it matches them all. A
+ * declaration the library lacks fails to link instead, and declarations it
+ * has beyond `rows` are fine.
  */
 template <size_t N>
-std::string contract_mismatch(const {{PREFIX}}_contract_entry* (*contract)(size_t*),
-                              const ContractEntry (&expected)[N]) {
-    size_t len = 0;
-    const {{PREFIX}}_contract_entry* table = contract(&len);
-    if (table == nullptr) len = 0;
-    for (const ContractEntry& want : expected) {
-        size_t lo = 0;
-        size_t hi = len;
-        while (lo < hi) {
-            size_t mid = lo + (hi - lo) / 2;
-            if (table[mid].id < want.id) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if (lo == len || table[lo].id != want.id) {
-            return std::string(want.path) + " is missing from the library";
-        }
-        if (table[lo].hash != want.hash) {
-            return std::string(want.path) + " changed since these bindings were generated";
+std::string contract_mismatch(const ContractRow (&rows)[N]) {
+    for (const ContractRow& row : rows) {
+        if (row.hash() != row.expected) {
+            return std::string(row.path) + " changed since these bindings were generated";
         }
     }
     return std::string();

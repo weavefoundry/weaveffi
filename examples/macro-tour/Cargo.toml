@@ -1,0 +1,19 @@
+[package]
+name = "macro-tour"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+description = "One of each WeaveFFI producer attribute: the producer macro guide's examples."
+
+[features]
+# Exports `Book::purge`; the guide uses it to show `#[cfg]` on a member.
+admin = []
+
+[dependencies]
+weaveffi = { path = "../../crates/weaveffi" }
+# `time` for `tokio::time::sleep` in an async export; `rt` for the
+# `set_spawner` example.
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
+
+[lints]
+workspace = true

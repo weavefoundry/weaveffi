@@ -1,25 +1,32 @@
-//! The validation rules: global name uniqueness, per-module identifier and
-//! shape checks, type-reference resolution, ABI-representability of element
-//! shapes, callback-interface rules, interface positions, and error-domain
-//! consistency.
+//! The validation rules: library-wide name uniqueness, identifier and shape
+//! checks, type-reference resolution, ABI-representability of element
+//! shapes, callback-interface rules, interface positions, recursive value
+//! types, and error-domain consistency.
 //!
 //! Every rule pushes into a shared sink instead of returning early, so one
 //! validation pass reports every violation in the document. Each violation
-//! carries the declaration path that encloses it (module segments, then
-//! declaration and member names), which the diagnostic uses to locate the
-//! offending text.
+//! carries the declaration path that encloses it (the declaration, then
+//! member and parameter or field names), which the diagnostic uses to locate
+//! the offending text.
 
 use super::{Found, ValidationError};
-use crate::ir::{
-    Api, CallbackInterfaceDef, ErrorDomain, Function, InterfaceDef, Module, StructField, Throws,
-    TypeRef,
-};
+use crate::ir::{Api, CallbackDef, ErrorDomain, Field, Function, InterfaceDef, Throws, TypeRef};
 use crate::ty::{Prim, TypeIndex, TypeKind};
 use std::collections::{BTreeMap, BTreeSet};
 
 const RESERVED: &[&str] = &[
     "if", "else", "for", "while", "loop", "match", "type", "return", "async", "await", "break",
     "continue", "fn", "struct", "enum", "mod", "use",
+];
+
+/// The slots the C ABI adds to signatures, which no parameter may be named.
+const ABI_SLOTS: &[&str] = &[
+    "self",
+    "ctx",
+    "out_err",
+    "callback",
+    "context",
+    "cancel_token",
 ];
 
 /// Primitive spellings other languages have that WeaveFFI deliberately
@@ -48,124 +55,131 @@ fn within(scope: &[String], names: &[&str]) -> Vec<String> {
 
 /// Run every rule over `api`, whose declarations `types` indexes.
 pub(super) fn check(api: &Api, types: &TypeIndex, found: &mut Vec<Found>) {
-    let carriers = object_carriers(&api.modules, types);
+    let carriers = object_carriers(api, types);
     let mut cx = Cx {
         types,
         carriers: &carriers,
         found,
     };
-    let mut names = BTreeSet::new();
-    for m in &api.modules {
-        if !names.insert(m.name.as_str()) {
-            cx.push(
-                &within(&[], &[&m.name]),
-                ValidationError::DuplicateModuleName {
-                    module: m.name.clone(),
-                },
-            );
-        }
-        cx.module(m, &[]);
-    }
-    check_global_names(&api.modules, found);
+    cx.declarations(api);
+    check_names(api, cx.found);
+    check_recursion(api, types, cx.found);
 }
 
-/// Enforce API-wide name uniqueness: every type name (records, enums,
-/// interfaces, callback interfaces, and error domains), every free-function
-/// name, and every error-code name is global. A free function also may not
-/// share its name with an error domain.
-fn check_global_names(modules: &[Module], found: &mut Vec<Found>) {
-    #[derive(Default)]
-    struct Seen<'a> {
-        types: BTreeMap<&'a str, String>,
-        functions: BTreeMap<&'a str, String>,
-        codes: BTreeMap<&'a str, String>,
-        domains: BTreeMap<&'a str, String>,
-        /// Every free function, as `(name, module path, module segments)`.
-        all_functions: Vec<(&'a str, String, Vec<String>)>,
-    }
-    fn walk<'a>(
-        modules: &'a [Module],
-        parent: &[String],
-        seen: &mut Seen<'a>,
-        found: &mut Vec<Found>,
-    ) {
-        for m in modules {
-            let segments = within(parent, &[&m.name]);
-            let path = segments.join(".");
-            let types = m
-                .structs
+/// Enforce library-wide name uniqueness: every record, enum, error domain,
+/// interface, callback interface, and free function shares one namespace,
+/// and every error-code name is unique too.
+fn check_names(api: &Api, found: &mut Vec<Found>) {
+    let mut seen: BTreeMap<&str, &'static str> = BTreeMap::new();
+    let decls = api
+        .records
+        .iter()
+        .map(|d| (d.name.as_str(), "record"))
+        .chain(api.enums.iter().map(|d| (d.name.as_str(), "enum")))
+        .chain(api.errors.iter().map(|d| (d.name.as_str(), "error domain")))
+        .chain(
+            api.interfaces
                 .iter()
-                .map(|s| s.name.as_str())
-                .chain(m.enums.iter().map(|e| e.name.as_str()))
-                .chain(m.interfaces.iter().map(|i| i.name.as_str()))
-                .chain(m.callback_interfaces.iter().map(|c| c.name.as_str()))
-                .chain(m.errors.iter().map(|d| d.name.as_str()));
-            for name in types {
-                match seen.types.get(name) {
-                    Some(first) => found.push((
-                        ValidationError::DuplicateTypeName {
-                            name: name.to_string(),
-                            first: first.clone(),
-                            second: path.clone(),
-                        },
-                        segments.clone(),
-                    )),
-                    None => {
-                        seen.types.insert(name, path.clone());
-                    }
-                }
+                .map(|d| (d.name.as_str(), "interface")),
+        )
+        .chain(
+            api.callbacks
+                .iter()
+                .map(|d| (d.name.as_str(), "callback interface")),
+        )
+        .chain(api.functions.iter().map(|d| (d.name.as_str(), "function")));
+    for (name, kind) in decls {
+        match seen.get(name) {
+            Some(first) => found.push((
+                ValidationError::DuplicateName {
+                    name: name.to_string(),
+                    first,
+                    second: kind,
+                },
+                vec![],
+            )),
+            None => {
+                seen.insert(name, kind);
             }
-            for f in &m.functions {
-                match seen.functions.get(f.name.as_str()) {
-                    Some(first) => found.push((
-                        ValidationError::DuplicateFunctionName {
-                            name: f.name.clone(),
-                            first: first.clone(),
-                            second: path.clone(),
-                        },
-                        segments.clone(),
-                    )),
-                    None => {
-                        seen.functions.insert(&f.name, path.clone());
-                    }
-                }
-                seen.all_functions
-                    .push((&f.name, path.clone(), segments.clone()));
-            }
-            for domain in &m.errors {
-                seen.domains.entry(&domain.name).or_insert(path.clone());
-                let owner = format!("{path}.{}", domain.name);
-                for code in &domain.codes {
-                    match seen.codes.get(code.name.as_str()) {
-                        Some(first) => found.push((
-                            ValidationError::DuplicateErrorCodeName {
-                                name: code.name.clone(),
-                                first: first.clone(),
-                                second: owner.clone(),
-                            },
-                            within(&segments, &[&domain.name]),
-                        )),
-                        None => {
-                            seen.codes.insert(&code.name, owner.clone());
-                        }
-                    }
-                }
-            }
-            walk(&m.modules, &segments, seen, found);
         }
     }
-    let mut seen = Seen::default();
-    walk(modules, &[], &mut seen, found);
-    for (name, function, segments) in &seen.all_functions {
-        if let Some(domain) = seen.domains.get(name) {
-            found.push((
-                ValidationError::NameCollisionWithErrorDomain {
-                    name: (*name).to_string(),
-                    function: function.clone(),
-                    domain: domain.clone(),
-                },
-                segments.clone(),
-            ));
+    let mut codes: BTreeMap<&str, &str> = BTreeMap::new();
+    for domain in &api.errors {
+        for code in &domain.codes {
+            match codes.get(code.name.as_str()) {
+                Some(first) => found.push((
+                    ValidationError::DuplicateErrorCodeName {
+                        name: code.name.clone(),
+                        first: (*first).to_string(),
+                        second: domain.name.clone(),
+                    },
+                    vec![domain.name.clone()],
+                )),
+                None => {
+                    codes.insert(&code.name, &domain.name);
+                }
+            }
+        }
+    }
+}
+
+/// Reject a record or rich enum that contains itself by value: directly or
+/// through optionals and other records and rich enums, but not through a
+/// list or a map, which hold their elements indirectly.
+fn check_recursion<'a>(api: &'a Api, types: &TypeIndex, found: &mut Vec<Found>) {
+    // The by-value edges: (type, field path) -> the user types the field
+    // holds by value.
+    let mut edges: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
+    let mut add = |name: &'a str, label: String, fields: &'a [Field]| {
+        for f in fields {
+            let mut ty = &f.ty;
+            while let TypeRef::Optional(inner) = ty {
+                ty = inner;
+            }
+            if let TypeRef::Named(target) = ty {
+                if matches!(
+                    types.kind(target),
+                    Some(TypeKind::Record | TypeKind::RichEnum)
+                ) {
+                    edges
+                        .entry(name)
+                        .or_default()
+                        .push((format!("{label}.{}", f.name), target.clone()));
+                }
+            }
+        }
+    };
+    for r in &api.records {
+        add(&r.name, r.name.clone(), &r.fields);
+    }
+    for e in &api.enums {
+        for v in &e.variants {
+            add(&e.name, format!("{}::{}", e.name, v.name), &v.fields);
+        }
+    }
+    let mut reported = BTreeSet::new();
+    for start in edges.keys() {
+        // Depth-first search for a path back to `start`.
+        let mut stack: Vec<(&str, Vec<String>)> = vec![(start, Vec::new())];
+        let mut visited = BTreeSet::new();
+        while let Some((at, path)) = stack.pop() {
+            for (field, target) in edges.get(at).into_iter().flatten() {
+                let mut next = path.clone();
+                next.push(format!("{field} -> {target}"));
+                if target == start {
+                    if reported.insert(start.to_string()) {
+                        found.push((
+                            ValidationError::RecursiveType {
+                                name: start.to_string(),
+                                path: next.join(", "),
+                            },
+                            vec![start.to_string()],
+                        ));
+                    }
+                } else if visited.insert(target.as_str()) {
+                    stack.push((target, next));
+                }
+            }
         }
     }
 }
@@ -208,80 +222,55 @@ impl Cx<'_> {
         self.types.kind(name)
     }
 
-    fn module(&mut self, module: &Module, parent: &[String]) {
-        if module.name.trim().is_empty() {
-            self.push(parent, ValidationError::NoModuleName);
-            return;
-        }
-        if !is_valid_identifier(&module.name) {
-            self.push(
-                parent,
-                ValidationError::InvalidModuleName {
-                    name: module.name.clone(),
-                    reason: IDENTIFIER_RULE,
-                },
-            );
-        } else if RESERVED.contains(&module.name.as_str()) {
-            self.push(
-                parent,
-                ValidationError::InvalidModuleName {
-                    name: module.name.clone(),
-                    reason: "reserved word",
-                },
-            );
-        }
-        let scope = within(parent, &[&module.name]);
-        let path = scope.join(".");
-
-        for f in &module.functions {
-            self.function(&scope, &path, &f.name, f);
-            self.callable_types(&within(&scope, &[&f.name]), &path, &f.name, f);
+    fn declarations(&mut self, api: &Api) {
+        let top: &[String] = &[];
+        for f in &api.functions {
+            self.function(top, &f.name, f);
+            self.callable_types(std::slice::from_ref(&f.name), &f.name, f);
         }
 
-        for s in &module.structs {
-            self.identifier(&scope, &s.name);
-            if s.fields.is_empty() {
+        for r in &api.records {
+            self.identifier(top, &r.name);
+            let decl = within(top, &[&r.name]);
+            if r.fields.is_empty() {
                 self.push(
-                    &scope,
-                    ValidationError::EmptyStruct {
-                        module: path.clone(),
-                        name: s.name.clone(),
+                    &decl,
+                    ValidationError::EmptyRecord {
+                        name: r.name.clone(),
                     },
                 );
             }
-            let decl = within(&scope, &[&s.name]);
             let mut names = BTreeSet::new();
-            for f in &s.fields {
+            for f in &r.fields {
                 self.identifier(&decl, &f.name);
                 if !names.insert(&f.name) {
                     self.push(
                         &decl,
-                        ValidationError::DuplicateStructField {
-                            struct_name: s.name.clone(),
+                        ValidationError::DuplicateRecordField {
+                            record: r.name.clone(),
                             field: f.name.clone(),
                         },
                     );
                 }
-                let location = || format!("field '{}' of struct '{}'", f.name, s.name);
+                let location = || format!("field '{}' of record '{}'", f.name, r.name);
                 self.buffered_field(&decl, f, &location);
             }
         }
 
-        for e in &module.enums {
-            self.identifier(&scope, &e.name);
+        for e in &api.enums {
+            self.identifier(top, &e.name);
+            let decl = within(top, &[&e.name]);
             if e.variants.is_empty() {
                 self.push(
-                    &scope,
+                    &decl,
                     ValidationError::EmptyEnum {
-                        module: path.clone(),
                         name: e.name.clone(),
                     },
                 );
             }
-            let decl = within(&scope, &[&e.name]);
             let mut names = BTreeSet::new();
             let mut values = BTreeSet::new();
-            for v in &e.variants {
+            for (v, value) in e.variants.iter().zip(e.values()) {
                 self.identifier(&decl, &v.name);
                 if !names.insert(&v.name) {
                     self.push(
@@ -292,12 +281,12 @@ impl Cx<'_> {
                         },
                     );
                 }
-                if !values.insert(v.value) {
+                if !values.insert(value) {
                     self.push(
-                        &scope,
+                        &decl,
                         ValidationError::DuplicateEnumValue {
                             enum_name: e.name.clone(),
-                            value: v.value,
+                            value,
                         },
                     );
                 }
@@ -322,31 +311,18 @@ impl Cx<'_> {
             }
         }
 
-        for i in &module.interfaces {
-            self.identifier(&scope, &i.name);
-            self.interface(&scope, &path, i);
+        for i in &api.interfaces {
+            self.identifier(top, &i.name);
+            self.interface(i);
         }
 
-        for cb in &module.callback_interfaces {
-            self.identifier(&scope, &cb.name);
-            self.callback_interface(&scope, &path, cb);
+        for cb in &api.callbacks {
+            self.identifier(top, &cb.name);
+            self.callback_interface(cb);
         }
 
-        for domain in &module.errors {
-            self.error_domain(&scope, &path, domain);
-        }
-
-        let mut names = BTreeSet::new();
-        for sub in &module.modules {
-            if !names.insert(sub.name.as_str()) {
-                self.push(
-                    &within(&scope, &[&sub.name]),
-                    ValidationError::DuplicateModuleName {
-                        module: format!("{path}.{}", sub.name),
-                    },
-                );
-            }
-            self.module(sub, &scope);
+        for domain in &api.errors {
+            self.error_domain(domain);
         }
     }
 
@@ -354,7 +330,7 @@ impl Cx<'_> {
     /// serialized inside a value buffer, so it obeys the buffered positional
     /// rules: no iterators, no callback interfaces, no interface map keys,
     /// and every reference must resolve.
-    fn buffered_field(&mut self, scope: &[String], f: &StructField, location: &dyn Fn() -> String) {
+    fn buffered_field(&mut self, scope: &[String], f: &Field, location: &dyn Fn() -> String) {
         let scope = within(scope, &[&f.name]);
         if contains_iterator(&f.ty) {
             self.push(
@@ -369,21 +345,18 @@ impl Cx<'_> {
         self.no_callback_interface(&scope, &f.ty, location);
     }
 
-    /// Validate an interface's shape: unique member names across
-    /// constructors, methods, and statics; constructor restrictions;
-    /// per-member signature rules. C symbol collisions are checked API-wide
-    /// once the model is built.
-    fn interface(&mut self, scope: &[String], path: &str, iface: &InterfaceDef) {
+    /// Validate an interface's shape: at least one member, unique member
+    /// names, constructor restrictions, and per-member signature rules.
+    fn interface(&mut self, iface: &InterfaceDef) {
+        let decl = vec![iface.name.clone()];
         if iface.constructors.is_empty() && iface.methods.is_empty() && iface.statics.is_empty() {
             self.push(
-                scope,
+                &decl,
                 ValidationError::EmptyInterface {
-                    module: path.to_string(),
                     name: iface.name.clone(),
                 },
             );
         }
-        let decl = within(scope, &[&iface.name]);
         let mut names = BTreeSet::new();
         for (f, constructor) in iface.constructors.iter().map(|c| (c, true)).chain(
             iface
@@ -402,8 +375,8 @@ impl Cx<'_> {
                 );
             }
             let display = format!("{}.{}", iface.name, f.name);
-            self.function(&decl, path, &display, f);
-            self.callable_types(&within(&decl, &[&f.name]), path, &display, f);
+            self.function(&decl, &display, f);
+            self.callable_types(&within(&decl, &[&f.name]), &display, f);
             if constructor && f.returns.is_some() {
                 self.push(
                     &decl,
@@ -428,20 +401,19 @@ impl Cx<'_> {
     /// Validate a callback interface: at least one method, unique method
     /// names, and per-method restrictions. A callback method is implemented
     /// by the consumer, so it is synchronous, never takes a cancel token,
-    /// returns nothing or any value but an iterator or a callback interface,
-    /// takes no callback interface or iterator as a parameter, and may
-    /// throw only an error domain that exists (or `any`).
-    fn callback_interface(&mut self, scope: &[String], path: &str, cb: &CallbackInterfaceDef) {
+    /// returns nothing or any value, takes no callback interface or
+    /// iterator as a parameter, and may throw only an existing domain (or
+    /// `any`).
+    fn callback_interface(&mut self, cb: &CallbackDef) {
+        let decl = vec![cb.name.clone()];
         if cb.methods.is_empty() {
             self.push(
-                scope,
+                &decl,
                 ValidationError::EmptyCallbackInterface {
-                    module: path.to_string(),
                     name: cb.name.clone(),
                 },
             );
         }
-        let decl = within(scope, &[&cb.name]);
         let mut names = BTreeSet::new();
         for m in &cb.methods {
             self.identifier(&decl, &m.name);
@@ -470,10 +442,11 @@ impl Cx<'_> {
             if m.cancellable {
                 reject(self, "cannot be cancellable");
             }
+            let display = format!("{}.{}", cb.name, m.name);
             let method = within(&decl, &[&m.name]);
-            self.throws(&method, path, &format!("{}.{}", cb.name, m.name), m);
+            self.throws(&method, &display, m);
             if let Some(ret) = &m.returns {
-                let location = || format!("return type of {path}::{}.{}", cb.name, m.name);
+                let location = || format!("return type of {display}");
                 if contains_iterator(ret) {
                     reject(self, "cannot return an iterator");
                 }
@@ -481,24 +454,13 @@ impl Cx<'_> {
                 self.interface_positions(&method, ret, &location);
                 self.no_callback_interface(&method, ret, &location);
             }
-            let mut params = BTreeSet::new();
+            self.params(&method, &display, m);
             for p in &m.params {
-                self.identifier(&method, &p.name);
-                if !params.insert(&p.name) {
-                    self.push(
-                        &method,
-                        ValidationError::DuplicateParamName {
-                            module: path.to_string(),
-                            function: format!("{}.{}", cb.name, m.name),
-                            param: p.name.clone(),
-                        },
-                    );
-                }
                 let param = within(&method, &[&p.name]);
                 let location = || {
                     format!(
-                        "param '{}' of callback interface method '{}.{}'",
-                        p.name, cb.name, m.name
+                        "param '{}' of callback interface method '{display}'",
+                        p.name
                     )
                 };
                 if contains_iterator(&p.ty) {
@@ -516,47 +478,57 @@ impl Cx<'_> {
         }
     }
 
-    /// Name-level checks for one callable declared in `scope`: a valid
-    /// identifier, unique parameter names, and an existing error domain when
-    /// the callable throws one.
-    fn function(&mut self, scope: &[String], path: &str, display: &str, f: &Function) {
-        self.identifier(scope, &f.name);
-        let decl = within(scope, &[&f.name]);
-        if f.cancellable && !f.r#async {
-            self.push(
-                &decl,
-                ValidationError::CancellableNotAsync {
-                    module: path.to_string(),
-                    function: display.to_string(),
-                },
-            );
-        }
-        self.throws(&decl, path, display, f);
+    /// Valid, unique, slot-free parameter names.
+    fn params(&mut self, decl: &[String], display: &str, f: &Function) {
         let mut names = BTreeSet::new();
         for p in &f.params {
-            self.identifier(&decl, &p.name);
+            self.identifier(decl, &p.name);
             if !names.insert(&p.name) {
                 self.push(
-                    &decl,
+                    decl,
                     ValidationError::DuplicateParamName {
-                        module: path.to_string(),
                         function: display.to_string(),
                         param: p.name.clone(),
+                    },
+                );
+            }
+            if ABI_SLOTS.contains(&p.name.as_str()) {
+                self.push(
+                    decl,
+                    ValidationError::SlotCollision {
+                        function: display.to_string(),
+                        slot: p.name.clone(),
                     },
                 );
             }
         }
     }
 
-    /// Check that a callable's `throws` names an error domain (declared in
-    /// any module; domain names are global) or is `any`.
-    fn throws(&mut self, scope: &[String], path: &str, display: &str, f: &Function) {
+    /// Name-level checks for one callable declared in `scope`: a valid
+    /// identifier, valid parameter names, and an existing error domain when
+    /// the callable throws one.
+    fn function(&mut self, scope: &[String], display: &str, f: &Function) {
+        self.identifier(scope, &f.name);
+        let decl = within(scope, &[&f.name]);
+        if f.cancellable && !f.r#async {
+            self.push(
+                &decl,
+                ValidationError::CancellableNotAsync {
+                    function: display.to_string(),
+                },
+            );
+        }
+        self.throws(&decl, display, f);
+        self.params(&decl, display, f);
+    }
+
+    /// Check that a callable's `throws` names an error domain or is `any`.
+    fn throws(&mut self, scope: &[String], display: &str, f: &Function) {
         if let Some(Throws::Domain(domain)) = &f.throws {
             if self.kind(domain) != Some(TypeKind::ErrorDomain) {
                 self.push(
                     scope,
                     ValidationError::UnknownErrorDomain {
-                        module: path.to_string(),
                         function: display.to_string(),
                         domain: domain.clone(),
                     },
@@ -569,10 +541,10 @@ impl Cx<'_> {
     /// positions, async-iterator exclusion, reference resolution, element
     /// shapes, interface map keys, and callback-interface positions. `scope`
     /// ends with the callable's own name.
-    fn callable_types(&mut self, scope: &[String], path: &str, display: &str, f: &Function) {
+    fn callable_types(&mut self, scope: &[String], display: &str, f: &Function) {
         for p in &f.params {
             let param = within(scope, &[&p.name]);
-            let location = || format!("param '{}' of function '{path}::{display}'", p.name);
+            let location = || format!("param '{}' of function '{display}'", p.name);
             if contains_iterator(&p.ty) {
                 self.push(
                     &param,
@@ -596,23 +568,16 @@ impl Cx<'_> {
             }
         }
         if let Some(ret) = &f.returns {
-            let location = || format!("return type of {path}::{display}");
-            // An async function completes through a one-shot callback; an
-            // iterator needs a pull-based handle. The two shapes cannot
-            // compose on the C ABI, so reject the combination up front
-            // instead of letting backends lower it inconsistently.
+            let location = || format!("return type of {display}");
             if f.r#async && contains_iterator(ret) {
                 self.push(
                     scope,
                     ValidationError::AsyncIteratorReturn {
-                        module: path.to_string(),
                         function: display.to_string(),
                     },
                 );
             }
-            // An iterator is a pull handle, valid only as the outermost
-            // return shape: `[iter<T>]`, `iter<T>?`, `iter<iter<T>>`, and
-            // iterators inside a map have no lowering.
+            // An iterator is valid only as the outermost return shape.
             let nested_iterator = match ret {
                 TypeRef::Iterator(elem) => contains_iterator(elem),
                 other => contains_iterator(other),
@@ -632,10 +597,8 @@ impl Cx<'_> {
     }
 
     /// Enforce the one place an interface reference may not appear: as a
-    /// map key. Objects are reference-counted tokens, so they compose with
-    /// every other buffered shape (fields, elements, map values, optionals),
-    /// but no target can hash an object by identity in a way that survives
-    /// the ABI.
+    /// map key. No target can hash an object by identity in a way that
+    /// survives the ABI.
     fn interface_positions(
         &mut self,
         scope: &[String],
@@ -667,12 +630,7 @@ impl Cx<'_> {
     /// or through a record or rich enum. Error domains are open: a consumer
     /// generated before the code existed discards its payload undecoded, so
     /// an object token inside it would never be released.
-    fn no_object_in_payload(
-        &mut self,
-        scope: &[String],
-        f: &StructField,
-        location: &dyn Fn() -> String,
-    ) {
+    fn no_object_in_payload(&mut self, scope: &[String], f: &Field, location: &dyn Fn() -> String) {
         let mut names = Vec::new();
         f.ty.walk(&mut |t| {
             if let TypeRef::Named(name) = t {
@@ -724,13 +682,9 @@ impl Cx<'_> {
     fn type_ref(&mut self, scope: &[String], ty: &TypeRef) {
         match ty {
             TypeRef::Named(name) => {
-                let error = if name.contains('.') {
-                    ValidationError::QualifiedTypeRef { name: name.clone() }
-                } else if self.kind(name) == Some(TypeKind::ErrorDomain) {
+                let error = if self.kind(name) == Some(TypeKind::ErrorDomain) {
                     ValidationError::ErrorDomainAsType { name: name.clone() }
-                } else if self.kind(name).is_some() || self.types.is_foreign(name) {
-                    // Declared here, or a record or rich enum from another
-                    // module tree the caller named explicitly.
+                } else if self.kind(name).is_some() {
                     return;
                 } else if UNSUPPORTED_PRIMITIVES.contains(&name.as_str()) {
                     ValidationError::UnsupportedPrimitive { name: name.clone() }
@@ -758,11 +712,9 @@ impl Cx<'_> {
         }
     }
 
-    /// May `ty` be a map key? Every target must be able to use the key in
-    /// its native dictionary idiom with exact equality, so only integers,
-    /// bools, strings, and C-style enums qualify; floats (NaN and signed zero
-    /// break key equality in several languages), composites, optionals,
-    /// bytes, and objects are rejected.
+    /// May `ty` be a map key? Only integers, bools, strings, and C-style
+    /// enums: every target must use the key in its native dictionary with
+    /// exact equality.
     fn is_map_key(&self, ty: &TypeRef) -> bool {
         match ty {
             TypeRef::Prim(p) => p.is_integer() || matches!(p, Prim::Bool | Prim::String),
@@ -771,40 +723,30 @@ impl Cx<'_> {
         }
     }
 
-    fn error_domain(&mut self, scope: &[String], path: &str, domain: &ErrorDomain) {
-        if domain.name.trim().is_empty() {
-            self.push(
-                scope,
-                ValidationError::ErrorDomainMissingName {
-                    module: path.to_string(),
-                },
-            );
-            return;
-        }
-        self.identifier(scope, &domain.name);
-        if domain.name == "any" {
+    fn error_domain(&mut self, domain: &ErrorDomain) {
+        let top: &[String] = &[];
+        self.identifier(top, &domain.name);
+        if domain.name == crate::ir::THROWS_ANY {
             // `throws: any` means an untyped error, so no domain can be
             // named `any`.
             self.push(
-                scope,
+                top,
                 ValidationError::ReservedKeyword {
                     name: domain.name.clone(),
                 },
             );
         }
-        let decl = within(scope, &[&domain.name]);
+        let decl = within(top, &[&domain.name]);
         let mut values = BTreeSet::new();
         for c in &domain.codes {
             self.identifier(&decl, &c.name);
             // 0 means success and the whole negative range is reserved for
-            // the runtime (-1 generic error, -2 panic, -3 marshalling
-            // failure, -4 foreign callback error, -5 cancelled, and room to
-            // grow), so domain codes must be positive.
+            // the runtime, so domain codes must be positive.
             if c.code <= 0 {
                 self.push(
                     &decl,
                     ValidationError::InvalidErrorCode {
-                        module: path.to_string(),
+                        domain: domain.name.clone(),
                         name: c.name.clone(),
                     },
                 );
@@ -813,7 +755,6 @@ impl Cx<'_> {
                 self.push(
                     &decl,
                     ValidationError::DuplicateErrorCode {
-                        module: path.to_string(),
                         domain: domain.name.clone(),
                         value: c.code,
                     },
@@ -823,7 +764,7 @@ impl Cx<'_> {
             for f in &c.fields {
                 let location = || {
                     format!(
-                        "payload field '{}' of error code '{}::{}'",
+                        "payload field '{}' of error code '{}.{}'",
                         f.name, domain.name, c.name
                     )
                 };
@@ -837,21 +778,15 @@ impl Cx<'_> {
 /// Every record and rich enum whose fields reach an interface object, directly
 /// or through other records and rich enums (a fixed point over the whole API,
 /// since types may reference each other in any order).
-fn object_carriers(modules: &[Module], types: &TypeIndex) -> BTreeSet<String> {
-    fn collect<'a>(modules: &'a [Module], out: &mut Vec<(&'a str, Vec<&'a TypeRef>)>) {
-        for m in modules {
-            for s in &m.structs {
-                out.push((&s.name, s.fields.iter().map(|f| &f.ty).collect()));
-            }
-            for e in &m.enums {
-                let fields = e.variants.iter().flat_map(|v| &v.fields);
-                out.push((&e.name, fields.map(|f| &f.ty).collect()));
-            }
-            collect(&m.modules, out);
-        }
+fn object_carriers(api: &Api, types: &TypeIndex) -> BTreeSet<String> {
+    let mut decls: Vec<(&str, Vec<&TypeRef>)> = Vec::new();
+    for r in &api.records {
+        decls.push((&r.name, r.fields.iter().map(|f| &f.ty).collect()));
     }
-    let mut decls = Vec::new();
-    collect(modules, &mut decls);
+    for e in &api.enums {
+        let fields = e.variants.iter().flat_map(|v| &v.fields);
+        decls.push((&e.name, fields.map(|f| &f.ty).collect()));
+    }
     let mut carriers = BTreeSet::new();
     loop {
         let before = carriers.len();

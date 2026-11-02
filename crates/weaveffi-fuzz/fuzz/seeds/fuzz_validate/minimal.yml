@@ -1,9 +1,7 @@
-version: "0.12.0"
-modules:
-  - name: m
-    functions:
-      - name: add
-        params:
-          - { name: a, type: i32 }
-          - { name: b, type: i32 }
-        return: i32
+version: "0.13.0"
+functions:
+  - name: add
+    params:
+      - { name: a, type: i32 }
+      - { name: b, type: i32 }
+    return: i32

@@ -11,6 +11,7 @@ use clap::builder::{PossibleValue, PossibleValuesParser};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use weaveffi_cli::commands::{self, extract::IdlFormat, Locate};
+use weaveffi_cli::config::CargoFeatures;
 use weaveffi_cli::targets::REGISTRY;
 use weaveffi_model::ir::CURRENT_SCHEMA_VERSION;
 
@@ -35,6 +36,8 @@ const DEV_PROFILE_HELP: &str =
 const RELEASE_PROFILE_HELP: &str =
     "The Cargo profile to build with (default: `[build] profile`, else release)";
 
+const WARN_HELP: &str = "Also report advisory lints (undocumented declarations, deep nesting)";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "weaveffi",
@@ -57,6 +60,34 @@ struct LocateArgs {
     /// Path to weaveffi.toml (default: the nearest one at or above the input)
     #[arg(long)]
     config: Option<String>,
+}
+
+/// The Cargo feature flags for building a Rust producer. Given any of them,
+/// they replace `[build] features`, `all_features`, and
+/// `no_default_features`.
+#[derive(Args, Debug)]
+struct FeatureArgs {
+    /// Comma-separated Cargo features to build the producer with
+    #[arg(short = 'F', long, value_delimiter = ',')]
+    features: Vec<String>,
+    /// Build the producer with every Cargo feature
+    #[arg(long)]
+    all_features: bool,
+    /// Build the producer without its default Cargo features
+    #[arg(long)]
+    no_default_features: bool,
+}
+
+impl FeatureArgs {
+    /// The flags as a feature set, or `None` when none was given.
+    fn get(&self) -> Option<CargoFeatures> {
+        let features = CargoFeatures {
+            features: self.features.clone(),
+            all_features: self.all_features,
+            no_default_features: self.no_default_features,
+        };
+        (!features.is_default()).then_some(features)
+    }
 }
 
 /// `--target`: registered target names, validated and listed by `clap`.
@@ -125,32 +156,23 @@ enum Commands {
         library: Option<String>,
         #[arg(long, value_name = "NAME", help = DEV_PROFILE_HELP)]
         profile: Option<String>,
-        /// Print advisory lints after validation
-        #[arg(long)]
+        #[command(flatten)]
+        features: FeatureArgs,
+        #[arg(long, help = WARN_HELP)]
         warn: bool,
         /// List the files the targets render, without writing
-        #[arg(long, conflicts_with_all = ["check", "diff"])]
+        #[arg(long, conflicts_with_all = ["check", "diff", "dev"])]
         dry_run: bool,
         /// Write nothing; list the files that would change and exit 1 if any would
-        #[arg(long)]
+        #[arg(long, conflicts_with = "dev")]
         check: bool,
         /// Write nothing; print a unified diff of what would change
-        #[arg(long)]
+        #[arg(long, conflicts_with = "dev")]
         diff: bool,
-    },
-    /// Build a Rust producer's library, generate, and point the bindings at it
-    Dev {
-        #[command(flatten)]
-        locate: LocateArgs,
-        #[command(flatten)]
-        targets: TargetArgs,
-        /// Output directory (default: `[project] out`, else ./bindings)
-        #[arg(short, long)]
-        out: Option<String>,
-        #[arg(long, help = LIBRARY_HELP)]
-        library: Option<String>,
-        #[arg(long, value_name = "NAME", help = DEV_PROFILE_HELP)]
-        profile: Option<String>,
+        /// Then point the generated packages at the Rust producer's library: copy it into
+        /// those that bundle one, and print how the others find it
+        #[arg(long)]
+        dev: bool,
     },
     /// Validate an API definition without generating anything
     Validate {
@@ -160,36 +182,28 @@ enum Commands {
         library: Option<String>,
         #[arg(long, value_name = "NAME", help = DEV_PROFILE_HELP)]
         profile: Option<String>,
-        /// Also report advisory lints
-        #[arg(long)]
+        #[command(flatten)]
+        features: FeatureArgs,
+        #[arg(long, help = WARN_HELP)]
         warn: bool,
         /// Output format
-        #[arg(long, value_enum, default_value_t = ReportFormat::Human)]
+        #[arg(short, long, value_enum, default_value_t = ReportFormat::Human)]
         format: ReportFormat,
     },
     /// Cross-compile the Rust producer per platform into target/weaveffi/<platform>/
     Build {
         #[command(flatten)]
         locate: LocateArgs,
-        /// Comma-separated targets whose C glue to prebuild (default: `[project] targets`,
-        /// else every target)
-        #[arg(
-            short,
-            long = "target",
-            value_name = "TARGETS",
-            value_delimiter = ',',
-            value_parser = target_names()
-        )]
-        targets: Option<Vec<String>>,
         #[arg(long, help = PLATFORMS_HELP)]
         platforms: Option<String>,
         #[arg(long, value_name = "NAME", help = RELEASE_PROFILE_HELP)]
         profile: Option<String>,
+        #[command(flatten)]
+        features: FeatureArgs,
         /// The producer crate's Cargo.toml (default: `[build] manifest`, else the input's crate)
         #[arg(long)]
         manifest_path: Option<String>,
-        /// Print advisory lints after validation
-        #[arg(long)]
+        #[arg(long, help = WARN_HELP)]
         warn: bool,
         /// Exit 1 when an artifact is skipped because a tool is missing
         #[arg(long)]
@@ -213,11 +227,12 @@ enum Commands {
         platforms: Option<String>,
         #[arg(long, value_name = "NAME", help = RELEASE_PROFILE_HELP)]
         profile: Option<String>,
+        #[command(flatten)]
+        features: FeatureArgs,
         /// The producer crate's Cargo.toml (default: `[build] manifest`, else the input's crate)
         #[arg(long)]
         manifest_path: Option<String>,
-        /// Print advisory lints after validation
-        #[arg(long)]
+        #[arg(long, help = WARN_HELP)]
         warn: bool,
         /// Exit 1 when an artifact is skipped because a tool is missing
         #[arg(long)]
@@ -231,9 +246,11 @@ enum Commands {
         library: Option<String>,
         #[arg(long, value_name = "NAME", help = DEV_PROFILE_HELP)]
         profile: Option<String>,
+        #[command(flatten)]
+        features: FeatureArgs,
         /// Output file (default: stdout)
         #[arg(short, long)]
-        output: Option<String>,
+        out: Option<String>,
         /// Output format
         #[arg(short, long, value_enum, default_value_t = IdlFormat::Yaml)]
         format: IdlFormat,
@@ -272,6 +289,7 @@ fn locate<'a>(
     args: &'a LocateArgs,
     library: Option<&'a String>,
     profile: Option<&'a String>,
+    features: Option<&'a CargoFeatures>,
     quiet: bool,
 ) -> Locate<'a> {
     Locate {
@@ -279,6 +297,7 @@ fn locate<'a>(
         config: args.config.as_deref(),
         library: library.map(String::as_str),
         profile: profile.map(String::as_str),
+        features,
         quiet,
     }
 }
@@ -299,53 +318,57 @@ fn run(command: Commands, quiet: bool) -> Result<ExitCode> {
             out,
             library,
             profile,
+            features,
             warn,
             dry_run,
             check,
             diff,
+            dev,
         } => commands::generate::cmd_generate(&commands::generate::GenerateArgs {
-            locate: locate(&l, library.as_ref(), profile.as_ref(), quiet),
+            locate: locate(
+                &l,
+                library.as_ref(),
+                profile.as_ref(),
+                features.get().as_ref(),
+                quiet,
+            ),
             out: out.as_deref(),
             targets: targets.targets.as_deref(),
             warn,
             dry_run,
             check,
             diff,
-        }),
-        Commands::Dev {
-            locate: l,
-            targets,
-            out,
-            library,
-            profile,
-        } => commands::dev::cmd_dev(&commands::dev::DevArgs {
-            locate: locate(&l, library.as_ref(), profile.as_ref(), quiet),
-            out: out.as_deref(),
-            targets: targets.targets.as_deref(),
+            dev,
         }),
         Commands::Validate {
             locate: l,
             library,
             profile,
+            features,
             warn,
             format,
         } => commands::validate::cmd_validate(
-            &locate(&l, library.as_ref(), profile.as_ref(), quiet),
+            &locate(
+                &l,
+                library.as_ref(),
+                profile.as_ref(),
+                features.get().as_ref(),
+                quiet,
+            ),
             warn,
             format == ReportFormat::Json,
         ),
         Commands::Build {
             locate: l,
-            targets,
             platforms,
             profile,
+            features,
             manifest_path,
             warn,
             strict,
         } => commands::build::cmd_build(&commands::build::BuildArgs {
-            locate: locate(&l, None, profile.as_ref(), quiet),
+            locate: locate(&l, None, profile.as_ref(), features.get().as_ref(), quiet),
             platforms: platforms.as_deref(),
-            targets: targets.as_deref(),
             manifest_path: manifest_path.as_deref(),
             warn,
             strict,
@@ -357,11 +380,12 @@ fn run(command: Commands, quiet: bool) -> Result<ExitCode> {
             binaries,
             platforms,
             profile,
+            features,
             manifest_path,
             warn,
             strict,
         } => commands::package::cmd_package(&commands::package::PackageArgs {
-            locate: locate(&l, None, profile.as_ref(), quiet),
+            locate: locate(&l, None, profile.as_ref(), features.get().as_ref(), quiet),
             out: out.as_deref(),
             targets: targets.targets.as_deref(),
             binaries: binaries.as_deref(),
@@ -374,11 +398,18 @@ fn run(command: Commands, quiet: bool) -> Result<ExitCode> {
             locate: l,
             library,
             profile,
-            output,
+            features,
+            out,
             format,
         } => commands::extract::cmd_extract(
-            &locate(&l, library.as_ref(), profile.as_ref(), quiet),
-            output.as_deref(),
+            &locate(
+                &l,
+                library.as_ref(),
+                profile.as_ref(),
+                features.get().as_ref(),
+                quiet,
+            ),
+            out.as_deref(),
             format,
         ),
         Commands::Schema { version, format } => cmd_schema(version, format),

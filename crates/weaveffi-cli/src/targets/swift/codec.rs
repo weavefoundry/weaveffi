@@ -11,7 +11,7 @@
 //! `WvObject`: an object token carrying one strong reference.
 
 use crate::codegen::CodeWriter;
-use weaveffi_model::model::{EnumBinding, StructBinding};
+use weaveffi_model::model::{EnumBinding, RecordBinding};
 
 use crate::targets::swift::types::{swift_ident, SwiftCtx};
 
@@ -36,14 +36,14 @@ pub(crate) fn render_c_enum_codec(w: &mut CodeWriter, e: &EnumBinding, ctx: &Swi
     if let Some(attr) = ctx.deprecated_attr(&e.deprecated) {
         w.line(attr);
     }
-    w.line(format!("extension {}: WvCEnum {{}}", ctx.ty_name(&e.name)));
+    w.line(format!("extension {}: WvCEnum {{}}", e.name));
     w.blank();
 }
 
 /// Render a record's conformance: its fields in declaration order.
-pub(crate) fn render_record_codec(w: &mut CodeWriter, s: &StructBinding, ctx: &SwiftCtx) {
-    let ty = ctx.ty_name(&s.name);
-    open_extension(w, &ty, "WvCodable", &s.deprecated, ctx);
+pub(crate) fn render_record_codec(w: &mut CodeWriter, s: &RecordBinding, ctx: &SwiftCtx) {
+    let ty = &s.name;
+    open_extension(w, ty, "WvCodable", &s.deprecated, ctx);
     w.scope(|w| {
         let reader = if s.fields.is_empty() { "_" } else { "r" };
         let args = s
@@ -77,8 +77,8 @@ pub(crate) fn render_record_codec(w: &mut CodeWriter, s: &StructBinding, ctx: &S
 /// variant's fields in order. Reading an undeclared tag is a malformed
 /// buffer.
 pub(crate) fn render_rich_enum_codec(w: &mut CodeWriter, e: &EnumBinding, ctx: &SwiftCtx) {
-    let ty = ctx.ty_name(&e.name);
-    open_extension(w, &ty, "WvCodable", &e.deprecated, ctx);
+    let ty = &e.name;
+    open_extension(w, ty, "WvCodable", &e.deprecated, ctx);
     w.scope(|w| {
         w.line(format!(
             "static func wvRead(_ r: inout WvReader) -> {ty} {{"

@@ -1,32 +1,31 @@
 //! Callable rendering: sync, async, and iterator-returning wrapper
-//! functions.
+//! functions, and the per-[`Crossing`] marshalling every position shares.
 //!
-//! How a value crosses is read from the model's passing contracts
-//! ([`ArgPass`], [`RetPass`], [`ResultPass`], [`ItemPass`]) and how a
-//! failure surfaces from its [`ErrorStrategy`]; this module only renders the
+//! In C ABI revision 6 every value crosses as one C value, so a value is
+//! marshalled the same way whether it's a parameter, a return, an async
+//! result, an iterator item, or a callback argument or return; only who owns
+//! a run differs (see [`crate::codegen::values`]). How a failure surfaces
+//! comes from the callable's [`ErrorStrategy`]; this module only renders the
 //! Swift spelling.
 
+use crate::codegen::values::{crossing, Crossing};
 use crate::codegen::CodeWriter;
 use crate::lang;
-use weaveffi_model::model::{AsyncBinding, FnBinding, IteratorBinding, ParamBinding};
-use weaveffi_model::plan::{ArgPass, ErrorStrategy, ItemPass, ResultPass, RetPass};
-use weaveffi_model::ty::{Prim, RetTy, Ty};
+use weaveffi_model::model::{
+    AsyncBinding, ErrorStrategy, FnBinding, IteratorBinding, ParamBinding,
+};
+use weaveffi_model::ty::{ParamTy, Ty};
 
 use crate::targets::swift::docs::emit_fn_doc;
 use crate::targets::swift::types::{callback_vtable_name, prim_swift_type, swift_ident, SwiftCtx};
 
 /// Locals a wrapper body declares next to its parameters. A parameter
 /// spelled like one keeps its argument label and gets a `_`-suffixed local
-/// name (`err err_: Int32`), so the body never confuses the two.
-const BODY_LOCALS: &[&str] = &[
-    "err",
-    "rv",
-    "outLen",
-    "outValue",
-    "token",
-    "context",
-    "continuation",
-];
+/// name (`err err_: Int32`), so the body never confuses the two. (The
+/// `{local}_run` and `{local}_cb` locals can't collide with another
+/// parameter's: a lowerCamelCase local never contains an underscore but a
+/// trailing escape.)
+const BODY_LOCALS: &[&str] = &["err", "rv", "token", "context", "continuation"];
 
 /// One parameter of a wrapper: its argument label and the local name the
 /// body uses (they differ only when the label is a body local).
@@ -67,6 +66,89 @@ pub(crate) fn swift_params(f: &FnBinding) -> Vec<Param<'_>> {
         .collect()
 }
 
+// MARK: Marshalling
+
+/// The runtime helper that lends a run-crossing value of `crossing` for one
+/// call, binding the run to the closure's parameter, or `None` for a value
+/// that crosses without one.
+fn lender(crossing: &Crossing) -> Option<&'static str> {
+    Some(match crossing {
+        Crossing::Utf8 => "wvWithUTF8",
+        Crossing::Bytes => "wvWithBytes",
+        Crossing::Slice(_) => "wvWithSlice",
+        Crossing::Buffer(_) => "wvWithEncoded",
+        _ => return None,
+    })
+}
+
+/// The C value of `value` (a Swift expression of the value's Swift type)
+/// for a position that doesn't take a run: a scalar as itself, an enum as
+/// its raw value, an optional scalar as its `{p}_opt_{prim}`, and an object
+/// as its pointer, `fresh` (a fresh strong reference, for a callback return)
+/// or borrowed (the wrapper's own, for a parameter).
+fn pass(crossing: &Crossing, value: &str, fresh: bool, ctx: &SwiftCtx) -> String {
+    match crossing {
+        Crossing::Scalar(_) => value.to_string(),
+        Crossing::Enum(_) => format!("{value}.rawValue"),
+        Crossing::OptScalar(_) => format!("{}(wv: {value})", ctx.c_value_type(crossing)),
+        Crossing::OptEnum(_) => {
+            format!("{}(wv: {value}?.rawValue)", ctx.c_value_type(crossing))
+        }
+        Crossing::Object { nullable, .. } => {
+            let q = if *nullable { "?" } else { "" };
+            let member = if fresh { "clonePtr()" } else { "ptr" };
+            format!("{value}{q}.{member}")
+        }
+        Crossing::Utf8 | Crossing::Bytes | Crossing::Slice(_) | Crossing::Buffer(_) => {
+            unreachable!("a run crosses through its lender")
+        }
+    }
+}
+
+/// The C value of `value` handed to the library as a callback method's
+/// return: runs are allocated with `{p}_alloc` and adopted by the library,
+/// and an object is a fresh strong reference.
+pub(crate) fn hand_back(ty: &Ty, value: &str, ctx: &SwiftCtx) -> String {
+    let c = crossing(ty);
+    let helper = match c {
+        Crossing::Utf8 => "wvHandOverString",
+        Crossing::Bytes => "wvHandOverBytes",
+        Crossing::Slice(_) => "wvHandOverSlice",
+        Crossing::Buffer(_) => "wvHandOverBuffer",
+        _ => return pass(&c, value, true, ctx),
+    };
+    format!("{helper}({value})")
+}
+
+/// The Swift value of type `ty` that the library handed over as the C value
+/// `raw`. An `owned` run (a return, async result, or iterator item) is
+/// released after it's copied; a borrowed one (a callback argument) is only
+/// copied. An object always moves one strong reference, which the new
+/// wrapper adopts.
+pub(crate) fn receive(ty: &Ty, raw: &str, owned: bool, ctx: &SwiftCtx) -> String {
+    let take = if owned { "wvTake" } else { "wvBorrow" };
+    match crossing(ty) {
+        Crossing::Scalar(_) => raw.to_string(),
+        Crossing::Enum(name) => format!("wvEnumCase({name}.self, {raw})"),
+        Crossing::OptScalar(_) => format!("{raw}.wvValue"),
+        Crossing::OptEnum(name) => format!("{raw}.wvValue.map {{ wvEnumCase({name}.self, $0) }}"),
+        Crossing::Utf8 => format!("{take}String({raw})"),
+        Crossing::Bytes => format!("{take}Bytes({raw})"),
+        Crossing::Slice(p) => format!("{take}Slice({raw}, as: {}.self)", prim_swift_type(p)),
+        Crossing::Buffer(ty) => format!("{take}Buffer({raw}, as: {}.self)", ctx.swift_type(ty)),
+        Crossing::Object {
+            interface,
+            nullable: true,
+        } => format!("{raw}.map {{ {interface}(ptr: $0) }}"),
+        Crossing::Object {
+            interface,
+            nullable: false,
+        } => format!("{interface}(ptr: wvNonNull({raw}))"),
+    }
+}
+
+// MARK: Errors
+
 /// How a wrapper reports a failure, from the callable's [`ErrorStrategy`]
 /// and cancellability.
 ///
@@ -87,10 +169,7 @@ impl ErrCtx {
     /// The error context of `f`.
     pub(crate) fn for_fn(f: &FnBinding, ctx: &SwiftCtx) -> Self {
         Self {
-            domain_type: f
-                .error
-                .domain()
-                .map(|d| ctx.ty_name(&ctx.model.error_domain(d).type_name)),
+            domain_type: f.error.domain().map(|d| ctx.domain_type(d)),
             error: f.error.clone(),
             cancellable: f.cancellable(),
         }
@@ -110,7 +189,7 @@ impl ErrCtx {
         }
     }
 
-    /// The statement a completion runs for its boxed error `err`: resume
+    /// The statements a completion runs for its boxed error `err`: resume
     /// the continuation by throwing, or stop the process.
     fn completion_failure(&self) -> Vec<String> {
         let take = match (&self.error, &self.domain_type) {
@@ -161,6 +240,8 @@ impl ErrCtx {
     }
 }
 
+// MARK: Wrappers
+
 /// Where a wrapper sits, which decides how it reaches its object and whether
 /// it runs the load-time checks.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -174,12 +255,14 @@ pub(crate) enum Receiver {
 }
 
 /// Render one wrapper for `f` (sync, async, or iterator-returning) named
-/// `swift_name`.
+/// `swift_name`. A free function is a top-level `func`; an interface
+/// member, a member of its class.
 pub(crate) fn render_callable(
     w: &mut CodeWriter,
     f: &FnBinding,
     swift_name: &str,
     receiver: Receiver,
+    member: bool,
     ctx: &SwiftCtx,
 ) {
     let err = ErrCtx::for_fn(f, ctx);
@@ -219,10 +302,10 @@ pub(crate) fn render_callable(
             .as_ref()
             .map(|t| format!(" -> {}", ctx.ret_type(t)))
             .unwrap_or_default();
-        let static_kw = if receiver == Receiver::Instance {
-            ""
-        } else {
+        let static_kw = if member && receiver == Receiver::Static {
             "static "
+        } else {
+            ""
         };
         w.line(format!(
             "public {static_kw}func {swift_name}({sig}){effects}{ret} {{"
@@ -240,178 +323,74 @@ pub(crate) fn render_callable(
     w.line("}");
 }
 
-/// The Swift spelling of the C type of a direct scalar or C-style enum
-/// (`Int32` for an enum, whose C type is an `int32_t` typedef), and its
-/// zero value.
-fn c_scalar(t: &Ty) -> (&'static str, &'static str) {
-    match t {
-        Ty::Prim(Prim::Bool) => ("Bool", "false"),
-        Ty::Prim(p) => (prim_swift_type(*p), "0"),
-        _ => ("Int32", "0"),
-    }
-}
-
-/// The value type inside an optional (`T` of `T?`).
-fn unwrap_optional(t: &Ty) -> &Ty {
-    match t {
-        Ty::Optional(inner) => inner,
-        other => other,
-    }
-}
-
-/// How a value the library hands over is received.
-pub(crate) enum Recv<'a> {
-    /// A scalar or C-style enum discriminant, by value.
-    Direct,
-    /// An optional scalar: the value and the expression saying it's present.
-    Opt(&'a str),
-    /// A typed array of `len` elements.
-    Slice,
-    /// UTF-8 bytes.
-    String,
-    /// Raw bytes.
-    Bytes,
-    /// A value buffer.
-    Buffer,
-    /// An object reference the wrapper adopts.
-    Object {
-        /// `true` for `I?`.
-        nullable: bool,
-        /// The interface's name.
-        interface: &'a str,
-    },
-}
-
-/// The Swift expression receiving a value of type `ty` that the library
-/// handed over in `raw` (and `len`): `owned` values (returns, async
-/// results, iterator elements) are released after copying, borrowed ones
-/// (callback arguments) are only copied. An object argument is always
-/// adopted.
-pub(crate) fn receive(
-    ty: &Ty,
-    recv: &Recv,
-    raw: &str,
-    len: &str,
-    owned: bool,
-    ctx: &SwiftCtx,
-) -> String {
-    let take = if owned { "wvTake" } else { "wvBorrow" };
-    match recv {
-        Recv::Direct => match ty {
-            Ty::Enum(name) => format!("wvEnumCase({}.self, {raw})", ctx.ty_name(name)),
-            _ => raw.to_string(),
-        },
-        Recv::Opt(has) => {
-            let value = receive(unwrap_optional(ty), &Recv::Direct, raw, len, owned, ctx);
-            format!("{has} ? {value} : nil")
-        }
-        Recv::Slice => format!("{take}Slice({raw}, {len})"),
-        Recv::String => format!("{take}String({raw}, {len})"),
-        Recv::Bytes => format!("{take}Bytes({raw}, {len})"),
-        Recv::Buffer => format!(
-            "{take}Buffer({raw}, {len}, as: {}.self)",
-            ctx.swift_type(ty)
-        ),
-        Recv::Object {
-            nullable,
-            interface,
-        } => {
-            let class = ctx.ty_name(interface);
-            if *nullable {
-                format!("{raw}.map {{ {class}(ptr: $0) }}")
-            } else {
-                format!("{class}(ptr: wvNonNull({raw}))")
-            }
-        }
-    }
-}
-
 /// The C arguments for `params`, after the receiver's object for an
-/// instance method.
-fn c_call_args(params: &[Param], self_arg: Option<&str>) -> Vec<String> {
-    let mut args: Vec<String> = self_arg.into_iter().map(str::to_string).collect();
+/// instance method: a run-crossing value as the run its lending closure
+/// binds (`{local}_run`), a callback interface as its staged argument struct
+/// (`{local}_cb`), and anything else as its C value.
+fn c_call_args(params: &[Param], receiver: Receiver, ctx: &SwiftCtx) -> Vec<String> {
+    let mut args = Vec::new();
+    if receiver == Receiver::Instance {
+        args.push("self.ptr".to_string());
+    }
     for p in params {
         let n = &p.local;
-        match &p.binding.pass {
-            ArgPass::Direct { .. } => match p.binding.ty.value() {
-                Some(Ty::Enum(_)) => args.push(format!("{n}.rawValue")),
-                _ => args.push(n.clone()),
-            },
-            ArgPass::OptDirect { inner, .. } => {
-                args.push(format!("{n} != nil"));
-                args.push(match inner {
-                    Ty::Enum(_) => format!("{n}?.rawValue ?? 0"),
-                    other => format!("{n} ?? {}", c_scalar(other).1),
-                });
-            }
-            ArgPass::Slice { .. }
-            | ArgPass::String { .. }
-            | ArgPass::Bytes { .. }
-            | ArgPass::Buffer { .. } => {
-                args.push(format!("{n}_ptr"));
-                args.push(format!("{n}_len"));
-            }
-            // The wrapper borrows its own reference for the call; Swift
-            // keeps every argument alive until the wrapper returns.
-            ArgPass::Object { nullable, .. } => {
-                args.push(if *nullable {
-                    format!("{n}?.ptr")
+        args.push(match &p.binding.ty {
+            ParamTy::Callback { .. } => format!("{n}_cb"),
+            ParamTy::Value(ty) => {
+                let c = crossing(ty);
+                if c.is_run() {
+                    format!("{n}_run")
                 } else {
-                    format!("{n}.ptr")
-                });
+                    // The wrapper borrows its own reference for the call;
+                    // Swift keeps every argument alive until it returns.
+                    pass(&c, n, false, ctx)
+                }
             }
-            ArgPass::Callback {
-                nullable,
-                interface,
-                ..
-            } => {
-                let vtable = format!("{}.shared.pointer", callback_vtable_name(interface));
-                args.push(format!("{n}_ctx"));
-                args.push(if *nullable {
-                    format!("{n} == nil ? nil : {vtable}")
-                } else {
-                    vtable
-                });
-            }
-        }
+        });
     }
     args
 }
 
 /// Emit the pre-call staging of callback parameters: each implementation is
-/// retained for the library, whose vtable `free` entry releases it (also
-/// when the call fails).
-fn render_arg_staging(w: &mut CodeWriter, params: &[Param]) {
+/// retained for the library behind the `{p}_{Cb}` argument struct, whose
+/// vtable's `free` entry releases it (also when the call fails). A `nil`
+/// optional callback is the zero struct, whose null vtable means none.
+fn render_arg_staging(w: &mut CodeWriter, params: &[Param], ctx: &SwiftCtx) {
     for p in params {
-        if let ArgPass::Callback { nullable, .. } = &p.binding.pass {
-            let n = &p.local;
-            if *nullable {
-                w.line(format!("let {n}_ctx = {n}.map {{ wvRetain($0) }}"));
-            } else {
-                w.line(format!("let {n}_ctx = wvRetain({n})"));
-            }
+        let ParamTy::Callback { name, nullable } = &p.binding.ty else {
+            continue;
+        };
+        let n = &p.local;
+        let tag = ctx.model.callback(name).c_tag.clone();
+        let vtable = format!("{}.shared.pointer", callback_vtable_name(name));
+        if *nullable {
+            w.line(format!(
+                "let {n}_cb = {n}.map {{ {tag}(ctx: wvRetain($0), vtable: {vtable}) }} ?? {tag}()"
+            ));
+        } else {
+            w.line(format!(
+                "let {n}_cb = {tag}(ctx: wvRetain({n}), vtable: {vtable})"
+            ));
         }
     }
 }
 
-/// Open the closures lending the storage of every string, bytes, typed
-/// array, and buffered parameter, binding `{local}_ptr`/`{local}_len`.
-/// `bind` prefixes the first opening line (`let rv: T = ` or nothing);
-/// nested ones return their inner value implicitly. Returns how many
-/// closures were opened.
+/// Open the closures lending every run-crossing parameter (a string, bytes,
+/// typed array, or value buffer), binding `{local}_run`. `bind` prefixes the
+/// first opening line (`let rv: T = ` or nothing); nested ones return their
+/// inner value implicitly. Returns how many closures were opened.
 fn open_lending_closures(w: &mut CodeWriter, params: &[Param], bind: &str) -> usize {
     let mut opened = 0;
     for p in params {
-        let n = &p.local;
-        let open = match &p.binding.pass {
-            ArgPass::String { .. } => format!("wvWithUTF8({n})"),
-            ArgPass::Bytes { .. } => format!("wvWithBytes({n})"),
-            ArgPass::Slice { .. } => format!("wvWithSlice({n})"),
-            ArgPass::Buffer { .. } => format!("wvWithEncoded({n})"),
-            _ => continue,
+        let Some(ty) = p.binding.ty.value() else {
+            continue;
         };
+        let Some(lend) = lender(&crossing(ty)) else {
+            continue;
+        };
+        let n = &p.local;
         let prefix = if opened == 0 { bind } else { "" };
-        w.line(format!("{prefix}{open} {{ {n}_ptr, {n}_len in"));
+        w.line(format!("{prefix}{lend}({n}) {{ {n}_run in"));
         w.indent();
         opened += 1;
     }
@@ -426,22 +405,14 @@ fn close_closures(w: &mut CodeWriter, n: usize) {
     }
 }
 
-/// The Swift type of the raw C result of a synchronous call, which
-/// annotates its binding when the call sits inside lending closures.
-fn raw_return_swift(f: &FnBinding) -> Option<String> {
-    let ret = f.ret.as_ref().map(RetTy::elem);
-    Some(match &f.ret_pass {
-        RetPass::Void => return None,
-        RetPass::Direct => c_scalar(ret?).0.to_string(),
-        RetPass::OptDirect { .. } => "Bool".to_string(),
-        RetPass::Slice { elem, .. } => {
-            format!("UnsafeMutablePointer<{}>?", prim_swift_type(*elem))
-        }
-        RetPass::String { .. } | RetPass::Bytes { .. } | RetPass::Buffer { .. } => {
-            "UnsafePointer<UInt8>?".to_string()
-        }
-        RetPass::Object { .. } | RetPass::Iterator(_) => "OpaquePointer?".to_string(),
-    })
+/// The Swift type of the raw C result of a synchronous call (the one C
+/// value of its return, or the iterator handle), which annotates its
+/// binding when the call sits inside lending closures.
+fn raw_return_swift(f: &FnBinding, ctx: &SwiftCtx) -> Option<String> {
+    if f.iterator().is_some() {
+        return Some("OpaquePointer?".to_string());
+    }
+    f.ret_value().map(|ty| ctx.c_value_type(&crossing(ty)))
 }
 
 /// Render the body of a synchronous (or iterator-returning) callable: the
@@ -456,31 +427,12 @@ fn render_sync_body(
     ctx: &SwiftCtx,
 ) {
     w.line("var err = WvError()");
-    render_arg_staging(w, params);
-    let ret = f.ret.as_ref().map(RetTy::elem);
-    let mut args = c_call_args(
-        params,
-        (receiver == Receiver::Instance).then_some("self.ptr"),
-    );
-    match &f.ret_pass {
-        RetPass::Slice { .. }
-        | RetPass::String { .. }
-        | RetPass::Bytes { .. }
-        | RetPass::Buffer { .. } => {
-            w.line("var outLen = 0");
-            args.push("&outLen".to_string());
-        }
-        RetPass::OptDirect { .. } => {
-            let (ty, zero) = c_scalar(unwrap_optional(ret.expect("an optional return")));
-            w.line(format!("var outValue: {ty} = {zero}"));
-            args.push("&outValue".to_string());
-        }
-        _ => {}
-    }
+    render_arg_staging(w, params, ctx);
+    let mut args = c_call_args(params, receiver, ctx);
     args.push("&err".to_string());
     let call = format!("{}({})", f.abi.symbol, args.join(", "));
 
-    let raw = raw_return_swift(f);
+    let raw = raw_return_swift(f, ctx);
     let bind = raw
         .as_ref()
         .map(|t| format!("let rv: {t} = "))
@@ -498,61 +450,19 @@ fn render_sync_body(
     }
     w.line(err.check_stmt());
 
-    let value = match &f.ret_pass {
-        RetPass::Void => return,
-        // The constructor adopts the returned reference as its own.
-        _ if receiver == Receiver::Init => {
-            w.line("self.ptr = wvNonNull(rv)");
-            return;
-        }
-        RetPass::Iterator(it) => {
-            render_sequence(w, it, err, ctx);
-            return;
-        }
-        RetPass::Direct => receive(
-            ret.expect("a direct return"),
-            &Recv::Direct,
-            "rv",
-            "",
-            true,
-            ctx,
-        ),
-        RetPass::OptDirect { .. } => receive(
-            ret.expect("an optional return"),
-            &Recv::Opt("rv"),
-            "outValue",
-            "",
-            true,
-            ctx,
-        ),
-        RetPass::Slice { .. } => "wvTakeSlice(rv, outLen)".to_string(),
-        RetPass::String { .. } => "wvTakeString(rv, outLen)".to_string(),
-        RetPass::Bytes { .. } => "wvTakeBytes(rv, outLen)".to_string(),
-        RetPass::Buffer { .. } => receive(
-            ret.expect("a buffered return"),
-            &Recv::Buffer,
-            "rv",
-            "outLen",
-            true,
-            ctx,
-        ),
-        RetPass::Object {
-            nullable,
-            interface,
-            ..
-        } => receive(
-            ret.expect("an object return"),
-            &Recv::Object {
-                nullable: *nullable,
-                interface,
-            },
-            "rv",
-            "",
-            true,
-            ctx,
-        ),
+    if let Some(it) = f.iterator() {
+        render_sequence(w, it, err, ctx);
+        return;
+    }
+    let Some(ty) = f.ret_value() else {
+        return;
     };
-    w.line(format!("return {value}"));
+    if receiver == Receiver::Init {
+        // The constructor adopts the returned reference as its own.
+        w.line("self.ptr = wvNonNull(rv)");
+        return;
+    }
+    w.line(format!("return {}", receive(ty, "rv", true, ctx)));
 }
 
 /// Return the `NativeSequence` over the iterator handle in `rv`: its pull
@@ -560,57 +470,11 @@ fn render_sync_body(
 /// return of the same type.
 fn render_sequence(w: &mut CodeWriter, it: &IteratorBinding, err: &ErrCtx, ctx: &SwiftCtx) {
     let elem = &it.elem;
-    let mut decls = Vec::new();
-    let (args, recv, len) = match &it.item {
-        ItemPass::Direct { .. } => {
-            let (ty, zero) = c_scalar(elem);
-            decls.push(format!("var item: {ty} = {zero}"));
-            ("&item", Recv::Direct, "")
-        }
-        ItemPass::OptDirect { .. } => {
-            let (ty, zero) = c_scalar(unwrap_optional(elem));
-            decls.push("var hasItem = false".to_string());
-            decls.push(format!("var item: {ty} = {zero}"));
-            ("&hasItem, &item", Recv::Opt("hasItem"), "")
-        }
-        ItemPass::Slice { elem: prim, .. } => {
-            decls.push(format!(
-                "var item: UnsafeMutablePointer<{}>? = nil",
-                prim_swift_type(*prim)
-            ));
-            decls.push("var itemLen = 0".to_string());
-            ("&item, &itemLen", Recv::Slice, "itemLen")
-        }
-        ItemPass::String { .. } | ItemPass::Bytes { .. } | ItemPass::Buffer { .. } => {
-            decls.push("var item: UnsafePointer<UInt8>? = nil".to_string());
-            decls.push("var itemLen = 0".to_string());
-            let recv = match &it.item {
-                ItemPass::String { .. } => Recv::String,
-                ItemPass::Bytes { .. } => Recv::Bytes,
-                _ => Recv::Buffer,
-            };
-            ("&item, &itemLen", recv, "itemLen")
-        }
-        ItemPass::Object {
-            nullable,
-            interface,
-            ..
-        } => {
-            decls.push("var item: OpaquePointer? = nil".to_string());
-            (
-                "&item",
-                Recv::Object {
-                    nullable: *nullable,
-                    interface,
-                },
-                "",
-            )
-        }
-    };
-    let mut value = receive(elem, &recv, "item", len, true, ctx);
+    let c = crossing(elem);
+    let mut value = receive(elem, "item", true, ctx);
     // An optional element must stay distinguishable from the end of the
     // stream (`nil`).
-    if matches!(recv, Recv::Opt(_) | Recv::Object { nullable: true, .. }) {
+    if matches!(elem, Ty::Optional(_)) {
         value = format!(".some({value})");
     }
     w.line(format!(
@@ -619,75 +483,18 @@ fn render_sequence(w: &mut CodeWriter, it: &IteratorBinding, err: &ErrCtx, ctx: 
         err.sequence_failure()
     ));
     w.scope(|w| {
-        for d in &decls {
-            w.line(d);
-        }
         w.line(format!(
-            "guard {}(handle, {args}, err) != 0 else {{ return nil }}",
+            "var item: {} = {}",
+            ctx.c_value_type(&c),
+            ctx.c_zero(&c)
+        ));
+        w.line(format!(
+            "guard {}(handle, &item, err) != 0 else {{ return nil }}",
             it.next.symbol
         ));
         w.line(format!("return {value}"));
     });
     w.line("}");
-}
-
-/// The completion closure's formals and the expression receiving its
-/// result, per the async result's [`ResultPass`].
-fn completion_shape(f: &FnBinding, binding: &AsyncBinding, ctx: &SwiftCtx) -> (String, String) {
-    let formals = binding
-        .callback_params
-        .iter()
-        .map(|p| lang::escape_ident(&p.name, lang::SWIFT_KEYWORDS))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let ret = f.ret.as_ref().map(RetTy::elem);
-    let value = match &binding.result {
-        ResultPass::Void => "()".to_string(),
-        ResultPass::Direct { result } => receive(
-            ret.expect("a direct result"),
-            &Recv::Direct,
-            &result.name,
-            "",
-            true,
-            ctx,
-        ),
-        ResultPass::OptDirect { has, value } => receive(
-            ret.expect("an optional result"),
-            &Recv::Opt(&has.name),
-            &value.name,
-            "",
-            true,
-            ctx,
-        ),
-        ResultPass::Slice { ptr, len, .. } => format!("wvTakeSlice({}, {})", ptr.name, len.name),
-        ResultPass::String { ptr, len } => format!("wvTakeString({}, {})", ptr.name, len.name),
-        ResultPass::Bytes { ptr, len } => format!("wvTakeBytes({}, {})", ptr.name, len.name),
-        ResultPass::Buffer { ptr, len } => receive(
-            ret.expect("a buffered result"),
-            &Recv::Buffer,
-            &ptr.name,
-            &len.name,
-            true,
-            ctx,
-        ),
-        ResultPass::Object {
-            result,
-            nullable,
-            interface,
-            ..
-        } => receive(
-            ret.expect("an object result"),
-            &Recv::Object {
-                nullable: *nullable,
-                interface,
-            },
-            &result.name,
-            "",
-            true,
-            ctx,
-        ),
-    };
-    (formals, value)
 }
 
 /// Render the body of an async callable: a checked continuation resumed
@@ -707,7 +514,7 @@ fn render_async_body(
         .as_ref()
         .map_or_else(|| "Void".to_string(), |t| ctx.ret_type(t));
     let err_ty = if err.throws() { "Error" } else { "Never" };
-    let cancellable = binding.cancellable();
+    let cancellable = binding.cancellable;
 
     if cancellable {
         w.line("let token = WvCancelToken()");
@@ -728,18 +535,18 @@ fn render_async_body(
 
     // The library copies or retains every input during the launch, so
     // lending them for the launch call's duration is enough.
-    render_arg_staging(w, params);
+    render_arg_staging(w, params, ctx);
     w.line("let context = Unmanaged.passRetained(WvContinuation(continuation)).toOpaque()");
     let opened = open_lending_closures(w, params, "");
 
-    let mut args = c_call_args(
-        params,
-        (receiver == Receiver::Instance).then_some("self.ptr"),
-    );
+    let mut args = c_call_args(params, receiver, ctx);
     if cancellable {
         args.push("token.raw".to_string());
     }
-    let (formals, value) = completion_shape(f, binding, ctx);
+    let (formals, value) = match f.ret_value() {
+        Some(ty) => ("context, err, result", receive(ty, "result", true, ctx)),
+        None => ("context, err", "()".to_string()),
+    };
     let mut launch = args.join(", ");
     if !launch.is_empty() {
         launch.push_str(", ");

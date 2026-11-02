@@ -35,9 +35,8 @@ impl<'a> DocNames<'a> {
     /// Index the identifiers of `model`, spelled per `go`.
     pub(crate) fn new(model: &Model, go: &'a GoNames) -> Self {
         let variants = model
-            .modules
+            .enums
             .iter()
-            .flat_map(|m| &m.enums)
             .flat_map(|e| {
                 e.variants.iter().map(move |v| {
                     (
@@ -56,8 +55,8 @@ impl<'a> DocNames<'a> {
 
     /// The Go replacement for a backticked identifier, backticks included:
     /// a doc link for a package-level name or method, the plain Go spelling
-    /// for a field or parameter, and `None` (kept as written) for a module
-    /// or an identifier that names declarations of different kinds.
+    /// for a field or parameter, and `None` (kept as written) for an
+    /// identifier that names declarations of different kinds.
     fn replace(&self, ident: &str) -> Option<String> {
         let link = |s: &str| Some(format!("[{s}]"));
         match self.api.kind(ident)? {
@@ -70,7 +69,6 @@ impl<'a> DocNames<'a> {
             IdentKind::Variant => link(self.variants.get(self.api.c_name(ident)?)?),
             IdentKind::Field | IdentKind::CallbackMethod => Some(pascal(ident)),
             IdentKind::Param => Some(method_param(ident)),
-            IdentKind::Module => None,
         }
     }
 
@@ -226,25 +224,23 @@ mod tests {
     fn backticked_identifiers_become_links_or_go_spellings() {
         let model = test_model(
             r#"
-version: "0.12.0"
-modules:
-  - name: kv
-    errors:
-      - name: KvErrors
-        codes: [{ name: not_found, code: 1, message: missing }]
-    enums:
-      - name: Mode
-        variants: [{ name: fast, value: 0 }]
-    structs:
-      - name: Entry
-        fields: [{ name: expires_at, type: i64 }]
-    interfaces:
-      - name: Store
-        constructors: [{ name: open, params: [] }]
-        methods:
-          - { name: get_all, params: [{ name: ttl_seconds, type: i64 }] }
-    functions:
-      - { name: new_op, params: [] }
+version: "0.13.0"
+errors:
+  - name: KvErrors
+    codes: [{ name: not_found, code: 1, message: missing }]
+enums:
+  - name: Mode
+    variants: [{ name: fast, value: 0 }]
+records:
+  - name: Entry
+    fields: [{ name: expires_at, type: i64 }]
+interfaces:
+  - name: Store
+    constructors: [{ name: open, params: [] }]
+    methods:
+      - { name: get_all, params: [{ name: ttl_seconds, type: i64 }] }
+functions:
+  - { name: new_op, params: [] }
 "#,
         );
         let go = GoNames::new(&model);

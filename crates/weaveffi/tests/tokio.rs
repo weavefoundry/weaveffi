@@ -10,21 +10,24 @@ use std::os::raw::c_void;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use weaveffi::abi::{self, FfiError};
+use weaveffi::__rt::{self as abi, FfiError, Run};
 
-#[weaveffi::module]
-pub mod timers {
-    /// Sleep on a Tokio timer, then report the runtime thread's name.
-    #[weaveffi::export]
-    pub async fn nap(ms: u64) -> String {
-        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-        std::thread::current().name().unwrap_or("").to_string()
-    }
+/// Sleep on a Tokio timer, then report the runtime thread's name.
+#[weaveffi::export]
+pub async fn nap(ms: u64) -> String {
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    std::thread::current().name().unwrap_or("").to_string()
 }
 
 weaveffi::export_runtime!();
 
-extern "C" fn done(ctx: *mut c_void, err: *mut FfiError, ptr: *const u8, len: usize) {
+type Done = extern "C" fn(*mut c_void, *mut FfiError, Run);
+
+unsafe extern "C" {
+    fn tokio_nap(ms: u64, callback: Option<Done>, context: *mut c_void);
+}
+
+extern "C" fn done(ctx: *mut c_void, err: *mut FfiError, name: Run) {
     // Clone the sender before sending: the test may free the context as soon
     // as the value arrives, which can be before `send` returns.
     let tx = unsafe { &*ctx.cast::<mpsc::Sender<(i32, String)>>() }.clone();
@@ -35,15 +38,15 @@ extern "C" fn done(ctx: *mut c_void, err: *mut FfiError, ptr: *const u8, len: us
         unsafe { abi::error_free(err) };
         code
     };
-    let name = unsafe { abi::lift_string(ptr, len) }.unwrap_or_default();
-    unsafe { abi::free_bytes(ptr.cast_mut(), len) };
-    tx.send((code, name)).unwrap();
+    let text = unsafe { name.text() }.unwrap_or_default().to_string();
+    unsafe { name.free() };
+    tx.send((code, text)).unwrap();
 }
 
-fn nap(ms: u64) -> (i32, String) {
+fn call_nap(ms: u64) -> (i32, String) {
     let (tx, rx) = mpsc::channel::<(i32, String)>();
     let ctx: *mut c_void = Box::into_raw(Box::new(tx)).cast();
-    unsafe { timers::tokio_timers_nap(ms, done, ctx) };
+    unsafe { tokio_nap(ms, Some(done), ctx) };
     let out = rx.recv_timeout(Duration::from_secs(30)).unwrap();
     drop(unsafe { Box::from_raw(ctx.cast::<mpsc::Sender<(i32, String)>>()) });
     out
@@ -51,7 +54,7 @@ fn nap(ms: u64) -> (i32, String) {
 
 #[test]
 fn outside_a_runtime_the_library_starts_its_own() {
-    assert_eq!(nap(5), (0, "weaveffi-async".to_string()));
+    assert_eq!(call_nap(5), (0, "weaveffi-async".to_string()));
 }
 
 #[test]
@@ -61,6 +64,7 @@ fn inside_a_runtime_the_current_handle_is_used() {
         .enable_all()
         .build()
         .unwrap();
-    let (code, name) = rt.block_on(async { tokio::task::spawn_blocking(|| nap(5)).await.unwrap() });
+    let (code, name) =
+        rt.block_on(async { tokio::task::spawn_blocking(|| call_nap(5)).await.unwrap() });
     assert_eq!((code, name.as_str()), (0, "consumer-runtime"));
 }

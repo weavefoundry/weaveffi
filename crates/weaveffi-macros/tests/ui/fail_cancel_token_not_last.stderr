@@ -1,0 +1,5 @@
+error: weaveffi: only an `async fn` takes a `CancelToken`, as its last parameter
+ --> tests/ui/fail_cancel_token_not_last.rs:4:27
+  |
+4 | pub async fn wait(cancel: weaveffi::CancelToken, ms: u64) -> u64 {
+  |                           ^^^^^^^^

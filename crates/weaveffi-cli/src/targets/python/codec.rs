@@ -12,13 +12,13 @@
 
 use crate::codegen::codecs::{composites, stem};
 use crate::codegen::CodeWriter;
-use weaveffi_model::model::{EnumBinding, Model, StructBinding};
+use weaveffi_model::model::{EnumBinding, Model, RecordBinding};
 use weaveffi_model::ty::{Prim, Ty, WireType};
 
 use crate::targets::python::types::{py_field, py_type_hint, py_variant, Dir};
 
 /// `_write_{stem}`: the writer for a record, rich enum, or composite.
-fn write_fn(ty: &Ty) -> String {
+pub(crate) fn write_fn(ty: &Ty) -> String {
     format!("_write_{}", stem(ty))
 }
 
@@ -91,7 +91,7 @@ pub(crate) fn encode_stmts(writer: &str, expr: &str, ty: &Ty) -> [String; 2] {
 }
 
 /// Append a record's writer and reader.
-pub(crate) fn render_record_codecs(w: &mut CodeWriter, s: &StructBinding) {
+pub(crate) fn render_record_codecs(w: &mut CodeWriter, s: &RecordBinding) {
     let name = &s.name;
     let ty = Ty::Record(name.clone());
     w.blank().blank();
@@ -180,8 +180,8 @@ pub(crate) fn render_rich_enum_codecs(w: &mut CodeWriter, e: &EnumBinding) {
 }
 
 /// Append the writer and reader of every composite type the API uses, after
-/// every module (a function body resolves the codecs it calls when it runs,
-/// so definition order doesn't matter).
+/// every declaration (a function body resolves the codecs it calls when it
+/// runs, so definition order doesn't matter).
 pub(crate) fn render_composite_codecs(w: &mut CodeWriter, model: &Model) {
     let all = composites(model);
     if all.is_empty() {

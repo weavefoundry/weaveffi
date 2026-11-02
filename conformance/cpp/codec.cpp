@@ -1,4 +1,4 @@
-// Conformance consumer: codec sample, C++ target (ABI revision 5).
+// Conformance consumer: codec sample, C++ target (ABI revision 6).
 //
 // The shared-vector loop: fetch every vector the producer serves (decoded by
 // the generated codecs), hand it back to `check_vector` (re-encoded by them),
@@ -7,13 +7,13 @@
 // literals (so a symmetric encode/decode bug can't hide), spot checks of
 // decoded fields, the typed out-of-range error and its payload, malformed
 // input rejected on both sides, and object identity and reference counting
-// through value buffers. Then the ABI 5 shapes: optional scalars and enums
-// in both directions (`std::optional<T>`), typed arrays in both directions
-// (`std::vector<T>` storage passed as is, bit-exact), a `usize` crossing as
-// `uint64_t`, a `char` and a custom type crossing as strings (their
-// marshalling failures are InternalError -3), a lazy `Range` of typed
-// arrays, and record equality. Ends by asserting the producer's leak
-// counters are zero.
+// through value buffers. Then the values that cross without a buffer:
+// optional scalars and enums in both directions (`std::optional<T>` as an
+// opt struct), typed arrays in both directions (`std::vector<T>` storage
+// passed as a run as is, bit-exact), a `usize` crossing as `uint64_t`, a
+// `char` and a custom type crossing as strings (their marshalling failures
+// are InternalError -3), a lazy `Range` of typed arrays, and record
+// equality. Ends by asserting the producer's leak counters are zero.
 
 #include <cmath>
 #include <cstdint>
@@ -29,7 +29,7 @@
 #include "check.hpp"
 #include "codec.hpp"
 
-namespace api = ::codec::codec;
+namespace api = ::codec;
 using codec::Color;
 using codec::Composite;
 using codec::Holder;

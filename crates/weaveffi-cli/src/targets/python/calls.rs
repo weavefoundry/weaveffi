@@ -2,26 +2,27 @@
 //! `ctypes` bindings.
 //!
 //! Every C prototype is bound once, at import time, from the model's lowered
-//! [`AbiFn`] (`argtypes` and `restype` come straight from its slots).
-//! Marshalling is driven by the stored passing contracts: [`ArgPass`]
-//! decides how each parameter crosses, [`RetPass`], [`ResultPass`], and
-//! [`ItemPass`] how a sync return, an async result, and an iterator item are
-//! received, and [`ErrorStrategy`](weaveffi_model::plan::ErrorStrategy)
-//! what a failure raises, so this module never re-derives those shapes.
+//! [`AbiFn`] (`argtypes` and `restype` come straight from its slots). Every
+//! value is one C value, marshalled by its [`Crossing`] (see
+//! [`values`](crate::targets::python::values)), and the callable's
+//! [`ErrorStrategy`](weaveffi_model::model::ErrorStrategy) decides what a
+//! failure raises.
 
+use crate::codegen::values::{crossing, Crossing};
 use crate::codegen::CodeWriter;
-use weaveffi_model::abi::{AbiParam, CType};
-use weaveffi_model::model::{AbiFn, AsyncBinding, FnBinding, IteratorBinding};
-use weaveffi_model::plan::{ArgPass, ItemPass, ResultPass, RetPass};
-use weaveffi_model::ty::{Prim, RetTy, Ty};
+use weaveffi_model::abi::{AbiFn, AbiParam, CType};
+use weaveffi_model::model::{AsyncBinding, FnBinding, IteratorBinding};
+use weaveffi_model::ty::{ParamTy, Prim, Ty};
 
-use crate::targets::python::codec::{decode_expr, encode_stmts};
+use crate::targets::python::callbacks::lazy_vtable;
+use crate::targets::python::codec::encode_stmts;
 use crate::targets::python::docs::{fn_docstring, ParamDoc};
 use crate::targets::python::types::{
-    enum_class, int_checker, prim_kind, py_binding_name, py_ctype, py_local, py_member_name,
-    py_name, py_object_member, py_out_local, py_param_hint, py_restype, py_return_hint,
-    py_slot_hint, py_str_literal, py_type_hint, Dir,
+    callback_arg_struct, prim_kind, py_binding_name, py_ctype, py_local, py_member_name, py_name,
+    py_object_member, py_out_local, py_param_hint, py_return_hint, py_slot_hint, py_str_literal,
+    py_type_hint, Caller, Dir,
 };
+use crate::targets::python::values::{checked_scalar, opt_value, received, Ownership};
 use crate::targets::python::Gen;
 
 /// How a rendered callable is scoped and spelled in the generated Python.
@@ -44,10 +45,13 @@ pub(crate) enum FnScope {
 /// async launcher's `callback` slot is typed with the completion's
 /// `CFUNCTYPE` (`callback_type`).
 fn bind_line(g: &Gen<'_>, abi: &AbiFn, callback_type: Option<&str>) -> String {
-    let mut parts = vec![format!("\"{}\"", abi.symbol), py_restype(&abi.ret)];
+    let mut parts = vec![
+        format!("\"{}\"", abi.symbol),
+        py_ctype(&abi.ret, Caller::Python),
+    ];
     parts.extend(abi.params.iter().map(|p| match callback_type {
         Some(cb) if p.name == "callback" => cb.to_string(),
-        _ => py_ctype(&p.ty, true),
+        _ => py_ctype(&p.ty, Caller::Python),
     }));
     format!(
         "{} = _bind({})",
@@ -56,17 +60,16 @@ fn bind_line(g: &Gen<'_>, abi: &AbiFn, callback_type: Option<&str>) -> String {
     )
 }
 
-/// The `CFUNCTYPE(...)` spelling for a C function-pointer signature the
-/// producer calls (a vtable method or an async completion).
-pub(crate) fn cfunctype(ret: &CType, params: &[AbiParam]) -> String {
-    let parts: Vec<String> = std::iter::once(py_restype(ret))
-        .chain(params.iter().map(|p| py_ctype(&p.ty, false)))
-        .collect();
-    format!("ctypes.CFUNCTYPE({})", parts.join(", "))
+/// The `ctypes` types of a C function-pointer signature the producer calls
+/// (a callback method or an async completion): the return, then each slot.
+pub(crate) fn producer_types(ret: &CType, params: &[AbiParam]) -> Vec<String> {
+    std::iter::once(py_ctype(ret, Caller::Producer))
+        .chain(params.iter().map(|p| py_ctype(&p.ty, Caller::Producer)))
+        .collect()
 }
 
-/// The annotated parameter list of a function `ctypes` calls back with the
-/// C slots `params` (a trampoline or an async completion).
+/// The annotated parameter list of a function the producer calls with the
+/// C slots `params` (a callback method or an async completion).
 pub(crate) fn slot_params(params: &[AbiParam]) -> String {
     let all: Vec<String> = params
         .iter()
@@ -88,235 +91,15 @@ fn pull_fn(g: &Gen<'_>, it: &IteratorBinding) -> String {
     py_binding_name(&it.iter_tag, g.prefix).replacen("_c_", "_pull_", 1)
 }
 
-/// The value expression `expr` of a direct slot of C type `ty` as Python
-/// hands it out: re-wrapped in its `IntEnum` for a C-style enum.
-pub(crate) fn direct_value(expr: &str, ty: &CType) -> String {
-    match enum_class(ty) {
-        Some(class) => format!("{class}({expr})"),
-        None => expr.to_string(),
+/// The expression holding a received value of type `ty` from a `ctypes`
+/// out local `local` of its C type: the structure itself for an optional
+/// scalar or a run, and its `.value` for a scalar or an object address.
+fn out_value(local: &str, ty: &Ty) -> String {
+    match crossing(ty) {
+        Crossing::OptScalar(_) | Crossing::OptEnum(_) => local.to_string(),
+        c if c.is_run() => local.to_string(),
+        _ => format!("{local}.value"),
     }
-}
-
-/// One value the producer hands over (a sync return, an async result, or
-/// an iterator item) as the expressions that hold its slots.
-pub(crate) enum Recv<'a> {
-    /// A number, `bool`, or enum, by value.
-    Direct { value: String, ty: &'a CType },
-    /// A present flag and a value (ignored when absent).
-    OptDirect {
-        has: String,
-        value: String,
-        ty: &'a CType,
-    },
-    /// An owned typed-array run: address and element count.
-    Slice {
-        ptr: String,
-        len: String,
-        elem: Prim,
-    },
-    /// An owned UTF-8 run.
-    String { ptr: String, len: String },
-    /// An owned byte run.
-    Bytes { ptr: String, len: String },
-    /// An owned value buffer of type `ty`.
-    Buffer {
-        ptr: String,
-        len: String,
-        ty: &'a Ty,
-    },
-    /// One strong reference to an object.
-    Object {
-        ptr: String,
-        nullable: bool,
-        interface: &'a str,
-    },
-}
-
-/// The expression taking ownership of a received value: copying it into a
-/// Python value and releasing what the producer handed over.
-pub(crate) fn recv_expr(r: &Recv<'_>) -> String {
-    match r {
-        Recv::Direct { value, ty } => direct_value(value, ty),
-        Recv::OptDirect { has, value, ty } => {
-            format!("{} if {has} else None", direct_value(value, ty))
-        }
-        Recv::Slice { ptr, len, elem } => {
-            format!("_take_array({ptr}, {len}, \"{}\")", prim_kind(*elem))
-        }
-        Recv::String { ptr, len } => format!("_take_str({ptr}, {len})"),
-        Recv::Bytes { ptr, len } => format!("_take_bytes({ptr}, {len})"),
-        Recv::Buffer { ptr, len, ty } => decode_expr(&format!("_take_bytes({ptr}, {len})"), ty),
-        Recv::Object {
-            ptr,
-            nullable,
-            interface,
-        } => adopt_expr(interface, ptr, *nullable),
-    }
-}
-
-/// The expression adopting the object pointer `p` (one strong reference)
-/// into a new wrapper of `class`; `None` for a null `I?`.
-pub(crate) fn adopt_expr(class: &str, p: &str, nullable: bool) -> String {
-    if nullable {
-        format!("{class}._adopt({p}) if {p} else None")
-    } else {
-        format!("{class}._adopt(_required({p}))")
-    }
-}
-
-/// The local holding an out slot's value: `_` plus the slot name
-/// (`_out_len`, `_out_value`, `_out_item`).
-fn out_local(slot: &AbiParam) -> String {
-    format!("_{}", slot.name)
-}
-
-/// How an async completion's result slots become the awaited value.
-fn result_recv<'a>(result: &'a ResultPass, elem: Option<&'a Ty>) -> Option<Recv<'a>> {
-    let local = |slot: &AbiParam| py_local(&slot.name);
-    Some(match result {
-        ResultPass::Void => return None,
-        ResultPass::Direct { result } => Recv::Direct {
-            value: local(result),
-            ty: &result.ty,
-        },
-        ResultPass::OptDirect { has, value } => Recv::OptDirect {
-            has: local(has),
-            value: local(value),
-            ty: &value.ty,
-        },
-        ResultPass::Slice { ptr, len, elem } => Recv::Slice {
-            ptr: local(ptr),
-            len: local(len),
-            elem: *elem,
-        },
-        ResultPass::String { ptr, len } => Recv::String {
-            ptr: local(ptr),
-            len: local(len),
-        },
-        ResultPass::Bytes { ptr, len } => Recv::Bytes {
-            ptr: local(ptr),
-            len: local(len),
-        },
-        ResultPass::Buffer { ptr, len } => Recv::Buffer {
-            ptr: local(ptr),
-            len: local(len),
-            ty: elem.expect("a buffered result has a value type"),
-        },
-        ResultPass::Object {
-            result,
-            nullable,
-            interface,
-            ..
-        } => Recv::Object {
-            ptr: local(result),
-            nullable: *nullable,
-            interface,
-        },
-    })
-}
-
-/// How an iterator's `_next` out slots become the yielded item. The slots
-/// are locals named by [`out_local`], read through `.value`.
-fn item_recv<'a>(item: &'a ItemPass, elem: &'a Ty) -> Recv<'a> {
-    let value = |slot: &AbiParam| format!("{}.value", out_local(slot));
-    let pointee = |slot: &'a AbiParam| match &slot.ty {
-        CType::Ptr { pointee, .. } => pointee.as_ref(),
-        other => other,
-    };
-    match item {
-        ItemPass::Direct { out_item } => Recv::Direct {
-            value: value(out_item),
-            ty: pointee(out_item),
-        },
-        ItemPass::OptDirect { out_has, out_item } => Recv::OptDirect {
-            has: value(out_has),
-            value: value(out_item),
-            ty: pointee(out_item),
-        },
-        ItemPass::Slice {
-            out_item,
-            out_len,
-            elem,
-        } => Recv::Slice {
-            ptr: value(out_item),
-            len: value(out_len),
-            elem: *elem,
-        },
-        ItemPass::String { out_item, out_len } => Recv::String {
-            ptr: value(out_item),
-            len: value(out_len),
-        },
-        ItemPass::Bytes { out_item, out_len } => Recv::Bytes {
-            ptr: value(out_item),
-            len: value(out_len),
-        },
-        ItemPass::Buffer { out_item, out_len } => Recv::Buffer {
-            ptr: value(out_item),
-            len: value(out_len),
-            ty: elem,
-        },
-        ItemPass::Object {
-            out_item,
-            nullable,
-            interface,
-            ..
-        } => Recv::Object {
-            ptr: value(out_item),
-            nullable: *nullable,
-            interface,
-        },
-    }
-}
-
-/// How a sync call's C return (`_ret`) and out slots become the returned
-/// value; `None` for a void call or an iterator (handled by the caller).
-fn ret_recv<'a>(ret_pass: &'a RetPass, ret: Option<&'a RetTy>, abi: &'a AbiFn) -> Option<Recv<'a>> {
-    let value = |slot: &AbiParam| format!("{}.value", out_local(slot));
-    let ret_ptr = || "_ret".to_string();
-    Some(match ret_pass {
-        RetPass::Void | RetPass::Iterator(_) => return None,
-        RetPass::Direct => Recv::Direct {
-            value: ret_ptr(),
-            ty: &abi.ret,
-        },
-        RetPass::OptDirect { out_value } => Recv::OptDirect {
-            has: ret_ptr(),
-            value: value(out_value),
-            ty: match &out_value.ty {
-                CType::Ptr { pointee, .. } => pointee,
-                other => other,
-            },
-        },
-        RetPass::Slice { out_len, elem } => Recv::Slice {
-            ptr: ret_ptr(),
-            len: value(out_len),
-            elem: *elem,
-        },
-        RetPass::String { out_len } => Recv::String {
-            ptr: ret_ptr(),
-            len: value(out_len),
-        },
-        RetPass::Bytes { out_len } => Recv::Bytes {
-            ptr: ret_ptr(),
-            len: value(out_len),
-        },
-        RetPass::Buffer { out_len } => Recv::Buffer {
-            ptr: ret_ptr(),
-            len: value(out_len),
-            ty: ret
-                .and_then(RetTy::value)
-                .expect("a buffered return has a value type"),
-        },
-        RetPass::Object {
-            nullable,
-            interface,
-            ..
-        } => Recv::Object {
-            ptr: ret_ptr(),
-            nullable: *nullable,
-            interface,
-        },
-    })
 }
 
 /// Emit every module-level piece a callable needs ahead of its wrapper: the
@@ -353,6 +136,7 @@ pub(crate) fn render_bindings(w: &mut CodeWriter, g: &Gen<'_>, f: &FnBinding, pa
 /// calls it for each step and destroys the handle exactly once.
 fn render_pull(w: &mut CodeWriter, g: &Gen<'_>, f: &FnBinding, it: &IteratorBinding) {
     let next = py_binding_name(&it.next.symbol, g.prefix);
+    let slot = &it.next.params[1];
     w.blank().blank();
     w.line(format!(
         "def {}(_p: int) -> {}:",
@@ -360,18 +144,11 @@ fn render_pull(w: &mut CodeWriter, g: &Gen<'_>, f: &FnBinding, it: &IteratorBind
         py_type_hint(&it.elem, Dir::Out)
     ));
     w.scope(|w| {
-        let mut args = vec!["_p".to_string()];
-        for slot in it.item.slots() {
-            w.line(format!(
-                "{} = {}()",
-                out_local(slot),
-                py_out_local(&slot.ty)
-            ));
-            args.push(format!("ctypes.byref({})", out_local(slot)));
-        }
+        w.line(format!("_item = {}()", py_out_local(&slot.ty)));
         w.line("_err = _ErrorStruct()");
-        args.push("ctypes.byref(_err)".into());
-        w.line(format!("_more = {next}({})", args.join(", ")));
+        w.line(format!(
+            "_more = {next}(_p, ctypes.byref(_item), ctypes.byref(_err))"
+        ));
         w.line("if _err.code:");
         w.scope(|w| {
             w.line(format!(
@@ -385,7 +162,7 @@ fn render_pull(w: &mut CodeWriter, g: &Gen<'_>, f: &FnBinding, it: &IteratorBind
         });
         w.line(format!(
             "return {}",
-            recv_expr(&item_recv(&it.item, &it.elem))
+            received(&out_value("_item", &it.elem), &it.elem, Ownership::Owned)
         ));
     });
 }
@@ -397,18 +174,20 @@ fn render_pull(w: &mut CodeWriter, g: &Gen<'_>, f: &FnBinding, it: &IteratorBind
 fn render_completion(w: &mut CodeWriter, g: &Gen<'_>, f: &FnBinding, a: &AsyncBinding) {
     let stem = completion_stem(g, f);
     let cb_type = py_binding_name(&a.callback_type, g.prefix);
-    let elem = f.ret.as_ref().and_then(RetTy::value);
-    let value = result_recv(&a.result, elem).map_or_else(|| "None".into(), |r| recv_expr(&r));
+    let value = f.ret_value().map_or_else(
+        || "None".into(),
+        |ty| received("result", ty, Ownership::Owned),
+    );
     w.blank().blank();
     w.line(format!(
-        "{cb_type} = {}",
-        cfunctype(&CType::Void, &a.callback_params)
+        "{cb_type} = ctypes.CFUNCTYPE({})",
+        producer_types(&a.callback.ret, &a.callback.params).join(", ")
     ));
     w.line(bind_line(g, &f.abi, Some(&cb_type)));
     w.blank().blank();
     w.line(format!(
         "def {stem}_complete({}) -> None:",
-        slot_params(&a.callback_params)
+        slot_params(&a.callback.params)
     ));
     w.scope(|w| {
         w.line("# Runs once, on a producer thread: take ownership of the result");
@@ -454,89 +233,95 @@ struct Lend {
     release: String,
 }
 
-/// One parameter's local preparation and its C argument expressions.
+/// One parameter's preparation and its C argument.
 #[derive(Default)]
 struct ParamPlan {
-    /// Statements run before any object is lent (checking and encoding).
+    /// Statements run before any object is lent (encoding value buffers,
+    /// checking callback implementations).
     prep: Vec<String>,
-    /// Range checks: `(local, expression)`, inlined into the argument list
-    /// when nothing is lent or registered before the call, else bound to the
-    /// local in `prep` (a failing check must not strand a registration).
-    checks: Vec<(String, String)>,
+    /// A conversion that may fail, `(local, expression)`: inlined into the
+    /// argument when nothing is lent or registered before the call, else
+    /// bound to the local in `prep` (a failing conversion must not strand a
+    /// lent object or a registration).
+    eager: Option<(String, String)>,
     /// Statements run inside the innermost borrow scope, just before the
     /// call (finishing value buffers, registering callbacks).
     late: Vec<String>,
     /// The object lent for the call.
     lend: Option<Lend>,
-    /// The C argument expressions, in slot order.
-    args: Vec<String>,
+    /// The C argument expression.
+    arg: String,
 }
 
-/// The checked argument for a direct value `n` of C type `ty`: the
-/// runtime's range check for an integer or enum, the value itself for a
-/// float or `bool`.
-fn checked(plan: &mut ParamPlan, n: &str, local: String, ty: &CType) -> String {
-    match int_checker(ty) {
-        Some(check) => {
-            plan.checks
-                .push((local.clone(), format!("{check}({n}, \"{n}\")")));
-            local
+impl ParamPlan {
+    /// A plan whose argument is the conversion `expr` of parameter `n`.
+    fn eager(n: &str, expr: String) -> Self {
+        let local = format!("_{n}_v");
+        Self {
+            arg: local.clone(),
+            eager: Some((local, expr)),
+            ..Self::default()
         }
-        None => n.to_string(),
     }
 }
 
-/// Plan how parameter `n` crosses per its passing contract.
-fn plan_param(n: &str, pass: &ArgPass) -> ParamPlan {
-    let mut plan = ParamPlan::default();
-    match pass {
-        ArgPass::Direct { slot } => {
-            let arg = checked(&mut plan, n, format!("_{n}_v"), &slot.ty);
-            plan.args.push(arg);
-        }
-        ArgPass::OptDirect { value, .. } => {
-            let zero = match value.ty {
-                CType::Float | CType::Double => "0.0",
-                CType::Bool => "False",
-                _ => "0",
+/// Plan how parameter `n` of type `ty` crosses as its one C value.
+fn plan_param(n: &str, ty: &ParamTy) -> ParamPlan {
+    let ty = match ty {
+        ParamTy::Value(ty) => ty,
+        // Checked (and the vtable built) before anything is lent, and
+        // registered last, so nothing between registration and the call can
+        // fail and strand the entry; the producer releases it with `free`.
+        ParamTy::Callback { name, nullable } => {
+            let (check, register) = if *nullable {
+                ("_callback_vtable_opt", "_callback_register_opt")
+            } else {
+                ("_callback_vtable", "_callback_register")
             };
-            let local = format!("_{n}_v");
-            let present = match int_checker(&value.ty) {
-                Some(check) => format!("{check}({n}, \"{n}\")"),
-                None => n.to_string(),
+            return ParamPlan {
+                prep: vec![format!(
+                    "_{n}_vt = {check}({n}, {name}, {})",
+                    lazy_vtable(name)
+                )],
+                late: vec![format!("_{n}_ctx = {register}({n})")],
+                arg: format!("{}(_{n}_ctx, _{n}_vt)", callback_arg_struct(name)),
+                ..ParamPlan::default()
             };
-            plan.checks.push((
-                local.clone(),
-                format!("{present} if {n} is not None else {zero}"),
-            ));
-            plan.args = vec![format!("{n} is not None"), local];
         }
-        ArgPass::Slice { elem, .. } => {
-            plan.prep.push(format!(
-                "_{n}_a = _array({n}, \"{}\", \"{n}\")",
-                prim_kind(*elem)
-            ));
-            plan.args = vec![format!("_{n}_a.buffer_info()[0]"), format!("len(_{n}_a)")];
+    };
+    match crossing(ty) {
+        Crossing::Scalar(p) => {
+            let checked = checked_scalar(n, p, n, false);
+            if checked == n {
+                ParamPlan {
+                    arg: n.to_string(),
+                    ..ParamPlan::default()
+                }
+            } else {
+                ParamPlan::eager(n, checked)
+            }
         }
-        ArgPass::String { .. } => {
-            plan.prep.push(format!("_{n}_b = {n}.encode(\"utf-8\")"));
-            plan.args = vec![format!("_{n}_b"), format!("len(_{n}_b)")];
+        Crossing::Enum(_) => ParamPlan::eager(n, checked_scalar(n, Prim::I32, n, false)),
+        Crossing::OptScalar(p) => ParamPlan::eager(n, opt_value(n, p, n, false)),
+        Crossing::OptEnum(_) => ParamPlan::eager(n, opt_value(n, Prim::I32, n, false)),
+        Crossing::Utf8 => ParamPlan::eager(n, format!("_run_in({n}.encode(\"utf-8\"))")),
+        Crossing::Bytes => ParamPlan::eager(n, format!("_run_in(bytes({n}))")),
+        Crossing::Slice(p) => {
+            ParamPlan::eager(n, format!("_array_in({n}, \"{}\", \"{n}\")", prim_kind(p)))
         }
-        ArgPass::Bytes { .. } => {
-            plan.prep.push(format!("_{n}_b = bytes({n})"));
-            plan.args = vec![format!("_{n}_b"), format!("len(_{n}_b)")];
-        }
-        // Encoded with every other parameter; buffers are finished (object
-        // tokens minted) later.
-        ArgPass::Buffer { .. } => {
-            plan.args = vec![format!("_{n}_b"), format!("len(_{n}_b)")];
-        }
-        ArgPass::Object {
-            nullable,
+        // Encoded with every other parameter; finished (object tokens
+        // minted) just before the call.
+        Crossing::Buffer(ty) => ParamPlan {
+            prep: encode_stmts(&format!("_{n}_w"), n, ty).into(),
+            late: vec![format!("_{n}_b = _{n}_w.finish()")],
+            arg: format!("_run_in(_{n}_b)"),
+            ..ParamPlan::default()
+        },
+        Crossing::Object {
             interface,
-            ..
-        } => {
-            plan.lend = Some(if *nullable {
+            nullable,
+        } => ParamPlan {
+            lend: Some(if nullable {
                 Lend {
                     local: format!("_{n}_p"),
                     acquire: format!("_lend_opt({n}, {interface})"),
@@ -548,33 +333,11 @@ fn plan_param(n: &str, pass: &ArgPass) -> ParamPlan {
                     acquire: format!("_lend({n}, {interface})"),
                     release: format!("{n}._release()"),
                 }
-            });
-            plan.args.push(format!("_{n}_p"));
-        }
-        // Registered last, so nothing between registration and the call can
-        // fail and strand the entry; the producer releases it with `free`.
-        ArgPass::Callback {
-            nullable,
-            interface,
-            ..
-        } => {
-            let vtable = format!("_{interface}_vtable_ptr");
-            if *nullable {
-                plan.late.push(format!(
-                    "_{n}_ctx = _callback_register_opt({n}, {interface})"
-                ));
-                plan.args = vec![
-                    format!("_{n}_ctx"),
-                    format!("{vtable} if {n} is not None else None"),
-                ];
-            } else {
-                plan.late
-                    .push(format!("_{n}_ctx = _callback_register({n}, {interface})"));
-                plan.args = vec![format!("_{n}_ctx"), vtable];
-            }
-        }
+            }),
+            arg: format!("_{n}_p"),
+            ..ParamPlan::default()
+        },
     }
-    plan
 }
 
 /// Render one callable's wrapper `def` (its bindings are emitted separately
@@ -651,11 +414,11 @@ pub(crate) fn render_callable(w: &mut CodeWriter, g: &Gen<'_>, f: &FnBinding, sc
     let mut plans: Vec<ParamPlan> = f
         .params
         .iter()
-        .map(|p| plan_param(&py_name(&p.name), &p.pass))
+        .map(|p| plan_param(&py_name(&p.name), &p.ty))
         .collect();
 
     // Lent objects (the receiver first), and the late statements: finishing
-    // value buffers and registering callbacks.
+    // value buffers, then registering callbacks (which can't fail).
     let mut lends: Vec<Lend> = Vec::new();
     if f.has_self() {
         lends.push(Lend {
@@ -667,53 +430,43 @@ pub(crate) fn render_callable(w: &mut CodeWriter, g: &Gen<'_>, f: &FnBinding, sc
     lends.extend(plans.iter().filter_map(|p| p.lend.clone()));
     let mut late: Vec<String> = Vec::new();
     for (p, plan) in f.params.iter().zip(&plans) {
-        if let ArgPass::Buffer { .. } = p.pass {
-            let n = py_name(&p.name);
-            late.push(format!("_{n}_b = _{n}_w.finish()"));
+        if matches!(p.ty, ParamTy::Value(_)) {
+            late.extend(plan.late.iter().cloned());
         }
-        late.extend(plan.late.iter().cloned());
     }
-    // Range checks run in the argument list unless something is lent or
+    for (p, plan) in f.params.iter().zip(&plans) {
+        if matches!(p.ty, ParamTy::Callback { .. }) {
+            late.extend(plan.late.iter().cloned());
+        }
+    }
+    // Conversions run in the argument list unless something is lent or
     // registered first.
     let inline = lends.is_empty() && late.is_empty();
     for plan in &mut plans {
-        let checks = std::mem::take(&mut plan.checks);
-        for (local, expr) in checks {
+        if let Some((local, expr)) = plan.eager.take() {
             if inline {
-                for arg in &mut plan.args {
-                    if *arg == local {
-                        arg.clone_from(&expr);
-                    }
-                }
+                plan.arg = expr;
             } else {
                 plan.prep.push(format!("{local} = {expr}"));
             }
         }
     }
-    for (p, plan) in f.params.iter().zip(&plans) {
+    for plan in &plans {
         for line in &plan.prep {
             w.line(line);
         }
-        if let (ArgPass::Buffer { .. }, Some(ty)) = (&p.pass, p.ty.value()) {
-            let n = py_name(&p.name);
-            for line in encode_stmts(&format!("_{n}_w"), &n, ty) {
-                w.line(line);
-            }
-        }
     }
 
-    // The C arguments: `self`, each parameter's slots, then the trailing
+    // The C arguments: `self`, each parameter's value, then the trailing
     // slots of the shape.
     let mut args: Vec<String> = Vec::new();
     if f.has_self() {
         args.push("_self_p".into());
     }
-    for plan in &plans {
-        args.extend(plan.args.iter().cloned());
-    }
+    args.extend(plans.iter().map(|p| p.arg.clone()));
 
     if let Some(a) = f.async_binding() {
-        if a.cancellable() {
+        if a.cancellable {
             args.push("_token".into());
         }
         args.push(format!("{}_completion", completion_stem(g, f)));
@@ -721,7 +474,7 @@ pub(crate) fn render_callable(w: &mut CodeWriter, g: &Gen<'_>, f: &FnBinding, sc
         debug_assert_eq!(args.len(), f.abi.params.len(), "{}", f.abi.symbol);
         let call = format!("{binding}({})", args.join(", "));
         w.line("_call, _future = _async_begin()");
-        if a.cancellable() {
+        if a.cancellable {
             w.line("_token = _cancel_token_create()");
         }
         w.line("try:");
@@ -729,19 +482,19 @@ pub(crate) fn render_callable(w: &mut CodeWriter, g: &Gen<'_>, f: &FnBinding, sc
         w.line("except BaseException:");
         w.scope(|w| {
             w.line("_async_abandon(_call)");
-            if a.cancellable() {
+            if a.cancellable {
                 w.line("_cancel_token_destroy(_token)");
             }
             w.line("raise");
         });
-        let wait = if a.cancellable() {
+        let wait = if a.cancellable {
             "await _async_wait_cancellable(_future, _token)"
         } else {
             "await _future"
         };
         // The completion built the value; the annotation hands its type to
         // checkers.
-        match f.ret.as_ref().and_then(RetTy::value) {
+        match f.ret_value() {
             Some(ty) => {
                 w.line(format!("_result: {} = {wait}", py_type_hint(ty, Dir::Out)));
                 w.line("return _result");
@@ -754,26 +507,20 @@ pub(crate) fn render_callable(w: &mut CodeWriter, g: &Gen<'_>, f: &FnBinding, sc
         return;
     }
 
-    for slot in f.ret_pass.out_slots() {
-        w.line(format!(
-            "{} = {}()",
-            out_local(slot),
-            py_out_local(&slot.ty)
-        ));
-        args.push(format!("ctypes.byref({})", out_local(slot)));
-    }
     w.line("_err = _ErrorStruct()");
     args.push("ctypes.byref(_err)".into());
     debug_assert_eq!(args.len(), f.abi.params.len(), "{}", f.abi.symbol);
     let call = format!("{binding}({})", args.join(", "));
-    // A direct scalar result is used as returned, so its annotation tells
-    // checkers what the untyped `ctypes` call produced.
-    let call = match (&f.ret_pass, f.ret.as_ref().and_then(RetTy::value)) {
-        (RetPass::Void, _) if !matches!(scope, FnScope::Init | FnScope::Factory) => call,
-        (RetPass::Direct, Some(ty @ Ty::Prim(_))) => {
-            format!("_ret: {} = {call}", py_type_hint(ty, Dir::Out))
-        }
-        _ => format!("_ret = {call}"),
+    let value = f.ret.as_ref().map(|r| r.elem());
+    let call = match (scope, value, f.iterator()) {
+        (FnScope::Init | FnScope::Factory, _, _) | (_, _, Some(_)) => format!("_ret = {call}"),
+        (_, None, None) => call,
+        // A scalar result is used as returned, so its annotation tells
+        // checkers what the untyped `ctypes` call produced.
+        (_, Some(ty), None) => match crossing(ty) {
+            Crossing::Scalar(_) => format!("_ret: {} = {call}", py_type_hint(ty, Dir::Out)),
+            _ => format!("_ret = {call}"),
+        },
     };
     emit_lent_call(w, &lends, &late, &call);
     w.line("if _err.code:");
@@ -792,14 +539,14 @@ pub(crate) fn render_callable(w: &mut CodeWriter, g: &Gen<'_>, f: &FnBinding, sc
             w.line("return cls._adopt(_required(_ret))");
         }
         _ => {
-            if let RetPass::Iterator(it) = &f.ret_pass {
+            if let Some(it) = f.iterator() {
                 w.line(format!(
                     "return _iterate(_required(_ret), {}, {})",
                     pull_fn(g, it),
                     py_binding_name(&it.destroy_symbol, g.prefix)
                 ));
-            } else if let Some(r) = ret_recv(&f.ret_pass, f.ret.as_ref(), &f.abi) {
-                w.line(format!("return {}", recv_expr(&r)));
+            } else if let Some(ty) = value {
+                w.line(format!("return {}", received("_ret", ty, Ownership::Owned)));
             }
         }
     }

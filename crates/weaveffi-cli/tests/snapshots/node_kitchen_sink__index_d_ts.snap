@@ -21,8 +21,6 @@ export declare class KitchenSinkError extends Error {
 export declare class CancelledError extends KitchenSinkError {
   constructor(message?: string);
 }
-/** The root error class, under a name no namespace member can shadow. */
-declare const $Error: typeof KitchenSinkError;
 /**
  * A lazy iterator over a native `iter<T>`: each `next()` makes one native
  * call. The native iterator is released when it is exhausted or fails, by
@@ -35,220 +33,212 @@ export interface NativeIterator<T> extends IterableIterator<T> {
   /** Alias of `close()` for `using` declarations. */
   [Symbol.dispose](): void;
 }
-
-export declare namespace shared {
-  /** A reusable token referenced across modules */
-  export interface Token {
-    id: bigint;
-    label: string;
-  }
-  /** Trivial cross-module helper */
-  export function ping(): string;
+/** The errors of the `KitchenError` domain (an unknown code is this class itself). */
+export declare class KitchenError extends KitchenSinkError {
+  constructor(code: number, message?: string);
 }
-
-export declare namespace kitchen {
-  /** The errors of the `KitchenErrors` domain (an unknown code is this class itself). */
-  export class KitchenError extends $Error {
-    constructor(code: number, message?: string);
-  }
-  /** Item not found */
-  export class NotFoundError extends kitchen.KitchenError {
-    static readonly CODE: 1;
-    constructor(message?: string);
-  }
-  /** Invalid input */
-  export class InvalidInputError extends kitchen.KitchenError {
-    static readonly CODE: 2;
-    constructor(message?: string);
-  }
-  /** The errors of the `PantryError` domain (an unknown code is this class itself). */
-  export class PantryError extends $Error {
-    constructor(code: number, message?: string);
-  }
-  /** Out of stock */
-  export class OutOfStockError extends kitchen.PantryError {
-    static readonly CODE: 1;
-    readonly item: string;
-    constructor(fields: { item: string }, message?: string);
-  }
-  /** Spoiled */
-  export class SpoiledError extends kitchen.PantryError {
-    static readonly CODE: 2;
-    constructor(message?: string);
-  }
-  /** Task priority levels */
-  export enum Priority {
-    /** Low priority */
-    Low = 0,
-    /** Normal priority */
-    Normal = 1,
-    /** High priority */
-    High = 2,
-  }
-  /** Kitchen sink struct exercising every field feature */
-  export interface Item {
-    /** Stable identifier */
-    id: bigint;
-    /** Display name */
-    name: string;
-    /** Initial count */
-    count: number;
-    /** Whether the item is enabled */
-    enabled: boolean;
-    /** Scaling ratio */
-    ratio: number;
-    nick: number;
-    payload: Uint8Array;
-    tags: string[];
-    attrs: Record<string, string>;
-    parent: bigint | null;
-    /** Cross-module struct reference */
-    token: shared.Token;
-    priority: kitchen.Priority;
-    /** An optional object inside a record */
-    gadget: kitchen.Gadget | null;
-  }
-  /** Consumer-implemented observer of ready items */
-  export interface ReadyListener {
-    /** Fires when an item is ready */
-    onReady(code: number, msg: string): void;
-    /** Receives the item itself and says whether to keep listening */
-    onItem(item: kitchen.Item, gadget: kitchen.Gadget): boolean;
-    /**
-     * A display label, failing with a kitchen error
-     * @throws {kitchen.KitchenError} to report one of its codes, with its fields, to the library
-     */
-    label(): string;
-    /** The most recent item the listener kept, if any */
-    latest(): kitchen.Item | null;
-    /** The listener's favorite gadget */
-    favorite(): kitchen.Gadget;
-  }
-  /** Consumer-implemented source of scalar samples */
-  export interface Sampler {
-    /** The cutoff for a level, if the sampler has one */
-    threshold(level: number | null): number | null;
-    /**
-     * Up to `limit` samples, failing when the pantry is empty
-     * @throws {kitchen.PantryError} to report one of its codes, with its fields, to the library
-     */
-    samples(limit: number | null, weights: number[]): readonly number[] | Int16Array;
-    /**
-     * A free-form description, failing with an untyped error
-     * @throws to report a failure, with its message, to the library
-     */
-    describe(): string;
-  }
-  /** A pocket-sized interface exercising the object surface */
-  export class Gadget {
-    /** Create a gadget with the given id */
-    constructor(id: bigint);
-    /** Render the gadget as a human-readable string */
-    describe(): string;
-    /**
-     * Poke the gadget a number of times, failing on a negative count
-     * @throws {kitchen.KitchenError} when the call fails with one of its codes
-     */
-    poke(times: number): number;
-    /**
-     * The gadget's sensor readings, optionally limited
-     * @throws {KitchenSinkError} (code -1) when the call fails
-     */
-    readings(limit: number | null): number[];
-    /** The gadget subsystem version string */
-    static version(): string;
-    /**
-     * Release this wrapper's reference to the native object. Safe to call
-     * more than once; a wrapper that is never closed is released when it is
-     * garbage collected. Using the wrapper after `close()` throws.
-     */
-    close(): void;
-    /** Alias of `close()` for `using` declarations. */
-    [Symbol.dispose](): void;
-  }
-  /** Identity for bool */
-  export function boolId(x: boolean): boolean;
-  export function i32Id(x: number): number;
-  export function u32Id(x: number): number;
-  export function i64Id(x: bigint): bigint;
-  export function f64Id(x: number): number;
-  export function echoString(s: string): string;
-  export function echoBytes(b: Uint8Array): Uint8Array;
-  /** Register a listener, returning how many are attached */
-  export function subscribe(listener: kitchen.ReadyListener): number;
-  /** Register a listener if one is given */
-  export function maybeSubscribe(listener: kitchen.ReadyListener | null): boolean;
-  /** Optional object in both directions */
-  export function maybeGadget(fallback: kitchen.Gadget | null): kitchen.Gadget | null;
-  /** A list of objects */
-  export function gadgets(): kitchen.Gadget[];
-  /** An iterator over objects */
-  export function streamGadgets(): NativeIterator<kitchen.Gadget>;
+/** Item not found */
+export declare class NotFoundError extends KitchenError {
+  static readonly CODE: 1;
+  constructor(message?: string);
+}
+/** Invalid input */
+export declare class InvalidInputError extends KitchenError {
+  static readonly CODE: 2;
+  constructor(message?: string);
+}
+/** The errors of the `PantryError` domain (an unknown code is this class itself). */
+export declare class PantryError extends KitchenSinkError {
+  constructor(code: number, message?: string);
+}
+/** Out of stock */
+export declare class OutOfStockError extends PantryError {
+  static readonly CODE: 1;
+  readonly item: string;
+  constructor(fields: { item: string }, message?: string);
+}
+/** Spoiled */
+export declare class SpoiledError extends PantryError {
+  static readonly CODE: 2;
+  constructor(message?: string);
+}
+/** Task priority levels */
+export declare enum Priority {
+  /** Low priority */
+  Low = 0,
+  /** Normal priority */
+  Normal = 1,
+  /** High priority */
+  High = 2,
+}
+/** A reusable token referenced from several declarations */
+export interface Token {
+  id: bigint;
+  label: string;
+}
+/** Kitchen sink struct exercising every field feature */
+export interface Item {
+  /** Stable identifier */
+  id: bigint;
+  /** Display name */
+  name: string;
+  /** Initial count */
+  count: number;
+  /** Whether the item is enabled */
+  enabled: boolean;
+  /** Scaling ratio */
+  ratio: number;
+  nick: number;
+  payload: Uint8Array;
+  tags: string[];
+  attrs: Record<string, string>;
+  parent: bigint | null;
+  /** A record inside a record */
+  token: Token;
+  priority: Priority;
+  /** An optional object inside a record */
+  gadget: Gadget | null;
+}
+/** Consumer-implemented observer of ready items */
+export interface ReadyListener {
+  /** Fires when an item is ready */
+  onReady(code: number, msg: string): void;
+  /** Receives the item itself and says whether to keep listening */
+  onItem(item: Item, gadget: Gadget): boolean;
   /**
-   * Optional struct return
-   * @throws {kitchen.KitchenError} when the call fails with one of its codes
+   * A display label, failing with a kitchen error
+   * @throws {KitchenError} to report one of its codes, with its fields, to the library
    */
-  export function maybeItem(id: bigint): kitchen.Item | null;
-  /** List of structs */
-  export function listItems(): kitchen.Item[];
-  /** Map return type */
-  export function getAttrs(): Record<string, number>;
-  /** Iterator return type */
-  export function streamItems(): NativeIterator<kitchen.Item>;
-  /** Returns the shared Token type from another module */
-  export function crossModuleToken(): shared.Token;
-  /** Async operation */
-  export function doAsync(input: string): Promise<string>;
-  /** Cancellable async operation */
-  export function doCancellable(input: string, options?: { signal?: AbortSignal }): Promise<string>;
+  label(): string;
+  /** The most recent item the listener kept, if any */
+  latest(): Item | null;
+  /** The listener's favorite gadget */
+  favorite(): Gadget;
+}
+/** Consumer-implemented source of scalar samples */
+export interface Sampler {
+  /** The cutoff for a level, if the sampler has one */
+  threshold(level: number | null): number | null;
   /**
-   * Legacy operation kept for compatibility
-   * @deprecated Use `newOp` instead
+   * Up to `limit` samples, failing when the pantry is empty
+   * @throws {PantryError} to report one of its codes, with its fields, to the library
    */
-  export function legacyOp(): number;
-  /** Replacement for `legacyOp` */
-  export function newOp(): number;
-  /** Optional scalar in both directions */
-  export function optI32Id(x: number | null): number | null;
-  export function optBoolId(x: boolean | null): boolean | null;
-  /** Optional C-style enum in both directions */
-  export function optPriority(p: kitchen.Priority | null): kitchen.Priority | null;
-  /** Optional scalars next to ordinary parameters */
-  export function optMixed(base: number, scale: number | null, offset: bigint | null, label: string | null): number | null;
-  /** A typed-array parameter */
-  export function sumF64(xs: readonly number[] | Float64Array): number;
-  /** Typed arrays in both directions */
-  export function scaleI32(xs: readonly number[] | Int32Array, factor: number): number[];
-  export function idsU64(ids: readonly bigint[] | BigUint64Array): bigint[];
-  /** Every slice element type */
-  export function mixedSlices(a: readonly number[] | Int8Array, b: readonly number[] | Int16Array, c: readonly number[] | Uint16Array, d: readonly number[] | Uint32Array, e: readonly bigint[] | BigInt64Array, f: readonly number[] | Float32Array): number[];
-  /** Async returning an optional scalar */
-  export function asyncMaybeCount(): Promise<bigint | null>;
-  /** Async returning a typed array */
-  export function asyncSamples(n: number, options?: { signal?: AbortSignal }): Promise<number[]>;
-  /** Iterator of optional scalars */
-  export function streamMaybe(): NativeIterator<number | null>;
-  /** Iterator of typed arrays */
-  export function streamChunks(): NativeIterator<number[]>;
+  samples(limit: number | null, weights: number[]): readonly number[] | Int16Array;
   /**
-   * Drive a consumer-implemented sampler
-   * @throws {kitchen.PantryError} when the call fails with one of its codes
+   * A free-form description, failing with an untyped error
+   * @throws to report a failure, with its message, to the library
    */
-  export function sampleWith(sampler: kitchen.Sampler, level: number | null): number[];
+  describe(): string;
+}
+/** A pocket-sized interface exercising the object surface */
+export declare class Gadget {
+  /** Create a gadget with the given id */
+  constructor(id: bigint);
+  /** Render the gadget as a human-readable string */
+  describe(): string;
   /**
-   * Fails with the second domain
-   * @throws {kitchen.PantryError} when the call fails with one of its codes
+   * Poke the gadget a number of times, failing on a negative count
+   * @throws {KitchenError} when the call fails with one of its codes
    */
-  export function takeFromPantry(item: string): number;
+  poke(times: number): number;
   /**
-   * Fails with an untyped error
+   * The gadget's sensor readings, optionally limited
    * @throws {KitchenSinkError} (code -1) when the call fails
    */
-  export function parseAny(text: string): bigint;
-  export namespace nested {
-    /** Trivial nested-module function */
-    export function hello(): string;
-  }
+  readings(limit: number | null): number[];
+  /** The gadget subsystem version string */
+  static version(): string;
+  /**
+   * Release this wrapper's reference to the native object. Safe to call
+   * more than once; a wrapper that is never closed is released when it is
+   * garbage collected. Using the wrapper after `close()` throws.
+   */
+  close(): void;
+  /** Alias of `close()` for `using` declarations. */
+  [Symbol.dispose](): void;
 }
+/** A trivial helper */
+export declare function ping(): string;
+/** Identity for bool */
+export declare function boolId(x: boolean): boolean;
+export declare function i32Id(x: number): number;
+export declare function u32Id(x: number): number;
+export declare function i64Id(x: bigint): bigint;
+export declare function f64Id(x: number): number;
+export declare function echoString(s: string): string;
+export declare function echoBytes(b: Uint8Array): Uint8Array;
+/** Register a listener, returning how many are attached */
+export declare function subscribe(listener: ReadyListener): number;
+/** Register a listener if one is given */
+export declare function maybeSubscribe(listener: ReadyListener | null): boolean;
+/** Optional object in both directions */
+export declare function maybeGadget(fallback: Gadget | null): Gadget | null;
+/** A list of objects */
+export declare function gadgets(): Gadget[];
+/** An iterator over objects */
+export declare function streamGadgets(): NativeIterator<Gadget>;
+/**
+ * Optional struct return
+ * @throws {KitchenError} when the call fails with one of its codes
+ */
+export declare function maybeItem(id: bigint): Item | null;
+/** List of structs */
+export declare function listItems(): Item[];
+/** Map return type */
+export declare function getAttrs(): Record<string, number>;
+/** Iterator return type */
+export declare function streamItems(): NativeIterator<Item>;
+/** Returns the shared Token record */
+export declare function makeToken(): Token;
+/** Async operation */
+export declare function doAsync(input: string): Promise<string>;
+/** Cancellable async operation */
+export declare function doCancellable(input: string, options?: { signal?: AbortSignal }): Promise<string>;
+/**
+ * Legacy operation kept for compatibility
+ * @deprecated Use `newOp` instead
+ */
+export declare function legacyOp(): number;
+/** Replacement for `legacyOp` */
+export declare function newOp(): number;
+/** Optional scalar in both directions */
+export declare function optI32Id(x: number | null): number | null;
+export declare function optBoolId(x: boolean | null): boolean | null;
+/** Optional C-style enum in both directions */
+export declare function optPriority(p: Priority | null): Priority | null;
+/** Optional scalars next to ordinary parameters */
+export declare function optMixed(base: number, scale: number | null, offset: bigint | null, label: string | null): number | null;
+/** A typed-array parameter */
+export declare function sumF64(xs: readonly number[] | Float64Array): number;
+/** Typed arrays in both directions */
+export declare function scaleI32(xs: readonly number[] | Int32Array, factor: number): number[];
+export declare function idsU64(ids: readonly bigint[] | BigUint64Array): bigint[];
+/** Every slice element type */
+export declare function mixedSlices(a: readonly number[] | Int8Array, b: readonly number[] | Int16Array, c: readonly number[] | Uint16Array, d: readonly number[] | Uint32Array, e: readonly bigint[] | BigInt64Array, f: readonly number[] | Float32Array): number[];
+/** Async returning an optional scalar */
+export declare function asyncMaybeCount(): Promise<bigint | null>;
+/** Async returning a typed array */
+export declare function asyncSamples(n: number, options?: { signal?: AbortSignal }): Promise<number[]>;
+/** Iterator of optional scalars */
+export declare function streamMaybe(): NativeIterator<number | null>;
+/** Iterator of typed arrays */
+export declare function streamChunks(): NativeIterator<number[]>;
+/**
+ * Drive a consumer-implemented sampler
+ * @throws {PantryError} when the call fails with one of its codes
+ */
+export declare function sampleWith(sampler: Sampler, level: number | null): number[];
+/**
+ * Fails with the second domain
+ * @throws {PantryError} when the call fails with one of its codes
+ */
+export declare function takeFromPantry(item: string): number;
+/**
+ * Fails with an untyped error
+ * @throws {KitchenSinkError} (code -1) when the call fails
+ */
+export declare function parseAny(text: string): bigint;
+/** A trivial function returning a string */
+export declare function hello(): string;
 
 // END index.d.ts

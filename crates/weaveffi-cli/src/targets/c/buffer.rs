@@ -5,7 +5,8 @@
 //! for every record and rich enum (and for every error code that carries
 //! fields), a struct for every list and map shape the API uses, and
 //! `static inline` codecs for each: `{name}_write`, `{name}_read`,
-//! `{name}_decode`, and `{name}_free`. Optionals are pointers (`NULL` is
+//! `{name}_decode`, `{name}_take` (decode a returned run, then release it),
+//! and `{name}_free`. Optionals are pointers (`NULL` is
 //! absent), so they have codecs but no struct.
 //!
 //! The fixed reader and writer live in `runtime/buffer_runtime.h` and are
@@ -120,23 +121,21 @@ impl<'a> Codecs<'a> {
         };
         let mut users = Vec::new();
         let mut user_index = HashMap::new();
-        for m in &model.modules {
-            for s in &m.structs {
-                user_index.insert(s.name.as_str(), users.len());
-                users.push(UserType {
-                    name: s.c_tag.clone(),
-                    doc: doc(&s.doc, &s.deprecated),
-                    body: Body::Fields(&s.fields),
-                });
-            }
-            for e in m.enums.iter().filter(|e| e.rich) {
-                user_index.insert(e.name.as_str(), users.len());
-                users.push(UserType {
-                    name: e.c_tag.clone(),
-                    doc: doc(&e.doc, &e.deprecated),
-                    body: Body::Variants(e),
-                });
-            }
+        for s in &model.records {
+            user_index.insert(s.name.as_str(), users.len());
+            users.push(UserType {
+                name: s.c_tag.clone(),
+                doc: doc(&s.doc, &s.deprecated),
+                body: Body::Fields(&s.fields),
+            });
+        }
+        for e in model.enums.iter().filter(|e| e.is_rich()) {
+            user_index.insert(e.name.as_str(), users.len());
+            users.push(UserType {
+                name: e.c_tag.clone(),
+                doc: doc(&e.doc, &e.deprecated),
+                body: Body::Variants(e),
+            });
         }
         for table in errors::tables(model, "Error") {
             for row in table.codes.iter().filter(|r| !r.code.fields.is_empty()) {
@@ -185,7 +184,7 @@ impl<'a> Codecs<'a> {
         match ty {
             Ty::Record(n) | Ty::RichEnum(n) => Some(self.user(n).name.clone()),
             Ty::Optional(_) | Ty::List(_) | Ty::Map(_, _) => {
-                Some(format!("{}_{}", self.prefix, codecs::stem(ty)))
+                Some(format!("{}_buf_{}", self.prefix, codecs::stem(ty)))
             }
             _ => None,
         }
@@ -363,6 +362,10 @@ impl<'a> Codecs<'a> {
         w.line(" *   T_decode(ptr, len, out)  decodes a whole buffer; on a malformed");
         w.line(" *                            buffer it frees what it built and");
         w.line(" *                            returns false");
+        w.line(" *   T_take(run, out)         decodes a run the producer returned,");
+        w.line(format!(
+            " *                            then releases the run with {p}_run_free"
+        ));
         w.line(" *   T_free(v)                releases a decoded value");
         w.line(" *");
         w.line(" * An optional's T_write takes the nullable pointer itself. Writing an");
@@ -384,6 +387,9 @@ impl<'a> Codecs<'a> {
             ));
             w.line(format!(
                 "static inline bool {n}_decode(const uint8_t* ptr, size_t len, {v}* out);"
+            ));
+            w.line(format!(
+                "static inline bool {n}_take({p}_run run, {v}* out);"
             ));
             w.line(format!("static inline void {n}_free({v}* v);"));
         }
@@ -427,6 +433,16 @@ impl<'a> Codecs<'a> {
                         w.line("return false;");
                     });
                     w.line("return true;");
+                },
+            );
+            w.blank();
+            w.block(
+                format!("static inline bool {n}_take({p}_run run, {v}* out) {{"),
+                "}",
+                |w| {
+                    w.line(format!("bool ok = {n}_decode(run.ptr, run.len, out);"));
+                    w.line(format!("{p}_run_free(run);"));
+                    w.line("return ok;");
                 },
             );
             w.blank();

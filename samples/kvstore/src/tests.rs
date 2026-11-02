@@ -1,19 +1,30 @@
-//! Producer-side tests: the store's behavior through its safe Rust API, plus
-//! the ABI paths that the safe API can't reach (error payloads, a
-//! consumer-built callback vtable, async completion and cancellation).
+//! Producer-side tests: the store's behavior through its safe Rust API. The
+//! C ABI paths (error payloads, consumer vtables, async completion and
+//! cancellation) are exercised by the conformance consumers in every
+//! language.
 
-#![allow(unsafe_code)]
-
-use crate::kv::stats::*;
-use crate::kv::*;
 use crate::report::*;
+use crate::stats::*;
+use crate::*;
 use std::collections::BTreeMap;
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
-use weaveffi::abi::{self, ErrorDomain, FfiError};
+use std::sync::{Arc, Mutex};
+use weaveffi::__rt::{ErrorType, FfiError};
 use weaveffi::ForeignError;
+
+type Tag = crate::__weaveffi::Tag;
+
+/// The code and payload a domain error reports through the ABI.
+fn reported(e: KvError) -> (i32, Vec<u8>) {
+    let err: FfiError = <KvError as ErrorType<Tag>>::into_ffi(e);
+    (err.code, err.payload().to_vec())
+}
+
+/// The value-buffer encoding of a string.
+fn encoded(s: &str) -> Vec<u8> {
+    let mut out = (s.len() as u32).to_le_bytes().to_vec();
+    out.extend_from_slice(s.as_bytes());
+    out
+}
 
 fn store() -> Arc<Store> {
     Arc::new(Store::open("/tmp/kv".to_string()).unwrap())
@@ -96,9 +107,8 @@ fn capacity_rejects_new_keys_only() {
     let err = Arc::clone(&s)
         .put("b".to_string(), vec![], EntryKind::Volatile, None)
         .unwrap_err();
-    assert_eq!(err.code(), 1003);
     assert_eq!(err.to_string(), "store is full (1 entries)");
-    assert_eq!(err.payload(), abi::encode_value(&1u32));
+    assert_eq!(reported(err), (1003, 1u32.to_le_bytes().to_vec()));
     assert_eq!(Store::default_capacity(), 1_000_000);
 }
 
@@ -250,14 +260,9 @@ fn policy_admits_routes_and_rejects() {
     let err = Arc::clone(&s)
         .put("secret".to_string(), vec![], EntryKind::Volatile, None)
         .unwrap_err();
-    assert_eq!(err.code(), 1005);
     assert_eq!(
-        err.payload(),
-        KvError::Rejected {
-            key: "secret".to_string(),
-            reason: "no secrets".to_string()
-        }
-        .payload()
+        reported(err),
+        (1005, [encoded("secret"), encoded("no secrets")].concat())
     );
     s.set_policy(None);
     assert!(!s.has_policy());
@@ -329,15 +334,12 @@ fn loaders_fill_misses() {
     let err = s
         .get_or_load("y".to_string(), Some(shelf(None, Some("z"), false)))
         .unwrap_err();
-    assert_eq!(err.code(), 1001);
-    assert_eq!(err.payload(), abi::encode_value(&"z".to_string()));
+    assert_eq!(reported(err), (1001, encoded("z")));
     let err = s
         .get_or_load("y".to_string(), Some(shelf(None, None, true)))
         .unwrap_err();
-    assert_eq!(
-        (err.code(), err.to_string()),
-        (1006, "shelf is broken".to_string())
-    );
+    assert_eq!(err.to_string(), "shelf is broken");
+    assert_eq!(reported(err).0, 1006);
 }
 
 #[test]
@@ -404,243 +406,6 @@ fn stats_and_report() {
     ));
 }
 
-// ── ABI-level tests ────────────────────────────────────────────────────────
-
-/// A consumer-side policy built exactly as a generated binding builds one:
-/// a heap context plus a process-wide vtable. It rejects every write with a
-/// typed error carrying a payload.
-struct RejectAll {
-    freed: Arc<AtomicBool>,
-}
-
-unsafe extern "C" fn reject_ttl_for(
-    _ctx: *mut c_void,
-    _key_ptr: *const u8,
-    _key_len: usize,
-    has_requested: bool,
-    requested: i64,
-    out_value: *mut i64,
-    _out_err: *mut FfiError,
-) -> bool {
-    // An optional scalar crosses as a presence flag and a value, both ways.
-    unsafe { *out_value = requested * 2 };
-    has_requested
-}
-
-unsafe extern "C" fn reject_admit(
-    _ctx: *mut c_void,
-    entry_ptr: *const u8,
-    entry_len: usize,
-    _out_ptr: *mut *mut u8,
-    _out_len: *mut usize,
-    out_err: *mut FfiError,
-) {
-    let entry: Entry =
-        unsafe { abi::decode_value(std::slice::from_raw_parts(entry_ptr, entry_len)) }.unwrap();
-    let payload = KvError::Rejected {
-        key: entry.key,
-        reason: "read-only".to_string(),
-    }
-    .payload();
-    let message = "rejected";
-    unsafe {
-        crate::kvstore_error_set(out_err, 1005, message.as_ptr(), message.len());
-        crate::kvstore_error_set_payload(out_err, payload.as_ptr(), payload.len());
-    }
-}
-
-unsafe extern "C" fn reject_route(
-    _ctx: *mut c_void,
-    _key_ptr: *const u8,
-    _key_len: usize,
-    home: *mut Store,
-    _out_err: *mut FfiError,
-) -> *mut Store {
-    home
-}
-
-unsafe extern "C" fn reject_free(ctx: *mut c_void) {
-    let state = unsafe { Box::from_raw(ctx.cast::<RejectAll>()) };
-    state.freed.store(true, Ordering::SeqCst);
-}
-
-static REJECT_VTABLE: kvstore_kv_Policy_vtable = kvstore_kv_Policy_vtable {
-    header: abi::VtableHeader {
-        size: std::mem::size_of::<kvstore_kv_Policy_vtable>() as u32,
-        flags: 0,
-        free: reject_free,
-    },
-    ttl_for: reject_ttl_for,
-    admit: reject_admit,
-    route: reject_route,
-};
-
-#[test]
-fn a_typed_callback_error_reaches_the_caller_with_its_payload() {
-    let freed = Arc::new(AtomicBool::new(false));
-    let mut err = FfiError::default();
-    let path = "/tmp/abi";
-    let s = unsafe { kvstore_kv_Store_open(path.as_ptr(), path.len(), &mut err) };
-    assert_eq!(err.code, 0);
-    let ctx = Box::into_raw(Box::new(RejectAll {
-        freed: Arc::clone(&freed),
-    }));
-    unsafe { kvstore_kv_Store_set_policy(s, ctx.cast(), &REJECT_VTABLE, &mut err) };
-    assert_eq!(err.code, 0);
-
-    let (key, value) = ("k", b"v");
-    let mut len = 0usize;
-    let out = unsafe {
-        kvstore_kv_Store_put(
-            s,
-            key.as_ptr(),
-            key.len(),
-            value.as_ptr(),
-            value.len(),
-            EntryKind::Volatile as i32,
-            false,
-            0,
-            &mut len,
-            &mut err,
-        )
-    };
-    assert!(out.is_null());
-    assert_eq!(err.code, 1005);
-    // The consumer's code decoded into the typed `KvError`, so the caller
-    // sees that error's own message, rendered from its fields.
-    assert_eq!(
-        unsafe { err.message_str() },
-        Some("write to k rejected: read-only")
-    );
-    let mut r = abi::BufferReader::token_free(err.payload());
-    assert_eq!(r.read_string().unwrap(), "k");
-    assert_eq!(r.read_string().unwrap(), "read-only");
-    unsafe { abi::error_clear(&mut err) };
-
-    assert!(!freed.load(Ordering::SeqCst));
-    unsafe { kvstore_kv_Store_destroy(s) };
-    assert!(
-        freed.load(Ordering::SeqCst),
-        "destroying the store frees its policy"
-    );
-}
-
-type Done = mpsc::Sender<(i32, u32)>;
-
-extern "C" fn on_compacted(context: *mut c_void, err: *mut FfiError, result: u32) {
-    let tx = unsafe { &*(context as *const Done) }.clone();
-    let code = if err.is_null() {
-        0
-    } else {
-        let code = unsafe { (*err).code };
-        unsafe { crate::kvstore_error_free(err) };
-        code
-    };
-    tx.send((code, result)).unwrap();
-}
-
-/// Launch `compact` through its thunk and wait for the completion.
-fn compact(s: &Arc<Store>, pause_ms: u32, cancel_after: Option<Duration>) -> (i32, u32) {
-    let (tx, rx) = mpsc::channel::<(i32, u32)>();
-    let tx_ptr = Box::into_raw(Box::new(tx));
-    let token = crate::kvstore_cancel_token_create();
-    unsafe {
-        kvstore_kv_Store_compact(Arc::as_ptr(s), pause_ms, token, on_compacted, tx_ptr.cast());
-    }
-    if let Some(delay) = cancel_after {
-        std::thread::sleep(delay);
-        unsafe { crate::kvstore_cancel_token_cancel(token) };
-    }
-    unsafe { crate::kvstore_cancel_token_destroy(token) };
-    let out = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    drop(unsafe { Box::from_raw(tx_ptr) });
-    out
-}
-
-#[test]
-fn compaction_notifies_from_a_producer_thread_and_cancels_cooperatively() {
-    let s = store();
-    let rec = Arc::new(Recorder::default());
-    s.subscribe(Arc::clone(&rec) as Arc<dyn Listener>);
-    Arc::clone(&s)
-        .put("old".to_string(), vec![1], EntryKind::Volatile, Some(1))
-        .unwrap();
-    put(&s, "new", b"2");
-    s.tick(5);
-    rec.threads.lock().unwrap().clear();
-
-    assert_eq!(compact(&s, 0, None), (0, 1));
-    let threads = rec.threads.lock().unwrap().clone();
-    assert_eq!(threads.len(), 1);
-    assert_ne!(threads[0], std::thread::current().id());
-
-    // A long pause, cancelled: the call completes with the cancelled code
-    // at once, and the background pause stops soon after.
-    let started = std::time::Instant::now();
-    assert_eq!(
-        compact(&s, 60_000, Some(Duration::from_millis(20))),
-        (abi::CANCELLED_ERROR_CODE, 0)
-    );
-    assert!(started.elapsed() < Duration::from_secs(5));
-    let stopped = (0..2000).any(|_| {
-        std::thread::sleep(Duration::from_millis(1));
-        Store::active_jobs() == 0
-    });
-    assert!(stopped, "the cancelled pause stopped cooperatively");
-}
-
-#[test]
-fn contract_tables_are_exported() {
-    assert_eq!(crate::kvstore_abi_version(), abi::ABI_VERSION);
-    let mut len = 0usize;
-    assert!(!unsafe { crate::kv::kvstore_kv_contract(&mut len) }.is_null());
-    assert!(len > 40);
-    assert!(!unsafe { crate::report::kvstore_report_contract(&mut len) }.is_null());
-    assert_eq!(len, 3, "the function, the domain, and its code");
-}
-
-#[test]
-fn listener_vtables_are_released_once() {
-    static FREED: AtomicUsize = AtomicUsize::new(0);
-    unsafe extern "C" fn free(_ctx: *mut c_void) {
-        FREED.fetch_add(1, Ordering::SeqCst);
-    }
-    unsafe extern "C" fn accepts(
-        _ctx: *mut c_void,
-        _key_ptr: *const u8,
-        _key_len: usize,
-        _out_err: *mut FfiError,
-    ) -> bool {
-        true
-    }
-    unsafe extern "C" fn on_change(
-        _ctx: *mut c_void,
-        _ptr: *const u8,
-        _len: usize,
-        out_err: *mut FfiError,
-    ) {
-        let message = "nope";
-        unsafe { crate::kvstore_error_set(out_err, -4, message.as_ptr(), message.len()) };
-    }
-    static VTABLE: kvstore_kv_Listener_vtable = kvstore_kv_Listener_vtable {
-        header: abi::VtableHeader {
-            size: std::mem::size_of::<kvstore_kv_Listener_vtable>() as u32,
-            flags: 0,
-            free,
-        },
-        accepts,
-        on_change,
-    };
-    let mut err = FfiError::default();
-    let s = Arc::new(Store::new());
-    let raw = Arc::as_ptr(&s);
-    let id = unsafe { kvstore_kv_Store_subscribe(raw, std::ptr::null_mut(), &VTABLE, &mut err) };
-    assert_eq!((id, err.code), (1, 0));
-    put(&s, "k", b"v");
-    assert_eq!(s.listener_count(), 0);
-    assert_eq!(FREED.load(Ordering::SeqCst), 1);
-}
-
 #[test]
 fn optional_scalars_arrays_and_counts() {
     let s = store();
@@ -655,13 +420,16 @@ fn optional_scalars_arrays_and_counts() {
     assert_eq!(s.value_sizes(), vec![3, 2]);
     assert_eq!(collect(s.expirations()), vec![Some(7), None]);
     assert_eq!(
-        weaveffi::abi::block_on(s.version_of("a".to_string())),
+        weaveffi::__rt::spawn::block_on(s.version_of("a".to_string())),
         Some(1)
     );
-    assert_eq!(weaveffi::abi::block_on(s.version_of("q".to_string())), None);
+    assert_eq!(
+        weaveffi::__rt::spawn::block_on(s.version_of("q".to_string())),
+        None
+    );
     put(&s, "b", b"x");
     assert_eq!(
-        weaveffi::abi::block_on(s.versions(vec!["b".into(), "q".into(), "a".into()])),
+        weaveffi::__rt::spawn::block_on(s.versions(vec!["b".into(), "q".into(), "a".into()])),
         vec![2, 0, 1]
     );
 }
@@ -684,7 +452,10 @@ fn rank_orders_by_the_consumers_scores() {
     put(&s, "b", b"333");
     put(&s, "c", b"22");
     assert_eq!(s.rank(Arc::new(BySize(1.0))).unwrap(), vec!["b", "c", "a"]);
-    assert_eq!(s.rank(Arc::new(BySize(-1.0))).unwrap_err().code(), 1006);
+    assert_eq!(
+        reported(s.rank(Arc::new(BySize(-1.0))).unwrap_err()).0,
+        1006
+    );
 }
 
 #[test]
@@ -697,42 +468,4 @@ fn import_lines_fails_untyped() {
         Err("line 2: expected key=value".to_string())
     );
     assert_eq!(s.count(), 3, "the lines before the bad one were stored");
-
-    // `import_lines` throws `any`: the generic code and the `String`.
-    let mut err = FfiError::default();
-    let text = "nope";
-    let n = unsafe {
-        kvstore_kv_Store_import_lines(Arc::as_ptr(&s), text.as_ptr(), text.len(), &mut err)
-    };
-    assert_eq!((n, err.code), (0, abi::GENERIC_ERROR_CODE));
-    assert_eq!(
-        unsafe { err.message_str() },
-        Some("line 1: expected key=value")
-    );
-    unsafe { abi::error_clear(&mut err) };
-}
-
-#[test]
-fn a_consumer_policy_returns_optional_scalars() {
-    let freed = Arc::new(AtomicBool::new(false));
-    let ctx = Box::into_raw(Box::new(RejectAll {
-        freed: Arc::clone(&freed),
-    }));
-    // The same wrapper a `set_policy` call builds, driven directly: the
-    // optional TTL crosses as a presence flag plus a value, both ways.
-    let policy = unsafe { abi::lift_callback::<dyn Policy>(ctx.cast(), &REJECT_VTABLE, "p") }
-        .unwrap_or_else(|_| panic!("a valid vtable"));
-    assert_eq!(policy.ttl_for("k", Some(4)), Ok(Some(8)));
-    assert_eq!(policy.ttl_for("k", None), Ok(None));
-    let entry = put(&store(), "k", b"v");
-    assert_eq!(
-        policy.admit(&entry),
-        Err(KvError::Rejected {
-            key: "k".to_string(),
-            reason: "read-only".to_string()
-        }),
-        "a consumer's KvError arrives typed"
-    );
-    drop(policy);
-    assert!(freed.load(Ordering::SeqCst));
 }

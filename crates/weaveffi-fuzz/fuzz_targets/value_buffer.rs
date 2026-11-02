@@ -1,5 +1,5 @@
-//! Fuzzes the runtime's value-buffer decoders (`weaveffi::abi::decode_value`)
-//! with arbitrary bytes. The first byte picks a shape; the rest is the
+//! Fuzzes the runtime's value-buffer decoders (`FfiType::read`) with
+//! arbitrary bytes. The first byte picks a shape; the rest is the
 //! buffer. A decode must either fail cleanly or produce a value that encodes
 //! back to the same bytes (maps, which collapse duplicate keys and don't keep
 //! wire order, must instead survive a second round trip unchanged).
@@ -16,19 +16,12 @@ use std::collections::{BTreeMap, HashMap};
 #[cfg(fuzzing)]
 use libfuzzer_sys::fuzz_target;
 #[cfg(fuzzing)]
-use weaveffi::abi::{encode_value, BufferDecodeError, BufferValue};
-
-/// Decode a buffer of one of the fuzzed types, none of which carries an
-/// object token, so no input can make the decode unsound.
-fn decode_value<T: BufferValue>(data: &[u8]) -> Result<T, BufferDecodeError> {
-    // SAFETY: the fuzzed types contain no interfaces, so no token is adopted.
-    unsafe { weaveffi::abi::decode_value(data) }
-}
+use weaveffi_fuzz::{decode_value, encode_value, Value};
 
 /// Decodes `data` as `T`; on success, re-encodes it and checks the bytes
 /// match.
 #[cfg(fuzzing)]
-fn exact<T: BufferValue>(data: &[u8]) {
+fn exact<T: Value>(data: &[u8]) {
     if let Ok(value) = decode_value::<T>(data) {
         assert_eq!(encode_value(&value), data, "re-encoding changed the bytes");
     }
@@ -37,7 +30,7 @@ fn exact<T: BufferValue>(data: &[u8]) {
 /// Decodes `data` as `T`; on success, checks that the value survives an
 /// encode and decode unchanged.
 #[cfg(fuzzing)]
-fn stable<T: BufferValue + PartialEq + std::fmt::Debug>(data: &[u8]) {
+fn stable<T: Value + PartialEq + std::fmt::Debug>(data: &[u8]) {
     if let Ok(value) = decode_value::<T>(data) {
         let again: T = decode_value(&encode_value(&value)).expect("re-encoded value decodes");
         assert_eq!(again, value);

@@ -33,15 +33,16 @@ trait-object interfaces are on the [roadmap](roadmap.md).
 ## What's the runtime overhead?
 
 A call costs the marshalling of its arguments, one `extern "C"` call, and the
-marshalling of its result. Scalars pass by value. Strings and bytes pass as
-borrowed `(ptr, len)` views, so the producer copies only what it keeps.
-Objects pass as one pointer. Optional scalars pass as a flag plus the
-value, and numeric lists as typed arrays the producer reads in place (a
-`&[f64]` parameter borrows the caller's array without copying). Records and
-other collections are encoded into one value buffer per value. Async calls add a completion callback and whatever executor drives
-the future. The runtime itself is the small `weaveffi::abi` module; the
-`leak-check` counters cost an atomic update per counted operation and are off
-by default.
+marshalling of its result, and every value is one C value. Scalars pass by
+value, and optional scalars as a small `{has, value}` struct. Strings and
+bytes pass as borrowed runs (a pointer and a length), so the producer copies
+only what it keeps, and numeric lists as typed arrays the producer reads in
+place (a `&[f64]` parameter borrows the caller's array without copying).
+Objects pass as one pointer. Records and other collections are encoded into
+one value buffer per value. Async calls add a completion callback and
+whatever executor drives the future. The runtime itself is a small module
+inside the `weaveffi` crate; the `leak-check` counters cost an atomic update
+per counted operation and are off by default.
 
 ## How are errors propagated?
 
@@ -51,11 +52,19 @@ the callable throws, negative codes are the runtime's (untyped, panic,
 marshalling, callback failure, cancelled). A function declared `throws:
 KvError` (a `Result<T, KvError>` in Rust) surfaces the domain's codes as
 typed errors in every language, and an unknown code added later as the
-domain's base error. A function declared `throws: any` (a `Result` with any
-other error type, such as `anyhow::Error`) surfaces its failure as the
-library's base error with a message. A function without `throws` traps on
+domain's base error. A function declared `throws: any` (a `Result` with an
+untyped error such as `String`, `weaveffi::Error`, or `anyhow::Error`)
+surfaces its failure as the library's base error with a message. A function without `throws` traps on
 failure, since a failure there is a bug. See
 [Errors and Memory](guides/errors-and-memory.md#domain-errors-and-the-trap-channel).
+
+## Can I split an API across files or modules?
+
+Yes. An IDL can list other files under a top-level `imports:` (see
+[Multi-file IDLs](reference/idl.md#multi-file-idls)), and a Rust producer's
+exported items can live in any module or file of the crate. Either way the
+library is one namespace: names are unique across it, and no file or module
+appears in a C symbol or a binding's API.
 
 ## Can two WeaveFFI libraries live in one process?
 
@@ -68,9 +77,9 @@ own copy of the small runtime.
 ## What happens if the bindings and the library drift apart?
 
 They refuse to load. Every generated consumer compares the library's ABI
-revision with the one it was generated against, and checks that every
-declaration it uses is in the library's contract table with the same
-signature hash. On a mismatch it raises the language's load error (a
+revision with the one it was generated against, and calls the contract
+function of every declaration it was generated with, checking that it
+exists and returns the same signature hash. On a mismatch it raises the language's load error (a
 catchable one, in every language) naming the declaration that's missing or
 changed. The hashes cover declaration names, types, and flags, but not
 parameter or field names, documentation, or declaration order, so editing doc
@@ -82,10 +91,11 @@ ship.
 
 ## Does the CLI parse my Rust source?
 
-No. `#[weaveffi::module]` embeds a description of the API in the library it
-compiles, and `weaveffi generate` builds the crate and reads that
-description back out of the library, so macros, type aliases, and `#[cfg]`
-are already resolved and the bindings match the build exactly. `weaveffi
+No. WeaveFFI's attributes embed a description of each declaration in the
+library they're compiled into, and `weaveffi generate` builds the crate and
+reads that description back out of the library, so macros, type aliases,
+`#[cfg]`, and Cargo features are already resolved and the bindings match the
+build exactly. `weaveffi
 extract` prints it as an IDL. See [Library Mode](guides/extract.md).
 
 ## Can I customize the generated code?
@@ -120,7 +130,7 @@ are on the [roadmap](roadmap.md#windows-conformance-lanes-planned).
 
 Build it per platform and let `weaveffi package` bundle it into each
 ecosystem's package layout (npm platform packages, platform wheels, NuGet
-`runtimes/`, Android `jniLibs/`, and so on), then publish with each
+`runtimes/`, an XCFramework, and so on), then publish with each
 ecosystem's own tools. Every generated manifest takes its name and version
 from `[package]`. See [Packaging](guides/packaging.md).
 

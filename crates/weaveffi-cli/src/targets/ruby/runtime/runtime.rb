@@ -85,8 +85,8 @@ module {{MODULE}}
   end
 
   # @api private
-  # The native library and its runtime functions. The generated bindings
-  # attach every function they call here as well.
+  # The native library, its C types, and its runtime functions. The
+  # generated bindings attach every function they call here as well.
   module Native
     extend FFI::Library
 
@@ -111,8 +111,7 @@ module {{MODULE}}
     end
 
     # Checked before anything else is attached, so a mismatched library
-    # fails at require time instead of misreading an error struct or a value
-    # buffer later.
+    # fails at require time instead of misreading a value later.
     begin
       attach_function :{{PREFIX}}_abi_version, [], :uint32
     rescue FFI::NotFoundError
@@ -127,6 +126,86 @@ module {{MODULE}}
             "but the loaded library reports revision #{revision}"
     end
 
+    # `{{PREFIX}}_run`: a string's UTF-8, raw bytes, a typed array, or a
+    # value buffer, passed by value. NULL with length 0 is the empty run.
+    class Run < FFI::Struct
+      layout :ptr, :pointer,
+             :len, :size_t
+
+      # The memory an argument run points into, kept alive with the struct
+      # for as long as the library borrows it.
+      attr_accessor :memory
+    end
+
+    # `{{PREFIX}}_opt_bool`, an optional scalar passed by value; one class
+    # per scalar.
+    class OptBool < FFI::Struct
+      layout :has, :bool, :value, :bool
+    end
+
+    # `{{PREFIX}}_opt_i8`.
+    class OptI8 < FFI::Struct
+      layout :has, :bool, :value, :int8
+    end
+
+    # `{{PREFIX}}_opt_i16`.
+    class OptI16 < FFI::Struct
+      layout :has, :bool, :value, :int16
+    end
+
+    # `{{PREFIX}}_opt_i32`, also every optional C-style enum.
+    class OptI32 < FFI::Struct
+      layout :has, :bool, :value, :int32
+    end
+
+    # `{{PREFIX}}_opt_i64`.
+    class OptI64 < FFI::Struct
+      layout :has, :bool, :value, :int64
+    end
+
+    # `{{PREFIX}}_opt_u8`.
+    class OptU8 < FFI::Struct
+      layout :has, :bool, :value, :uint8
+    end
+
+    # `{{PREFIX}}_opt_u16`.
+    class OptU16 < FFI::Struct
+      layout :has, :bool, :value, :uint16
+    end
+
+    # `{{PREFIX}}_opt_u32`.
+    class OptU32 < FFI::Struct
+      layout :has, :bool, :value, :uint32
+    end
+
+    # `{{PREFIX}}_opt_u64`.
+    class OptU64 < FFI::Struct
+      layout :has, :bool, :value, :uint64
+    end
+
+    # `{{PREFIX}}_opt_f32`.
+    class OptF32 < FFI::Struct
+      layout :has, :bool, :value, :float
+    end
+
+    # `{{PREFIX}}_opt_f64`.
+    class OptF64 < FFI::Struct
+      layout :has, :bool, :value, :double
+    end
+
+    # The optional-scalar struct of each scalar.
+    OPT = {
+      bool: OptBool, i8: OptI8, i16: OptI16, i32: OptI32, i64: OptI64, u8: OptU8,
+      u16: OptU16, u32: OptU32, u64: OptU64, f32: OptF32, f64: OptF64
+    }.freeze
+
+    # A callback-interface argument, `{ctx, vtable}` by value (every
+    # interface's struct has this layout). A NULL vtable is none.
+    class Callback < FFI::Struct
+      layout :ctx, :pointer,
+             :vtable, :pointer
+    end
+
     # The `{{PREFIX}}_error` out-parameter every call reports through. The
     # message is UTF-8, not NUL-terminated, and NULL when empty.
     class ErrorStruct < FFI::Struct
@@ -137,18 +216,12 @@ module {{MODULE}}
              :payload_len, :size_t
     end
 
-    # One entry of a module's contract table.
-    class ContractEntry < FFI::Struct
-      layout :id, :uint64,
-             :hash, :uint64
-    end
-
     attach_function :{{PREFIX}}_error_set, [:pointer, :int32, :pointer, :size_t], :void
     attach_function :{{PREFIX}}_error_set_payload, [:pointer, :pointer, :size_t], :void
     attach_function :{{PREFIX}}_error_clear, [:pointer], :void
     attach_function :{{PREFIX}}_error_free, [:pointer], :void
     attach_function :{{PREFIX}}_alloc, [:size_t], :pointer
-    attach_function :{{PREFIX}}_free_bytes, [:pointer, :size_t], :void
+    attach_function :{{PREFIX}}_run_free, [Run.by_value], :void
     attach_function :{{PREFIX}}_cancel_token_create, [], :pointer
     attach_function :{{PREFIX}}_cancel_token_cancel, [:pointer], :void
     attach_function :{{PREFIX}}_cancel_token_is_cancelled, [:pointer], :bool
@@ -206,19 +279,17 @@ module {{MODULE}}
 
   # @api private
   # The marshalling every generated wrapper shares: argument checks and
-  # conversions, the call helpers (errors, out slots, returns), async
-  # completions, iterators, interface wrappers, value buffers, and callback
-  # interfaces.
+  # conversions, the call helpers, async completions, iterators, interface
+  # wrappers, value buffers, and callback interfaces.
   #
-  # Values are described by small Ruby literals. A *kind* says how a return,
-  # an async result, or an iterator element crosses: nil (void), a scalar
-  # (`:i32`, `:f64`, `:bool`; a C-style enum is `:i32`), `:string`, `:bytes`,
-  # `[:buffer, type]`, `[:slice, :i32]`, `[:opt, :i32]` (an optional scalar
-  # crossing as a flag and a value), `[:object, Class]`, `[:object?, Class]`,
-  # or `:pointer` (a constructor's raw pointer). A *type* says how a value
-  # is written into a value buffer: a scalar, `:string`, `:bytes`,
-  # `[:opt, type]`, `[:list, type]`, `[:map, key, value]`, or a class (a
-  # record, a rich enum's module, or an interface).
+  # Every value crosses as one C value, described by a *kind*: nil (void),
+  # a scalar (`:i32`, `:f64`, `:bool`; a C-style enum is `:i32`), `:string`,
+  # `:bytes`, `[:slice, :i32]` (a typed array), `[:buffer, type]` (a value
+  # buffer), `[:opt, :i32]` (an optional scalar), `[:object, Class]`,
+  # `[:object?, Class]`, or `:pointer` (a constructor's raw pointer). A
+  # *type* says how a value is written into a value buffer: a scalar,
+  # `:string`, `:bytes`, `[:opt, type]`, `[:list, type]`, `[:map, key,
+  # value]`, or a class (a record, a rich enum's module, or an interface).
   module Bridge
     # The ffi gem's name for each scalar.
     FFI_TYPES = {
@@ -233,10 +304,50 @@ module {{MODULE}}
       i64: -0x8000_0000_0000_0000..0x7fff_ffff_ffff_ffff, u64: 0..0xffff_ffff_ffff_ffff
     }.freeze
 
-    # The size in bytes of each typed-array element.
-    SIZES = { i8: 1, i16: 2, u16: 2, i32: 4, u32: 4, i64: 8, u64: 8, f32: 4, f64: 8 }.freeze
+    # The width in bytes of each fixed-width scalar (and typed-array
+    # element).
+    SIZES = { i8: 1, u8: 1, i16: 2, u16: 2, i32: 4, u32: 4, i64: 8, u64: 8, f32: 4, f64: 8 }.freeze
 
-    # --- Scalars, strings, and typed arrays ---
+    # `Array#pack` directives of the fixed-width scalars.
+    PACK = {
+      i8: 'c', u8: 'C', i16: 's<', u16: 'S<', i32: 'l<', u32: 'L<', i64: 'q<', u64: 'Q<', f32: 'e', f64: 'E'
+    }.freeze
+
+    # --- Kinds ---
+
+    # The ffi gem's type of a value of `kind` in a C signature.
+    def self.ffi_type(kind)
+      case kind
+      when nil then :void
+      when :string, :bytes then Native::Run.by_value
+      when :pointer then :pointer
+      when Symbol then FFI_TYPES.fetch(kind)
+      else
+        case kind[0]
+        when :opt then Native::OPT.fetch(kind[1]).by_value
+        when :slice, :buffer then Native::Run.by_value
+        else :pointer
+        end
+      end
+    end
+
+    # The C type `kind` crosses as, as a Symbol (a cache key).
+    def self.type_key(kind)
+      case kind
+      when nil then :void
+      when :string, :bytes then :run
+      when :pointer then :pointer
+      when Symbol then FFI_TYPES.fetch(kind)
+      else
+        case kind[0]
+        when :opt then :"opt_#{kind[1]}"
+        when :slice, :buffer then :run
+        else :pointer
+        end
+      end
+    end
+
+    # --- Arguments ---
 
     # `value` checked for scalar `kind`: an Integer in range (RangeError
     # rather than wrapping), a Numeric for a float, any truthiness for a
@@ -256,14 +367,18 @@ module {{MODULE}}
       end
     end
 
-    # The `[has, value]` slots of an optional scalar argument.
+    # An optional scalar argument: the `{has, value}` struct of `kind`.
     def self.opt_arg(value, kind)
-      value.nil? ? [false, kind == :bool ? false : 0] : [true, scalar(value, kind)]
+      opt = Native::OPT.fetch(kind).new
+      unless value.nil?
+        opt[:has] = true
+        opt[:value] = scalar(value, kind)
+      end
+      opt
     end
 
-    # The UTF-8 bytes of a string argument, as a private binary copy the
-    # library borrows for the call.
-    def self.string_arg(value)
+    # The UTF-8 bytes of a string, as a private binary copy.
+    def self.utf8(value)
       str = String.try_convert(value)
       raise TypeError, "expected a String, got #{value.class}" if str.nil?
 
@@ -273,65 +388,134 @@ module {{MODULE}}
         else
           str.encode(Encoding::UTF_8).b
         end
-      raise ArgumentError, 'string is not valid UTF-8' unless bytes.force_encoding(Encoding::UTF_8).valid_encoding?
+      raise ArgumentError, 'string is not valid UTF-8' unless bytes.dup.force_encoding(Encoding::UTF_8).valid_encoding?
 
-      bytes.force_encoding(Encoding::BINARY)
+      bytes
     rescue EncodingError => e
       raise ArgumentError, "string can't be converted to UTF-8 (#{e.message})"
     end
 
-    # A private binary copy of a bytes argument.
-    def self.bytes_arg(value)
+    # A private binary copy of bytes.
+    def self.binary(value)
       str = String.try_convert(value)
       raise TypeError, "expected a String of bytes, got #{value.class}" if str.nil?
 
       str.b
     end
 
-    # The `[pointer, count]` slots of a typed-array argument: the elements,
-    # range-checked, in an aligned native array (NULL when empty).
-    def self.slice_arg(values, kind)
+    # The packed native elements of a typed array, each range-checked.
+    def self.pack_slice(values, kind)
       ary = Array.try_convert(values)
       raise TypeError, "expected an Array, got #{values.class}" if ary.nil?
-      return [nil, 0] if ary.empty?
 
-      ptr = FFI::MemoryPointer.new(FFI_TYPES.fetch(kind), ary.length)
-      ptr.public_send(:"put_array_of_#{FFI_TYPES.fetch(kind)}", 0, ary.map { |v| scalar(v, kind) })
-      [ptr, ary.length]
+      ary.map { |v| scalar(v, kind) }.pack("#{PACK.fetch(kind)}*")
     end
 
-    # Copies a borrowed (ptr, len) run without releasing it.
-    def self.borrow_bytes(ptr, len)
+    # A run the library borrows for a call: `bytes` copied into native
+    # memory (8-aligned, so a typed array is aligned for its element) that
+    # lives as long as the struct. Empty bytes are the empty run.
+    def self.run(bytes)
+      run = Native::Run.new
+      return run if bytes.empty?
+
+      memory = FFI::MemoryPointer.new(:uint8, bytes.bytesize)
+      memory.put_bytes(0, bytes)
+      run[:ptr] = memory
+      run[:len] = bytes.bytesize
+      run.memory = memory
+      run
+    end
+
+    # A string argument's run.
+    def self.string_arg(value)
+      run(utf8(value))
+    end
+
+    # A bytes argument's run.
+    def self.bytes_arg(value)
+      run(binary(value))
+    end
+
+    # A typed-array argument's run.
+    def self.slice_arg(values, kind)
+      run(pack_slice(values, kind))
+    end
+
+    # The runs of sealed value-buffer encodings.
+    def self.runs(encodings)
+      encodings.map { |bytes| run(bytes) }
+    end
+
+    # --- Values the library hands over ---
+
+    # Copies the bytes of a run without releasing it.
+    def self.run_bytes(run)
+      ptr = run[:ptr]
+      len = run[:len]
+      raise malformed('null run with a length') if ptr.null? && !len.zero?
+
       ptr.null? || len.zero? ? ''.b : ptr.read_bytes(len)
     end
 
-    # Copies a borrowed (ptr, len) UTF-8 run without releasing it.
-    def self.borrow_string(ptr, len)
-      borrow_bytes(ptr, len).force_encoding(Encoding::UTF_8)
+    # Copies the bytes of a run the library returned, then releases it.
+    def self.take_run(run)
+      bytes = run_bytes(run)
+      Native.{{PREFIX}}_run_free(run) unless run[:ptr].null?
+      bytes
     end
 
-    # Copies a borrowed typed array of `len` elements without releasing it.
-    def self.borrow_slice(ptr, len, kind)
-      ptr.null? || len.zero? ? [] : ptr.public_send(:"get_array_of_#{FFI_TYPES.fetch(kind)}", 0, len)
+    # The elements of a typed array's packed bytes.
+    def self.unpack_slice(bytes, kind)
+      raise malformed("ragged #{kind} array") unless (bytes.bytesize % SIZES.fetch(kind)).zero?
+
+      bytes.unpack("#{PACK.fetch(kind)}*")
     end
 
-    # Copies a returned (ptr, len) run, then releases it.
-    def self.take_bytes(ptr, len)
-      data = borrow_bytes(ptr, len)
-      Native.{{PREFIX}}_free_bytes(ptr, len) unless ptr.null?
-      data
+    # A value the library handed over (a return, an async result, or an
+    # iterator element) as `kind`: runs are copied and released, objects
+    # adopted.
+    def self.take(kind, value)
+      receive(kind, value) { |run| take_run(run) }
     end
 
-    # Copies a returned UTF-8 run, then releases it.
-    def self.take_string(ptr, len)
-      take_bytes(ptr, len).force_encoding(Encoding::UTF_8)
+    # A callback argument as `kind`: runs are copied (the library still
+    # owns them), objects adopted.
+    def self.borrow(kind, value)
+      receive(kind, value) { |run| run_bytes(run) }
     end
 
-    # Copies a returned typed array, then releases it.
-    def self.take_slice(ptr, len, kind)
-      values = borrow_slice(ptr, len, kind)
-      Native.{{PREFIX}}_free_bytes(ptr, len * SIZES.fetch(kind)) unless ptr.null?
-      values
+    # Receives `value` as `kind`, reading a run's bytes with the block.
+    def self.receive(kind, value)
+      case kind
+      when nil then nil
+      when :pointer then nonnull(value)
+      when :string then text(yield(value))
+      when :bytes then yield(value)
+      when Symbol then value
+      else
+        case kind[0]
+        when :opt then value[:has] ? value[:value] : nil
+        when :slice then unpack_slice(yield(value), kind[1])
+        when :buffer then decode_bytes(yield(value), kind[1])
+        when :object then adopt(kind[1], nonnull(value))
+        when :object? then value.null? ? nil : adopt(kind[1], value)
+        end
+      end
+    end
+
+    # UTF-8 text from the library.
+    def self.text(bytes)
+      str = bytes.force_encoding(Encoding::UTF_8)
+      raise malformed('string is not valid UTF-8') unless str.valid_encoding?
+
+      str
+    end
+
+    # A returned object pointer that must not be NULL.
+    def self.nonnull(ptr)
+      raise NativeBugError.new('null object pointer', code: Error::MARSHAL) if ptr.null?
+
+      ptr
     end
 
     # --- Errors ---
@@ -342,8 +526,9 @@ module {{MODULE}}
       code = err[:code]
       return nil if code.zero?
 
-      message = borrow_string(err[:message_ptr], err[:message_len])
-      payload = err[:payload_ptr].null? ? nil : borrow_bytes(err[:payload_ptr], err[:payload_len])
+      message = err[:message_ptr].null? ? ''.b : err[:message_ptr].read_bytes(err[:message_len])
+      message.force_encoding(Encoding::UTF_8)
+      payload = err[:payload_ptr].null? ? nil : err[:payload_ptr].read_bytes(err[:payload_len])
       Native.{{PREFIX}}_error_clear(err.to_ptr)
       [code, message.empty? ? nil : message, payload]
     end
@@ -403,87 +588,13 @@ module {{MODULE}}
     # --- Calls ---
 
     # Makes one synchronous call. Seals `writers` (the call's value-buffer
-    # arguments), allocates the out slots `kind` needs, yields the sealed
-    # encodings, the out slots, and the error slot, raises the reported
+    # arguments), yields their runs and the error slot, raises the reported
     # error, and returns the result received per `kind`.
     def self.call(error, kind = nil, *writers)
       err = Native::ErrorStruct.new
-      outs = return_slots(kind)
-      result = yield(*seal(*writers), *outs, err)
+      result = yield(*runs(seal(*writers)), err)
       check!(err, error)
-      take_return(kind, result, outs)
-    end
-
-    # The out slots a synchronous return of `kind` needs.
-    def self.return_slots(kind)
-      case kind
-      when :string, :bytes then [FFI::MemoryPointer.new(:size_t)]
-      when Array
-        case kind[0]
-        when :buffer, :slice then [FFI::MemoryPointer.new(:size_t)]
-        when :opt then [FFI::MemoryPointer.new(FFI_TYPES.fetch(kind[1]))]
-        else []
-        end
-      else []
-      end
-    end
-
-    # A synchronous call's result, received per `kind`.
-    def self.take_return(kind, result, outs)
-      case kind
-      when :pointer then nonnull(result)
-      when :string, :bytes then take_value(kind, result, outs[0].read(:size_t))
-      when Array
-        case kind[0]
-        when :buffer, :slice then take_value(kind, result, outs[0].read(:size_t))
-        when :opt then result ? outs[0].read(FFI_TYPES.fetch(kind[1])) : nil
-        else take_value(kind, result)
-        end
-      else result
-      end
-    end
-
-    # A value the library handed over (an async result or an iterator
-    # element) from its slot values, received per `kind`: runs are copied
-    # and released, objects adopted.
-    def self.take_value(kind, *slots)
-      case kind
-      when nil then nil
-      when :string then take_string(*slots)
-      when :bytes then take_bytes(*slots)
-      when Symbol then slots[0]
-      else
-        case kind[0]
-        when :buffer then decode(slots[0], slots[1], kind[1])
-        when :slice then take_slice(slots[0], slots[1], kind[1])
-        when :opt then slots[0] ? slots[1] : nil
-        when :object then adopt(kind[1], nonnull(slots[0]))
-        when :object? then slots[0].null? ? nil : adopt(kind[1], slots[0])
-        end
-      end
-    end
-
-    # The C types of the slots a value of `kind` occupies as an async
-    # result.
-    def self.slot_types(kind)
-      case kind
-      when nil then []
-      when :string, :bytes then %i[pointer size_t]
-      when Symbol then [FFI_TYPES.fetch(kind)]
-      else
-        case kind[0]
-        when :buffer, :slice then %i[pointer size_t]
-        when :opt then [:bool, FFI_TYPES.fetch(kind[1])]
-        else [:pointer]
-        end
-      end
-    end
-
-    # A returned object pointer that must not be NULL.
-    def self.nonnull(ptr)
-      raise NativeBugError.new('null object pointer', code: Error::MARSHAL) if ptr.null?
-
-      ptr
+      take(kind, result)
     end
 
     # --- Async calls ---
@@ -492,23 +603,25 @@ module {{MODULE}}
     @completions_lock = Mutex.new
 
     # The completion function for async results of `kind`, one per result
-    # slot signature for the life of the process (the library may call it
-    # from any thread). It finds the pending call by `context`, receives the
-    # error or the result, and delivers it to the waiting caller; nothing
-    # raised while receiving escapes into the C frame.
+    # C type for the life of the process (the library may call it from any
+    # thread). It finds the pending call by `context`, receives the error
+    # or the result, and delivers it to the waiting caller; nothing raised
+    # while receiving escapes into the C frame.
     def self.completion(kind)
-      types = slot_types(kind)
       @completions_lock.synchronize do
-        @completions[types] ||= FFI::Function.new(:void, [:pointer, :pointer, *types]) do |context, err, *slots|
-          entry = HANDLES.take(context)
-          next if entry.nil?
+        @completions[type_key(kind)] ||= begin
+          types = kind.nil? ? [] : [ffi_type(kind)]
+          FFI::Function.new(:void, [:pointer, :pointer, *types]) do |context, err, *result|
+            entry = HANDLES.take(context)
+            next if entry.nil?
 
-          _, queue, error, result_kind = entry
-          begin
-            taken = take_boxed_error(err)
-            queue << (taken.nil? ? take_value(result_kind, *slots) : failure(error, *taken))
-          rescue Exception => e # rubocop:disable Lint/RescueException
-            queue << e
+            _, queue, error, result_kind = entry
+            begin
+              taken = take_boxed_error(err)
+              queue << (taken.nil? ? take(result_kind, result[0]) : failure(error, *taken))
+            rescue Exception => e # rubocop:disable Lint/RescueException
+              queue << e
+            end
           end
         end
       end
@@ -525,8 +638,9 @@ module {{MODULE}}
     end
 
     # Launches an async call and blocks until it completes: yields the
-    # sealed `writers`, the completion function, and the completion context
-    # to the launch, then waits for the result or raises the error.
+    # runs of the sealed `writers`, the completion function, and the
+    # completion context to the launch, then waits for the result or raises
+    # the error.
     def self.await(error, kind, *writers)
       pending(error, kind, writers) { |sealed, callback, context| yield(*sealed, callback, context) }
     end
@@ -553,7 +667,7 @@ module {{MODULE}}
       context = HANDLES.put([:async, queue, error, kind])
       launched = false
       begin
-        yield seal(*writers), completion(kind), context
+        yield runs(seal(*writers)), completion(kind), context
         launched = true
       ensure
         HANDLES.take(context) unless launched
@@ -583,27 +697,27 @@ module {{MODULE}}
 
     # A lazy Enumerator over a native iterator. Each enumeration launches
     # its own iterator (on the first pull, through the block, which receives
-    # the sealed `writers` and the error slot), pulls one element per step
-    # with `next_fn`, and releases the iterator with `destroy_fn` exactly
-    # once: when iteration finishes, raises, or stops early, or (as a
-    # backstop) from the GC finalizer of its FFI::AutoPointer, since Ruby
-    # never runs the `ensure` of an external enumeration (`next`) that's
-    # abandoned midway.
+    # the runs of the sealed `writers` and the error slot), pulls one
+    # element per step with `next_fn`, and releases the iterator with
+    # `destroy_fn` exactly once: when iteration finishes, raises, or stops
+    # early, or (as a backstop) from the GC finalizer of its
+    # FFI::AutoPointer, since Ruby never runs the `ensure` of an external
+    # enumeration (`next`) that's abandoned midway.
     def self.iterate(error, kind, next_fn, destroy_fn, *writers, &launch)
       Enumerator.new do |y|
         err = Native::ErrorStruct.new
-        raw = launch.call(*seal(*writers), err)
+        raw = launch.call(*runs(seal(*writers)), err)
         iter = FFI::AutoPointer.new(raw, Native.method(destroy_fn)) unless raw.null?
         begin
           check!(err, error)
-          outs = item_slots(kind)
+          item = item_slot(kind)
           advance = Native.method(next_fn)
           loop do
-            more = advance.call(iter, *outs, err)
+            more = advance.call(iter, item, err)
             check!(err, error)
             break if more.zero?
 
-            y << take_value(kind, *read_slots(kind, outs))
+            y << take(kind, read_item(kind, item))
           end
         ensure
           iter&.free
@@ -611,15 +725,23 @@ module {{MODULE}}
       end
     end
 
-    # The out slots of one iterator element of `kind`: one pointer to each
-    # slot the element would occupy as an async result.
-    def self.item_slots(kind)
-      slot_types(kind).map { |type| FFI::MemoryPointer.new(type) }
+    # The memory `_next` writes one element of `kind` to.
+    def self.item_slot(kind)
+      case type_key(kind)
+      when :run then Native::Run.new
+      when :pointer then FFI::MemoryPointer.new(:pointer)
+      else
+        kind.is_a?(Array) ? Native::OPT.fetch(kind[1]).new : FFI::MemoryPointer.new(FFI_TYPES.fetch(kind))
+      end
     end
 
-    # The values `_next` wrote to an element's out slots.
-    def self.read_slots(kind, outs)
-      slot_types(kind).zip(outs).map { |type, out| out.read(type) }
+    # The element `_next` wrote to `slot`.
+    def self.read_item(kind, slot)
+      case type_key(kind)
+      when :run then slot
+      when :pointer then slot.read_pointer
+      else kind.is_a?(Array) ? slot : slot.read(FFI_TYPES.fetch(kind))
+      end
     end
 
     # --- Interfaces ---
@@ -799,11 +921,6 @@ module {{MODULE}}
     # Appends values in the value-buffer wire format: little-endian, packed,
     # no alignment.
     class Writer
-      # `Array#pack` directives of the fixed-width scalars.
-      PACK = {
-        i8: 'c', u8: 'C', i16: 's<', u16: 'S<', i32: 'l<', u32: 'L<', i64: 'q<', u64: 'Q<', f32: 'e', f64: 'E'
-      }.freeze
-
       def initialize
         @buf = +''.b
         @objects = []
@@ -813,8 +930,8 @@ module {{MODULE}}
       def write(type, value)
         case type
         when :bool then @buf << (value ? "\x01" : "\x00")
-        when :string then run(Bridge.string_arg(value))
-        when :bytes then run(Bridge.bytes_arg(value))
+        when :string then run(Bridge.utf8(value))
+        when :bytes then run(Bridge.binary(value))
         when Symbol then @buf << [Bridge.scalar(value, type)].pack(PACK.fetch(type))
         when Array then composite(type, value)
         else user(type, value)
@@ -893,9 +1010,6 @@ module {{MODULE}}
     # Reads values in the value-buffer wire format, raising NativeBugError
     # on any malformed buffer.
     class Reader
-      # The byte width of each fixed-width scalar.
-      WIDTHS = { i8: 1, u8: 1, i16: 2, u16: 2, i32: 4, u32: 4, i64: 8, u64: 8, f32: 4, f64: 8 }.freeze
-
       def initialize(data)
         @data = data
         @pos = 0
@@ -905,13 +1019,9 @@ module {{MODULE}}
       def read(type)
         case type
         when :bool then flag('bool')
-        when :string
-          text = run.force_encoding(Encoding::UTF_8)
-          raise Bridge.malformed('string is not valid UTF-8') unless text.valid_encoding?
-
-          text
+        when :string then Bridge.text(run)
         when :bytes then run
-        when Symbol then take(WIDTHS.fetch(type), type).unpack1(Writer::PACK.fetch(type))
+        when Symbol then take(SIZES.fetch(type), type).unpack1(PACK.fetch(type))
         when Array then composite(type)
         else user(type)
         end
@@ -982,7 +1092,7 @@ module {{MODULE}}
 
     # The error for a malformed value the library handed over.
     def self.malformed(what)
-      NativeBugError.new("malformed value buffer: #{what}", code: Error::MARSHAL)
+      NativeBugError.new("malformed value: #{what}", code: Error::MARSHAL)
     end
 
     # A writer holding `value` encoded as `type`, sealed just before the
@@ -1001,18 +1111,6 @@ module {{MODULE}}
     rescue Exception # rubocop:disable Lint/RescueException
       minted.each { |cls, ptr| INTERFACES.fetch(cls)[1].call(ptr) }
       raise
-    end
-
-    # Decodes a returned value buffer: copies and releases it, then reads
-    # one `type` value, which must consume every byte.
-    def self.decode(ptr, len, type)
-      decode_bytes(take_bytes(ptr, len), type)
-    end
-
-    # Decodes a borrowed value buffer (a callback argument) without
-    # releasing it.
-    def self.decode_borrowed(ptr, len, type)
-      decode_bytes(borrow_bytes(ptr, len), type)
     end
 
     # Reads one `type` value (or, with `fields`, a layout's fields) from a
@@ -1057,36 +1155,63 @@ module {{MODULE}}
     HANDLES = Handles.new
 
     # The vtable `free` every interface shares: drops the implementation
-    # when the library releases its last reference (on any library thread).
+    # when the library releases it (on any library thread).
     FREE = FFI::Function.new(:void, [:pointer]) { |ctx| HANDLES.take(ctx) }
 
-    # The vtable of each callback interface module.
+    # The vtable of each callback interface module: the native table and
+    # the trampolines it points to, both kept for the life of the process.
     VTABLES = {}
 
-    # Builds `iface`'s one process-wide vtable: the `{size, flags, free}`
-    # header (flags 0: methods may run on any thread), then one trampoline
-    # per method in declaration order. The trampolines live as long as the
-    # vtable, which is the process.
+    # Builds `iface`'s one process-wide vtable from its methods, each
+    # `[name, error, return kind, [parameter kinds]]` in declaration order:
+    # the `{size, flags, free}` header (flags 0: methods may run on any
+    # thread), then one trampoline per method.
     def self.vtable(iface, *methods)
+      trampolines = methods.map { |name, error, ret, params| trampoline(name, error, ret, params) }
       word = FFI::Pointer.size
-      size = 8 + (word * (methods.length + 1))
+      size = 8 + (word * (trampolines.length + 1))
       table = FFI::MemoryPointer.new(:uint8, size)
       table.put_uint32(0, size)
       table.put_uint32(4, 0)
       table.put_pointer(8, FREE)
-      methods.each_with_index { |fn, i| table.put_pointer(8 + (word * (i + 1)), fn) }
-      VTABLES[iface] = [table, methods.freeze].freeze
+      trampolines.each_with_index { |fn, i| table.put_pointer(8 + (word * (i + 1)), fn) }
+      VTABLES[iface] = [table, trampolines.freeze].freeze
     end
 
-    # Registers a callback implementation and returns its `ctx` and
-    # `vtable` arguments: two NULLs for a nil (optional) implementation.
-    # Never raises, so nothing can strand the registration between this
-    # and the call that hands it to the library (an unusable implementation
-    # fails when the library calls it).
-    def self.register(impl, iface)
-      return [nil, nil] if impl.nil?
+    # One method's vtable entry: receives each argument (objects first, so
+    # their references are owned by a wrapper even when a later step
+    # raises; runs copied before the implementation runs), calls the
+    # method, and hands its return back. Nothing unwinds through the C
+    # frame: an exception is reported through `out_err` (see report) and
+    # the entry returns the zero value of its return.
+    def self.trampoline(name, error, ret, params)
+      FFI::Function.new(ffi_type(ret), [:pointer, *params.map { |k| ffi_type(k) }, :pointer]) do |ctx, *args|
+        out_err = args.pop
+        callback(out_err, error, ret) do
+          values = Array.new(params.length)
+          params.each_with_index { |k, i| values[i] = borrow(k, args[i]) if object_kind?(k) }
+          params.each_with_index { |k, i| values[i] = borrow(k, args[i]) unless object_kind?(k) }
+          give(ret, impl(ctx).public_send(name, *values))
+        end
+      end
+    end
 
-      [HANDLES.put([:callback, impl]), VTABLES.fetch(iface)[0]]
+    def self.object_kind?(kind)
+      kind.is_a?(Array) && %i[object object?].include?(kind[0])
+    end
+
+    # Registers a callback implementation and returns its `{ctx, vtable}`
+    # argument: NULLs for a nil (optional) implementation. Never raises
+    # for a registered interface, so nothing can strand the registration
+    # between this and the call that hands it to the library (an unusable
+    # implementation fails when the library calls it).
+    def self.register(impl, iface)
+      arg = Native::Callback.new
+      return arg if impl.nil?
+
+      arg[:ctx] = HANDLES.put([:callback, impl])
+      arg[:vtable] = VTABLES.fetch(iface)[0]
+      arg
     end
 
     # Raises TypeError for a nil callback implementation where one is
@@ -1103,14 +1228,73 @@ module {{MODULE}}
       impl
     end
 
-    # Runs a trampoline's body. Nothing unwinds through the C frame: an
-    # exception is reported through `out_err` (see report) and the method
-    # returns `default`.
-    def self.callback(out_err, error, default = nil)
+    # Runs a trampoline's body, which returns the C value. An exception is
+    # reported through `out_err` and the zero value of `kind` returned.
+    def self.callback(out_err, error, kind)
       yield
     rescue Exception => e # rubocop:disable Lint/RescueException
       report(out_err, e, error)
-      default
+      zero(kind)
+    end
+
+    # A callback method's return of `kind`, handed to the library: a
+    # checked scalar, an optional's struct, a run allocated with
+    # {{PREFIX}}_alloc (which the library adopts), or a fresh strong
+    # reference (NULL for nil, which the library rejects where the return
+    # isn't optional).
+    def self.give(kind, value)
+      case kind
+      when nil then nil
+      when :string then alloc_run(utf8(value))
+      when :bytes then alloc_run(binary(value))
+      when Symbol then scalar(value, kind)
+      else
+        case kind[0]
+        when :opt then opt_arg(value, kind[1])
+        when :slice then alloc_run(pack_slice(value, kind[1]))
+        when :buffer then alloc_run(seal(encode(kind[1], value)).first)
+        else object_return(value, kind[1])
+        end
+      end
+    end
+
+    # The C zero value of `kind`, which a failed callback method returns.
+    def self.zero(kind)
+      case kind
+      when nil then nil
+      when :bool then false
+      when :f32, :f64 then 0.0
+      when :string, :bytes then Native::Run.new
+      when Symbol then 0
+      else
+        case kind[0]
+        when :opt then Native::OPT.fetch(kind[1]).new
+        when :slice, :buffer then Native::Run.new
+        end
+      end
+    end
+
+    # A run of `bytes` allocated with {{PREFIX}}_alloc, for the library to
+    # adopt.
+    def self.alloc_run(bytes)
+      run = Native::Run.new
+      return run if bytes.empty?
+
+      ptr = Native.{{PREFIX}}_alloc(bytes.bytesize)
+      raise NoMemoryError, '{{PREFIX}}_alloc failed' if ptr.null?
+
+      ptr.put_bytes(0, bytes)
+      run[:ptr] = ptr
+      run[:len] = bytes.bytesize
+      run
+    end
+
+    # A callback's object return: a fresh strong reference, or NULL for nil.
+    def self.object_return(value, cls)
+      return nil if value.nil?
+      raise TypeError, "expected a #{cls.name}, got #{value.class}" unless value.is_a?(cls)
+
+      clone_ref(value)
     end
 
     # Reports a callback implementation's exception through `out_err`. A
@@ -1145,109 +1329,27 @@ module {{MODULE}}
       Native.{{PREFIX}}_error_set(out_err, code, message, message.bytesize)
     end
 
-    # Hands a callback's string, bytes, or buffer return to the library: a
-    # run allocated with {{PREFIX}}_alloc, written to the out slots. The
-    # library adopts and frees it.
-    def self.run_return(bytes, out_ptr, out_len)
-      out_ptr.write_pointer(alloc(bytes.bytesize) { |run| run.put_bytes(0, bytes) })
-      out_len.write(:size_t, bytes.bytesize)
-      nil
-    end
-
-    # A callback's string return.
-    def self.string_return(value, out_ptr, out_len)
-      run_return(string_arg(value), out_ptr, out_len)
-    end
-
-    # A callback's bytes return.
-    def self.bytes_return(value, out_ptr, out_len)
-      run_return(bytes_arg(value), out_ptr, out_len)
-    end
-
-    # A callback's value-buffer return.
-    def self.buffer_return(type, value, out_ptr, out_len)
-      run_return(seal(encode(type, value)).first, out_ptr, out_len)
-    end
-
-    # A callback's typed-array return, in a run the library adopts.
-    def self.slice_return(values, kind, out_ptr, out_len)
-      ary = Array.try_convert(values)
-      raise TypeError, "expected an Array, got #{values.class}" if ary.nil?
-
-      checked = ary.map { |v| scalar(v, kind) }
-      run = alloc(checked.length * SIZES.fetch(kind)) do |ptr|
-        ptr.public_send(:"put_array_of_#{FFI_TYPES.fetch(kind)}", 0, checked)
-      end
-      out_ptr.write_pointer(run)
-      out_len.write(:size_t, checked.length)
-      nil
-    end
-
-    # A callback's optional-scalar return: writes a present value to the
-    # out slot and returns whether there is one.
-    def self.opt_return(value, kind, out_value)
-      return false if value.nil?
-
-      out_value.put(FFI_TYPES.fetch(kind), 0, scalar(value, kind))
-      true
-    end
-
-    # A callback's object return: a fresh strong reference the library
-    # adopts, or NULL for nil (which the library rejects where the return
-    # isn't optional).
-    def self.object_return(value, cls)
-      return nil if value.nil?
-      raise TypeError, "expected a #{cls.name}, got #{value.class}" unless value.is_a?(cls)
-
-      clone_ref(value)
-    end
-
-    # A {{PREFIX}}_alloc run of `len` bytes, filled by the block (NULL when
-    # empty).
-    def self.alloc(len)
-      return nil if len.zero?
-
-      run = Native.{{PREFIX}}_alloc(len)
-      raise NoMemoryError, '{{PREFIX}}_alloc failed' if run.null?
-
-      yield run
-      run
-    end
-
     # --- Load-time checks and diagnostics ---
 
-    # Checks, for every top-level module, that the library's contract table
-    # (`{{PREFIX}}_{module}_contract`) holds each declaration these bindings
-    # were generated with, as `[id, hash, path]`, with an equal signature
-    # hash. Declarations the library adds are fine.
-    def self.check_contract!(tables)
-      tables.each do |symbol, expected|
-        begin
-          Native.attach_function(symbol, [:pointer], :pointer) unless Native.respond_to?(symbol)
-        rescue FFI::NotFoundError
-          raise {{MODULE}}::LoadError, "the loaded {{LIBRARY}} library does not export #{symbol}"
-        end
-        out_len = FFI::MemoryPointer.new(:size_t)
-        table = Native.public_send(symbol, out_len)
-        count = table.null? ? 0 : out_len.read(:size_t)
-        actual = Array.new(count) do |i|
-          entry = Native::ContractEntry.new(table + (i * Native::ContractEntry.size))
-          [entry[:id], entry[:hash]]
-        end.to_h
-        expected.each do |id, hash, path|
-          found = actual[id]
-          raise {{MODULE}}::LoadError, "{{LIBRARY}}: #{path} is missing from the library" if found.nil?
-          next if found == hash
+    # Checks that the library exports every declaration these bindings were
+    # generated with, each row `[contract function, hash, path]`, and that
+    # each function returns the row's hash. Declarations the library adds
+    # are fine.
+    def self.check_contract!(rows)
+      library = Native.ffi_libraries.first
+      rows.each do |symbol, hash, path|
+        address = library.find_function(symbol.to_s)
+        raise {{MODULE}}::LoadError, "{{LIBRARY}}: #{path} is missing from the library" if address.nil?
+        next if FFI::Function.new(:uint64, [], address).call == hash
 
-          raise {{MODULE}}::LoadError, "{{LIBRARY}}: #{path} changed since these bindings were generated"
-        end
+        raise {{MODULE}}::LoadError, "{{LIBRARY}}: #{path} changed since these bindings were generated"
       end
     end
 
     # Live native resources of one kind (0 objects, 1 callbacks, 2
-    # iterators, 3 cancel tokens, 4 byte runs; -1 reports whether the
-    # library counts at all). Only libraries built with the `leak-check`
-    # feature count.
+    # iterators, 3 cancel tokens, 4 runs; -1 reports whether the library
+    # counts at all). Only libraries built with the `leak-check` feature
+    # count.
     def self.debug_live(kind)
       unless Native.respond_to?(:{{PREFIX}}_debug_live)
         begin

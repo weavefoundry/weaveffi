@@ -1,18 +1,23 @@
 //! Python (`ctypes`) binding generator.
 //!
-//! Emits a pip-installable package of `ctypes` bindings over the C ABI
-//! (revision 5): distribution `{name}`, import package `{prefix}`, and one
-//! fully annotated implementation module `{prefix}/{prefix}.py` with a
-//! `py.typed` marker (Python 3.10 or later). Every C prototype is bound once
-//! at import time, after the load-time ABI revision and contract-table
-//! check. Records and rich enums are frozen, slotted dataclasses crossing
-//! the boundary as value buffers; optional scalars and numeric lists cross
-//! directly (`bool` flag plus value, and typed arrays); interfaces are
-//! reference-counted wrapper classes with `close()` and a `__del__`
-//! backstop; callback interfaces are abstract base classes backed by one
-//! static vtable of `ctypes` trampolines; async functions are coroutines
-//! whose cancellation cancels the native call; `iter<T>` returns are lazy
-//! `NativeIterator[T]` objects.
+//! Emits a pip-installable package of pure `ctypes` bindings over the C ABI
+//! (revision 6): distribution `{name}`, import package `{prefix}`, and one
+//! fully annotated implementation module `{prefix}/{prefix}.py`, which the
+//! package's `__init__.py` re-exports, with a `py.typed` marker (Python 3.10
+//! or later). The library is one namespace, so the package is too. Every C
+//! prototype is bound once at import time, after the load-time ABI revision
+//! and contract check.
+//!
+//! Every value crosses as one C value: scalars and enums by value, optional
+//! scalars as `_Opt{Prim}` structures and strings, bytes, typed arrays, and
+//! value buffers as `_Run` structures (both by value), and objects as
+//! pointers. Records and rich enums are frozen, slotted dataclasses
+//! crossing as value buffers; interfaces are reference-counted wrapper
+//! classes with `close()`, a context manager, and a `__del__` backstop;
+//! error domains are exception classes; callback interfaces are abstract
+//! base classes backed by one vtable of trampolines; async functions are
+//! coroutines whose cancellation cancels the native call; and `iter<T>`
+//! returns are lazy `NativeIterator[T]` objects.
 
 mod callbacks;
 mod calls;
@@ -24,6 +29,7 @@ mod runtime;
 #[cfg(test)]
 mod tests;
 mod types;
+mod values;
 
 use std::collections::{HashMap, HashSet};
 
@@ -40,15 +46,14 @@ use heck::ToSnakeCase;
 use miette::Result;
 use serde::{Deserialize, Serialize};
 use weaveffi_model::errors::type_name;
-use weaveffi_model::model::{Model, ModuleBinding};
+use weaveffi_model::model::{ErrorStrategy, Model};
 use weaveffi_model::pkg::Identity;
-use weaveffi_model::plan::ErrorStrategy;
 
 use crate::targets::python::callbacks::render_callback_interface;
 use crate::targets::python::calls::{render_bindings, render_callable, FnScope};
 use crate::targets::python::codec::render_composite_codecs;
 use crate::targets::python::entities::{
-    render_enum, render_error, render_interface, render_struct,
+    render_enum, render_error, render_interface, render_record,
 };
 use crate::targets::python::package::{
     render_py_typed, render_pyproject_toml, render_readme, render_wheel_readme,
@@ -200,11 +205,10 @@ pub(crate) struct Gen<'a> {
     /// The unchecked `RuntimeError` subclass a failed call that declares no
     /// errors raises: `InternalError`, unless the API declares that name.
     pub trap_error: String,
-    /// Every error domain with its shared type names, by declaring module.
+    /// Every error domain with its shared type names.
     errors: Vec<ErrorTable<'a>>,
-    /// Each error code's module-level class name, by code name (code names
-    /// are globally unique).
-    code_classes: HashMap<String, String>,
+    /// Each error code's module-level class name, by domain and code name.
+    code_classes: HashMap<(String, String), String>,
     /// Every identifier the API declares, for rewriting doc text.
     names: ApiNames,
 }
@@ -213,12 +217,10 @@ impl<'a> Gen<'a> {
     fn new(model: &'a Model) -> Self {
         let errors = errors::tables(model, "Error");
         let mut taken: HashSet<String> = RUNTIME_CLASSES.iter().map(|s| s.to_string()).collect();
-        for m in &model.modules {
-            taken.extend(m.enums.iter().map(|e| e.name.clone()));
-            taken.extend(m.structs.iter().map(|s| s.name.clone()));
-            taken.extend(m.interfaces.iter().map(|i| i.name.clone()));
-            taken.extend(m.callback_interfaces.iter().map(|c| c.name.clone()));
-        }
+        taken.extend(model.enums.iter().map(|e| e.name.clone()));
+        taken.extend(model.records.iter().map(|s| s.name.clone()));
+        taken.extend(model.interfaces.iter().map(|i| i.name.clone()));
+        taken.extend(model.callbacks.iter().map(|c| c.name.clone()));
         taken.extend(errors.iter().map(|t| t.type_name.clone()));
         // A code class is the shared `{Code}Error` name, or, when that's a
         // builtin or another declaration, `{DomainStem}{Code}Error`.
@@ -230,7 +232,7 @@ impl<'a> Gen<'a> {
                     class = format!("{}{class}", type_name(&t.domain.name, ""));
                 }
                 taken.insert(class.clone());
-                code_classes.insert(row.code.name.clone(), class);
+                code_classes.insert((t.domain.name.clone(), row.code.name.clone()), class);
             }
         }
         let pascal = model.identity.pascal_name();
@@ -262,12 +264,6 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// The error domains `m` declares.
-    fn errors_of(&self, m: &ModuleBinding) -> impl Iterator<Item = &ErrorTable<'a>> {
-        let index = m.index;
-        self.errors.iter().filter(move |t| t.module.index == index)
-    }
-
     /// The class of the error domain named `name` (the shared type name).
     pub(crate) fn domain_class(&self, name: &str) -> &str {
         self.errors
@@ -277,9 +273,22 @@ impl<'a> Gen<'a> {
             .expect("a validated model declares every domain a callable throws")
     }
 
-    /// The module-level class of the error code named `code`.
-    pub(crate) fn code_class(&self, code: &str) -> &str {
-        &self.code_classes[code]
+    /// The module-level class of the code `code` of the error domain
+    /// `domain`.
+    pub(crate) fn code_class(&self, domain: &str, code: &str) -> &str {
+        &self.code_classes[&(domain.to_string(), code.to_string())]
+    }
+
+    /// The class of the error code named `code`, when exactly one domain
+    /// declares a code by that name.
+    fn code_class_named(&self, code: &str) -> Option<&str> {
+        let mut found = self
+            .code_classes
+            .iter()
+            .filter(|((_, c), _)| c == code)
+            .map(|(_, class)| class.as_str());
+        let class = found.next()?;
+        found.next().is_none().then_some(class)
     }
 
     /// The factory building the exception of a failed call that throws the
@@ -320,8 +329,8 @@ impl<'a> Gen<'a> {
             IdentKind::Param => py_name(ident),
             IdentKind::Field => py_field(ident),
             IdentKind::ErrorDomain => type_name(ident, "Error"),
-            IdentKind::ErrorCode => self.code_classes.get(ident)?.clone(),
-            IdentKind::Module | IdentKind::Type | IdentKind::Variant => return None,
+            IdentKind::ErrorCode => self.code_class_named(ident)?.to_string(),
+            IdentKind::Type | IdentKind::Variant => return None,
         })
     }
 
@@ -356,20 +365,17 @@ impl From<PythonConfig> for PythonGenerator {
 }
 
 impl PythonGenerator {
-    /// Render the implementation module: the runtime, every module's members
-    /// in canonical order (error domain, enums, records, callback
-    /// interfaces, interfaces, functions), the composite codecs, and
+    /// Render the implementation module: the runtime, every declaration in
+    /// canonical order (see [`emit_api`]), the composite codecs, and
     /// `__all__`.
     fn render_py_source(&self, model: &Model, file_name: &str) -> String {
         let g = Gen::new(model);
         let mut w = CodeWriter::four_space();
         w.raw(render_prelude(CommentStyle::Hash));
         render_runtime(&mut w, &g);
-        for m in &model.modules {
-            w.blank().blank();
-            w.line(format!("# === Module: {} ===", m.dot_path));
-            emit_module(&mut w, &g, m);
-        }
+        w.blank().blank();
+        w.line("# === API ===");
+        emit_api(&mut w, &g);
         render_composite_codecs(&mut w, model);
         render_all(&mut w, &g);
         w.blank();
@@ -399,26 +405,27 @@ impl PythonGenerator {
     }
 }
 
-/// Emit every member of `m` in canonical order: error domains, enums,
+/// Emit every declaration in canonical order: error domains, enums,
 /// records, callback interfaces (which interface members take as
 /// parameters), interfaces, and functions.
-fn emit_module(w: &mut CodeWriter, g: &Gen<'_>, m: &ModuleBinding) {
-    for t in g.errors_of(m) {
+fn emit_api(w: &mut CodeWriter, g: &Gen<'_>) {
+    let model = g.model;
+    for t in &g.errors {
         render_error(w, g, t);
     }
-    for e in &m.enums {
+    for e in &model.enums {
         render_enum(w, g, e);
     }
-    for s in &m.structs {
-        render_struct(w, g, s);
+    for s in &model.records {
+        render_record(w, g, s);
     }
-    for cb in &m.callback_interfaces {
+    for cb in &model.callbacks {
         render_callback_interface(w, g, cb);
     }
-    for i in &m.interfaces {
+    for i in &model.interfaces {
         render_interface(w, g, i);
     }
-    for f in &m.functions {
+    for f in &model.functions {
         render_bindings(w, g, f, false);
         render_callable(w, g, f, FnScope::Free);
     }
@@ -427,32 +434,31 @@ fn emit_module(w: &mut CodeWriter, g: &Gen<'_>, m: &ModuleBinding) {
 /// Emit `__all__`: the public names, in declaration order, so a star import
 /// (the package's `__init__.py`) re-exports the API and nothing else.
 fn render_all(w: &mut CodeWriter, g: &Gen<'_>) {
+    let model = g.model;
     let mut names = vec![g.root_error.clone(), g.trap_error.clone()];
     names.extend(RUNTIME_CLASSES.iter().map(|s| s.to_string()));
-    for m in &g.model.modules {
-        for t in g.errors_of(m) {
-            names.push(t.type_name.clone());
+    for t in &g.errors {
+        names.push(t.type_name.clone());
+        names.extend(
+            t.codes
+                .iter()
+                .map(|c| g.code_class(&t.domain.name, &c.code.name).to_string()),
+        );
+    }
+    for e in &model.enums {
+        names.push(e.name.clone());
+        if e.is_rich() {
             names.extend(
-                t.codes
+                e.variants
                     .iter()
-                    .map(|c| g.code_class(&c.code.name).to_string()),
+                    .map(|v| format!("{}{}", e.name, py_variant(&v.name))),
             );
         }
-        for e in &m.enums {
-            names.push(e.name.clone());
-            if e.is_rich() {
-                names.extend(
-                    e.variants
-                        .iter()
-                        .map(|v| format!("{}{}", e.name, py_variant(&v.name))),
-                );
-            }
-        }
-        names.extend(m.structs.iter().map(|s| s.name.clone()));
-        names.extend(m.callback_interfaces.iter().map(|c| c.name.clone()));
-        names.extend(m.interfaces.iter().map(|i| i.name.clone()));
-        names.extend(m.functions.iter().map(|f| py_member_name(&f.name)));
     }
+    names.extend(model.records.iter().map(|s| s.name.clone()));
+    names.extend(model.callbacks.iter().map(|c| c.name.clone()));
+    names.extend(model.interfaces.iter().map(|i| i.name.clone()));
+    names.extend(model.functions.iter().map(|f| py_member_name(&f.name)));
     w.blank().blank();
     w.line("__all__ = [");
     w.scope(|w| {

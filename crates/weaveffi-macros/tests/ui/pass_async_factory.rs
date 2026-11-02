@@ -2,55 +2,52 @@
 //! static factory (constructors are synchronous), in every return spelling.
 #![deny(unsafe_code)]
 
-#[weaveffi::module]
-mod store {
-    use std::sync::Arc;
+use std::sync::Arc;
 
-    #[weaveffi::error]
-    #[repr(i32)]
-    #[derive(Debug)]
-    pub enum StoreError {
-        /// Empty path
-        #[weaveffi(message = "invalid path")]
-        InvalidPath = 1,
+#[weaveffi::error]
+#[repr(i32)]
+#[derive(Debug)]
+pub enum StoreError {
+    /// Empty path
+    #[weaveffi(message = "invalid path")]
+    InvalidPath = 1,
+}
+
+#[weaveffi::interface]
+pub struct Store {
+    path: String,
+}
+
+#[weaveffi::export]
+impl Store {
+    pub fn new(path: String) -> Self {
+        Self { path }
     }
 
-    #[weaveffi::interface]
-    pub struct Store {
-        path: String,
+    pub async fn open_async(path: String) -> Result<Arc<Self>, StoreError> {
+        if path.is_empty() {
+            Err(StoreError::InvalidPath)
+        } else {
+            Ok(Arc::new(Self { path }))
+        }
     }
 
-    impl Store {
-        pub fn new(path: String) -> Self {
-            Self { path }
-        }
+    pub async fn open_later(path: String, cancel: weaveffi::CancelToken) -> Self {
+        let _ = cancel;
+        Self { path }
+    }
 
-        pub async fn open_async(path: String) -> Result<Arc<Self>, StoreError> {
-            if path.is_empty() {
-                Err(StoreError::InvalidPath)
-            } else {
-                Ok(Arc::new(Self { path }))
-            }
-        }
+    pub async fn reopen(path: String) -> Store {
+        Self { path }
+    }
 
-        #[weaveffi::cancellable]
-        pub async fn open_later(path: String, cancel: weaveffi::CancelToken) -> Self {
-            let _ = cancel;
-            Self { path }
-        }
-
-        pub async fn reopen(path: String) -> Store {
-            Self { path }
-        }
-
-        pub fn path(&self) -> String {
-            self.path.clone()
-        }
+    pub fn path(&self) -> String {
+        self.path.clone()
     }
 }
 
 weaveffi::export_runtime!();
 
 fn main() {
-    let _ = store::Store::new("x".into()).path();
+    let _ = Store::new("x".into()).path();
 }

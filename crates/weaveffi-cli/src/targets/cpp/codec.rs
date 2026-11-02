@@ -9,7 +9,7 @@
 //! templates, which call back into these overloads for user element types.
 
 use crate::codegen::CodeWriter;
-use weaveffi_model::model::{EnumBinding, StructBinding};
+use weaveffi_model::model::{EnumBinding, RecordBinding};
 
 use crate::targets::cpp::entities::ValueDef;
 use crate::targets::cpp::types::{cpp_ident, cpp_type};
@@ -54,7 +54,7 @@ fn read_fields<'a>(fields: impl Iterator<Item = &'a weaveffi_model::ty::Ty>) -> 
 
 /// Append a record's writer and reader (validation guarantees a record has
 /// fields). The reader aggregate-initializes the record from a braced list.
-fn render_record_codec(w: &mut CodeWriter, s: &StructBinding) {
+fn render_record_codec(w: &mut CodeWriter, s: &RecordBinding) {
     let name = &s.name;
     w.block(
         format!("inline void write(BufferWriter& w, const {name}& v) {{"),

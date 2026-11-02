@@ -36,13 +36,11 @@
 //! ```
 
 use weaveffi_model::errors::type_name;
-use weaveffi_model::model::{ErrorBinding, ErrorCodeBinding, Model, ModuleBinding};
+use weaveffi_model::model::{ErrorBinding, ErrorCodeBinding, Model};
 
-/// One error domain, its owning module, and its codes, named for a target.
+/// One error domain and its codes, named for a target.
 #[derive(Debug, Clone)]
 pub(crate) struct ErrorTable<'m> {
-    /// The module that declares the domain.
-    pub(crate) module: &'m ModuleBinding,
     /// The domain as lowered (raw `name`, `c_tag`, ...).
     pub(crate) domain: &'m ErrorBinding,
     /// The domain's base type name: `type_name(domain.name, suffix)`.
@@ -63,14 +61,14 @@ pub(crate) struct CodeRow<'m> {
     pub(crate) type_name: String,
 }
 
-/// Every error domain in `model` (module by module, in declaration order)
-/// with type names built with `suffix`.
+/// Every error domain in `model`, in declaration order, with type names
+/// built with `suffix`.
 #[must_use]
 pub(crate) fn tables<'m>(model: &'m Model, suffix: &str) -> Vec<ErrorTable<'m>> {
     model
-        .error_domains()
-        .map(|(module, domain)| ErrorTable {
-            module,
+        .errors
+        .iter()
+        .map(|domain| ErrorTable {
             domain,
             type_name: type_name(&domain.name, suffix),
             codes: domain
@@ -94,26 +92,21 @@ mod tests {
     fn names_never_double_the_suffix() {
         let model = test_model(
             r#"
-version: "0.12.0"
-modules:
-  - name: m
-    errors:
-      - name: KitchenErrors
-        codes: [{ name: NOT_FOUND, code: 1, message: missing }]
-      - name: Failure
-        codes: [{ name: Broken, code: 1, message: broken }]
-    modules:
-      - name: sub
-        errors:
-          - name: KvError
-            codes: [{ name: Full, code: 1, message: full }]
+version: "0.13.0"
+errors:
+  - name: KitchenErrors
+    codes: [{ name: NOT_FOUND, code: 1, message: missing }]
+  - name: Failure
+    codes: [{ name: Broken, code: 1, message: broken }]
+  - name: KvError
+    codes: [{ name: Full, code: 1, message: full }]
 "#,
         );
         let names: Vec<(String, Vec<String>)> = tables(&model, "Error")
             .into_iter()
             .map(|t| {
                 (
-                    format!("{}:{}", t.module.dot_path, t.type_name),
+                    t.type_name.clone(),
                     t.codes.iter().map(|c| c.type_name.clone()).collect(),
                 )
             })
@@ -121,9 +114,9 @@ modules:
         assert_eq!(
             names,
             [
-                ("m:KitchenError".into(), vec!["NotFoundError".into()]),
-                ("m:FailureError".into(), vec!["BrokenError".into()]),
-                ("m.sub:KvError".into(), vec!["FullError".into()]),
+                ("KitchenError".into(), vec!["NotFoundError".into()]),
+                ("FailureError".into(), vec!["BrokenError".into()]),
+                ("KvError".into(), vec!["FullError".into()]),
             ]
         );
         let exceptions = tables(&model, "Exception");

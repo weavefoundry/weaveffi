@@ -3,15 +3,15 @@
 //! Emits an npm package for a `wasm32-unknown-unknown` build of the
 //! library: the ES module (`index.js`, `index.d.ts`, `runtime.js`, and the
 //! `./debug` export) shared with the Node.js target through the
-//! [shared JavaScript layer](crate::targets::js), and its transport, the
-//! linear-memory glue (`linear.js` plus one generated entry point per C
-//! symbol) that stages arguments in the module's memory and installs async
+//! [shared JavaScript layer](crate::targets::js), and its transport,
+//! `linear.js`, which binds each C symbol from its signature, staging
+//! arguments in the module's linear memory (structs pass indirectly and
+//! return through a hidden pointer on wasm32) and installing async
 //! completions and callback-interface vtables in its function table.
 //! `init()` loads the module and checks its ABI revision and contract
-//! tables before any other export works. A trap poisons the instance: every
-//! later call throws.
+//! before any other export works. A trap poisons the instance: every later
+//! call throws.
 
-mod glue;
 mod package;
 
 use serde::{Deserialize, Serialize};
@@ -22,12 +22,11 @@ use crate::codegen::CodeWriter;
 use crate::codegen::OutputFile;
 use crate::package::{Artifact, PackageContext, PackagedFile};
 use crate::platform::Platform;
-use crate::targets::js::{self, npm_tarball_name};
+use crate::targets::js::{self, npm_tarball_name, ErrorNames};
 use crate::targets::{Linkage, Target};
 use crate::utils::{render_prelude, render_trailer, CommentStyle};
 use miette::Result;
 
-use self::glue::render_bind;
 use self::package::{render_package_json, render_readme};
 
 /// The fixed transport: loading, staging, and table functions.
@@ -58,23 +57,23 @@ impl From<WasmConfig> for WasmGenerator {
     }
 }
 
-/// The generated `index.js`: the imports, `init()` with the load-time
-/// checks, the raw entry points, and the shared API.
-fn render_index(model: &Model) -> String {
+/// The generated `index.js`: the imports, the C signatures and contract,
+/// `init()` with the load-time checks, and the shared API.
+fn render_index(model: &Model, errors: &ErrorNames) -> String {
     let identity = &model.identity;
     let name = js::names::js_string(&identity.name);
     let prefix = model.prefix();
     let mut w = CodeWriter::two_space();
     w.raw(render_prelude(CommentStyle::DoubleSlash));
-    js::render_imports(&mut w, identity);
+    js::render_imports(&mut w, errors);
     w.line("import { $loadWasm, $unloaded } from './linear.js';");
     w.blank();
-    w.line(format!("let $raw = $unloaded({name});"));
-    w.line("// Handles are linear-memory addresses; object tokens are u64s.");
-    w.line("const $token = Number;");
-    w.line("let $loading = null;");
+    js::render_tables(&mut w, model);
     w.blank();
-    js::render_contract(&mut w, model);
+    w.line("// The loaded module and its bound functions, once `init()` resolves.");
+    w.line(format!("let $m = $unloaded({name});"));
+    w.line(format!("let $f = $unloaded({name});"));
+    w.line("let $loading = null;");
     w.blank();
     w.line("/**");
     w.line(format!(
@@ -96,14 +95,15 @@ fn render_index(model: &Model) -> String {
         ));
         w.scope(|w| {
             w.block(".then((m) => {", "})", |w| {
-                w.line("$raw = $bind(m);");
+                w.line("$m = m;");
                 w.line("try {");
                 w.scope(|w| {
                     w.line(js::verify_call(model));
+                    w.line("$f = m.bind($sigs);");
                 });
                 w.line("} catch (e) {");
                 w.scope(|w| {
-                    w.line(format!("$raw = $unloaded({name});"));
+                    w.line(format!("$m = $unloaded({name});"));
                     w.line("throw e;");
                 });
                 w.line("}");
@@ -116,9 +116,8 @@ fn render_index(model: &Model) -> String {
         w.line("return $loading;");
     });
     w.blank();
-    render_bind(&mut w, model);
+    js::render_api(&mut w, model, errors);
     w.blank();
-    js::render_api(&mut w, model);
     w.raw(render_trailer(CommentStyle::DoubleSlash, "index.js"));
     w.finish()
 }
@@ -137,18 +136,18 @@ export declare function init(
 fn render_files(model: &Model, config: &WasmConfig, wasm: Option<&str>) -> Vec<(String, String)> {
     let identity = &model.identity;
     let name = config.package_name(identity);
-    let modules: Vec<String> = model
-        .roots()
-        .map(|m| js::names::module_name(&m.name))
-        .collect();
+    let errors = ErrorNames::new(model);
     let mut linear = render_prelude(CommentStyle::DoubleSlash);
     linear.push_str(LINEAR_JS);
     linear.push('\n');
     linear.push_str(&render_trailer(CommentStyle::DoubleSlash, "linear.js"));
     vec![
-        ("index.js".into(), render_index(model)),
-        ("index.d.ts".into(), js::render_dts(model, DTS_EXTRA)),
-        ("runtime.js".into(), js::render_runtime(identity)),
+        ("index.js".into(), render_index(model, &errors)),
+        (
+            "index.d.ts".into(),
+            js::render_dts(model, &errors, DTS_EXTRA),
+        ),
+        ("runtime.js".into(), js::render_runtime(&errors)),
         ("debug.js".into(), js::render_debug_js()),
         ("debug.d.ts".into(), js::render_debug_dts()),
         ("linear.js".into(), linear),
@@ -156,7 +155,7 @@ fn render_files(model: &Model, config: &WasmConfig, wasm: Option<&str>) -> Vec<(
             "package.json".into(),
             render_package_json(identity, &name, wasm),
         ),
-        ("README.md".into(), render_readme(identity, &name, &modules)),
+        ("README.md".into(), render_readme(identity, &name)),
     ]
 }
 

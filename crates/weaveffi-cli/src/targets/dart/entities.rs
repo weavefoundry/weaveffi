@@ -4,7 +4,7 @@
 use crate::codegen::errors::ErrorTable;
 use crate::codegen::CodeWriter;
 use weaveffi_model::model::{
-    EnumBinding, EnumVariantBinding, FieldBinding, InterfaceBinding, Model, StructBinding,
+    EnumBinding, EnumVariantBinding, FieldBinding, InterfaceBinding, Model, RecordBinding,
 };
 use weaveffi_model::ty::{Prim, Ty};
 
@@ -134,12 +134,12 @@ pub(crate) fn render_error(w: &mut CodeWriter, docs: &Docs, table: &ErrorTable, 
     let exc = dart_class(&table.type_name);
     w.blank();
     w.line(format!(
-        "/// The `{}` error domain of module `{}`: catch it to handle any of",
-        table.domain.name, table.module.dot_path
+        "/// The `{}` error domain: catch it to handle any of its codes, or a",
+        table.domain.name
     ));
-    w.line("/// its codes, or a subclass for one code. The domain is open: a code");
-    w.line("/// these bindings don't declare (from a newer library) arrives as this");
-    w.line("/// class itself, with its [code] and [message].");
+    w.line("/// subclass for one code. The domain is open: a code these bindings");
+    w.line("/// don't declare (from a newer library) arrives as this class itself,");
+    w.line("/// with its [code] and [message].");
     w.block(
         format!("class {exc} extends NativeException {{"),
         "}",
@@ -363,7 +363,7 @@ pub(crate) fn render_enum(w: &mut CodeWriter, docs: &Docs, e: &EnumBinding) {
 /// Render one record as a Dart value class (final fields, one named
 /// constructor argument per field, optional fields not required, value
 /// equality) plus its `_pack_{Name}`/`_unpack_{Name}` helpers.
-pub(crate) fn render_struct(w: &mut CodeWriter, docs: &Docs, s: &StructBinding) {
+pub(crate) fn render_record(w: &mut CodeWriter, docs: &Docs, s: &RecordBinding) {
     let class = dart_class(&s.name);
     let ty = Ty::Record(s.name.clone());
     w.blank();

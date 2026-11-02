@@ -53,12 +53,6 @@ fn write_prebuilt(root: &Path, lib_base: &str) {
         };
         std::fs::write(dir.join(&lib), bytes).expect("write fake lib");
     }
-    std::fs::write(
-        root.join("darwin-arm64")
-            .join(format!("{lib_base}_node.node")),
-        b"addon",
-    )
-    .unwrap();
 }
 
 /// An IDL project for the calculator API (`calculator` 1.0.0) in `dir`,
@@ -68,11 +62,9 @@ fn calculator_idl(dir: &Path) -> PathBuf {
     std::fs::write(
         &idl,
         concat!(
-            "version: \"0.12.0\"\n",
-            "modules:\n",
-            "  - name: calculator\n",
-            "    functions:\n",
-            "      - { name: add, params: [{ name: a, type: i32 }, { name: b, type: i32 }], return: i32 }\n",
+            "version: \"0.13.0\"\n",
+            "functions:\n",
+            "  - { name: add, params: [{ name: a, type: i32 }, { name: b, type: i32 }], return: i32 }\n",
         ),
     )
     .unwrap();
@@ -151,21 +143,22 @@ fn python_wheels(dist: &Path) {
     }
 }
 
-/// Node: per-platform tarballs with the library (and the prebuilt addon
-/// where one was built), plus the main package.
+/// Node: per-platform tarballs with just the library (koffi loads it; there
+/// is no addon), plus the main package.
 fn node_tarballs(dist: &Path) {
     let mac = untar_gz(&dist.join("node/calculator-darwin-arm64-1.0.0.tgz"));
     let names: Vec<&str> = mac.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(
         names,
-        [
-            "package/package.json",
-            "package/libcalculator.dylib",
-            "package/calculator_node.node"
-        ]
+        ["package/package.json", "package/libcalculator.dylib"]
     );
     let linux = untar_gz(&dist.join("node/calculator-linux-x64-1.0.0.tgz"));
-    assert_eq!(linux.len(), 2, "no addon was prebuilt for linux-x64");
+    assert_eq!(
+        linux.len(),
+        2,
+        "{:?}",
+        linux.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
     let main = untar_gz(&dist.join("node/calculator-1.0.0.tgz"));
     let package_json = main
         .iter()
@@ -253,7 +246,7 @@ fn build_without_a_cargo_toml_explains_the_alternatives() {
     let idl = dir.path().join("greeter.yml");
     std::fs::write(
         &idl,
-        "version: \"0.12.0\"\nmodules:\n  - name: greeter\n    functions:\n      - { name: hi, params: [], return: i32 }\n",
+        "version: \"0.13.0\"\nfunctions:\n  - { name: hi, params: [], return: i32 }\n",
     )
     .unwrap();
     for command in ["build", "package"] {

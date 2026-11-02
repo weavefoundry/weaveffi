@@ -47,7 +47,7 @@ impl Docs {
             IdentKind::CallbackMethod | IdentKind::Field | IdentKind::Param => {
                 (dart_ident(ident), false)
             }
-            IdentKind::Module | IdentKind::Variant => return None,
+            IdentKind::Variant => return None,
         })
     }
 

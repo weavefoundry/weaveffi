@@ -24,6 +24,7 @@ import 'package:ffi/ffi.dart';
 part 'src/runtime/loader.dart';
 part 'src/runtime/contracts.dart';
 part 'src/runtime/core.dart';
+part 'src/runtime/options.dart';
 part 'src/runtime/object.dart';
 part 'src/runtime/codec.dart';
 part 'src/runtime/arrays.dart';
@@ -32,8 +33,6 @@ part 'src/runtime/cancel.dart';
 part 'src/runtime/callbacks.dart';
 part 'src/runtime/iterator.dart';
 part 'src/runtime/composites.dart';
-part 'src/shared.dart';
-part 'src/kitchen.dart';
-part 'src/kitchen/nested.dart';
+part 'src/api.dart';
 
 // END kitchen_sink.dart

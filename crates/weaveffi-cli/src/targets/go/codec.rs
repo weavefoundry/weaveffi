@@ -94,20 +94,18 @@ impl BufferTypes {
             enums: BTreeSet::new(),
             interfaces: BTreeSet::new(),
         };
-        let fields = model.modules.iter().flat_map(|m| {
-            let structs = m.structs.iter().flat_map(|s| &s.fields);
-            let variants = m
-                .enums
-                .iter()
-                .flat_map(|e| &e.variants)
-                .flat_map(|v| &v.fields);
-            let payloads = m
-                .errors
-                .iter()
-                .flat_map(|e| &e.codes)
-                .flat_map(|c| &c.fields);
-            structs.chain(variants).chain(payloads).map(|f| &f.ty)
-        });
+        let records = model.records.iter().flat_map(|s| &s.fields);
+        let variants = model
+            .enums
+            .iter()
+            .flat_map(|e| &e.variants)
+            .flat_map(|v| &v.fields);
+        let payloads = model
+            .errors
+            .iter()
+            .flat_map(|e| &e.codes)
+            .flat_map(|c| &c.fields);
+        let fields = records.chain(variants).chain(payloads).map(|f| &f.ty);
         for ty in fields.chain(&composites) {
             t.leaves(ty);
         }

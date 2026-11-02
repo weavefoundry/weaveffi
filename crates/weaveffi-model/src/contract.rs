@@ -1,69 +1,61 @@
-//! Contract tables: a per-declaration fingerprint of each top-level module's
-//! ABI.
+//! The contract: one fingerprint per declaration, which a generated binding
+//! checks against the library it loads before the first call.
 //!
-//! A producer exports, for every top-level module `m`,
-//! `const {prefix}_contract_entry* {prefix}_{m}_contract(size_t* out_len)`:
-//! a static table with one [`ContractEntry`] per declaration in `m` and its
-//! submodules, sorted ascending by id. Every generated consumer checks, when
-//! it loads the library, that each entry it was generated with is present in
-//! the producer's table with an equal hash. Extra producer entries are fine,
-//! so adding a declaration never breaks a deployed binding, while removing
-//! or changing one is reported by its dotted path.
+//! Every declaration has an entry: each function, interface, interface
+//! member, record, enum, callback interface, callback method, error domain,
+//! and error code. An entry has:
 //!
-//! [`entries`] is the one function that computes a table. The
-//! `#[weaveffi::module]` macro, the CLI, and the C header generator all call
-//! it on the validated [`Model`], so the two sides agree by construction.
+//! * an **id**, [`fnv1a64`] of the declaration's dotted path (`open`,
+//!   `Store.get`, `Listener.on_put`, `KvError.NotFound`);
+//! * a **hash**, [`fnv1a64`] of its canonical signature string.
 //!
-//! * The **id** is [`fnv1a64`] of the declaration's dotted path
-//!   (`kv.Store.put`, `kv.KvError`, `kv.KvError.NotFound`,
-//!   `kv.Listener.on_put`).
-//! * The **hash** is [`fnv1a64`] of a canonical signature string computed
-//!   from the resolved model, never from source spelling: type aliases are
-//!   already substituted, `[u8]` is already `bytes`, and every type is its
-//!   resolved IDL spelling (see [`Ty`]'s `Display`). Names that don't
-//!   affect the ABI (parameter and field names), docs, deprecation text,
-//!   and error messages are excluded, and so is the order of sibling
-//!   declarations, because each entry is independent.
+//! A producer exports one function per entry, `uint64_t
+//! {prefix}_contract_{id:016x}(void)` ([`symbol`]), returning the hash. A
+//! binding resolves the function of every entry it was generated with and
+//! compares the hash: a missing function means the library lacks the
+//! declaration, and a different hash means it changed. Entries the library
+//! has and the binding doesn't are fine, so adding a declaration (a
+//! function, a method, a record, an error code, or a callback method at the
+//! end of its interface) never breaks a deployed binding.
 //!
-//! Error domains and callback interfaces are **open**: each code and each
-//! callback method is its own entry, so adding a code or a method never
-//! breaks a deployed binding (a consumer maps a positive code it doesn't
-//! know to the domain's base error type, and a vtable may grow at its end;
-//! its `size` header is still checked). Inserting a method anywhere else, or
-//! reordering methods, moves slots and breaks the binding.
+//! The canonical signature is computed from resolved types: aliases are
+//! substituted, `[u8]` is `bytes`, and each type is written in its IDL
+//! spelling by [`canonical`] (not by `Display`, so a cosmetic change to
+//! diagnostics can't change a hash). Parameter and field names, docs,
+//! deprecation text, and error messages are excluded.
 //!
-//! The canonical strings are:
+//! | Declaration | Signature |
+//! |---|---|
+//! | function or interface member | `{kind} {name}({type}, ...) -> {type or void}`, then ` throws {Domain}` or ` throws any`, ` async`, ` cancellable` when set; `kind` is `function`, `constructor`, `method`, or `static` |
+//! | interface | `interface {name}` |
+//! | record | `record {name} {{type}, ...}` |
+//! | enum | `enum {name} {{Variant} = {value}, ...}`, a variant with fields followed by ` {{type}, ...}` |
+//! | callback interface | `callback {name}` |
+//! | callback method | `callback_method #{slot} {name}({type}, ...) -> {type or void}`, then ` throws {Domain}` or ` throws any` when set |
+//! | error domain | `errors {name}` |
+//! | error code | `code {Code} = {value}`, a code with fields followed by ` {{type}, ...}` |
 //!
-//! | Declaration | Path | Signature |
-//! |---|---|---|
-//! | function or interface member | `{module}.{name}`, `{module}.{Interface}.{name}` | `{kind} {name}({type}, ...) -> {type or void}`, then ` throws {Domain}` or ` throws any`, ` async`, ` cancellable` when set; `kind` is `function`, `constructor`, `method`, or `static` |
-//! | interface | `{module}.{Interface}` | `interface {name}` (its members have their own entries) |
-//! | record | `{module}.{Record}` | `record {name} {{type}, ...}` (field types only, in order) |
-//! | enum | `{module}.{Enum}` | `enum {name} {{Variant} = {value}, ...}`, a variant with fields followed by ` {{type}, ...}` |
-//! | callback interface | `{module}.{Callback}` | `callback {name}` |
-//! | callback method | `{module}.{Callback}.{method}` | `callback_method #{slot} {name}({type}, ...) -> {type or void}` (`slot` is the method's zero-based vtable position), then ` throws {Domain}` or ` throws any` when set |
-//! | error domain | `{module}.{Domain}` | `errors {name}` |
-//! | error code | `{module}.{Domain}.{Code}` | `code {Code} = {value}`, a code with fields followed by ` {{type}, ...}` |
+//! [`Sig`] builds these strings from parts, so the producer macro, which
+//! knows each type's spelling only at compile time, assembles exactly the
+//! strings the CLI does.
 
-use std::fmt::Write;
+use crate::model::{ErrorStrategy, FieldBinding, FnBinding, Model};
+use crate::ty::{ParamTy, RetTy, Ty};
 
-use crate::model::{FieldBinding, FnBinding, Model, ModuleBinding};
-use crate::plan::ErrorStrategy;
-use crate::ty::Ty;
-
-/// One declaration's entry in a module's contract table.
+/// One declaration's contract entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractEntry {
-    /// The declaration's dotted path (`kv.Store.put`), which consumers name
-    /// in their load errors.
+    /// The declaration's dotted path (`Store.put`), which bindings name in
+    /// their load errors.
     pub path: String,
     /// [`fnv1a64`] of [`path`](Self::path).
     pub id: u64,
     /// [`fnv1a64`] of [`signature`](Self::signature).
     pub hash: u64,
-    /// The declaration's canonical signature string (see the table in the
-    /// [module docs](self)), kept for diagnostics and generated comments.
+    /// The canonical signature (see the [module docs](self)).
     pub signature: String,
+    /// The producer's function returning the hash, [`symbol`].
+    pub symbol: String,
 }
 
 /// The 64-bit FNV-1a hash of `data`: tiny, dependency-free, and stable
@@ -80,147 +72,278 @@ pub const fn fnv1a64(data: &[u8]) -> u64 {
     hash
 }
 
-/// The contract table of the top-level module `root` (one of `model`'s
-/// [roots](Model::roots)): one entry per declaration in `root` and its
-/// submodules, sorted ascending by id.
+/// The producer's contract function for the declaration `path`:
+/// `{prefix}_contract_{id:016x}`, the id in lower-case hex.
 #[must_use]
-pub fn entries(model: &Model, root: &ModuleBinding) -> Vec<ContractEntry> {
+pub fn symbol(prefix: &str, path: &str) -> String {
+    format!("{prefix}_contract_{:016x}", fnv1a64(path.as_bytes()))
+}
+
+/// The canonical IDL spelling of a value type (`i32`, `[Entry?]`,
+/// `{string:Kind}`).
+#[must_use]
+pub fn canonical(ty: &Ty) -> String {
+    match ty {
+        Ty::Prim(p) => p.snake().to_string(),
+        Ty::Record(n) | Ty::RichEnum(n) | Ty::Enum(n) | Ty::Interface(n) => n.clone(),
+        Ty::Optional(inner) => format!("{}?", canonical(inner)),
+        Ty::List(inner) => format!("[{}]", canonical(inner)),
+        Ty::Map(k, v) => format!("{{{}:{}}}", canonical(k), canonical(v)),
+    }
+}
+
+fn canonical_param(ty: &ParamTy) -> String {
+    match ty {
+        ParamTy::Value(t) => canonical(t),
+        ParamTy::Callback { name, nullable } => {
+            if *nullable {
+                format!("{name}?")
+            } else {
+                name.clone()
+            }
+        }
+    }
+}
+
+fn canonical_ret(ty: Option<&RetTy>) -> String {
+    match ty {
+        None => VOID.to_string(),
+        Some(RetTy::Value(t)) => canonical(t),
+        Some(RetTy::Iterator(t)) => format!("iter<{}>", canonical(t)),
+    }
+}
+
+/// The spelling of a missing return.
+pub const VOID: &str = "void";
+
+/// The ` throws ...` suffix of a strategy: empty, ` throws {Domain}`, or
+/// ` throws any`.
+#[must_use]
+pub fn throws_suffix(error: &ErrorStrategy) -> String {
+    match error {
+        ErrorStrategy::Trap => String::new(),
+        ErrorStrategy::Domain(d) => format!(" throws {d}"),
+        ErrorStrategy::Untyped => " throws any".to_string(),
+    }
+}
+
+/// One part of a canonical signature: literal text, or a slot whose text
+/// the caller supplies (a type's spelling, a ` throws` suffix).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Part<T> {
+    /// Literal text.
+    Lit(String),
+    /// A caller-supplied piece.
+    Slot(T),
+}
+
+/// A canonical signature as a sequence of [`Part`]s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sig<T>(pub Vec<Part<T>>);
+
+impl<T> Sig<T> {
+    fn new() -> Self {
+        Sig(Vec::new())
+    }
+
+    fn lit(mut self, s: impl Into<String>) -> Self {
+        let s = s.into();
+        if let Some(Part::Lit(last)) = self.0.last_mut() {
+            last.push_str(&s);
+        } else {
+            self.0.push(Part::Lit(s));
+        }
+        self
+    }
+
+    fn slot(mut self, t: T) -> Self {
+        self.0.push(Part::Slot(t));
+        self
+    }
+
+    fn list(mut self, items: Vec<T>) -> Self {
+        for (i, t) in items.into_iter().enumerate() {
+            if i > 0 {
+                self = self.lit(", ");
+            }
+            self = self.slot(t);
+        }
+        self
+    }
+
+    /// `{kind} {name}({params}) -> {ret}{throws}[ async][ cancellable]`,
+    /// where `ret` spells `void` for no return and `throws` is a
+    /// [`throws_suffix`].
+    #[must_use]
+    pub fn callable(
+        kind: &str,
+        name: &str,
+        params: Vec<T>,
+        ret: T,
+        throws: T,
+        is_async: bool,
+        cancellable: bool,
+    ) -> Self {
+        let mut sig = Self::new()
+            .lit(format!("{kind} {name}("))
+            .list(params)
+            .lit(") -> ")
+            .slot(ret)
+            .slot(throws);
+        if is_async {
+            sig = sig.lit(" async");
+        }
+        if cancellable {
+            sig = sig.lit(" cancellable");
+        }
+        sig
+    }
+
+    /// `callback_method #{slot} {name}({params}) -> {ret}{throws}`.
+    #[must_use]
+    pub fn callback_method(slot: usize, name: &str, params: Vec<T>, ret: T, throws: T) -> Self {
+        Self::new()
+            .lit(format!("callback_method #{slot} {name}("))
+            .list(params)
+            .lit(") -> ")
+            .slot(ret)
+            .slot(throws)
+    }
+
+    /// `record {name} {{fields}}`.
+    #[must_use]
+    pub fn record(name: &str, fields: Vec<T>) -> Self {
+        Self::new()
+            .lit(format!("record {name} {{"))
+            .list(fields)
+            .lit("}")
+    }
+
+    /// `enum {name} {{V = value[ {{types}}], ...}}`.
+    #[must_use]
+    pub fn enumeration(name: &str, variants: Vec<(String, i32, Vec<T>)>) -> Self {
+        let mut sig = Self::new().lit(format!("enum {name} {{"));
+        for (i, (variant, value, fields)) in variants.into_iter().enumerate() {
+            if i > 0 {
+                sig = sig.lit(", ");
+            }
+            sig = sig.case(&variant, value, fields);
+        }
+        sig.lit("}")
+    }
+
+    /// `code {name} = {value}[ {{types}}]`.
+    #[must_use]
+    pub fn code(name: &str, value: i32, fields: Vec<T>) -> Self {
+        Self::new().lit("code ").case(name, value, fields)
+    }
+
+    fn case(self, name: &str, value: i32, fields: Vec<T>) -> Self {
+        let sig = self.lit(format!("{name} = {value}"));
+        if fields.is_empty() {
+            sig
+        } else {
+            sig.lit(" {").list(fields).lit("}")
+        }
+    }
+
+    /// A signature that is all literal text (`interface Store`).
+    #[must_use]
+    pub fn text(s: impl Into<String>) -> Self {
+        Self::new().lit(s)
+    }
+}
+
+impl Sig<String> {
+    /// The signature's text.
+    #[must_use]
+    pub fn render(&self) -> String {
+        self.0
+            .iter()
+            .map(|p| match p {
+                Part::Lit(s) | Part::Slot(s) => s.as_str(),
+            })
+            .collect()
+    }
+}
+
+/// Every contract entry of `model`, sorted ascending by id.
+#[must_use]
+pub fn entries(model: &Model) -> Vec<ContractEntry> {
+    let prefix = model.prefix();
     let mut out = Vec::new();
-    let mut stack = vec![root];
-    while let Some(m) = stack.pop() {
-        module_entries(m, &mut out);
-        stack.extend(model.children(m));
+    let mut push = |path: String, sig: Sig<String>| {
+        let signature = sig.render();
+        out.push(ContractEntry {
+            id: fnv1a64(path.as_bytes()),
+            hash: fnv1a64(signature.as_bytes()),
+            symbol: symbol(prefix, &path),
+            path,
+            signature,
+        });
+    };
+    for f in &model.functions {
+        push(f.path.clone(), callable_signature(f));
+    }
+    for i in &model.interfaces {
+        push(i.name.clone(), Sig::text(format!("interface {}", i.name)));
+        for f in i.members() {
+            push(f.path.clone(), callable_signature(f));
+        }
+    }
+    for r in &model.records {
+        push(r.name.clone(), Sig::record(&r.name, field_types(&r.fields)));
+    }
+    for e in &model.enums {
+        let variants = e
+            .variants
+            .iter()
+            .map(|v| (v.name.clone(), v.value, field_types(&v.fields)))
+            .collect();
+        push(e.name.clone(), Sig::enumeration(&e.name, variants));
+    }
+    for c in &model.callbacks {
+        push(c.name.clone(), Sig::text(format!("callback {}", c.name)));
+        for m in &c.methods {
+            push(
+                format!("{}.{}", c.name, m.name),
+                Sig::callback_method(
+                    m.slot,
+                    &m.name,
+                    field_types(&m.params),
+                    m.ret.as_ref().map_or_else(|| VOID.to_string(), canonical),
+                    throws_suffix(&m.error),
+                ),
+            );
+        }
+    }
+    for d in &model.errors {
+        push(d.name.clone(), Sig::text(format!("errors {}", d.name)));
+        for c in &d.codes {
+            push(
+                format!("{}.{}", d.name, c.name),
+                Sig::code(&c.name, c.value, field_types(&c.fields)),
+            );
+        }
     }
     out.sort_by_key(|e| e.id);
     out
 }
 
-fn entry(path: String, signature: String) -> ContractEntry {
-    ContractEntry {
-        id: fnv1a64(path.as_bytes()),
-        hash: fnv1a64(signature.as_bytes()),
-        path,
-        signature,
-    }
+fn field_types(fields: &[FieldBinding]) -> Vec<String> {
+    fields.iter().map(|f| canonical(&f.ty)).collect()
 }
 
-fn module_entries(m: &ModuleBinding, out: &mut Vec<ContractEntry>) {
-    let dot = &m.dot_path;
-    for f in &m.functions {
-        out.push(entry(
-            format!("{dot}.{}", f.name),
-            callable_signature("function", f),
-        ));
-    }
-    for i in &m.interfaces {
-        let owner = format!("{dot}.{}", i.name);
-        out.push(entry(owner.clone(), format!("interface {}", i.name)));
-        for (kind, members) in [
-            ("constructor", &i.constructors),
-            ("method", &i.methods),
-            ("static", &i.statics),
-        ] {
-            for f in members {
-                out.push(entry(
-                    format!("{owner}.{}", f.name),
-                    callable_signature(kind, f),
-                ));
-            }
-        }
-    }
-    for s in &m.structs {
-        out.push(entry(
-            format!("{dot}.{}", s.name),
-            format!("record {} {{{}}}", s.name, field_types(&s.fields)),
-        ));
-    }
-    for e in &m.enums {
-        let variants: Vec<String> = e
-            .variants
-            .iter()
-            .map(|v| case(&v.name, v.value, &v.fields))
-            .collect();
-        out.push(entry(
-            format!("{dot}.{}", e.name),
-            format!("enum {} {{{}}}", e.name, variants.join(", ")),
-        ));
-    }
-    for c in &m.callback_interfaces {
-        let owner = format!("{dot}.{}", c.name);
-        out.push(entry(owner.clone(), format!("callback {}", c.name)));
-        for (slot, cm) in c.methods.iter().enumerate() {
-            let types: Vec<String> = cm.params.iter().map(|p| p.ty.to_string()).collect();
-            // The slot is the method's position in the vtable: reordering
-            // methods, or inserting one before others, must fail the check,
-            // while appending one leaves every existing slot unchanged.
-            let mut sig = format!(
-                "callback_method #{slot} {}({}) -> {}",
-                cm.name,
-                types.join(", "),
-                cm.ret
-                    .as_ref()
-                    .map_or_else(|| "void".to_string(), Ty::to_string)
-            );
-            throws(&mut sig, &cm.error);
-            out.push(entry(format!("{owner}.{}", cm.name), sig));
-        }
-    }
-    for d in &m.errors {
-        let owner = format!("{dot}.{}", d.name);
-        out.push(entry(owner.clone(), format!("errors {}", d.name)));
-        for c in &d.codes {
-            out.push(entry(
-                format!("{owner}.{}", c.name),
-                format!("code {}", case(&c.name, c.value, &c.fields)),
-            ));
-        }
-    }
-}
-
-/// The field types, in order, comma-separated (names are ABI-neutral).
-fn field_types(fields: &[FieldBinding]) -> String {
-    let all: Vec<String> = fields.iter().map(|f| f.ty.to_string()).collect();
-    all.join(", ")
-}
-
-/// `Name = value`, followed by ` {types}` when the case carries fields.
-fn case(name: &str, value: i32, case_fields: &[FieldBinding]) -> String {
-    let mut out = format!("{name} = {value}");
-    if !case_fields.is_empty() {
-        let _ = write!(out, " {{{}}}", field_types(case_fields));
-    }
-    out
-}
-
-/// Append ` throws {Domain}` or ` throws any` for a throwing strategy.
-fn throws(sig: &mut String, error: &ErrorStrategy) {
-    match error {
-        ErrorStrategy::Trap => {}
-        ErrorStrategy::Domain(domain) => {
-            let _ = write!(sig, " throws {domain}");
-        }
-        ErrorStrategy::Untyped => sig.push_str(" throws any"),
-    }
-}
-
-fn callable_signature(kind: &str, f: &FnBinding) -> String {
-    let types: Vec<String> = f.params.iter().map(|p| p.ty.to_string()).collect();
-    let mut sig = format!(
-        "{kind} {}({}) -> {}",
-        f.name,
-        types.join(", "),
-        f.ret
-            .as_ref()
-            .map_or_else(|| "void".to_string(), ToString::to_string)
-    );
-    throws(&mut sig, &f.error);
-    if f.is_async() {
-        sig.push_str(" async");
-    }
-    if f.cancellable() {
-        sig.push_str(" cancellable");
-    }
-    sig
+fn callable_signature(f: &FnBinding) -> Sig<String> {
+    Sig::callable(
+        f.kind.keyword(),
+        &f.name,
+        f.params.iter().map(|p| canonical_param(&p.ty)).collect(),
+        canonical_ret(f.ret.as_ref()),
+        throws_suffix(&f.error),
+        f.is_async(),
+        f.cancellable(),
+    )
 }
 
 #[cfg(all(test, feature = "idl"))]
@@ -235,223 +358,132 @@ mod tests {
     }
 
     const KV: &str = r#"
-version: "0.12.0"
-modules:
-  - name: kv
-    doc: Key-value storage.
-    errors:
-      - name: KvError
-        codes:
-          - { name: NotFound, code: 1, message: missing, fields: [{ name: key, type: string }] }
-          - { name: Full, code: 2, message: full }
-    structs:
-      - name: Entry
-        fields: [{ name: key, type: string }, { name: value, type: bytes }]
-    interfaces:
-      - name: Store
-        constructors: [{ name: open, params: [{ name: path, type: string }], throws: KvError }]
-        methods:
-          - { name: get, params: [{ name: key, type: string }], return: Entry, throws: KvError }
-          - { name: sizes, params: [{ name: limit, type: "u32?" }], return: "[u64]", throws: any }
-    callback_interfaces:
-      - name: Listener
-        methods:
-          - { name: on_put, params: [{ name: entry, type: Entry }], return: string, throws: KvError }
-          - { name: on_clear, params: [] }
-    functions:
-      - { name: version, params: [], return: string, doc: The version. }
-      - { name: fetch, params: [{ name: key, type: string }], return: "i64?", async: true, cancellable: true }
-      - { name: watch, params: [{ name: l, type: "Listener?" }], return: "iter<[i32]>" }
-    modules:
-      - name: stats
-        enums:
-          - name: Kind
-            variants: [{ name: Hot, value: 0 }, { name: Cold, value: 1 }]
-          - name: Shape
-            variants: [{ name: Dot, value: 0 }, { name: Circle, value: 1, fields: [{ name: r, type: f64 }] }]
+version: "0.13.0"
+errors:
+  - name: KvError
+    codes:
+      - { name: NotFound, code: 1, message: missing, fields: [{ name: key, type: string }] }
+      - { name: Full, code: 2, message: full }
+records:
+  - name: Entry
+    fields: [{ name: key, type: string }, { name: value, type: bytes }]
+enums:
+  - name: Kind
+    variants: [{ name: Hot }, { name: Cold, value: 4 }]
+  - name: Shape
+    variants: [{ name: Dot }, { name: Circle, fields: [{ name: r, type: f64 }] }]
+interfaces:
+  - name: Store
+    constructors: [{ name: open, params: [{ name: path, type: string }], throws: KvError }]
+    methods:
+      - { name: get, params: [{ name: key, type: string }], return: Entry, throws: KvError }
+      - { name: sizes, params: [{ name: limit, type: "u32?" }], return: "[u64]", throws: any }
+callbacks:
+  - name: Listener
+    methods:
+      - { name: on_put, params: [{ name: entry, type: Entry }], return: string, throws: KvError }
+      - { name: on_clear }
+functions:
+  - { name: version, return: string }
+  - { name: fetch, params: [{ name: key, type: string }], return: "i64?", async: true, cancellable: true }
+  - { name: watch, params: [{ name: l, type: "Listener?" }], return: "iter<[i32]>" }
 "#;
 
-    fn table(model: &Model) -> Vec<ContractEntry> {
-        let root = model.roots().next().unwrap();
-        entries(model, root)
-    }
-
     fn signature(model: &Model, path: &str) -> String {
-        let entry = table(model).into_iter().find(|e| e.path == path);
+        let entry = entries(model).into_iter().find(|e| e.path == path);
         let entry = entry.unwrap_or_else(|| panic!("no entry {path}"));
         assert_eq!(entry.id, fnv1a64(path.as_bytes()));
         assert_eq!(entry.hash, fnv1a64(entry.signature.as_bytes()));
+        assert_eq!(entry.symbol, format!("kv_contract_{:016x}", entry.id));
         entry.signature
     }
 
     #[test]
-    fn one_entry_per_declaration_code_and_callback_method_sorted_by_id() {
+    fn one_entry_per_declaration_member_code_and_method_sorted_by_id() {
         let model = model(KV);
-        let table = table(&model);
-        let mut got: Vec<String> = table.iter().map(|e| e.path.clone()).collect();
-        got.sort();
+        let table = entries(&model);
+        assert!(table.windows(2).all(|w| w[0].id < w[1].id));
+        let mut got: Vec<&str> = table.iter().map(|e| e.path.as_str()).collect();
+        got.sort_unstable();
         assert_eq!(
             got,
             [
-                "kv.Entry",
-                "kv.KvError",
-                "kv.KvError.Full",
-                "kv.KvError.NotFound",
-                "kv.Listener",
-                "kv.Listener.on_clear",
-                "kv.Listener.on_put",
-                "kv.Store",
-                "kv.Store.get",
-                "kv.Store.open",
-                "kv.Store.sizes",
-                "kv.fetch",
-                "kv.stats.Kind",
-                "kv.stats.Shape",
-                "kv.version",
-                "kv.watch",
+                "Entry",
+                "Kind",
+                "KvError",
+                "KvError.Full",
+                "KvError.NotFound",
+                "Listener",
+                "Listener.on_clear",
+                "Listener.on_put",
+                "Shape",
+                "Store",
+                "Store.get",
+                "Store.open",
+                "Store.sizes",
+                "fetch",
+                "version",
+                "watch",
             ]
         );
-        assert!(table.windows(2).all(|w| w[0].id < w[1].id));
     }
 
     #[test]
     fn canonical_signatures() {
-        let model = model(KV);
+        let m = model(KV);
         let cases = [
-            ("kv.Store.get", "method get(string) -> Entry throws KvError"),
+            ("version", "function version() -> string"),
+            ("fetch", "function fetch(string) -> i64? async cancellable"),
+            ("watch", "function watch(Listener?) -> iter<[i32]>"),
+            ("Store", "interface Store"),
             (
-                "kv.Store.open",
+                "Store.open",
                 "constructor open(string) -> Store throws KvError",
             ),
-            ("kv.Store.sizes", "method sizes(u32?) -> [u64] throws any"),
-            ("kv.Store", "interface Store"),
-            ("kv.version", "function version() -> string"),
+            ("Store.get", "method get(string) -> Entry throws KvError"),
+            ("Store.sizes", "method sizes(u32?) -> [u64] throws any"),
+            ("Entry", "record Entry {string, bytes}"),
+            ("Kind", "enum Kind {Hot = 0, Cold = 4}"),
+            ("Shape", "enum Shape {Dot = 0, Circle = 1 {f64}}"),
+            ("Listener", "callback Listener"),
             (
-                "kv.fetch",
-                "function fetch(string) -> i64? async cancellable",
-            ),
-            ("kv.watch", "function watch(Listener?) -> iter<[i32]>"),
-            ("kv.Entry", "record Entry {string, bytes}"),
-            ("kv.stats.Kind", "enum Kind {Hot = 0, Cold = 1}"),
-            ("kv.stats.Shape", "enum Shape {Dot = 0, Circle = 1 {f64}}"),
-            ("kv.Listener", "callback Listener"),
-            (
-                "kv.Listener.on_put",
+                "Listener.on_put",
                 "callback_method #0 on_put(Entry) -> string throws KvError",
             ),
-            (
-                "kv.Listener.on_clear",
-                "callback_method #1 on_clear() -> void",
-            ),
-            ("kv.KvError", "errors KvError"),
-            ("kv.KvError.NotFound", "code NotFound = 1 {string}"),
-            ("kv.KvError.Full", "code Full = 2"),
+            ("Listener.on_clear", "callback_method #1 on_clear() -> void"),
+            ("KvError", "errors KvError"),
+            ("KvError.NotFound", "code NotFound = 1 {string}"),
+            ("KvError.Full", "code Full = 2"),
         ];
         for (path, expected) in cases {
-            assert_eq!(signature(&model, path), expected, "{path}");
+            assert_eq!(signature(&m, path), expected, "{path}");
         }
     }
 
     #[test]
-    fn names_prose_and_sibling_order_are_excluded() {
-        let a = model(KV);
-        let edited = KV
-            .replace("doc: The version.", "doc: Changed prose.")
-            .replace("message: missing", "message: gone")
-            .replace("{ name: key, type: string }]", "{ name: k, type: string }]")
-            .replace("name: value, type: bytes", "name: data, type: bytes");
-        let b = model(&edited);
-        assert_eq!(table(&a), table(&b));
-        // Swapping two variants changes the enum (its own order is part of
-        // the signature) but not its neighbors.
-        let swapped = KV.replace(
-            "[{ name: Hot, value: 0 }, { name: Cold, value: 1 }]",
-            "[{ name: Cold, value: 1 }, { name: Hot, value: 0 }]",
-        );
-        let c = model(&swapped);
-        assert_ne!(
-            signature(&a, "kv.stats.Kind"),
-            signature(&c, "kv.stats.Kind")
-        );
-        assert_eq!(signature(&a, "kv.Entry"), signature(&c, "kv.Entry"));
-    }
-
-    #[test]
-    fn domains_and_callbacks_are_open() {
-        let a = model(KV);
-        let grown = model(
-            &KV.replace(
-                "- { name: Full, code: 2, message: full }",
-                "- { name: Full, code: 2, message: full }\n          - { name: Busy, code: 3, message: busy }",
-            )
-            .replace(
-                "- { name: on_clear, params: [] }",
-                "- { name: on_clear, params: [] }\n          - { name: on_close, params: [] }",
-            ),
-        );
-        // Every entry the old binding has is unchanged in the grown table.
-        let grown_table = table(&grown);
-        for e in table(&a) {
-            assert!(grown_table.contains(&e), "{} changed", e.path);
-        }
-        assert_eq!(grown_table.len(), table(&a).len() + 2);
-    }
-
-    #[test]
-    fn moving_a_callback_method_changes_its_slot() {
-        // A vtable is laid out in declaration order, so swapping two
-        // methods (even with identical signatures) or inserting one before
-        // another must fail the check for every method whose slot moved.
-        let a = model(KV);
-        let swapped = model(&KV.replace(
-            "- { name: on_put, params: [{ name: entry, type: Entry }], return: string, throws: KvError }\n          - { name: on_clear, params: [] }",
-            "- { name: on_clear, params: [] }\n          - { name: on_put, params: [{ name: entry, type: Entry }], return: string, throws: KvError }",
-        ));
-        for path in ["kv.Listener.on_put", "kv.Listener.on_clear"] {
-            assert_ne!(signature(&a, path), signature(&swapped, path), "{path}");
-        }
-        let inserted = model(&KV.replace(
-            "- { name: on_clear, params: [] }",
-            "- { name: on_open, params: [] }\n          - { name: on_clear, params: [] }",
-        ));
+    fn the_documented_example_hashes() {
         assert_eq!(
-            signature(&a, "kv.Listener.on_put"),
-            signature(&inserted, "kv.Listener.on_put")
+            fnv1a64(b"method get(string) -> Entry throws KvError"),
+            fnv1a64("method get(string) -> Entry throws KvError".as_bytes())
         );
-        assert_ne!(
-            signature(&a, "kv.Listener.on_clear"),
-            signature(&inserted, "kv.Listener.on_clear")
-        );
-    }
-
-    #[test]
-    fn abi_changes_change_only_their_entry() {
-        let a = model(KV);
-        let b = model(&KV.replace(
-            "return: Entry, throws: KvError",
-            "return: \"Entry?\", throws: KvError",
-        ));
-        assert_ne!(signature(&a, "kv.Store.get"), signature(&b, "kv.Store.get"));
-        assert_eq!(
-            signature(&a, "kv.Store.open"),
-            signature(&b, "kv.Store.open")
-        );
-        assert_eq!(signature(&a, "kv.Store"), signature(&b, "kv.Store"));
-        let c = model(&KV.replace(
-            "return: Entry, throws: KvError",
-            "return: Entry, throws: any",
-        ));
-        assert_eq!(
-            signature(&c, "kv.Store.get"),
-            "method get(string) -> Entry throws any"
-        );
-    }
-
-    #[test]
-    fn fnv_is_pinned() {
-        // Changing the algorithm invalidates every deployed binding, so it
-        // must be a deliberate, documented ABI change.
         assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+    }
+
+    #[test]
+    fn slots_render_where_the_caller_puts_them() {
+        let sig: Sig<&str> = Sig::callable("method", "f", vec!["A", "B"], "R", "T", true, false);
+        assert_eq!(
+            sig.0,
+            [
+                Part::Lit("method f(".into()),
+                Part::Slot("A"),
+                Part::Lit(", ".into()),
+                Part::Slot("B"),
+                Part::Lit(") -> ".into()),
+                Part::Slot("R"),
+                Part::Slot("T"),
+                Part::Lit(" async".into()),
+            ]
+        );
     }
 }

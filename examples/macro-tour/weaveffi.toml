@@ -1,0 +1,3 @@
+[project]
+input = "."
+out = "bindings"

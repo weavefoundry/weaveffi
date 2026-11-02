@@ -1,13 +1,14 @@
 //! Go identifiers: case conversion with Go's initialisms, keyword escaping,
 //! and the names the flat package gives every declaration.
 //!
-//! The whole module tree renders into one Go package, so every exported
-//! name is computed here once ([`GoNames`]) and looked up by the renderers:
-//! types keep their IDL name (`Store`), constructors become factories
-//! (`OpenStore`), statics are prefixed with their type (`StoreOpenMany`),
-//! error domains and codes take the shared error type names (`KvError`,
-//! `*KeyNotFoundError`), and a free function whose name would clash with
-//! any of those keeps its module path (`KvOpenStore`).
+//! A library is one namespace and renders into one Go package, so every
+//! exported name is computed here once ([`GoNames`]) and looked up by the
+//! renderers: types keep their IDL name (`Store`), constructors become
+//! factories (`OpenStore`), statics are prefixed with their type
+//! (`StoreOpenMany`), error domains and codes take the shared error type
+//! names (`KvError`, `*KeyNotFoundError`), and a free function whose name
+//! would clash with any of those gains a trailing underscore
+//! (`OpenStore_`).
 
 use heck::ToSnakeCase;
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,7 +32,7 @@ const RUNTIME_NAMES: &[&str] = &["Check", "DebugLive", "Error"];
 /// packages it calls into, the receiver, and its locals. A parameter or
 /// slot spelled like one of them gains a trailing underscore.
 const RESERVED: &[&str] = &[
-    "C", "cErr", "cOut", "cRet", "cRetLen", "cSelf", "call", "context", "err", "iter", "it", "ret",
+    "C", "cErr", "cItem", "cRet", "cSelf", "call", "context", "err", "iter", "it", "ret",
     "runtime", "token", "unsafe",
 ];
 
@@ -128,8 +129,7 @@ pub(crate) fn method_param(name: &str) -> String {
 }
 
 /// The Go spelling of one C ABI slot inside an exported trampoline: the C
-/// name, escaped against Go's keywords and the names bodies use. The
-/// preamble `extern` uses the same spelling so the two prototypes agree.
+/// name, escaped against Go's keywords and the names bodies use.
 pub(crate) fn slot(name: &str) -> String {
     let ident = lang::escape_ident(name, lang::GO_KEYWORDS);
     if RESERVED.contains(&ident.as_str()) {
@@ -160,7 +160,7 @@ pub(crate) fn error_field(name: &str) -> String {
 #[derive(Debug, Clone)]
 pub(crate) struct DomainNames {
     /// The sealed interface every code type implements (`KvError`): the
-    /// shared [`type_name`] in Go's casing.
+    /// domain's shared type name in Go's casing.
     pub(crate) iface: String,
     /// The concrete type of a code these bindings don't declare
     /// (`UnknownKvError`).
@@ -190,8 +190,8 @@ impl GoNames {
         // Names the runtime declares, then every type-level name.
         let mut taken: BTreeSet<String> = RUNTIME_NAMES.iter().map(|s| s.to_string()).collect();
         let mut domains = BTreeMap::new();
-        for (_, e) in model.error_domains() {
-            let iface = pascal(&type_name(&e.name, "Error"));
+        for e in &model.errors {
+            let iface = pascal(&e.type_name);
             let names = DomainNames {
                 unknown: format!("Unknown{iface}"),
                 mapper: format!("wv{iface}"),
@@ -201,43 +201,41 @@ impl GoNames {
             taken.insert(names.unknown.clone());
             domains.insert(e.name.clone(), names);
         }
+        for e in &model.enums {
+            let name = pascal(&e.name);
+            for v in &e.variants {
+                taken.insert(format!("{name}{}", pascal(&v.name)));
+            }
+            taken.insert(name);
+        }
+        for r in &model.records {
+            taken.insert(pascal(&r.name));
+        }
+        for cb in &model.callbacks {
+            taken.insert(pascal(&cb.name));
+        }
         let mut callables = BTreeMap::new();
-        for m in &model.modules {
-            for e in &m.enums {
-                let name = pascal(&e.name);
-                for v in &e.variants {
-                    taken.insert(format!("{name}{}", pascal(&v.name)));
-                }
-                taken.insert(name);
+        for i in &model.interfaces {
+            let name = pascal(&i.name);
+            for c in &i.constructors {
+                let factory = constructor(&name, c);
+                taken.insert(factory.clone());
+                callables.insert(c.abi.symbol.clone(), factory);
             }
-            for s in &m.structs {
-                taken.insert(pascal(&s.name));
+            for f in &i.statics {
+                let go = format!("{name}{}", pascal(&f.name));
+                taken.insert(go.clone());
+                callables.insert(f.abi.symbol.clone(), go);
             }
-            for cb in &m.callback_interfaces {
-                taken.insert(pascal(&cb.name));
+            for f in &i.methods {
+                callables.insert(f.abi.symbol.clone(), format!("{name}.{}", method(&f.name)));
             }
-            for i in &m.interfaces {
-                let name = pascal(&i.name);
-                for c in &i.constructors {
-                    let factory = constructor(&name, c);
-                    taken.insert(factory.clone());
-                    callables.insert(c.abi.symbol.clone(), factory);
-                }
-                for f in &i.statics {
-                    let go = format!("{name}{}", pascal(&f.name));
-                    taken.insert(go.clone());
-                    callables.insert(f.abi.symbol.clone(), go);
-                }
-                for f in &i.methods {
-                    callables.insert(f.abi.symbol.clone(), format!("{name}.{}", method(&f.name)));
-                }
-                taken.insert(name);
-            }
+            taken.insert(name);
         }
 
         // Error codes: `{Code}Error`, or `{Domain}{Code}Error` past a clash.
         let mut codes = BTreeMap::new();
-        for (_, e) in model.error_domains() {
+        for e in &model.errors {
             let domain = &domains[&e.name].iface;
             for c in &e.codes {
                 let plain = pascal(&type_name(&c.name, "Error"));
@@ -254,19 +252,14 @@ impl GoNames {
             }
         }
 
-        // Free functions: the bare name unless it clashes with a declared
-        // name or another function's.
-        let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-        for (_, f) in model.functions() {
-            *seen.entry(pascal(&f.name)).or_default() += 1;
-        }
-        for (m, f) in model.functions() {
-            let bare = pascal(&f.name);
-            let name = if taken.contains(&bare) || seen[&bare] > 1 {
-                pascal(&format!("{}_{}", m.path, f.name))
-            } else {
-                bare
-            };
+        // Free functions: the bare name, with a trailing underscore while
+        // a declared name or an earlier function holds it.
+        for f in &model.functions {
+            let mut name = pascal(&f.name);
+            while taken.contains(&name) {
+                name.push('_');
+            }
+            taken.insert(name.clone());
             callables.insert(f.abi.symbol.clone(), name);
         }
         Self {
@@ -347,30 +340,28 @@ mod tests {
     fn parameters_avoid_keywords_and_body_names() {
         let model = test_model(
             r#"
-version: "0.12.0"
-modules:
-  - name: m
-    interfaces:
-      - name: Box
-        methods:
-          - { name: put, params: [{ name: s, type: i32 }, { name: range, type: i32 }] }
-    functions:
-      - { name: plain, params: [{ name: s, type: i32 }, { name: ctx, type: i32 }] }
-      - { name: later, params: [{ name: ctx, type: i32 }], return: i32, async: true }
+version: "0.13.0"
+interfaces:
+  - name: Box
+    methods:
+      - { name: put, params: [{ name: s, type: i32 }, { name: range, type: i32 }] }
+functions:
+  - { name: plain, params: [{ name: s, type: i32 }, { name: err, type: i32 }] }
+  - { name: later, params: [{ name: s, type: i32 }], return: i32, async: true }
 "#,
         );
-        let m = &model.modules[0];
         let (put, plain, later) = (
-            &m.interfaces[0].methods[0],
-            &m.functions[0],
-            &m.functions[1],
+            &model.interfaces[0].methods[0],
+            &model.functions[0],
+            &model.functions[1],
         );
         assert_eq!(param("s", put), "s_");
         assert_eq!(param("range", put), "range_");
         assert_eq!(param("s", plain), "s");
+        assert_eq!(param("err", plain), "err_");
         assert_eq!(param("ctx", plain), "ctx");
         assert_eq!(param("ctx", later), "ctx_");
-        assert_eq!(param("context", plain), "context_");
+        assert_eq!(param("token", plain), "token_");
         assert_eq!(method_param("chan"), "chan_");
         assert_eq!(method_param("item"), "item");
         assert_eq!(slot("err"), "err_");
@@ -387,24 +378,23 @@ modules:
     }
 
     #[test]
-    fn clashing_names_gain_a_qualifier() {
+    fn clashing_function_names_gain_an_underscore() {
         let model = test_model(
             r#"
-version: "0.12.0"
-modules:
-  - name: kv
-    errors:
-      - name: KvErrors
-        codes:
-          - { name: Store, code: 1, message: store }
-          - { name: user_id_missing, code: 2, message: missing }
-    interfaces:
-      - name: Store
-        constructors: [{ name: open, params: [] }]
-        methods: [{ name: close, params: [] }]
-    functions:
-      - { name: open_store, params: [], return: Store }
-      - { name: check, params: [] }
+version: "0.13.0"
+errors:
+  - name: KvErrors
+    codes:
+      - { name: Store, code: 1, message: store }
+      - { name: user_id_missing, code: 2, message: missing }
+interfaces:
+  - name: Store
+    constructors: [{ name: open, params: [] }]
+    methods: [{ name: close, params: [] }]
+functions:
+  - { name: open_store, params: [], return: Store }
+  - { name: check, params: [] }
+  - { name: ping, params: [] }
 "#,
         );
         let names = GoNames::new(&model);
@@ -413,13 +403,14 @@ modules:
             (d.iface.as_str(), d.unknown.as_str(), d.mapper.as_str()),
             ("KvError", "UnknownKvError", "wvKvError")
         );
-        let e = &model.modules[0].errors[0];
+        let e = &model.errors[0];
         assert_eq!(names.code(&e.codes[0]), "StoreError");
         assert_eq!(names.code(&e.codes[1]), "UserIDMissingError");
-        let f = &model.modules[0].functions;
-        assert_eq!(names.function(&f[0]), "KvOpenStore");
-        assert_eq!(names.function(&f[1]), "KvCheck");
-        assert_eq!(names.callable("kv_kv_Store_close"), Some("Store.Close_"));
-        assert_eq!(names.callable("kv_kv_Store_open"), Some("OpenStore"));
+        let f = &model.functions;
+        assert_eq!(names.function(&f[0]), "OpenStore_");
+        assert_eq!(names.function(&f[1]), "Check_");
+        assert_eq!(names.function(&f[2]), "Ping");
+        assert_eq!(names.callable("kv_Store_close"), Some("Store.Close_"));
+        assert_eq!(names.callable("kv_Store_open"), Some("OpenStore"));
     }
 }

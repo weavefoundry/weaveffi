@@ -6,7 +6,7 @@
 
 use heck::ToShoutySnakeCase;
 use weaveffi_model::errors::pascal;
-use weaveffi_model::model::{EnumBinding, FieldBinding, InterfaceBinding, Model, StructBinding};
+use weaveffi_model::model::{EnumBinding, FieldBinding, InterfaceBinding, Model, RecordBinding};
 
 use crate::codegen::common::{wrap, DocCommentStyle};
 use crate::codegen::docs::Doc;
@@ -28,14 +28,18 @@ const MAX_LINE: usize = 100;
 /// `Error#initialize` takes as required keywords). A code these bindings
 /// don't know (the library is newer) raises the domain class itself, with
 /// the code and message.
-pub(crate) fn render_error(w: &mut CodeWriter, table: &ErrorTable<'_>) {
+pub(crate) fn render_error(w: &mut CodeWriter, ctx: &RbCtx, table: &ErrorTable<'_>) {
     let domain = rb_const(&table.type_name);
     w.blank();
+    let doc = Doc::new(&table.domain.doc, &None).text(|i| docs::spell(&ctx.names, i));
+    if doc.is_some() {
+        w.doc(&doc, DocCommentStyle::Hash);
+        w.line("#");
+    }
     let about = format!(
-        "The `{}` error domain of the `{}` module. A code these bindings don't \
-         know (from a newer library) raises this class itself, with its code \
-         and message.",
-        table.domain.name, table.module.dot_path
+        "The `{}` error domain. A code these bindings don't know (from a newer \
+         library) raises this class itself, with its code and message.",
+        table.domain.name
     );
     w.doc(&Some(wrap(&about, 76)), DocCommentStyle::Hash);
     w.block(format!("class {domain} < Error"), "end", |w| {
@@ -103,7 +107,7 @@ fn emit_attributes(w: &mut CodeWriter, fields: &[FieldBinding]) {
 
 /// `Data.define(:a, :b)`, wrapped one member per line when long. `lead`
 /// precedes it on the first line (`Item = `, `class Circle < `).
-fn emit_data_define(w: &mut CodeWriter, lead: &str, trail: &str, fields: &[FieldBinding]) {
+fn emit_data_define(w: &mut CodeWriter, lead: &str, fields: &[FieldBinding]) {
     let members: Vec<String> = fields
         .iter()
         .map(|f| format!(":{}", rb_field_name(&f.name)))
@@ -113,7 +117,7 @@ fn emit_data_define(w: &mut CodeWriter, lead: &str, trail: &str, fields: &[Field
     } else {
         format!("({})", members.join(", "))
     };
-    let one_line = format!("{lead}Data.define{args}{trail}");
+    let one_line = format!("{lead}Data.define{args}");
     if w.indent_str().len() + one_line.len() <= MAX_LINE {
         w.line(one_line);
         return;
@@ -124,21 +128,21 @@ fn emit_data_define(w: &mut CodeWriter, lead: &str, trail: &str, fields: &[Field
             w.line(format!("{m},"));
         }
     });
-    w.line(format!("){trail}"));
+    w.line(")");
 }
 
 /// Render one record as a `Data` class: immutable, constructed with
 /// keywords (or positionally), with value equality and hashing, `with`,
 /// `to_h`, and pattern matching.
-pub(crate) fn render_struct(w: &mut CodeWriter, ctx: &RbCtx, s: &StructBinding) {
+pub(crate) fn render_record(w: &mut CodeWriter, ctx: &RbCtx, r: &RecordBinding) {
     w.blank();
-    let doc = Doc::new(&s.doc, &s.deprecated);
+    let doc = Doc::new(&r.doc, &r.deprecated);
     docs::emit_plain(w, &ctx.names, &doc);
-    if !s.fields.is_empty() && (s.doc.is_some() || s.deprecated.is_some()) {
+    if !r.fields.is_empty() && (r.doc.is_some() || r.deprecated.is_some()) {
         w.line("#");
     }
-    emit_attributes(w, &s.fields);
-    emit_data_define(w, &format!("{} = ", rb_const(&s.name)), "", &s.fields);
+    emit_attributes(w, &r.fields);
+    emit_data_define(w, &format!("{} = ", rb_const(&r.name)), &r.fields);
 }
 
 /// Render one rich enum as a module of `Data` variant classes. Each variant
@@ -161,7 +165,7 @@ pub(crate) fn render_rich_enum(w: &mut CodeWriter, ctx: &RbCtx, e: &EnumBinding)
                 w.line("#");
             }
             emit_attributes(w, &v.fields);
-            emit_data_define(w, &format!("class {} < ", rb_const(&v.name)), "", &v.fields);
+            emit_data_define(w, &format!("class {} < ", rb_const(&v.name)), &v.fields);
             w.scope(|w| {
                 w.line(format!("include {name}"));
                 w.blank();
@@ -250,15 +254,13 @@ pub(crate) fn render_layouts(w: &mut CodeWriter, model: &Model, tables: &[ErrorT
     w.blank();
     w.line("# How the library clones and releases each interface's objects, and how");
     w.line("# each record, variant, and error payload is laid out in a value buffer.");
-    for m in &model.modules {
-        for i in &m.interfaces {
-            w.line(format!(
-                "Bridge.interface({}, :{}, :{})",
-                rb_const(&i.name),
-                i.clone_symbol,
-                i.destroy_symbol
-            ));
-        }
+    for i in &model.interfaces {
+        w.line(format!(
+            "Bridge.interface({}, :{}, :{})",
+            rb_const(&i.name),
+            i.clone_symbol,
+            i.destroy_symbol
+        ));
     }
     let record_fields = |fields: &[FieldBinding]| -> Vec<(String, String)> {
         fields
@@ -266,33 +268,31 @@ pub(crate) fn render_layouts(w: &mut CodeWriter, model: &Model, tables: &[ErrorT
             .map(|f| (rb_field_name(&f.name), rb_wire(&f.ty)))
             .collect()
     };
-    for m in &model.modules {
-        for s in &m.structs {
-            emit_layout(w, &rb_const(&s.name), &record_fields(&s.fields));
+    for r in &model.records {
+        emit_layout(w, &rb_const(&r.name), &record_fields(&r.fields));
+    }
+    for e in model.enums.iter().filter(|e| e.is_rich()) {
+        let name = rb_const(&e.name);
+        let variants: Vec<String> = e
+            .variants
+            .iter()
+            .map(|v| format!("{name}::{}", rb_const(&v.name)))
+            .collect();
+        for (v, class) in e.variants.iter().zip(&variants) {
+            emit_layout(w, class, &record_fields(&v.fields));
         }
-        for e in m.enums.iter().filter(|e| e.is_rich()) {
-            let name = rb_const(&e.name);
-            let variants: Vec<String> = e
-                .variants
-                .iter()
-                .map(|v| format!("{name}::{}", rb_const(&v.name)))
-                .collect();
-            for (v, class) in e.variants.iter().zip(&variants) {
-                emit_layout(w, class, &record_fields(&v.fields));
-            }
-            let one_line = format!("Bridge.union({name}, {})", variants.join(", "));
-            if w.indent_str().len() + one_line.len() <= MAX_LINE {
-                w.line(one_line);
-            } else {
-                w.line("Bridge.union(");
-                w.scope(|w| {
-                    w.line(format!("{name},"));
-                    for v in &variants {
-                        w.line(format!("{v},"));
-                    }
-                });
-                w.line(")");
-            }
+        let one_line = format!("Bridge.union({name}, {})", variants.join(", "));
+        if w.indent_str().len() + one_line.len() <= MAX_LINE {
+            w.line(one_line);
+        } else {
+            w.line("Bridge.union(");
+            w.scope(|w| {
+                w.line(format!("{name},"));
+                for v in &variants {
+                    w.line(format!("{v},"));
+                }
+            });
+            w.line(")");
         }
     }
     for table in tables {

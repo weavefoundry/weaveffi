@@ -5,8 +5,7 @@
 //! `weaveffi.toml`), renders its files from the validated [`Model`], and
 //! declares the few things the commands need to know about it through
 //! hooks: what `weaveffi package` builds from the per-platform libraries
-//! ([`package`](Target::package)), which C glue `weaveffi build` prebuilds
-//! ([`glue`](Target::glue)), and where `weaveffi dev` puts the library
+//! ([`package`](Target::package)) and where `weaveffi generate --dev` puts the library
 //! ([`dev_bundle_dir`](Target::dev_bundle_dir),
 //! [`linkage`](Target::linkage)). Nothing outside a target matches on its
 //! name.
@@ -16,13 +15,15 @@ pub(crate) mod cpp;
 pub(crate) mod dart;
 pub(crate) mod dotnet;
 pub(crate) mod go;
-pub(crate) mod js;
 pub(crate) mod kotlin;
 pub(crate) mod node;
 pub(crate) mod python;
 pub(crate) mod ruby;
 pub(crate) mod swift;
 pub(crate) mod wasm;
+
+/// The JavaScript layer `node` and `wasm` share (not a target itself).
+pub(crate) mod js;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use miette::{miette, Result};
@@ -33,7 +34,7 @@ use crate::codegen::OutputFile;
 use crate::package::{Artifact, PackageContext};
 
 /// One language target: its name, its rendering, and the hooks the
-/// `build`, `package`, and `dev` commands call.
+/// `build`, `package`, and `generate --dev` commands call.
 ///
 /// Rendering is pure: [`render`](Self::render) returns files in memory with
 /// paths relative to the target's own output directory (`{out}/{name}/`),
@@ -83,15 +84,7 @@ pub trait Target: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// The C glue library this target's bindings load next to the
-    /// producer's, which `weaveffi build` prebuilds per platform. The
-    /// default is none.
-    fn glue(&self, model: &Model) -> Option<Glue> {
-        let _ = model;
-        None
-    }
-
-    /// Where `weaveffi dev` copies the producer's library so the generated
+    /// Where `weaveffi generate --dev` copies the producer's library so the generated
     /// package finds it without setup, relative to the target's output
     /// directory, or `None` when the package doesn't bundle one.
     fn dev_bundle_dir(&self, model: &Model) -> Option<Utf8PathBuf> {
@@ -124,50 +117,6 @@ pub enum Linkage {
     /// The bindings load a `wasm32` module, which `weaveffi build
     /// --platforms wasm32` produces.
     Wasm,
-}
-
-/// The kind of C glue library a target prebuilds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GlueKind {
-    /// A Node.js N-API addon, built for desktop platforms.
-    NodeAddon,
-    /// A JNI shim, built for Android and desktop platforms.
-    JniShim,
-}
-
-/// A C glue library a target's bindings load next to the producer's.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Glue {
-    /// What the library is.
-    pub kind: GlueKind,
-    /// The glue's C source, as the target renders it.
-    pub source: OutputFile,
-    /// The producer's C header the source includes.
-    pub header: OutputFile,
-}
-
-impl Glue {
-    /// The glue of `kind` from a target's rendered `files`: the file named
-    /// `source` and the producer's header, `{library}.h`.
-    pub(crate) fn from_files(
-        kind: GlueKind,
-        files: &[OutputFile],
-        source: &str,
-        model: &Model,
-    ) -> Option<Self> {
-        let header = c::header_name(model);
-        let find = |name: &str| {
-            files
-                .iter()
-                .find(|f| f.path.file_name() == Some(name))
-                .cloned()
-        };
-        Some(Self {
-            kind,
-            source: find(source)?,
-            header: find(&header)?,
-        })
-    }
 }
 
 /// A registered target: its name, help text, and how to build it from its
@@ -248,8 +197,14 @@ pub static REGISTRY: &[TargetDesc] = &[
         build: configured::<swift::SwiftConfig, swift::SwiftGenerator>,
     },
     TargetDesc {
+        name: "kotlin",
+        description: "Kotlin/JVM and Android Gradle project over JNA",
+        default: true,
+        build: configured::<kotlin::KotlinConfig, kotlin::KotlinGenerator>,
+    },
+    TargetDesc {
         name: "node",
-        description: "Node.js N-API package",
+        description: "Node.js npm package (koffi)",
         default: true,
         build: configured::<node::NodeConfig, node::NodeGenerator>,
     },
@@ -258,6 +213,12 @@ pub static REGISTRY: &[TargetDesc] = &[
         description: "WebAssembly npm package",
         default: true,
         build: configured::<wasm::WasmConfig, wasm::WasmGenerator>,
+    },
+    TargetDesc {
+        name: "python",
+        description: "Python package over ctypes",
+        default: true,
+        build: configured::<python::PythonConfig, python::PythonGenerator>,
     },
     TargetDesc {
         name: "dotnet",
@@ -272,12 +233,6 @@ pub static REGISTRY: &[TargetDesc] = &[
         build: configured::<dart::DartConfig, dart::DartGenerator>,
     },
     TargetDesc {
-        name: "python",
-        description: "Python package over ctypes",
-        default: true,
-        build: configured::<python::PythonConfig, python::PythonGenerator>,
-    },
-    TargetDesc {
         name: "go",
         description: "Go module over cgo",
         default: true,
@@ -288,12 +243,6 @@ pub static REGISTRY: &[TargetDesc] = &[
         description: "Ruby gem over FFI",
         default: true,
         build: configured::<ruby::RubyConfig, ruby::RubyGenerator>,
-    },
-    TargetDesc {
-        name: "kotlin",
-        description: "Kotlin/JVM and Android Gradle project with a JNI shim",
-        default: true,
-        build: configured::<kotlin::KotlinConfig, kotlin::KotlinGenerator>,
     },
 ];
 

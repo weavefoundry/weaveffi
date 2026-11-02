@@ -7,8 +7,8 @@
 #
 #   python  the wheel, pip-installed into a fresh venv
 #   node    the per-platform and main npm tarballs, npm-installed into a
-#           temporary project (and checked to load the prebuilt addon, so
-#           nothing compiled at install time)
+#           temporary project (which fetches koffi from the registry), with
+#           the library loaded from the installed platform package
 #   swift   the XCFramework archive unzipped beside the packaged SwiftPM
 #           package, used by path from a temporary executable package
 #           (macOS only)
@@ -97,15 +97,11 @@ smoke_node() {
     mkdir -p "$app"
     printf '{"name":"smoke","version":"0.0.0","private":true,"type":"module"}\n' >"$app/package.json"
     (cd "$app" && npm install --no-audit --no-fund --loglevel=error "$DIST"/node/*.tgz)
-    if [ -d "$app/node_modules/calculator/build" ]; then
-        echo "error: npm install compiled the addon instead of using the prebuilt one" >&2
-        return 1
-    fi
-    (cd "$app" && node --input-type=module -e '
-import { calculator } from "calculator";
-const sum = calculator.add(2, 3);
+    (cd "$app" && env -u CALCULATOR_LIBRARY node --input-type=module -e '
+import { add } from "calculator";
+const sum = add(2, 3);
 if (sum !== 5) throw new Error(`add(2, 3) returned ${sum}`);
-console.log("node: calculator.add(2, 3) === 5");
+console.log("node: add(2, 3) === 5");
 ')
 }
 

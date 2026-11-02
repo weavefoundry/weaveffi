@@ -70,16 +70,14 @@ fn check_fails_when_idl_changed() {
     write_file(
         &idl,
         concat!(
-            "version: \"0.12.0\"\n",
-            "modules:\n",
-            "  - name: calc\n",
-            "    functions:\n",
-            "      - name: add\n",
-            "        doc: Add two integers\n",
-            "        params:\n",
-            "          - { name: a, type: i32 }\n",
-            "          - { name: b, type: i32 }\n",
-            "        return: i32\n",
+            "version: \"0.13.0\"\n",
+            "functions:\n",
+            "  - name: add\n",
+            "    doc: Add two integers\n",
+            "    params:\n",
+            "      - { name: a, type: i32 }\n",
+            "      - { name: b, type: i32 }\n",
+            "    return: i32\n",
         ),
     );
 
@@ -96,22 +94,20 @@ fn check_fails_when_idl_changed() {
     write_file(
         &idl,
         concat!(
-            "version: \"0.12.0\"\n",
-            "modules:\n",
-            "  - name: calc\n",
-            "    functions:\n",
-            "      - name: add\n",
-            "        doc: Add two integers\n",
-            "        params:\n",
-            "          - { name: a, type: i32 }\n",
-            "          - { name: b, type: i32 }\n",
-            "        return: i32\n",
-            "      - name: sub\n",
-            "        doc: Subtract two integers\n",
-            "        params:\n",
-            "          - { name: a, type: i32 }\n",
-            "          - { name: b, type: i32 }\n",
-            "        return: i32\n",
+            "version: \"0.13.0\"\n",
+            "functions:\n",
+            "  - name: add\n",
+            "    doc: Add two integers\n",
+            "    params:\n",
+            "      - { name: a, type: i32 }\n",
+            "      - { name: b, type: i32 }\n",
+            "    return: i32\n",
+            "  - name: sub\n",
+            "    doc: Subtract two integers\n",
+            "    params:\n",
+            "      - { name: a, type: i32 }\n",
+            "      - { name: b, type: i32 }\n",
+            "    return: i32\n",
         ),
     );
 
@@ -139,7 +135,7 @@ fn check_fails_when_idl_changed() {
         "generate --check must not print per-file diff content, got: {stdout}"
     );
     assert!(
-        std::fs::read_to_string(out.join("c/api.h")).is_ok_and(|h| !h.contains("api_calc_sub")),
+        std::fs::read_to_string(out.join("c/api.h")).is_ok_and(|h| !h.contains("api_sub")),
         "generate --check must not write"
     );
 }
@@ -163,7 +159,6 @@ fn validate_json_format_outputs_object() {
     let parsed: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
     assert_eq!(parsed["ok"], serde_json::Value::Bool(true));
-    assert_eq!(parsed["modules"], serde_json::Value::from(1));
     assert!(
         parsed["functions"].as_u64().unwrap() >= 1,
         "expected at least 1 function in calculator sample, got: {parsed}"
@@ -179,12 +174,10 @@ fn validate_warn_json_format_outputs_warnings_array() {
     write_file(
         &path,
         concat!(
-            "version: \"0.12.0\"\n",
-            "modules:\n",
-            "  - name: nodocs\n",
-            "    functions:\n",
-            "      - name: do_stuff\n",
-            "        params: []\n",
+            "version: \"0.13.0\"\n",
+            "functions:\n",
+            "  - name: do_stuff\n",
+            "    params: []\n",
         ),
     );
 
@@ -209,14 +202,11 @@ fn validate_warn_json_format_outputs_warnings_array() {
         .expect("expected 'warnings' to be an array");
     assert!(
         !warnings.is_empty(),
-        "expected at least one warning for an undocumented module, got: {parsed}"
+        "expected at least one warning for an undocumented function, got: {parsed}"
     );
     let first = &warnings[0];
-    assert!(first.get("code").is_some(), "warning missing 'code'");
-    assert!(
-        first.get("location").is_some(),
-        "warning missing 'location'"
-    );
+    assert_eq!(first["code"], "Undocumented", "{parsed}");
+    assert_eq!(first["name"], "do_stuff", "{parsed}");
     assert!(first.get("message").is_some(), "warning missing 'message'");
 
     assert_eq!(
@@ -234,13 +224,12 @@ fn validate_json_failures_carry_the_code_and_fields() {
     write_file(
         &path,
         concat!(
-            "version: \"0.12.0\"\n",
-            "modules:\n",
-            "  - name: a\n",
-            "    structs: [{ name: Item, fields: [{ name: n, type: usize }] }]\n",
-            "    functions: [{ name: open, params: [{ name: i, type: a.Item }] }]\n",
-            "  - name: b\n",
-            "    functions: [{ name: open }]\n",
+            "version: \"0.13.0\"\n",
+            "records:\n",
+            "  - { name: Item, fields: [{ name: n, type: usize }] }\n",
+            "  - { name: open, fields: [{ name: n, type: i32 }] }\n",
+            "functions:\n",
+            "  - { name: open, params: [{ name: i, type: a.Item }] }\n",
         ),
     );
 
@@ -248,7 +237,7 @@ fn validate_json_failures_carry_the_code_and_fields() {
         .args(["validate", path.to_str().unwrap(), "--format", "json"])
         .output()
         .expect("failed to run weaveffi validate --format json");
-    assert!(!output.status.success(), "global name clashes must fail");
+    assert!(!output.status.success(), "name clashes must fail");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value =
@@ -261,10 +250,10 @@ fn validate_json_failures_carry_the_code_and_fields() {
             .unwrap_or_else(|| panic!("no {code} in {parsed}"))
     };
     assert_eq!(find("UnsupportedPrimitive")["name"], "usize");
-    assert_eq!(find("QualifiedTypeRef")["name"], "a.Item");
-    let dup = find("DuplicateFunctionName");
+    assert_eq!(find("UnknownTypeRef")["name"], "a.Item");
+    let dup = find("DuplicateName");
     assert_eq!(dup["name"], "open");
-    assert_eq!(dup["first"], "a");
-    assert_eq!(dup["second"], "b");
+    assert_eq!(dup["first"], "record");
+    assert_eq!(dup["second"], "function");
     assert!(dup["suggestion"].as_str().is_some_and(|s| !s.is_empty()));
 }

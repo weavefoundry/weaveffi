@@ -2,25 +2,23 @@
 //! exported trampolines behind each vtable entry, and the cgo preamble
 //! declaring them and the one static vtable per interface.
 //!
-//! An implementation crosses as a handle-table context (see
-//! `wvNewCallback`) plus the address of its interface's static vtable,
-//! whose header records the vtable's `size` and the `free` trampoline that
-//! deletes the handle once the native library is done with it.
+//! An implementation crosses as the interface's `{p}_{Cb}` argument struct:
+//! a handle-table context (see `wvNewCallback`) and the address of the
+//! interface's static vtable, whose header records the vtable's `size` and
+//! the `free` trampoline that deletes the handle once the native library is
+//! done with it.
 
 use crate::cabi::c_param_name;
 use crate::codegen::CodeWriter;
-use weaveffi_model::abi::{AbiParam, CType};
-use weaveffi_model::model::{
-    CallShape, CallbackInterfaceBinding, CallbackMethodBinding, CallbackParamBinding, Model,
-};
-use weaveffi_model::plan::{ArgPass, CallbackRetPass, ErrorStrategy};
-use weaveffi_model::ty::Ty;
+use weaveffi_model::abi::{ctx_param, AbiParam, CType};
+use weaveffi_model::model::{CallbackBinding, CallbackMethodBinding, ErrorStrategy, Model};
 
 use crate::targets::go::calls::{completion_trampoline, vtable_accessor};
-use crate::targets::go::codec::{func, read_fn, write_fn};
+use crate::targets::go::codec::func;
 use crate::targets::go::docs::GoDoc;
 use crate::targets::go::names::{self, pascal};
-use crate::targets::go::types::{cgo_pointee, cgo_type, go_type, prim_type, strip_const};
+use crate::targets::go::types::{cgo_type, go_type};
+use crate::targets::go::values::{borrow, hand_over};
 use crate::targets::go::Ctx;
 
 /// The C name of the exported trampoline behind one vtable entry;
@@ -34,19 +32,13 @@ fn vtable_var(vtable_tag: &str) -> String {
     format!("wvVtable_{vtable_tag}")
 }
 
-/// The preamble `extern` declaration of one exported trampoline. Pointer
-/// types are const-free to match the prototypes cgo writes into
-/// `_cgo_export.h` from the Go signature.
+/// The preamble `extern` declaration of one exported trampoline, matching
+/// the prototype cgo writes into `_cgo_export.h` from the Go signature
+/// (every slot of a trampoline is const-free).
 fn extern_decl(name: &str, ret: &CType, params: &[AbiParam], prefix: &str) -> String {
     let args: Vec<String> = params
         .iter()
-        .map(|p| {
-            format!(
-                "{} {}",
-                strip_const(&p.ty).render_c(prefix),
-                c_param_name(&p.name)
-            )
-        })
+        .map(|p| format!("{} {}", p.ty.render_c(prefix), c_param_name(&p.name)))
         .collect();
     format!(
         "extern {} {name}({});",
@@ -68,7 +60,7 @@ fn extern_decl(name: &str, ret: &CType, params: &[AbiParam], prefix: &str) -> St
 /// process.
 pub(crate) fn emit_preamble_decls(w: &mut CodeWriter, model: &Model) {
     let prefix = model.prefix();
-    for (_, cb) in model.callback_interfaces() {
+    for cb in &model.callbacks {
         for m in &cb.methods {
             w.line(extern_decl(
                 &trampoline(&cb.c_tag, &m.name),
@@ -78,12 +70,7 @@ pub(crate) fn emit_preamble_decls(w: &mut CodeWriter, model: &Model) {
             ));
         }
         let free = trampoline(&cb.c_tag, "free");
-        w.line(extern_decl(
-            &free,
-            &CType::Void,
-            &[AbiParam::new("ctx", CType::ptr(CType::Void))],
-            prefix,
-        ));
+        w.line(extern_decl(&free, &CType::Void, &[ctx_param()], prefix));
         let tag = &cb.vtable_tag;
         w.block(
             format!("static const {tag} {} = {{", vtable_var(tag)),
@@ -95,22 +82,11 @@ pub(crate) fn emit_preamble_decls(w: &mut CodeWriter, model: &Model) {
                 w.line(".flags = 0,");
                 w.line(format!(".free = {free},"));
                 for m in &cb.methods {
-                    let tramp = trampoline(&cb.c_tag, &m.name);
-                    // An entry whose C signature has `const` pointers is
-                    // cast to the field's exact type, since the exported
-                    // Go function is declared const-free.
-                    if m.abi.params.iter().any(|p| strip_const(&p.ty) != p.ty) {
-                        let types: Vec<String> =
-                            m.abi.params.iter().map(|p| p.ty.render_c(prefix)).collect();
-                        w.line(format!(
-                            ".{} = ({} (*)({})){tramp},",
-                            c_param_name(&m.name),
-                            m.abi.ret.render_c(prefix),
-                            types.join(", ")
-                        ));
-                    } else {
-                        w.line(format!(".{} = {tramp},", c_param_name(&m.name)));
-                    }
+                    w.line(format!(
+                        ".{} = {},",
+                        c_param_name(&m.name),
+                        trampoline(&cb.c_tag, &m.name)
+                    ));
                 }
             },
         );
@@ -120,12 +96,12 @@ pub(crate) fn emit_preamble_decls(w: &mut CodeWriter, model: &Model) {
             vtable_var(tag)
         ));
     }
-    for (_, f) in model.callables() {
-        if let CallShape::Async(ab) = &f.shape {
+    for f in model.callables() {
+        if let Some(ab) = f.async_binding() {
             w.line(extern_decl(
                 &completion_trampoline(&ab.callback_type),
                 &CType::Void,
-                &ab.callback_params,
+                &ab.callback.params,
                 prefix,
             ));
         }
@@ -152,11 +128,7 @@ fn method_sig(m: &CallbackMethodBinding) -> String {
 /// Render one callback interface: the Go `interface` the consumer
 /// implements, the trampoline behind each vtable entry, and the `free`
 /// trampoline.
-pub(crate) fn render_callback_interface(
-    w: &mut CodeWriter,
-    ctx: &Ctx,
-    cb: &CallbackInterfaceBinding,
-) {
+pub(crate) fn render_callback_interface(w: &mut CodeWriter, ctx: &Ctx, cb: &CallbackBinding) {
     let name = pascal(&cb.name);
     let (doc, deprecated) = ctx.docs.of(&cb.doc, &cb.deprecated);
     GoDoc::decl(&name, doc)
@@ -211,62 +183,19 @@ pub(crate) fn render_callback_interface(
     );
 }
 
-/// The Go expression converting one callback argument's C slots into the
-/// Go value the implementation receives: strings, bytes, typed arrays, and
-/// buffers are borrowed for the call, so they're copied or decoded; an
-/// optional scalar is joined from its flag and value; an object transfers
-/// one strong reference, adopted into a new wrapper.
-fn argument(p: &CallbackParamBinding) -> String {
-    let s = |slot: &weaveffi_model::abi::AbiParam| names::slot(&slot.name);
-    match &p.pass {
-        ArgPass::Direct { slot } => format!("{}({})", go_type(&p.ty), s(slot)),
-        ArgPass::OptDirect { has, value, inner } => {
-            format!(
-                "wvOptional(bool({}), {}({}))",
-                s(has),
-                go_type(inner),
-                s(value)
-            )
-        }
-        ArgPass::Slice { ptr, len, elem } => {
-            format!(
-                "wvBorrowSlice[{}]({}, {})",
-                prim_type(*elem),
-                s(ptr),
-                s(len)
-            )
-        }
-        ArgPass::String { ptr, len } => format!("wvBorrowString({}, {})", s(ptr), s(len)),
-        ArgPass::Bytes { ptr, len } => format!("wvBorrowBytes({}, {})", s(ptr), s(len)),
-        ArgPass::Buffer { ptr, len } => format!(
-            "wvDecodeBorrowed({}, {}, {})",
-            s(ptr),
-            s(len),
-            read_fn(&p.ty)
-        ),
-        ArgPass::Object {
-            slot, interface, ..
-        } => format!("wvAdopt{}({})", pascal(interface), s(slot)),
-        ArgPass::Callback { .. } => {
-            unreachable!("a callback method parameter is never a callback")
-        }
-    }
-}
-
 /// Render the exported trampoline behind one vtable entry. It recovers the
-/// implementation from the context, converts the arguments, calls the Go
-/// method, and hands the result back: a direct value as the C return, an
-/// optional scalar as the C return (present) plus its out slot, an object
-/// as a fresh strong reference the native library adopts (nil stays null),
-/// and a string, bytes, typed array, or buffer as a run allocated with the
-/// library's allocator in the out slots. A returned error is reported
-/// through `out_err`: a code of the method's domain with its payload, or
-/// code -1 with its text; a panic is recovered into code -4. Nothing
-/// unwinds through the C frame.
+/// implementation from the context, receives the arguments (runs are lent
+/// for the call and copied or decoded; an object moves one strong
+/// reference into a new wrapper), calls the Go method, and hands the result
+/// back as the C return (a run from the library's allocator, or a fresh
+/// object reference, which the library adopts). A returned error is
+/// reported through `out_err`: a code of the method's domain with its
+/// payload, or code -1 with its text; a panic is recovered into code -4.
+/// Nothing unwinds through the C frame.
 fn render_trampoline(
     w: &mut CodeWriter,
     ctx: &Ctx,
-    cb: &CallbackInterfaceBinding,
+    cb: &CallbackBinding,
     m: &CallbackMethodBinding,
     iface: &str,
 ) {
@@ -278,13 +207,17 @@ fn render_trampoline(
         .collect();
     let first = names::slot(&params[0].name);
     let out_err = names::slot(&params[params.len() - 1].name);
-    let direct_ret = m.abi.ret != CType::Void;
-    let ret_sig = if direct_ret {
-        format!(" (cRet {})", cgo_type(&m.abi.ret, ctx.prefix))
-    } else {
-        String::new()
+    let ret_sig = match &m.ret {
+        Some(_) => format!(" (cRet {})", cgo_type(&m.abi.ret, ctx.prefix)),
+        None => String::new(),
     };
-    let args: Vec<String> = m.params.iter().map(argument).collect();
+    // The method's own parameters sit between `ctx` and `out_err`.
+    let args: Vec<String> = m
+        .params
+        .iter()
+        .zip(&params[1..])
+        .map(|(p, slot)| borrow(&p.ty, &names::slot(&slot.name)))
+        .collect();
     let call = format!(
         "wvCallback[{iface}]({first}).{}({})",
         pascal(&m.name),
@@ -306,82 +239,26 @@ fn render_trampoline(
         "}",
         |w| {
             w.line(format!("defer wvRecoverCallback({out_err})"));
-            match (&m.ret, m.error.throws()) {
-                (None, false) => {
-                    w.line(call);
-                    return;
-                }
-                (None, true) => {
+            let Some(ty) = &m.ret else {
+                if m.error.throws() {
                     w.block(format!("if err := {call}; err != nil {{"), "}", |w| {
                         w.line(failed);
                     });
-                    return;
+                } else {
+                    w.line(call);
                 }
-                (Some(_), false) => {
-                    w.line(format!("ret := {call}"));
-                }
-                (Some(_), true) => {
-                    w.line(format!("ret, err := {call}"));
-                    w.block("if err != nil {", "}", |w| {
-                        w.line(failed);
-                        w.line("return");
-                    });
-                }
+                return;
+            };
+            if m.error.throws() {
+                w.line(format!("ret, err := {call}"));
+                w.block("if err != nil {", "}", |w| {
+                    w.line(failed);
+                    w.line("return");
+                });
+            } else {
+                w.line(format!("ret := {call}"));
             }
-            let ty: &Ty = m.ret.as_ref().expect("a returning method");
-            let s = |slot: &weaveffi_model::abi::AbiParam| names::slot(&slot.name);
-            match &m.ret_pass {
-                CallbackRetPass::Direct => {
-                    w.line(format!("return {}(ret)", cgo_type(&m.abi.ret, ctx.prefix)));
-                }
-                CallbackRetPass::OptDirect { out_value } => {
-                    w.line("cPresent, cValue := wvPresent(ret)");
-                    w.line(format!(
-                        "*{} = {}(cValue)",
-                        s(out_value),
-                        cgo_pointee(&out_value.ty, ctx.prefix)
-                    ));
-                    w.line(format!(
-                        "return {}(cPresent)",
-                        cgo_type(&m.abi.ret, ctx.prefix)
-                    ));
-                }
-                CallbackRetPass::Object { .. } => {
-                    w.line("return ret.share()");
-                }
-                CallbackRetPass::Slice {
-                    out_ptr, out_len, ..
-                } => {
-                    w.line(format!(
-                        "wvHandOverSlice(ret, {}, {})",
-                        s(out_ptr),
-                        s(out_len)
-                    ));
-                }
-                CallbackRetPass::String { out_ptr, out_len } => {
-                    w.line(format!(
-                        "wvHandOverString(ret, {}, {})",
-                        s(out_ptr),
-                        s(out_len)
-                    ));
-                }
-                CallbackRetPass::Bytes { out_ptr, out_len } => {
-                    w.line(format!(
-                        "wvHandOverBytes(ret, {}, {})",
-                        s(out_ptr),
-                        s(out_len)
-                    ));
-                }
-                CallbackRetPass::Buffer { out_ptr, out_len } => {
-                    w.line(format!(
-                        "wvHandOverBytes(wvEncode(ret, {}), {}, {})",
-                        write_fn(ty),
-                        s(out_ptr),
-                        s(out_len)
-                    ));
-                }
-                CallbackRetPass::Void => unreachable!("a returning method"),
-            }
+            w.line(format!("return {}", hand_over(ctx, ty, "ret")));
         },
     );
     w.blank();

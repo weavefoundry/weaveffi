@@ -1,0 +1,43 @@
+error[E0277]: `Oops` isn't a WeaveFFI error type
+  --> tests/ui/fail_error_type_not_a_domain.rs:17:19
+   |
+17 | pub fn risky() -> Result<i32, Oops> {
+   |                   ^^^^^^ not a `#[weaveffi::error]` domain or an untyped error
+   |
+help: the trait `weaveffi::rt::error::ErrorType<Tag>` is not implemented for `Oops`
+  --> tests/ui/fail_error_type_not_a_domain.rs:6:1
+   |
+ 6 | pub struct Oops;
+   | ^^^^^^^^^^^^^^^
+   = note: declare a domain with `#[weaveffi::error]`, or return `weaveffi::Error`, which any `std::error::Error` converts into with `?`
+   = help: the following other types implement trait `weaveffi::rt::error::ErrorType<UT>`:
+             &'static str
+             Box<(dyn std::error::Error + 'static)>
+             Box<(dyn std::error::Error + Send + Sync + 'static)>
+             ForeignError
+             String
+             std::io::Error
+             weaveffi::Error
+   = note: required for `Result<i32, Oops>` to implement `weaveffi::rt::types::FfiReturn<Tag>`
+
+error[E0277]: `Oops` isn't a WeaveFFI error type
+  --> tests/ui/fail_error_type_not_a_domain.rs:17:19
+   |
+17 | pub fn risky() -> Result<i32, Oops> {
+   |                   ^^^^^^^^^^^^^^^^^ not a `#[weaveffi::error]` domain or an untyped error
+   |
+help: the trait `weaveffi::rt::error::ErrorType<Tag>` is not implemented for `Oops`
+  --> tests/ui/fail_error_type_not_a_domain.rs:6:1
+   |
+ 6 | pub struct Oops;
+   | ^^^^^^^^^^^^^^^
+   = note: declare a domain with `#[weaveffi::error]`, or return `weaveffi::Error`, which any `std::error::Error` converts into with `?`
+   = help: the following other types implement trait `weaveffi::rt::error::ErrorType<UT>`:
+             &'static str
+             Box<(dyn std::error::Error + 'static)>
+             Box<(dyn std::error::Error + Send + Sync + 'static)>
+             ForeignError
+             String
+             std::io::Error
+             weaveffi::Error
+   = note: required for `Result<i32, Oops>` to implement `weaveffi::rt::types::FfiReturn<Tag>`

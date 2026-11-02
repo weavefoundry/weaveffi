@@ -11,10 +11,6 @@ runs:
       uses: actions/setup-node@v4
       with:
         node-version: '22'
-    # The node fixture check compiles the N-API addon against these headers.
-    - if: inputs.lang == 'node'
-      shell: bash
-      run: npx --yes node-gyp install
     - if: inputs.lang == 'python'
       uses: actions/setup-python@v5
       with:

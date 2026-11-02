@@ -3,8 +3,8 @@
 //! In a Rust crate (a directory with a `Cargo.toml` that has a `[package]`),
 //! it writes a `weaveffi.toml` whose `[project] input` is the crate itself
 //! (`"."`), whose API WeaveFFI reads from the library the crate builds, then
-//! checks the things a producer needs (a `weaveffi` dependency, a
-//! `#[weaveffi::module]`, and one `weaveffi::export_runtime!()` call) and
+//! checks the things a producer needs (a `weaveffi` dependency, at least one
+//! `#[weaveffi::export]`, and one `weaveffi::export_runtime!()` call) and
 //! prints any that are missing. It never edits `Cargo.toml` or
 //! source files. Anywhere else, it writes a starter IDL plus a
 //! `weaveffi.toml` that points at it.
@@ -91,8 +91,8 @@ fn init_rust(dir: &Utf8Path, config_path: &Utf8Path, crate_name: &str, quiet: bo
     if !lib.contains("export_runtime!") {
         todo.push("call `weaveffi::export_runtime!();` once in src/lib.rs");
     }
-    if !lib.contains("weaveffi::module") {
-        todo.push("annotate your API module with `#[weaveffi::module]`");
+    if !lib.contains("weaveffi::export") {
+        todo.push("annotate the functions and types to export with `#[weaveffi::export]` and its siblings");
     }
     if todo.is_empty() {
         println!("The crate is ready: run `weaveffi generate`.");
@@ -113,8 +113,7 @@ fn init_idl(dir: &Utf8Path, config_path: &Utf8Path, name: Option<&str>, quiet: b
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "api".to_string()),
     };
-    let module = c_ident(&name);
-    let idl_name = format!("{module}.yml");
+    let idl_name = format!("{}.yml", c_ident(&name));
     let idl_path = dir.join(&idl_name);
     if !idl_path.exists() {
         write(
@@ -122,19 +121,17 @@ fn init_idl(dir: &Utf8Path, config_path: &Utf8Path, name: Option<&str>, quiet: b
             &format!(
                 "# yaml-language-server: $schema=https://weaveffi.com/weaveffi.schema.json\n\
                  version: \"{version}\"\n\
-                 modules:\n  \
-                   - name: {module}\n    \
-                     structs:\n      \
-                       - name: Greeting\n        \
-                         fields:\n          \
-                           - {{ name: text, type: string }}\n          \
-                           - {{ name: count, type: u32 }}\n    \
-                     functions:\n      \
-                       - name: greet\n        \
-                         doc: Build a greeting for `name`.\n        \
-                         params:\n          \
-                           - {{ name: name, type: string }}\n        \
-                         return: Greeting\n",
+                 records:\n  \
+                   - name: Greeting\n    \
+                     fields:\n      \
+                       - {{ name: text, type: string }}\n      \
+                       - {{ name: count, type: u32 }}\n\
+                 functions:\n  \
+                   - name: greet\n    \
+                     doc: Build a greeting for `name`.\n    \
+                     params:\n      \
+                       - {{ name: name, type: string }}\n    \
+                     return: Greeting\n",
                 version = weaveffi_model::ir::CURRENT_SCHEMA_VERSION,
             ),
         )?;

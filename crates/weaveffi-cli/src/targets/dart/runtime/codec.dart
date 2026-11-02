@@ -217,6 +217,16 @@ T _decode<T>(Uint8List bytes, T Function(_BufferReader) read) {
   return value;
 }
 
+/// Decodes exactly one value with [read] from an owned run and releases
+/// the run, whether or not it decodes.
+T _takeDecoded<T>(_Run run, T Function(_BufferReader) read) {
+  try {
+    return _decode(_viewRun(run), read);
+  } finally {
+    _runFree(run);
+  }
+}
+
 // Records and rich enums compare by value: lists, maps, and byte arrays
 // element by element, and everything else with `==` (interface wrappers by
 // identity).

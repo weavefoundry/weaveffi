@@ -5,25 +5,35 @@
 //! system-library target holding a copy of the C header and a module map
 //! that links the native library.
 //!
-//! Records, rich enums, and every optional, list, and map that isn't an
-//! optional scalar or a numeric list cross the C ABI as value buffers. The
-//! runtime ships a small private writer/reader pair (`WvWriter`/`WvReader`,
-//! decoding in place from the library's memory) and a `WvCodable` protocol:
-//! every primitive conforms, optionals, arrays, and dictionaries conform
-//! generically, and each record, enum, and interface conforms where it's
-//! declared, so records surface as plain `Hashable` Swift structs and rich
-//! enums as native Swift enums with associated values. Optional scalars
-//! (`T?`) cross directly as a presence flag and a value, and numeric lists
-//! (`[T]`) as the array's own storage. Objects surface as `final class`
-//! wrappers owning one strong reference each, `Hashable` by identity;
-//! callback interfaces as class-bound `Sendable` protocols whose
-//! implementations cross through a process-wide vtable of `@convention(c)`
-//! trampolines; iterators as the runtime's generic `NativeSequence`; and
-//! async functions as `async` functions over checked continuations, with task
-//! cancellation wired to the native cancel token. Error domains are open
-//! `Error` enums. `{Module}Library.check()` reports a library that doesn't
-//! match the bindings as a thrown error; a call made while it doesn't
-//! match stops the process.
+//! A library is one namespace, and so is the Swift module: every type sits
+//! at file scope and every free function is a top-level `func`, which a
+//! consumer may qualify with the module name (`Kvstore.openStore(path:)`).
+//!
+//! Every value crosses the C ABI as one C value (C ABI revision 6), by
+//! value in every position. Strings, bytes, typed arrays (`[T]` of a number
+//! other than `u8`), and value buffers are one `{p}_run`: a parameter lends
+//! the Swift value's own storage (or its encoding) for the call, and a
+//! returned run is copied out and released with `{p}_run_free`. Records,
+//! rich enums, and every other optional, list, and map are value buffers:
+//! the runtime ships a small private writer/reader pair
+//! (`WvWriter`/`WvReader`, decoding in place from the library's memory) and
+//! a `WvCodable` protocol that every primitive conforms to, optionals,
+//! arrays, and dictionaries generically, and each record, enum, and
+//! interface where it's declared, so records surface as plain `Hashable`
+//! Swift structs and rich enums as native Swift enums with associated
+//! values. Optional scalars (`T?`) cross as their `{p}_opt_{prim}` struct.
+//! Objects surface as `final class` wrappers owning one strong reference
+//! each, `Hashable` by identity; callback interfaces as class-bound
+//! `Sendable` protocols whose implementations cross as a `{p}_{Cb}` struct
+//! of a retained context and a process-wide, open vtable of
+//! `@convention(c)` trampolines; iterators as the runtime's generic
+//! `NativeSequence`; and async functions as `async` functions over checked
+//! continuations, with task cancellation wired to the native cancel token.
+//! Error domains are open `Error` enums. Before the first call the bindings
+//! check, once, the library's ABI revision and every declaration's contract
+//! function; `{Module}Library.check()` reports a library that doesn't match
+//! the bindings as a thrown error, and a call made while it doesn't match
+//! stops the process.
 //!
 //! The fixed Swift sources (runtime, manifest, module map, README) live
 //! under `runtime/` and are spliced with the package's names.
@@ -52,10 +62,7 @@ use miette::Result;
 use serde::{Deserialize, Serialize};
 use weaveffi_model::model::Model;
 
-use crate::codegen::errors;
-use crate::targets::swift::entities::{
-    render_swift_errors, render_swift_module_types, render_swift_namespace,
-};
+use crate::targets::swift::entities::render_swift_api;
 use crate::targets::swift::package::{
     render_modulemap, render_package_swift, render_packaged_readme, CSource,
 };
@@ -296,8 +303,7 @@ impl Target for SwiftGenerator {
 }
 
 /// Render the Swift API file: prelude and imports, the contract rows the
-/// load check compares, every error domain, every module's file-scope
-/// types, and one namespace `enum` per top-level module.
+/// load check compares, and the whole API in the module's one namespace.
 fn render_swift_wrapper(layout: &Layout, model: &Model, filename: &str) -> String {
     let ctx = SwiftCtx::new(model, &layout.module);
     let mut w = CodeWriter::four_space();
@@ -308,14 +314,7 @@ fn render_swift_wrapper(layout: &Layout, model: &Model, filename: &str) -> Strin
     render_contract_checks(&mut w, model, &ctx.library_type);
     w.line("// MARK: - API");
     w.blank();
-    render_swift_errors(&mut w, &errors::tables(model, "Error"), &ctx);
-    for mb in &model.modules {
-        render_swift_module_types(&mut w, mb, &ctx);
-    }
-    for root in model.roots() {
-        render_swift_namespace(&mut w, model, root, &ctx);
-        w.blank();
-    }
+    render_swift_api(&mut w, model, &ctx);
     w.raw(render_trailer(CommentStyle::DoubleSlash, filename));
     w.finish()
 }

@@ -2,8 +2,9 @@
 //! `{library}.h`.
 //!
 //! The header is the C ABI every other target binds to. The C target emits
-//! it, and the C++, Swift, Go, Kotlin (JNI shim), and Node.js (addon)
-//! targets ship or include the same file, so everything here renders from
+//! it, and the C++, Swift, and Go targets ship or include the same file
+//! (the others declare the same functions in their own FFI), so everything
+//! here renders from
 //! the lowered model: every slot list is an [`AbiFn`] the model computed,
 //! never re-derived.
 //!
@@ -13,20 +14,20 @@
 use std::fmt::Write;
 
 use crate::codegen::common::{self, DocCommentStyle};
-use crate::codegen::contract::{self, ContractTable};
+use crate::codegen::contract;
 use crate::codegen::docs::{ApiNames, Doc};
 use crate::codegen::errors::{self, ErrorTable};
 use crate::codegen::CodeWriter;
 use crate::lang::{is_reserved, CPP_KEYWORDS, C_KEYWORDS};
-use weaveffi_model::abi::AbiParam;
+use weaveffi_model::abi::{AbiFn, AbiParam, CType};
 use weaveffi_model::model::{
-    AbiFn, CallShape, CallbackInterfaceBinding, CallbackMethodBinding, EnumBinding, FnBinding,
-    InterfaceBinding, Model, ModuleBinding,
+    CallbackBinding, CallbackMethodBinding, EnumBinding, ErrorStrategy, FnBinding,
+    InterfaceBinding, Model, Shape,
 };
-use weaveffi_model::plan::ErrorStrategy;
+use weaveffi_model::ty::Prim;
 
 /// The C ABI revision the generated headers declare. Mirrors
-/// `weaveffi::abi::ABI_VERSION`; a test in this crate keeps the two equal.
+/// `weaveffi::__rt::ABI_VERSION`; a test in this crate keeps the two equal.
 pub(crate) use weaveffi_model::model::ABI_VERSION;
 
 /// The width generated prose in the header wraps at.
@@ -190,9 +191,9 @@ impl<'m> Decls<'m> {
     }
 
     /// Render the runtime surface every producer exports (the ABI revision
-    /// check, the error struct and its helpers, allocation, cancel tokens,
-    /// the vtable flags, and the debug leak counter), followed by each
-    /// top-level module's contract table.
+    /// check, the run and optional-scalar structs, the error struct and its
+    /// helpers, allocation, cancel tokens, the vtable flags, and the debug
+    /// leak counter), followed by the contract.
     pub(crate) fn runtime(&self, out: &mut String) {
         let p = self.prefix;
         let api = export_macro(p);
@@ -204,14 +205,39 @@ impl<'m> Decls<'m> {
                library built for a different revision. */\n\
              #define {upper}_ABI_VERSION {ABI_VERSION}u\n\
              {api} uint32_t {p}_abi_version(void);\n\n\
-             /* Error slot written by every fallible call. `code` is 0 on success,\n   \
+             /* A run of bytes: a string's UTF-8 (never NUL-terminated), raw bytes, a\n   \
+               typed array (`len` is its size in bytes, a multiple of the element's,\n   \
+               and `ptr` is aligned for it), or a value buffer. NULL with length 0 is\n   \
+               the empty run. A run passed to the producer is borrowed for the call;\n   \
+               one it returns belongs to the consumer, who releases it with\n   \
+               {p}_run_free. Every run the producer allocates is 8-aligned. */\n\
+             typedef struct {p}_run {{\n    \
+               const uint8_t* ptr;\n    \
+               size_t len;\n\
+             }} {p}_run;\n\n\
+             /* An optional scalar: `has` is true when `value` is present (and\n   \
+               `value` is 0 when it isn't). An optional C-style enum\n   \
+               crosses as {p}_opt_i32. */\n",
+        );
+        for prim in Prim::ALL.into_iter().filter(|p| p.is_scalar()) {
+            let c = CType::scalar_c(prim);
+            let _ = writeln!(
+                out,
+                "typedef struct {p}_opt_{0} {{ bool has; {c} value; }} {p}_opt_{0};",
+                prim.snake()
+            );
+        }
+        let _ = write!(
+            out,
+            "\n/* Error slot written by every fallible call. `code` is 0 on success,\n   \
                positive for an error domain's code, and negative for a runtime\n   \
                failure: -1 an untyped error (`throws: any`), -2 a producer panic, -3 a\n   \
                marshalling failure, -4 a callback interface implementation failed,\n   \
                -5 cancelled. The message is `message_len` bytes of UTF-8 at\n   \
                `message_ptr`, NOT NUL-terminated. `payload_ptr`/`payload_len` hold\n   \
                the code's fields in the value buffer format (NULL when it declares\n   \
-               none). The producer owns both runs; {p}_error_clear releases them. */\n\
+               none). A call overwrites the slot without reading it; after reading a\n   \
+               failure, release it with {p}_error_clear. */\n\
              typedef struct {p}_error {{\n    \
                int32_t code;\n    \
                const uint8_t* message_ptr;\n    \
@@ -235,14 +261,13 @@ impl<'m> Decls<'m> {
                NULL is a no-op. */\n\
              {api} void {p}_error_free({p}_error* err);\n\n\
              /* Allocate a zero-filled, 8-aligned run of `len` bytes (NULL for 0). A\n   \
-               callback method returns a string, bytes, buffer, or typed array as\n   \
-               such a run, which the producer adopts. */\n\
+               callback method returns a string, bytes, typed array, or buffer as a\n   \
+               run allocated this way, which the producer adopts. */\n\
              {api} uint8_t* {p}_alloc(size_t len);\n\
-             /* Release a run the producer returned (a string, bytes, value buffer,\n   \
-               or typed array: `len` is its size in bytes, `count * sizeof(T)` for\n   \
-               a typed array) or one from {p}_alloc. NULL or 0 is a no-op. */\n\
-             {api} void {p}_free_bytes(uint8_t* ptr, size_t len);\n\n\
-             /* Cancellation for `cancellable` async functions. A token starts with\n   \
+             /* Release a run the producer returned, or one from {p}_alloc. The empty\n   \
+               run is a no-op. */\n\
+             {api} void {p}_run_free({p}_run run);\n\n\
+             /* Cancellation for cancellable async functions. A token starts with\n   \
                one reference owned by the consumer; the producer takes its own for\n   \
                each call it is passed to, so the consumer may cancel and destroy its\n   \
                reference at any time. A cancelled call completes with code -5. */\n\
@@ -252,96 +277,90 @@ impl<'m> Decls<'m> {
              {api} bool {p}_cancel_token_is_cancelled(const {p}_cancel_token* token);\n\
              {api} void {p}_cancel_token_destroy({p}_cancel_token* token);\n\n\
              /* A callback interface vtable's `flags` bit: the methods that return a\n   \
-               value (a non-void C return or any out slot) may only be called on\n   \
-               the thread that passed the vtable to the producer, which fails such\n   \
-               a call from any other thread with -4 without calling it. */\n\
+               value may only be called on the thread that passed the vtable to the\n   \
+               producer, which fails such a call from any other thread with -4\n   \
+               without calling it. */\n\
              #define {upper}_VTABLE_THREAD_AFFINE 1u\n\n\
              /* Live-allocation counters for leak checks in tests: 0 objects,\n   \
-               1 callbacks, 2 iterators, 3 cancel tokens, 4 returned allocations.\n   \
-               Kind -1 is 1 when the producer counts at all (its `leak-check`\n   \
-               feature) and 0 when every counter reads 0 regardless. */\n\
-             {api} uint64_t {p}_debug_live(int32_t kind);\n\n\
-             /* One declaration's fingerprint in a module's contract table: FNV-1a 64\n   \
-               of its dotted path and of its canonical signature. */\n\
-             typedef struct {p}_contract_entry {{\n    \
-               uint64_t id;\n    \
-               uint64_t hash;\n\
-             }} {p}_contract_entry;\n\n",
+               1 callbacks, 2 iterators, 3 cancel tokens, 4 runs. Kind -1 is 1 when\n   \
+               the producer counts at all (its `leak-check` feature) and 0 when every\n   \
+               counter reads 0 regardless. */\n\
+             {api} uint64_t {p}_debug_live(int32_t kind);\n\n",
         );
-        for table in contract::tables(self.model) {
-            self.contract(out, &table);
-        }
+        self.contract(out);
     }
 
-    /// Render one top-level module's contract: the producer's table
-    /// function, the rows these bindings were generated with as
-    /// `{PREFIX}_{MODULE}_CONTRACT` and `{PREFIX}_{MODULE}_CONTRACT_LEN`
-    /// (each row commented with its path and canonical signature), and a
-    /// `static inline` checker returning the id of the first expected row
-    /// the producer lacks or hashes differently (`0` when compatible).
-    fn contract(&self, out: &mut String, table: &ContractTable<'_>) {
+    /// Render the contract: the producer's function per declaration (each
+    /// commented with its path and canonical signature), a `static inline`
+    /// checker returning the path of the first declaration the loaded
+    /// library declares differently, and, for a producer implementing this
+    /// header by hand, a macro defining every contract function.
+    fn contract(&self, out: &mut String) {
         let p = self.prefix;
         let api = export_macro(p);
-        let symbol = &table.symbol;
-        let check = &table.check_symbol;
-        let upper = symbol.to_uppercase();
-        let _ = writeln!(
-            out,
-            "/* The contract of module `{}`: one entry per declaration, sorted by\n   \
-             id. The producer's table comes from the function below; a consumer\n   \
-             checks each entry it was generated with against it once, before any\n   \
-             other call (producer entries it doesn't know are fine). */\n\
-             {api} const {p}_contract_entry* {symbol}(size_t* out_len);\n\
-             #define {upper}_LEN {}\n\
-             #define {upper} {{ \\",
-            table.root.name,
-            table.rows.len()
+        let upper = p.to_uppercase();
+        let rows = contract::rows(self.model);
+        out.push_str(
+            "/* The contract: one function per declaration, returning the FNV-1a 64\n   \
+               hash of its canonical signature. A consumer checks every one it was\n   \
+               generated with once, before any other call: a library that lacks a\n   \
+               declaration doesn't link, and one that changed it fails the check.\n   \
+               Declarations the library has and the consumer doesn't are fine. */\n",
         );
-        if table.rows.is_empty() {
-            out.push_str("    {0ull, 0ull} \\\n");
-        }
-        for row in &table.rows {
+        for row in &rows {
             let _ = writeln!(
                 out,
-                "    {{{}ull, {}ull}}, /* {}: {} */ \\",
-                contract::hex(row.id),
-                contract::hex(row.hash),
+                "{api} uint64_t {}(void); /* {}: {} */",
+                row.symbol,
                 row.path,
                 row.signature.replace("*/", "* /")
             );
         }
-        out.push_str("}\n");
-        if table.rows.is_empty() {
-            let _ = write!(
-                out,
-                "/* Nothing to check: the module declares nothing. */\n\
-                 static inline uint64_t {check}(void) {{\n    \
-                   return 0;\n\
-                 }}\n\n"
-            );
-            return;
-        }
         let _ = write!(
             out,
-            "/* The id of the first expected entry the loaded library lacks or\n   \
-               declares differently, or 0 when these bindings match it. */\n\
-             static inline uint64_t {check}(void) {{\n    \
-               static const {p}_contract_entry expected[] = {upper};\n    \
-               size_t len = 0;\n    \
-               const {p}_contract_entry* table = {symbol}(&len);\n    \
-               for (size_t i = 0; i < {upper}_LEN; i++) {{\n        \
-                 size_t lo = 0, hi = len;\n        \
-                 while (lo < hi) {{\n            \
-                   size_t mid = lo + (hi - lo) / 2;\n            \
-                   if (table[mid].id < expected[i].id) lo = mid + 1; else hi = mid;\n        \
-                 }}\n        \
-                 if (lo == len || table[lo].id != expected[i].id || table[lo].hash != expected[i].hash) {{\n            \
-                   return expected[i].id;\n        \
-                 }}\n    \
-               }}\n    \
-               return 0;\n\
-             }}\n\n"
+            "\n/* The path of the first declaration the loaded library declares\n   \
+               differently from these bindings, or NULL when they match. */\n\
+             static inline const char* {p}_contract_check(void) {{\n"
         );
+        if rows.is_empty() {
+            out.push_str("    return NULL;\n}\n\n");
+        } else {
+            let _ = writeln!(
+                out,
+                "    static const struct {{ uint64_t (*hash)(void); uint64_t expected; const char* path; }} rows[] = {{"
+            );
+            for row in &rows {
+                let _ = writeln!(
+                    out,
+                    "        {{{}, {}ull, \"{}\"}},",
+                    row.symbol,
+                    contract::hex(row.hash),
+                    c_string(&row.path)
+                );
+            }
+            out.push_str(
+                "    };\n    \
+                 for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++) {\n        \
+                   if (rows[i].hash() != rows[i].expected) return rows[i].path;\n    \
+                 }\n    \
+                 return NULL;\n}\n\n",
+            );
+        }
+        let _ = writeln!(
+            out,
+            "/* A producer implementing this header defines every contract function\n   \
+               with this macro (in one source file). */\n\
+             #define {upper}_DEFINE_CONTRACT \\"
+        );
+        for row in &rows {
+            let _ = writeln!(
+                out,
+                "    {api} uint64_t {}(void) {{ return {}ull; }} \\",
+                row.symbol,
+                contract::hex(row.hash)
+            );
+        }
+        out.push_str("    /* end of the contract */\n\n");
     }
 
     /// Render an `int32_t` typedef named `type_name` and an anonymous enum of
@@ -409,13 +428,16 @@ impl<'m> Decls<'m> {
     /// declared `throws: {Domain}` stores in `{prefix}_error.code`.
     fn error_domain(&self, out: &mut String, table: &ErrorTable<'_>) {
         let d = table.domain;
-        let doc = wrap(&format!(
-            "Error codes of the `{}` domain of module `{}` (`{}` in the language \
-             bindings), which a function declared `throws: {}` reports in \
-             `{}_error.code`. Domains are open: a newer library may report a positive \
-             code not listed here, which keeps its message.",
-            d.name, table.module.dot_path, table.type_name, d.name, self.prefix
+        let mut doc = wrap(&format!(
+            "Error codes of the `{}` domain (`{}` in the language bindings), which a \
+             function declared `throws: {}` reports in `{}_error.code`. Domains are open: \
+             a newer library may report a positive code not listed here, which keeps its \
+             message.",
+            d.name, table.type_name, d.name, self.prefix
         ));
+        if let Some(text) = Doc::new(&d.doc, &None).text(|i| self.spell(i)) {
+            doc = format!("{text}\n\n{doc}");
+        }
         let constants: Vec<(Option<String>, &str, i32)> = table
             .codes
             .iter()
@@ -425,36 +447,6 @@ impl<'m> Decls<'m> {
             })
             .collect();
         self.int_enum(out, Some(doc), &d.c_tag, &constants);
-    }
-
-    /// Phase 1a: every enum, rich-enum tag, and error-domain code type.
-    /// These reference no other types, so they come first.
-    fn enum_defs(&self, out: &mut String) {
-        for m in &self.model.modules {
-            for e in &m.enums {
-                self.enumeration(out, e);
-            }
-        }
-        for table in errors::tables(self.model, "Error") {
-            self.error_domain(out, &table);
-        }
-    }
-
-    /// Phase 1b: opaque interface and iterator types for one module. The C
-    /// ABI only ever uses pointers to these, so a forward typedef is enough
-    /// and lets declarations in any module reference them. Records and rich
-    /// enums declare no tags: they cross serialized.
-    fn type_tags(&self, out: &mut String, module: &ModuleBinding) {
-        for i in &module.interfaces {
-            let t = &i.c_tag;
-            let _ = writeln!(out, "typedef struct {t} {t};");
-        }
-        for f in module.callables() {
-            if let Some(it) = f.iterator() {
-                let t = &it.iter_tag;
-                let _ = writeln!(out, "typedef struct {t} {t};");
-            }
-        }
     }
 
     /// What a callable's failure may carry, for its doc: a domain's codes
@@ -484,76 +476,52 @@ impl<'m> Decls<'m> {
         }
     }
 
-    /// One callback interface's vtable struct: the fixed header (`size`,
-    /// `flags`, `free`), then one function pointer per method in
-    /// declaration order.
-    fn vtable(&self, out: &mut String, cb: &CallbackInterfaceBinding) {
+    /// One callback interface's argument struct and vtable: the fixed
+    /// header (`size`, `flags`, `free`), then one function pointer per
+    /// method in declaration order.
+    fn callback(&self, out: &mut String, cb: &CallbackBinding) {
         let p = self.prefix;
         let upper = p.to_uppercase();
         let mut w = CodeWriter::four_space();
         let contract = wrap(&format!(
-            "A consumer-implemented callback interface. The consumer passes a context \
+            "A consumer-implemented callback interface, passed as a `{tag}`: a context \
              pointer and a pointer to a vtable that outlives it, with `size` set to \
-             `sizeof` the vtable (the producer rejects a smaller one) and `flags` to 0 or \
-             `{upper}_VTABLE_THREAD_AFFINE`. The producer may call any method from any \
-             thread (with `{upper}_VTABLE_THREAD_AFFINE`, a method that returns a value \
-             only from the thread that passed the vtable) until it calls `free(ctx)` \
-             exactly once, also from any thread. A method reports failure with \
-             `{p}_error_set(out_err, ...)`. It returns a string, bytes, buffer, or typed \
-             array as a run it allocates with `{p}_alloc` and stores in `*out_ptr` and \
-             `*out_len` (an element count for a typed array), which the producer adopts, \
-             and an optional scalar as a `bool` C return (present) with the value in \
-             `*out_value`."
+             `sizeof` the vtable and `flags` to 0 or `{upper}_VTABLE_THREAD_AFFINE`. Vtables \
+             are open: the producer accepts a shorter vtable (a binding generated before \
+             a method was appended), and a call to a method past its `size`, or a NULL \
+             entry, fails with -4. The producer may call any method from any thread (with \
+             `{upper}_VTABLE_THREAD_AFFINE`, a method that returns a value only from the \
+             thread that passed the vtable) until it calls `free(ctx)` exactly once, also \
+             from any thread. A method reports failure with `{p}_error_set(out_err, ...)`, \
+             and returns a run it allocates with `{p}_alloc`, which the producer adopts \
+             whether or not the method failed.",
+            tag = cb.c_tag
         ));
         let doc = match self.doc_with_deprecation(&cb.doc, &cb.deprecated) {
             Some(doc) => format!("{doc}\n\n{contract}"),
             None => contract,
         };
         w.doc(&Some(doc), DocCommentStyle::Javadoc);
-        w.block(
-            format!("typedef struct {} {{", cb.vtable_tag),
-            format!("}} {};", cb.vtable_tag),
-            |w| {
-                w.line("uint32_t size;");
-                w.line("uint32_t flags;");
-                w.line("void (*free)(void* ctx);");
-                for m in &cb.methods {
-                    let doc = self.doc_with_deprecation(&m.doc, &m.deprecated);
-                    let doc = match (doc, self.method_failure(m)) {
-                        (Some(doc), Some(t)) => Some(format!("{doc}\n\n{t}")),
-                        (doc, t) => doc.or(t),
-                    };
-                    w.doc(&doc, DocCommentStyle::Javadoc);
-                    w.line(format!(
-                        "{} (*{})({});",
-                        m.abi.ret.render_c(p),
-                        c_param_name(&m.abi.symbol),
-                        params_str(&m.abi.params, p)
-                    ));
-                }
-            },
-        );
-        out.push_str(&w.finish());
-    }
-
-    /// Phase 1c: callback-interface vtables and async completion-callback
-    /// typedefs for one module. These may reference enums (by value) and
-    /// interfaces (by pointer), so they follow every module's enums and
-    /// type tags.
-    fn callback_types(&self, out: &mut String, module: &ModuleBinding) {
-        for cb in &module.callback_interfaces {
-            self.vtable(out, cb);
-        }
-        for f in module.callables() {
-            if let CallShape::Async(a) = &f.shape {
-                let _ = writeln!(
-                    out,
-                    "typedef void (*{})({});",
-                    a.callback_type,
-                    params_str(&a.callback_params, self.prefix)
-                );
+        w.block(format!("struct {} {{", cb.vtable_tag), "};", |w| {
+            w.line("uint32_t size;");
+            w.line("uint32_t flags;");
+            w.line("void (*free)(void* ctx);");
+            for m in &cb.methods {
+                let doc = self.doc_with_deprecation(&m.doc, &m.deprecated);
+                let doc = match (doc, self.method_failure(m)) {
+                    (Some(doc), Some(t)) => Some(format!("{doc}\n\n{t}")),
+                    (doc, t) => doc.or(t),
+                };
+                w.doc(&doc, DocCommentStyle::Javadoc);
+                w.line(format!(
+                    "{} (*{})({});",
+                    m.abi.ret.render_c(p),
+                    c_param_name(&m.abi.symbol),
+                    params_str(&m.abi.params, p)
+                ));
             }
-        }
+        });
+        out.push_str(&w.finish());
     }
 
     /// One callable's prototypes with its doc and deprecation marker: the
@@ -586,7 +554,7 @@ impl<'m> Decls<'m> {
     }
 
     /// One interface's functions: constructors, statics, methods, then the
-    /// reference-count pair. The opaque tag is already declared (phase 1b).
+    /// reference-count pair.
     fn interface_fns(&self, out: &mut String, i: &InterfaceBinding) {
         let p = self.prefix;
         let api = export_macro(p);
@@ -612,29 +580,58 @@ impl<'m> Decls<'m> {
         );
     }
 
-    /// Render every declaration in dependency-safe order: all enum and
-    /// error-code types, then all opaque type tags, then all vtables and
-    /// completion typedefs, then each module's functions under a
-    /// `// Module:` comment. Emitting every type before any function lets a
-    /// parent module's function reference a child module's interface.
+    /// Render every declaration in dependency-safe order: every enum and
+    /// error-code type; every opaque interface and iterator type and callback
+    /// argument struct (vtables are forward-declared); every vtable and
+    /// async completion typedef; then the interfaces' and free functions'
+    /// prototypes.
     pub(crate) fn declarations(&self, out: &mut String) {
-        self.enum_defs(out);
-        for m in &self.model.modules {
-            self.type_tags(out, m);
+        for e in &self.model.enums {
+            self.enumeration(out, e);
         }
-        for m in &self.model.modules {
-            self.callback_types(out, m);
+        for table in errors::tables(self.model, "Error") {
+            self.error_domain(out, &table);
+        }
+        for i in &self.model.interfaces {
+            let t = &i.c_tag;
+            let _ = writeln!(out, "typedef struct {t} {t};");
+        }
+        for f in self.model.callables() {
+            if let Some(it) = f.iterator() {
+                let t = &it.iter_tag;
+                let _ = writeln!(out, "typedef struct {t} {t};");
+            }
+        }
+        for cb in &self.model.callbacks {
+            let (t, v) = (&cb.c_tag, &cb.vtable_tag);
+            let _ = writeln!(
+                out,
+                "typedef struct {v} {v};\n\
+                 /** A `{}` argument: the consumer's context and vtable (a NULL vtable is \
+                 none). */\n\
+                 typedef struct {t} {{ void* ctx; const {v}* vtable; }} {t};",
+                cb.name
+            );
+        }
+        for cb in &self.model.callbacks {
+            self.callback(out, cb);
+        }
+        for f in self.model.callables() {
+            if let Shape::Async(a) = &f.shape {
+                let _ = writeln!(
+                    out,
+                    "typedef void (*{})({});",
+                    a.callback_type,
+                    params_str(&a.callback.params, self.prefix)
+                );
+            }
         }
         out.push('\n');
-        for m in &self.model.modules {
-            let _ = writeln!(out, "// Module: {}", m.path);
-            for i in &m.interfaces {
-                self.interface_fns(out, i);
-            }
-            for f in &m.functions {
-                self.callable(out, f);
-            }
-            out.push('\n');
+        for i in &self.model.interfaces {
+            self.interface_fns(out, i);
+        }
+        for f in &self.model.functions {
+            self.callable(out, f);
         }
     }
 }

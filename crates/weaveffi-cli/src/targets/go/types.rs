@@ -1,7 +1,7 @@
 //! Go type mapping: how value types, parameter and return types, zero
-//! values, and C ABI slot types are spelled in the generated package.
+//! values, and C ABI types are spelled in the generated package.
 
-use weaveffi_model::abi::{CType, ConstPos};
+use weaveffi_model::abi::CType;
 use weaveffi_model::ty::{ParamTy, Prim, RetTy, Ty};
 
 use crate::targets::go::names::pascal;
@@ -84,47 +84,24 @@ pub(crate) fn go_zero(ty: &Ty) -> String {
     }
 }
 
-/// The cgo spelling of one C ABI type: `C.int32_t`, `*C.uint8_t`,
-/// `**C.uint8_t`, `*C.kv_kv_Store`, and `unsafe.Pointer` for `void*`.
+/// The cgo spelling of a C scalar (`C.int32_t`, `C.double`, `C._Bool`).
+pub(crate) fn cgo_scalar(p: Prim) -> String {
+    match p {
+        Prim::Bool => "C._Bool".into(),
+        other => format!("C.{}", CType::scalar_c(other)),
+    }
+}
+
+/// The cgo spelling of one C ABI type: `C.int32_t`, `C.kv_run`,
+/// `*C.kv_Store` (cgo drops `const`), and `unsafe.Pointer` for `void*`.
 pub(crate) fn cgo_type(ct: &CType, prefix: &str) -> String {
     match ct {
-        CType::Int8 => "C.int8_t".into(),
-        CType::Int16 => "C.int16_t".into(),
-        CType::Int32 => "C.int32_t".into(),
-        CType::Uint8 => "C.uint8_t".into(),
-        CType::Uint16 => "C.uint16_t".into(),
-        CType::Uint32 => "C.uint32_t".into(),
-        CType::Int64 => "C.int64_t".into(),
-        CType::Uint64 => "C.uint64_t".into(),
-        CType::Float => "C.float".into(),
-        CType::Double => "C.double".into(),
-        CType::Bool => "C._Bool".into(),
+        CType::Scalar(p) => cgo_scalar(*p),
         CType::Size => "C.size_t".into(),
-        CType::Char => "C.char".into(),
         CType::Ptr { pointee, .. } if **pointee == CType::Void => "unsafe.Pointer".into(),
         CType::Ptr { pointee, .. } => format!("*{}", cgo_type(pointee, prefix)),
         CType::Void => unreachable!("a void slot is never spelled in Go"),
         named => format!("C.{}", named.render_c(prefix)),
-    }
-}
-
-/// The cgo type a pointer slot points at (`C.int32_t` for `int32_t*`).
-pub(crate) fn cgo_pointee(ct: &CType, prefix: &str) -> String {
-    match ct {
-        CType::Ptr { pointee, .. } => cgo_type(&strip_const(pointee), prefix),
-        other => unreachable!("{other:?} is not a pointer slot"),
-    }
-}
-
-/// `ct` with every `const` qualifier dropped, matching the const-free
-/// prototypes cgo writes into `_cgo_export.h` for exported Go functions.
-pub(crate) fn strip_const(ct: &CType) -> CType {
-    match ct {
-        CType::Ptr { pointee, .. } => CType::Ptr {
-            konst: ConstPos::None,
-            pointee: Box::new(strip_const(pointee)),
-        },
-        other => other.clone(),
     }
 }
 

@@ -3,11 +3,11 @@
 // The getting-started surface: a direct-value call (wrapping at the i32
 // edges), a throwing call that raises the typed DivisionByZeroException, and
 // a string in and out (non-ASCII and astral text and an interior NUL
-// survive). Then a second error domain in the same module (`ParseError`,
+// survive). Then a second error domain in the same library (`ParseError`,
 // whose code 1 must not be mistaken for `CalcError`'s), an untyped
 // `throws any` error, an optional scalar return (OptDirect), and numeric
 // lists in and out (typed arrays). Loading the bindings checks the ABI
-// revision and the `calculator` contract. Ends by asserting the producer's
+// revision and every declaration's contract function. Ends by asserting the producer's
 // leak counters are zero.
 
 import 'dart:typed_data';

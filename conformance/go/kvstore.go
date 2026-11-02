@@ -1,8 +1,8 @@
-// Conformance consumer: kvstore sample, Go target (ABI revision 5).
+// Conformance consumer: kvstore sample, Go target (ABI revision 6).
 //
 // Drives the feature-complete producer through the generated bindings:
 //
-//   - the load-time checks (ABI revision, both modules' contract tables),
+//   - the load-time checks (ABI revision and every declaration's contract),
 //     which Check reports;
 //   - Store: the throwing OpenStore and plain NewStore factories, methods,
 //     statics (StoreOpenMany, StoreDefaultCapacity, ...), the deprecated
@@ -29,13 +29,14 @@
 //     map value, record field, sequence element, async result, and callback
 //     parameter and return;
 //   - async calls that block on a context.Context: an async free function
-//     returning an object, a cancellable method cancelled mid-pause
+//     returning an object (OpenStore_, since the Store.open factory is
+//     OpenStore), a cancellable method cancelled mid-pause
 //     (returning context.Canceled at once while its background work stops
 //     cooperatively, shown by StoreActiveJobs), an async list launched from
-//     32 goroutines, and an async function in the nested kv.stats module;
-//   - the sibling report root (the shared Entry record and its own error
+//     32 goroutines, and an async function taking a list of objects;
+//   - the report functions (the shared Entry record and their own error
 //     domain);
-//   - the ABI 5 shapes: an optional scalar return, iterator item, and async
+//   - the direct shapes: an optional scalar return, iterator item, and async
 //     result, typed-array returns and async results, and usize counts.
 //
 // Releases of consumer callbacks are observed through the producer's
@@ -293,11 +294,11 @@ func constructors() {
 	s.Close()
 
 	ctx := context.Background()
-	a, err := kv.KvOpenStore(ctx, "/async")
-	expect(err == nil && a.Path() == "/async", fmt.Sprintf("KvOpenStore: %v", err))
+	a, err := kv.OpenStore_(ctx, "/async")
+	expect(err == nil && a.Path() == "/async", fmt.Sprintf("OpenStore_: %v", err))
 	a.Close()
-	_, err = kv.KvOpenStore(ctx, "")
-	expectAs[*kv.InvalidPathError](err, `KvOpenStore("")`)
+	_, err = kv.OpenStore_(ctx, "")
+	expectAs[*kv.InvalidPathError](err, `OpenStore_("")`)
 }
 
 func basics() {
@@ -638,7 +639,7 @@ func asyncCalls() {
 		expect(got[0] != nil && got[0].Key == "keep" && got[1] == nil && got[2] != nil && got[2].Key == "keep", "GetMany entries")
 	}
 
-	// The nested module's async function: objects in a list in, a record out.
+	// An async free function: objects in a list in, a record out.
 	other, _ := kv.OpenStore("/other")
 	put(other, "a", "123")
 	st, err := kv.SummarizeAll(ctx, []*kv.Store{s, other})
@@ -727,14 +728,14 @@ func statsAndReport() {
 	put(s, "a", "123")
 	putKind(s, "c", "x", kv.EntryKindEncrypted, nil)
 
-	// kv.stats: the parent's Store as a parameter, the parent's error domain.
+	// Summarize: a Store as a parameter, the KvError domain.
 	st, err := kv.Summarize(s, nil)
 	expect(err == nil && st.Entries == 3 && st.Bytes == 6, fmt.Sprintf("Summarize (got %+v)", st))
 	expect(len(st.ByKind) == 2 && st.ByKind[kv.EntryKindPersistent] == 2 && st.ByKind[kv.EntryKindEncrypted] == 1, "Summarize by kind")
 	_, err = kv.Summarize(s, ptr("q"))
 	expectKeyNotFound(err, "q")
 
-	// report: the sibling root shares the Entry record.
+	// RenderReport: the shared Entry record, its own error domain.
 	var entries []kv.Entry
 	for e := range s.Entries(nil) {
 		entries = append(entries, e)
@@ -763,15 +764,15 @@ func main() {
 	asyncCalls()
 	objectGraph()
 	statsAndReport()
-	abi5()
+	directShapes()
 
 	expectNoLeaks(kv.DebugLive)
 	fmt.Println("go/kvstore: OK")
 }
 
-func abi5() {
+func directShapes() {
 	ctx := context.Background()
-	s, _ := kv.OpenStore("/abi5")
+	s, _ := kv.OpenStore("/direct")
 	_, err := putKind(s, "b", "12", kv.EntryKindPersistent, nil)
 	expect(err == nil, "put b")
 	_, err = s.Put("a", []byte{1, 2, 3}, kv.EntryKindVolatile, ptr(int64(7)))

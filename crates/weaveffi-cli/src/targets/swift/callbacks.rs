@@ -2,73 +2,27 @@
 //! and the process-wide vtable of `@convention(c)` trampolines the library
 //! calls through.
 //!
-//! One static vtable per interface carries the `{size, flags, free}` header
-//! (`flags` is 0: any thread may call), a context that retains the
-//! implementation (released by `free`), and one trampoline per method.
-//! Arguments arrive per the method's [`ArgPass`]es (borrowed strings, bytes,
-//! typed arrays, and buffers are copied; objects are adopted), results go
-//! back per its [`CallbackRetPass`] (a scalar by value, an optional scalar as
-//! a presence flag plus out slot, an object as a fresh reference, and a
-//! string, bytes, typed array, or buffer as a `{prefix}_alloc` run in the out
-//! slots), and failures are reported through `out_err` instead of unwinding
-//! through the C frame, per its [`ErrorStrategy`].
+//! A callback argument is a `{p}_{Cb}` struct of a context (which retains the
+//! implementation, released by the vtable's `free`) and a pointer to one
+//! static vtable per interface. The vtable carries the `{size, flags, free}`
+//! header (`size` is the vtable's as these bindings compiled it, so a newer
+//! producer can tell which methods they lack; `flags` is 0: any thread may
+//! call) and one trampoline per method. Arguments arrive as one C value each
+//! (borrowed runs are copied; objects are adopted), results go back as one C
+//! value (a run from `{p}_alloc` and an object as a fresh reference, both
+//! adopted by the library), and failures are reported through `out_err`
+//! instead of unwinding through the C frame, per the method's
+//! [`ErrorStrategy`].
 
 use crate::cabi::c_param_name;
 use crate::codegen::common::{wrap, DocCommentStyle};
 use crate::codegen::CodeWriter;
-use crate::lang;
-use weaveffi_model::model::{CallbackInterfaceBinding, CallbackMethodBinding};
-use weaveffi_model::plan::{ArgPass, CallbackRetPass, ErrorStrategy};
-use weaveffi_model::ty::{Prim, Ty};
+use weaveffi_model::model::{CallbackBinding, CallbackMethodBinding, ErrorStrategy};
 
-use crate::targets::swift::calls::{receive, Recv};
+use crate::codegen::values::crossing;
+use crate::targets::swift::calls::{hand_back, receive};
 use crate::targets::swift::docs::{emit_decl_doc, emit_fn_doc};
 use crate::targets::swift::types::{callback_vtable_name, swift_ident, SwiftCtx};
-
-/// The Swift spelling of one trampoline closure formal: the ABI slot name,
-/// keyword-escaped (a param named `in` yields a slot named `in`, which can't
-/// bind as a closure formal unescaped).
-fn slot_ident(name: &str) -> String {
-    lang::escape_ident(name, lang::SWIFT_KEYWORDS)
-}
-
-/// The expression handing one trampoline argument to the implementation:
-/// borrowed strings, bytes, typed arrays, and buffers are copied before the
-/// implementation runs (the library owns them only for the call); object
-/// arguments carry one strong reference the new wrapper adopts.
-fn receive_arg(ty: &Ty, pass: &ArgPass, ctx: &SwiftCtx) -> String {
-    let (recv, raw, len) = match pass {
-        ArgPass::Direct { slot } => (Recv::Direct, slot_ident(&slot.name), String::new()),
-        ArgPass::OptDirect { has, value, .. } => {
-            let has = slot_ident(&has.name);
-            let value = slot_ident(&value.name);
-            return receive(ty, &Recv::Opt(&has), &value, "", false, ctx);
-        }
-        ArgPass::Slice { ptr, len, .. } => {
-            (Recv::Slice, slot_ident(&ptr.name), slot_ident(&len.name))
-        }
-        ArgPass::String { ptr, len } => {
-            (Recv::String, slot_ident(&ptr.name), slot_ident(&len.name))
-        }
-        ArgPass::Bytes { ptr, len } => (Recv::Bytes, slot_ident(&ptr.name), slot_ident(&len.name)),
-        ArgPass::Buffer { ptr, len } => {
-            (Recv::Buffer, slot_ident(&ptr.name), slot_ident(&len.name))
-        }
-        ArgPass::Object {
-            slot,
-            nullable,
-            interface,
-        } => {
-            let recv = Recv::Object {
-                nullable: *nullable,
-                interface,
-            };
-            return receive(ty, &recv, &slot_ident(&slot.name), "", true, ctx);
-        }
-        ArgPass::Callback { .. } => unreachable!("a callback method never takes a callback"),
-    };
-    receive(ty, &recv, &raw, &len, false, ctx)
-}
 
 /// The `- Throws:` callout of a protocol requirement.
 fn throws_doc(m: &CallbackMethodBinding, ctx: &SwiftCtx) -> Option<String> {
@@ -81,7 +35,7 @@ fn throws_doc(m: &CallbackMethodBinding, ctx: &SwiftCtx) -> Option<String> {
         ErrorStrategy::Domain(name) => Some(format!(
             "- Throws: ``{}`` to fail the library's call with that error and its fields; any \
              other error fails it with the error's description.",
-            ctx.ty_name(&ctx.model.error_domain(name).type_name)
+            ctx.domain_type(name)
         )),
     }
 }
@@ -90,10 +44,9 @@ fn throws_doc(m: &CallbackMethodBinding, ctx: &SwiftCtx) -> Option<String> {
 /// per method with idiomatic labels and types, `throws` when the IDL method
 /// declares errors. Implementations are classes (`AnyObject`) the library
 /// may call from any thread (`Sendable`).
-fn render_protocol(w: &mut CodeWriter, cb: &CallbackInterfaceBinding, ctx: &SwiftCtx) {
-    let name = ctx.ty_name(&cb.name);
-    let doc = ctx.doc(&cb.doc);
-    if doc.is_some() {
+fn render_protocol(w: &mut CodeWriter, cb: &CallbackBinding, ctx: &SwiftCtx) {
+    let name = &cb.name;
+    if ctx.doc(&cb.doc).is_some() {
         emit_decl_doc(w, ctx, &cb.doc, &None);
         w.line("///");
     }
@@ -147,109 +100,64 @@ fn render_protocol(w: &mut CodeWriter, cb: &CallbackInterfaceBinding, ctx: &Swif
     w.blank();
 }
 
-/// How one method's result crosses back: the implementation call wrapped
-/// into the trampoline's return expression, and the value returned on
-/// failure.
-fn return_shape(m: &CallbackMethodBinding, call: &str) -> (String, &'static str) {
-    let optional_enum = matches!(
-        &m.ret,
-        Some(Ty::Optional(inner)) if matches!(**inner, Ty::Enum(_))
-    );
-    let out = |ptr: &str, len: &str| (slot_ident(ptr), slot_ident(len));
-    match &m.ret_pass {
-        CallbackRetPass::Void => (call.to_string(), "()"),
-        CallbackRetPass::Direct => match &m.ret {
-            Some(Ty::Enum(_)) => (format!("{call}.rawValue"), "0"),
-            Some(Ty::Prim(Prim::Bool)) => (call.to_string(), "false"),
-            _ => (call.to_string(), "0"),
-        },
-        CallbackRetPass::OptDirect { out_value } => {
-            let value = if optional_enum {
-                format!("{call}?.rawValue")
-            } else {
-                call.to_string()
-            };
-            (
-                format!("wvReturnOptional({value}, {})", slot_ident(&out_value.name)),
-                "false",
-            )
-        }
-        // One strong reference the library adopts.
-        CallbackRetPass::Object { nullable, .. } => {
-            let q = if *nullable { "?" } else { "" };
-            (format!("{call}{q}.clonePtr()"), "nil")
-        }
-        CallbackRetPass::Slice {
-            out_ptr, out_len, ..
-        }
-        | CallbackRetPass::String { out_ptr, out_len }
-        | CallbackRetPass::Bytes { out_ptr, out_len }
-        | CallbackRetPass::Buffer { out_ptr, out_len } => {
-            let helper = match &m.ret_pass {
-                CallbackRetPass::Slice { .. } => "wvReturnSlice",
-                CallbackRetPass::String { .. } => "wvReturnString",
-                CallbackRetPass::Bytes { .. } => "wvReturnBytes",
-                _ => "wvReturnBuffer",
-            };
-            let (ptr, len) = out(&out_ptr.name, &out_len.name);
-            (format!("{helper}({call}, {ptr}, {len})"), "()")
-        }
-    }
-}
-
 /// Render one trampoline closure literal (the vtable entry for `m`) as a
 /// labeled argument of the vtable struct initializer; `last` drops the
 /// trailing comma.
+///
+/// The closure's formals are positional (`ctx`, `a0`, `a1`, ..., `outErr`)
+/// rather than the IDL's parameter names, so no parameter can shadow a name
+/// the body uses.
 fn render_trampoline(
     w: &mut CodeWriter,
-    cb: &CallbackInterfaceBinding,
+    cb: &CallbackBinding,
     m: &CallbackMethodBinding,
     last: bool,
     ctx: &SwiftCtx,
 ) {
-    let proto = ctx.ty_name(&cb.name);
     // No trailing comma: argument lists accept one only from Swift 6.1.
     let sep = if last { "" } else { "," };
-    let slots = &m.abi.params;
-    let formals = slots
-        .iter()
-        .map(|s| slot_ident(&s.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let ctx_slot = slot_ident(&slots[0].name);
-    let err_slot = slot_ident(&slots[slots.len() - 1].name);
+    let args: Vec<String> = (0..m.params.len()).map(|i| format!("a{i}")).collect();
+    let mut formals = vec!["ctx".to_string()];
+    formals.extend(args.iter().cloned());
+    formals.push("outErr".to_string());
     let call_args = m
         .params
         .iter()
-        .map(|p| {
+        .zip(&args)
+        .map(|(p, a)| {
             format!(
                 "{}: {}",
                 swift_ident(&p.name),
-                receive_arg(&p.ty, &p.pass, ctx)
+                receive(&p.ty, a, false, ctx)
             )
         })
         .collect::<Vec<_>>()
         .join(", ");
     let call = format!("wvImpl.{}({call_args})", swift_ident(&m.name));
-    let (body, fallback) = return_shape(m, &call);
+    let (body, fallback) = match &m.ret {
+        None => (call, "()".to_string()),
+        Some(ty) => (hand_back(ty, &call, ctx), ctx.c_zero(&crossing(ty))),
+    };
     let body = if m.error.throws() {
         format!("try {body}")
     } else {
         body
     };
     let throwing = match &m.error {
-        ErrorStrategy::Domain(name) => format!(
-            ", throwing: {}.self",
-            ctx.ty_name(&ctx.model.error_domain(name).type_name)
-        ),
+        ErrorStrategy::Domain(name) => format!(", throwing: {}.self", ctx.domain_type(name)),
         ErrorStrategy::Trap | ErrorStrategy::Untyped => String::new(),
     };
     // The vtable field is spelled exactly as the C header declares it, so a
     // method whose name is a C keyword carries the header's escape.
-    w.line(format!("{}: {{ {formals} in", c_param_name(&m.abi.symbol)));
+    w.line(format!(
+        "{}: {{ {} in",
+        c_param_name(&m.abi.symbol),
+        formals.join(", ")
+    ));
     w.scope(|w| {
         w.line(format!(
-            "wvInvoke({ctx_slot}, {err_slot}, as: (any {proto}).self{throwing}, fallback: {fallback}) {{ wvImpl in"
+            "wvInvoke(ctx, outErr, as: (any {}).self{throwing}, fallback: {fallback}) {{ wvImpl in",
+            cb.name
         ));
         w.scope(|w| {
             w.line(body);
@@ -262,8 +170,8 @@ fn render_trampoline(
 /// Render the process-wide vtable namespace: `shared` holds the C struct
 /// (its header, then capture-free trampolines, implicitly `@convention(c)`)
 /// at a stable address the library can hold for the process lifetime.
-fn render_vtable(w: &mut CodeWriter, cb: &CallbackInterfaceBinding, ctx: &SwiftCtx) {
-    let proto = ctx.ty_name(&cb.name);
+fn render_vtable(w: &mut CodeWriter, cb: &CallbackBinding, ctx: &SwiftCtx) {
+    let proto = &cb.name;
     let vtable_name = callback_vtable_name(&cb.name);
     let vtable_tag = &cb.vtable_tag;
     let doc = format!(
@@ -277,7 +185,7 @@ fn render_vtable(w: &mut CodeWriter, cb: &CallbackInterfaceBinding, ctx: &SwiftC
     w.indent();
     w.line(format!("static let shared = WvVtable({vtable_tag}("));
     w.indent();
-    w.line(format!("size: UInt32(MemoryLayout<{vtable_tag}>.stride),"));
+    w.line(format!("size: UInt32(MemoryLayout<{vtable_tag}>.size),"));
     w.line("flags: 0,");
     w.line(format!(
         "free: {{ ctx in wvRelease(ctx, as: (any {proto}).self) }}{}",
@@ -293,14 +201,10 @@ fn render_vtable(w: &mut CodeWriter, cb: &CallbackInterfaceBinding, ctx: &SwiftC
     w.blank();
 }
 
-/// Render everything one callback interface contributes at file scope: the
-/// public protocol and the vtable namespace whose `shared.pointer` every
-/// call site passing this interface hands to the library.
-pub(crate) fn render_swift_callback_interface(
-    w: &mut CodeWriter,
-    cb: &CallbackInterfaceBinding,
-    ctx: &SwiftCtx,
-) {
+/// Render everything one callback interface contributes: the public
+/// protocol and the vtable namespace whose `shared.pointer` every call site
+/// passing this interface hands to the library.
+pub(crate) fn render_swift_callback(w: &mut CodeWriter, cb: &CallbackBinding, ctx: &SwiftCtx) {
     render_protocol(w, cb, ctx);
     render_vtable(w, cb, ctx);
 }

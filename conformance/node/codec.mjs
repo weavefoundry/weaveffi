@@ -15,9 +15,12 @@
 
 import { expect, finish, isWasm, live, load, same, throws } from './harness.mjs';
 
+// Every declaration is a named export of the package. The root error class
+// is `CodecLibraryError`, since the package's own name, `CodecError`, is its
+// error domain's.
 const api = await load('codec');
-const { codec, CodecError } = api;
-const { Color, Token } = codec;
+const codec = api;
+const { CodecLibraryError, Color, Token } = codec;
 
 const I32_MIN = -2147483648;
 const I32_MAX = 2147483647;
@@ -193,7 +196,7 @@ throws(
   (e) =>
     e instanceof codec.OutOfRangeError &&
     e instanceof codec.CodecError &&
-    e instanceof CodecError &&
+    e instanceof CodecLibraryError &&
     e.code === 1 &&
     e.index === n &&
     e.count === n &&
@@ -212,7 +215,7 @@ expect(!codec.checkVector(n, { tag: 'Blank' }), 'checkVector past the end is fal
 // what the wire format can't carry.
 throws(
   () => codec.echoColor(3),
-  (e) => e instanceof CodecError && !(e instanceof codec.CodecError) && e.code === -3,
+  (e) => e instanceof CodecLibraryError && !(e instanceof codec.CodecError) && e.code === -3,
   'an undeclared enum value',
 );
 throws(() => codec.checkVector(0, { tag: 'Flag', value: 2 }), (e) => e instanceof TypeError, 'a non-boolean bool');
@@ -291,7 +294,7 @@ expect(codec.echoOptColor(Color.Infrared) === -1 && codec.echoOptColor(Color.Blu
 expect(codec.echoOptColor(null) === null, 'echoOptColor(none)');
 throws(
   () => codec.echoOptColor(3),
-  (e) => e instanceof CodecError && !(e instanceof codec.CodecError) && e.code === -3,
+  (e) => e instanceof CodecLibraryError && !(e instanceof codec.CodecError) && e.code === -3,
   'an undeclared optional enum value',
 );
 
@@ -320,7 +323,7 @@ if (isWasm(api)) {
   // wasm32's usize is 32 bits: a wider value fails the conversion.
   throws(
     () => codec.echoUsize(U64_MAX),
-    (e) => e instanceof CodecError && e.code === -3 && e.message === `value: ${U64_MAX} is not a valid usize`,
+    (e) => e instanceof CodecLibraryError && e.code === -3 && e.message === `value: ${U64_MAX} is not a valid usize`,
     'echoUsize(u64::MAX) on a 32-bit producer',
   );
 } else {
@@ -328,7 +331,7 @@ if (isWasm(api)) {
 }
 for (const ch of ['\u{1F980}', 'é', 'a']) expect(codec.echoChar(ch) === ch, `echoChar(${ch})`);
 const marshalling = (message) => (e) =>
-  e instanceof CodecError && !(e instanceof codec.CodecError) && e.code === -3 && e.message === message;
+  e instanceof CodecLibraryError && !(e instanceof codec.CodecError) && e.code === -3 && e.message === message;
 throws(() => codec.echoChar('ab'), marshalling('value: "ab" is not a valid char'), 'echoChar("ab")');
 throws(() => codec.echoChar(''), marshalling('value: "" is not a valid char'), 'echoChar("")');
 expect(codec.echoHex('ff') === 'ff' && codec.echoHex('00FF') === 'ff' && codec.echoHex('0') === '0', 'echoHex');
@@ -380,7 +383,7 @@ expect(
 );
 for (const t of [p, twin, minus4]) t.close();
 release(full);
-throws(() => p.value(), (e) => e instanceof CodecError && e.code === -3, 'a closed token');
+throws(() => p.value(), (e) => e instanceof CodecLibraryError && e.code === -3, 'a closed token');
 
 // 12. On WebAssembly, a trap poisons the instance: every later call
 // throws a code -2 fault, and releases do nothing. A separate instance of
@@ -389,7 +392,7 @@ throws(() => p.value(), (e) => e instanceof CodecError && e.code === -3, 'a clos
 if (isWasm(api)) {
   const { $loadWasm } = await import(new URL('./node_modules/codec/linear.js', import.meta.url));
   const m = await $loadWasm('codec', undefined, 'codec', 'CODEC_LIBRARY', null);
-  expect(m.x.codec_abi_version() === 5, 'a second instance works');
+  expect(m.x.codec_abi_version() === 6, 'a second instance works');
   let trapped = null;
   try {
     m.x.codec_error_set(m.err, 1, 0x7ffffff0, 64);
@@ -407,7 +410,7 @@ if (isWasm(api)) {
     after !== null && after.code === -2 && after.message.includes('trapped earlier'),
     `a call after the trap throws a code -2 fault (got ${after && after.message})`,
   );
-  expect(m.q.codec_free_bytes(0, 0) === undefined, 'a release after the trap does nothing');
+  expect(m.q.codec_run_free(0) === undefined, 'a release after the trap does nothing');
   expect(codec.echoI32(7) === 7, "the bindings' own instance is unaffected");
 }
 

@@ -1,9 +1,9 @@
-// Conformance consumer: kvstore sample, Kotlin (JVM via JNI) target.
+// Conformance consumer: kvstore sample, Kotlin (JVM over JNA) target.
 //
 // Drives the feature-complete producer through the generated bindings:
 //
-//   * the load-time checks (ABI revision, both modules' contract tables),
-//     which loading the bindings performs;
+//   * the load-time checks (ABI revision, every contract row), which
+//     loading the bindings performs;
 //   * `Store`: fallible and infallible constructors (`Store.open`, `Store()`),
 //     methods, statics, the deprecated `size()`, the `Entry` and `StoreInfo`
 //     data classes, the `EntryKind` enum class, maps and optionals, unsigned
@@ -11,7 +11,7 @@
 //   * `KvException` subclasses with their payload fields (`KeyNotFound`,
 //     `Expired`, `StoreFull`, `Rejected`, `CallbackFailed`), and untyped
 //     failures (-1) as the root `FfiException`;
-//   * lazy `NativeIterator`s of strings (throwing at launch), records, and
+//   * lazy `NativeSequence`s of strings (throwing at launch), records, and
 //     objects, including one abandoned part-way;
 //   * three callback interfaces implemented in Kotlin: a `Listener`
 //     (retained, filtered by `accepts`, told about every `Change`, detached
@@ -28,11 +28,10 @@
 //   * suspend functions: an async free function returning an object, a
 //     cancellable method cancelled mid-pause (completing at once while its
 //     background work stops cooperatively, shown by `activeJobs`), an async
-//     list launched concurrently, and an async function in the nested
-//     `kv.stats` module (`Kv.StatsModule`);
-//   * the sibling `report` root (the shared `Entry` record and its own error
-//     domain);
-//   * the ABI 5 shapes: optional scalars as a parameter (`ttlSeconds`), a
+//     list launched concurrently, and an async function taking a list of
+//     objects (`Kvstore.summarizeAll`);
+//   * a second error domain (`ReportException`, from `renderReport`);
+//   * the direct shapes: optional scalars as a parameter (`ttlSeconds`), a
 //     return (`expiresAt`), iterator items (`expirations`), an async result
 //     (`versionOf`), and a callback parameter and return (`Policy.ttlFor`);
 //     typed arrays as a return (`valueSizes`), an async result
@@ -44,9 +43,10 @@
 // Releases of consumer callbacks are observed through the producer's
 // callback counter (`debug_live(1)`). Ends by asserting the producer's leak
 // counters are zero. Compiled with `-Xfriend-paths`, so the bindings'
-// `internal` members (the bridge and each wrapper's handle) are reachable.
+// `internal` members (the library and each wrapper's handle) are reachable.
 @file:JvmName("Main")
 
+import com.sun.jna.Pointer
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
@@ -59,13 +59,12 @@ import kvstore.Change
 import kvstore.Entry
 import kvstore.EntryKind
 import kvstore.FfiException
-import kvstore.JniBridge
-import kvstore.Kv
 import kvstore.KvException
+import kvstore.Kvstore
+import kvstore.Lib
 import kvstore.Listener
 import kvstore.Loader
 import kvstore.Policy
-import kvstore.Report
 import kvstore.ReportException
 import kvstore.Scorer
 import kvstore.Stats
@@ -75,10 +74,10 @@ import kvstore.StoreInfo
 val mainThread: Thread = Thread.currentThread()
 
 /** Live consumer callbacks the producer holds. */
-fun liveCallbacks(): Long = JniBridge.debug_live(1)
+fun liveCallbacks(): Long = Lib.c.kvstore_debug_live(1)
 
 /** The native object a wrapper refers to (identity, not value). */
-fun Store.address(): Long = handle.address
+fun Store.address(): Long = Pointer.nativeValue(handle.pointer)
 
 fun bytes(s: String) = s.toByteArray(Charsets.UTF_8)
 
@@ -181,8 +180,8 @@ fun constructors() {
     }
 
     runBlocking {
-        Kv.openStore("/async").use { s -> expect(s.path() == "/async", "openStore path") }
-        val err = thrownBy { Kv.openStore("") }
+        Kvstore.openStore("/async").use { s -> expect(s.path() == "/async", "openStore path") }
+        val err = thrownBy { Kvstore.openStore("") }
         expect(err is KvException.InvalidPath, "openStore(\"\") rejects with InvalidPath (got $err)")
     }
 }
@@ -232,18 +231,18 @@ fun iterators() = Store.open("/iter").use { s ->
     s.putText("user.alice", "a")
     s.putText("sys.x", "xx")
 
-    expect(s.keys(null).asSequence().toList() == listOf("sys.x", "user.alice", "user.bob"), "keys in order")
-    expect(JniBridge.debug_live(2) == 0L, "an exhausted iterator is released")
+    expect(s.keys(null).toList() == listOf("sys.x", "user.alice", "user.bob"), "keys in order")
+    expect(Lib.c.kvstore_debug_live(2) == 0L, "an exhausted iterator is released")
     expectKeyNotFound("zzz") { s.keys("zzz") }
 
     // Abandoning an iterator part-way releases it.
     s.keys("user.").use { keys ->
-        expect(keys.next() == "user.alice", "first user key")
-        expect(JniBridge.debug_live(2) == 1L, "the iterator is live")
+        expect(keys.iterator().next() == "user.alice", "first user key")
+        expect(Lib.c.kvstore_debug_live(2) == 1L, "the iterator is live")
     }
-    expect(JniBridge.debug_live(2) == 0L, "an abandoned iterator is released")
+    expect(Lib.c.kvstore_debug_live(2) == 0L, "an abandoned iterator is released")
 
-    val sys = s.entries("sys.").asSequence().toList()
+    val sys = s.entries("sys.").toList()
     expect(sys.size == 1 && sys[0].key == "sys.x" && text(sys[0].value) == "xx", "entries(sys.)")
 
     // partition: objects, created as they're pulled.
@@ -446,10 +445,10 @@ fun asyncCalls() = runBlocking {
         expect(got.size == 3 && got[0]?.key == "keep" && got[1] == null && got[2]?.key == "keep", "getMany")
     }
 
-    // The nested module's async function: objects in a list in, a record out.
+    // An async function: objects in a list in, a record out.
     Store.open("/other").use { other ->
         other.putText("a", "123")
-        val st = Kv.StatsModule.summarizeAll(listOf(s, other))
+        val st = Kvstore.summarizeAll(listOf(s, other))
         expect(st == Stats(2u, 4uL, mapOf(EntryKind.Persistent to 2u)), "summarizeAll (got $st)")
     }
     s.close()
@@ -518,34 +517,34 @@ fun statsAndReport() = Store.open("/stats").use { s ->
     s.putText("a", "123")
     s.putText("c", "x", EntryKind.Encrypted)
 
-    // kv.stats: the parent's Store as a parameter, the parent's error domain.
-    val st = Kv.StatsModule.summarize(s, null)
+    // A free function taking a Store, failing with KvError.
+    val st = Kvstore.summarize(s, null)
     expect(st == Stats(3u, 6uL, mapOf(EntryKind.Persistent to 2u, EntryKind.Encrypted to 1u)), "summarize (got $st)")
-    expectKeyNotFound("q") { Kv.StatsModule.summarize(s, "q") }
+    expectKeyNotFound("q") { Kvstore.summarize(s, "q") }
 
-    // report: the sibling root shares the Entry record.
-    val lines = Report.renderReport(s.entries(null).asSequence().toList())
+    // A second error domain over the shared Entry record.
+    val lines = Kvstore.renderReport(s.entries(null).toList())
     expect(
         lines == listOf("a: 3 bytes, Persistent, v2", "b: 2 bytes, Persistent", "c: 1 bytes, Encrypted"),
         "renderReport (got $lines)",
     )
-    val nothing = expectThrows<ReportException.NothingToReport>("renderReport([])") { Report.renderReport(emptyList()) }
+    val nothing = expectThrows<ReportException.NothingToReport>("renderReport([])") { Kvstore.renderReport(emptyList()) }
     expect(nothing.code == 2001 && nothing.message == "nothing to report", "NothingToReport")
 }
 
-// ── ABI 5 shapes ──────────────────────────────────────────────────────────
+// ── direct shapes ─────────────────────────────────────────────────────────
 
 /** Optional scalars and typed arrays as returns, iterator items, and async results. */
-fun abi5Shapes() = Store.open("/abi5").use { s ->
+fun directShapes() = Store.open("/direct").use { s ->
     s.putText("b", "12", EntryKind.Persistent)
     s.put("a", byteArrayOf(1, 2, 3), EntryKind.Volatile, 7)
     expect(s.count() == 2uL, "count() is a usize")
     expect(s.expiresAt("a") == 7L, "expiresAt(a)")
     expect(s.expiresAt("b") == null && s.expiresAt("zzz") == null, "expiresAt absent")
     expect(s.valueSizes() == listOf(3uL, 2uL), "valueSizes (got ${s.valueSizes()})")
-    val expirations = s.expirations().asSequence().toList()
+    val expirations = s.expirations().toList()
     expect(expirations == listOf(7L, null), "expirations (got $expirations)")
-    expect(JniBridge.debug_live(2) == 0L, "the expirations iterator is released")
+    expect(Lib.c.kvstore_debug_live(2) == 0L, "the expirations iterator is released")
     runBlocking {
         expect(s.versionOf("a") == 1u, "versionOf(a)")
         expect(s.versionOf("q") == null, "versionOf(q) is absent")
@@ -604,7 +603,7 @@ fun recordEquality() = Store.open("/equality").use { s ->
 }
 
 fun main() {
-    expect(JniBridge.debug_live(-1) == 1L, "the sample counts live allocations")
+    expect(Lib.c.kvstore_debug_live(-1) == 1L, "the sample counts live allocations")
 
     constructors()
     basics()
@@ -615,11 +614,11 @@ fun main() {
     asyncCalls()
     objectGraph()
     statsAndReport()
-    abi5Shapes()
+    directShapes()
     ranking()
     imports()
     recordEquality()
 
-    expectNoLeaks(JniBridge::debug_live)
+    expectNoLeaks(Lib.c::kvstore_debug_live)
     println("kotlin/kvstore: OK")
 }

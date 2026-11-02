@@ -5,7 +5,14 @@
 
 weaveffi::export_runtime!();
 
+unsafe extern "C" {
+    fn abi_version_abi_version() -> u32;
+}
+
 #[test]
 fn exported_thunk_reports_the_runtime_revision() {
-    assert_eq!(abi_version_abi_version(), weaveffi::abi::ABI_VERSION);
+    assert_eq!(
+        unsafe { abi_version_abi_version() },
+        weaveffi::__rt::ABI_VERSION
+    );
 }

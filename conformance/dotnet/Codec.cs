@@ -1,7 +1,7 @@
 // Conformance consumer: codec sample, .NET target (the wire oracle).
 //
-// Loading the generated project checks the ABI revision and the `codec`
-// contract table. Then, against the producer's shared vectors:
+// Loading the generated project checks the ABI revision and every
+// declaration's contract. Then, against the producer's shared vectors:
 //
 //   1. every vector decodes (producer encodes, consumer decodes), checks
 //      against its own index and not its neighbor's (consumer encodes,
@@ -20,20 +20,21 @@
 //   7. records are value-equal: every object-free vector decoded twice is
 //      equal (lists, maps, and byte arrays compare by content) with equal
 //      hashes, and `with` makes an unequal copy;
-//   8. the ABI 5 shapes: optional scalars (`int?`, `double?`, `bool?`,
-//      `Color?`) both ways, an undeclared optional enum value rejected
+//   8. the one-C-value shapes: optional scalars (`int?`, `double?`,
+//      `bool?`, `Color?`, each an opt struct) both ways, an undeclared optional enum value rejected
 //      (-3), typed arrays both ways (bit-identical floats, extreme
 //      integers, empty, a span over part of an array), a `usize`, a `char`
 //      (and its rejections), a custom type (and its lift failures), and an
 //      iterator of typed arrays, enumerated twice;
 //
-// and ends by asserting the producer's leak counters are zero.
+// and ends by asserting the producer's leak counters are zero. The free
+// functions are statics of the library class, `Codec.CodecLibrary`.
 
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using Codec;
-using C = Codec.Codec;
+using C = Codec.CodecLibrary;
 
 internal static class Program
 {

@@ -11,7 +11,7 @@
 // encode well-formed values), and object identity and reference counting
 // through buffers. Then the direct transports: optional scalars (OptDirect)
 // in both directions, numeric lists as typed arrays (bit-exact floats, the
-// u64 edges, a misaligned raw array rejected), `usize`, `char`, and a custom
+// u64 edges, a misaligned or ragged raw array rejected), `usize`, `char`, and a custom
 // type crossing as strings (their marshalling failures surface as a
 // NativeError, since those functions don't declare `throws`), and an
 // iterator of typed arrays. Ends by asserting the producer's leak counters
@@ -325,7 +325,7 @@ void outOfRange(int n) {
   );
 }
 
-/// The C `codec_error` struct (ABI 5), for raw calls.
+/// The C `codec_error` struct, for raw calls.
 final class RawError extends Struct {
   @Int32()
   external int code;
@@ -337,6 +337,21 @@ final class RawError extends Struct {
   external int payloadLen;
 }
 
+/// The C `codec_run` struct, passed and returned by value.
+final class RawRun extends Struct {
+  external Pointer<Uint8> ptr;
+  @Size()
+  external int len;
+}
+
+/// The C `codec_opt_i32` struct, passed and returned by value.
+final class RawOptI32 extends Struct {
+  @Bool()
+  external bool has;
+  @Int32()
+  external int value;
+}
+
 /// The producer's symbols, bound directly so malformed input can be sent.
 final class Raw {
   Raw() : _lib = DynamicLibrary.open(Platform.environment['CODEC_LIBRARY']!);
@@ -345,71 +360,67 @@ final class Raw {
 
   late final checkVector = _lib
       .lookupFunction<
-        Bool Function(Uint32, Pointer<Uint8>, Size, Pointer<RawError>),
-        bool Function(int, Pointer<Uint8>, int, Pointer<RawError>)
-      >('codec_codec_check_vector');
+        Bool Function(Uint32, RawRun, Pointer<RawError>),
+        bool Function(int, RawRun, Pointer<RawError>)
+      >('codec_check_vector');
   late final echoColor = _lib
       .lookupFunction<
         Int32 Function(Int32, Pointer<RawError>),
         int Function(int, Pointer<RawError>)
-      >('codec_codec_echo_color');
+      >('codec_echo_color');
   late final echoText = _lib
       .lookupFunction<
-        Pointer<Uint8> Function(
-          Pointer<Uint8>,
-          Size,
-          Pointer<Size>,
-          Pointer<RawError>,
-        ),
-        Pointer<Uint8> Function(
-          Pointer<Uint8>,
-          int,
-          Pointer<Size>,
-          Pointer<RawError>,
-        )
-      >('codec_codec_echo_text');
+        RawRun Function(RawRun, Pointer<RawError>),
+        RawRun Function(RawRun, Pointer<RawError>)
+      >('codec_echo_text');
   late final sumHolder = _lib
       .lookupFunction<
-        Int64 Function(Pointer<Uint8>, Size, Pointer<RawError>),
-        int Function(Pointer<Uint8>, int, Pointer<RawError>)
-      >('codec_codec_sum_holder');
+        Int64 Function(RawRun, Pointer<RawError>),
+        int Function(RawRun, Pointer<RawError>)
+      >('codec_sum_holder');
   late final echoOptColor = _lib
       .lookupFunction<
-        Bool Function(Bool, Int32, Pointer<Int32>, Pointer<RawError>),
-        bool Function(bool, int, Pointer<Int32>, Pointer<RawError>)
-      >('codec_codec_echo_opt_color');
+        RawOptI32 Function(RawOptI32, Pointer<RawError>),
+        RawOptI32 Function(RawOptI32, Pointer<RawError>)
+      >('codec_echo_opt_color');
   late final echoU64s = _lib
       .lookupFunction<
-        Pointer<Uint64> Function(
-          Pointer<Uint64>,
-          Size,
-          Pointer<Size>,
-          Pointer<RawError>,
-        ),
-        Pointer<Uint64> Function(
-          Pointer<Uint64>,
-          int,
-          Pointer<Size>,
-          Pointer<RawError>,
-        )
-      >('codec_codec_echo_u64s');
+        RawRun Function(RawRun, Pointer<RawError>),
+        RawRun Function(RawRun, Pointer<RawError>)
+      >('codec_echo_u64s');
+  late final runFree = _lib
+      .lookupFunction<Void Function(RawRun), void Function(RawRun)>(
+        'codec_run_free',
+      );
   late final errorClear = _lib
       .lookupFunction<
         Void Function(Pointer<RawError>),
         void Function(Pointer<RawError>)
       >('codec_error_clear');
 
-  /// Runs [call] with a staged copy of [bytes] and a fresh error slot, and
-  /// returns the error code it reported.
+  /// Runs [call] with a run holding a staged copy of [bytes] (offset by
+  /// [skip] bytes, with [len] bytes when given) and a fresh error slot, and
+  /// returns the error code it reported. The error slot starts out as
+  /// garbage: a call overwrites it without reading it.
   int code(
     List<int> bytes,
-    void Function(Pointer<Uint8>, int, Pointer<RawError>) call,
-  ) {
+    void Function(RawRun, Pointer<RawError>) call, {
+    int skip = 0,
+    int? len,
+  }) {
     final ptr = calloc<Uint8>(bytes.length + 1);
     final err = calloc<RawError>();
     try {
       ptr.asTypedList(bytes.length).setAll(0, bytes);
-      call(ptr, bytes.length, err);
+      err.cast<Uint8>().asTypedList(sizeOf<RawError>()).fillRange(
+        0,
+        sizeOf<RawError>(),
+        0xAB,
+      );
+      final run = Struct.create<RawRun>()
+        ..ptr = bytes.isEmpty ? nullptr : ptr + skip
+        ..len = len ?? bytes.length - skip;
+      call(run, err);
       final code = err.ref.code;
       errorClear(err);
       return code;
@@ -418,6 +429,10 @@ final class Raw {
       calloc.free(err);
     }
   }
+
+  RawOptI32 optI32(bool has, int value) => Struct.create<RawOptI32>()
+    ..has = has
+    ..value = value;
 }
 
 /// Little-endian buffer bytes for the malformed vectors.
@@ -449,49 +464,55 @@ void malformed(Raw raw) {
     "a string that isn't UTF-8": [...i32(tagText), ...u32(2), 0xC3, 0x28],
   };
   for (final MapEntry(key: what, value: bytes) in cases.entries) {
-    final code = raw.code(bytes, (p, n, e) => raw.checkVector(0, p, n, e));
+    final code = raw.code(bytes, (run, e) => raw.checkVector(0, run, e));
     expect(code == -3, '$what is rejected with -3 (got $code)');
   }
+  // A null run with a non-zero length is malformed.
+  final nullCode = raw.code(
+    const [],
+    (run, e) => raw.checkVector(0, run..len = 4, e),
+  );
+  expect(nullCode == -3, 'a null run with a length is rejected (got $nullCode)');
   // Color can't spell an undeclared value, but a raw call can.
-  final colorCode = raw.code(const [], (_, __, e) => raw.echoColor(3, e));
+  final colorCode = raw.code(const [], (_, e) => raw.echoColor(3, e));
   expect(colorCode == -3, 'an undeclared Color is rejected (got $colorCode)');
-  final len = calloc<Size>();
-  final textCode = raw.code([
-    0xC3,
-    0x28,
-  ], (p, n, e) => raw.echoText(p, n, len, e));
-  calloc.free(len);
+  final textCode = raw.code([0xC3, 0x28], (run, e) {
+    raw.runFree(raw.echoText(run, e));
+  });
   expect(textCode == -3, 'invalid UTF-8 is rejected (got $textCode)');
-  // An optional Color that's present must be a declared Color.
-  final out = calloc<Int32>();
+  // An optional Color that's present must be a declared Color; an absent
+  // one's value is ignored.
   final optColorCode = raw.code(
     const [],
-    (_, __, e) => raw.echoOptColor(true, 3, out, e),
+    (_, e) => raw.echoOptColor(raw.optI32(true, 3), e),
   );
+  late RawOptI32 absent;
   final absentCode = raw.code(
     const [],
-    (_, __, e) => raw.echoOptColor(false, 3, out, e),
+    (_, e) => absent = raw.echoOptColor(raw.optI32(false, 3), e),
   );
-  calloc.free(out);
   expect(
-    optColorCode == -3 && absentCode == 0,
+    optColorCode == -3 && absentCode == 0 && !absent.has,
     'a present undeclared Color? is rejected, an absent one ignored '
     '(got $optColorCode, $absentCode)',
   );
-  // A typed array must be aligned for its element type.
-  final misalignedCode = raw.code(List<int>.filled(17, 0), (p, n, e) {
-    final len = calloc<Size>();
-    raw.echoU64s((p + 1).cast(), 2, len, e);
-    calloc.free(len);
-  });
+  // A typed array must be aligned for its element type, and its length a
+  // multiple of the element size.
+  final misalignedCode = raw.code(List<int>.filled(17, 0), (run, e) {
+    raw.runFree(raw.echoU64s(run, e));
+  }, skip: 1);
   expect(
     misalignedCode == -3,
     'a misaligned array is rejected (got $misalignedCode)',
   );
+  final raggedCode = raw.code(List<int>.filled(16, 0), (run, e) {
+    raw.runFree(raw.echoU64s(run, e));
+  }, len: 12);
+  expect(raggedCode == -3, 'a ragged array is rejected (got $raggedCode)');
   // A zero token is a marshalling failure, not a crash.
   final zeroCode = raw.code(
     List<int>.filled(17, 0),
-    (p, n, e) => raw.sumHolder(p, n, e),
+    (run, e) => raw.sumHolder(run, e),
   );
   expect(zeroCode == -3, 'a zero token is rejected (got $zeroCode)');
 }

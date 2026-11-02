@@ -60,14 +60,6 @@ DynamicLibrary _open(String path) {
 /// The C ABI revision these bindings were generated against.
 const int _abiVersion = {{ABI_VERSION}};
 
-/// One `{{PREFIX}}_contract_entry` of a module's contract table.
-final class _ContractEntry extends Struct {
-  @Uint64()
-  external int id;
-  @Uint64()
-  external int hash;
-}
-
 DynamicLibrary _verifyLibrary(DynamicLibrary lib) {
   final int Function() abiVersion;
   try {
@@ -84,45 +76,17 @@ DynamicLibrary _verifyLibrary(DynamicLibrary lib) {
         'revision $_abiVersion, but the loaded library implements revision '
         '$found');
   }
-  for (final (symbol, expected) in _contracts) {
-    _checkContract(lib, symbol, expected);
-  }
-  return lib;
-}
-
-/// Checks that every `(id, hash, path)` entry in [expected] is in the table
-/// [symbol] returns with an equal hash. Entries only the library has are
-/// fine: they're declarations (or error codes, or callback methods) added
-/// after these bindings were generated.
-void _checkContract(
-    DynamicLibrary lib, String symbol, List<(int, int, String)> expected) {
-  final Pointer<_ContractEntry> Function(Pointer<Size>) table;
-  try {
-    table = lib.lookupFunction<Pointer<_ContractEntry> Function(Pointer<Size>),
-        Pointer<_ContractEntry> Function(Pointer<Size>)>(symbol);
-  } on ArgumentError {
-    throw NativeLibraryException(
-        "{{NAME}}: the loaded library doesn't export '$symbol'");
-  }
-  final hashes = <int, int>{};
-  final len = calloc<Size>();
-  try {
-    final entries = table(len);
-    for (var i = 0; i < len.value; i++) {
-      hashes[entries[i].id] = entries[i].hash;
-    }
-  } finally {
-    calloc.free(len);
-  }
-  for (final (id, hash, path) in expected) {
-    final found = hashes[id];
-    if (found == null) {
+  for (final (symbol, hash, path) in _contracts) {
+    if (!lib.providesSymbol(symbol)) {
       throw NativeLibraryException(
           '{{NAME}}: $path is missing from the library');
     }
-    if (found != hash) {
+    final contract =
+        lib.lookupFunction<Uint64 Function(), int Function()>(symbol);
+    if (contract() != hash) {
       throw NativeLibraryException(
           '{{NAME}}: $path changed since these bindings were generated');
     }
   }
+  return lib;
 }

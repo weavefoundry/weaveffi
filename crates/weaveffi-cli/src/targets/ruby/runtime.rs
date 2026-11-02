@@ -1,9 +1,12 @@
 //! The fixed Ruby runtime every generated gem ships as
 //! `lib/{prefix}/runtime.rb`: the library loader (honoring
 //! `{PREFIX}_LIBRARY`, then a bundled `lib/native/` copy, then the system
-//! search path), the load-time ABI check, the error classes, the value-buffer
-//! reader and writer, cancel tokens, the handle table behind callback
-//! interfaces and async completions, and the `WvObject` wrapper base class.
+//! search path), the load-time ABI and contract checks, the C structs every
+//! value crosses in (`Run`, the `Opt*` optional scalars, and `Callback`),
+//! the error classes, the conversion of each value kind in and out, the
+//! value-buffer reader and writer, cancel tokens, the handle table behind
+//! callback interfaces and async completions, the vtable builder, and the
+//! `Handle` wrapper base class.
 //!
 //! The source lives in `runtime/runtime.rb` as ordinary Ruby; rendering only
 //! substitutes the `{{PLACEHOLDER}}` names below.

@@ -1,4 +1,4 @@
-// Conformance consumer: codec sample, Kotlin (JVM via JNI) target.
+// Conformance consumer: codec sample, Kotlin (JVM over JNA) target.
 //
 // The shared-vector loop: for every vector the producer serves, decode it
 // with the generated codec, re-encode it (which must reproduce the
@@ -8,12 +8,13 @@
 // built from literals (so a symmetric encode/decode bug can't hide), spot
 // checks of decoded fields, the typed `CodecException.OutOfRange` and its
 // payload, malformed input rejected as marshalling failures (through the
-// internal JNI bridge, which takes raw bytes), and object identity and
+// internal JNA library, which takes raw runs), and object identity and
 // reference counting through buffers. Ends by asserting the producer's leak
-// counters are zero. Also the ABI 5 shapes: optional scalars, typed arrays
+// counters are zero. Also the direct shapes: optional scalars, typed arrays
 // (in, out, and as iterator items), `usize`, `char`, a custom type, and
-// content equality of records holding bytes. Compiled with `-Xfriend-paths`, so the bindings'
-// `internal` codec and bridge are reachable.
+// content equality of records holding bytes. Compiled with
+// `-Xfriend-paths`, so the bindings' `internal` codec and library are
+// reachable.
 @file:JvmName("Main")
 
 import codec.BufferWriter
@@ -22,15 +23,21 @@ import codec.Codec
 import codec.Color
 import codec.Composite
 import codec.Holder
-import codec.JniBridge
+import codec.Lib
 import codec.NativeBugException
+import codec.OptI32
 import codec.Scalars
 import codec.Shape
 import codec.Token
 import codec.Vector
+import codec.bytes
+import codec.callNative
 import codec.decodeBuffer
 import codec.encodeBuffer
+import codec.optI32
 import codec.pack_Vector
+import codec.runOf
+import codec.take
 import codec.unpack_Vector
 
 /** Release the tokens a decoded vector carries (only `Objects` has any). */
@@ -103,7 +110,7 @@ fun echo(v: Vector) {
 
 fun everyVector(n: UInt) {
     for (i in 0u until n) {
-        val raw = JniBridge.codec_vector(i.toInt())
+        val raw = take(callNative(0) { e -> Lib.c.codec_vector(i.toInt(), e) }) { it.bytes() }
         val v = decodeBuffer(raw) { unpack_Vector(it) }
         if (!Codec.checkVector(i, v)) {
             expect(
@@ -237,7 +244,7 @@ fun outOfRange(n: UInt) {
 /** A raw buffer that `check_vector` must reject as a marshalling failure. */
 internal fun reject(what: String, write: (BufferWriter) -> Unit) {
     val bytes = encodeBuffer(write)
-    val e = thrownBy { JniBridge.codec_check_vector(0, bytes) }
+    val e = thrownBy { callNative(0) { err -> Lib.c.codec_check_vector(0, runOf(bytes), err) } }
     expect(e is NativeBugException && e.code == -3, "$what is rejected with -3 (got $e)")
 }
 
@@ -267,9 +274,12 @@ fun malformed() {
 
     // Color can't spell an undeclared value, but the raw bridge can: the
     // producer rejects it with -3, a trap for a call that can't fail.
-    val badColor = thrownBy { JniBridge.codec_echo_color(3) }
+    val badColor = thrownBy { callNative(0) { e -> Lib.c.codec_echo_color(3, e) } }
     expect(badColor is NativeBugException && badColor.code == -3, "an undeclared Color is rejected (got $badColor)")
-    val badText = thrownBy { JniBridge.codec_echo_text(byteArrayOf(0xC3.toByte(), 0x28)) }
+    val badText = thrownBy {
+        val run = callNative(0) { e -> Lib.c.codec_echo_text(runOf(byteArrayOf(0xC3.toByte(), 0x28)), e) }
+        take(run) { it.bytes() }
+    }
     expect(badText is NativeBugException && badText.code == -3, "invalid UTF-8 is rejected (got $badText)")
 }
 
@@ -297,7 +307,7 @@ fun objects(n: UInt) {
     expect(Codec.sumHolder(mine) == 10L * 5 - 4, "consumer holder sums to 46")
 
     // A zero token is a marshalling failure, not a crash.
-    val zero = thrownBy { JniBridge.codec_sum_holder(ByteArray(17)) }
+    val zero = thrownBy { callNative(0) { e -> Lib.c.codec_sum_holder(runOf(ByteArray(17)), e) } }
     expect(zero is NativeBugException && zero.code == -3, "a zero token is rejected (got $zero)")
 
     minus4.close()
@@ -308,9 +318,9 @@ fun objects(n: UInt) {
     expect(thrownBy { p.value() } is IllegalStateException, "a closed wrapper can't be used")
 }
 
-/** The ABI 5 shapes: optional scalars, typed arrays, usize, char, a custom type, and an iterator of arrays. */
-fun abi5Shapes() {
-    // Optional scalars cross as a presence flag and a value.
+/** The direct shapes: optional scalars, typed arrays, usize, char, a custom type, and an iterator of arrays. */
+fun directShapes() {
+    // Optional scalars cross as one `{has, value}` struct.
     expect(Codec.echoOptI32(null) == null, "echoOptI32(null)")
     expect(Codec.echoOptI32(Int.MIN_VALUE) == Int.MIN_VALUE, "echoOptI32(MIN)")
     expect(Codec.echoOptI32(0) == 0, "echoOptI32(0) is present")
@@ -323,10 +333,14 @@ fun abi5Shapes() {
     expect(Codec.echoOptColor(Color.Infrared) == Color.Infrared, "echoOptColor(Infrared)")
     expect(Codec.echoOptColor(Color.Blue) == Color.Blue, "echoOptColor(Blue)")
     expect(Codec.echoOptColor(null) == null, "echoOptColor(null)")
-    // The raw bridge can send an undeclared enum value: -3.
-    val badOpt = thrownBy { JniBridge.codec_echo_opt_color(true, 3) }
+    // The raw library can send an undeclared enum value: -3.
+    val badOpt = thrownBy { callNative(0) { e -> Lib.c.codec_echo_opt_color(optI32(3), e) } }
     expect(badOpt is NativeBugException && badOpt.code == -3, "an undeclared Color? is rejected (got $badOpt)")
-    expect(JniBridge.codec_echo_opt_color(false, 3) == null, "an absent value is ignored")
+    val absent = OptI32.ByValue().also {
+        it.value = 3
+        it.write()
+    }
+    expect(callNative(0) { e -> Lib.c.codec_echo_opt_color(absent, e) }.get() == null, "an absent value is ignored")
 
     // Typed arrays.
     val floats = listOf(Double.NaN, -0.0, Double.MIN_VALUE, Double.POSITIVE_INFINITY)
@@ -377,17 +391,20 @@ fun abi5Shapes() {
 
     // An iterator of typed arrays.
     expect(
-        Codec.chunks(listOf(Int.MIN_VALUE, 0, Int.MAX_VALUE), 2u).asSequence().toList() ==
+        Codec.chunks(listOf(Int.MIN_VALUE, 0, Int.MAX_VALUE), 2u).toList() ==
             listOf(listOf(Int.MIN_VALUE, 0), listOf(Int.MAX_VALUE)),
         "chunks of 2",
     )
     expect(
-        Codec.chunks(listOf(1, 2, 3, 4), 2u).asSequence().toList() == listOf(listOf(1, 2), listOf(3, 4)),
+        Codec.chunks(listOf(1, 2, 3, 4), 2u).toList() == listOf(listOf(1, 2), listOf(3, 4)),
         "chunks([1, 2, 3, 4], 2)",
     )
-    expect(!Codec.chunks(listOf(1, 2), 0u).hasNext(), "chunks of 0 is empty")
-    expect(!Codec.chunks(emptyList(), 3u).hasNext(), "chunks of [] is empty")
-    expect(JniBridge.debug_live(2) == 0L, "exhausted chunk iterators are released")
+    expect(Codec.chunks(listOf(1, 2), 0u).none(), "chunks of 0 is empty")
+    expect(Codec.chunks(emptyList(), 3u).none(), "chunks of [] is empty")
+    expect(Lib.c.codec_debug_live(2) == 0L, "exhausted chunk iterators are released")
+    val once = Codec.chunks(listOf(1), 1u)
+    expect(once.count() == 1, "a sequence iterates once")
+    expect(thrownBy { once.count() } is IllegalStateException, "and only once")
 
     // Records holding bytes compare by content.
     val blob = byteArrayOf(1, 2, 3)
@@ -398,7 +415,7 @@ fun abi5Shapes() {
 }
 
 fun main() {
-    expect(JniBridge.debug_live(-1) == 1L, "the sample counts live allocations")
+    expect(Lib.c.codec_debug_live(-1) == 1L, "the sample counts live allocations")
     val n = Codec.vectorCount()
     expect(n >= 60u, "at least 60 vectors (got $n)")
 
@@ -408,8 +425,8 @@ fun main() {
     outOfRange(n)
     malformed()
     objects(n)
-    abi5Shapes()
+    directShapes()
 
-    expectNoLeaks(JniBridge::debug_live)
+    expectNoLeaks(Lib.c::codec_debug_live)
     println("kotlin/codec: OK ($n vectors)")
 }

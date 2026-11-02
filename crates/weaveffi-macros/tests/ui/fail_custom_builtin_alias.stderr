@@ -1,0 +1,5 @@
+error: weaveffi: `u16` already crosses the ABI, so an alias of it can't be a custom type; wrap it in a newtype (`pub struct Port(pub u16);`) and put `#[weaveffi::custom]` on that
+ --> tests/ui/fail_custom_builtin_alias.rs:5:17
+  |
+5 | pub type Port = u16;
+  |                 ^^^

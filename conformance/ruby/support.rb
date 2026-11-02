@@ -25,13 +25,20 @@ def eventually
   false
 end
 
-# The 64-bit FNV-1a hash the contract tables use.
+# The 64-bit FNV-1a hash the contract uses.
 def fnv1a64(text)
   text.bytes.reduce(0xcbf29ce484222325) { |h, b| ((h ^ b) * 0x100000001b3) & 0xffff_ffff_ffff_ffff }
 end
 
+# The contract function of the declaration at `path` in the library with
+# symbol prefix `prefix`: `{prefix}_contract_{fnv1a64(path)}`.
+def contract_symbol(prefix, path)
+  :"#{prefix}_contract_#{format('%016x', fnv1a64(path))}"
+end
+
 # The bindings' private runtime module (Bridge), which the consumers use
-# for the leak counters and the contract check.
+# for the leak counters, the contract check, and the runs they send past
+# the idiomatic wrappers.
 def bridge(mod)
   mod.const_get(:Bridge)
 end
@@ -97,6 +104,11 @@ class MiniScheduler
   end
 
   def io_wait(_io, _events, _timeout)
+    raise NotImplementedError, 'MiniScheduler does no I/O'
+  end
+
+  # Interrupts a Fiber blocked on I/O, which never happens here.
+  def fiber_interrupt(_fiber, _exception)
     raise NotImplementedError, 'MiniScheduler does no I/O'
   end
 

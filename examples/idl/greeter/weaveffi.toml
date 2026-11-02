@@ -1,0 +1,10 @@
+# ANCHOR: config
+[project]
+input = "greeter.yml"
+out = "bindings"
+targets = ["c", "python"]
+
+[package]
+name = "greeter"
+version = "0.1.0"
+# ANCHOR_END: config

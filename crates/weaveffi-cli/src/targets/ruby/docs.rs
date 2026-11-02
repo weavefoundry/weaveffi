@@ -12,7 +12,7 @@ use crate::targets::ruby::types::{rb_const, rb_domain};
 /// How the bindings spell an identifier an IDL doc names in backticks:
 /// callables, parameters, and fields in snake_case, error domains and
 /// codes by their class names, and types by their (escaped) constants.
-/// Variants and modules keep their IDL spelling.
+/// Variants keep their IDL spelling.
 pub(crate) fn spell(names: &ApiNames, ident: &str) -> Option<String> {
     match names.kind(ident)? {
         IdentKind::Function
@@ -23,7 +23,7 @@ pub(crate) fn spell(names: &ApiNames, ident: &str) -> Option<String> {
         IdentKind::ErrorDomain => Some(rb_domain(ident)),
         IdentKind::ErrorCode => Some(pascal(ident)),
         IdentKind::Type => Some(rb_const(ident)),
-        IdentKind::Variant | IdentKind::Module => None,
+        IdentKind::Variant => None,
     }
 }
 

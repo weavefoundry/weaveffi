@@ -17,7 +17,8 @@ pub(crate) struct RuntimeNames {
     pub bug_exception: String,
     /// The load-time failure (`NativeLoadException`).
     pub load_exception: String,
-    /// The static class with `Check()` (`{Namespace}Library`).
+    /// The static class with `Check()`, `AbiVersion`, and the free
+    /// functions (`{Namespace}Library`).
     pub library_class: String,
 }
 
@@ -26,17 +27,17 @@ impl RuntimeNames {
     /// is qualified by the namespace's last segment (`KvstoreNativeException`).
     pub(crate) fn new(model: &Model, namespace: &str) -> Self {
         let taken = |name: &str| {
-            model.modules.iter().any(|m| {
-                m.structs.iter().any(|s| s.name == name)
-                    || m.enums.iter().any(|e| e.name == name)
-                    || m.interfaces.iter().any(|i| i.name == name)
-                    || m.callback_interfaces
-                        .iter()
-                        .any(|c| c.name == name || format!("I{}", c.name) == name)
-                    || m.errors
-                        .iter()
-                        .any(|e| errors::exception_type_name(&e.name) == name)
-            })
+            model.records.iter().any(|s| s.name == name)
+                || model.enums.iter().any(|e| e.name == name)
+                || model.interfaces.iter().any(|i| i.name == name)
+                || model
+                    .callbacks
+                    .iter()
+                    .any(|c| c.name == name || format!("I{}", c.name) == name)
+                || model
+                    .errors
+                    .iter()
+                    .any(|e| errors::exception_type_name(&e.name) == name)
         };
         let last = namespace.rsplit('.').next().unwrap_or(namespace);
         let pick = |name: &str| {

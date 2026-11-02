@@ -1,5 +1,7 @@
 package {{PACKAGE}}
 
+import com.sun.jna.Pointer
+
 /**
  * Growable little-endian writer for the value-buffer wire format that
  * records, rich enums, optionals, lists, and maps cross the ABI in.
@@ -7,7 +9,7 @@ package {{PACKAGE}}
 internal class BufferWriter {
     private var buf = ByteArray(64)
     private var len = 0
-    private var minted: ArrayList<Pair<Long, (Long) -> Unit>>? = null
+    private var minted: ArrayList<Pair<Pointer, (Pointer) -> Unit>>? = null
 
     private fun reserve(extra: Int) {
         if (len + extra <= buf.size) return
@@ -73,10 +75,10 @@ internal class BufferWriter {
      * An object token: one new strong reference the reader adopts, which
      * [abandon] releases with [release] if the encoding fails.
      */
-    fun writeObject(token: Long, release: (Long) -> Unit) {
-        val list = minted ?: ArrayList<Pair<Long, (Long) -> Unit>>().also { minted = it }
+    fun writeObject(token: Pointer, release: (Pointer) -> Unit) {
+        val list = minted ?: ArrayList<Pair<Pointer, (Pointer) -> Unit>>().also { minted = it }
         list.add(token to release)
-        writeI64(token)
+        writeI64(Pointer.nativeValue(token))
     }
 
     /** Releases every object token written so far, for an encoding that failed midway. */
@@ -188,10 +190,10 @@ internal class BufferReader(private val buf: ByteArray) {
     }
 
     /** An object token: one strong reference the caller adopts. */
-    fun readObject(): Long {
+    fun readObject(): Pointer {
         val token = readI64()
         if (token == 0L) malformed("null object token")
-        return token
+        return Pointer(token)
     }
 
     inline fun <T> readOptional(read: () -> T): T? = if (readBool()) read() else null
@@ -244,6 +246,9 @@ internal inline fun <T> decodeBuffer(bytes: ByteArray, read: (BufferReader) -> T
     r.expectEnd()
     return v
 }
+
+/** Decodes the value buffer this run holds. */
+internal inline fun <T> Run.decode(read: (BufferReader) -> T): T = decodeBuffer(bytes(), read)
 
 /**
  * Structural equality that compares `ByteArray`s by content, also inside

@@ -1,12 +1,11 @@
 //! Non-fatal, lint-style checks over a validated [`Api`].
 //!
 //! These are distinct from the hard validation errors in the parent
-//! [`crate::validate`] module: errors *reject* an IDL, whereas warnings
-//! merely flag stylistic or ergonomic concerns (deep nesting, undocumented
-//! modules, async functions with no result) that the caller can surface and
-//! the user can choose to ignore.
+//! [`crate::validate`] module: errors *reject* an API, whereas warnings flag
+//! ergonomic concerns (deep nesting, huge enums, undocumented declarations)
+//! that `weaveffi validate --warn` surfaces and the user may ignore.
 
-use crate::ir::{Api, Module, TypeRef};
+use crate::ir::{Api, Function, TypeRef};
 
 /// Nesting deeper than this (`[[[[i32]]]]`) is flagged.
 const MAX_NESTING: usize = 3;
@@ -15,94 +14,65 @@ const MAX_NESTING: usize = 3;
 const MAX_ENUM_VARIANTS: usize = 100;
 
 /// A non-fatal advisory emitted by [`collect_warnings`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "code")]
 pub enum ValidationWarning {
-    /// An enum has an unusually large number of variants (more than 100).
+    /// An enum has more than 100 variants.
     LargeEnumVariantCount {
-        /// Enum that tripped the threshold.
+        /// The enum.
         enum_name: String,
-        /// Number of variants the enum declares.
+        /// How many variants it declares.
         count: usize,
     },
-    /// A type is nested more deeply than recommended (more than 3 levels).
+    /// A type is nested more than 3 levels deep.
     DeepNesting {
-        /// Where the deeply nested type appears (a `module::fn::param` path).
+        /// Where the type appears (`Store.get.key`, `Entry.tags`).
         location: String,
-        /// Measured nesting depth.
+        /// The nesting depth.
         depth: usize,
     },
-    /// A module declares functions but carries no doc comment on itself or
-    /// on any of them.
-    EmptyModuleDoc {
-        /// Module with no documentation.
-        module: String,
-    },
-    /// An async function declares no return type, which is unusual.
-    AsyncVoidFunction {
-        /// Module that contains the function.
-        module: String,
-        /// Async function with no return type.
-        function: String,
-    },
-    /// A function is marked deprecated; the message is surfaced to consumers.
-    DeprecatedFunction {
-        /// Module that contains the function.
-        module: String,
-        /// Deprecated function.
-        function: String,
-        /// Deprecation message declared in the IDL.
-        message: String,
+    /// A top-level declaration has no documentation, so its bindings have
+    /// no doc comment.
+    Undocumented {
+        /// The declaration.
+        name: String,
     },
 }
 
 impl std::fmt::Display for ValidationWarning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::LargeEnumVariantCount { enum_name, count } => {
-                write!(
-                    f,
-                    "enum '{enum_name}' has {count} variants (>{MAX_ENUM_VARIANTS})"
-                )
-            }
+            Self::LargeEnumVariantCount { enum_name, count } => write!(
+                f,
+                "enum '{enum_name}' has {count} variants (more than {MAX_ENUM_VARIANTS})"
+            ),
             Self::DeepNesting { location, depth } => write!(
                 f,
-                "deep type nesting at {location} (depth {depth}, max recommended {MAX_NESTING})"
+                "deep type nesting at {location} (depth {depth}, at most {MAX_NESTING} \
+                 recommended)"
             ),
-            Self::EmptyModuleDoc { module } => {
-                write!(
-                    f,
-                    "module '{module}' has no doc comment on itself or any function"
-                )
-            }
-            Self::AsyncVoidFunction { module, function } => write!(
-                f,
-                "async function {module}::{function} has no return type; async void is unusual"
-            ),
-            Self::DeprecatedFunction {
-                module,
-                function,
-                message,
-            } => write!(f, "function {module}::{function} is deprecated: {message}"),
+            Self::Undocumented { name } => write!(f, "'{name}' has no documentation"),
         }
     }
 }
 
-/// Walk every module (including nested submodules) and collect all advisory
-/// warnings for `api`.
-///
-/// Assumes `api` has already passed hard validation; it does not re-check
-/// structural invariants.
-pub fn collect_warnings(api: &Api) -> Vec<ValidationWarning> {
-    let mut warnings = Vec::new();
-    for module in &api.modules {
-        collect_module(module, &mut warnings);
+impl ValidationWarning {
+    /// The warning's code, the variant name (`--format json` reports it).
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::LargeEnumVariantCount { .. } => "LargeEnumVariantCount",
+            Self::DeepNesting { .. } => "DeepNesting",
+            Self::Undocumented { .. } => "Undocumented",
+        }
     }
-    warnings
 }
 
-fn collect_module(module: &Module, warnings: &mut Vec<ValidationWarning>) {
-    let name = &module.name;
-    for e in &module.enums {
+/// Collect every advisory warning for `api`, which has passed validation.
+#[must_use]
+pub fn collect_warnings(api: &Api) -> Vec<ValidationWarning> {
+    let mut warnings = Vec::new();
+    for e in &api.enums {
         if e.variants.len() > MAX_ENUM_VARIANTS {
             warnings.push(ValidationWarning::LargeEnumVariantCount {
                 enum_name: e.name.clone(),
@@ -116,45 +86,43 @@ fn collect_module(module: &Module, warnings: &mut Vec<ValidationWarning>) {
             warnings.push(ValidationWarning::DeepNesting { location, depth });
         }
     };
-    for s in &module.structs {
-        for field in &s.fields {
-            deep(&field.ty, format!("{name}::{}::{}", s.name, field.name));
+    for r in &api.records {
+        for field in &r.fields {
+            deep(&field.ty, format!("{}.{}", r.name, field.name));
         }
     }
-    for f in &module.functions {
+    let mut callable = |owner: Option<&str>, f: &Function| {
+        let path = owner.map_or_else(|| f.name.clone(), |o| format!("{o}.{}", f.name));
         for p in &f.params {
-            deep(&p.ty, format!("{name}::{}::{}", f.name, p.name));
+            deep(&p.ty, format!("{path}.{}", p.name));
         }
         if let Some(ret) = &f.returns {
-            deep(ret, format!("{name}::{}::return", f.name));
+            deep(ret, format!("{path} (return)"));
+        }
+    };
+    for f in &api.functions {
+        callable(None, f);
+    }
+    for i in &api.interfaces {
+        for f in i.constructors.iter().chain(&i.methods).chain(&i.statics) {
+            callable(Some(&i.name), f);
         }
     }
-    for f in &module.functions {
-        if f.r#async && f.returns.is_none() {
-            warnings.push(ValidationWarning::AsyncVoidFunction {
-                module: name.clone(),
-                function: f.name.clone(),
-            });
+    let docs = api
+        .records
+        .iter()
+        .map(|d| (&d.name, &d.doc))
+        .chain(api.enums.iter().map(|d| (&d.name, &d.doc)))
+        .chain(api.errors.iter().map(|d| (&d.name, &d.doc)))
+        .chain(api.interfaces.iter().map(|d| (&d.name, &d.doc)))
+        .chain(api.callbacks.iter().map(|d| (&d.name, &d.doc)))
+        .chain(api.functions.iter().map(|d| (&d.name, &d.doc)));
+    for (name, doc) in docs {
+        if doc.is_none() {
+            warnings.push(ValidationWarning::Undocumented { name: name.clone() });
         }
-        if let Some(msg) = &f.deprecated {
-            warnings.push(ValidationWarning::DeprecatedFunction {
-                module: name.clone(),
-                function: f.name.clone(),
-                message: msg.clone(),
-            });
-        }
     }
-    if module.doc.is_none()
-        && !module.functions.is_empty()
-        && module.functions.iter().all(|f| f.doc.is_none())
-    {
-        warnings.push(ValidationWarning::EmptyModuleDoc {
-            module: name.clone(),
-        });
-    }
-    for child in &module.modules {
-        collect_module(child, warnings);
-    }
+    warnings
 }
 
 fn nesting_depth(ty: &TypeRef) -> usize {
@@ -164,5 +132,32 @@ fn nesting_depth(ty: &TypeRef) -> usize {
         }
         TypeRef::Map(k, v) => 1 + nesting_depth(k).max(nesting_depth(v)),
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deep_nesting_large_enums_and_missing_docs_warn() {
+        let api: Api = serde_json::from_str(
+            r#"{"version":"0.13.0",
+                "records":[{"name":"R","doc":"r","fields":[{"name":"x","type":"[[[[i32]]]]"}]}],
+                "functions":[{"name":"f"}]}"#,
+        )
+        .unwrap();
+        let warnings = collect_warnings(&api);
+        assert_eq!(
+            warnings,
+            [
+                ValidationWarning::DeepNesting {
+                    location: "R.x".into(),
+                    depth: 4
+                },
+                ValidationWarning::Undocumented { name: "f".into() },
+            ]
+        );
+        assert_eq!(warnings[1].code(), "Undocumented");
     }
 }

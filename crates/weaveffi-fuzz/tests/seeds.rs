@@ -4,7 +4,7 @@
 //!   1. every committed seed is well-formed for its target's parser, and
 //!   2. each fuzz target's underlying call pattern (the body of the
 //!      `fuzz_target!` macro invocation) keeps compiling against the upstream
-//!      APIs in `weaveffi-model` and `weaveffi::abi`.
+//!      APIs in `weaveffi-model` and the `weaveffi` runtime.
 //!
 //! If a parser or validator signature changes, this file is what should
 //! break first, long before a nightly fuzz run.
@@ -14,14 +14,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
-use weaveffi::abi::{encode_value, BufferDecodeError, BufferValue};
-
-/// Decode a buffer of one of the fuzzed types, none of which carries an
-/// object token, so no input can make the decode unsound.
-fn decode_value<T: BufferValue>(data: &[u8]) -> Result<T, BufferDecodeError> {
-    // SAFETY: the fuzzed types contain no interfaces, so no token is adopted.
-    unsafe { weaveffi::abi::decode_value(data) }
-}
+use weaveffi_fuzz::{decode_value, encode_value, Value};
 use weaveffi_model::ir::parse_type_ref;
 use weaveffi_model::parse::parse_api_str;
 use weaveffi_model::pkg::Identity;
@@ -41,14 +34,14 @@ fn seed(target: &str, name: &str) -> String {
 fn parse_yaml_seed_is_well_formed() {
     let s = seed("fuzz_parse_yaml", "minimal.yml");
     let api = parse_api_str(&s, "yaml").expect("seed must parse as YAML");
-    assert_eq!(api.modules.len(), 1);
+    assert_eq!(api.functions.len(), 1);
 }
 
 #[test]
 fn parse_json_seed_is_well_formed() {
     let s = seed("fuzz_parse_json", "minimal.json");
     let api = parse_api_str(&s, "json").expect("seed must parse as JSON");
-    assert_eq!(api.modules.len(), 1);
+    assert_eq!(api.functions.len(), 1);
 }
 
 #[test]
@@ -110,7 +103,7 @@ fn seed_bytes(target: &str, name: &str) -> Vec<u8> {
 
 /// Mirrors `exact` in `value_buffer.rs`: a successful decode re-encodes to
 /// the same bytes. Returns whether the decode succeeded.
-fn exact<T: BufferValue>(data: &[u8]) -> bool {
+fn exact<T: Value>(data: &[u8]) -> bool {
     let Ok(value) = decode_value::<T>(data) else {
         return false;
     };
@@ -120,7 +113,7 @@ fn exact<T: BufferValue>(data: &[u8]) -> bool {
 
 /// Mirrors `stable` in `value_buffer.rs`: a successful decode survives an
 /// encode and decode unchanged. Returns whether the decode succeeded.
-fn stable<T: BufferValue + PartialEq + std::fmt::Debug>(data: &[u8]) -> bool {
+fn stable<T: Value + PartialEq + std::fmt::Debug>(data: &[u8]) -> bool {
     let Ok(value) = decode_value::<T>(data) else {
         return false;
     };
@@ -178,4 +171,23 @@ fn value_buffer_target_rejects_garbage() {
     for data in garbage {
         assert!(!value_buffer_target(data), "{data:?} must not decode");
     }
+}
+
+/// Mirrors the body of `fuzz_target!` in `meta_frames.rs`: garbage and a
+/// truncated real frame are rejected without panicking, and a real frame
+/// round-trips.
+#[test]
+fn meta_frames_target_rejects_garbage_and_reads_real_frames() {
+    for data in [&b""[..], b"\x00", b"WFFI", &[0xff; 64]] {
+        assert!(weaveffi_model::meta::decode(data).is_err() || data.is_empty());
+    }
+    let api = parse_api_str(&seed("fuzz_validate", "minimal.yml"), "yaml").unwrap();
+    let frames = weaveffi_model::meta::frames(&api, "fuzz");
+    assert_eq!(
+        weaveffi_model::meta::assemble(&frames, "fuzz")
+            .unwrap()
+            .functions
+            .len(),
+        1
+    );
 }

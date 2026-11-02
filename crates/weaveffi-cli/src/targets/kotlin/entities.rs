@@ -1,16 +1,14 @@
-//! Kotlin declarations for one top-level module: error domains, enums,
+//! The public Kotlin declarations of the library: error domains, enums,
 //! records, rich enums, callback interfaces, interface wrapper classes, and
-//! the module object holding the free functions (nested modules become
-//! nested objects).
+//! the object holding the free functions.
 
 use crate::codegen::common::pascal_case;
 use crate::codegen::CodeWriter;
 use weaveffi_model::errors;
 use weaveffi_model::model::{
-    CallbackInterfaceBinding, EnumBinding, ErrorBinding, FieldBinding, InterfaceBinding, Model,
-    ModuleBinding, StructBinding,
+    CallbackBinding, EnumBinding, ErrorBinding, ErrorStrategy, FieldBinding, InterfaceBinding,
+    Model, RecordBinding,
 };
-use weaveffi_model::plan::ErrorStrategy;
 use weaveffi_model::ty::{Prim, Ty};
 
 use crate::targets::kotlin::calls::{deprecated_line, emit_callable, kt_string, Decl};
@@ -291,7 +289,7 @@ fn render_rich_enum(w: &mut CodeWriter, n: &Names, sp: &Speller, e: &EnumBinding
 
 /// A record: a `data class` (a plain `class` when it has no fields), plus
 /// its buffer codec (the fields in declaration order).
-fn render_struct(w: &mut CodeWriter, n: &Names, sp: &Speller, s: &StructBinding) {
+fn render_record(w: &mut CodeWriter, n: &Names, sp: &Speller, s: &RecordBinding) {
     let name = n.ty(&s.name);
     let stem = &s.name;
     w.blank();
@@ -346,16 +344,11 @@ fn render_struct(w: &mut CodeWriter, n: &Names, sp: &Speller, s: &StructBinding)
 
 /// A callback interface: the Kotlin `interface` the consumer implements (a
 /// `fun interface` when it has one method, so a lambda can implement it).
-/// Its JNI dispatch shims live on `JniBridge`. A method that throws a
+/// Its vtable and dispatch live in `CLibrary.kt`. A method that throws a
 /// domain may throw that domain's exceptions, which reach the producer
 /// with their code and fields; anything else it throws reaches the
 /// producer as a failure with its message.
-fn render_callback_interface(
-    w: &mut CodeWriter,
-    n: &Names,
-    sp: &Speller,
-    cb: &CallbackInterfaceBinding,
-) {
+fn render_callback_interface(w: &mut CodeWriter, n: &Names, sp: &Speller, cb: &CallbackBinding) {
     w.blank();
     sp.doc(w, &cb.doc);
     deprecated(w, sp, &cb.deprecated);
@@ -419,24 +412,25 @@ fn render_callback_interface(
 /// `operator fun invoke`.
 fn render_interface(w: &mut CodeWriter, n: &Names, sp: &Speller, i: &InterfaceBinding) {
     let name = n.ty(&i.name);
-    let destroy = n.native(&i.destroy_symbol);
-    let clone = n.native(&i.clone_symbol);
+    let destroy = &i.destroy_symbol;
+    let clone = &i.clone_symbol;
     w.blank();
     sp.doc(w, &i.doc);
     deprecated(w, sp, &i.deprecated);
-    // The address constructor is private so a `new` constructor taking one
-    // `Long` (exposed as `invoke`) is never shadowed by it.
     w.line(format!(
-        "class {name} private constructor(address: Long) : AutoCloseable {{"
+        "class {name} private constructor(pointer: Pointer) : AutoCloseable {{"
     ));
     w.scope(|w| {
         w.line(format!(
-            "internal val handle: NativeHandle = NativeCleaner.register(this, NativeHandle(address, JniBridge::{destroy}))"
+            "internal val handle: NativeHandle = NativeCleaner.register(this, NativeHandle(pointer, Lib.c::{destroy}))"
         ));
         w.blank();
-        w.line("/** A new strong reference to this object, as written into a value buffer. */");
+        w.line("/**");
+        w.line(" * A new strong reference to this object, as written into a value buffer or");
+        w.line(" * returned from a callback.");
+        w.line(" */");
         w.line(format!(
-            "internal fun cloneHandle(): Long = handle.borrow {{ JniBridge.{clone}(it) }}"
+            "internal fun cloneHandle(): Pointer = handle.borrow {{ nonNull(Lib.c.{clone}(it)) }}"
         ));
         for f in &i.methods {
             w.blank();
@@ -461,12 +455,12 @@ fn render_interface(w: &mut CodeWriter, n: &Names, sp: &Speller, i: &InterfaceBi
         w.scope(|w| {
             w.line("/** Adopts one strong reference (a return value or a buffer token). */");
             w.line(format!(
-                "internal fun fromHandle(address: Long): {name} = {name}(address)"
+                "internal fun fromHandle(pointer: Pointer?): {name} = {name}(nonNull(pointer))"
             ));
             w.blank();
-            w.line("/** [fromHandle], with address 0 meaning no object. */");
+            w.line("/** [fromHandle], with a null pointer meaning no object. */");
             w.line(format!(
-                "internal fun fromHandleOrNull(address: Long): {name}? = if (address == 0L) null else {name}(address)"
+                "internal fun fromHandleOrNull(pointer: Pointer?): {name}? = pointer?.let {{ {name}(it) }}"
             ));
             for c in &i.constructors {
                 w.blank();
@@ -594,31 +588,17 @@ fn render_error_domain(w: &mut CodeWriter, n: &Names, sp: &Speller, eb: &ErrorBi
     w.line("}");
 }
 
-/// Whether `m` or any module below it declares a free function.
-fn has_functions(model: &Model, m: &ModuleBinding) -> bool {
-    !m.functions.is_empty() || model.children(m).any(|c| has_functions(model, c))
-}
-
-/// The module object for `m`: its free functions (`@JvmStatic`, so Java
-/// sees static methods), then one nested object per submodule that has
-/// functions of its own.
-fn render_module_object(
-    w: &mut CodeWriter,
-    n: &Names,
-    sp: &Speller,
-    model: &Model,
-    m: &ModuleBinding,
-) {
-    sp.doc(w, &m.doc);
-    w.line(format!("object {} {{", n.object(m)));
-    w.scope(|w| {
-        let mut first = true;
-        for f in &m.functions {
-            if !first {
+/// The object holding the free functions (`@JvmStatic`, so Java sees
+/// static methods).
+fn render_functions(w: &mut CodeWriter, n: &Names, sp: &Speller, model: &Model) {
+    w.blank();
+    sp.doc(w, &model.doc);
+    w.block(format!("object {} {{", n.object), "}", |w| {
+        for (i, f) in model.functions.iter().enumerate() {
+            if i > 0 {
                 w.blank();
             }
-            first = false;
-            let name = n.function(f);
+            let name = kt_member(&f.name);
             emit_callable(
                 w,
                 n,
@@ -631,49 +611,34 @@ fn render_module_object(
                 },
             );
         }
-        for child in model.children(m).filter(|c| has_functions(model, c)) {
-            if !first {
-                w.blank();
-            }
-            first = false;
-            render_module_object(w, n, sp, model, child);
-        }
     });
-    w.line("}");
 }
 
-/// Render every declaration of the top-level module `root` and its
-/// submodules (the body of `{Root}.kt`, after the package line).
-pub(crate) fn render_root(n: &Names, sp: &Speller, model: &Model, root: &ModuleBinding) -> String {
+/// Render every public declaration (the body of `{Object}.kt`, after the
+/// package line).
+pub(crate) fn render_declarations(n: &Names, sp: &Speller, model: &Model) -> String {
     let mut w = CodeWriter::four_space();
-    let tree = model
-        .modules
-        .iter()
-        .filter(|m| m.segments.first() == root.segments.first());
-    for m in tree {
-        for eb in &m.errors {
-            render_error_domain(&mut w, n, sp, eb);
-        }
-        for e in &m.enums {
-            if e.is_rich() {
-                render_rich_enum(&mut w, n, sp, e);
-            } else {
-                render_enum(&mut w, n, sp, e);
-            }
-        }
-        for s in &m.structs {
-            render_struct(&mut w, n, sp, s);
-        }
-        for cb in &m.callback_interfaces {
-            render_callback_interface(&mut w, n, sp, cb);
-        }
-        for i in &m.interfaces {
-            render_interface(&mut w, n, sp, i);
+    for eb in &model.errors {
+        render_error_domain(&mut w, n, sp, eb);
+    }
+    for e in &model.enums {
+        if e.is_rich() {
+            render_rich_enum(&mut w, n, sp, e);
+        } else {
+            render_enum(&mut w, n, sp, e);
         }
     }
-    if has_functions(model, root) {
-        w.blank();
-        render_module_object(&mut w, n, sp, model, root);
+    for s in &model.records {
+        render_record(&mut w, n, sp, s);
+    }
+    for cb in &model.callbacks {
+        render_callback_interface(&mut w, n, sp, cb);
+    }
+    for i in &model.interfaces {
+        render_interface(&mut w, n, sp, i);
+    }
+    if !model.functions.is_empty() {
+        render_functions(&mut w, n, sp, model);
     }
     w.finish()
 }

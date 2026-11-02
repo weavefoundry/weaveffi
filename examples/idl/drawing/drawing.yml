@@ -1,0 +1,18 @@
+# ANCHOR: root
+version: "0.13.0"
+doc: Drawing with shapes, measured in units.
+imports:
+  - shapes.yml
+records:
+  - name: Canvas
+    fields:
+      - { name: width, type: f64 }
+      - { name: shapes, type: "[Shape]" }
+functions:
+  - name: area
+    params:
+      - { name: canvas, type: Canvas }
+      - { name: unit, type: Unit }
+    return: f64
+    throws: DrawError
+# ANCHOR_END: root

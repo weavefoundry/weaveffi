@@ -18,40 +18,40 @@ package kitchensink
 #cgo CFLAGS: -Wno-deprecated-declarations
 #include "kitchen_sink.h"
 __attribute__((unused)) static void* wvHandlePtr(uintptr_t h) { return (void*)h; }
-extern void goWv_kitchen_sink_kitchen_ReadyListener_on_ready(void* ctx, int32_t code, uint8_t* msg_ptr, size_t msg_len, kitchen_sink_error* out_err);
-extern bool goWv_kitchen_sink_kitchen_ReadyListener_on_item(void* ctx, uint8_t* item_ptr, size_t item_len, kitchen_sink_kitchen_Gadget* gadget, kitchen_sink_error* out_err);
-extern void goWv_kitchen_sink_kitchen_ReadyListener_label(void* ctx, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err);
-extern void goWv_kitchen_sink_kitchen_ReadyListener_latest(void* ctx, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err);
-extern kitchen_sink_kitchen_Gadget* goWv_kitchen_sink_kitchen_ReadyListener_favorite(void* ctx, kitchen_sink_error* out_err);
-extern void goWv_kitchen_sink_kitchen_ReadyListener_free(void* ctx);
-static const kitchen_sink_kitchen_ReadyListener_vtable wvVtable_kitchen_sink_kitchen_ReadyListener_vtable = {
-	.size = sizeof(kitchen_sink_kitchen_ReadyListener_vtable),
+extern void goWv_kitchen_sink_ReadyListener_on_ready(void* ctx, int32_t code, kitchen_sink_run msg, kitchen_sink_error* out_err);
+extern bool goWv_kitchen_sink_ReadyListener_on_item(void* ctx, kitchen_sink_run item, kitchen_sink_Gadget* gadget, kitchen_sink_error* out_err);
+extern kitchen_sink_run goWv_kitchen_sink_ReadyListener_label(void* ctx, kitchen_sink_error* out_err);
+extern kitchen_sink_run goWv_kitchen_sink_ReadyListener_latest(void* ctx, kitchen_sink_error* out_err);
+extern kitchen_sink_Gadget* goWv_kitchen_sink_ReadyListener_favorite(void* ctx, kitchen_sink_error* out_err);
+extern void goWv_kitchen_sink_ReadyListener_free(void* ctx);
+static const kitchen_sink_ReadyListener_vtable wvVtable_kitchen_sink_ReadyListener_vtable = {
+	.size = sizeof(kitchen_sink_ReadyListener_vtable),
 	.flags = 0,
-	.free = goWv_kitchen_sink_kitchen_ReadyListener_free,
-	.on_ready = (void (*)(void*, int32_t, const uint8_t*, size_t, kitchen_sink_error*))goWv_kitchen_sink_kitchen_ReadyListener_on_ready,
-	.on_item = (bool (*)(void*, const uint8_t*, size_t, kitchen_sink_kitchen_Gadget*, kitchen_sink_error*))goWv_kitchen_sink_kitchen_ReadyListener_on_item,
-	.label = goWv_kitchen_sink_kitchen_ReadyListener_label,
-	.latest = goWv_kitchen_sink_kitchen_ReadyListener_latest,
-	.favorite = goWv_kitchen_sink_kitchen_ReadyListener_favorite,
+	.free = goWv_kitchen_sink_ReadyListener_free,
+	.on_ready = goWv_kitchen_sink_ReadyListener_on_ready,
+	.on_item = goWv_kitchen_sink_ReadyListener_on_item,
+	.label = goWv_kitchen_sink_ReadyListener_label,
+	.latest = goWv_kitchen_sink_ReadyListener_latest,
+	.favorite = goWv_kitchen_sink_ReadyListener_favorite,
 };
-__attribute__((unused)) static const kitchen_sink_kitchen_ReadyListener_vtable* wvVtablePtr_kitchen_sink_kitchen_ReadyListener_vtable(void) { return &wvVtable_kitchen_sink_kitchen_ReadyListener_vtable; }
-extern bool goWv_kitchen_sink_kitchen_Sampler_threshold(void* ctx, bool has_level, uint32_t level, double* out_value, kitchen_sink_error* out_err);
-extern void goWv_kitchen_sink_kitchen_Sampler_samples(void* ctx, bool has_limit, uint32_t limit, double* weights_ptr, size_t weights_len, int16_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err);
-extern void goWv_kitchen_sink_kitchen_Sampler_describe(void* ctx, uint8_t** out_ptr, size_t* out_len, kitchen_sink_error* out_err);
-extern void goWv_kitchen_sink_kitchen_Sampler_free(void* ctx);
-static const kitchen_sink_kitchen_Sampler_vtable wvVtable_kitchen_sink_kitchen_Sampler_vtable = {
-	.size = sizeof(kitchen_sink_kitchen_Sampler_vtable),
+__attribute__((unused)) static const kitchen_sink_ReadyListener_vtable* wvVtablePtr_kitchen_sink_ReadyListener_vtable(void) { return &wvVtable_kitchen_sink_ReadyListener_vtable; }
+extern kitchen_sink_opt_f64 goWv_kitchen_sink_Sampler_threshold(void* ctx, kitchen_sink_opt_u32 level, kitchen_sink_error* out_err);
+extern kitchen_sink_run goWv_kitchen_sink_Sampler_samples(void* ctx, kitchen_sink_opt_u32 limit, kitchen_sink_run weights, kitchen_sink_error* out_err);
+extern kitchen_sink_run goWv_kitchen_sink_Sampler_describe(void* ctx, kitchen_sink_error* out_err);
+extern void goWv_kitchen_sink_Sampler_free(void* ctx);
+static const kitchen_sink_Sampler_vtable wvVtable_kitchen_sink_Sampler_vtable = {
+	.size = sizeof(kitchen_sink_Sampler_vtable),
 	.flags = 0,
-	.free = goWv_kitchen_sink_kitchen_Sampler_free,
-	.threshold = goWv_kitchen_sink_kitchen_Sampler_threshold,
-	.samples = (void (*)(void*, bool, uint32_t, const double*, size_t, int16_t**, size_t*, kitchen_sink_error*))goWv_kitchen_sink_kitchen_Sampler_samples,
-	.describe = goWv_kitchen_sink_kitchen_Sampler_describe,
+	.free = goWv_kitchen_sink_Sampler_free,
+	.threshold = goWv_kitchen_sink_Sampler_threshold,
+	.samples = goWv_kitchen_sink_Sampler_samples,
+	.describe = goWv_kitchen_sink_Sampler_describe,
 };
-__attribute__((unused)) static const kitchen_sink_kitchen_Sampler_vtable* wvVtablePtr_kitchen_sink_kitchen_Sampler_vtable(void) { return &wvVtable_kitchen_sink_kitchen_Sampler_vtable; }
-extern void goWv_kitchen_sink_kitchen_do_async_callback(void* context, kitchen_sink_error* err, uint8_t* result_ptr, size_t result_len);
-extern void goWv_kitchen_sink_kitchen_do_cancellable_callback(void* context, kitchen_sink_error* err, uint8_t* result_ptr, size_t result_len);
-extern void goWv_kitchen_sink_kitchen_async_maybe_count_callback(void* context, kitchen_sink_error* err, bool has_result, int64_t result);
-extern void goWv_kitchen_sink_kitchen_async_samples_callback(void* context, kitchen_sink_error* err, float* result_ptr, size_t result_len);
+__attribute__((unused)) static const kitchen_sink_Sampler_vtable* wvVtablePtr_kitchen_sink_Sampler_vtable(void) { return &wvVtable_kitchen_sink_Sampler_vtable; }
+extern void goWv_kitchen_sink_do_async_callback(void* context, kitchen_sink_error* err, kitchen_sink_run result);
+extern void goWv_kitchen_sink_do_cancellable_callback(void* context, kitchen_sink_error* err, kitchen_sink_run result);
+extern void goWv_kitchen_sink_async_maybe_count_callback(void* context, kitchen_sink_error* err, kitchen_sink_opt_i64 result);
+extern void goWv_kitchen_sink_async_samples_callback(void* context, kitchen_sink_error* err, kitchen_sink_run result);
 */
 import "C"
 
@@ -61,115 +61,77 @@ import (
 	"unsafe"
 )
 
-// wvCheckLibrary checks the linked library's ABI revision and every
-// top-level module's contract table.
+// wvCheckLibrary checks the linked library's ABI revision and the contract
+// of every declaration these bindings were generated with.
 func wvCheckLibrary() error {
 	if err := wvCheckABI(); err != nil {
 		return err
 	}
-	var n C.size_t
-	table := C.kitchen_sink_shared_contract(&n)
-	if err := wvCheckContract(table, n, []wvContractEntry{
-		{0x709e234caa962446, 0x3894f2ca452e9f98, "shared.ping"},
-		{0xcfb306fa5801ee5b, 0x18e9fc204a13df6f, "shared.Token"},
-	}); err != nil {
-		return err
-	}
-	table = C.kitchen_sink_kitchen_contract(&n)
-	if err := wvCheckContract(table, n, []wvContractEntry{
-		{0x01d4f09bbddc986f, 0xffcf2bd3b04aa002, "kitchen.Gadget.new"},
-		{0x02bbd5f31c953704, 0x2cfa679ea1373e09, "kitchen.Sampler.samples"},
-		{0x10472d8fe748c2ee, 0xcc570a2649bbf7dc, "kitchen.maybe_gadget"},
-		{0x11368eec07a74078, 0xfa049f78b77e146a, "kitchen.gadgets"},
-		{0x137f08a29cde6021, 0xda8de7aeb2dbb8a3, "kitchen.stream_gadgets"},
-		{0x184bfc4ab0e3fe45, 0xb64587477022696b, "kitchen.ids_u64"},
-		{0x2111b54980826dd7, 0x627bf01ab365b209, "kitchen.do_cancellable"},
-		{0x21c70f9371374d74, 0x25d5d88a30fe0a79, "kitchen.ReadyListener.favorite"},
-		{0x23de5bd597372f46, 0xcf1bc6bb37872798, "kitchen.stream_chunks"},
-		{0x249f1ddaec6a6cbe, 0x0710d6c9a4de93da, "kitchen.take_from_pantry"},
-		{0x29dddbc60bf8d7db, 0x452a3e573d57f6db, "kitchen.Priority"},
-		{0x2b227003b74a0d16, 0x5dae036b8a6aed30, "kitchen.maybe_subscribe"},
-		{0x2dd66cb0064f0494, 0x74b131724dd0d867, "kitchen.Item"},
-		{0x33c265bbf079b0e9, 0x97c32b764693f2cb, "kitchen.u32_id"},
-		{0x33e6381d01660dfe, 0x05e35a563089bf7d, "kitchen.KitchenErrors"},
-		{0x3d969ae76db6cb23, 0x65a325cfc772296b, "kitchen.ReadyListener.latest"},
-		{0x3f5fc99d73504b76, 0x417e4a2acd3210b3, "kitchen.Gadget.poke"},
-		{0x4082f0085db28781, 0x18848e701962912e, "kitchen.Sampler"},
-		{0x4340a6b1e7ec8c50, 0xa59d0f32a66dc7a2, "kitchen.Sampler.describe"},
-		{0x4c5764cf109528d1, 0xb374accf14676d90, "kitchen.maybe_item"},
-		{0x4de17dfb93fd494d, 0x78be3203bcd10727, "kitchen.i32_id"},
-		{0x504e95b7f7e65570, 0x01b3e8e0c9a10e23, "kitchen.stream_items"},
-		{0x5dafabb7775fcb2d, 0x6c4b78c7d3f858c1, "kitchen.PantryError.Spoiled"},
-		{0x5e0a8f6be4b00600, 0x18ea1a42036c96a0, "kitchen.Sampler.threshold"},
-		{0x5ec0af1d4ecc6fed, 0x6540bdb74246420c, "kitchen.async_samples"},
-		{0x61a358b0571e0a4e, 0x11a24c4b50d11996, "kitchen.async_maybe_count"},
-		{0x68cdb9a4bd3e3dd5, 0xcde022fe6bc3b1bf, "kitchen.bool_id"},
-		{0x69e7cd703d16eb85, 0xb13cb8d39e702c79, "kitchen.do_async"},
-		{0x70865079ce41be82, 0xbe3b69464672af46, "kitchen.Gadget.describe"},
-		{0x71c5a1116cb7c49a, 0x1506cfe6f548fac4, "kitchen.echo_bytes"},
-		{0x735ee1e0049ee91a, 0xa713dbd1be707752, "kitchen.echo_string"},
-		{0x76d7fc58f4e41d84, 0x6bdb4ccea2841d5e, "kitchen.i64_id"},
-		{0x78d91fd617e162b8, 0xd88e2753503b36df, "kitchen.stream_maybe"},
-		{0x79abfe1aa960fd6a, 0xbca7a9e5eb26f3a6, "kitchen.nested.hello"},
-		{0x7b3865b536da998c, 0x1c4e79d60a20e74f, "kitchen.mixed_slices"},
-		{0x7ba266dc26a58989, 0x0f86001cac0c21e8, "kitchen.KitchenErrors.InvalidInput"},
-		{0x7d3dd7d5cf6749e3, 0xa192f5a7298adb39, "kitchen.new_op"},
-		{0x81ded69adee0abf2, 0x8c71141a931906f6, "kitchen.scale_i32"},
-		{0x81fa72769330fed6, 0x89681e305b55a4f4, "kitchen.ReadyListener.label"},
-		{0x89a5e664bc25c67b, 0x357fd9b65ad879a9, "kitchen.f64_id"},
-		{0x8cfdbdcecac5f7f1, 0x07e272f09c41fffc, "kitchen.Gadget.version"},
-		{0x8dc42397e47614b9, 0xcddf6fede09b2e7f, "kitchen.opt_priority"},
-		{0x92f060ef68961fc1, 0x4af6ce5b4f9fa508, "kitchen.ReadyListener.on_item"},
-		{0x974b9f3e823c1738, 0xb81b91e975695f27, "kitchen.cross_module_token"},
-		{0x9f0f001aa85f97d5, 0x55815247f895bd45, "kitchen.sum_f64"},
-		{0xab2a29fd1ef5458b, 0x471a34aa4c09ae2b, "kitchen.KitchenErrors.NotFound"},
-		{0xaca0655fac15d230, 0x11c4d2b28abe07bb, "kitchen.list_items"},
-		{0xb57c8e6ae3fb4383, 0x3f857851ab75366c, "kitchen.PantryError"},
-		{0xbdc795b195edd428, 0x36127462f8b0969f, "kitchen.opt_mixed"},
-		{0xbe4821ab3c340e71, 0xe1d32e38b766e623, "kitchen.ReadyListener.on_ready"},
-		{0xc2ad53f2a6a36323, 0x071e29abee823f17, "kitchen.opt_i32_id"},
-		{0xc7ab409554fd3d7b, 0xfea12b6bc219fc46, "kitchen.parse_any"},
-		{0xc82a7f2d85f99f4e, 0xa9bcb8bacedb036c, "kitchen.sample_with"},
-		{0xc883b4afae20543e, 0xc40560e5411ff392, "kitchen.legacy_op"},
-		{0xd180bf646bff59e2, 0xa4515a6d00d7c600, "kitchen.PantryError.OutOfStock"},
-		{0xe6778df0f5c1b82b, 0x38eaafdb350559e1, "kitchen.opt_bool_id"},
-		{0xf2f7753e6e1dffc2, 0xc9047a95bdf49e93, "kitchen.get_attrs"},
-		{0xfae25d3391922ead, 0xcc034cf506cae182, "kitchen.subscribe"},
-		{0xfd0059b05cb2fcfb, 0x248bf8404a5823b4, "kitchen.Gadget"},
-		{0xfed9c551fb9fd2d6, 0xe1020573f084dc1d, "kitchen.ReadyListener"},
-		{0xff3a99b52597dee2, 0x14c4ecac97bdfc9b, "kitchen.Gadget.readings"},
-	}); err != nil {
-		return err
-	}
-	return nil
-}
-
-// Token: A reusable token referenced across modules
-type Token struct {
-	ID    int64
-	Label string
-}
-
-func wvWriteToken(w *wvWriter, v Token) {
-	w.writeI64(v.ID)
-	w.writeString(v.Label)
-}
-
-func wvReadToken(r *wvReader) Token {
-	var v Token
-	v.ID = r.readI64()
-	v.Label = r.readString()
-	return v
-}
-
-// Ping: Trivial cross-module helper
-func Ping() string {
-	wvLoaded()
-	var cRetLen C.size_t
-	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_shared_ping(&cRetLen, &cErr)
-	wvTrap(&cErr)
-	return wvTakeString(cRet, cRetLen)
+	return wvCheckContract([]wvContractRow{
+		{uint64(C.kitchen_sink_contract_07055ed9d3ef8987()), 0x6c4b78c7d3f858c1, "PantryError.Spoiled"},
+		{uint64(C.kitchen_sink_contract_093696260e3767ef()), 0x18848e701962912e, "Sampler"},
+		{uint64(C.kitchen_sink_contract_15de761502d6b0f7()), 0xb64587477022696b, "ids_u64"},
+		{uint64(C.kitchen_sink_contract_1ab4ac8d3595af9e()), 0x18ea1a42036c96a0, "Sampler.threshold"},
+		{uint64(C.kitchen_sink_contract_1ad5b1c1cb5b7b0f()), 0xe1d32e38b766e623, "ReadyListener.on_ready"},
+		{uint64(C.kitchen_sink_contract_1b068c8d584a3666()), 0x1c4e79d60a20e74f, "mixed_slices"},
+		{uint64(C.kitchen_sink_contract_1c905aa8cc074ab9()), 0x071e29abee823f17, "opt_i32_id"},
+		{uint64(C.kitchen_sink_contract_2288b6ba9247f3fa()), 0x01b3e8e0c9a10e23, "stream_items"},
+		{uint64(C.kitchen_sink_contract_262973c2f9754366()), 0x11c4d2b28abe07bb, "list_items"},
+		{uint64(C.kitchen_sink_contract_29fb7143db10b460()), 0xa9bcb8bacedb036c, "sample_with"},
+		{uint64(C.kitchen_sink_contract_2a3cca9903035fc1()), 0x38eaafdb350559e1, "opt_bool_id"},
+		{uint64(C.kitchen_sink_contract_2b411bd19468fe38()), 0x1506cfe6f548fac4, "echo_bytes"},
+		{uint64(C.kitchen_sink_contract_30d1f6e5606a39a1()), 0xfea12b6bc219fc46, "parse_any"},
+		{uint64(C.kitchen_sink_contract_3545d44146da2693()), 0xb374accf14676d90, "maybe_item"},
+		{uint64(C.kitchen_sink_contract_355964ddca795015()), 0x65a325cfc772296b, "ReadyListener.latest"},
+		{uint64(C.kitchen_sink_contract_3f36f640360df807()), 0xcddf6fede09b2e7f, "opt_priority"},
+		{uint64(C.kitchen_sink_contract_40306466cd73f71b()), 0xcde022fe6bc3b1bf, "bool_id"},
+		{uint64(C.kitchen_sink_contract_46a82538b4fd65b3()), 0x0f86001cac0c21e8, "KitchenErrors.InvalidInput"},
+		{uint64(C.kitchen_sink_contract_49db162e058b9fa4()), 0xe1020573f084dc1d, "ReadyListener"},
+		{uint64(C.kitchen_sink_contract_4bae2c564d268fab()), 0xda8de7aeb2dbb8a3, "stream_gadgets"},
+		{uint64(C.kitchen_sink_contract_4e03769b2b65f3ee()), 0xa59d0f32a66dc7a2, "Sampler.describe"},
+		{uint64(C.kitchen_sink_contract_52cfa1d198476806()), 0x74b131724dd0d867, "Item"},
+		{uint64(C.kitchen_sink_contract_5cda1b5d810fe743()), 0xcc034cf506cae182, "subscribe"},
+		{uint64(C.kitchen_sink_contract_5ec87ece39394738()), 0x11a24c4b50d11996, "async_maybe_count"},
+		{uint64(C.kitchen_sink_contract_6084dc628fdb0d02()), 0x25d5d88a30fe0a79, "ReadyListener.favorite"},
+		{uint64(C.kitchen_sink_contract_632ae5cd56d2f5fc()), 0x5dae036b8a6aed30, "maybe_subscribe"},
+		{uint64(C.kitchen_sink_contract_6b91c75a2b38364c()), 0x14c4ecac97bdfc9b, "Gadget.readings"},
+		{uint64(C.kitchen_sink_contract_6c14076d12124cfd()), 0xa192f5a7298adb39, "new_op"},
+		{uint64(C.kitchen_sink_contract_777c1f6342492998()), 0xcc570a2649bbf7dc, "maybe_gadget"},
+		{uint64(C.kitchen_sink_contract_77f7c86a80aa8b81()), 0x3f857851ab75366c, "PantryError"},
+		{uint64(C.kitchen_sink_contract_784cfd093415f2b5()), 0xffcf2bd3b04aa002, "Gadget.new"},
+		{uint64(C.kitchen_sink_contract_7e1071dd9fa68834()), 0x89681e305b55a4f4, "ReadyListener.label"},
+		{uint64(C.kitchen_sink_contract_7edf409e8ac33025()), 0x2a3ae79e1a476b7a, "make_token"},
+		{uint64(C.kitchen_sink_contract_8400c9a27c8c432b()), 0xb13cb8d39e702c79, "do_async"},
+		{uint64(C.kitchen_sink_contract_87133f22c66bac36()), 0x6bdb4ccea2841d5e, "i64_id"},
+		{uint64(C.kitchen_sink_contract_878316bb56b5eacc()), 0xa4515a6d00d7c600, "PantryError.OutOfStock"},
+		{uint64(C.kitchen_sink_contract_8cbd66b05c30c00e()), 0x2cfa679ea1373e09, "Sampler.samples"},
+		{uint64(C.kitchen_sink_contract_8e374aef14935b0d()), 0x471a34aa4c09ae2b, "KitchenErrors.NotFound"},
+		{uint64(C.kitchen_sink_contract_94e2dad4408a7687()), 0x4af6ce5b4f9fa508, "ReadyListener.on_item"},
+		{uint64(C.kitchen_sink_contract_996a3929498216f3()), 0x78be3203bcd10727, "i32_id"},
+		{uint64(C.kitchen_sink_contract_9ab72c28265c60e4()), 0x05e35a563089bf7d, "KitchenErrors"},
+		{uint64(C.kitchen_sink_contract_a430d84680aabd0b()), 0xbca7a9e5eb26f3a6, "hello"},
+		{uint64(C.kitchen_sink_contract_a4e407b3a0fe4669()), 0x452a3e573d57f6db, "Priority"},
+		{uint64(C.kitchen_sink_contract_a529e4a4e0e26d47()), 0x97c32b764693f2cb, "u32_id"},
+		{uint64(C.kitchen_sink_contract_a717c034ba23905d()), 0x248bf8404a5823b4, "Gadget"},
+		{uint64(C.kitchen_sink_contract_a9590de6f773a9a4()), 0x8c71141a931906f6, "scale_i32"},
+		{uint64(C.kitchen_sink_contract_ac26813984c811d0()), 0x417e4a2acd3210b3, "Gadget.poke"},
+		{uint64(C.kitchen_sink_contract_b08395f5e5678b0e()), 0x36127462f8b0969f, "opt_mixed"},
+		{uint64(C.kitchen_sink_contract_b66eb0792245db7c()), 0xa713dbd1be707752, "echo_string"},
+		{uint64(C.kitchen_sink_contract_b985fff5c1b5382c()), 0xc40560e5411ff392, "legacy_op"},
+		{uint64(C.kitchen_sink_contract_bf30e00dc53307a9()), 0x3894f2ca452e9f98, "ping"},
+		{uint64(C.kitchen_sink_contract_c1ceb5fe42730211()), 0x357fd9b65ad879a9, "f64_id"},
+		{uint64(C.kitchen_sink_contract_c9e1d6b030b1f854()), 0xbe3b69464672af46, "Gadget.describe"},
+		{uint64(C.kitchen_sink_contract_cea95e3a6107f209()), 0x627bf01ab365b209, "do_cancellable"},
+		{uint64(C.kitchen_sink_contract_d06c00826f2918d3()), 0x6540bdb74246420c, "async_samples"},
+		{uint64(C.kitchen_sink_contract_da96f2dc9f83015b()), 0x55815247f895bd45, "sum_f64"},
+		{uint64(C.kitchen_sink_contract_e68398e3c2c760b2()), 0x18e9fc204a13df6f, "Token"},
+		{uint64(C.kitchen_sink_contract_ea2a5b33b86fb660()), 0x0710d6c9a4de93da, "take_from_pantry"},
+		{uint64(C.kitchen_sink_contract_eb66fcdc777f75ca()), 0xfa049f78b77e146a, "gadgets"},
+		{uint64(C.kitchen_sink_contract_eea763c41fa7d198()), 0xcf1bc6bb37872798, "stream_chunks"},
+		{uint64(C.kitchen_sink_contract_f24fd5a4569f91f3()), 0x07e272f09c41fffc, "Gadget.version"},
+		{uint64(C.kitchen_sink_contract_fe26cde50070f9a2()), 0xd88e2753503b36df, "stream_maybe"},
+		{uint64(C.kitchen_sink_contract_ff329711a0bd4978()), 0xc9047a95bdf49e93, "get_attrs"},
+	})
 }
 
 // KitchenError is an error of the KitchenErrors domain: *NotFoundError,
@@ -413,6 +375,24 @@ func wvReadPriority(r *wvReader) Priority {
 	return Priority(r.readI32())
 }
 
+// Token: A reusable token referenced from several declarations
+type Token struct {
+	ID    int64
+	Label string
+}
+
+func wvWriteToken(w *wvWriter, v Token) {
+	w.writeI64(v.ID)
+	w.writeString(v.Label)
+}
+
+func wvReadToken(r *wvReader) Token {
+	var v Token
+	v.ID = r.readI64()
+	v.Label = r.readString()
+	return v
+}
+
 // Item: Kitchen sink struct exercising every field feature
 type Item struct {
 	// Stable identifier
@@ -430,7 +410,7 @@ type Item struct {
 	Tags    []string
 	Attrs   map[string]string
 	Parent  *int64
-	// Cross-module struct reference
+	// A record inside a record
 	Token    Token
 	Priority Priority
 	// An optional object inside a record
@@ -493,46 +473,46 @@ type ReadyListener interface {
 	Favorite() *Gadget
 }
 
-//export goWv_kitchen_sink_kitchen_ReadyListener_on_ready
-func goWv_kitchen_sink_kitchen_ReadyListener_on_ready(ctx unsafe.Pointer, code C.int32_t, msg_ptr *C.uint8_t, msg_len C.size_t, out_err *C.kitchen_sink_error) {
+//export goWv_kitchen_sink_ReadyListener_on_ready
+func goWv_kitchen_sink_ReadyListener_on_ready(ctx unsafe.Pointer, code C.int32_t, msg C.kitchen_sink_run, out_err *C.kitchen_sink_error) {
 	defer wvRecoverCallback(out_err)
-	wvCallback[ReadyListener](ctx).OnReady(int32(code), wvBorrowString(msg_ptr, msg_len))
+	wvCallback[ReadyListener](ctx).OnReady(int32(code), wvBorrowString(msg))
 }
 
-//export goWv_kitchen_sink_kitchen_ReadyListener_on_item
-func goWv_kitchen_sink_kitchen_ReadyListener_on_item(ctx unsafe.Pointer, item_ptr *C.uint8_t, item_len C.size_t, gadget *C.kitchen_sink_kitchen_Gadget, out_err *C.kitchen_sink_error) (cRet C._Bool) {
+//export goWv_kitchen_sink_ReadyListener_on_item
+func goWv_kitchen_sink_ReadyListener_on_item(ctx unsafe.Pointer, item C.kitchen_sink_run, gadget *C.kitchen_sink_Gadget, out_err *C.kitchen_sink_error) (cRet C._Bool) {
 	defer wvRecoverCallback(out_err)
-	ret := wvCallback[ReadyListener](ctx).OnItem(wvDecodeBorrowed(item_ptr, item_len, wvReadItem), wvAdoptGadget(gadget))
+	ret := wvCallback[ReadyListener](ctx).OnItem(wvDecodeBorrowed(item, wvReadItem), wvAdoptGadget(gadget))
 	return C._Bool(ret)
 }
 
-//export goWv_kitchen_sink_kitchen_ReadyListener_label
-func goWv_kitchen_sink_kitchen_ReadyListener_label(ctx unsafe.Pointer, out_ptr **C.uint8_t, out_len *C.size_t, out_err *C.kitchen_sink_error) {
+//export goWv_kitchen_sink_ReadyListener_label
+func goWv_kitchen_sink_ReadyListener_label(ctx unsafe.Pointer, out_err *C.kitchen_sink_error) (cRet C.kitchen_sink_run) {
 	defer wvRecoverCallback(out_err)
 	ret, err := wvCallback[ReadyListener](ctx).Label()
 	if err != nil {
 		wvCallbackFailed[KitchenError](out_err, err)
 		return
 	}
-	wvHandOverString(ret, out_ptr, out_len)
+	return wvAllocString(ret)
 }
 
-//export goWv_kitchen_sink_kitchen_ReadyListener_latest
-func goWv_kitchen_sink_kitchen_ReadyListener_latest(ctx unsafe.Pointer, out_ptr **C.uint8_t, out_len *C.size_t, out_err *C.kitchen_sink_error) {
+//export goWv_kitchen_sink_ReadyListener_latest
+func goWv_kitchen_sink_ReadyListener_latest(ctx unsafe.Pointer, out_err *C.kitchen_sink_error) (cRet C.kitchen_sink_run) {
 	defer wvRecoverCallback(out_err)
 	ret := wvCallback[ReadyListener](ctx).Latest()
-	wvHandOverBytes(wvEncode(ret, wvWrite_opt_Item), out_ptr, out_len)
+	return wvAllocSlice(wvEncode(ret, wvWrite_opt_Item))
 }
 
-//export goWv_kitchen_sink_kitchen_ReadyListener_favorite
-func goWv_kitchen_sink_kitchen_ReadyListener_favorite(ctx unsafe.Pointer, out_err *C.kitchen_sink_error) (cRet *C.kitchen_sink_kitchen_Gadget) {
+//export goWv_kitchen_sink_ReadyListener_favorite
+func goWv_kitchen_sink_ReadyListener_favorite(ctx unsafe.Pointer, out_err *C.kitchen_sink_error) (cRet *C.kitchen_sink_Gadget) {
 	defer wvRecoverCallback(out_err)
 	ret := wvCallback[ReadyListener](ctx).Favorite()
 	return ret.share()
 }
 
-//export goWv_kitchen_sink_kitchen_ReadyListener_free
-func goWv_kitchen_sink_kitchen_ReadyListener_free(ctx unsafe.Pointer) {
+//export goWv_kitchen_sink_ReadyListener_free
+func goWv_kitchen_sink_ReadyListener_free(ctx unsafe.Pointer) {
 	wvFreeCallback(ctx)
 }
 
@@ -556,39 +536,37 @@ type Sampler interface {
 	Describe() (string, error)
 }
 
-//export goWv_kitchen_sink_kitchen_Sampler_threshold
-func goWv_kitchen_sink_kitchen_Sampler_threshold(ctx unsafe.Pointer, has_level C._Bool, level C.uint32_t, out_value *C.double, out_err *C.kitchen_sink_error) (cRet C._Bool) {
+//export goWv_kitchen_sink_Sampler_threshold
+func goWv_kitchen_sink_Sampler_threshold(ctx unsafe.Pointer, level C.kitchen_sink_opt_u32, out_err *C.kitchen_sink_error) (cRet C.kitchen_sink_opt_f64) {
 	defer wvRecoverCallback(out_err)
-	ret := wvCallback[Sampler](ctx).Threshold(wvOptional(bool(has_level), uint32(level)))
-	cPresent, cValue := wvPresent(ret)
-	*out_value = C.double(cValue)
-	return C._Bool(cPresent)
+	ret := wvCallback[Sampler](ctx).Threshold(wvOptOutU32(level))
+	return wvOptInF64(ret)
 }
 
-//export goWv_kitchen_sink_kitchen_Sampler_samples
-func goWv_kitchen_sink_kitchen_Sampler_samples(ctx unsafe.Pointer, has_limit C._Bool, limit C.uint32_t, weights_ptr *C.double, weights_len C.size_t, out_ptr **C.int16_t, out_len *C.size_t, out_err *C.kitchen_sink_error) {
+//export goWv_kitchen_sink_Sampler_samples
+func goWv_kitchen_sink_Sampler_samples(ctx unsafe.Pointer, limit C.kitchen_sink_opt_u32, weights C.kitchen_sink_run, out_err *C.kitchen_sink_error) (cRet C.kitchen_sink_run) {
 	defer wvRecoverCallback(out_err)
-	ret, err := wvCallback[Sampler](ctx).Samples(wvOptional(bool(has_limit), uint32(limit)), wvBorrowSlice[float64](weights_ptr, weights_len))
+	ret, err := wvCallback[Sampler](ctx).Samples(wvOptOutU32(limit), wvBorrowSlice[float64](weights))
 	if err != nil {
 		wvCallbackFailed[PantryError](out_err, err)
 		return
 	}
-	wvHandOverSlice(ret, out_ptr, out_len)
+	return wvAllocSlice(ret)
 }
 
-//export goWv_kitchen_sink_kitchen_Sampler_describe
-func goWv_kitchen_sink_kitchen_Sampler_describe(ctx unsafe.Pointer, out_ptr **C.uint8_t, out_len *C.size_t, out_err *C.kitchen_sink_error) {
+//export goWv_kitchen_sink_Sampler_describe
+func goWv_kitchen_sink_Sampler_describe(ctx unsafe.Pointer, out_err *C.kitchen_sink_error) (cRet C.kitchen_sink_run) {
 	defer wvRecoverCallback(out_err)
 	ret, err := wvCallback[Sampler](ctx).Describe()
 	if err != nil {
 		wvCallbackError(out_err, err)
 		return
 	}
-	wvHandOverString(ret, out_ptr, out_len)
+	return wvAllocString(ret)
 }
 
-//export goWv_kitchen_sink_kitchen_Sampler_free
-func goWv_kitchen_sink_kitchen_Sampler_free(ctx unsafe.Pointer) {
+//export goWv_kitchen_sink_Sampler_free
+func goWv_kitchen_sink_Sampler_free(ctx unsafe.Pointer) {
 	wvFreeCallback(ctx)
 }
 
@@ -602,11 +580,11 @@ type Gadget struct {
 }
 
 func wvDestroyGadget(ptr unsafe.Pointer) {
-	C.kitchen_sink_kitchen_Gadget_destroy((*C.kitchen_sink_kitchen_Gadget)(ptr))
+	C.kitchen_sink_Gadget_destroy((*C.kitchen_sink_Gadget)(ptr))
 }
 
 // wvAdoptGadget wraps one owned strong reference. A null pointer adopts to nil.
-func wvAdoptGadget(ptr *C.kitchen_sink_kitchen_Gadget) *Gadget {
+func wvAdoptGadget(ptr *C.kitchen_sink_Gadget) *Gadget {
 	if ptr == nil {
 		return nil
 	}
@@ -617,22 +595,22 @@ func wvAdoptGadget(ptr *C.kitchen_sink_kitchen_Gadget) *Gadget {
 
 // native borrows the wrapper's pointer for one call; pair it with a
 // deferred s.release().
-func (s *Gadget) native() *C.kitchen_sink_kitchen_Gadget {
+func (s *Gadget) native() *C.kitchen_sink_Gadget {
 	if s == nil {
 		panic("kitchensink: nil *Gadget")
 	}
-	return (*C.kitchen_sink_kitchen_Gadget)(s.acquire("Gadget"))
+	return (*C.kitchen_sink_Gadget)(s.acquire("Gadget"))
 }
 
 // share returns a new strong reference to the wrapper's object for the
 // native library to adopt (the wrapper keeps its own), or null for nil.
-func (s *Gadget) share() *C.kitchen_sink_kitchen_Gadget {
+func (s *Gadget) share() *C.kitchen_sink_Gadget {
 	if s == nil {
 		return nil
 	}
 	ptr := s.native()
 	defer s.release()
-	return C.kitchen_sink_kitchen_Gadget_clone(ptr)
+	return C.kitchen_sink_Gadget_clone(ptr)
 }
 
 func wvWriteGadget(w *wvWriter, v *Gadget) {
@@ -644,14 +622,14 @@ func wvReadGadget(r *wvReader) *Gadget {
 	if token == 0 {
 		wvMalformed("null object token")
 	}
-	return wvAdoptGadget((*C.kitchen_sink_kitchen_Gadget)(C.wvHandlePtr(C.uintptr_t(token))))
+	return wvAdoptGadget((*C.kitchen_sink_Gadget)(C.wvHandlePtr(C.uintptr_t(token))))
 }
 
 // NewGadget: Create a gadget with the given id
 func NewGadget(id int64) *Gadget {
 	wvLoaded()
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_Gadget_new(C.int64_t(id), &cErr)
+	cRet := C.kitchen_sink_Gadget_new(C.int64_t(id), &cErr)
 	wvTrap(&cErr)
 	return wvAdoptGadget(cRet)
 }
@@ -660,11 +638,10 @@ func NewGadget(id int64) *Gadget {
 func (s *Gadget) Describe() string {
 	cSelf := s.native()
 	defer s.release()
-	var cRetLen C.size_t
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_Gadget_describe(cSelf, &cRetLen, &cErr)
+	cRet := C.kitchen_sink_Gadget_describe(cSelf, &cErr)
 	wvTrap(&cErr)
-	return wvTakeString(cRet, cRetLen)
+	return wvTakeString(cRet)
 }
 
 // Poke the gadget a number of times, failing on a negative count
@@ -672,7 +649,7 @@ func (s *Gadget) Poke(times int32) (int32, error) {
 	cSelf := s.native()
 	defer s.release()
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_Gadget_poke(cSelf, C.int32_t(times), &cErr)
+	cRet := C.kitchen_sink_Gadget_poke(cSelf, C.int32_t(times), &cErr)
 	if cErr.code != 0 {
 		return 0, wvKitchenError(wvTakeError(&cErr))
 	}
@@ -683,31 +660,37 @@ func (s *Gadget) Poke(times int32) (int32, error) {
 func (s *Gadget) Readings(limit *uint32) ([]float64, error) {
 	cSelf := s.native()
 	defer s.release()
-	cLimitHas, cLimit := wvPresent(limit)
-	var cRetLen C.size_t
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_Gadget_readings(cSelf, C._Bool(cLimitHas), C.uint32_t(cLimit), &cRetLen, &cErr)
+	cRet := C.kitchen_sink_Gadget_readings(cSelf, wvOptInU32(limit), &cErr)
 	if cErr.code != 0 {
 		return nil, wvTakeError(&cErr).err()
 	}
-	return wvTakeSlice[float64](cRet, cRetLen), nil
+	return wvTakeSlice[float64](cRet), nil
 }
 
 // GadgetVersion: The gadget subsystem version string
 func GadgetVersion() string {
 	wvLoaded()
-	var cRetLen C.size_t
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_Gadget_version(&cRetLen, &cErr)
+	cRet := C.kitchen_sink_Gadget_version(&cErr)
 	wvTrap(&cErr)
-	return wvTakeString(cRet, cRetLen)
+	return wvTakeString(cRet)
+}
+
+// Ping: A trivial helper
+func Ping() string {
+	wvLoaded()
+	var cErr C.kitchen_sink_error
+	cRet := C.kitchen_sink_ping(&cErr)
+	wvTrap(&cErr)
+	return wvTakeString(cRet)
 }
 
 // BoolID: Identity for bool
 func BoolID(x bool) bool {
 	wvLoaded()
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_bool_id(C._Bool(x), &cErr)
+	cRet := C.kitchen_sink_bool_id(C._Bool(x), &cErr)
 	wvTrap(&cErr)
 	return bool(cRet)
 }
@@ -715,7 +698,7 @@ func BoolID(x bool) bool {
 func I32ID(x int32) int32 {
 	wvLoaded()
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_i32_id(C.int32_t(x), &cErr)
+	cRet := C.kitchen_sink_i32_id(C.int32_t(x), &cErr)
 	wvTrap(&cErr)
 	return int32(cRet)
 }
@@ -723,7 +706,7 @@ func I32ID(x int32) int32 {
 func U32ID(x uint32) uint32 {
 	wvLoaded()
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_u32_id(C.uint32_t(x), &cErr)
+	cRet := C.kitchen_sink_u32_id(C.uint32_t(x), &cErr)
 	wvTrap(&cErr)
 	return uint32(cRet)
 }
@@ -731,7 +714,7 @@ func U32ID(x uint32) uint32 {
 func I64ID(x int64) int64 {
 	wvLoaded()
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_i64_id(C.int64_t(x), &cErr)
+	cRet := C.kitchen_sink_i64_id(C.int64_t(x), &cErr)
 	wvTrap(&cErr)
 	return int64(cRet)
 }
@@ -739,36 +722,32 @@ func I64ID(x int64) int64 {
 func F64ID(x float64) float64 {
 	wvLoaded()
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_f64_id(C.double(x), &cErr)
+	cRet := C.kitchen_sink_f64_id(C.double(x), &cErr)
 	wvTrap(&cErr)
 	return float64(cRet)
 }
 
 func EchoString(s string) string {
 	wvLoaded()
-	cSPtr, cSLen := wvStr(s)
-	var cRetLen C.size_t
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_echo_string(cSPtr, cSLen, &cRetLen, &cErr)
+	cRet := C.kitchen_sink_echo_string(wvStrRun(s), &cErr)
 	wvTrap(&cErr)
-	return wvTakeString(cRet, cRetLen)
+	return wvTakeString(cRet)
 }
 
 func EchoBytes(b []byte) []byte {
 	wvLoaded()
-	cBPtr, cBLen := wvBytes(b)
-	var cRetLen C.size_t
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_echo_bytes(cBPtr, cBLen, &cRetLen, &cErr)
+	cRet := C.kitchen_sink_echo_bytes(wvBytesRun(b), &cErr)
 	wvTrap(&cErr)
-	return wvTakeBytes(cRet, cRetLen)
+	return wvTakeBytes(cRet)
 }
 
 // Subscribe: Register a listener, returning how many are attached
 func Subscribe(listener ReadyListener) int32 {
 	wvLoaded()
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_subscribe(wvNewCallback(listener, "ReadyListener"), C.wvVtablePtr_kitchen_sink_kitchen_ReadyListener_vtable(), &cErr)
+	cRet := C.kitchen_sink_subscribe(C.kitchen_sink_ReadyListener{ctx: wvNewCallback(listener, "ReadyListener"), vtable: C.wvVtablePtr_kitchen_sink_ReadyListener_vtable()}, &cErr)
 	wvTrap(&cErr)
 	return int32(cRet)
 }
@@ -776,9 +755,9 @@ func Subscribe(listener ReadyListener) int32 {
 // MaybeSubscribe: Register a listener if one is given
 func MaybeSubscribe(listener ReadyListener) bool {
 	wvLoaded()
-	cListenerCtx, cListenerVtable := wvOptionalCallback(listener, C.wvVtablePtr_kitchen_sink_kitchen_ReadyListener_vtable())
+	cListenerCtx, cListenerVtable := wvOptionalCallback(listener, C.wvVtablePtr_kitchen_sink_ReadyListener_vtable())
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_maybe_subscribe(cListenerCtx, cListenerVtable, &cErr)
+	cRet := C.kitchen_sink_maybe_subscribe(C.kitchen_sink_ReadyListener{ctx: cListenerCtx, vtable: cListenerVtable}, &cErr)
 	wvTrap(&cErr)
 	return bool(cRet)
 }
@@ -786,13 +765,13 @@ func MaybeSubscribe(listener ReadyListener) bool {
 // MaybeGadget: Optional object in both directions
 func MaybeGadget(fallback *Gadget) *Gadget {
 	wvLoaded()
-	var cFallback *C.kitchen_sink_kitchen_Gadget
+	var cFallback *C.kitchen_sink_Gadget
 	if fallback != nil {
 		cFallback = fallback.native()
 		defer fallback.release()
 	}
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_maybe_gadget(cFallback, &cErr)
+	cRet := C.kitchen_sink_maybe_gadget(cFallback, &cErr)
 	wvTrap(&cErr)
 	return wvAdoptGadget(cRet)
 }
@@ -800,11 +779,10 @@ func MaybeGadget(fallback *Gadget) *Gadget {
 // Gadgets: A list of objects
 func Gadgets() []*Gadget {
 	wvLoaded()
-	var cRetLen C.size_t
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_gadgets(&cRetLen, &cErr)
+	cRet := C.kitchen_sink_gadgets(&cErr)
 	wvTrap(&cErr)
-	return wvDecode(cRet, cRetLen, wvRead_list_Gadget)
+	return wvDecode(cRet, wvRead_list_Gadget)
 }
 
 // StreamGadgets: An iterator over objects
@@ -815,16 +793,16 @@ func Gadgets() []*Gadget {
 func StreamGadgets() iter.Seq[*Gadget] {
 	wvLoaded()
 	return wvSeq(func(cErr *C.kitchen_sink_error) wvCursor[*Gadget] {
-		it := C.kitchen_sink_kitchen_stream_gadgets(cErr)
+		it := C.kitchen_sink_stream_gadgets(cErr)
 		return wvCursor[*Gadget]{
 			next: func(cErr *C.kitchen_sink_error) (*Gadget, bool) {
-				var cItem *C.kitchen_sink_kitchen_Gadget
-				if C.kitchen_sink_kitchen_StreamGadgetsIterator_next(it, &cItem, cErr) == 0 {
+				var cItem *C.kitchen_sink_Gadget
+				if C.kitchen_sink_StreamGadgetsIterator_next(it, &cItem, cErr) == 0 {
 					return nil, false
 				}
 				return wvAdoptGadget(cItem), true
 			},
-			destroy: func() { C.kitchen_sink_kitchen_StreamGadgetsIterator_destroy(it) },
+			destroy: func() { C.kitchen_sink_StreamGadgetsIterator_destroy(it) },
 		}
 	})
 }
@@ -832,33 +810,30 @@ func StreamGadgets() iter.Seq[*Gadget] {
 // MaybeItem: Optional struct return
 func MaybeItem(id int64) (*Item, error) {
 	wvLoaded()
-	var cRetLen C.size_t
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_maybe_item(C.int64_t(id), &cRetLen, &cErr)
+	cRet := C.kitchen_sink_maybe_item(C.int64_t(id), &cErr)
 	if cErr.code != 0 {
 		return nil, wvKitchenError(wvTakeError(&cErr))
 	}
-	return wvDecode(cRet, cRetLen, wvRead_opt_Item), nil
+	return wvDecode(cRet, wvRead_opt_Item), nil
 }
 
 // ListItems: List of structs
 func ListItems() []Item {
 	wvLoaded()
-	var cRetLen C.size_t
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_list_items(&cRetLen, &cErr)
+	cRet := C.kitchen_sink_list_items(&cErr)
 	wvTrap(&cErr)
-	return wvDecode(cRet, cRetLen, wvRead_list_Item)
+	return wvDecode(cRet, wvRead_list_Item)
 }
 
 // GetAttrs: Map return type
 func GetAttrs() map[string]int32 {
 	wvLoaded()
-	var cRetLen C.size_t
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_get_attrs(&cRetLen, &cErr)
+	cRet := C.kitchen_sink_get_attrs(&cErr)
 	wvTrap(&cErr)
-	return wvDecode(cRet, cRetLen, wvRead_map_string_i32)
+	return wvDecode(cRet, wvRead_map_string_i32)
 }
 
 // StreamItems: Iterator return type
@@ -869,35 +844,33 @@ func GetAttrs() map[string]int32 {
 func StreamItems() iter.Seq[Item] {
 	wvLoaded()
 	return wvSeq(func(cErr *C.kitchen_sink_error) wvCursor[Item] {
-		it := C.kitchen_sink_kitchen_stream_items(cErr)
+		it := C.kitchen_sink_stream_items(cErr)
 		return wvCursor[Item]{
 			next: func(cErr *C.kitchen_sink_error) (Item, bool) {
-				var cItem *C.uint8_t
-				var cItemLen C.size_t
-				if C.kitchen_sink_kitchen_StreamItemsIterator_next(it, &cItem, &cItemLen, cErr) == 0 {
+				var cItem C.kitchen_sink_run
+				if C.kitchen_sink_StreamItemsIterator_next(it, &cItem, cErr) == 0 {
 					return Item{}, false
 				}
-				return wvDecode(cItem, cItemLen, wvReadItem), true
+				return wvDecode(cItem, wvReadItem), true
 			},
-			destroy: func() { C.kitchen_sink_kitchen_StreamItemsIterator_destroy(it) },
+			destroy: func() { C.kitchen_sink_StreamItemsIterator_destroy(it) },
 		}
 	})
 }
 
-// CrossModuleToken: Returns the shared Token type from another module
-func CrossModuleToken() Token {
+// MakeToken: Returns the shared Token record
+func MakeToken() Token {
 	wvLoaded()
-	var cRetLen C.size_t
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_cross_module_token(&cRetLen, &cErr)
+	cRet := C.kitchen_sink_make_token(&cErr)
 	wvTrap(&cErr)
-	return wvDecode(cRet, cRetLen, wvReadToken)
+	return wvDecode(cRet, wvReadToken)
 }
 
-//export goWv_kitchen_sink_kitchen_do_async_callback
-func goWv_kitchen_sink_kitchen_do_async_callback(context_ unsafe.Pointer, err_ *C.kitchen_sink_error, result_ptr *C.uint8_t, result_len C.size_t) {
+//export goWv_kitchen_sink_do_async_callback
+func goWv_kitchen_sink_do_async_callback(context_ unsafe.Pointer, err_ *C.kitchen_sink_error, result C.kitchen_sink_run) {
 	wvComplete(context_, err_, func() string {
-		return wvTakeString(result_ptr, result_len)
+		return wvTakeString(result)
 	})
 }
 
@@ -910,16 +883,15 @@ func DoAsync(ctx context.Context, input string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	cInputPtr, cInputLen := wvStr(input)
 	call := wvNewAsyncCall[string]()
-	C.kitchen_sink_kitchen_do_async(cInputPtr, cInputLen, C.kitchen_sink_kitchen_do_async_callback(unsafe.Pointer(C.goWv_kitchen_sink_kitchen_do_async_callback)), call.context())
+	C.kitchen_sink_do_async(wvStrRun(input), C.kitchen_sink_do_async_callback(unsafe.Pointer(C.goWv_kitchen_sink_do_async_callback)), call.context())
 	return wvAwait(ctx, call, nil, wvFailure.err)
 }
 
-//export goWv_kitchen_sink_kitchen_do_cancellable_callback
-func goWv_kitchen_sink_kitchen_do_cancellable_callback(context_ unsafe.Pointer, err_ *C.kitchen_sink_error, result_ptr *C.uint8_t, result_len C.size_t) {
+//export goWv_kitchen_sink_do_cancellable_callback
+func goWv_kitchen_sink_do_cancellable_callback(context_ unsafe.Pointer, err_ *C.kitchen_sink_error, result C.kitchen_sink_run) {
 	wvComplete(context_, err_, func() string {
-		return wvTakeString(result_ptr, result_len)
+		return wvTakeString(result)
 	})
 }
 
@@ -932,11 +904,10 @@ func DoCancellable(ctx context.Context, input string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	cInputPtr, cInputLen := wvStr(input)
 	token := C.kitchen_sink_cancel_token_create()
 	defer C.kitchen_sink_cancel_token_destroy(token)
 	call := wvNewAsyncCall[string]()
-	C.kitchen_sink_kitchen_do_cancellable(cInputPtr, cInputLen, token, C.kitchen_sink_kitchen_do_cancellable_callback(unsafe.Pointer(C.goWv_kitchen_sink_kitchen_do_cancellable_callback)), call.context())
+	C.kitchen_sink_do_cancellable(wvStrRun(input), token, C.kitchen_sink_do_cancellable_callback(unsafe.Pointer(C.goWv_kitchen_sink_do_cancellable_callback)), call.context())
 	return wvAwait(ctx, call, token, wvFailure.err)
 }
 
@@ -946,7 +917,7 @@ func DoCancellable(ctx context.Context, input string) (string, error) {
 func LegacyOp() int32 {
 	wvLoaded()
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_legacy_op(&cErr)
+	cRet := C.kitchen_sink_legacy_op(&cErr)
 	wvTrap(&cErr)
 	return int32(cRet)
 }
@@ -955,7 +926,7 @@ func LegacyOp() int32 {
 func NewOp() int32 {
 	wvLoaded()
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_new_op(&cErr)
+	cRet := C.kitchen_sink_new_op(&cErr)
 	wvTrap(&cErr)
 	return int32(cRet)
 }
@@ -963,54 +934,43 @@ func NewOp() int32 {
 // OptI32ID: Optional scalar in both directions
 func OptI32ID(x *int32) *int32 {
 	wvLoaded()
-	cXHas, cX := wvPresent(x)
-	var cOut C.int32_t
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_opt_i32_id(C._Bool(cXHas), C.int32_t(cX), &cOut, &cErr)
+	cRet := C.kitchen_sink_opt_i32_id(wvOptInI32(x), &cErr)
 	wvTrap(&cErr)
-	return wvOptional(bool(cRet), int32(cOut))
+	return wvOptOutI32(cRet)
 }
 
 func OptBoolID(x *bool) *bool {
 	wvLoaded()
-	cXHas, cX := wvPresent(x)
-	var cOut C._Bool
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_opt_bool_id(C._Bool(cXHas), C._Bool(cX), &cOut, &cErr)
+	cRet := C.kitchen_sink_opt_bool_id(wvOptInBool(x), &cErr)
 	wvTrap(&cErr)
-	return wvOptional(bool(cRet), bool(cOut))
+	return wvOptOutBool(cRet)
 }
 
 // OptPriority: Optional C-style enum in both directions
 func OptPriority(p *Priority) *Priority {
 	wvLoaded()
-	cPHas, cP := wvPresent(p)
-	var cOut C.kitchen_sink_kitchen_Priority
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_opt_priority(C._Bool(cPHas), C.kitchen_sink_kitchen_Priority(cP), &cOut, &cErr)
+	cRet := C.kitchen_sink_opt_priority(wvOptInI32((*int32)(p)), &cErr)
 	wvTrap(&cErr)
-	return wvOptional(bool(cRet), Priority(cOut))
+	return (*Priority)(wvOptOutI32(cRet))
 }
 
 // OptMixed: Optional scalars next to ordinary parameters
 func OptMixed(base float64, scale *float32, offset *int64, label *string) *uint16 {
 	wvLoaded()
-	cScaleHas, cScale := wvPresent(scale)
-	cOffsetHas, cOffset := wvPresent(offset)
-	cLabelPtr, cLabelLen := wvBytes(wvEncode(label, wvWrite_opt_string))
-	var cOut C.uint16_t
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_opt_mixed(C.double(base), C._Bool(cScaleHas), C.float(cScale), C._Bool(cOffsetHas), C.int64_t(cOffset), cLabelPtr, cLabelLen, &cOut, &cErr)
+	cRet := C.kitchen_sink_opt_mixed(C.double(base), wvOptInF32(scale), wvOptInI64(offset), wvBytesRun(wvEncode(label, wvWrite_opt_string)), &cErr)
 	wvTrap(&cErr)
-	return wvOptional(bool(cRet), uint16(cOut))
+	return wvOptOutU16(cRet)
 }
 
 // SumF64: A typed-array parameter
 func SumF64(xs []float64) float64 {
 	wvLoaded()
-	cXsPtr, cXsLen := wvSliceIn[C.double](xs)
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_sum_f64(cXsPtr, cXsLen, &cErr)
+	cRet := C.kitchen_sink_sum_f64(wvSliceRun(xs), &cErr)
 	wvTrap(&cErr)
 	return float64(cRet)
 }
@@ -1018,44 +978,33 @@ func SumF64(xs []float64) float64 {
 // ScaleI32: Typed arrays in both directions
 func ScaleI32(xs []int32, factor int32) []int32 {
 	wvLoaded()
-	cXsPtr, cXsLen := wvSliceIn[C.int32_t](xs)
-	var cRetLen C.size_t
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_scale_i32(cXsPtr, cXsLen, C.int32_t(factor), &cRetLen, &cErr)
+	cRet := C.kitchen_sink_scale_i32(wvSliceRun(xs), C.int32_t(factor), &cErr)
 	wvTrap(&cErr)
-	return wvTakeSlice[int32](cRet, cRetLen)
+	return wvTakeSlice[int32](cRet)
 }
 
 func IdsU64(ids []uint64) []uint64 {
 	wvLoaded()
-	cIdsPtr, cIdsLen := wvSliceIn[C.uint64_t](ids)
-	var cRetLen C.size_t
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_ids_u64(cIdsPtr, cIdsLen, &cRetLen, &cErr)
+	cRet := C.kitchen_sink_ids_u64(wvSliceRun(ids), &cErr)
 	wvTrap(&cErr)
-	return wvTakeSlice[uint64](cRet, cRetLen)
+	return wvTakeSlice[uint64](cRet)
 }
 
 // MixedSlices: Every slice element type
 func MixedSlices(a []int8, b []int16, c []uint16, d []uint32, e []int64, f []float32) []uint32 {
 	wvLoaded()
-	cAPtr, cALen := wvSliceIn[C.int8_t](a)
-	cBPtr, cBLen := wvSliceIn[C.int16_t](b)
-	cCPtr, cCLen := wvSliceIn[C.uint16_t](c)
-	cDPtr, cDLen := wvSliceIn[C.uint32_t](d)
-	cEPtr, cELen := wvSliceIn[C.int64_t](e)
-	cFPtr, cFLen := wvSliceIn[C.float](f)
-	var cRetLen C.size_t
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_mixed_slices(cAPtr, cALen, cBPtr, cBLen, cCPtr, cCLen, cDPtr, cDLen, cEPtr, cELen, cFPtr, cFLen, &cRetLen, &cErr)
+	cRet := C.kitchen_sink_mixed_slices(wvSliceRun(a), wvSliceRun(b), wvSliceRun(c), wvSliceRun(d), wvSliceRun(e), wvSliceRun(f), &cErr)
 	wvTrap(&cErr)
-	return wvTakeSlice[uint32](cRet, cRetLen)
+	return wvTakeSlice[uint32](cRet)
 }
 
-//export goWv_kitchen_sink_kitchen_async_maybe_count_callback
-func goWv_kitchen_sink_kitchen_async_maybe_count_callback(context_ unsafe.Pointer, err_ *C.kitchen_sink_error, has_result C._Bool, result C.int64_t) {
+//export goWv_kitchen_sink_async_maybe_count_callback
+func goWv_kitchen_sink_async_maybe_count_callback(context_ unsafe.Pointer, err_ *C.kitchen_sink_error, result C.kitchen_sink_opt_i64) {
 	wvComplete(context_, err_, func() *int64 {
-		return wvOptional(bool(has_result), int64(result))
+		return wvOptOutI64(result)
 	})
 }
 
@@ -1069,14 +1018,14 @@ func AsyncMaybeCount(ctx context.Context) (*int64, error) {
 		return nil, err
 	}
 	call := wvNewAsyncCall[*int64]()
-	C.kitchen_sink_kitchen_async_maybe_count(C.kitchen_sink_kitchen_async_maybe_count_callback(unsafe.Pointer(C.goWv_kitchen_sink_kitchen_async_maybe_count_callback)), call.context())
+	C.kitchen_sink_async_maybe_count(C.kitchen_sink_async_maybe_count_callback(unsafe.Pointer(C.goWv_kitchen_sink_async_maybe_count_callback)), call.context())
 	return wvAwait(ctx, call, nil, wvFailure.err)
 }
 
-//export goWv_kitchen_sink_kitchen_async_samples_callback
-func goWv_kitchen_sink_kitchen_async_samples_callback(context_ unsafe.Pointer, err_ *C.kitchen_sink_error, result_ptr *C.float, result_len C.size_t) {
+//export goWv_kitchen_sink_async_samples_callback
+func goWv_kitchen_sink_async_samples_callback(context_ unsafe.Pointer, err_ *C.kitchen_sink_error, result C.kitchen_sink_run) {
 	wvComplete(context_, err_, func() []float32 {
-		return wvTakeSlice[float32](result_ptr, result_len)
+		return wvTakeSlice[float32](result)
 	})
 }
 
@@ -1092,7 +1041,7 @@ func AsyncSamples(ctx context.Context, n uint32) ([]float32, error) {
 	token := C.kitchen_sink_cancel_token_create()
 	defer C.kitchen_sink_cancel_token_destroy(token)
 	call := wvNewAsyncCall[[]float32]()
-	C.kitchen_sink_kitchen_async_samples(C.uint32_t(n), token, C.kitchen_sink_kitchen_async_samples_callback(unsafe.Pointer(C.goWv_kitchen_sink_kitchen_async_samples_callback)), call.context())
+	C.kitchen_sink_async_samples(C.uint32_t(n), token, C.kitchen_sink_async_samples_callback(unsafe.Pointer(C.goWv_kitchen_sink_async_samples_callback)), call.context())
 	return wvAwait(ctx, call, token, wvFailure.err)
 }
 
@@ -1104,17 +1053,16 @@ func AsyncSamples(ctx context.Context, n uint32) ([]float32, error) {
 func StreamMaybe() iter.Seq[*int32] {
 	wvLoaded()
 	return wvSeq(func(cErr *C.kitchen_sink_error) wvCursor[*int32] {
-		it := C.kitchen_sink_kitchen_stream_maybe(cErr)
+		it := C.kitchen_sink_stream_maybe(cErr)
 		return wvCursor[*int32]{
 			next: func(cErr *C.kitchen_sink_error) (*int32, bool) {
-				var cHas C._Bool
-				var cItem C.int32_t
-				if C.kitchen_sink_kitchen_StreamMaybeIterator_next(it, &cHas, &cItem, cErr) == 0 {
+				var cItem C.kitchen_sink_opt_i32
+				if C.kitchen_sink_StreamMaybeIterator_next(it, &cItem, cErr) == 0 {
 					return nil, false
 				}
-				return wvOptional(bool(cHas), int32(cItem)), true
+				return wvOptOutI32(cItem), true
 			},
-			destroy: func() { C.kitchen_sink_kitchen_StreamMaybeIterator_destroy(it) },
+			destroy: func() { C.kitchen_sink_StreamMaybeIterator_destroy(it) },
 		}
 	})
 }
@@ -1127,17 +1075,16 @@ func StreamMaybe() iter.Seq[*int32] {
 func StreamChunks() iter.Seq[[]int32] {
 	wvLoaded()
 	return wvSeq(func(cErr *C.kitchen_sink_error) wvCursor[[]int32] {
-		it := C.kitchen_sink_kitchen_stream_chunks(cErr)
+		it := C.kitchen_sink_stream_chunks(cErr)
 		return wvCursor[[]int32]{
 			next: func(cErr *C.kitchen_sink_error) ([]int32, bool) {
-				var cItem *C.int32_t
-				var cItemLen C.size_t
-				if C.kitchen_sink_kitchen_StreamChunksIterator_next(it, &cItem, &cItemLen, cErr) == 0 {
+				var cItem C.kitchen_sink_run
+				if C.kitchen_sink_StreamChunksIterator_next(it, &cItem, cErr) == 0 {
 					return nil, false
 				}
-				return wvTakeSlice[int32](cItem, cItemLen), true
+				return wvTakeSlice[int32](cItem), true
 			},
-			destroy: func() { C.kitchen_sink_kitchen_StreamChunksIterator_destroy(it) },
+			destroy: func() { C.kitchen_sink_StreamChunksIterator_destroy(it) },
 		}
 	})
 }
@@ -1145,22 +1092,20 @@ func StreamChunks() iter.Seq[[]int32] {
 // SampleWith: Drive a consumer-implemented sampler
 func SampleWith(sampler Sampler, level *uint32) ([]int16, error) {
 	wvLoaded()
-	cLevelHas, cLevel := wvPresent(level)
-	var cRetLen C.size_t
+	cLevel := wvOptInU32(level)
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_sample_with(wvNewCallback(sampler, "Sampler"), C.wvVtablePtr_kitchen_sink_kitchen_Sampler_vtable(), C._Bool(cLevelHas), C.uint32_t(cLevel), &cRetLen, &cErr)
+	cRet := C.kitchen_sink_sample_with(C.kitchen_sink_Sampler{ctx: wvNewCallback(sampler, "Sampler"), vtable: C.wvVtablePtr_kitchen_sink_Sampler_vtable()}, cLevel, &cErr)
 	if cErr.code != 0 {
 		return nil, wvPantryError(wvTakeError(&cErr))
 	}
-	return wvTakeSlice[int16](cRet, cRetLen), nil
+	return wvTakeSlice[int16](cRet), nil
 }
 
 // TakeFromPantry: Fails with the second domain
 func TakeFromPantry(item string) (int32, error) {
 	wvLoaded()
-	cItemPtr, cItemLen := wvStr(item)
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_take_from_pantry(cItemPtr, cItemLen, &cErr)
+	cRet := C.kitchen_sink_take_from_pantry(wvStrRun(item), &cErr)
 	if cErr.code != 0 {
 		return 0, wvPantryError(wvTakeError(&cErr))
 	}
@@ -1170,23 +1115,21 @@ func TakeFromPantry(item string) (int32, error) {
 // ParseAny: Fails with an untyped error
 func ParseAny(text string) (int64, error) {
 	wvLoaded()
-	cTextPtr, cTextLen := wvStr(text)
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_parse_any(cTextPtr, cTextLen, &cErr)
+	cRet := C.kitchen_sink_parse_any(wvStrRun(text), &cErr)
 	if cErr.code != 0 {
 		return 0, wvTakeError(&cErr).err()
 	}
 	return int64(cRet), nil
 }
 
-// Hello: Trivial nested-module function
+// Hello: A trivial function returning a string
 func Hello() string {
 	wvLoaded()
-	var cRetLen C.size_t
 	var cErr C.kitchen_sink_error
-	cRet := C.kitchen_sink_kitchen_nested_hello(&cRetLen, &cErr)
+	cRet := C.kitchen_sink_hello(&cErr)
 	wvTrap(&cErr)
-	return wvTakeString(cRet, cRetLen)
+	return wvTakeString(cRet)
 }
 
 func wvWrite_list_string(w *wvWriter, v []string) {

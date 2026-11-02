@@ -1,0 +1,47 @@
+version: "0.13.0"
+doc: >-
+  Value types that contain themselves or each other through lists, maps, and
+  optionals of those.
+records:
+  - name: Node
+    doc: A type that contains itself
+    fields:
+      - { name: value, type: i32 }
+      - { name: children, type: "[Node]" }
+      - { name: named, type: "{string:Node}" }
+      - { name: spare, type: "[Node]?" }
+      - { name: spare_named, type: "{string:Node}?" }
+  - name: Dir
+    doc: Declared before the type it contains, which contains it back
+    fields:
+      - { name: name, type: string }
+      - { name: files, type: "[File]" }
+      - { name: indexed, type: "{string:File}" }
+      - { name: gaps, type: "[File?]" }
+  - name: File
+    doc: Contains Dir through optionals
+    fields:
+      - { name: name, type: string }
+      - { name: links, type: "[Dir]?" }
+      - { name: indexed, type: "{string:Dir}?" }
+  - name: Crate
+    doc: Contains Leaf, which contains it back
+    fields:
+      - { name: leaves, type: "[Leaf]" }
+enums:
+  - name: Expr
+    doc: A rich enum that contains itself
+    variants:
+      - { name: Lit, fields: [{ name: value, type: i64 }] }
+      - { name: Sum, fields: [{ name: terms, type: "[Expr]" }, { name: spare, type: "[Expr]?" }] }
+  - name: Leaf
+    doc: A rich enum and a record that contain each other
+    variants:
+      - { name: Empty }
+      - { name: Boxed, fields: [{ name: boxes, type: "[Crate]?" }, { name: dirs, type: "[Dir]" }] }
+functions:
+  - { name: echo_node, params: [{ name: value, type: Node }], return: Node }
+  - { name: echo_dir, params: [{ name: value, type: Dir }], return: Dir }
+  - { name: echo_file, params: [{ name: value, type: File }], return: File }
+  - { name: echo_expr, params: [{ name: value, type: Expr }], return: Expr }
+  - { name: echo_leaf, params: [{ name: value, type: Leaf }], return: Leaf }

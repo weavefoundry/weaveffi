@@ -1,5 +1,5 @@
-error: weaveffi: a callback interface method must return `Result<T, E>` (or `Result<(), E>` for no value) with `E: From<weaveffi::ForeignError>`, because the consumer's implementation can fail and the `Err` is how its failure reaches you; use `weaveffi::ForeignError` itself, or a #[weaveffi::error] domain to receive the consumer's typed errors
- --> tests/ui/fail_callback_plain_return.rs:9:27
+error: weaveffi: a callback interface method returns `Result<T, E>` (`Result<(), E>` for no value): the consumer's implementation can fail, and the `Err` is how its failure reaches you; use `weaveffi::ForeignError` as `E`, or a `#[weaveffi::error]` domain that implements `From<weaveffi::ForeignError>`
+ --> tests/ui/fail_callback_plain_return.rs:6:23
   |
-9 |         fn name(&self) -> String;
-  |                           ^^^^^^
+6 |     fn name(&self) -> String;
+  |                       ^^^^^^

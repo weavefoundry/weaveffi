@@ -1,0 +1,13 @@
+[package]
+name = "idl-examples"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+description = "The IDL documents the WeaveFFI book includes, validated by this crate's tests."
+
+[dev-dependencies]
+weaveffi-model = { path = "../../crates/weaveffi-model" }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

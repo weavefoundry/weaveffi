@@ -38,6 +38,7 @@ fn files_are_named_for_the_package() {
         serde_json::from_str(&out[6].contents).expect("valid package.json");
     assert_eq!(manifest["name"], "acme-kv");
     assert_eq!(manifest["type"], "module");
+    assert!(manifest.get("dependencies").is_none());
     assert_eq!(
         manifest["files"],
         serde_json::json!([
@@ -64,40 +65,33 @@ fn emscripten_mode_is_gone() {
 }
 
 #[test]
-fn init_loads_and_verifies_the_module() {
+fn init_loads_verifies_and_binds_the_module() {
     let js = index();
     has(&js, "import { $loadWasm, $unloaded } from './linear.js';");
-    has(&js, "let $raw = $unloaded('acme-kv');");
+    has(
+        &js,
+        "let $m = $unloaded('acme-kv');\nlet $f = $unloaded('acme-kv');",
+    );
     has(
         &js,
         "$loading ??= $loadWasm('acme-kv', source, 'acme_kv', 'ACME_KV_LIBRARY', new URL('./acme_kv.wasm', import.meta.url))",
     );
     has(
         &js,
-        "      try {\n        $verify($raw, 'acme-kv', 'acme_kv', 5, $contract);\n      } catch (e) {",
+        "      try {\n        $verify($m, 'acme-kv', 6, $contract);\n        $f = m.bind($sigs);\n      } catch (e) {",
     );
     assert!(!js.contains("weaveffi_"), "{js}");
 }
 
 #[test]
-fn releases_survive_a_poisoned_instance() {
-    let js = index();
-    has(
-        &js,
-        "acme_kv_kv_Store_destroy: (h) => q.acme_kv_kv_Store_destroy(m.handle(h)),",
-    );
-    has(
-        &js,
-        "acme_kv_kv_ShapesIterator_destroy: (h) => q.acme_kv_kv_ShapesIterator_destroy(m.handle(h)),",
-    );
-    has(
-        &js,
-        "acme_kv_cancel_token_destroy: (t) => q.acme_kv_cancel_token_destroy(m.handle(t)),",
-    );
-    has(
-        &js,
-        "acme_kv_kv_Store_clone: (h) => x.acme_kv_kv_Store_clone(m.handle(h)),",
-    );
+fn the_api_is_the_node_targets() {
+    let model = test_api("acme-kv");
+    let node =
+        crate::targets::node::NodeGenerator::from(crate::targets::node::NodeConfig::default())
+            .render(&model);
+    let node_index = &node[0].contents;
+    let api = |js: &str| js[js.find("// Object tokens").expect("the API section")..].to_string();
+    assert_eq!(api(&index()), api(node_index));
 }
 
 #[test]

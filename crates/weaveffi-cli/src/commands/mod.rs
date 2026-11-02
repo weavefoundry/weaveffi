@@ -8,7 +8,6 @@
 #![allow(clippy::missing_errors_doc)]
 
 pub mod build;
-pub mod dev;
 pub mod extract;
 pub mod generate;
 pub mod init;
@@ -21,12 +20,12 @@ use camino::{Utf8Path, Utf8PathBuf};
 use miette::{bail, Result};
 use weaveffi_model::model::Model;
 
-use crate::cargo::CargoCrate;
+use crate::cargo::{CargoCrate, CargoFeatures};
 use crate::package::Skips;
 use crate::project::{Project, Source};
 
 /// How a command finds its project: the positional input, `--config`,
-/// `--library`, and `--profile`.
+/// `--library`, `--profile`, and the feature flags.
 #[derive(Clone, Copy, Default)]
 pub struct Locate<'a> {
     /// The input: a producer crate or an IDL.
@@ -37,17 +36,24 @@ pub struct Locate<'a> {
     pub library: Option<&'a str>,
     /// `--profile`.
     pub profile: Option<&'a str>,
+    /// `--features`, `--all-features`, and `--no-default-features`, when
+    /// any is given (else `[build]`'s).
+    pub features: Option<&'a CargoFeatures>,
     /// `--quiet`.
     pub quiet: bool,
 }
 
 impl Locate<'_> {
     /// Locate the project, building a crate's library with `--profile`
-    /// (default `dev`).
+    /// (default `dev`) and the feature flags.
     pub(crate) fn project(&self) -> Result<Project> {
-        Ok(Project::locate(self.config, self.input, self.library)?
+        let mut project = Project::locate(self.config, self.input, self.library)?
             .profile(self.profile.unwrap_or("dev"))
-            .quiet(self.quiet))
+            .quiet(self.quiet);
+        if let Some(features) = self.features {
+            project = project.features(features.clone());
+        }
+        Ok(project)
     }
 }
 

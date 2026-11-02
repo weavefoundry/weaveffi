@@ -1,11 +1,11 @@
-// Conformance consumer: calculator sample, Swift target (ABI revision 5).
+// Conformance consumer: calculator sample, Swift target (ABI revision 6).
 //
 // The getting-started surface through the generated `Calculator` module:
 //
 //   * the load check: `CalculatorLibrary.check()` passes, and the contract
-//     comparison it runs reports a missing or changed declaration as a
-//     `LoadError` (driven directly through the runtime, since a matching
-//     library can't produce one);
+//     comparison it runs reports a declaration whose contract function
+//     returns another hash as a changed `LoadError` (driven directly through
+//     the runtime, since a matching library can't produce one);
 //   * a direct-value call (wrapping on overflow) and a string in and out
 //     (non-ASCII text, an astral character, and an interior NUL survive);
 //   * two error domains whose codes coincide: `CalcError.divisionByZero` and
@@ -60,19 +60,21 @@ func loadCheck() {
     } catch {
         fail("check() threw \(error)")
     }
-    expect(CalculatorLibrary.abiVersion == 5, "abiVersion")
+    expect(CalculatorLibrary.abiVersion == 6, "abiVersion")
 
-    // The comparison `check()` runs, against the real table: an unknown id
-    // is missing, a known id with another hash changed.
-    let missing = wvCheckContract(calculator_calculator_contract, [(0x1, 0x2, "calculator.nope")])
-    expect(missing == .missing(declaration: "calculator.nope"), "missing row (got \(String(describing: missing)))")
-    var len = 0
-    guard let first = calculator_calculator_contract(&len)?.pointee, len > 0 else { fail("empty contract table") }
-    let changed = wvCheckContract(calculator_calculator_contract, [(first.id, first.hash &+ 1, "calculator.x")])
-    expect(changed == .changed(declaration: "calculator.x"), "changed row (got \(String(describing: changed)))")
-    expect(wvCheckContract(calculator_calculator_contract, [(first.id, first.hash, "calculator.x")]) == nil, "matching row")
-    let description = CalculatorLibrary.LoadError.missing(declaration: "calculator.nope").localizedDescription
-    expect(description == "Calculator: calculator.nope is missing from the library 'calculator'; regenerate the bindings or rebuild the library", description)
+    // The comparison `check()` runs, against the real contract function of
+    // `add` (`function add(i32, i32) -> i32`): its own hash matches, and any
+    // other hash is a changed declaration.
+    let add: () -> UInt64 = calculator_contract_e70bc3190530e654
+    expect(add() == 0xb235f6267772bee6, "add's contract hash (got \(add()))")
+    expect(wvCheckContract([(add, 0xb235f6267772bee6, "add")]) == nil, "matching row")
+    let changed = wvCheckContract([(add, 0xb235f6267772bee6, "add"), (add, 0x1, "add.x")])
+    expect(changed == .changed(declaration: "add.x"), "changed row (got \(String(describing: changed)))")
+    expect(wvCheckContract([]) == nil, "no rows")
+    let description = CalculatorLibrary.LoadError.changed(declaration: "add").localizedDescription
+    expect(description == "Calculator: add changed since these bindings were generated; regenerate the bindings or rebuild the library 'calculator'", description)
+    let abi = CalculatorLibrary.LoadError.abiMismatch(found: 5, expected: 6).localizedDescription
+    expect(abi == "Calculator: the native library 'calculator' implements C ABI revision 5, but these bindings need revision 6", abi)
 }
 
 func domains() {
@@ -166,7 +168,7 @@ func run() {
 }
 
 run()
-expect(calculator_abi_version() == 5, "ABI revision 5")
+expect(calculator_abi_version() == 6, "ABI revision 6")
 expect(calculator_debug_live(-1) == 1, "the sample counts live resources")
 assertNoLeaks()
 print("swift/calculator: OK")

@@ -1,0 +1,5 @@
+error: weaveffi: every error code needs an explicit positive value (`NotFound = 1`)
+  --> tests/ui/fail_error_code_without_value.rs:10:5
+   |
+10 |     Full,
+   |     ^^^^

@@ -1,32 +1,33 @@
 # Value Buffers
 
 Records, rich enums, optionals, lists, maps, and error payloads cross the C
-ABI *by value*, serialized in one compact binary format. A buffered value
-occupies one `(const uint8_t*, size_t)` slot pair however deeply it nests.
-This page is the normative wire format every generator and the
-`weaveffi::abi` runtime (`weaveffi::abi::buffer`) implement.
+ABI *by value*, serialized in one compact binary format. A buffered value is
+one `{p}_run` however deeply it nests. This page is the normative wire
+format every generator and the Rust runtime implement.
 
 ## Which types are buffered
 
-- a struct (record)
-- a rich enum (any variant has fields)
-- `{K:V}`
-- `[T]`, except a list of a fixed-width number (`[i8]`, `[i16]`, `[i32]`,
-  `[i64]`, `[u16]`, `[u32]`, `[u64]`, `[f32]`, `[f64]`), which crosses as a
-  typed array (the Slice family) at the top level of a parameter, return,
-  async result, iterator item, or callback method
-- `T?`, except an optional scalar or C-style enum (the OptDirect family,
-  `bool has_v, T v` at the top level), `Interface?`, which stays a nullable
-  object pointer, and `Cb?`, an optional callback parameter whose null
-  vtable means none
+At a call boundary (a parameter, a return, an async result, an iterator
+item, a callback argument or return), these types cross as a value buffer
+in a run:
 
-Everything else keeps its own slot shape at the top level (see the
-[C ABI contract](abi.md#families-and-slots)): direct values by value, strings
-and bytes as `(ptr, len)`, objects as pointers. Any of them may appear
-*inside* a buffer, and there they all use the encoding below: a record's
-`i64?` field is a flag byte and a value, and its `[f64]` field is a count and
-packed elements, exactly as before revision 5. Iterators and callback
-interfaces never appear inside a buffer; validation rejects them there.
+- a record;
+- a rich enum (any variant has fields);
+- `{K:V}`;
+- `[T]`, except `[u8]` (which is `bytes`) and a list of a fixed-width
+  number (`[i8]`, `[i16]`, `[i32]`, `[i64]`, `[u16]`, `[u32]`, `[u64]`,
+  `[f32]`, `[f64]`), which is a typed array: a run of the packed elements;
+- `T?`, except an optional scalar or C-style enum (a `{p}_opt_*` struct),
+  `Interface?` (a nullable object pointer), and `Cb?` (an optional callback
+  parameter, whose null vtable means none).
+
+Everything else keeps its own C value at the top level (see the
+[C ABI contract](abi.md#one-value-one-c-value)): scalars by value, strings,
+bytes, and typed arrays as runs of their own bytes, objects as pointers. Any
+of them may appear *inside* a buffer, and there they all use the encoding
+below: a record's `i64?` field is a flag byte and a value, and its `[f64]`
+field is a count and packed elements. Iterators and callback interfaces
+never appear inside a buffer; validation rejects them there.
 
 ## Encoding
 
@@ -50,7 +51,7 @@ encoder refuses to write more rather than truncate.
 | `T?` | 1 flag byte (`0` absent, `1` present), then the value if present |
 | `[T]` | `u32` count, then each element |
 | `{K:V}` | `u32` count, then alternating key and value; no key appears twice |
-| struct | each field, in declaration order |
+| record | each field, in declaration order |
 | rich enum | `i32` tag (the variant's `value`), then the variant's fields in order |
 | error payload | the code's fields, in declaration order |
 
@@ -106,36 +107,30 @@ An error payload never carries object tokens: validation rejects an error
 code whose fields reach an interface (`ObjectInErrorPayload`), because a
 consumer that doesn't know a code discards its payload undecoded, and a
 Rust producer decodes a callback's payload with a reader that refuses every
-token. That reader (`BufferReader::token_free`) is also why decoding is
-otherwise `unsafe` in the Rust runtime: only a reader that refuses tokens can
-safely decode arbitrary bytes, because no safe function can turn an arbitrary
-`u64` into an object reference.
+token.
 
-## Runs
+## Runs and ownership
 
-A buffer the producer hands out (a return, an iterator element, an async
-result, an error payload) is a run allocated with alignment 8, released
-with `{p}_free_bytes(ptr, len)` (or, for a payload, with the error). A
-buffer a consumer returns from a callback method is a run it allocates
-with `{p}_alloc(len)`, which the producer adopts. A buffer a consumer
-passes as a parameter is its own memory, borrowed for the call, with no
-alignment requirement: values inside a buffer are packed and read
-byte-wise.
+A buffer the producer hands out (a return, an iterator item, an async
+result) is a run allocated with alignment 8 and released with
+`{p}_run_free`; an error payload belongs to the error and is released with
+it. A buffer a consumer returns from a callback method is a run it allocates
+with `{p}_alloc(len)`, which the producer adopts. A buffer a consumer passes
+as a parameter is its own memory, borrowed for the call, with no alignment
+requirement: values inside a buffer are packed and read byte-wise.
 
-## Slots and ownership
+| Position | C value | Owner |
+|----------|---------|-------|
+| parameter | `{p}_run` | the caller; borrowed for the call |
+| return | `{p}_run` | the consumer; release with `{p}_run_free` |
+| iterator item | `{p}_run` written to `*out_item` | the consumer, per item |
+| async result | the completion's `{p}_run result` | the consumer |
+| callback method argument | `{p}_run` | the producer; borrowed for the call |
+| callback method return | `{p}_run` | a `{p}_alloc` run the producer adopts |
+| error payload | `payload_ptr`, `payload_len` in `{p}_error` | released by `{p}_error_clear` or `{p}_error_free` |
 
-| Position | Slots | Owner |
-|----------|-------|-------|
-| parameter `v` | `const uint8_t* v_ptr, size_t v_len` | the caller; borrowed for the call |
-| return | `const uint8_t*` return plus `size_t* out_len` | the consumer; free with `{p}_free_bytes(ptr, len)` |
-| iterator element | `const uint8_t** out_item, size_t* out_len` | the consumer, per element |
-| async result | `const uint8_t* result_ptr, size_t result_len` | the consumer |
-| callback method argument | `const uint8_t* v_ptr, size_t v_len` | the producer; borrowed for the call |
-| callback method return | `uint8_t** out_ptr, size_t* out_len` | a `{p}_alloc` run the producer adopts |
-| error payload | `payload_ptr`, `payload_len` in `{p}_error` | freed by `{p}_error_clear` or `{p}_error_free` |
-
-Object tokens inside any of these transfer their reference to whoever
-decodes them, including the consumer decoding a callback argument.
+Object tokens inside any of these move their reference to whoever decodes
+them, including the consumer decoding a callback argument.
 
 ## What generators emit
 
@@ -144,8 +139,9 @@ table above) plus one encode and one decode routine per record and rich enum,
 generated from the definition so field order is fixed at generation time.
 Optionals, lists, and maps nested in buffers each get one codec per distinct
 shape, named by one canonical stem shared by every target (`list_i32`,
-`opt_Item`, `map_string_list_i64`). Lists of bytes and of
-fixed-width numbers (every integer and float type, but not `bool`, whose
-bytes must be validated) encode and decode with a single copy where the
-platform is little-endian. The `codec` sample's conformance lane checks every
-binding's codec against the Rust runtime's, in both directions.
+`opt_Item`, `map_string_list_i64`); the C buffer header names them
+`{p}_buf_{stem}`. Lists of bytes and of fixed-width numbers (every integer
+and float type, but not `bool`, whose bytes must be validated) encode and
+decode with a single copy where the platform is little-endian. The `codec`
+sample's conformance lane checks every binding's codec against the Rust
+runtime's, in both directions.

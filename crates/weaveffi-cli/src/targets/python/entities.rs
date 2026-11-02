@@ -3,7 +3,7 @@
 
 use crate::codegen::errors::ErrorTable;
 use crate::codegen::CodeWriter;
-use weaveffi_model::model::{EnumBinding, FieldBinding, InterfaceBinding, StructBinding};
+use weaveffi_model::model::{EnumBinding, FieldBinding, InterfaceBinding, RecordBinding};
 
 use crate::targets::python::calls::{render_bindings, render_callable, FnScope};
 use crate::targets::python::codec::{
@@ -38,7 +38,7 @@ pub(crate) fn render_error(w: &mut CodeWriter, g: &Gen<'_>, t: &ErrorTable<'_>) 
         .map(|row| {
             (
                 weaveffi_model::errors::pascal(&row.code.name),
-                g.code_class(&row.code.name).to_string(),
+                g.code_class(&t.domain.name, &row.code.name).to_string(),
             )
         })
         .collect();
@@ -49,11 +49,11 @@ pub(crate) fn render_error(w: &mut CodeWriter, g: &Gen<'_>, t: &ErrorTable<'_>) 
         docstring(
             w,
             Some(&format!(
-                "Base exception of the `{}` error domain (module `{}`).\n\n\
+                "Base exception of the `{}` error domain.\n\n\
                  Each declared code raises its own subclass. A positive code these\n\
                  bindings don't know (from a newer library) raises this class itself,\n\
                  with `code` and `message` preserved.",
-                t.domain.name, t.module.dot_path
+                t.domain.name
             )),
         );
         if !codes.is_empty() {
@@ -266,7 +266,7 @@ fn render_rich_enum(w: &mut CodeWriter, g: &Gen<'_>, e: &EnumBinding) {
 /// Records have no C symbols: construction, equality, hashing, and repr all
 /// come from the dataclass, and instances cross the ABI serialized in value
 /// buffers. Derive a changed copy with `dataclasses.replace`.
-pub(crate) fn render_struct(w: &mut CodeWriter, g: &Gen<'_>, s: &StructBinding) {
+pub(crate) fn render_record(w: &mut CodeWriter, g: &Gen<'_>, s: &RecordBinding) {
     w.blank().blank();
     w.line("@dataclass(frozen=True, slots=True)");
     w.line(format!("class {}:", s.name));

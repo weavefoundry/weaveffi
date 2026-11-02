@@ -6,7 +6,7 @@
 
 # Guides
 
-- [The Rust Producer Macro](guides/producer-macro.md)
+- [The Rust Producer Macros](guides/producer-macro.md)
 - [Errors and Memory](guides/errors-and-memory.md)
 - [Async and Cancellation](guides/async.md)
 - [Project Configuration](guides/config.md)
@@ -38,7 +38,7 @@
 # Project
 
 - [Architecture](architecture.md)
-- [Samples](samples.md)
+- [Samples and Examples](samples.md)
 - [Comparison](comparison.md)
 - [FAQ](faq.md)
 - [Stability and Versioning](stability.md)

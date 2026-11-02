@@ -16,19 +16,15 @@ public enum {{LIBRARY_TYPE}} {
     public enum LoadError: Error, LocalizedError, Hashable, Sendable {
         /// The library implements another C ABI revision than `expected`.
         case abiMismatch(found: UInt32, expected: UInt32)
-        /// The library lacks a declaration, named by its dotted IDL path
-        /// (`kv.Store.put`).
-        case missing(declaration: String)
-        /// A declaration's signature changed since these bindings were
-        /// generated.
+        /// A declaration, named by its dotted IDL path (`Store.put`), changed
+        /// its signature since these bindings were generated. (A declaration
+        /// the library lacks fails to link instead.)
         case changed(declaration: String)
 
         public var errorDescription: String? {
             switch self {
             case let .abiMismatch(found, expected):
                 return "{{MODULE}}: the native library '{{LIBRARY}}' implements C ABI revision \(found), but these bindings need revision \(expected)"
-            case let .missing(declaration):
-                return "{{MODULE}}: \(declaration) is missing from the library '{{LIBRARY}}'; regenerate the bindings or rebuild the library"
             case let .changed(declaration):
                 return "{{MODULE}}: \(declaration) changed since these bindings were generated; regenerate the bindings or rebuild the library '{{LIBRARY}}'"
             }
@@ -68,25 +64,14 @@ func wvLoad() {
     }
 }
 
-/// The first expected row that a top-level module's contract table lacks or
-/// declares with another signature hash. Rows the library adds are fine.
+/// The first row whose contract function (one per declaration, returning the
+/// hash of its signature) doesn't return the hash these bindings were
+/// generated with. Declarations the library adds are fine.
 func wvCheckContract(
-    _ table: (UnsafeMutablePointer<Int>?) -> UnsafePointer<{{PREFIX}}_contract_entry>?,
-    _ expected: [(id: UInt64, hash: UInt64, path: String)]
+    _ rows: [(contract: () -> UInt64, hash: UInt64, path: String)]
 ) -> {{LIBRARY_TYPE}}.LoadError? {
-    var len = 0
-    let entries = UnsafeBufferPointer(start: table(&len), count: len)
-    var hashes: [UInt64: UInt64] = [:]
-    for entry in entries {
-        hashes[entry.id] = entry.hash
-    }
-    for (id, hash, path) in expected {
-        guard let actual = hashes[id] else {
-            return .missing(declaration: path)
-        }
-        guard actual == hash else {
-            return .changed(declaration: path)
-        }
+    for row in rows where row.contract() != row.hash {
+        return .changed(declaration: row.path)
     }
     return nil
 }
@@ -232,95 +217,152 @@ func wvEnumCase<E: RawRepresentable>(_ type: E.Type, _ raw: Int32) -> E where E.
     return value
 }
 
-// MARK: - Strings, bytes, typed arrays, and buffers
+// MARK: - Optional scalars
+
+/// An optional scalar's `{{PREFIX}}_opt_{prim}` struct: a presence flag and the
+/// value (zero when absent).
+protocol WvOptional {
+    associatedtype Value
+    var has: Bool { get }
+    var value: Value { get }
+    init()
+    init(has: Bool, value: Value)
+}
+
+extension WvOptional {
+    /// The struct for an optional Swift value.
+    @inline(__always)
+    init(wv value: Value?) {
+        if let value = value {
+            self.init(has: true, value: value)
+        } else {
+            self.init()
+        }
+    }
+
+    /// The optional Swift value the struct holds.
+    @inline(__always)
+    var wvValue: Value? { has ? value : nil }
+}
+
+extension {{PREFIX}}_opt_bool: WvOptional {}
+extension {{PREFIX}}_opt_i8: WvOptional {}
+extension {{PREFIX}}_opt_i16: WvOptional {}
+extension {{PREFIX}}_opt_i32: WvOptional {}
+extension {{PREFIX}}_opt_i64: WvOptional {}
+extension {{PREFIX}}_opt_u8: WvOptional {}
+extension {{PREFIX}}_opt_u16: WvOptional {}
+extension {{PREFIX}}_opt_u32: WvOptional {}
+extension {{PREFIX}}_opt_u64: WvOptional {}
+extension {{PREFIX}}_opt_f32: WvOptional {}
+extension {{PREFIX}}_opt_f64: WvOptional {}
+
+// MARK: - Runs: strings, bytes, typed arrays, and buffers
+
+/// A run of bytes crossing the C ABI, by value in every position: a
+/// string's UTF-8, raw bytes, a typed array's packed elements (its length
+/// counts bytes), or a value buffer.
+typealias WvRun = {{PREFIX}}_run
+
+/// The run viewing `bytes`.
+@inline(__always)
+func wvRun(_ bytes: UnsafeRawBufferPointer) -> WvRun {
+    WvRun(ptr: bytes.baseAddress?.assumingMemoryBound(to: UInt8.self), len: bytes.count)
+}
 
 /// Lends the UTF-8 bytes of `s` (not NUL-terminated) for one call.
 @inline(__always)
-func wvWithUTF8<R>(_ s: String, _ body: (UnsafePointer<UInt8>?, Int) throws -> R) rethrows -> R {
+func wvWithUTF8<R>(_ s: String, _ body: (WvRun) throws -> R) rethrows -> R {
     var s = s
-    return try s.withUTF8 { try body($0.baseAddress, $0.count) }
+    return try s.withUTF8 { try body(wvRun(UnsafeRawBufferPointer($0))) }
 }
 
 /// Lends the bytes of `d` for one call.
 @inline(__always)
-func wvWithBytes<R>(_ d: Data, _ body: (UnsafePointer<UInt8>?, Int) throws -> R) rethrows -> R {
-    try d.withUnsafeBytes { try body($0.baseAddress?.assumingMemoryBound(to: UInt8.self), $0.count) }
+func wvWithBytes<R>(_ d: Data, _ body: (WvRun) throws -> R) rethrows -> R {
+    try d.withUnsafeBytes { try body(wvRun($0)) }
 }
 
 /// Lends the storage of `a` (aligned for its element) for one call.
 @inline(__always)
-func wvWithSlice<T, R>(_ a: [T], _ body: (UnsafePointer<T>?, Int) throws -> R) rethrows -> R {
-    try a.withUnsafeBufferPointer { try body($0.baseAddress, $0.count) }
+func wvWithSlice<T, R>(_ a: [T], _ body: (WvRun) throws -> R) rethrows -> R {
+    try a.withUnsafeBytes { try body(wvRun($0)) }
 }
 
 /// Encodes `value` as a value buffer and lends it for one call.
 @inline(__always)
-func wvWithEncoded<T: WvCodable, R>(_ value: T, _ body: (UnsafePointer<UInt8>?, Int) throws -> R) rethrows -> R {
+func wvWithEncoded<T: WvCodable, R>(_ value: T, _ body: (WvRun) throws -> R) rethrows -> R {
     var w = WvWriter()
     w.write(value)
-    return try w.bytes.withUnsafeBufferPointer { try body($0.baseAddress, $0.count) }
+    return try w.bytes.withUnsafeBytes { try body(wvRun($0)) }
 }
 
 /// Releases a run the library handed over.
 @inline(__always)
-func wvFree(_ ptr: UnsafeRawPointer, _ byteCount: Int) {
-    {{PREFIX}}_free_bytes(UnsafeMutablePointer(mutating: ptr.assumingMemoryBound(to: UInt8.self)), byteCount)
+func wvFree(_ run: WvRun) {
+    {{PREFIX}}_run_free(run)
 }
 
-/// Copies a returned string, then releases the library's run.
-func wvTakeString(_ ptr: UnsafePointer<UInt8>?, _ len: Int) -> String {
-    guard let ptr = ptr else { return "" }
-    defer { wvFree(ptr, len) }
-    return String(decoding: UnsafeBufferPointer(start: ptr, count: len), as: UTF8.self)
-}
-
-/// Copies returned bytes, then releases the library's run.
-func wvTakeBytes(_ ptr: UnsafePointer<UInt8>?, _ len: Int) -> Data {
-    guard let ptr = ptr else { return Data() }
-    defer { wvFree(ptr, len) }
-    return Data(bytes: ptr, count: len)
-}
-
-/// Copies a returned typed array of `count` elements, then releases the
-/// library's run.
-func wvTakeSlice<T>(_ ptr: UnsafePointer<T>?, _ count: Int) -> [T] {
-    guard let ptr = ptr else { return [] }
-    defer { wvFree(ptr, count * MemoryLayout<T>.stride) }
-    return Array(UnsafeBufferPointer(start: ptr, count: count))
-}
-
-/// Decodes a returned value buffer in place, then releases it.
-func wvTakeBuffer<T: WvCodable>(_ ptr: UnsafePointer<UInt8>?, _ len: Int, as type: T.Type) -> T {
-    defer {
-        if let ptr = ptr { wvFree(ptr, len) }
-    }
-    return wvBorrowBuffer(ptr, len, as: type)
+/// The bytes of a run, or `nil` for an empty one.
+@inline(__always)
+func wvBytes(_ run: WvRun) -> UnsafeRawBufferPointer? {
+    guard let ptr = run.ptr, run.len > 0 else { return nil }
+    return UnsafeRawBufferPointer(start: ptr, count: run.len)
 }
 
 /// Copies a borrowed string.
-func wvBorrowString(_ ptr: UnsafePointer<UInt8>?, _ len: Int) -> String {
-    guard let ptr = ptr, len > 0 else { return "" }
-    return String(decoding: UnsafeBufferPointer(start: ptr, count: len), as: UTF8.self)
+func wvBorrowString(_ run: WvRun) -> String {
+    guard let bytes = wvBytes(run) else { return "" }
+    return String(decoding: bytes, as: UTF8.self)
 }
 
 /// Copies borrowed bytes.
-func wvBorrowBytes(_ ptr: UnsafePointer<UInt8>?, _ len: Int) -> Data {
-    guard let ptr = ptr, len > 0 else { return Data() }
-    return Data(bytes: ptr, count: len)
+func wvBorrowBytes(_ run: WvRun) -> Data {
+    guard let bytes = wvBytes(run) else { return Data() }
+    return Data(bytes)
 }
 
-/// Copies a borrowed typed array of `count` elements.
-func wvBorrowSlice<T>(_ ptr: UnsafePointer<T>?, _ count: Int) -> [T] {
-    guard let ptr = ptr, count > 0 else { return [] }
-    return Array(UnsafeBufferPointer(start: ptr, count: count))
+/// Copies a borrowed typed array: as many whole elements as the run holds.
+func wvBorrowSlice<T>(_ run: WvRun, as type: T.Type) -> [T] {
+    guard let bytes = wvBytes(run) else { return [] }
+    let count = bytes.count / MemoryLayout<T>.stride
+    return [T](unsafeUninitializedCapacity: count) { buffer, initialized in
+        UnsafeMutableRawBufferPointer(buffer).copyMemory(
+            from: UnsafeRawBufferPointer(rebasing: bytes[0..<(count * MemoryLayout<T>.stride)]))
+        initialized = count
+    }
 }
 
 /// Decodes a borrowed value buffer in place.
-func wvBorrowBuffer<T: WvCodable>(_ ptr: UnsafePointer<UInt8>?, _ len: Int, as type: T.Type) -> T {
-    var r = WvReader(ptr, len)
+func wvBorrowBuffer<T: WvCodable>(_ run: WvRun, as type: T.Type) -> T {
+    var r = WvReader(run.ptr, run.len)
     let value: T = r.read()
     r.finish()
     return value
+}
+
+/// Copies a returned string, then releases the library's run.
+func wvTakeString(_ run: WvRun) -> String {
+    defer { wvFree(run) }
+    return wvBorrowString(run)
+}
+
+/// Copies returned bytes, then releases the library's run.
+func wvTakeBytes(_ run: WvRun) -> Data {
+    defer { wvFree(run) }
+    return wvBorrowBytes(run)
+}
+
+/// Copies a returned typed array, then releases the library's run.
+func wvTakeSlice<T>(_ run: WvRun, as type: T.Type) -> [T] {
+    defer { wvFree(run) }
+    return wvBorrowSlice(run, as: type)
+}
+
+/// Decodes a returned value buffer in place, then releases it.
+func wvTakeBuffer<T: WvCodable>(_ run: WvRun, as type: T.Type) -> T {
+    defer { wvFree(run) }
+    return wvBorrowBuffer(run, as: type)
 }
 
 /// Stops the process on a malformed value buffer, which the wire format
@@ -832,58 +874,41 @@ func wvInvoke<T, R, D: WvDomain>(
 /// Fills a callback method's error slot: a code, a message, and the fields
 /// of a domain code as the payload.
 func wvSetError(_ outErr: UnsafeMutablePointer<WvError>?, _ code: Int32, _ message: String, _ payload: WvWriter? = nil) {
-    wvWithUTF8(message) { {{PREFIX}}_error_set(outErr, code, $0, $1) }
+    wvWithUTF8(message) { {{PREFIX}}_error_set(outErr, code, $0.ptr, $0.len) }
     if let payload = payload {
         payload.bytes.withUnsafeBufferPointer { {{PREFIX}}_error_set_payload(outErr, $0.baseAddress, $0.count) }
     }
 }
 
-/// Returns an optional scalar from a callback method: the value through
-/// `outValue` and whether it's present.
-func wvReturnOptional<T>(_ value: T?, _ outValue: UnsafeMutablePointer<T>?) -> Bool {
-    guard let value = value else { return false }
-    outValue?.pointee = value
-    return true
-}
-
-/// Hands `bytes` to the library as a callback method's return: a run
-/// allocated with `{{PREFIX}}_alloc` that the library adopts.
-func wvHandOver(_ bytes: UnsafeRawBufferPointer) -> (UnsafeMutableRawPointer?, Int) {
+/// Hands a copy of `bytes` to the library as a callback method's return: a
+/// run allocated with `{{PREFIX}}_alloc`, which the library adopts.
+func wvHandOver(_ bytes: UnsafeRawBufferPointer) -> WvRun {
     guard let base = bytes.baseAddress, bytes.count > 0, let run = {{PREFIX}}_alloc(bytes.count) else {
-        return (nil, 0)
+        return WvRun()
     }
     run.initialize(from: base.assumingMemoryBound(to: UInt8.self), count: bytes.count)
-    return (UnsafeMutableRawPointer(run), bytes.count)
+    return WvRun(ptr: UnsafePointer(run), len: bytes.count)
 }
 
-/// Returns a string from a callback method through its out slots.
-func wvReturnString(_ value: String, _ outPtr: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?, _ outLen: UnsafeMutablePointer<Int>?) {
+/// Returns a string from a callback method.
+func wvHandOverString(_ value: String) -> WvRun {
     var value = value
-    let (run, len) = value.withUTF8 { wvHandOver(UnsafeRawBufferPointer($0)) }
-    outPtr?.pointee = run?.assumingMemoryBound(to: UInt8.self)
-    outLen?.pointee = len
+    return value.withUTF8 { wvHandOver(UnsafeRawBufferPointer($0)) }
 }
 
-/// Returns bytes from a callback method through its out slots.
-func wvReturnBytes(_ value: Data, _ outPtr: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?, _ outLen: UnsafeMutablePointer<Int>?) {
-    let (run, len) = value.withUnsafeBytes { wvHandOver($0) }
-    outPtr?.pointee = run?.assumingMemoryBound(to: UInt8.self)
-    outLen?.pointee = len
+/// Returns bytes from a callback method.
+func wvHandOverBytes(_ value: Data) -> WvRun {
+    value.withUnsafeBytes { wvHandOver($0) }
 }
 
-/// Returns a typed array from a callback method through its out slots: the
-/// element count, in a run the library adopts.
-func wvReturnSlice<T>(_ value: [T], _ outPtr: UnsafeMutablePointer<UnsafeMutablePointer<T>?>?, _ outLen: UnsafeMutablePointer<Int>?) {
-    let (run, len) = value.withUnsafeBytes { wvHandOver($0) }
-    outPtr?.pointee = run?.bindMemory(to: T.self, capacity: value.count)
-    outLen?.pointee = len / MemoryLayout<T>.stride
+/// Returns a typed array from a callback method.
+func wvHandOverSlice<T>(_ value: [T]) -> WvRun {
+    value.withUnsafeBytes { wvHandOver($0) }
 }
 
-/// Returns a value buffer from a callback method through its out slots.
-func wvReturnBuffer<T: WvCodable>(_ value: T, _ outPtr: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?, _ outLen: UnsafeMutablePointer<Int>?) {
+/// Returns a value buffer from a callback method.
+func wvHandOverBuffer<T: WvCodable>(_ value: T) -> WvRun {
     var w = WvWriter()
     w.write(value)
-    let (run, len) = w.bytes.withUnsafeBytes { wvHandOver($0) }
-    outPtr?.pointee = run?.assumingMemoryBound(to: UInt8.self)
-    outLen?.pointee = len
+    return w.bytes.withUnsafeBytes { wvHandOver($0) }
 }

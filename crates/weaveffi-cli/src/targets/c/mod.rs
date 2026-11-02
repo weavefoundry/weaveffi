@@ -130,14 +130,12 @@ mod tests {
     use crate::platform::{BinarySet, NativeBinary, Platform};
 
     const SHOP: &str = r#"
-version: "0.12.0"
-modules:
-  - name: shop
-    structs:
-      - name: Item
-        fields: [{ name: name, type: string }]
-    functions:
-      - { name: first, params: [], return: Item }
+version: "0.13.0"
+records:
+  - name: Item
+    fields: [{ name: name, type: string }]
+functions:
+  - { name: first, return: Item }
 "#;
 
     #[test]
@@ -173,26 +171,31 @@ modules:
     fn enums_cross_as_int32_with_anonymous_constants() {
         let model = test_model(
             r#"
-version: "0.12.0"
-modules:
-  - name: m
-    enums:
-      - name: Mode
-        variants: [{ name: Fast, value: 0 }, { name: Slow, value: 7 }]
-    errors:
-      - name: Oops
-        codes: [{ name: Broke, code: 3, message: broke }]
-    functions:
-      - { name: pick, params: [{ name: m, type: "Mode?" }], return: Mode, throws: Oops }
+version: "0.13.0"
+enums:
+  - name: Mode
+    variants: [{ name: Fast }, { name: Slow, value: 7 }]
+errors:
+  - name: Oops
+    codes: [{ name: Broke, code: 3, message: broke }]
+functions:
+  - { name: pick, params: [{ name: m, type: "Mode?" }], return: Mode, throws: Oops }
 "#,
         );
         let h = render_c_header_from_model(&model, "kv.h");
-        assert!(h.contains(
-            "typedef int32_t kv_m_Mode;\nenum { kv_m_Mode_Fast = 0, kv_m_Mode_Slow = 7 };"
-        ));
-        assert!(h.contains("typedef int32_t kv_m_Oops;\nenum { kv_m_Oops_Broke = 3 };"));
+        assert!(
+            h.contains("typedef int32_t kv_Mode;\nenum { kv_Mode_Fast = 0, kv_Mode_Slow = 7 };")
+        );
+        assert!(h.contains("enum { kv_Oops_Broke = 3 };"), "{h}");
         assert!(!h.contains("typedef enum"));
-        assert!(h.contains("kv_m_Mode kv_m_pick(bool has_m, kv_m_Mode m, kv_error* out_err);"));
-        assert!(h.contains("Fails with a `kv_m_Oops` code"));
+        assert!(
+            h.contains("KV_API kv_Mode kv_pick(kv_opt_i32 m, kv_error* out_err);"),
+            "{h}"
+        );
+        assert!(h.contains("Fails with a `kv_Oops` code"));
+        assert!(h.contains("typedef struct kv_opt_f64 { bool has; double value; } kv_opt_f64;"));
+        assert!(h.contains("KV_API uint64_t kv_contract_"));
+        assert!(h.contains("static inline const char* kv_contract_check(void)"));
+        assert!(h.contains("#define KV_DEFINE_CONTRACT"));
     }
 }

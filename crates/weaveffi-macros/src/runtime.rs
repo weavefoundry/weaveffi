@@ -1,24 +1,21 @@
 //! Expansion of `weaveffi::export_runtime!()`: the fixed runtime surface
-//! every library exports under its own prefix.
+//! every library exports under its own prefix, and the crate's tag type.
 //!
-//! The bodies live in `weaveffi::abi`; only the `extern "C"` thunks are
-//! emitted here, in the producer's crate, because `#[no_mangle]` symbols in
-//! a transitive `rlib` aren't guaranteed to be exported from a `cdylib`.
+//! The bodies live in the `weaveffi` runtime; only the `extern "C"`
+//! functions are emitted here, in the producer's crate, because exported
+//! symbols in a transitive `rlib` aren't guaranteed to be exported from a
+//! `cdylib`.
 //!
-//! The expansion also defines the hidden module `crate::__weaveffi_runtime`,
-//! which every `#[weaveffi::module]` references, so a crate that forgets to
-//! call `export_runtime!()` (or calls it anywhere but the crate root) fails
-//! to compile instead of producing a library with no runtime symbols.
-//!
-//! `{prefix}_debug_live` is always exported. The macro can't see which cargo
-//! features the producer enabled on its `weaveffi` dependency, and a
-//! consumer shouldn't need to know either: without the `leak-check` feature
-//! the function exists and reports `0` for every kind.
+//! The expansion also defines `crate::__weaveffi::Tag`, the type every
+//! other attribute implements the runtime's value traits under, so a crate
+//! that forgets to call `export_runtime!()` (or calls it anywhere but the
+//! crate root) fails to compile instead of producing a library with no
+//! runtime symbols.
 
 use proc_macro2::TokenStream;
 use quote::quote;
 
-use crate::codegen::{ident, prefix};
+use crate::common::prefix;
 
 /// Expand `export_runtime!()` (which takes no arguments).
 pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
@@ -29,131 +26,113 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
         ));
     }
     let p = prefix()?;
-    let sym = |name: &str| ident(&format!("{p}_{name}"));
+    let sym = |name: &str| format!("{p}_{name}");
     let abi_version = sym("abi_version");
     let error_set = sym("error_set");
     let error_set_payload = sym("error_set_payload");
     let error_clear = sym("error_clear");
     let error_free = sym("error_free");
-    let free_bytes = sym("free_bytes");
+    let alloc = sym("alloc");
+    let run_free = sym("run_free");
     let token_create = sym("cancel_token_create");
     let token_cancel = sym("cancel_token_cancel");
     let token_is_cancelled = sym("cancel_token_is_cancelled");
     let token_destroy = sym("cancel_token_destroy");
     let debug_live = sym("debug_live");
-    let alloc = sym("alloc");
     Ok(quote! {
-            /// Proof that this crate exports the WeaveFFI runtime, which every
-            /// `#[weaveffi::module]` checks for.
-            #[doc(hidden)]
-            pub mod __weaveffi_runtime {}
+        /// The crate's WeaveFFI tag: the type every exported item implements
+        /// the runtime's value traits under.
+        #[doc(hidden)]
+        pub mod __weaveffi {
+            /// The tag.
+            #[derive(Debug)]
+            pub struct Tag;
+        }
 
-            // Consumers compare this against the revision they were generated
-            // for before touching any other symbol, so it must stay a plain
-            // constant with no side effects.
-            #[doc(hidden)]
-            #[unsafe(no_mangle)]
-            #[allow(unsafe_code)]
-            pub extern "C" fn #abi_version() -> u32 {
-                ::weaveffi::abi::ABI_VERSION
+        #[allow(unsafe_code, unused_unsafe, clippy::missing_safety_doc)]
+        const _: () = {
+            // Consumers compare this against the revision they were
+            // generated for before touching any other symbol.
+            #[unsafe(export_name = #abi_version)]
+            pub extern "C" fn __weaveffi_abi_version() -> u32 {
+                ::weaveffi::__rt::ABI_VERSION
             }
 
-            #[doc(hidden)]
-            #[unsafe(no_mangle)]
-            #[allow(unsafe_code, unused_unsafe, clippy::missing_safety_doc)]
-            pub unsafe extern "C" fn #error_set(
-                __wv_err: *mut ::weaveffi::abi::FfiError,
-                __wv_code: i32,
-                __wv_message_ptr: *const u8,
-                __wv_message_len: usize,
+            #[unsafe(export_name = #error_set)]
+            pub unsafe extern "C" fn __weaveffi_error_set(
+                err: *mut ::weaveffi::__rt::FfiError,
+                code: i32,
+                message_ptr: *const u8,
+                message_len: usize,
             ) {
-                unsafe {
-                    ::weaveffi::abi::error_set_c(
-                        __wv_err,
-                        __wv_code,
-                        __wv_message_ptr,
-                        __wv_message_len,
-                    )
-                }
+                unsafe { ::weaveffi::__rt::error_set_c(err, code, message_ptr, message_len) }
             }
 
-            #[doc(hidden)]
-            #[unsafe(no_mangle)]
-            #[allow(unsafe_code, unused_unsafe, clippy::missing_safety_doc)]
-            pub unsafe extern "C" fn #error_set_payload(
-                __wv_err: *mut ::weaveffi::abi::FfiError,
-                __wv_ptr: *const u8,
-                __wv_len: usize,
+            #[unsafe(export_name = #error_set_payload)]
+            pub unsafe extern "C" fn __weaveffi_error_set_payload(
+                err: *mut ::weaveffi::__rt::FfiError,
+                ptr: *const u8,
+                len: usize,
             ) {
-                unsafe { ::weaveffi::abi::error_set_payload_c(__wv_err, __wv_ptr, __wv_len) }
+                unsafe { ::weaveffi::__rt::error_set_payload_c(err, ptr, len) }
             }
 
-            #[doc(hidden)]
-            #[unsafe(no_mangle)]
-            #[allow(unsafe_code, unused_unsafe, clippy::missing_safety_doc)]
-            pub unsafe extern "C" fn #error_clear(__wv_err: *mut ::weaveffi::abi::FfiError) {
-                unsafe { ::weaveffi::abi::error_clear(__wv_err) }
+            #[unsafe(export_name = #error_clear)]
+            pub unsafe extern "C" fn __weaveffi_error_clear(err: *mut ::weaveffi::__rt::FfiError) {
+                unsafe { ::weaveffi::__rt::error_clear(err) }
             }
 
-            #[doc(hidden)]
-            #[unsafe(no_mangle)]
-            #[allow(unsafe_code, unused_unsafe, clippy::missing_safety_doc)]
-            pub unsafe extern "C" fn #error_free(__wv_err: *mut ::weaveffi::abi::FfiError) {
-                unsafe { ::weaveffi::abi::error_free(__wv_err) }
-            }
-
-            #[doc(hidden)]
-            #[unsafe(no_mangle)]
-            #[allow(unsafe_code, unused_unsafe, clippy::missing_safety_doc)]
-            pub unsafe extern "C" fn #free_bytes(__wv_ptr: *mut u8, __wv_len: usize) {
-                unsafe { ::weaveffi::abi::free_bytes(__wv_ptr, __wv_len) }
-            }
-
-            #[doc(hidden)]
-            #[unsafe(no_mangle)]
-            #[allow(unsafe_code)]
-            pub extern "C" fn #token_create() -> *mut ::weaveffi::abi::FfiCancelToken {
-                ::weaveffi::abi::cancel_token_create()
-            }
-
-            #[doc(hidden)]
-            #[unsafe(no_mangle)]
-            #[allow(unsafe_code, unused_unsafe, clippy::missing_safety_doc)]
-            pub unsafe extern "C" fn #token_cancel(__wv_token: *mut ::weaveffi::abi::FfiCancelToken) {
-                unsafe { ::weaveffi::abi::cancel_token_cancel(__wv_token) }
-            }
-
-            #[doc(hidden)]
-            #[unsafe(no_mangle)]
-            #[allow(unsafe_code, unused_unsafe, clippy::missing_safety_doc)]
-            pub unsafe extern "C" fn #token_is_cancelled(
-                __wv_token: *const ::weaveffi::abi::FfiCancelToken,
-            ) -> bool {
-                unsafe { ::weaveffi::abi::cancel_token_is_cancelled(__wv_token) }
-            }
-
-            #[doc(hidden)]
-            #[unsafe(no_mangle)]
-            #[allow(unsafe_code, unused_unsafe, clippy::missing_safety_doc)]
-            pub unsafe extern "C" fn #token_destroy(__wv_token: *mut ::weaveffi::abi::FfiCancelToken) {
-                unsafe { ::weaveffi::abi::cancel_token_destroy(__wv_token) }
-            }
-
-            #[doc(hidden)]
-            #[unsafe(no_mangle)]
-            #[allow(unsafe_code)]
-            pub extern "C" fn #debug_live(__wv_kind: i32) -> u64 {
-                ::weaveffi::abi::debug_live(__wv_kind)
+            #[unsafe(export_name = #error_free)]
+            pub unsafe extern "C" fn __weaveffi_error_free(err: *mut ::weaveffi::__rt::FfiError) {
+                unsafe { ::weaveffi::__rt::error_free(err) }
             }
 
             // Consumers allocate the runs they hand to the producer (a
-            // callback's string, bytes, or buffer return) and, on wasm32,
-            // stage arguments through this.
-            #[doc(hidden)]
-            #[unsafe(no_mangle)]
-            #[allow(unsafe_code)]
-            pub extern "C" fn #alloc(__wv_len: usize) -> *mut u8 {
-                ::weaveffi::abi::alloc(__wv_len)
+            // callback's string, bytes, buffer, or typed-array return) and,
+            // on wasm32, stage arguments through this.
+            #[unsafe(export_name = #alloc)]
+            pub extern "C" fn __weaveffi_alloc(len: usize) -> *mut u8 {
+                ::weaveffi::__rt::alloc(len)
             }
+
+            #[unsafe(export_name = #run_free)]
+            pub unsafe extern "C" fn __weaveffi_run_free(run: ::weaveffi::__rt::Run) {
+                unsafe { ::weaveffi::__rt::run_free(run) }
+            }
+
+            #[unsafe(export_name = #token_create)]
+            pub extern "C" fn __weaveffi_cancel_token_create() -> *mut ::weaveffi::__rt::FfiCancelToken {
+                ::weaveffi::__rt::cancel_token_create()
+            }
+
+            #[unsafe(export_name = #token_cancel)]
+            pub unsafe extern "C" fn __weaveffi_cancel_token_cancel(
+                token: *mut ::weaveffi::__rt::FfiCancelToken,
+            ) {
+                unsafe { ::weaveffi::__rt::cancel_token_cancel(token) }
+            }
+
+            #[unsafe(export_name = #token_is_cancelled)]
+            pub unsafe extern "C" fn __weaveffi_cancel_token_is_cancelled(
+                token: *const ::weaveffi::__rt::FfiCancelToken,
+            ) -> bool {
+                unsafe { ::weaveffi::__rt::cancel_token_is_cancelled(token) }
+            }
+
+            #[unsafe(export_name = #token_destroy)]
+            pub unsafe extern "C" fn __weaveffi_cancel_token_destroy(
+                token: *mut ::weaveffi::__rt::FfiCancelToken,
+            ) {
+                unsafe { ::weaveffi::__rt::cancel_token_destroy(token) }
+            }
+
+            // Always exported: without the `leak-check` feature every kind
+            // but `-1` reads `0`, so a consumer never has to know how the
+            // producer was built.
+            #[unsafe(export_name = #debug_live)]
+            pub extern "C" fn __weaveffi_debug_live(kind: i32) -> u64 {
+                ::weaveffi::__rt::debug_live(kind)
+            }
+        };
     })
 }

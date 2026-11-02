@@ -1,22 +1,27 @@
 //! Ruby (ffi gem) binding generator.
 //!
-//! Emits a pure-Ruby gem that binds the C ABI (revision 5) with the `ffi`
+//! Emits a pure-Ruby gem that binds the C ABI (revision 6) with the `ffi`
 //! gem: `lib/{prefix}.rb` (the generated bindings, required as `{prefix}`),
 //! `lib/{prefix}/runtime.rb` (the fixed runtime from `runtime/runtime.rb`),
-//! a `{name}.gemspec` (Ruby 3.2 or newer), and a README. Every IDL module's
-//! declarations live in one Ruby module, `PascalCase(name)` unless
-//! configured (type and function names are global, so nothing collides).
+//! a `{name}.gemspec` (Ruby 3.2 or newer), and a README. A library is one
+//! namespace, so every declaration lives directly in one Ruby module,
+//! `PascalCase(name)` unless configured.
 //!
 //! The public surface is only the idiomatic API: error classes, enum
 //! constants, records as `Data` classes, rich enums as modules of `Data`
 //! variants, interface wrapper classes, callback-interface modules, and
-//! module functions. The raw C functions live in the private `Native`
+//! library functions. The raw C functions live in the private `Native`
 //! module and the shared marshalling in the private `Bridge` module, both
-//! in the runtime: a wrapper only converts its arguments and hands the C
-//! call to a `Bridge` helper as a block, and value buffers are encoded by a
-//! generic codec from per-type layouts registered at the end of the file.
-//! Loading checks the ABI revision and every top-level module's contract
-//! table and raises `{Module}::LoadError` on a mismatch.
+//! in the runtime. Every value crosses as one C value: a scalar, an
+//! `FFI::Struct` passed by value (`Run` for strings, bytes, typed arrays,
+//! and value buffers; `Opt*` for optional scalars; `Callback` for a
+//! callback-interface argument), or a pointer. A wrapper only converts its
+//! arguments and hands the C call to a `Bridge` helper as a block, value
+//! buffers are encoded by a generic codec from per-type layouts registered
+//! at the end of the file, and each callback interface's vtable is built
+//! from a row per method. Loading checks the ABI revision and every
+//! declaration's contract function and raises `{Module}::LoadError` on a
+//! mismatch.
 
 mod callbacks;
 mod calls;
@@ -42,7 +47,7 @@ use weaveffi_model::model::Model;
 use crate::targets::ruby::callbacks::{render_callback_module, render_vtable};
 use crate::targets::ruby::calls::{render_attach, render_callable, RbScope, ScopeKind};
 use crate::targets::ruby::entities::{
-    render_enum, render_error, render_interface, render_layouts, render_rich_enum, render_struct,
+    render_enum, render_error, render_interface, render_layouts, render_record, render_rich_enum,
 };
 use crate::targets::ruby::package::{
     gem_authors, render_gemspec, render_packaged_readme, render_readme, GemNames, FFI_REQUIREMENT,
@@ -57,13 +62,14 @@ use crate::targets::ruby::types::rb_str_literal;
 pub struct RubyConfig {
     /// Gem name written into the gemspec (default: the package name).
     pub name: Option<String>,
-    /// Top-level Ruby module name (default: the package name in PascalCase).
+    /// The Ruby module holding the bindings (default: the package name in
+    /// PascalCase).
     pub module_name: Option<String>,
 }
 
 impl RubyConfig {
-    /// The gem, module, and require names for `api`: the identity's, unless
-    /// overridden here.
+    /// The gem, module, and require names for `model`: the identity's,
+    /// unless overridden here.
     fn names<'a>(&self, model: &'a Model) -> GemNames<'a> {
         let identity = &model.identity;
         let configured = |v: &Option<String>| {
@@ -107,22 +113,19 @@ impl Target for RubyGenerator {
     }
 
     fn render(&self, model: &Model) -> Vec<OutputFile> {
-        let config = &self.config;
-        let names = config.names(model);
-        let dir = Utf8PathBuf::new();
-        let lib_dir = dir.join("lib");
+        let names = self.config.names(model);
         let lib_file = format!("{}.rb", names.require());
         vec![
             OutputFile::new(
-                lib_dir.join(&lib_file),
+                format!("lib/{lib_file}"),
                 render_bindings(model, &names, &lib_file),
             ),
             OutputFile::new(
-                lib_dir.join(names.require()).join("runtime.rb"),
+                format!("lib/{}/runtime.rb", names.require()),
                 render_runtime(names.identity, &names.module, "runtime.rb"),
             ),
-            OutputFile::new(dir.join(names.gemspec_file()), render_gemspec(&names)),
-            OutputFile::new(dir.join("README.md"), render_readme(&names)),
+            OutputFile::new(names.gemspec_file(), render_gemspec(&names)),
+            OutputFile::new("README.md", render_readme(&names)),
         ]
     }
 
@@ -131,8 +134,7 @@ impl Target for RubyGenerator {
     /// RubyGems has no platform string for (Android, iOS, `wasm32`) are
     /// skipped.
     fn package(&self, model: &Model, ctx: &PackageContext<'_>) -> Result<Vec<Artifact>> {
-        let config = &self.config;
-        let names = config.names(model);
+        let names = self.config.names(model);
         let id = names.identity;
         let lib_file = format!("{}.rb", names.require());
         let bindings = render_bindings(model, &names, &lib_file);
@@ -178,16 +180,16 @@ impl Target for RubyGenerator {
 
 /// What every renderer of one bindings file shares.
 pub(crate) struct RbCtx<'a> {
-    /// The top-level Ruby module name, which deprecation warnings name.
+    /// The Ruby module name, which deprecation warnings name.
     pub(crate) module: &'a str,
     /// Every identifier the API declares, for rewriting doc text.
     pub(crate) names: ApiNames,
 }
 
 /// Render `lib/{prefix}.rb`: the contract check, the `Native` attachments,
-/// each module's declarations (errors, enums, records, callback
-/// interfaces, interfaces, functions), and finally the private
-/// registrations (interface lifecycles, wire layouts, vtables).
+/// the declarations (errors, enums, records, callback interfaces,
+/// interfaces, functions), and finally the private registrations
+/// (interface lifecycles, wire layouts, vtables).
 fn render_bindings(model: &Model, names: &GemNames, lib_file: &str) -> String {
     let ctx = RbCtx {
         module: &names.module,
@@ -204,44 +206,38 @@ fn render_bindings(model: &Model, names: &GemNames, lib_file: &str) -> String {
     w.block(format!("module {}", names.module), "end", |w| {
         render_contract(w, model);
         render_native(w, model);
-        for m in &model.modules {
+        for table in &tables {
+            render_error(w, &ctx, table);
+        }
+        for e in &model.enums {
+            if e.is_rich() {
+                render_rich_enum(w, &ctx, e);
+            } else {
+                render_enum(w, &ctx, e);
+            }
+        }
+        for r in &model.records {
+            render_record(w, &ctx, r);
+        }
+        for cb in &model.callbacks {
+            render_callback_module(w, &ctx, cb);
+        }
+        for i in &model.interfaces {
+            render_interface(w, &ctx, i);
+        }
+        for f in &model.functions {
             w.blank();
-            w.line(format!("# === Module: {} ===", m.dot_path));
-            for table in tables.iter().filter(|t| t.module.index == m.index) {
-                render_error(w, table);
-            }
-            for e in &m.enums {
-                if e.is_rich() {
-                    render_rich_enum(w, &ctx, e);
-                } else {
-                    render_enum(w, &ctx, e);
-                }
-            }
-            for s in &m.structs {
-                render_struct(w, &ctx, s);
-            }
-            for cb in &m.callback_interfaces {
-                render_callback_module(w, &ctx, cb);
-            }
-            for i in &m.interfaces {
-                render_interface(w, &ctx, i);
-            }
-            for f in &m.functions {
-                w.blank();
-                let scope = RbScope {
-                    kind: ScopeKind::Free,
-                    class: None,
-                };
-                render_callable(w, &ctx, f, &scope);
-            }
+            let scope = RbScope {
+                kind: ScopeKind::Free,
+                class: None,
+            };
+            render_callable(w, &ctx, f, &scope);
         }
         w.blank();
         w.line("# === Private registrations ===");
         render_layouts(w, model, &tables);
-        for m in &model.modules {
-            for cb in &m.callback_interfaces {
-                render_vtable(w, cb);
-            }
+        for cb in &model.callbacks {
+            render_vtable(w, cb);
         }
     });
     w.blank();
@@ -249,62 +245,53 @@ fn render_bindings(model: &Model, names: &GemNames, lib_file: &str) -> String {
     w.finish()
 }
 
-/// The load-time contract check: for every top-level module, each row of
-/// its contract table (`[id, hash, path]`, with the canonical signature as
-/// a comment), which `Bridge.check_contract!` looks up in the library's
-/// own table.
+/// The load-time contract check: one row per declaration, `[contract
+/// function, hash, path]` with the canonical signature as a comment, which
+/// `Bridge.check_contract!` calls and compares before anything else runs.
 fn render_contract(w: &mut CodeWriter, model: &Model) {
-    w.line("# The declarations these bindings were generated with, per top-level");
-    w.line("# module, as [id, hash, path]. Loading raises LoadError, naming the path,");
-    w.line("# unless the library's contract table holds each one with an equal hash.");
+    w.line("# The declarations these bindings were generated with, as [contract");
+    w.line("# function, hash, path]. Loading raises LoadError, naming the path, unless");
+    w.line("# the library exports each function and it returns the hash.");
     w.line("Bridge.check_contract!(");
     w.scope(|w| {
-        for table in contract::tables(model) {
-            w.line(format!("{}: [", table.symbol));
-            w.scope(|w| {
-                for row in &table.rows {
-                    w.line(format!("# {}", row.signature));
-                    w.line(format!(
-                        "[{}, {}, '{}'],",
-                        contract::hex(row.id),
-                        contract::hex(row.hash),
-                        rb_str_literal(&row.path)
-                    ));
-                }
-            });
-            w.line("],");
-        }
+        w.line("[");
+        w.scope(|w| {
+            for row in contract::rows(model) {
+                w.line(format!("# {}", row.signature));
+                w.line(format!(
+                    "[:{}, {}, '{}'],",
+                    row.symbol,
+                    contract::hex(row.hash),
+                    rb_str_literal(&row.path)
+                ));
+            }
+        });
+        w.line("],");
     });
     w.line(")");
 }
 
 /// The private `Native` module's attachments: every C function the
-/// wrappers call, module by module.
+/// wrappers call.
 fn render_native(w: &mut CodeWriter, model: &Model) {
     w.blank();
     w.line("# The C functions the wrappers below call (private).");
     w.block("module Native", "end", |w| {
-        for (idx, m) in model.modules.iter().enumerate() {
-            if idx > 0 {
-                w.blank();
-            }
-            w.line(format!("# {}", m.dot_path));
-            for i in &m.interfaces {
-                w.line(format!(
-                    "attach_function :{}, [:pointer], :pointer",
-                    i.clone_symbol
-                ));
-                w.line(format!(
-                    "attach_function :{}, [:pointer], :void",
-                    i.destroy_symbol
-                ));
-                for f in i.members() {
-                    render_attach(w, f);
-                }
-            }
-            for f in &m.functions {
+        for i in &model.interfaces {
+            w.line(format!(
+                "attach_function :{}, [:pointer], :pointer",
+                i.clone_symbol
+            ));
+            w.line(format!(
+                "attach_function :{}, [:pointer], :void",
+                i.destroy_symbol
+            ));
+            for f in i.members() {
                 render_attach(w, f);
             }
+        }
+        for f in &model.functions {
+            render_attach(w, f);
         }
     });
 }

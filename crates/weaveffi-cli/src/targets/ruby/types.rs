@@ -1,14 +1,15 @@
 //! Ruby naming and the value descriptors the generated code hands the
-//! runtime: the ffi gem's C type symbols, the *kinds* that say how a return,
-//! an async result, or an iterator element crosses, the wire *types* that
+//! runtime: the ffi gem's C types, the *kinds* that say how a value crosses
+//! (one per [`Crossing`], the same in every position), the wire *types* that
 //! say how a value is packed into a value buffer, and the YARD type of each
 //! value.
 
+use crate::codegen::values::{crossing, Crossing};
 use crate::lang::{escape_ident, escape_member, RUBY_KEYWORDS};
 use heck::ToSnakeCase;
 use weaveffi_model::abi::{AbiParam, CType};
 use weaveffi_model::errors::type_name;
-use weaveffi_model::plan::{ErrorStrategy, ItemPass, ResultPass, RetPass};
+use weaveffi_model::model::ErrorStrategy;
 use weaveffi_model::ty::{ParamTy, Prim, RetTy, Ty, WireType};
 
 /// Constants the runtime and the generated code refer to inside the gem's
@@ -78,13 +79,6 @@ pub(crate) fn rb_domain(name: &str) -> String {
 /// then keyword-escaped (a reserved name like `end` gains a trailing `_`).
 pub(crate) fn rb_param_name(name: &str) -> String {
     escape_ident(&name.to_snake_case(), RUBY_KEYWORDS)
-}
-
-/// The Ruby local holding one C slot of a call: the slot's name, keyword
-/// escaped (a receiver's `self` slot is `self_`). Slot names are unique per
-/// callable (validated), so these locals never collide.
-pub(crate) fn rb_slot(slot: &AbiParam) -> String {
-    escape_ident(&slot.name, RUBY_KEYWORDS)
 }
 
 /// Methods every record (a `Data` class) relies on, from `Data` and
@@ -169,6 +163,7 @@ const OBJECT_METHODS: &[&str] = &[
     "inspect",
     "method",
     "object_id",
+    "public_send",
     "send",
     "to_s",
 ];
@@ -205,8 +200,8 @@ pub(crate) fn rb_member_name(name: &str, method: bool) -> String {
     escape_member(&name.to_snake_case(), members)
 }
 
-/// The Ruby spelling of a module-level function (a singleton method of the
-/// gem's module).
+/// The Ruby spelling of a library function (a singleton method of the gem's
+/// module).
 pub(crate) fn rb_function_name(name: &str) -> String {
     escape_member(&name.to_snake_case(), MODULE_METHODS)
 }
@@ -217,65 +212,51 @@ pub(crate) fn rb_callback_method_name(name: &str) -> String {
     escape_member(&name.to_snake_case(), OBJECT_METHODS)
 }
 
-/// The ffi gem's symbol for a C slot type. Every pointer (runs, objects,
-/// out slots, vtables, contexts) is `:pointer`; `bool` is the 1-byte C
-/// `bool`; a C-style enum is its `int32_t` typedef.
-pub(crate) fn rb_ffi_type(ty: &CType) -> &'static str {
+/// The ffi gem's type of a C slot: a scalar's symbol (`:int32`, `:bool`,
+/// the 1-byte C `bool`), a C-style enum's `int32_t` typedef, a struct
+/// passed by value (`Run.by_value`, `OptI32.by_value`, `Callback.by_value`,
+/// resolved inside the private `Native` module), or `:pointer` for every
+/// pointer (objects, iterators, the error slot, tokens, completions).
+pub(crate) fn rb_ffi_type(ty: &CType) -> String {
     match ty {
-        CType::Bool => ":bool",
-        CType::Int8 => ":int8",
-        CType::Int16 => ":int16",
-        CType::Int32 | CType::Enum { .. } => ":int32",
-        CType::Uint8 => ":uint8",
-        CType::Uint16 => ":uint16",
-        CType::Uint32 => ":uint32",
-        CType::Int64 => ":int64",
-        CType::Uint64 => ":uint64",
-        CType::Float => ":float",
-        CType::Double => ":double",
-        CType::Size => ":size_t",
-        CType::Void => ":void",
-        _ => ":pointer",
+        CType::Scalar(p) => format!(":{}", rb_ffi_scalar(*p)),
+        CType::Enum(_) => ":int32".to_string(),
+        CType::Size => ":size_t".to_string(),
+        CType::Void => ":void".to_string(),
+        CType::Opt(p) => format!("Opt{}.by_value", p.pascal()),
+        CType::Run => "Run.by_value".to_string(),
+        CType::Callback(_) => "Callback.by_value".to_string(),
+        _ => ":pointer".to_string(),
     }
 }
 
-/// The ffi gem's symbols for a list of slots, as a Ruby array literal.
+/// The ffi gem's name of a scalar primitive.
+fn rb_ffi_scalar(p: Prim) -> &'static str {
+    match p {
+        Prim::Bool => "bool",
+        Prim::I8 => "int8",
+        Prim::I16 => "int16",
+        Prim::I32 => "int32",
+        Prim::I64 => "int64",
+        Prim::U8 => "uint8",
+        Prim::U16 => "uint16",
+        Prim::U32 => "uint32",
+        Prim::U64 => "uint64",
+        Prim::F32 => "float",
+        Prim::F64 => "double",
+        Prim::String | Prim::Bytes => unreachable!("{p} isn't a scalar"),
+    }
+}
+
+/// The ffi gem's types of a list of slots, as a Ruby array literal.
 pub(crate) fn rb_ffi_types(params: &[AbiParam]) -> String {
-    let types: Vec<&str> = params.iter().map(|p| rb_ffi_type(&p.ty)).collect();
+    let types: Vec<String> = params.iter().map(|p| rb_ffi_type(&p.ty)).collect();
     format!("[{}]", types.join(", "))
 }
 
-/// The scalar kind of a direct value (`:i32`, `:f64`, `:bool`); a C-style
-/// enum crosses as `:i32`.
-pub(crate) fn rb_scalar(ty: &Ty) -> String {
-    match ty {
-        Ty::Prim(p) => format!(":{}", p.snake()),
-        Ty::Enum(_) => ":i32".to_string(),
-        other => unreachable!("{other} isn't a scalar"),
-    }
-}
-
-/// The scalar kind of a typed-array element.
-pub(crate) fn rb_elem(p: Prim) -> String {
+/// The runtime's name of a scalar (`:i32`, `:f64`, `:bool`).
+pub(crate) fn rb_scalar(p: Prim) -> String {
     format!(":{}", p.snake())
-}
-
-/// The scalar a range check applies to, when `ty` is an integer or a
-/// C-style enum (floats and bools are converted by the ffi gem itself).
-pub(crate) fn rb_checked_int(ty: &Ty) -> Option<String> {
-    match ty {
-        Ty::Prim(p) if p.is_integer() => Some(rb_scalar(ty)),
-        Ty::Enum(_) => Some(rb_scalar(ty)),
-        _ => None,
-    }
-}
-
-/// The inner type of an optional.
-fn optional_inner(ty: &Ty) -> &Ty {
-    match ty {
-        Ty::Optional(inner) => inner,
-        other => unreachable!("{other} isn't optional"),
-    }
 }
 
 /// The wire type of a value inside a value buffer: `:i64`, `:string`,
@@ -283,7 +264,7 @@ fn optional_inner(ty: &Ty) -> &Ty {
 /// of a record, rich enum, or interface. A C-style enum is `:i32`.
 pub(crate) fn rb_wire(ty: &Ty) -> String {
     match ty.wire() {
-        WireType::Prim(p) => format!(":{}", p.snake()),
+        WireType::Prim(p) => rb_scalar(p),
         WireType::Enum(_) => ":i32".to_string(),
         WireType::Object(n) | WireType::User(n) => rb_const(n),
         WireType::Optional(inner) => format!("[:opt, {}]", rb_wire(inner)),
@@ -292,67 +273,35 @@ pub(crate) fn rb_wire(ty: &Ty) -> String {
     }
 }
 
-/// The kind of an object: `[:object, Store]` or `[:object?, Store]`.
-fn object_kind(interface: &str, nullable: bool) -> String {
-    let tag = if nullable { ":object?" } else { ":object" };
-    format!("[{tag}, {}]", rb_const(interface))
-}
-
-/// The kind of a synchronous return (see the runtime's `Bridge` for the
-/// vocabulary), or `None` for a void return. `ret` is the returned value
-/// type. An iterator has no kind; its element does (see [`rb_item_kind`]).
-pub(crate) fn rb_return_kind(pass: &RetPass, ret: Option<&Ty>) -> Option<String> {
-    let ty = || ret.expect("a value return has a type");
-    Some(match pass {
-        RetPass::Void | RetPass::Iterator(_) => return None,
-        RetPass::Direct => rb_scalar(ty()),
-        RetPass::OptDirect { .. } => format!("[:opt, {}]", rb_scalar(optional_inner(ty()))),
-        RetPass::Slice { elem, .. } => format!("[:slice, {}]", rb_elem(*elem)),
-        RetPass::String { .. } => ":string".to_string(),
-        RetPass::Bytes { .. } => ":bytes".to_string(),
-        RetPass::Buffer { .. } => format!("[:buffer, {}]", rb_wire(ty())),
-        RetPass::Object {
-            nullable,
+/// The runtime's *kind* of a value of type `ty`, which says how it crosses
+/// in every position (see the runtime's `Bridge`): a scalar (`:i32`; a
+/// C-style enum is `:i32`), `[:opt, :i32]`, `:string`, `:bytes`,
+/// `[:slice, :f64]`, `[:buffer, type]`, `[:object, Store]`, or
+/// `[:object?, Store]`.
+pub(crate) fn rb_kind(ty: &Ty) -> String {
+    match crossing(ty) {
+        Crossing::Scalar(p) => rb_scalar(p),
+        Crossing::Enum(_) => ":i32".to_string(),
+        Crossing::OptScalar(p) => format!("[:opt, {}]", rb_scalar(p)),
+        Crossing::OptEnum(_) => "[:opt, :i32]".to_string(),
+        Crossing::Utf8 => ":string".to_string(),
+        Crossing::Bytes => ":bytes".to_string(),
+        Crossing::Slice(p) => format!("[:slice, {}]", rb_scalar(p)),
+        Crossing::Buffer(ty) => format!("[:buffer, {}]", rb_wire(ty)),
+        Crossing::Object {
             interface,
-            ..
-        } => object_kind(interface, *nullable),
-    })
-}
-
-/// The kind of an async result, `nil` for void.
-pub(crate) fn rb_result_kind(pass: &ResultPass, ret: Option<&Ty>) -> String {
-    let ty = || ret.expect("a value result has a type");
-    match pass {
-        ResultPass::Void => "nil".to_string(),
-        ResultPass::Direct { .. } => rb_scalar(ty()),
-        ResultPass::OptDirect { .. } => format!("[:opt, {}]", rb_scalar(optional_inner(ty()))),
-        ResultPass::Slice { elem, .. } => format!("[:slice, {}]", rb_elem(*elem)),
-        ResultPass::String { .. } => ":string".to_string(),
-        ResultPass::Bytes { .. } => ":bytes".to_string(),
-        ResultPass::Buffer { .. } => format!("[:buffer, {}]", rb_wire(ty())),
-        ResultPass::Object {
             nullable,
-            interface,
-            ..
-        } => object_kind(interface, *nullable),
+        } => {
+            let tag = if nullable { ":object?" } else { ":object" };
+            format!("[{tag}, {}]", rb_const(interface))
+        }
     }
 }
 
-/// The kind of an iterator element of type `elem`.
-pub(crate) fn rb_item_kind(pass: &ItemPass, elem: &Ty) -> String {
-    match pass {
-        ItemPass::Direct { .. } => rb_scalar(elem),
-        ItemPass::OptDirect { .. } => format!("[:opt, {}]", rb_scalar(optional_inner(elem))),
-        ItemPass::Slice { elem: p, .. } => format!("[:slice, {}]", rb_elem(*p)),
-        ItemPass::String { .. } => ":string".to_string(),
-        ItemPass::Bytes { .. } => ":bytes".to_string(),
-        ItemPass::Buffer { .. } => format!("[:buffer, {}]", rb_wire(elem)),
-        ItemPass::Object {
-            nullable,
-            interface,
-            ..
-        } => object_kind(interface, *nullable),
-    }
+/// The kind of a value that may be absent (a void return or result):
+/// `nil` when it is.
+pub(crate) fn rb_kind_or_nil(ty: Option<&Ty>) -> String {
+    ty.map_or_else(|| "nil".to_string(), rb_kind)
 }
 
 /// The error class a call's failures are raised through: `nil` for a call
@@ -458,5 +407,33 @@ mod tests {
         );
         assert_eq!(rb_wire(&ty), "[:map, :string, [:list, [:opt, Data_]]]");
         assert_eq!(rb_wire(&Ty::Enum("Color".into())), ":i32");
+    }
+
+    #[test]
+    fn every_crossing_has_a_kind_and_one_ffi_type() {
+        let opt = |t| Ty::Optional(Box::new(t));
+        let list = |t| Ty::List(Box::new(t));
+        assert_eq!(rb_kind(&Ty::Prim(Prim::Bool)), ":bool");
+        assert_eq!(rb_kind(&Ty::Enum("Color".into())), ":i32");
+        assert_eq!(rb_kind(&opt(Ty::Prim(Prim::U16))), "[:opt, :u16]");
+        assert_eq!(rb_kind(&opt(Ty::Enum("Color".into()))), "[:opt, :i32]");
+        assert_eq!(rb_kind(&Ty::Prim(Prim::String)), ":string");
+        assert_eq!(rb_kind(&list(Ty::Prim(Prim::F32))), "[:slice, :f32]");
+        assert_eq!(
+            rb_kind(&list(Ty::Prim(Prim::String))),
+            "[:buffer, [:list, :string]]"
+        );
+        assert_eq!(
+            rb_kind(&opt(Ty::Interface("Store".into()))),
+            "[:object?, Store]"
+        );
+        assert_eq!(rb_ffi_type(&CType::Opt(Prim::I32)), "OptI32.by_value");
+        assert_eq!(rb_ffi_type(&CType::Run), "Run.by_value");
+        assert_eq!(
+            rb_ffi_type(&CType::Callback("L".into())),
+            "Callback.by_value"
+        );
+        assert_eq!(rb_ffi_type(&CType::Enum("Color".into())), ":int32");
+        assert_eq!(rb_ffi_type(&CType::ptr(CType::Error)), ":pointer");
     }
 }

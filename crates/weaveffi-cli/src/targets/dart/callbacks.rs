@@ -3,37 +3,36 @@
 //! then one entry per method), the vtable entries, the dispatcher that
 //! delivers forwarded void methods, and the vtable itself.
 //!
-//! A method that returns a value (its [`CallbackRetPass`] isn't `Void`) is a
-//! `NativeCallable.isolateLocal` trampoline: it runs synchronously on the
-//! isolate's thread, receives its borrowed arguments in place, adopts object
-//! arguments, and hands its return to the producer (by value, as a presence
-//! flag and an out value, as a fresh object reference, or as a
-//! `{prefix}_alloc` run in the out slots). The vtable is flagged
-//! thread-affine, so the producer refuses to call such a method from any
-//! other thread (failing it with -4) instead of letting the VM abort. A
-//! thrown exception never unwinds: a method that throws a domain reports
-//! its code and payload, and anything else is reported with a runtime code.
-//! A void method is a `NativeCallable.isolateGroupBound` forwarder: it may
-//! run on any thread, copies its arguments into a message for the isolate,
-//! and returns at once; the dispatcher then runs the implementation on the
-//! event loop.
+//! A method that returns a value is a `NativeCallable.isolateLocal`
+//! trampoline: it runs synchronously on the isolate's thread, receives its
+//! borrowed arguments in place, adopts object arguments, and returns its
+//! value to the producer as one C value (a scalar, an optional-scalar
+//! struct, a fresh object reference, or a `{prefix}_alloc` run). The vtable
+//! is flagged thread-affine, so the producer refuses to call such a method
+//! from any other thread (failing it with -4) instead of letting the VM
+//! abort. A thrown exception never unwinds: a method that throws a domain
+//! reports its code and payload, and anything else is reported with a
+//! runtime code. A void method is a `NativeCallable.isolateGroupBound`
+//! forwarder: it may run on any thread, copies its arguments into a message
+//! for the isolate, and returns at once; the dispatcher then runs the
+//! implementation on the event loop.
 
+use crate::codegen::values::{crossing, Crossing};
 use crate::codegen::CodeWriter;
 use heck::ToUpperCamelCase;
 use weaveffi_model::model::{
-    CallbackInterfaceBinding, CallbackMethodBinding, CallbackParamBinding, Model,
+    CallbackBinding, CallbackMethodBinding, ErrorStrategy, FieldBinding, Model,
 };
-use weaveffi_model::plan::{ArgPass, CallbackRetPass, ErrorStrategy};
-use weaveffi_model::ty::{Prim, Ty};
+use weaveffi_model::ty::Prim;
 
-use crate::targets::dart::calls::{receive, Arrival, Throws};
-use crate::targets::dart::codec::{pack_fn, unpack_fn};
+use crate::targets::dart::calls::Throws;
+use crate::targets::dart::codec::unpack_fn;
 use crate::targets::dart::docs::Docs;
 use crate::targets::dart::entities::payload_fn;
 use crate::targets::dart::types::{
-    dart_class, dart_ident, dart_in_type, dart_type, ffi_type, ffi_typedef, object_class, slice_fn,
-    typed_data_kind, zero_literal,
+    dart_class, dart_ident, dart_in_type, dart_type, ffi_type, ffi_typedef, typed_data_kind,
 };
+use crate::targets::dart::values::{exceptional_return, hand_over, receive, zero};
 
 /// The private global holding a callback interface's vtable.
 pub(crate) fn vtable_var(name: &str) -> String {
@@ -62,11 +61,10 @@ fn lower_first(s: &str) -> String {
     })
 }
 
-/// Whether a method returns a value to the producer (a non-void C return or
-/// a return out slot), which makes it a synchronous, thread-affine
-/// trampoline.
+/// Whether a method returns a value to the producer, which makes it a
+/// synchronous, thread-affine trampoline.
 pub(crate) fn returns_value(m: &CallbackMethodBinding) -> bool {
-    !matches!(m.ret_pass, CallbackRetPass::Void)
+    m.ret.is_some()
 }
 
 /// Render one callback interface.
@@ -74,7 +72,7 @@ pub(crate) fn render_callback_interface(
     w: &mut CodeWriter,
     model: &Model,
     docs: &Docs,
-    cb: &CallbackInterfaceBinding,
+    cb: &CallbackBinding,
 ) {
     let class = dart_class(&cb.name);
     render_abstract_class(w, model, docs, cb, &class);
@@ -95,7 +93,7 @@ fn render_abstract_class(
     w: &mut CodeWriter,
     model: &Model,
     docs: &Docs,
-    cb: &CallbackInterfaceBinding,
+    cb: &CallbackBinding,
     class: &str,
 ) {
     w.blank();
@@ -167,13 +165,13 @@ fn render_abstract_class(
 }
 
 /// The native typedef of one vtable entry.
-fn entry_typedef(cb: &CallbackInterfaceBinding, m: &CallbackMethodBinding) -> String {
+fn entry_typedef(cb: &CallbackBinding, m: &CallbackMethodBinding) -> String {
     ffi_typedef(&format!("{}_{}", cb.c_tag, m.name))
 }
 
 /// The `Struct` whose layout is the C vtable: the `size`, `flags`, and
 /// `free` header, then one function pointer per method in declaration order.
-fn render_vtable_struct(w: &mut CodeWriter, cb: &CallbackInterfaceBinding, class: &str) {
+fn render_vtable_struct(w: &mut CodeWriter, cb: &CallbackBinding, class: &str) {
     w.blank();
     for m in &cb.methods {
         let natives: Vec<String> = m.abi.params.iter().map(|p| ffi_type(&p.ty).0).collect();
@@ -221,71 +219,32 @@ fn out_err(m: &CallbackMethodBinding) -> String {
     dart_ident(&m.abi.params.last().expect("out_err").name)
 }
 
-/// How a borrowed callback argument arrives, per its [`ArgPass`].
-fn arrival(p: &CallbackParamBinding) -> Arrival {
-    let n = |s: &weaveffi_model::abi::AbiParam| dart_ident(&s.name);
-    match &p.pass {
-        ArgPass::Direct { slot } => Arrival::Direct(n(slot)),
-        ArgPass::OptDirect { has, value, .. } => Arrival::OptDirect {
-            has: n(has),
-            value: n(value),
-        },
-        ArgPass::Slice { ptr, len, elem } => Arrival::Slice {
-            ptr: n(ptr),
-            len: n(len),
-            elem: *elem,
-        },
-        ArgPass::String { ptr, len } => Arrival::String {
-            ptr: n(ptr),
-            len: n(len),
-        },
-        ArgPass::Bytes { ptr, len } => Arrival::Bytes {
-            ptr: n(ptr),
-            len: n(len),
-        },
-        ArgPass::Buffer { ptr, len } => Arrival::Buffer {
-            ptr: n(ptr),
-            len: n(len),
-        },
-        ArgPass::Object { slot, nullable, .. } => Arrival::Object {
-            ptr: n(slot),
-            nullable: *nullable,
-        },
-        ArgPass::Callback { .. } => {
-            unreachable!("callback methods never take callback interfaces")
-        }
-    }
-}
-
 /// Whether an argument is received into a local first: objects (adopted
 /// references) and buffers (which may carry object tokens), so each
 /// reference is owned by a finalizable wrapper even if a later step throws.
-fn owns_references(p: &CallbackParamBinding) -> bool {
-    matches!(p.pass, ArgPass::Object { .. } | ArgPass::Buffer { .. })
+fn owns_references(p: &FieldBinding) -> bool {
+    matches!(
+        crossing(&p.ty),
+        Crossing::Object { .. } | Crossing::Buffer(_)
+    )
 }
 
 /// A value-returning method's `isolateLocal` trampoline: adopt object
 /// arguments first (so a later failure still leaves each reference owned by
 /// a finalizable wrapper), receive the borrowed ones in place, call the
-/// implementation, and hand its value to the producer. A thrown exception is
-/// reported through `out_err` and the zero value is returned.
+/// implementation, and return its value to the producer. A thrown exception
+/// is reported through `out_err` and the zero value is returned.
 fn render_trampoline(
     w: &mut CodeWriter,
     model: &Model,
-    cb: &CallbackInterfaceBinding,
+    cb: &CallbackBinding,
     m: &CallbackMethodBinding,
     class: &str,
 ) {
     let throws = &Throws::of(model, &m.error);
+    let ret = m.ret.as_ref().expect("a value-returning method");
     let (_, dart_ret) = ffi_type(&m.abi.ret);
     let out_err = out_err(m);
-    let n = |s: &weaveffi_model::abi::AbiParam| dart_ident(&s.name);
-    let zero = match (&m.ret_pass, &m.ret) {
-        (CallbackRetPass::Direct, Some(ret)) => Some(zero_literal(ret)),
-        (CallbackRetPass::OptDirect { .. }, _) => Some("false"),
-        (CallbackRetPass::Object { .. }, _) => Some("nullptr"),
-        _ => None,
-    };
     w.blank();
     w.line(format!("// Vtable entry `{}.{}`.", cb.vtable_tag, m.name));
     w.block(
@@ -299,101 +258,30 @@ fn render_trampoline(
             w.line("try {");
             w.scope(|w| {
                 let mut args = vec![String::new(); m.params.len()];
-                let first = m
+                for (i, p) in m
                     .params
                     .iter()
                     .enumerate()
-                    .filter(|(_, p)| owns_references(p));
-                for (i, p) in first {
-                    let local = format!("_{}", dart_ident(&p.name));
+                    .filter(|(_, p)| owns_references(p))
+                {
+                    let local = format!("_{}Arg", dart_ident(&p.name));
                     w.line(format!(
                         "final {local} = {};",
-                        receive(&p.ty, arrival(p), false)
+                        receive(&p.ty, &dart_ident(&p.name), false)
                     ));
                     args[i] = local;
                 }
                 for (i, p) in m.params.iter().enumerate() {
                     if !owns_references(p) {
-                        args[i] = receive(&p.ty, arrival(p), false);
+                        args[i] = receive(&p.ty, &dart_ident(&p.name), false);
                     }
                 }
-                let call = format!(
-                    "(_callbackTarget(ctx) as {class}).{}({})",
+                w.line(format!(
+                    "final _result = (_callbackTarget(ctx) as {class}).{}({});",
                     dart_ident(&m.name),
                     args.join(", ")
-                );
-                let enum_value = |ty: Option<&Ty>| match ty {
-                    Some(Ty::Enum(_)) => ".value",
-                    _ => "",
-                };
-                match &m.ret_pass {
-                    CallbackRetPass::Void => unreachable!("void methods are forwarded"),
-                    CallbackRetPass::Direct => {
-                        w.line(format!("return {call}{};", enum_value(m.ret.as_ref())));
-                    }
-                    CallbackRetPass::OptDirect { out_value } => {
-                        let inner = match &m.ret {
-                            Some(Ty::Optional(inner)) => Some(inner.as_ref()),
-                            _ => None,
-                        };
-                        w.line(format!("final _result = {call};"));
-                        w.line("if (_result == null) return false;");
-                        w.line(format!(
-                            "{}.value = _result{};",
-                            n(out_value),
-                            enum_value(inner)
-                        ));
-                        w.line("return true;");
-                    }
-                    CallbackRetPass::Slice {
-                        out_ptr,
-                        out_len,
-                        elem,
-                    } => {
-                        w.line(format!("final _result = {call};"));
-                        w.line(format!(
-                            "{}(_result, {}, {});",
-                            slice_fn("handOver", *elem),
-                            n(out_ptr),
-                            n(out_len)
-                        ));
-                    }
-                    CallbackRetPass::String { out_ptr, out_len } => {
-                        w.line(format!("final _result = {call};"));
-                        w.line(format!(
-                            "_handOver(utf8.encode(_result), {}, {});",
-                            n(out_ptr),
-                            n(out_len)
-                        ));
-                    }
-                    CallbackRetPass::Bytes { out_ptr, out_len } => {
-                        w.line(format!("final _result = {call};"));
-                        w.line(format!(
-                            "_handOver(_result, {}, {});",
-                            n(out_ptr),
-                            n(out_len)
-                        ));
-                    }
-                    CallbackRetPass::Buffer { out_ptr, out_len } => {
-                        let ret = m.ret.as_ref().expect("a buffer return");
-                        w.line(format!("final _result = {call};"));
-                        w.line(format!(
-                            "_handOver(_encode(_result, {}), {}, {});",
-                            pack_fn(ret),
-                            n(out_ptr),
-                            n(out_len)
-                        ));
-                    }
-                    // A fresh strong reference the producer adopts.
-                    CallbackRetPass::Object { nullable, .. } => {
-                        w.line(format!("final _result = {call};"));
-                        w.line(if *nullable {
-                            "return _result?._cloneRef() ?? nullptr;"
-                        } else {
-                            "return _result._cloneRef();"
-                        });
-                    }
-                }
+                ));
+                w.line(format!("return {};", hand_over(ret, "_result")));
             });
             match throws {
                 Throws::Domain(exc) => {
@@ -433,63 +321,47 @@ fn render_trampoline(
                 }
             }
             w.line("}");
-            if let Some(zero) = zero {
-                w.line(format!("return {zero};"));
-            }
+            w.line(format!("return {};", zero(ret)));
         },
     );
 }
 
-/// The `_CallbackMessage` cascade step posting one argument of a forwarded
-/// void method.
-fn post_arg(p: &CallbackParamBinding) -> String {
-    let n = |s: &weaveffi_model::abi::AbiParam| dart_ident(&s.name);
-    let scalar = |ty: &Ty| match ty {
-        Ty::Prim(Prim::Bool) => "Bool",
-        Ty::Prim(Prim::F32 | Prim::F64) => "Float64",
+/// The `_CallbackMessage` cascade step posting the argument `p` of a
+/// forwarded void method.
+fn post_arg(p: &FieldBinding) -> String {
+    let n = dart_ident(&p.name);
+    let scalar = |prim: Prim| match prim {
+        Prim::Bool => "Bool",
+        Prim::F32 | Prim::F64 => "Float64",
         _ => "Int64",
     };
-    match &p.pass {
-        ArgPass::Direct { slot } => match scalar(&p.ty) {
-            "Bool" => format!("..boolean({})", n(slot)),
-            "Float64" => format!("..float64({})", n(slot)),
-            _ => format!("..int64({})", n(slot)),
-        },
-        ArgPass::OptDirect { has, value, inner } => {
-            format!("..maybe{}({}, {})", scalar(inner), n(has), n(value))
+    match crossing(&p.ty) {
+        Crossing::Scalar(Prim::Bool) => format!("..boolean({n})"),
+        Crossing::Scalar(Prim::F32 | Prim::F64) => format!("..float64({n})"),
+        Crossing::Scalar(_) | Crossing::Enum(_) => format!("..int64({n})"),
+        Crossing::OptScalar(prim) => {
+            format!("..maybe{}({n}.has, {n}.value)", scalar(prim))
         }
-        ArgPass::Slice { ptr, len, elem } => format!(
-            "..typedData({}, {}, _CallbackMessage.{})",
-            n(ptr),
-            n(len),
-            typed_data_kind(*elem)
+        Crossing::OptEnum(_) => format!("..maybeInt64({n}.has, {n}.value)"),
+        Crossing::Slice(elem) => format!(
+            "..array({n}, {}, _CallbackMessage.{})",
+            elem.size().expect("a typed-array element is a scalar"),
+            typed_data_kind(elem)
         ),
-        ArgPass::String { ptr, len }
-        | ArgPass::Bytes { ptr, len }
-        | ArgPass::Buffer { ptr, len } => {
-            format!("..bytes({}, {})", n(ptr), n(len))
-        }
-        ArgPass::Object { slot, .. } => format!("..pointer({})", n(slot)),
-        ArgPass::Callback { .. } => {
-            unreachable!("callback methods never take callback interfaces")
-        }
+        Crossing::Utf8 | Crossing::Bytes | Crossing::Buffer(_) => format!("..run({n})"),
+        Crossing::Object { .. } => format!("..pointer({n})"),
     }
 }
 
 /// A void method's `isolateGroupBound` forwarder: it runs outside the
-/// isolate, so it only copies its slots into a message (borrowed runs and
-/// arrays are copied by the post) and touches no Dart globals.
+/// isolate, so it only copies its slots into a message (borrowed runs are
+/// copied by the post) and touches no Dart globals.
 fn render_forwarder(
     w: &mut CodeWriter,
-    cb: &CallbackInterfaceBinding,
+    cb: &CallbackBinding,
     m: &CallbackMethodBinding,
     class: &str,
 ) {
-    let index = cb
-        .methods
-        .iter()
-        .position(|x| x.name == m.name)
-        .expect("method of its interface");
     w.blank();
     w.line(format!(
         "// Vtable entry `{}.{}`: forwarded to the isolate.",
@@ -500,7 +372,8 @@ fn render_forwarder(
         "}",
         |w| {
             w.line(format!(
-                "_CallbackMessage(ctx, {index}, {})",
+                "_CallbackMessage(ctx, {}, {})",
+                m.slot,
                 m.params.len()
             ));
             w.scope(|w| {
@@ -517,7 +390,7 @@ fn render_forwarder(
 
 /// The dispatcher running forwarded void methods on the isolate:
 /// `message` is `[key, method, arguments...]`.
-fn render_dispatch(w: &mut CodeWriter, cb: &CallbackInterfaceBinding, class: &str) {
+fn render_dispatch(w: &mut CodeWriter, cb: &CallbackBinding, class: &str) {
     w.blank();
     w.block(
         format!(
@@ -534,16 +407,13 @@ fn render_dispatch(w: &mut CodeWriter, cb: &CallbackInterfaceBinding, class: &st
             }
             w.line(format!("final target = impl as {class};"));
             w.block("switch (method) {", "}", |w| {
-                for (index, m) in cb.methods.iter().enumerate() {
-                    if returns_value(m) {
-                        continue;
-                    }
+                for m in cb.methods.iter().filter(|m| !returns_value(m)) {
                     // Object arguments are adopted first, so a failure while
                     // decoding the rest still leaves each transferred
                     // reference owned by a finalizable wrapper.
-                    w.block(format!("case {index}: {{"), "}", |w| {
+                    w.block(format!("case {}: {{", m.slot), "}", |w| {
                         let is_object =
-                            |p: &CallbackParamBinding| matches!(p.pass, ArgPass::Object { .. });
+                            |p: &FieldBinding| matches!(crossing(&p.ty), Crossing::Object { .. });
                         for (i, p) in m.params.iter().enumerate().filter(|(_, p)| is_object(p)) {
                             message_arg(w, p, i + 2);
                         }
@@ -565,47 +435,38 @@ fn render_dispatch(w: &mut CodeWriter, cb: &CallbackInterfaceBinding, class: &st
 }
 
 /// Decode forwarded argument `i` of `message` into the local `a{i}`.
-fn message_arg(w: &mut CodeWriter, p: &CallbackParamBinding, i: usize) {
+fn message_arg(w: &mut CodeWriter, p: &FieldBinding, i: usize) {
     let field = format!("message[{i}]");
     let local = format!("a{i}");
-    let value = match &p.pass {
-        ArgPass::Direct { .. } => match &p.ty {
-            Ty::Enum(n) => format!("{}.fromValue({field}! as int)", dart_class(n)),
-            ty => format!("{field}! as {}", dart_type(ty)),
-        },
-        ArgPass::OptDirect { inner, .. } => match inner {
-            Ty::Enum(n) => {
-                let raw = format!("{local}Value");
-                w.line(format!("final {raw} = {field} as int?;"));
-                format!("{raw} == null ? null : {}.fromValue({raw})", dart_class(n))
-            }
-            other => format!("{field} as {}?", dart_type(other)),
-        },
-        ArgPass::Slice { .. } => format!("{field}! as {}", dart_type(&p.ty)),
-        ArgPass::String { .. } => format!("utf8.decode({field}! as Uint8List)"),
-        ArgPass::Bytes { .. } => format!("{field}! as Uint8List"),
-        ArgPass::Buffer { .. } => {
-            format!("_decode({field}! as Uint8List, {})", unpack_fn(&p.ty))
+    let value = match crossing(&p.ty) {
+        Crossing::Enum(n) => format!("{}.fromValue({field}! as int)", dart_class(n)),
+        Crossing::Scalar(_) | Crossing::Slice(_) => {
+            format!("{field}! as {}", dart_type(&p.ty))
         }
-        ArgPass::Object {
-            nullable,
+        Crossing::OptEnum(n) => {
+            let raw = format!("{local}Value");
+            w.line(format!("final {raw} = {field} as int?;"));
+            format!("{raw} == null ? null : {}.fromValue({raw})", dart_class(n))
+        }
+        Crossing::OptScalar(_) => format!("{field} as {}", dart_type(&p.ty)),
+        Crossing::Utf8 => format!("utf8.decode({field}! as Uint8List)"),
+        Crossing::Bytes => format!("{field}! as Uint8List"),
+        Crossing::Buffer(t) => format!("_decode({field}! as Uint8List, {})", unpack_fn(t)),
+        Crossing::Object {
             interface,
-            ..
+            nullable,
         } => {
             let address = format!("{local}Address");
             w.line(format!("final {address} = {field}! as int;"));
             let adopt = format!(
                 "{}._(Pointer<Void>.fromAddress({address}))",
-                object_class(interface)
+                dart_class(interface)
             );
-            if *nullable {
+            if nullable {
                 format!("{address} == 0 ? null : {adopt}")
             } else {
                 adopt
             }
-        }
-        ArgPass::Callback { .. } => {
-            unreachable!("callback methods never take callback interfaces")
         }
     };
     w.line(format!("final {local} = {value};"));
@@ -613,9 +474,9 @@ fn message_arg(w: &mut CodeWriter, p: &CallbackParamBinding, i: usize) {
 
 /// The vtable every instance passed to the producer from this isolate
 /// shares; the per-instance state travels in `ctx`. It's flagged
-/// thread-affine (DESIGN 1.7): only this isolate's thread may call a
-/// value-returning method.
-fn render_vtable(w: &mut CodeWriter, cb: &CallbackInterfaceBinding, class: &str) {
+/// thread-affine: only this isolate's thread may call a value-returning
+/// method.
+fn render_vtable(w: &mut CodeWriter, cb: &CallbackBinding, class: &str) {
     let strukt = vtable_struct(class);
     w.blank();
     w.block(
@@ -628,26 +489,18 @@ fn render_vtable(w: &mut CodeWriter, cb: &CallbackInterfaceBinding, class: &str)
                 w.scope(|w| {
                     w.line(format!("..size = sizeOf<{strukt}>()"));
                     w.line("..flags = _vtableThreadAffine");
-                    w.line(if cb.methods.is_empty() {
-                        "..free = _callbackFree;"
-                    } else {
-                        "..free = _callbackFree"
-                    });
+                    w.line("..free = _callbackFree");
                     for (i, m) in cb.methods.iter().enumerate() {
                         let td = entry_typedef(cb, m);
                         let entry = entry_fn(class, &m.name);
-                        let callable = match (&m.ret_pass, &m.ret) {
-                            (CallbackRetPass::Void, _) => {
-                                format!("NativeCallable<{td}>.isolateGroupBound({entry})")
-                            }
-                            (CallbackRetPass::Direct, Some(ret)) => format!(
-                                "NativeCallable<{td}>.isolateLocal({entry}, exceptionalReturn: {})",
-                                zero_literal(ret)
-                            ),
-                            (CallbackRetPass::OptDirect { .. }, _) => format!(
-                                "NativeCallable<{td}>.isolateLocal({entry}, exceptionalReturn: false)"
-                            ),
-                            _ => format!("NativeCallable<{td}>.isolateLocal({entry})"),
+                        let callable = match &m.ret {
+                            None => format!("NativeCallable<{td}>.isolateGroupBound({entry})"),
+                            Some(ret) => match exceptional_return(ret) {
+                                Some(zero) => format!(
+                                    "NativeCallable<{td}>.isolateLocal({entry}, exceptionalReturn: {zero})"
+                                ),
+                                None => format!("NativeCallable<{td}>.isolateLocal({entry})"),
+                            },
                         };
                         let end = if i + 1 == cb.methods.len() { ";" } else { "" };
                         w.line(format!("..{} = _pin({callable}){end}", dart_ident(&m.name)));
@@ -674,8 +527,9 @@ fn domain_has_fields(model: &Model, error: &ErrorStrategy) -> bool {
 /// carry fields, by domain name: each needs an encoder for those fields.
 pub(crate) fn reported_domains(model: &Model) -> std::collections::BTreeSet<String> {
     model
-        .callback_interfaces()
-        .flat_map(|(_, cb)| &cb.methods)
+        .callbacks
+        .iter()
+        .flat_map(|cb| &cb.methods)
         .filter(|m| returns_value(m) && domain_has_fields(model, &m.error))
         .filter_map(|m| m.error.domain().map(str::to_string))
         .collect()
