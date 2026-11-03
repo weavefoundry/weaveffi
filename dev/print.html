@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "ayu";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-1339018f.js";
+            window.path_to_searchindex_js = "searchindex-e2d4111b.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-e1100732.js"></script>
+        <script src="toc-a16c9ce3.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -262,6 +262,8 @@ project, which the workspace’s tests build and call.</p>
 <pre><code class="language-bash">cargo install weaveffi-cli
 weaveffi --version
 </code></pre>
+<p>To set up tab completion in your shell, see
+<a href="#shell-completions">Shell Completions</a>.</p>
 <h2 id="write-the-producer"><a class="header" href="#write-the-producer">Write the producer</a></h2>
 <p>Create a library crate and add the <code>weaveffi</code> crate. It needs no
 <code>crate-type</code>: WeaveFFI builds the C dynamic library itself (with <code>cargo rustc --crate-type cdylib</code>).</p>
@@ -3999,6 +4001,53 @@ emit JavaScript). A deployment platform is never a target name: <code>kotlin</co
 covers Android and the desktop JVM. The same token names the <code>--target</code>
 value, the <code>[generators.&lt;target&gt;]</code> table, the output directory, and the page
 under <a href="generators/README.html">Generators</a>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="shell-completions"><a class="header" href="#shell-completions">Shell Completions</a></h1>
+<p><code>weaveffi completions &lt;shell&gt;</code> prints a completion script to standard
+output, where <code>&lt;shell&gt;</code> is <code>bash</code>, <code>zsh</code>, <code>fish</code>, <code>powershell</code>, or <code>elvish</code>:</p>
+<pre><code class="language-bash">weaveffi completions bash
+</code></pre>
+<p>Install the script with the section for your shell below. The Bash, Zsh, and
+fish setups save a copy of the script, so regenerate it after upgrading the
+CLI to pick up new commands and flags; the PowerShell and Elvish setups run
+the CLI each time the shell starts and stay current on their own.</p>
+<h2 id="bash"><a class="header" href="#bash">Bash</a></h2>
+<p>With the <a href="https://github.com/scop/bash-completion">bash-completion</a> package
+installed, write the script to your user completions directory, where it’s
+loaded the first time you complete <code>weaveffi</code>:</p>
+<pre><code class="language-bash">mkdir -p ~/.local/share/bash-completion/completions
+weaveffi completions bash &gt; ~/.local/share/bash-completion/completions/weaveffi
+</code></pre>
+<p>To install it for every user on a system that loads
+<code>/etc/bash_completion.d</code>, write it with <code>sudo tee</code> (a plain <code>sudo weaveffi ... &gt;</code> fails, because the redirection runs without root):</p>
+<pre><code class="language-bash">weaveffi completions bash | sudo tee /etc/bash_completion.d/weaveffi &gt; /dev/null
+</code></pre>
+<h2 id="zsh"><a class="header" href="#zsh">Zsh</a></h2>
+<p>Write the script as <code>_weaveffi</code> in a directory on your <code>$fpath</code>:</p>
+<pre><code class="language-zsh">mkdir -p ~/.zfunc
+weaveffi completions zsh &gt; ~/.zfunc/_weaveffi
+</code></pre>
+<p>Then add the directory to <code>fpath</code> in <code>~/.zshrc</code>, before <code>compinit</code> runs. If
+your configuration already calls <code>compinit</code> (as Oh My Zsh does), add only the
+first line, above that call:</p>
+<pre><code class="language-zsh">fpath=(~/.zfunc $fpath)
+autoload -Uz compinit &amp;&amp; compinit
+</code></pre>
+<h2 id="fish"><a class="header" href="#fish">fish</a></h2>
+<pre><code class="language-fish">mkdir -p ~/.config/fish/completions
+weaveffi completions fish &gt; ~/.config/fish/completions/weaveffi.fish
+</code></pre>
+<h2 id="powershell"><a class="header" href="#powershell">PowerShell</a></h2>
+<p>Add a line to your profile that loads the script in each session, creating
+the profile first if it doesn’t exist:</p>
+<pre><code class="language-powershell">if (!(Test-Path $PROFILE)) { New-Item -ItemType File -Path $PROFILE -Force | Out-Null }
+Add-Content $PROFILE 'weaveffi completions powershell | Out-String | Invoke-Expression'
+</code></pre>
+<p>Open a new session to load it.</p>
+<h2 id="elvish"><a class="header" href="#elvish">Elvish</a></h2>
+<p>Add this line to <code>~/.config/elvish/rc.elv</code>:</p>
+<pre><code class="language-elvish">eval (weaveffi completions elvish | slurp)
+</code></pre>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="generators"><a class="header" href="#generators">Generators</a></h1>
 <p>WeaveFFI ships eleven generators, one per target, and every one implements
