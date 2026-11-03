@@ -7,7 +7,7 @@ use libfuzzer_sys::fuzz_target;
 #[cfg(fuzzing)]
 fuzz_target!(|data: &[u8]| {
     if let Ok(s) = std::str::from_utf8(data) {
-        let _ = weaveffi_ir::ir::parse_type_ref(s);
+        let _ = weaveffi_model::ir::parse_type_ref(s);
     }
 });
 

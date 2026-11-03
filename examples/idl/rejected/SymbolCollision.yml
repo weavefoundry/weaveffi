@@ -1,0 +1,11 @@
+# rejected: SymbolCollision
+version: "0.13.0"
+interfaces:
+  - name: Store
+    methods:
+      - { name: get, params: [{ name: key, type: string }], return: bytes }
+functions:
+  - name: Store_get
+    params:
+      - { name: key, type: string }
+    return: bytes

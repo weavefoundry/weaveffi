@@ -1,81 +1,87 @@
-//! Snapshot tests covering every generator against a small, feature-complete
-//! IDL corpus.
+//! Snapshot tests covering every generator.
 //!
-//! Five fixtures cover the whole IDL surface between them: `kitchen_sink`
-//! (every scalar and composite type, an interface with objects in optional,
-//! list, iterator, and record positions, a callback interface, an error
-//! domain, iterators, async and cancellable functions, deprecation, and a
-//! nested submodule), `shapes` (rich enums and the full numeric primitive
-//! set), `nested_modules` (a three-deep module tree with cross-module
-//! references), `docs_everywhere` (doc comments on every declaration kind),
-//! and `edge_cases` (identifiers that are reserved words in some target,
-//! deeply nested composites, optional parameters, interfaces and callback
-//! interfaces in every legal position, async functions with non-string
-//! results, type-level deprecation, and scalar and string iterators). One
-//! test per generator runs it over all
-//! five fixtures into a fresh tempdir, walks the
-//! resulting files in sorted order, and snapshots each file under
-//! `tests/snapshots/`. Regressions in any generator's output fail the
-//! affected `cargo insta test` job; behavioral regressions are the
-//! conformance harness's job.
+//! Six fixtures cover the whole IDL surface between them: `kitchen_sink`
+//! (every scalar and composite type, optional scalars and typed arrays in
+//! every position, an interface with objects in optional, list, iterator,
+//! and record positions, two callback interfaces, two error domains, typed
+//! and untyped `throws`, iterators, async and cancellable functions, and
+//! deprecation), `shapes` (rich enums and the full numeric primitive set),
+//! `imports` (an API split across three files, with references in every
+//! direction), `docs_everywhere` (doc comments on every declaration kind),
+//! `edge_cases` (identifiers that are reserved words in some target, deeply
+//! nested composites, and every legal position of interfaces and callback
+//! interfaces), and `recursive` (value types that contain themselves or each
+//! other).
+//!
+//! Every target renders all six fixtures, in its own test
+//! (`cargo test --test snapshots python`). Each rendered file must carry the
+//! WeaveFFI prelude, and a file that shares its name with a C target output
+//! (a target's copy of the C header) must be byte-equal to the C target's.
+//! Only `kitchen_sink` is snapshotted, as full files, and only the files
+//! that depend on the API: a file matching one of the target's
+//! [`fixed_files`](weaveffi_cli::targets::Target::fixed_files) patterns
+//! (fixed runtimes, package manifests, READMEs) isn't snapshotted at all.
+//! The other fixtures are covered by the fixture compile checks
+//! (`scripts/check-fixtures.sh`) and by targeted assertions in each target's
+//! unit tests.
+//!
+//! Snapshots live under `tests/snapshots/` and are named
+//! `{target}_kitchen_sink__{path}`.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
-use camino::Utf8Path;
-use weaveffi_core::codegen::{ConfiguredBackend, Target};
-use weaveffi_core::resolved::ResolvedApi;
-use weaveffi_core::validate::validate_api;
-use weaveffi_gen_c::{CConfig, CGenerator};
-use weaveffi_gen_cpp::{CppConfig, CppGenerator};
-use weaveffi_gen_dart::{DartConfig, DartGenerator};
-use weaveffi_gen_dotnet::{DotnetConfig, DotnetGenerator};
-use weaveffi_gen_go::{GoConfig, GoGenerator};
-use weaveffi_gen_kotlin::{KotlinConfig, KotlinGenerator};
-use weaveffi_gen_node::{NodeConfig, NodeGenerator};
-use weaveffi_gen_python::{PythonConfig, PythonGenerator};
-use weaveffi_gen_ruby::{RubyConfig, RubyGenerator};
-use weaveffi_gen_swift::{SwiftConfig, SwiftGenerator};
-use weaveffi_gen_wasm::{WasmConfig, WasmGenerator};
-use weaveffi_ir::parse::parse_api_str;
+use weaveffi_cli::targets::{self, Target, REGISTRY};
+use weaveffi_model::model::Model;
+use weaveffi_model::parse::load_api;
+use weaveffi_model::pkg::Identity;
+use weaveffi_model::validate::validate;
 
-const FIXTURES: [&str; 5] = [
+const FIXTURES: [&str; 6] = [
     "kitchen_sink",
     "shapes",
-    "nested_modules",
+    "imports",
     "docs_everywhere",
     "edge_cases",
+    "recursive",
 ];
 
-fn load_api(stem: &str) -> ResolvedApi {
+/// The one fixture whose outputs are snapshotted. It exercises every
+/// feature, so it also emits every optional file (such as Kotlin's
+/// `Async.kt`), and every fixed-file pattern must match one of its outputs,
+/// so a renamed or removed file can't leave a stale entry behind.
+const SNAPSHOTTED: &str = "kitchen_sink";
+
+fn matches_pattern(pattern: &str, file_name: &str) -> bool {
+    match pattern.strip_prefix('*') {
+        Some(suffix) => file_name.ends_with(suffix),
+        None => file_name == pattern,
+    }
+}
+
+/// The C target's outputs for `api`, keyed by file name. Other targets copy
+/// the C header verbatim, under the same file name.
+fn c_outputs(model: &Model) -> BTreeMap<String, String> {
+    targets::find("c")
+        .expect("the C target")
+        .build_default()
+        .render(model)
+        .into_iter()
+        .map(|file| {
+            let name = file.path.file_name().expect("file name").to_owned();
+            (name, file.contents)
+        })
+        .collect()
+}
+
+fn load_model(stem: &str) -> Model {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(format!("{stem}.yml"));
-    let contents = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
-    let api = parse_api_str(&contents, "yaml")
-        .unwrap_or_else(|e| panic!("parse fixture {}: {e}", path.display()));
-    validate_api(api, None).unwrap_or_else(|e| panic!("validate fixture {}: {e}", path.display()))
-}
-
-fn collect_files_sorted(root: &Path) -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.is_file() {
-                out.push(path);
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(root, &mut out);
-    out.sort();
-    out
+    let (api, sources) =
+        load_api(&path).unwrap_or_else(|e| panic!("load fixture {}: {e}", path.display()));
+    validate(&api, &Identity::named(stem), Some(&sources))
+        .unwrap_or_else(|e| panic!("validate fixture {}: {e}", path.display()))
 }
 
 fn sanitize(rel: &Path) -> String {
@@ -115,14 +121,17 @@ fn assert_prelude_present(contents: &str, file: &Path) {
 }
 
 fn run_snapshots(target: &dyn Target) {
+    let fixed = target.fixed_files();
+    let mut unmatched: BTreeSet<&str> = fixed.iter().copied().collect();
     for stem in FIXTURES {
-        let api = load_api(stem);
-        let tmp = tempfile::tempdir().expect("create tempdir");
-        let out_dir = Utf8Path::from_path(tmp.path()).expect("utf8 tempdir");
-        target.generate(&api, out_dir).expect("generator failed");
-
-        let root = out_dir.join(target.name());
-        let files = collect_files_sorted(root.as_std_path());
+        let model = load_model(stem);
+        let c_headers = if target.name() == "c" {
+            BTreeMap::new()
+        } else {
+            c_outputs(&model)
+        };
+        let mut files = target.render(&model);
+        files.sort_by(|a, b| a.path.cmp(&b.path));
         assert!(
             !files.is_empty(),
             "generator {} produced no files for fixture {stem}",
@@ -135,40 +144,60 @@ fn run_snapshots(target: &dyn Target) {
             omit_expression => true,
         }, {
             for file in files {
-                let rel = file
-                    .strip_prefix(root.as_std_path())
-                    .expect("file under generator root");
-                let name = format!("{}_{stem}__{}", target.name(), sanitize(rel));
-                let contents = fs::read_to_string(&file)
-                    .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
-                insta::assert_snapshot!(name, redact_version(&contents));
-                assert_prelude_present(&contents, &file);
+                assert_prelude_present(&file.contents, file.path.as_std_path());
+                let file_name = file.path.file_name().expect("file name");
+                if let Some(header) = c_headers.get(file_name) {
+                    assert!(
+                        file.contents == *header,
+                        "{} in fixture {stem} isn't a byte-equal copy of the C target's {file_name}",
+                        file.path,
+                    );
+                    continue;
+                }
+                if stem != SNAPSHOTTED {
+                    continue;
+                }
+                if let Some(pattern) = fixed.iter().find(|p| matches_pattern(p, file_name)) {
+                    unmatched.remove(pattern);
+                    continue;
+                }
+                let name = format!(
+                    "{}_{stem}__{}",
+                    target.name(),
+                    sanitize(file.path.as_std_path())
+                );
+                insta::assert_snapshot!(name, redact_version(&file.contents));
             }
         });
     }
+    assert!(
+        unmatched.is_empty(),
+        "fixed-file patterns for {} match no {SNAPSHOTTED} output: {unmatched:?}",
+        target.name(),
+    );
 }
 
+/// One test per target, with its default configuration.
 macro_rules! snapshot_tests {
-    ($( $fn_name:ident => $gen:expr, $cfg:ty; )*) => {
+    ($($name:ident),* $(,)?) => {
         $(
             #[test]
-            fn $fn_name() {
-                run_snapshots(&ConfiguredBackend::new($gen, <$cfg>::default()));
+            fn $name() {
+                let desc = targets::find(stringify!($name))
+                    .unwrap_or_else(|| panic!("{} isn't registered", stringify!($name)));
+                run_snapshots(desc.build_default().as_ref());
             }
         )*
+
+        /// Every registered target has a test above.
+        #[test]
+        fn every_target_has_a_snapshot_test() {
+            let tested = [$(stringify!($name)),*];
+            for desc in REGISTRY {
+                assert!(tested.contains(&desc.name), "add {} to snapshot_tests!", desc.name);
+            }
+        }
     };
 }
 
-snapshot_tests! {
-    snapshot_c => CGenerator, CConfig;
-    snapshot_cpp => CppGenerator, CppConfig;
-    snapshot_swift => SwiftGenerator, SwiftConfig;
-    snapshot_kotlin => KotlinGenerator, KotlinConfig;
-    snapshot_node => NodeGenerator, NodeConfig;
-    snapshot_wasm => WasmGenerator, WasmConfig;
-    snapshot_python => PythonGenerator, PythonConfig;
-    snapshot_dotnet => DotnetGenerator, DotnetConfig;
-    snapshot_dart => DartGenerator, DartConfig;
-    snapshot_go => GoGenerator, GoConfig;
-    snapshot_ruby => RubyGenerator, RubyConfig;
-}
+snapshot_tests!(c, cpp, swift, kotlin, node, wasm, python, dotnet, dart, go, ruby);

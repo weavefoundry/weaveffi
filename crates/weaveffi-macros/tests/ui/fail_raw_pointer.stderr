@@ -1,5 +1,57 @@
-error: weaveffi: raw pointers cannot cross the FFI boundary; declare the pointee as a #[weaveffi::interface] and pass it as `&T` or `Arc<T>`
- --> tests/ui/fail_raw_pointer.rs:6:22
+error[E0277]: `*mut Token` can't be returned across the WeaveFFI C ABI
+ --> tests/ui/fail_raw_pointer.rs:6:18
   |
-6 |     pub fn open() -> *mut Token {
-  |                      ^
+6 | pub fn open() -> *mut Token {
+  |                  ^ not a WeaveFFI return type
+  |
+  = help: the trait `weaveffi::rt::types::FfiReturn<Tag>` is not implemented for `*mut Token`
+  = note: a callable returns nothing, a value type, a `#[weaveffi::interface]` by value (`Self`) or as `Arc<T>`, a `weaveffi::Iter<T>`, or a `Result` of one whose error is a `#[weaveffi::error]` domain or an untyped error (`weaveffi::Error`, `String`, ...)
+  = help: the following other types implement trait `weaveffi::rt::types::FfiReturn<UT>`:
+            ()
+            BTreeMap<K, V>
+            HashMap<K, V>
+            Option<T>
+            Result<T, E>
+            String
+            Vec<T>
+            bool
+          and $N others
+
+error[E0277]: `*mut Token` can't be returned across the WeaveFFI C ABI
+ --> tests/ui/fail_raw_pointer.rs:6:18
+  |
+6 | pub fn open() -> *mut Token {
+  |                  ^^^^^^^^^^ not a WeaveFFI return type
+  |
+  = help: the trait `weaveffi::rt::types::FfiReturn<Tag>` is not implemented for `*mut Token`
+  = note: a callable returns nothing, a value type, a `#[weaveffi::interface]` by value (`Self`) or as `Arc<T>`, a `weaveffi::Iter<T>`, or a `Result` of one whose error is a `#[weaveffi::error]` domain or an untyped error (`weaveffi::Error`, `String`, ...)
+  = help: the following other types implement trait `weaveffi::rt::types::FfiReturn<UT>`:
+            ()
+            BTreeMap<K, V>
+            HashMap<K, V>
+            Option<T>
+            Result<T, E>
+            String
+            Vec<T>
+            bool
+          and $N others
+
+error[E0277]: `*mut Token` can't be returned across the WeaveFFI C ABI
+ --> tests/ui/fail_raw_pointer.rs:5:1
+  |
+5 | #[weaveffi::export]
+  | ^^^^^^^^^^^^^^^^^^^ not a WeaveFFI return type
+  |
+  = help: the trait `weaveffi::rt::types::FfiReturn<Tag>` is not implemented for `*mut Token`
+  = note: a callable returns nothing, a value type, a `#[weaveffi::interface]` by value (`Self`) or as `Arc<T>`, a `weaveffi::Iter<T>`, or a `Result` of one whose error is a `#[weaveffi::error]` domain or an untyped error (`weaveffi::Error`, `String`, ...)
+  = help: the following other types implement trait `weaveffi::rt::types::FfiReturn<UT>`:
+            ()
+            BTreeMap<K, V>
+            HashMap<K, V>
+            Option<T>
+            Result<T, E>
+            String
+            Vec<T>
+            bool
+          and $N others
+  = note: this error originates in the attribute macro `weaveffi::export` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -1,0 +1,11 @@
+error[E0277]: the trait bound `LookupError: From<ForeignError>` is not satisfied
+  --> tests/ui/fail_callback_error_without_from.rs:13:48
+   |
+13 |     fn lookup(&self, key: &str) -> Result<i64, LookupError>;
+   |                                                ^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `From<ForeignError>` is not implemented for `LookupError`
+  --> tests/ui/fail_callback_error_without_from.rs:6:1
+   |
+ 6 | pub enum LookupError {
+   | ^^^^^^^^^^^^^^^^^^^^

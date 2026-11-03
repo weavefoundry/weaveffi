@@ -4,7 +4,7 @@
 #[cfg(fuzzing)]
 use libfuzzer_sys::fuzz_target;
 #[cfg(fuzzing)]
-use weaveffi_ir::parse::parse_api_str;
+use weaveffi_model::parse::parse_api_str;
 
 #[cfg(fuzzing)]
 fuzz_target!(|data: &[u8]| {

@@ -1,1092 +1,783 @@
-// Conformance consumer: codec sample, C target (ABI revision 2).
+// Conformance consumer: codec sample, C target (ABI revision 6).
 //
-// A round-trip check of the value-buffer protocol against the producer's own
-// codec: every fixed-width scalar, strings (including non-ASCII), bytes,
-// present and absent optionals, lists (nested and empty), string- and
-// integer-keyed maps with record values, nested records, every rich-enum
-// variant, lists of optionals and enums, and object tokens in a record
-// field, an optional, and a list. Fixtures fetched from the producer are
-// checked field by field (producer encodes, consumer decodes), handed back
-// to `verify_*` (consumer encodes, producer decodes), and re-encoded through
-// `roundtrip_*` and compared again; hand-built edge values (empty
-// containers, 64-bit extremes, NaN, infinities, negative zero) go through
-// the same round trip. Exits 0 on success; aborts on any mismatch.
+// The shared-vector loop: for every vector the producer serves, decode it
+// with the generated `codec_buffer.h`, re-encode it (which must reproduce the
+// producer's bytes exactly, objects aside), pass it back to `check_vector`,
+// and push each primitive vector's value through the matching direct-family
+// `echo_*`. Then vectors built from literals (so a symmetric encode/decode
+// bug can't hide), spot checks of decoded fields, the typed out-of-range
+// error and its payload, malformed buffers (truncated, unknown tag, trailing
+// bytes, a bad bool, a duplicate map key) rejected as marshalling failures,
+// object identity and reference counting through buffers, and the one-value
+// shapes: optional scalars (opt structs, with their `bool` bytes checked)
+// and typed arrays (runs of packed elements, `len` in bytes) in both
+// directions and as iterator items, a `usize`, a `char`, and a custom type.
+// It also checks the per-declaration contract functions against hashes it
+// computes itself. Ends by asserting the producer's leak counters are zero.
 
-#include <assert.h>
+#include "harness.h"
+
 #include <math.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <stddef.h>
 
-#include "weaveffi.h"
-#include "wvbuf.h"
+#include "codec_buffer.h"
 
-// ── Scalars ────────────────────────────────────────────────────────────────
+HARNESS_RUNS(codec)
 
-typedef struct {
-    int8_t i8v;
-    uint8_t u8v;
-    int16_t i16v;
-    uint16_t u16v;
-    int32_t i32v;
-    uint32_t u32v;
-    int64_t i64v;
-    uint64_t u64v;
-    float f32v;
-    double f64v;
-    int flag;
-    int32_t color;
-} scalars_t;
-
-static void read_scalars(wv_reader* r, scalars_t* s) {
-    s->i8v = wv_get_i8(r);
-    s->u8v = wv_get_u8(r);
-    s->i16v = wv_get_i16(r);
-    s->u16v = wv_get_u16(r);
-    s->i32v = wv_get_i32(r);
-    s->u32v = wv_get_u32(r);
-    s->i64v = wv_get_i64(r);
-    s->u64v = wv_get_u64(r);
-    s->f32v = wv_get_f32(r);
-    s->f64v = wv_get_f64(r);
-    s->flag = wv_get_bool(r);
-    s->color = wv_get_i32(r);
-}
-
-static void write_scalars(wv_writer* w, const scalars_t* s) {
-    wv_put_i8(w, s->i8v);
-    wv_put_u8(w, s->u8v);
-    wv_put_i16(w, s->i16v);
-    wv_put_u16(w, s->u16v);
-    wv_put_i32(w, s->i32v);
-    wv_put_u32(w, s->u32v);
-    wv_put_i64(w, s->i64v);
-    wv_put_u64(w, s->u64v);
-    wv_put_f32(w, s->f32v);
-    wv_put_f64(w, s->f64v);
-    wv_put_bool(w, s->flag);
-    wv_put_i32(w, s->color);
-}
-
-// Bitwise float equality, so NaN payloads and the sign of zero count.
 static int f32_bits_eq(float a, float b) { return memcmp(&a, &b, 4) == 0; }
 static int f64_bits_eq(double a, double b) { return memcmp(&a, &b, 8) == 0; }
 
-static int scalars_eq(const scalars_t* a, const scalars_t* b) {
-    return a->i8v == b->i8v && a->u8v == b->u8v && a->i16v == b->i16v &&
-           a->u16v == b->u16v && a->i32v == b->i32v && a->u32v == b->u32v &&
-           a->i64v == b->i64v && a->u64v == b->u64v &&
-           f32_bits_eq(a->f32v, b->f32v) && f64_bits_eq(a->f64v, b->f64v) &&
-           a->flag == b->flag && a->color == b->color;
+static int str_is(codec_str s, const char* expected, size_t n) {
+    return s.len == n && (n == 0 || memcmp(s.ptr, expected, n) == 0);
 }
 
-// The canonical fixture the producer hands out and expects back.
-static const scalars_t CANONICAL_SCALARS = {
-    -8, 200, -16000, 60000, -2000000000, 4000000000u,
-    -9007199254740993LL, 18446744073709551615ULL, 1.5f, -2.25e100, 1,
-    weaveffi_codec_Color_Blue,
-};
-
-// ── Shape (rich enum) ──────────────────────────────────────────────────────
-
-typedef struct {
-    int32_t tag;
-    double radius;        // Circle
-    float width, height;  // Rect
-    char* label;          // Labeled
-    int32_t count;        // Labeled
-    scalars_t inner;      // Nested
-    int has_note;         // Nested
-    char* note;           // Nested (when has_note)
-} shape_t;
-
-static void read_shape(wv_reader* r, shape_t* s) {
-    memset(s, 0, sizeof *s);
-    s->tag = wv_get_i32(r);
-    switch (s->tag) {
-        case weaveffi_codec_Shape_Empty:
-            break;
-        case weaveffi_codec_Shape_Circle:
-            s->radius = wv_get_f64(r);
-            break;
-        case weaveffi_codec_Shape_Rect:
-            s->width = wv_get_f32(r);
-            s->height = wv_get_f32(r);
-            break;
-        case weaveffi_codec_Shape_Labeled:
-            s->label = wv_get_str(r);
-            s->count = wv_get_i32(r);
-            break;
-        case weaveffi_codec_Shape_Nested:
-            read_scalars(r, &s->inner);
-            s->has_note = wv_get_bool(r);
-            if (s->has_note) s->note = wv_get_str(r);
-            break;
-        default:
-            assert(0 && "unknown Shape tag");
+// Fetch vector `i`, keeping a copy of the producer's encoding in `*raw`
+// (owned).
+static codec_Vector fetch(uint32_t i, uint8_t** raw, size_t* raw_len) {
+    codec_error err;
+    codec_run run = codec_vector(i, &err);
+    assert(err.code == 0 && run.ptr != NULL);
+    if (raw != NULL) {
+        *raw = (uint8_t*)malloc(run.len);
+        memcpy(*raw, run.ptr, run.len);
+        *raw_len = run.len;
     }
+    codec_Vector v;
+    assert(codec_Vector_take(run, &v));
+    return v;
 }
 
-static void write_shape(wv_writer* w, const shape_t* s) {
-    wv_put_i32(w, s->tag);
-    switch (s->tag) {
-        case weaveffi_codec_Shape_Empty:
-            break;
-        case weaveffi_codec_Shape_Circle:
-            wv_put_f64(w, s->radius);
-            break;
-        case weaveffi_codec_Shape_Rect:
-            wv_put_f32(w, s->width);
-            wv_put_f32(w, s->height);
-            break;
-        case weaveffi_codec_Shape_Labeled:
-            wv_put_str(w, s->label);
-            wv_put_i32(w, s->count);
-            break;
-        case weaveffi_codec_Shape_Nested:
-            write_scalars(w, &s->inner);
-            wv_put_bool(w, s->has_note);
-            if (s->has_note) wv_put_str(w, s->note);
-            break;
-        default:
-            assert(0 && "unknown Shape tag");
-    }
-}
-
-static int str_eq(const char* a, const char* b) {
-    if (a == NULL || b == NULL) return a == b;
-    return strcmp(a, b) == 0;
-}
-
-static int shape_eq(const shape_t* a, const shape_t* b) {
-    if (a->tag != b->tag) return 0;
-    switch (a->tag) {
-        case weaveffi_codec_Shape_Empty:
-            return 1;
-        case weaveffi_codec_Shape_Circle:
-            return f64_bits_eq(a->radius, b->radius);
-        case weaveffi_codec_Shape_Rect:
-            return f32_bits_eq(a->width, b->width) && f32_bits_eq(a->height, b->height);
-        case weaveffi_codec_Shape_Labeled:
-            return str_eq(a->label, b->label) && a->count == b->count;
-        case weaveffi_codec_Shape_Nested:
-            return scalars_eq(&a->inner, &b->inner) && a->has_note == b->has_note &&
-                   (!a->has_note || str_eq(a->note, b->note));
-        default:
-            return 0;
-    }
-}
-
-static void shape_free(shape_t* s) {
-    free(s->label);
-    free(s->note);
-    s->label = s->note = NULL;
-}
-
-static shape_t shape_empty(void) {
-    shape_t s;
-    memset(&s, 0, sizeof s);
-    s.tag = weaveffi_codec_Shape_Empty;
-    return s;
-}
-
-static shape_t shape_circle(double radius) {
-    shape_t s = shape_empty();
-    s.tag = weaveffi_codec_Shape_Circle;
-    s.radius = radius;
-    return s;
-}
-
-static shape_t shape_rect(float w, float h) {
-    shape_t s = shape_empty();
-    s.tag = weaveffi_codec_Shape_Rect;
-    s.width = w;
-    s.height = h;
-    return s;
-}
-
-// `label` is copied so every shape_t owns its strings uniformly.
-static shape_t shape_labeled(const char* label, int32_t count) {
-    shape_t s = shape_empty();
-    s.tag = weaveffi_codec_Shape_Labeled;
-    s.label = strdup(label);
-    s.count = count;
-    return s;
-}
-
-static shape_t shape_nested(const scalars_t* inner, const char* note) {
-    shape_t s = shape_empty();
-    s.tag = weaveffi_codec_Shape_Nested;
-    s.inner = *inner;
-    s.has_note = note != NULL;
-    s.note = note ? strdup(note) : NULL;
-    return s;
-}
-
-// ── Composite ──────────────────────────────────────────────────────────────
-
-typedef struct {
-    int32_t* v;
-    uint32_t n;
-} i32_list_t;
-
-typedef struct {
-    char* key;
-    int64_t value;
-} by_name_t;
-
-typedef struct {
-    int32_t key;
-    scalars_t value;
-} by_id_t;
-
-typedef struct {
-    int has;
-    int value;
-} opt_bool_t;
-
-typedef struct {
-    char* name;
-    uint8_t* blob;
-    uint32_t blob_len;
-    int has_some_i64;
-    int64_t some_i64;
-    int has_none_i64;
-    int64_t none_i64;
-    int has_some_text;
-    char* some_text;
-    char** names;
-    uint32_t names_n;
-    i32_list_t* matrix;
-    uint32_t matrix_n;
-    double* empty;
-    uint32_t empty_n;
-    by_name_t* by_name;
-    uint32_t by_name_n;
-    by_id_t* by_id;
-    uint32_t by_id_n;
-    scalars_t scalars;
-    shape_t shape;
-    shape_t* shapes;
-    uint32_t shapes_n;
-    int has_maybe_shape;
-    shape_t maybe_shape;
-    int has_maybe_list;
-    uint8_t* maybe_list;
-    uint32_t maybe_list_n;
-    opt_bool_t* sparse;
-    uint32_t sparse_n;
-    int32_t* colors;
-    uint32_t colors_n;
-} composite_t;
-
-static void* xcalloc(size_t n, size_t size) {
-    void* p = calloc(n ? n : 1, size);
-    assert(p != NULL);
-    return p;
-}
-
-static void read_composite(wv_reader* r, composite_t* c) {
-    memset(c, 0, sizeof *c);
-    c->name = wv_get_str(r);
-    c->blob_len = wv_get_u32(r);
-    c->blob = (uint8_t*)xcalloc(c->blob_len, 1);
-    memcpy(c->blob, wv_take(r, c->blob_len), c->blob_len);
-    c->has_some_i64 = wv_get_bool(r);
-    if (c->has_some_i64) c->some_i64 = wv_get_i64(r);
-    c->has_none_i64 = wv_get_bool(r);
-    if (c->has_none_i64) c->none_i64 = wv_get_i64(r);
-    c->has_some_text = wv_get_bool(r);
-    if (c->has_some_text) c->some_text = wv_get_str(r);
-    c->names_n = wv_get_u32(r);
-    c->names = (char**)xcalloc(c->names_n, sizeof(char*));
-    for (uint32_t i = 0; i < c->names_n; i++) c->names[i] = wv_get_str(r);
-    c->matrix_n = wv_get_u32(r);
-    c->matrix = (i32_list_t*)xcalloc(c->matrix_n, sizeof(i32_list_t));
-    for (uint32_t i = 0; i < c->matrix_n; i++) {
-        c->matrix[i].n = wv_get_u32(r);
-        c->matrix[i].v = (int32_t*)xcalloc(c->matrix[i].n, sizeof(int32_t));
-        for (uint32_t j = 0; j < c->matrix[i].n; j++) c->matrix[i].v[j] = wv_get_i32(r);
-    }
-    c->empty_n = wv_get_u32(r);
-    c->empty = (double*)xcalloc(c->empty_n, sizeof(double));
-    for (uint32_t i = 0; i < c->empty_n; i++) c->empty[i] = wv_get_f64(r);
-    c->by_name_n = wv_get_u32(r);
-    c->by_name = (by_name_t*)xcalloc(c->by_name_n, sizeof(by_name_t));
-    for (uint32_t i = 0; i < c->by_name_n; i++) {
-        c->by_name[i].key = wv_get_str(r);
-        c->by_name[i].value = wv_get_i64(r);
-    }
-    c->by_id_n = wv_get_u32(r);
-    c->by_id = (by_id_t*)xcalloc(c->by_id_n, sizeof(by_id_t));
-    for (uint32_t i = 0; i < c->by_id_n; i++) {
-        c->by_id[i].key = wv_get_i32(r);
-        read_scalars(r, &c->by_id[i].value);
-    }
-    read_scalars(r, &c->scalars);
-    read_shape(r, &c->shape);
-    c->shapes_n = wv_get_u32(r);
-    c->shapes = (shape_t*)xcalloc(c->shapes_n, sizeof(shape_t));
-    for (uint32_t i = 0; i < c->shapes_n; i++) read_shape(r, &c->shapes[i]);
-    c->has_maybe_shape = wv_get_bool(r);
-    if (c->has_maybe_shape) read_shape(r, &c->maybe_shape);
-    c->has_maybe_list = wv_get_bool(r);
-    if (c->has_maybe_list) {
-        c->maybe_list_n = wv_get_u32(r);
-        c->maybe_list = (uint8_t*)xcalloc(c->maybe_list_n, 1);
-        for (uint32_t i = 0; i < c->maybe_list_n; i++) c->maybe_list[i] = wv_get_u8(r);
-    }
-    c->sparse_n = wv_get_u32(r);
-    c->sparse = (opt_bool_t*)xcalloc(c->sparse_n, sizeof(opt_bool_t));
-    for (uint32_t i = 0; i < c->sparse_n; i++) {
-        c->sparse[i].has = wv_get_bool(r);
-        if (c->sparse[i].has) c->sparse[i].value = wv_get_bool(r);
-    }
-    c->colors_n = wv_get_u32(r);
-    c->colors = (int32_t*)xcalloc(c->colors_n, sizeof(int32_t));
-    for (uint32_t i = 0; i < c->colors_n; i++) c->colors[i] = wv_get_i32(r);
-}
-
-static void write_composite(wv_writer* w, const composite_t* c) {
-    wv_put_str(w, c->name);
-    wv_put_bytes(w, c->blob, c->blob_len);
-    wv_put_bool(w, c->has_some_i64);
-    if (c->has_some_i64) wv_put_i64(w, c->some_i64);
-    wv_put_bool(w, c->has_none_i64);
-    if (c->has_none_i64) wv_put_i64(w, c->none_i64);
-    wv_put_bool(w, c->has_some_text);
-    if (c->has_some_text) wv_put_str(w, c->some_text);
-    wv_put_u32(w, c->names_n);
-    for (uint32_t i = 0; i < c->names_n; i++) wv_put_str(w, c->names[i]);
-    wv_put_u32(w, c->matrix_n);
-    for (uint32_t i = 0; i < c->matrix_n; i++) {
-        wv_put_u32(w, c->matrix[i].n);
-        for (uint32_t j = 0; j < c->matrix[i].n; j++) wv_put_i32(w, c->matrix[i].v[j]);
-    }
-    wv_put_u32(w, c->empty_n);
-    for (uint32_t i = 0; i < c->empty_n; i++) wv_put_f64(w, c->empty[i]);
-    wv_put_u32(w, c->by_name_n);
-    for (uint32_t i = 0; i < c->by_name_n; i++) {
-        wv_put_str(w, c->by_name[i].key);
-        wv_put_i64(w, c->by_name[i].value);
-    }
-    wv_put_u32(w, c->by_id_n);
-    for (uint32_t i = 0; i < c->by_id_n; i++) {
-        wv_put_i32(w, c->by_id[i].key);
-        write_scalars(w, &c->by_id[i].value);
-    }
-    write_scalars(w, &c->scalars);
-    write_shape(w, &c->shape);
-    wv_put_u32(w, c->shapes_n);
-    for (uint32_t i = 0; i < c->shapes_n; i++) write_shape(w, &c->shapes[i]);
-    wv_put_bool(w, c->has_maybe_shape);
-    if (c->has_maybe_shape) write_shape(w, &c->maybe_shape);
-    wv_put_bool(w, c->has_maybe_list);
-    if (c->has_maybe_list) {
-        wv_put_u32(w, c->maybe_list_n);
-        for (uint32_t i = 0; i < c->maybe_list_n; i++) wv_put_u8(w, c->maybe_list[i]);
-    }
-    wv_put_u32(w, c->sparse_n);
-    for (uint32_t i = 0; i < c->sparse_n; i++) {
-        wv_put_bool(w, c->sparse[i].has);
-        if (c->sparse[i].has) wv_put_bool(w, c->sparse[i].value);
-    }
-    wv_put_u32(w, c->colors_n);
-    for (uint32_t i = 0; i < c->colors_n; i++) wv_put_i32(w, c->colors[i]);
-}
-
-static int composite_eq(const composite_t* a, const composite_t* b) {
-    if (!str_eq(a->name, b->name)) return 0;
-    if (a->blob_len != b->blob_len || memcmp(a->blob, b->blob, a->blob_len) != 0) return 0;
-    if (a->has_some_i64 != b->has_some_i64 || (a->has_some_i64 && a->some_i64 != b->some_i64))
-        return 0;
-    if (a->has_none_i64 != b->has_none_i64 || (a->has_none_i64 && a->none_i64 != b->none_i64))
-        return 0;
-    if (a->has_some_text != b->has_some_text ||
-        (a->has_some_text && !str_eq(a->some_text, b->some_text)))
-        return 0;
-    if (a->names_n != b->names_n) return 0;
-    for (uint32_t i = 0; i < a->names_n; i++)
-        if (!str_eq(a->names[i], b->names[i])) return 0;
-    if (a->matrix_n != b->matrix_n) return 0;
-    for (uint32_t i = 0; i < a->matrix_n; i++) {
-        if (a->matrix[i].n != b->matrix[i].n) return 0;
-        for (uint32_t j = 0; j < a->matrix[i].n; j++)
-            if (a->matrix[i].v[j] != b->matrix[i].v[j]) return 0;
-    }
-    if (a->empty_n != b->empty_n) return 0;
-    for (uint32_t i = 0; i < a->empty_n; i++)
-        if (!f64_bits_eq(a->empty[i], b->empty[i])) return 0;
-    if (a->by_name_n != b->by_name_n) return 0;
-    for (uint32_t i = 0; i < a->by_name_n; i++)
-        if (!str_eq(a->by_name[i].key, b->by_name[i].key) ||
-            a->by_name[i].value != b->by_name[i].value)
-            return 0;
-    if (a->by_id_n != b->by_id_n) return 0;
-    for (uint32_t i = 0; i < a->by_id_n; i++)
-        if (a->by_id[i].key != b->by_id[i].key ||
-            !scalars_eq(&a->by_id[i].value, &b->by_id[i].value))
-            return 0;
-    if (!scalars_eq(&a->scalars, &b->scalars)) return 0;
-    if (!shape_eq(&a->shape, &b->shape)) return 0;
-    if (a->shapes_n != b->shapes_n) return 0;
-    for (uint32_t i = 0; i < a->shapes_n; i++)
-        if (!shape_eq(&a->shapes[i], &b->shapes[i])) return 0;
-    if (a->has_maybe_shape != b->has_maybe_shape ||
-        (a->has_maybe_shape && !shape_eq(&a->maybe_shape, &b->maybe_shape)))
-        return 0;
-    if (a->has_maybe_list != b->has_maybe_list) return 0;
-    if (a->has_maybe_list &&
-        (a->maybe_list_n != b->maybe_list_n ||
-         memcmp(a->maybe_list, b->maybe_list, a->maybe_list_n) != 0))
-        return 0;
-    if (a->sparse_n != b->sparse_n) return 0;
-    for (uint32_t i = 0; i < a->sparse_n; i++)
-        if (a->sparse[i].has != b->sparse[i].has ||
-            (a->sparse[i].has && a->sparse[i].value != b->sparse[i].value))
-            return 0;
-    if (a->colors_n != b->colors_n) return 0;
-    for (uint32_t i = 0; i < a->colors_n; i++)
-        if (a->colors[i] != b->colors[i]) return 0;
-    return 1;
-}
-
-static void composite_free(composite_t* c) {
-    free(c->name);
-    free(c->blob);
-    free(c->some_text);
-    for (uint32_t i = 0; i < c->names_n; i++) free(c->names[i]);
-    free(c->names);
-    for (uint32_t i = 0; i < c->matrix_n; i++) free(c->matrix[i].v);
-    free(c->matrix);
-    free(c->empty);
-    for (uint32_t i = 0; i < c->by_name_n; i++) free(c->by_name[i].key);
-    free(c->by_name);
-    free(c->by_id);
-    shape_free(&c->shape);
-    for (uint32_t i = 0; i < c->shapes_n; i++) shape_free(&c->shapes[i]);
-    free(c->shapes);
-    if (c->has_maybe_shape) shape_free(&c->maybe_shape);
-    free(c->maybe_list);
-    free(c->sparse);
-    free(c->colors);
-    memset(c, 0, sizeof *c);
-}
-
-// ── ABI helpers ────────────────────────────────────────────────────────────
-
-// Decode a buffered return, checking it was consumed exactly, and free it.
-#define TAKE_BUFFER(ptr, len, reader_body)          \
-    do {                                            \
-        assert((ptr) != NULL);                      \
-        wv_reader r_;                               \
-        wv_r_init(&r_, (ptr), (len));               \
-        reader_body;                                \
-        wv_r_expect_end(&r_);                       \
-        weaveffi_free_bytes((uint8_t*)(ptr), (len)); \
-    } while (0)
-
-static void fetch_sample_scalars(scalars_t* out) {
-    weaveffi_error err = {0};
-    size_t len = 0;
-    const uint8_t* p = weaveffi_codec_sample_scalars(&len, &err);
+static bool check(uint32_t i, const codec_Vector* v) {
+    codec_error err;
+    codec_writer w;
+    memset(&w, 0, sizeof w);
+    codec_Vector_write(&w, v);
+    assert(!w.failed);
+    bool ok = codec_check_vector(i, codec_writer_run(&w), &err);
     assert(err.code == 0);
-    TAKE_BUFFER(p, len, read_scalars(&r_, out));
-}
-
-static void fetch_sample_composite(composite_t* out) {
-    weaveffi_error err = {0};
-    size_t len = 0;
-    const uint8_t* p = weaveffi_codec_sample_composite(&len, &err);
-    assert(err.code == 0);
-    TAKE_BUFFER(p, len, read_composite(&r_, out));
-}
-
-static void roundtrip_scalars(const scalars_t* in, scalars_t* out) {
-    weaveffi_error err = {0};
-    wv_writer w;
-    wv_w_init(&w);
-    write_scalars(&w, in);
-    size_t len = 0;
-    const uint8_t* p = weaveffi_codec_roundtrip_scalars(w.buf, w.len, &len, &err);
-    assert(err.code == 0);
-    assert(len == w.len && memcmp(p, w.buf, len) == 0 &&
-           "our encoding is byte-identical to the producer's");
-    wv_w_free(&w);
-    TAKE_BUFFER(p, len, read_scalars(&r_, out));
-}
-
-static void roundtrip_composite(const composite_t* in, composite_t* out) {
-    weaveffi_error err = {0};
-    wv_writer w;
-    wv_w_init(&w);
-    write_composite(&w, in);
-    size_t len = 0;
-    const uint8_t* p = weaveffi_codec_roundtrip_composite(w.buf, w.len, &len, &err);
-    assert(err.code == 0);
-    assert(len == w.len && memcmp(p, w.buf, len) == 0 &&
-           "our encoding is byte-identical to the producer's");
-    wv_w_free(&w);
-    TAKE_BUFFER(p, len, read_composite(&r_, out));
-}
-
-static void roundtrip_shape(const shape_t* in, shape_t* out) {
-    weaveffi_error err = {0};
-    wv_writer w;
-    wv_w_init(&w);
-    write_shape(&w, in);
-    size_t len = 0;
-    const uint8_t* p = weaveffi_codec_roundtrip_shape(w.buf, w.len, &len, &err);
-    assert(err.code == 0);
-    assert(len == w.len && memcmp(p, w.buf, len) == 0);
-    wv_w_free(&w);
-    TAKE_BUFFER(p, len, read_shape(&r_, out));
-}
-
-static int verify_scalars(const scalars_t* s, weaveffi_error* err) {
-    wv_writer w;
-    wv_w_init(&w);
-    write_scalars(&w, s);
-    int ok = weaveffi_codec_verify_scalars(w.buf, w.len, err);
-    wv_w_free(&w);
+    codec_writer_free(&w);
     return ok;
 }
 
-static int verify_composite(const composite_t* c, weaveffi_error* err) {
-    wv_writer w;
-    wv_w_init(&w);
-    write_composite(&w, c);
-    int ok = weaveffi_codec_verify_composite(w.buf, w.len, err);
-    wv_w_free(&w);
-    return ok;
+// An owned, NUL-terminated copy of a returned string, which is released.
+static char* take_string(codec_run run) {
+    char* s = (char*)calloc(run.len + 1, 1);
+    if (run.len > 0) memcpy(s, run.ptr, run.len);
+    codec_run_free(run);
+    return s;
 }
 
-static char* describe_shape(const shape_t* s) {
-    weaveffi_error err = {0};
-    wv_writer w;
-    wv_w_init(&w);
-    write_shape(&w, s);
-    const char* text = weaveffi_codec_describe_shape(w.buf, w.len, &err);
-    assert(err.code == 0 && text != NULL);
-    wv_w_free(&w);
-    char* copy = strdup(text);
-    weaveffi_free_string(text);
-    return copy;
+static char* vector_name(uint32_t i) {
+    codec_error err;
+    codec_run name = codec_vector_name(i, &err);
+    assert(err.code == 0);
+    return take_string(name);
 }
 
-// ── Holder (objects inside buffers) ────────────────────────────────────────
-
-typedef struct {
-    weaveffi_codec_Token* primary;
-    weaveffi_codec_Token* spare;  // NULL when absent
-    weaveffi_codec_Token* many[8];
-    uint32_t many_n;
-} holder_t;
-
-// Decoding adopts one strong reference per token.
-static void read_holder(wv_reader* r, holder_t* h) {
-    memset(h, 0, sizeof *h);
-    h->primary = (weaveffi_codec_Token*)wv_get_obj(r);
-    h->spare = wv_get_bool(r) ? (weaveffi_codec_Token*)wv_get_obj(r) : NULL;
-    h->many_n = wv_get_u32(r);
-    assert(h->many_n <= 8);
-    for (uint32_t i = 0; i < h->many_n; i++) h->many[i] = (weaveffi_codec_Token*)wv_get_obj(r);
+static char* describe(const codec_Vector* v) {
+    codec_error err;
+    codec_writer w;
+    memset(&w, 0, sizeof w);
+    codec_Vector_write(&w, v);
+    codec_run text = codec_describe_vector(codec_writer_run(&w), &err);
+    codec_writer_free(&w);
+    assert(err.code == 0);
+    return take_string(text);
 }
 
-// Encoding mints a fresh reference per token with `_clone`; the holder's
-// own references are untouched.
-static void write_holder(wv_writer* w, const holder_t* h) {
-    wv_put_obj(w, weaveffi_codec_Token_clone(h->primary));
-    wv_put_bool(w, h->spare != NULL);
-    if (h->spare) wv_put_obj(w, weaveffi_codec_Token_clone(h->spare));
-    wv_put_u32(w, h->many_n);
-    for (uint32_t i = 0; i < h->many_n; i++) wv_put_obj(w, weaveffi_codec_Token_clone(h->many[i]));
+static uint32_t find(uint32_t n, const char* name) {
+    for (uint32_t i = 0; i < n; i++) {
+        char* s = vector_name(i);
+        int hit = strcmp(s, name) == 0;
+        free(s);
+        if (hit) return i;
+    }
+    fprintf(stderr, "no vector named %s\n", name);
+    abort();
 }
 
-static void holder_release(holder_t* h) {
-    weaveffi_codec_Token_destroy(h->primary);
-    weaveffi_codec_Token_destroy(h->spare);
-    for (uint32_t i = 0; i < h->many_n; i++) weaveffi_codec_Token_destroy(h->many[i]);
-    memset(h, 0, sizeof *h);
+// Whether a returned run holds exactly the `len` bytes at `ptr`; releases
+// the run.
+static int run_take_bytes(codec_run run, const void* ptr, size_t len) {
+    int eq = run.len == len && (len == 0 || memcmp(run.ptr, ptr, len) == 0);
+    codec_run_free(run);
+    return eq;
 }
 
-static int64_t token_value(const weaveffi_codec_Token* t) {
-    weaveffi_error err = {0};
-    int64_t v = weaveffi_codec_Token_value(t, &err);
+// Push a primitive vector's value through its direct-family echo.
+static void echo(const codec_Vector* v) {
+    codec_error err = {0};
+    switch (v->tag) {
+    case codec_Vector_I8:
+        assert(codec_echo_i8(v->as.I8.value, &err) == v->as.I8.value);
+        break;
+    case codec_Vector_U8:
+        assert(codec_echo_u8(v->as.U8.value, &err) == v->as.U8.value);
+        break;
+    case codec_Vector_I16:
+        assert(codec_echo_i16(v->as.I16.value, &err) == v->as.I16.value);
+        break;
+    case codec_Vector_U16:
+        assert(codec_echo_u16(v->as.U16.value, &err) == v->as.U16.value);
+        break;
+    case codec_Vector_I32:
+        assert(codec_echo_i32(v->as.I32.value, &err) == v->as.I32.value);
+        break;
+    case codec_Vector_U32:
+        assert(codec_echo_u32(v->as.U32.value, &err) == v->as.U32.value);
+        break;
+    case codec_Vector_I64:
+        assert(codec_echo_i64(v->as.I64.value, &err) == v->as.I64.value);
+        break;
+    case codec_Vector_U64:
+        assert(codec_echo_u64(v->as.U64.value, &err) == v->as.U64.value);
+        break;
+    case codec_Vector_F32:
+        assert(f32_bits_eq(codec_echo_f32(v->as.F32.value, &err), v->as.F32.value));
+        break;
+    case codec_Vector_F64:
+        assert(f64_bits_eq(codec_echo_f64(v->as.F64.value, &err), v->as.F64.value));
+        break;
+    case codec_Vector_Flag:
+        assert(codec_echo_bool(v->as.Flag.value, &err) == v->as.Flag.value);
+        break;
+    case codec_Vector_Hue:
+        assert(codec_echo_color(v->as.Hue.value, &err) == v->as.Hue.value);
+        break;
+    case codec_Vector_Text: {
+        codec_str s = v->as.Text.value;
+        assert(run_take_bytes(codec_echo_text(codec_str_run(s), &err), s.ptr, s.len));
+        break;
+    }
+    case codec_Vector_Blob: {
+        codec_bytes b = v->as.Blob.value;
+        assert(run_take_bytes(codec_echo_blob(codec_bytes_run(b), &err), b.ptr, b.len));
+        break;
+    }
+    default:
+        break;
+    }
+    assert(err.code == 0);
+}
+
+static void every_vector(uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t* raw = NULL;
+        size_t raw_len = 0;
+        codec_Vector v = fetch(i, &raw, &raw_len);
+        if (!check(i, &v)) {
+            char* name = vector_name(i);
+            char* seen = describe(&v);
+            fprintf(stderr, "vector %u (%s) did not round-trip; producer saw %s\n", i, name,
+                    seen);
+            abort();
+        }
+        assert(!check((i + 1) % n, &v) && "a vector never matches its neighbor");
+        // The generated encoder is deterministic, so re-encoding reproduces
+        // the producer's bytes, except for object tokens (fresh references).
+        if (v.tag != codec_Vector_Objects) {
+            codec_writer w;
+            memset(&w, 0, sizeof w);
+            codec_Vector_write(&w, &v);
+            assert(w.len == raw_len && memcmp(w.ptr, raw, raw_len) == 0);
+            codec_writer_free(&w);
+        }
+        echo(&v);
+        free(raw);
+        codec_Vector_free(&v);
+    }
+}
+
+static codec_Scalars canonical_scalars(void) {
+    codec_Scalars s;
+    s.i8_value = -8;
+    s.u8_value = 200;
+    s.i16_value = -16000;
+    s.u16_value = 60000;
+    s.i32_value = -2000000000;
+    s.u32_value = 4000000000u;
+    s.i64_value = -9007199254740993LL;
+    s.u64_value = UINT64_MAX;
+    s.f32_value = 1.5f;
+    s.f64_value = -2.25e100;
+    s.flag = true;
+    s.color = codec_Color_Blue;
+    return s;
+}
+
+static void literal_vectors(uint32_t n) {
+    codec_Vector v;
+
+    v.tag = codec_Vector_AllScalars;
+    v.as.AllScalars.value = canonical_scalars();
+    assert(check(find(n, "scalars canonical"), &v));
+    v.as.AllScalars.value.u16_value = 60001;
+    assert(!check(find(n, "scalars canonical"), &v));
+
+    v.tag = codec_Vector_Figure;
+    v.as.Figure.value.tag = codec_Shape_Labeled;
+    v.as.Figure.value.as.Labeled.label = codec_str_of("tag");
+    v.as.Figure.value.as.Labeled.count = 3;
+    assert(check(find(n, "shape labeled"), &v));
+
+    v.tag = codec_Vector_Text;
+    v.as.Text.value.ptr = "nul\0inside\0";
+    v.as.Text.value.len = 11;
+    assert(check(find(n, "string interior nul"), &v));
+
+    // Any NaN matches the NaN vector; zero keeps its sign.
+    uint64_t bits = 0x7ff8000000000001ull;
+    v.tag = codec_Vector_F64;
+    memcpy(&v.as.F64.value, &bits, 8);
+    assert(check(find(n, "f64 nan"), &v));
+    v.as.F64.value = -0.0;
+    assert(check(find(n, "f64 -0"), &v));
+    v.as.F64.value = 0.0;
+    assert(!check(find(n, "f64 -0"), &v));
+
+    v.tag = codec_Vector_U64;
+    v.as.U64.value = UINT64_MAX;
+    assert(check(find(n, "u64 max"), &v));
+
+    v.tag = codec_Vector_Hue;
+    v.as.Hue.value = codec_Color_Infrared;
+    assert(check(find(n, "enum infrared"), &v));
+
+    int64_t zero = 0;
+    v.tag = codec_Vector_MaybeI64;
+    v.as.MaybeI64.value = &zero;
+    assert(check(find(n, "optional zero"), &v));
+    v.as.MaybeI64.value = NULL;
+    assert(check(find(n, "optional absent"), &v));
+    assert(!check(find(n, "optional zero"), &v));
+
+    // A map's entry order doesn't matter on the wire.
+    codec_str keys[3] = {codec_str_of("x"), codec_str_of("h\xc3\xa9llo"), codec_str_of("")};
+    int64_t values[3] = {0, -1, INT64_MAX};
+    v.tag = codec_Vector_Counts;
+    v.as.Counts.value.keys = keys;
+    v.as.Counts.value.values = values;
+    v.as.Counts.value.len = 3;
+    assert(check(find(n, "map of strings"), &v));
+
+    v.tag = codec_Vector_Blank;
+    assert(check(find(n, "blank"), &v));
+}
+
+static void spot_checks(uint32_t n) {
+    codec_Vector v = fetch(find(n, "i64 past 2^53"), NULL, NULL);
+    assert(v.tag == codec_Vector_I64 && v.as.I64.value == -9007199254740993LL);
+    codec_Vector_free(&v);
+
+    v = fetch(find(n, "f32 min subnormal"), NULL, NULL);
+    uint32_t f32_bits;
+    memcpy(&f32_bits, &v.as.F32.value, 4);
+    assert(v.tag == codec_Vector_F32 && f32_bits == 1u);
+    codec_Vector_free(&v);
+
+    v = fetch(find(n, "string astral"), NULL, NULL);
+    assert(str_is(v.as.Text.value, "\xf0\x9f\xa6\x80 crab \xf0\x9f\x98\x80", 14));
+    codec_Vector_free(&v);
+
+    v = fetch(find(n, "scalars minimum"), NULL, NULL);
+    assert(v.tag == codec_Vector_AllScalars);
+    codec_Scalars* m = &v.as.AllScalars.value;
+    assert(m->i8_value == INT8_MIN && m->i16_value == INT16_MIN && m->i32_value == INT32_MIN);
+    assert(m->i64_value == INT64_MIN && m->u64_value == 0);
+    assert(isinf(m->f32_value) && m->f32_value < 0 && isnan(m->f64_value));
+    assert(m->color == codec_Color_Infrared && !m->flag);
+    codec_Vector_free(&v);
+
+    v = fetch(find(n, "composite canonical"), NULL, NULL);
+    assert(v.tag == codec_Vector_Deep);
+    codec_Composite* c = &v.as.Deep.value;
+    assert(str_is(c->name, "h\xc3\xa9llo w\xc3\xb6rld \xe2\x9c\x93", 17));
+    assert(c->blob.len == 6 && c->blob.ptr[5] == 255);
+    assert(c->some_i64 != NULL && *c->some_i64 == INT64_MIN && c->none_i64 == NULL);
+    assert(c->some_text != NULL && c->some_text->len == 0);
+    assert(c->names.len == 3 && c->names.items[1].len == 0);
+    assert(c->matrix.len == 3 && c->matrix.items[1].len == 0 && c->matrix.items[2].items[0] == -4);
+    assert(c->floats.len == 6 && isnan(c->floats.items[0]) && signbit(c->floats.items[3]));
+    assert(c->by_name.len == 4 && c->by_id.len == 3 && c->by_color.len == 2 && c->flags.len == 2);
+    assert(c->scalars.u32_value == 4000000000u);
+    assert(c->shape.tag == codec_Shape_Labeled && c->shape.as.Labeled.count == 3);
+    assert(c->shapes.len == 6 && c->shapes.items[5].as.Nested.note == NULL);
+    assert(c->maybe_shape != NULL && c->maybe_shape->tag == codec_Shape_Nested);
+    assert(c->maybe_list != NULL && c->maybe_list->len == 2);
+    assert(c->sparse.len == 3 && c->sparse.items[1] == NULL && *c->sparse.items[0]);
+    assert(c->colors.len == 4 && c->colors.items[3] == codec_Color_Infrared);
+    codec_Vector_free(&v);
+}
+
+static void out_of_range(uint32_t n) {
+    codec_error err;
+    codec_run run = codec_vector(n, &err);
+    assert(run.ptr == NULL && run.len == 0 && "a failure returns the empty run");
+    assert(err.code == codec_CodecError_OutOfRange);
+    char expected[64];
+    snprintf(expected, sizeof expected, "vector %u is out of range (count %u)", n, n);
+    assert(MSG_EQ(err, expected));
+    codec_CodecError_OutOfRange_payload p;
+    assert(codec_CodecError_OutOfRange_payload_decode(err.payload_ptr, err.payload_len, &p));
+    assert(p.index == n && p.count == n);
+    codec_error_clear(&err);
+
+    run = codec_vector_name(n + 5, &err);
+    assert(run.ptr == NULL && run.len == 0);
+    assert(err.code == codec_CodecError_OutOfRange);
+    assert(codec_CodecError_OutOfRange_payload_decode(err.payload_ptr, err.payload_len, &p));
+    assert(p.index == n + 5 && p.count == n);
+    codec_error_clear(&err);
+
+    codec_Vector blank;
+    blank.tag = codec_Vector_Blank;
+    assert(!check(n, &blank));
+}
+
+// Hand a malformed buffer to check_vector, which must reject it with -3.
+static void reject(const codec_writer* w) {
+    codec_error err;
+    assert(!codec_check_vector(0, codec_writer_run(w), &err));
+    assert(err.code == -3);
+    codec_error_clear(&err);
+}
+
+static void malformed(void) {
+    codec_writer w;
+
+    memset(&w, 0, sizeof w);  // truncated mid-value
+    codec_writer_put_i32(&w, codec_Vector_I64);
+    codec_writer_put_u32(&w, 7);
+    reject(&w);
+    codec_writer_free(&w);
+
+    memset(&w, 0, sizeof w);  // unknown tag
+    codec_writer_put_i32(&w, 999);
+    reject(&w);
+    codec_writer_free(&w);
+
+    memset(&w, 0, sizeof w);  // trailing bytes
+    codec_writer_put_i32(&w, codec_Vector_Blank);
+    codec_writer_put_u8(&w, 0);
+    reject(&w);
+    codec_writer_free(&w);
+
+    memset(&w, 0, sizeof w);  // a bool that is neither 0 nor 1
+    codec_writer_put_i32(&w, codec_Vector_Flag);
+    codec_writer_put_u8(&w, 2);
+    reject(&w);
+    codec_writer_free(&w);
+
+    memset(&w, 0, sizeof w);  // an undeclared C-style enum value
+    codec_writer_put_i32(&w, codec_Vector_Hue);
+    codec_writer_put_i32(&w, 3);
+    reject(&w);
+    codec_writer_free(&w);
+
+    memset(&w, 0, sizeof w);  // a map that repeats a key
+    codec_writer_put_i32(&w, codec_Vector_Counts);
+    codec_writer_put_u32(&w, 2);
+    codec_writer_put_string(&w, codec_str_of("a"));
+    codec_writer_put_i64(&w, 1);
+    codec_writer_put_string(&w, codec_str_of("a"));
+    codec_writer_put_i64(&w, 2);
+    reject(&w);
+    codec_writer_free(&w);
+
+    memset(&w, 0, sizeof w);  // a string that isn't UTF-8
+    codec_writer_put_i32(&w, codec_Vector_Text);
+    const uint8_t bad[2] = {0xC3, 0x28};
+    codec_writer_put_bytes(&w, codec_bytes_of(bad, 2));
+    reject(&w);
+    codec_writer_free(&w);
+
+    // The generated decoder rejects the same inputs.
+    codec_Vector v;
+    const uint8_t unknown[4] = {0xE7, 0x03, 0, 0};
+    assert(!codec_Vector_decode(unknown, sizeof unknown, &v));
+
+    // Direct families: an undeclared enum value, a null run with a
+    // length, and invalid UTF-8.
+    codec_error err;
+    codec_echo_color((codec_Color)3, &err);
+    assert(err.code == -3);
+    codec_error_clear(&err);
+    codec_run null_run = {NULL, 2};
+    codec_run out = codec_echo_text(null_run, &err);
+    assert(out.ptr == NULL && out.len == 0 && err.code == -3);
+    codec_error_clear(&err);
+    out = codec_echo_text(bytes_run(bad, sizeof bad), &err);
+    assert(out.ptr == NULL && out.len == 0 && err.code == -3);
+    codec_error_clear(&err);
+    codec_run empty = {NULL, 0};
+    out = codec_echo_text(empty, &err);
+    assert(out.ptr == NULL && out.len == 0 && err.code == 0);
+}
+
+static codec_Token* token(int64_t value) {
+    codec_error err;
+    codec_Token* t = codec_Token_new(value, &err);
+    assert(err.code == 0 && t != NULL);
+    return t;
+}
+
+static int64_t value_of(const codec_Token* t) {
+    codec_error err;
+    int64_t v = codec_Token_value(t, &err);
     assert(err.code == 0);
     return v;
 }
 
-static void make_holder(int64_t base, int with_spare, holder_t* out) {
-    weaveffi_error err = {0};
-    size_t len = 0;
-    const uint8_t* p = weaveffi_codec_make_holder(base, with_spare, &len, &err);
+static int64_t sum(const codec_Holder* h) {
+    codec_error err;
+    codec_writer w;
+    memset(&w, 0, sizeof w);
+    codec_Holder_write(&w, h);
+    int64_t total = codec_sum_holder(codec_writer_run(&w), &err);
     assert(err.code == 0);
-    TAKE_BUFFER(p, len, read_holder(&r_, out));
+    codec_writer_free(&w);
+    return total;
 }
 
-// ── main ───────────────────────────────────────────────────────────────────
+static void objects(uint32_t n) {
+    codec_error err;
+
+    // The full object vector decodes to live tokens with the table's values.
+    codec_Vector v = fetch(find(n, "objects full"), NULL, NULL);
+    assert(v.tag == codec_Vector_Objects);
+    codec_Holder* h = &v.as.Objects.value;
+    assert(value_of(h->primary) == 10 && h->spare != NULL && value_of(h->spare) == 11);
+    assert(h->many.len == 3 && value_of(h->many.items[2]) == INT64_MIN);
+    assert(h->by_name.len == 2 && value_of(h->by_name.values[1]) == 21);
+    // Each encoding mints fresh references, so the holder can be sent twice.
+    int64_t expected = 10 + 11 + 12 + 13 + 20 + 21 + INT64_MIN;
+    assert(sum(h) == expected && sum(h) == expected);
+
+    // primary_of returns the very same object (a new reference to it).
+    codec_writer w;
+    memset(&w, 0, sizeof w);
+    codec_Holder_write(&w, h);
+    codec_Token* p = codec_primary_of(codec_writer_run(&w), &err);
+    codec_writer_free(&w);
+    assert(err.code == 0 && p == h->primary);
+
+    // same_primary compares identity, not value.
+    codec_Holder other;
+    memset(&other, 0, sizeof other);
+    other.primary = p;
+    codec_writer a, b;
+    memset(&a, 0, sizeof a);
+    memset(&b, 0, sizeof b);
+    codec_Holder_write(&a, h);
+    codec_Holder_write(&b, &other);
+    assert(codec_same_primary(codec_writer_run(&a), codec_writer_run(&b), &err));
+    codec_writer_free(&a);
+    codec_writer_free(&b);
+    codec_Token* twin = token(10);
+    other.primary = twin;
+    memset(&a, 0, sizeof a);
+    memset(&b, 0, sizeof b);
+    codec_Holder_write(&a, h);
+    codec_Holder_write(&b, &other);
+    assert(!codec_same_primary(codec_writer_run(&a), codec_writer_run(&b), &err));
+    codec_writer_free(&a);
+    codec_writer_free(&b);
+
+    // A holder built from consumer-made tokens, one of them in every slot.
+    codec_Token* many[3] = {twin, twin, token(-4)};
+    codec_str names[1] = {codec_str_of("k")};
+    codec_Token* values[1] = {twin};
+    codec_Holder mine;
+    mine.primary = twin;
+    mine.spare = twin;
+    mine.many.items = many;
+    mine.many.len = 3;
+    mine.by_name.keys = names;
+    mine.by_name.values = values;
+    mine.by_name.len = 1;
+    assert(sum(&mine) == 10 * 5 - 4);
+
+    // The consumer-built sparse holder checks against the table.
+    codec_Vector sparse;
+    sparse.tag = codec_Vector_Objects;
+    memset(&sparse.as.Objects.value, 0, sizeof sparse.as.Objects.value);
+    codec_Token* lone = token(-1);
+    sparse.as.Objects.value.primary = lone;
+    assert(check(find(n, "objects sparse"), &sparse));
+    codec_Token_destroy(lone);
+
+    // A zero token is a marshalling failure, not a crash.
+    const uint8_t zero_token[17] = {0};
+    assert(codec_sum_holder(bytes_run(zero_token, sizeof zero_token), &err) == 0);
+    assert(err.code == -3);
+    codec_error_clear(&err);
+
+    codec_Token_destroy(many[2]);
+    codec_Token_destroy(twin);
+    codec_Token_destroy(p);
+    codec_Vector_free(&v);  // releases every decoded token
+    assert(codec_Token_clone(NULL) == NULL);
+    codec_Token_destroy(NULL);
+}
+
+// An optional bool built byte by byte, so a byte other than 0 or 1 can be
+// sent without forming an invalid C `bool`.
+static codec_opt_bool raw_opt_bool(uint8_t has, uint8_t value) {
+    codec_opt_bool o;
+    memset(&o, 0, sizeof o);
+    memcpy((uint8_t*)&o + offsetof(codec_opt_bool, has), &has, 1);
+    memcpy((uint8_t*)&o + offsetof(codec_opt_bool, value), &value, 1);
+    return o;
+}
+
+static void opt_scalars(void) {
+    codec_error err;
+    const codec_opt_i32 none_i32 = {false, 0};
+    codec_opt_i32 i = codec_echo_opt_i32(none_i32, &err);
+    assert(!i.has && i.value == 0 && err.code == 0);
+    const codec_opt_i32 min_i32 = {true, INT32_MIN};
+    i = codec_echo_opt_i32(min_i32, &err);
+    assert(i.has && i.value == INT32_MIN && err.code == 0);
+    const codec_opt_i32 zero_i32 = {true, 0};
+    i = codec_echo_opt_i32(zero_i32, &err);
+    assert(i.has && i.value == 0);
+
+    const codec_opt_f64 neg_zero = {true, -0.0};
+    codec_opt_f64 d = codec_echo_opt_f64(neg_zero, &err);
+    assert(d.has && d.value == 0.0 && signbit(d.value));
+    const codec_opt_f64 quiet_nan = {true, NAN};
+    d = codec_echo_opt_f64(quiet_nan, &err);
+    assert(d.has && isnan(d.value));
+    const codec_opt_f64 none_f64 = {false, 0.0};
+    d = codec_echo_opt_f64(none_f64, &err);
+    assert(!d.has && d.value == 0.0);
+
+    const codec_opt_bool yes = {true, true}, no = {true, false}, none_bool = {false, false};
+    codec_opt_bool flag = codec_echo_opt_bool(yes, &err);
+    assert(flag.has && flag.value);
+    flag = codec_echo_opt_bool(no, &err);
+    assert(flag.has && !flag.value);
+    flag = codec_echo_opt_bool(none_bool, &err);
+    assert(!flag.has && !flag.value && err.code == 0);
+    // A `bool` byte (the value or `has`) other than 0 or 1 is a
+    // marshalling failure.
+    flag = codec_echo_opt_bool(raw_opt_bool(1, 2), &err);
+    assert(!flag.has && err.code == -3);
+    codec_error_clear(&err);
+    flag = codec_echo_opt_bool(raw_opt_bool(2, 1), &err);
+    assert(!flag.has && err.code == -3);
+    codec_error_clear(&err);
+
+    // An optional C-style enum crosses as an opt_i32.
+    const codec_opt_i32 infrared = {true, codec_Color_Infrared};
+    codec_opt_i32 c = codec_echo_opt_color(infrared, &err);
+    assert(c.has && c.value == codec_Color_Infrared);
+    const codec_opt_i32 blue = {true, codec_Color_Blue};
+    c = codec_echo_opt_color(blue, &err);
+    assert(c.has && c.value == codec_Color_Blue);
+    c = codec_echo_opt_color(none_i32, &err);
+    assert(!c.has && c.value == 0 && err.code == 0);
+    // A present value is still checked; an absent one is ignored.
+    const codec_opt_i32 undeclared = {true, 3};
+    c = codec_echo_opt_color(undeclared, &err);
+    assert(!c.has && err.code == -3);
+    codec_error_clear(&err);
+    const codec_opt_i32 absent_undeclared = {false, 3};
+    c = codec_echo_opt_color(absent_undeclared, &err);
+    assert(!c.has && err.code == 0);
+}
+
+static void slices(void) {
+    codec_error err;
+
+    uint64_t nan_bits = 0x7ff8000000000001ull;
+    double f64s[4] = {0.0, -0.0, 5e-324, INFINITY};
+    memcpy(&f64s[0], &nan_bits, 8);
+    codec_run out = codec_echo_f64s(bytes_run(f64s, sizeof f64s), &err);
+    assert(err.code == 0 && out.len == sizeof f64s && "a typed array's len counts bytes");
+    assert(((uintptr_t)out.ptr % 8) == 0);
+    const double* d = (const double*)(const void*)out.ptr;
+    assert(isnan(d[0]) && memcmp(&d[1], &f64s[1], 3 * sizeof(double)) == 0);
+    codec_run_free(out);
+
+    const int32_t i32s[3] = {INT32_MIN, 0, INT32_MAX};
+    out = codec_echo_i32s(bytes_run(i32s, sizeof i32s), &err);
+    assert(err.code == 0 && run_take_bytes(out, i32s, sizeof i32s));
+    codec_run empty = {NULL, 0};
+    out = codec_echo_i32s(empty, &err);
+    assert(out.ptr == NULL && out.len == 0 && err.code == 0);
+
+    const uint64_t u64s[2] = {UINT64_MAX, 1ull << 63};
+    out = codec_echo_u64s(bytes_run(u64s, sizeof u64s), &err);
+    assert(err.code == 0 && run_take_bytes(out, u64s, sizeof u64s));
+    out = codec_echo_u64s(empty, &err);
+    assert(out.ptr == NULL && out.len == 0);
+
+    // A null array with a length, one not aligned for its element type,
+    // and one whose length isn't a multiple of the element's.
+    codec_run null_run = {NULL, 16};
+    out = codec_echo_u64s(null_run, &err);
+    assert(out.ptr == NULL && err.code == -3);
+    codec_error_clear(&err);
+    _Alignas(8) uint8_t raw[24] = {0};
+    out = codec_echo_u64s(bytes_run(raw + 4, 16), &err);
+    assert(out.ptr == NULL && err.code == -3);
+    codec_error_clear(&err);
+    out = codec_echo_u64s(bytes_run(raw, 12), &err);
+    assert(out.ptr == NULL && err.code == -3);
+    codec_error_clear(&err);
+}
+
+// Pull every chunk of `chunks(values, size)`, checking it against `expected`
+// (`counts[k]` elements each, laid out back to back).
+static void chunks(const int32_t* values, size_t n, uint32_t size, const int32_t* expected,
+                   const size_t* counts, size_t chunk_count) {
+    codec_error err;
+    codec_ChunksIterator* it = codec_chunks(bytes_run(values, n * sizeof(int32_t)), size, &err);
+    assert(err.code == 0 && it != NULL);
+    size_t seen = 0, offset = 0;
+    for (;;) {
+        codec_run item;
+        int32_t more = codec_ChunksIterator_next(it, &item, &err);
+        assert(err.code == 0);
+        if (!more) break;
+        assert(seen < chunk_count && item.len == counts[seen] * sizeof(int32_t));
+        assert(((uintptr_t)item.ptr % 8) == 0);
+        assert(run_take_bytes(item, expected + offset, counts[seen] * sizeof(int32_t)));
+        offset += counts[seen];
+        seen++;
+    }
+    assert(seen == chunk_count);
+    codec_ChunksIterator_destroy(it);
+}
+
+static void iterators(void) {
+    const int32_t extremes[3] = {INT32_MIN, 0, INT32_MAX};
+    const size_t two_one[2] = {2, 1};
+    chunks(extremes, 3, 2, extremes, two_one, 2);
+    const int32_t four[4] = {1, 2, 3, 4};
+    const size_t two_two[2] = {2, 2};
+    chunks(four, 4, 2, four, two_two, 2);
+    chunks(four, 2, 0, NULL, NULL, 0);
+    chunks(NULL, 0, 3, NULL, NULL, 0);
+
+    // `_next` checks `out_item` before it pulls an element, so a null slot
+    // fails with -3 and loses nothing.
+    codec_error err;
+    codec_ChunksIterator* it = codec_chunks(bytes_run(four, sizeof four), 4, &err);
+    assert(err.code == 0 && it != NULL);
+    assert(codec_ChunksIterator_next(it, NULL, &err) == 0 && err.code == -3);
+    codec_error_clear(&err);
+    codec_run item;
+    assert(codec_ChunksIterator_next(it, &item, &err) == 1 && err.code == 0);
+    assert(run_take_bytes(item, four, sizeof four));
+    assert(codec_ChunksIterator_next(it, &item, &err) == 0 && err.code == 0);
+    codec_ChunksIterator_destroy(it);
+}
+
+// Echo a string through `f`, expecting `expected` (or, when `expected` is
+// NULL, a -3 with `message`).
+typedef codec_run (*echo_fn)(codec_run, codec_error*);
+static void echo_text(echo_fn f, const char* in, const char* expected, const char* message) {
+    codec_error err;
+    codec_run out = f(str_run(in), &err);
+    if (expected != NULL) {
+        assert(err.code == 0 && run_take_eq(out, expected));
+    } else {
+        assert(out.ptr == NULL && err.code == -3 && MSG_EQ(err, message));
+        codec_error_clear(&err);
+    }
+}
+
+static void conversions(void) {
+    codec_error err;
+    assert(codec_echo_usize(4294967295u, &err) == 4294967295u && err.code == 0);
+    assert(codec_echo_usize(UINT64_MAX, &err) == UINT64_MAX && err.code == 0);
+
+    echo_text(codec_echo_char, "\xf0\x9f\xa6\x80", "\xf0\x9f\xa6\x80", NULL);
+    echo_text(codec_echo_char, "\xc3\xa9", "\xc3\xa9", NULL);
+    echo_text(codec_echo_char, "a", "a", NULL);
+    // A marshalling failure names the parameter.
+    echo_text(codec_echo_char, "ab", NULL, "value: \"ab\" is not a valid char");
+    echo_text(codec_echo_char, "", NULL, "value: \"\" is not a valid char");
+
+    echo_text(codec_echo_hex, "ff", "ff", NULL);
+    echo_text(codec_echo_hex, "00FF", "ff", NULL);
+    echo_text(codec_echo_hex, "0", "0", NULL);
+    echo_text(codec_echo_hex, "xyz", NULL, "value: invalid digit found in string");
+    echo_text(codec_echo_hex, "", NULL, "value: cannot parse integer from empty string");
+    echo_text(codec_echo_hex, "100000000", NULL,
+              "value: number too large to fit in target type");
+}
+
+// Every declaration exports `codec_contract_{fnv1a(path)}`, returning
+// fnv1a of its canonical signature. Recompute a few here, independently of
+// the generated table `codec_contract_check` walks.
+static void contracts(void) {
+    assert(codec_contract_check() == NULL);
+
+    assert(fnv1a64("check_vector") == 0x1bed7dee9a53da67ull);
+    assert(codec_contract_1bed7dee9a53da67() ==
+           fnv1a64("function check_vector(u32, Vector) -> bool"));
+    assert(fnv1a64("vector_name") == 0xc5e6b2820a4abbc4ull);
+    assert(codec_contract_c5e6b2820a4abbc4() ==
+           fnv1a64("function vector_name(u32) -> string throws CodecError"));
+    assert(fnv1a64("chunks") == 0x99034d67cbe5d3a3ull);
+    assert(codec_contract_99034d67cbe5d3a3() == fnv1a64("function chunks([i32], u32) -> iter<[i32]>"));
+    assert(fnv1a64("echo_opt_color") == 0xc478868729c1a422ull);
+    assert(codec_contract_c478868729c1a422() ==
+           fnv1a64("function echo_opt_color(Color?) -> Color?"));
+    // `usize` is `u64` in the signature.
+    assert(fnv1a64("echo_usize") == 0x2f655b1a7ab39335ull);
+    assert(codec_contract_2f655b1a7ab39335() == fnv1a64("function echo_usize(u64) -> u64"));
+    // The custom type `Hex` is its repr.
+    assert(fnv1a64("echo_hex") == 0x37c95403862d25b6ull);
+    assert(codec_contract_37c95403862d25b6() == fnv1a64("function echo_hex(string) -> string"));
+    // An interface and its members.
+    assert(fnv1a64("Token") == 0xe68398e3c2c760b2ull);
+    assert(codec_contract_e68398e3c2c760b2() == fnv1a64("interface Token"));
+    assert(fnv1a64("Token.new") == 0x19f363a91a374252ull);
+    assert(codec_contract_19f363a91a374252() == fnv1a64("constructor new(i64) -> Token"));
+    assert(fnv1a64("Token.value") == 0x59d25d13b44894adull);
+    assert(codec_contract_59d25d13b44894ad() == fnv1a64("method value() -> i64"));
+    // A record (field types only), an enum (variant names and values), an
+    // error domain and a code with fields.
+    assert(fnv1a64("Holder") == 0xa1f526c44ead452full);
+    assert(codec_contract_a1f526c44ead452f() ==
+           fnv1a64("record Holder {Token, Token?, [Token], {string:Token}}"));
+    assert(fnv1a64("Color") == 0x344ea8f4939cdc98ull);
+    assert(codec_contract_344ea8f4939cdc98() ==
+           fnv1a64("enum Color {Red = 0, Green = 1, Blue = 7, Infrared = -1}"));
+    assert(fnv1a64("CodecError") == 0xe164ee0906a952c1ull);
+    assert(codec_contract_e164ee0906a952c1() == fnv1a64("errors CodecError"));
+    assert(fnv1a64("CodecError.OutOfRange") == 0x2134ae9245baee17ull);
+    assert(codec_contract_2134ae9245baee17() == fnv1a64("code OutOfRange = 1 {u32, u32}"));
+}
 
 int main(void) {
-    weaveffi_error err = {0};
+    // `out_err` is overwritten, never read: garbage in it is fine.
+    codec_error err;
+    memset(&err, 0xA5, sizeof err);
 
-    assert(weaveffi_abi_version() == 2u && WEAVEFFI_ABI_VERSION == 2u);
+    assert(CODEC_ABI_VERSION == 6u && codec_abi_version() == CODEC_ABI_VERSION);
+    contracts();
+    assert(codec_debug_live(-1) == 1);
 
-    // ── Scalars: producer encodes, consumer decodes ──────────────────────
-    scalars_t s;
-    fetch_sample_scalars(&s);
-    assert(s.i8v == -8);
-    assert(s.u8v == 200);
-    assert(s.i16v == -16000);
-    assert(s.u16v == 60000);
-    assert(s.i32v == -2000000000);
-    assert(s.u32v == 4000000000u);
-    assert(s.i64v == -9007199254740993LL);
-    assert(s.u64v == UINT64_MAX);
-    assert(s.f32v == 1.5f);
-    assert(s.f64v == -2.25e100);
-    assert(s.flag == 1);
-    assert(s.color == weaveffi_codec_Color_Blue && s.color == 7);
-    assert(scalars_eq(&s, &CANONICAL_SCALARS));
+    uint32_t n = codec_vector_count(&err);
+    assert(err.code == 0 && n >= 60);
 
-    // Consumer encodes, producer decodes and compares to its canonical value.
-    assert(verify_scalars(&s, &err) && err.code == 0);
+    every_vector(n);
+    literal_vectors(n);
+    spot_checks(n);
+    out_of_range(n);
+    malformed();
+    objects(n);
+    opt_scalars();
+    slices();
+    iterators();
+    conversions();
 
-    // Consumer encodes, producer re-encodes: field-by-field equality.
-    scalars_t s2;
-    roundtrip_scalars(&s, &s2);
-    assert(scalars_eq(&s, &s2));
-
-    // A one-field change is a Mismatch (code 1) with the doc-comment message.
-    s2.flag = 0;
-    assert(!verify_scalars(&s2, &err));
-    assert(err.code == weaveffi_codec_CodecError_Mismatch && err.code == 1);
-    assert(err.message != NULL &&
-           strcmp(err.message, "value does not match the canonical fixture") == 0);
-    assert(err.payload_ptr == NULL && err.payload_len == 0);
-    weaveffi_error_clear(&err);
-
-    // Hand-built edge scalars: extremes, NaN, infinities, negative zero.
-    scalars_t edge = {
-        INT8_MIN, UINT8_MAX, INT16_MIN, UINT16_MAX, INT32_MIN, UINT32_MAX,
-        INT64_MIN, UINT64_MAX, NAN, -0.0, 0, weaveffi_codec_Color_Red,
-    };
-    scalars_t edge2;
-    roundtrip_scalars(&edge, &edge2);
-    assert(scalars_eq(&edge, &edge2));
-    assert(isnan(edge2.f32v) && signbit(edge2.f64v) && edge2.f64v == 0.0);
-    edge.i8v = INT8_MAX;
-    edge.i16v = INT16_MAX;
-    edge.i32v = INT32_MAX;
-    edge.i64v = INT64_MAX;
-    edge.u8v = 0;
-    edge.u16v = 0;
-    edge.u32v = 0;
-    edge.u64v = 0;
-    edge.f32v = -INFINITY;
-    edge.f64v = INFINITY;
-    edge.color = weaveffi_codec_Color_Green;
-    roundtrip_scalars(&edge, &edge2);
-    assert(scalars_eq(&edge, &edge2));
-    assert(isinf(edge2.f32v) && edge2.f32v < 0 && isinf(edge2.f64v) && edge2.f64v > 0);
-    edge.f64v = NAN;
-    edge.f32v = 0.0f;
-    roundtrip_scalars(&edge, &edge2);
-    assert(isnan(edge2.f64v) && scalars_eq(&edge, &edge2));
-
-    // ── Composite: producer encodes, consumer decodes ────────────────────
-    composite_t c;
-    fetch_sample_composite(&c);
-    assert(strcmp(c.name, "h\xC3\xA9llo w\xC3\xB6rld \xE2\x9C\x93") == 0);
-    const uint8_t blob[6] = {0, 1, 2, 253, 254, 255};
-    assert(c.blob_len == 6 && memcmp(c.blob, blob, 6) == 0);
-    assert(c.has_some_i64 && c.some_i64 == INT64_MIN);
-    assert(!c.has_none_i64);
-    assert(c.has_some_text && strcmp(c.some_text, "") == 0);
-    assert(c.names_n == 3 && strcmp(c.names[0], "a") == 0 && strcmp(c.names[1], "") == 0 &&
-           strcmp(c.names[2], "ccc") == 0);
-    assert(c.matrix_n == 3);
-    assert(c.matrix[0].n == 3 && c.matrix[0].v[0] == 1 && c.matrix[0].v[1] == 2 &&
-           c.matrix[0].v[2] == 3);
-    assert(c.matrix[1].n == 0);
-    assert(c.matrix[2].n == 1 && c.matrix[2].v[0] == -4);
-    assert(c.empty_n == 0);
-    // BTreeMap keys arrive sorted.
-    assert(c.by_name_n == 3);
-    assert(strcmp(c.by_name[0].key, "neg") == 0 && c.by_name[0].value == -3);
-    assert(strcmp(c.by_name[1].key, "one") == 0 && c.by_name[1].value == 1);
-    assert(strcmp(c.by_name[2].key, "two") == 0 && c.by_name[2].value == 2);
-    assert(c.by_id_n == 2);
-    assert(c.by_id[0].key == -1 && scalars_eq(&c.by_id[0].value, &CANONICAL_SCALARS));
-    assert(c.by_id[1].key == 42 && c.by_id[1].value.flag == 0 &&
-           c.by_id[1].value.u64v == UINT64_MAX);
-    assert(scalars_eq(&c.scalars, &CANONICAL_SCALARS));
-    assert(c.shape.tag == weaveffi_codec_Shape_Labeled && strcmp(c.shape.label, "tag") == 0 &&
-           c.shape.count == 3);
-    assert(c.shapes_n == 5);
-    assert(c.shapes[0].tag == weaveffi_codec_Shape_Empty);
-    assert(c.shapes[1].tag == weaveffi_codec_Shape_Circle && c.shapes[1].radius == 2.5);
-    assert(c.shapes[2].tag == weaveffi_codec_Shape_Rect && c.shapes[2].width == 1.0f &&
-           c.shapes[2].height == 0.5f);
-    assert(c.shapes[3].tag == weaveffi_codec_Shape_Labeled && strcmp(c.shapes[3].label, "") == 0 &&
-           c.shapes[3].count == -1);
-    assert(c.shapes[4].tag == weaveffi_codec_Shape_Nested &&
-           scalars_eq(&c.shapes[4].inner, &CANONICAL_SCALARS) && c.shapes[4].has_note &&
-           strcmp(c.shapes[4].note, "n") == 0);
-    assert(c.has_maybe_shape && c.maybe_shape.tag == weaveffi_codec_Shape_Nested &&
-           !c.maybe_shape.has_note && scalars_eq(&c.maybe_shape.inner, &CANONICAL_SCALARS));
-    assert(c.has_maybe_list && c.maybe_list_n == 2 && c.maybe_list[0] == 9 && c.maybe_list[1] == 8);
-    assert(c.sparse_n == 3);
-    assert(c.sparse[0].has && c.sparse[0].value == 1);
-    assert(!c.sparse[1].has);
-    assert(c.sparse[2].has && c.sparse[2].value == 0);
-    assert(c.colors_n == 3 && c.colors[0] == weaveffi_codec_Color_Red &&
-           c.colors[1] == weaveffi_codec_Color_Green && c.colors[2] == weaveffi_codec_Color_Blue);
-
-    // Consumer encodes, producer decodes.
-    assert(verify_composite(&c, &err) && err.code == 0);
-
-    // Consumer encodes, producer re-encodes, consumer decodes again.
-    composite_t c2;
-    roundtrip_composite(&c, &c2);
-    assert(composite_eq(&c, &c2));
-
-    // Perturb one deeply nested field: Mismatch.
-    c2.sparse[1].has = 1;
-    c2.sparse[1].value = 1;
-    assert(!verify_composite(&c2, &err));
-    assert(err.code == weaveffi_codec_CodecError_Mismatch);
-    weaveffi_error_clear(&err);
-    composite_free(&c2);
-
-    // describe_composite renders what the producer saw.
-    {
-        wv_writer w;
-        wv_w_init(&w);
-        write_composite(&w, &c);
-        const char* text = weaveffi_codec_describe_composite(w.buf, w.len, &err);
-        assert(err.code == 0 && text != NULL);
-        assert(strstr(text, "name: \"h\xC3\xA9llo w\xC3\xB6rld \xE2\x9C\x93\"") != NULL);
-        assert(strstr(text, "some_i64: Some(-9223372036854775808)") != NULL);
-        assert(strstr(text, "shape: Labeled { label: \"tag\", count: 3 }") != NULL);
-        weaveffi_free_string(text);
-        wv_w_free(&w);
-    }
-    composite_free(&c);
-
-    // Hand-built edge composite: everything empty or absent, unicode name,
-    // maps with extreme keys, a list of absent optionals.
-    composite_t e;
-    memset(&e, 0, sizeof e);
-    e.name = strdup("\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E \xF0\x9F\x8E\x89");  // 日本語 🎉
-    e.blob = (uint8_t*)xcalloc(0, 1);
-    e.blob_len = 0;
-    e.has_some_i64 = 1;
-    e.some_i64 = INT64_MAX;
-    e.has_none_i64 = 1;
-    e.none_i64 = -1;
-    e.has_some_text = 0;
-    e.names_n = 0;
-    e.names = (char**)xcalloc(0, sizeof(char*));
-    e.matrix_n = 1;
-    e.matrix = (i32_list_t*)xcalloc(1, sizeof(i32_list_t));
-    e.matrix[0].n = 2;
-    e.matrix[0].v = (int32_t*)xcalloc(2, sizeof(int32_t));
-    e.matrix[0].v[0] = INT32_MIN;
-    e.matrix[0].v[1] = INT32_MAX;
-    e.empty_n = 2;
-    e.empty = (double*)xcalloc(2, sizeof(double));
-    e.empty[0] = -0.0;
-    e.empty[1] = NAN;
-    e.by_name_n = 1;
-    e.by_name = (by_name_t*)xcalloc(1, sizeof(by_name_t));
-    e.by_name[0].key = strdup("");
-    e.by_name[0].value = INT64_MIN;
-    e.by_id_n = 0;
-    e.by_id = (by_id_t*)xcalloc(0, sizeof(by_id_t));
-    e.scalars = edge;
-    e.shape = shape_empty();
-    e.shapes_n = 0;
-    e.shapes = (shape_t*)xcalloc(0, sizeof(shape_t));
-    e.has_maybe_shape = 0;
-    e.has_maybe_list = 1;
-    e.maybe_list_n = 0;
-    e.maybe_list = (uint8_t*)xcalloc(0, 1);
-    e.sparse_n = 2;
-    e.sparse = (opt_bool_t*)xcalloc(2, sizeof(opt_bool_t));
-    e.colors_n = 0;
-    e.colors = (int32_t*)xcalloc(0, sizeof(int32_t));
-    composite_t e2;
-    roundtrip_composite(&e, &e2);
-    assert(composite_eq(&e, &e2));
-    assert(strcmp(e2.name, e.name) == 0 && e2.blob_len == 0 && e2.has_maybe_list &&
-           e2.maybe_list_n == 0 && isnan(e2.empty[1]) && signbit(e2.empty[0]));
-    assert(!verify_composite(&e, &err) && err.code == 1);
-    weaveffi_error_clear(&err);
-    composite_free(&e2);
-    composite_free(&e);
-
-    // ── Shape variants through roundtrip_shape and describe_shape ───────
-    shape_t variants[5];
-    variants[0] = shape_empty();
-    variants[1] = shape_circle(2.5);
-    variants[2] = shape_rect(1.0f, 0.5f);
-    variants[3] = shape_labeled("tag", 3);
-    variants[4] = shape_nested(&CANONICAL_SCALARS, "n");
-    const char* descriptions[5] = {
-        "Empty",
-        "Circle { radius: 2.5 }",
-        "Rect { width: 1.0, height: 0.5 }",
-        "Labeled { label: \"tag\", count: 3 }",
-        NULL,
-    };
-    for (int i = 0; i < 5; i++) {
-        shape_t back;
-        roundtrip_shape(&variants[i], &back);
-        assert(shape_eq(&variants[i], &back));
-        char* text = describe_shape(&back);
-        if (descriptions[i]) {
-            assert(strcmp(text, descriptions[i]) == 0);
-        } else {
-            assert(strstr(text, "Nested { inner: Scalars { i8_value: -8,") != NULL &&
-                   strstr(text, "note: Some(\"n\") }") != NULL);
-        }
-        free(text);
-        shape_free(&back);
-    }
-    {
-        shape_t no_note = shape_nested(&edge, NULL);
-        shape_t back;
-        roundtrip_shape(&no_note, &back);
-        assert(shape_eq(&no_note, &back) && !back.has_note);
-        shape_free(&back);
-        shape_free(&no_note);
-
-        shape_t huge = shape_labeled("", INT32_MIN);
-        roundtrip_shape(&huge, &back);
-        assert(shape_eq(&huge, &back));
-        shape_free(&back);
-        shape_free(&huge);
-    }
-
-    // roundtrip_shapes: a list of every variant.
-    {
-        wv_writer w;
-        wv_w_init(&w);
-        wv_put_u32(&w, 5);
-        for (int i = 0; i < 5; i++) write_shape(&w, &variants[i]);
-        size_t len = 0;
-        const uint8_t* p = weaveffi_codec_roundtrip_shapes(w.buf, w.len, &len, &err);
-        assert(err.code == 0);
-        assert(len == w.len && memcmp(p, w.buf, len) == 0);
-        wv_w_free(&w);
-        TAKE_BUFFER(p, len, {
-            assert(wv_get_u32(&r_) == 5);
-            for (int i = 0; i < 5; i++) {
-                shape_t back;
-                read_shape(&r_, &back);
-                assert(shape_eq(&variants[i], &back));
-                shape_free(&back);
-            }
-        });
-        wv_w_init(&w);
-        wv_put_u32(&w, 0);
-        p = weaveffi_codec_roundtrip_shapes(w.buf, w.len, &len, &err);
-        assert(err.code == 0);
-        TAKE_BUFFER(p, len, assert(wv_get_u32(&r_) == 0));
-        wv_w_free(&w);
-    }
-    for (int i = 0; i < 5; i++) shape_free(&variants[i]);
-
-    // A malformed buffer (truncated mid-value) is a marshalling failure (-3).
-    {
-        uint8_t truncated[3] = {1, 0, 0};
-        size_t len = 0;
-        assert(weaveffi_codec_roundtrip_shape(truncated, sizeof truncated, &len, &err) == NULL);
-        assert(err.code == -3);
-        weaveffi_error_clear(&err);
-    }
-
-    // ── Standalone optional, map, string, bytes, and direct scalars ──────
-    {
-        wv_writer w;
-        wv_w_init(&w);
-        wv_put_bool(&w, 1);
-        wv_put_i64(&w, -1);
-        size_t len = 0;
-        const uint8_t* p = weaveffi_codec_roundtrip_opt_i64(w.buf, w.len, &len, &err);
-        assert(err.code == 0);
-        TAKE_BUFFER(p, len, { assert(wv_get_bool(&r_) == 1 && wv_get_i64(&r_) == -1); });
-        wv_w_free(&w);
-        const uint8_t none[1] = {0};
-        p = weaveffi_codec_roundtrip_opt_i64(none, 1, &len, &err);
-        assert(err.code == 0);
-        TAKE_BUFFER(p, len, assert(wv_get_bool(&r_) == 0));
-
-        // Map: encoded out of key order, comes back sorted by the BTreeMap.
-        wv_w_init(&w);
-        wv_put_u32(&w, 3);
-        wv_put_str(&w, "b");
-        wv_put_i64(&w, -2);
-        wv_put_str(&w, "a");
-        wv_put_i64(&w, 1);
-        wv_put_str(&w, "");
-        wv_put_i64(&w, INT64_MAX);
-        p = weaveffi_codec_roundtrip_map(w.buf, w.len, &len, &err);
-        assert(err.code == 0);
-        TAKE_BUFFER(p, len, {
-            assert(wv_get_u32(&r_) == 3);
-            char* k = wv_get_str(&r_);
-            assert(strcmp(k, "") == 0 && wv_get_i64(&r_) == INT64_MAX);
-            free(k);
-            k = wv_get_str(&r_);
-            assert(strcmp(k, "a") == 0 && wv_get_i64(&r_) == 1);
-            free(k);
-            k = wv_get_str(&r_);
-            assert(strcmp(k, "b") == 0 && wv_get_i64(&r_) == -2);
-            free(k);
-        });
-        wv_w_free(&w);
-        wv_w_init(&w);
-        wv_put_u32(&w, 0);
-        p = weaveffi_codec_roundtrip_map(w.buf, w.len, &len, &err);
-        assert(err.code == 0);
-        TAKE_BUFFER(p, len, assert(wv_get_u32(&r_) == 0));
-        wv_w_free(&w);
-
-        // Strings and bytes keep their direct ABI.
-        const char* text = weaveffi_codec_roundtrip_string("h\xC3\xA9llo \xE2\x9C\x93", &err);
-        assert(err.code == 0 && strcmp(text, "h\xC3\xA9llo \xE2\x9C\x93") == 0);
-        weaveffi_free_string(text);
-        text = weaveffi_codec_roundtrip_string("", &err);
-        assert(err.code == 0 && strcmp(text, "") == 0);
-        weaveffi_free_string(text);
-        assert(weaveffi_codec_roundtrip_string(NULL, &err) == NULL && err.code == -3);
-        weaveffi_error_clear(&err);
-        const uint8_t raw[4] = {0, 255, 0, 128};
-        p = weaveffi_codec_roundtrip_bytes(raw, 4, &len, &err);
-        assert(err.code == 0 && len == 4 && memcmp(p, raw, 4) == 0);
-        weaveffi_free_bytes((uint8_t*)p, len);
-        p = weaveffi_codec_roundtrip_bytes(raw, 0, &len, &err);
-        assert(err.code == 0 && len == 0);
-        weaveffi_free_bytes((uint8_t*)p, len);
-
-        // Direct family.
-        assert(weaveffi_codec_roundtrip_i64(INT64_MIN, &err) == INT64_MIN);
-        assert(weaveffi_codec_roundtrip_i64(INT64_MAX, &err) == INT64_MAX);
-        assert(weaveffi_codec_roundtrip_u64(UINT64_MAX, &err) == UINT64_MAX);
-        assert(weaveffi_codec_roundtrip_u64(1ULL << 63, &err) == (1ULL << 63));
-        assert(isnan(weaveffi_codec_roundtrip_f64(NAN, &err)));
-        assert(signbit(weaveffi_codec_roundtrip_f64(-0.0, &err)));
-        assert(weaveffi_codec_roundtrip_f64(INFINITY, &err) == INFINITY);
-        assert(weaveffi_codec_roundtrip_f64(-2.25e100, &err) == -2.25e100);
-        assert(weaveffi_codec_roundtrip_bool(true, &err) == true);
-        assert(weaveffi_codec_roundtrip_bool(false, &err) == false);
-        assert(weaveffi_codec_roundtrip_color(weaveffi_codec_Color_Blue, &err) ==
-               weaveffi_codec_Color_Blue);
-        assert(weaveffi_codec_roundtrip_color(weaveffi_codec_Color_Red, &err) == 0);
-        assert(err.code == 0);
-        weaveffi_codec_roundtrip_color((weaveffi_codec_Color)3, &err);
-        assert(err.code == -3 && "an undeclared discriminant is a marshalling failure");
-        weaveffi_error_clear(&err);
-    }
-
-    // ── Token objects and Holder (objects inside buffers) ────────────────
-    weaveffi_codec_Token* t = weaveffi_codec_Token_new(5, &err);
-    assert(err.code == 0 && t != NULL);
-    assert(token_value(t) == 5);
-    weaveffi_codec_Token* t2 = weaveffi_codec_Token_clone(t);
-    assert(t2 == t);
-    weaveffi_codec_Token_destroy(t);
-    assert(token_value(t2) == 5 && "clone survives destroying the original");
-    weaveffi_codec_Token_destroy(t2);
-    weaveffi_codec_Token_destroy(NULL);
-    assert(weaveffi_codec_Token_clone(NULL) == NULL);
-
-    holder_t h;
-    make_holder(10, 1, &h);
-    assert(token_value(h.primary) == 10);
-    assert(h.spare != NULL && token_value(h.spare) == 11);
-    assert(h.many_n == 3);
-    assert(token_value(h.many[0]) == 12 && token_value(h.many[1]) == 13 &&
-           token_value(h.many[2]) == 14);
-    assert(h.primary != h.spare && h.primary != h.many[0]);
-
-    // sum_holder consumes one encoding (one reference per token).
-    {
-        wv_writer w;
-        wv_w_init(&w);
-        write_holder(&w, &h);
-        assert(weaveffi_codec_sum_holder(w.buf, w.len, &err) == 10 + 11 + 12 + 13 + 14);
-        assert(err.code == 0);
-        wv_w_free(&w);
-        assert(token_value(h.primary) == 10 && "our references are intact");
-    }
-
-    // primary_of returns the very same object as holder.primary, as an
-    // owned reference we release; the holder's reference stays valid.
-    {
-        wv_writer w;
-        wv_w_init(&w);
-        write_holder(&w, &h);
-        weaveffi_codec_Token* primary = weaveffi_codec_primary_of(w.buf, w.len, &err);
-        assert(err.code == 0);
-        assert(primary == h.primary);
-        wv_w_free(&w);
-        assert(token_value(primary) == 10);
-        weaveffi_codec_Token_destroy(primary);
-        assert(token_value(h.primary) == 10);
-    }
-
-    // same_primary: two encodings of the same holder share a primary; a
-    // different holder does not.
-    holder_t h2;
-    make_holder(100, 0, &h2);
-    assert(h2.spare == NULL && h2.many_n == 3 && token_value(h2.primary) == 100);
-    {
-        wv_writer a, b;
-        wv_w_init(&a);
-        wv_w_init(&b);
-        write_holder(&a, &h);
-        write_holder(&b, &h);
-        assert(weaveffi_codec_same_primary(a.buf, a.len, b.buf, b.len, &err));
-        assert(err.code == 0);
-        wv_w_free(&a);
-        wv_w_free(&b);
-        wv_w_init(&a);
-        wv_w_init(&b);
-        write_holder(&a, &h);
-        write_holder(&b, &h2);
-        assert(!weaveffi_codec_same_primary(a.buf, a.len, b.buf, b.len, &err));
-        assert(err.code == 0);
-        wv_w_free(&a);
-        wv_w_free(&b);
-
-        // A holder mixing our own tokens with the producer's.
-        holder_t mixed;
-        memset(&mixed, 0, sizeof mixed);
-        mixed.primary = weaveffi_codec_Token_new(1000, &err);
-        mixed.spare = weaveffi_codec_Token_clone(h.primary);
-        mixed.many_n = 2;
-        mixed.many[0] = weaveffi_codec_Token_clone(h2.primary);
-        mixed.many[1] = weaveffi_codec_Token_new(-1, &err);
-        wv_w_init(&a);
-        write_holder(&a, &mixed);
-        assert(weaveffi_codec_sum_holder(a.buf, a.len, &err) == 1000 + 10 + 100 - 1);
-        wv_w_free(&a);
-        wv_w_init(&a);
-        write_holder(&a, &mixed);
-        weaveffi_codec_Token* p = weaveffi_codec_primary_of(a.buf, a.len, &err);
-        assert(p == mixed.primary && token_value(p) == 1000);
-        weaveffi_codec_Token_destroy(p);
-        wv_w_free(&a);
-        holder_release(&mixed);
-        assert(token_value(h.primary) == 10 && token_value(h2.primary) == 100 &&
-               "the clones written into `mixed` never touched our references");
-    }
-    holder_release(&h2);
-    holder_release(&h);
-
-    printf("c/codec: OK\n");
+    ASSERT_NO_LEAKS(codec_debug_live);
+    printf("c/codec: OK (%u vectors)\n", n);
     return 0;
 }

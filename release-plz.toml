@@ -1,0 +1,59 @@
+# Releases: release-plz opens (and keeps updating) a release PR from the
+# Conventional Commits on `main`. CI runs on that PR like any other; merging
+# it publishes every crate at the new shared version, tags `v{version}`, and
+# creates the GitHub release, which triggers the binary build in
+# .github/workflows/release-binaries.yml.
+[workspace]
+# Every published crate shares one version.
+changelog_update = false
+git_tag_enable = false
+git_release_enable = false
+semver_check = false
+dependencies_update = false
+pr_labels = ["release"]
+release_always = false
+# Version rules, matching the semantic-release setup this replaced:
+#   feat                          -> minor (even on 0.x)
+#   fix, perf, revert             -> patch
+#   any type with `!` or a
+#   `BREAKING CHANGE:` footer     -> minor while 0.x
+#   chore, docs, style, refactor,
+#   test, build, ci               -> no release on their own
+# release-plz bumps feat by a patch on 0.x unless told otherwise.
+features_always_increment_minor = true
+# release-plz releases on any commit that changes a crate unless at least one
+# commit must match this pattern. Squash merges make the PR title the commit
+# subject, and pr-lint.yml keeps PR titles conventional.
+release_commits = '^(feat|fix|perf|revert)(\(.*\))?!?:|^[a-z]+(\(.*\))?!:|^Revert "|BREAKING[ -]CHANGE:'
+
+[changelog]
+commit_parsers = [
+  { message = "^feat", group = "Features" },
+  { message = "^fix", group = "Bug Fixes" },
+  { message = "^perf", group = "Performance" },
+  { message = "^revert", group = "Reverts" },
+  { message = "^(chore|ci|build|docs|style|test|refactor)", skip = true },
+]
+
+[[package]]
+name = "weaveffi-model"
+version_group = "weaveffi"
+
+[[package]]
+name = "weaveffi-macros"
+version_group = "weaveffi"
+
+[[package]]
+name = "weaveffi"
+version_group = "weaveffi"
+
+[[package]]
+name = "weaveffi-cli"
+version_group = "weaveffi"
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+changelog_include = ["weaveffi-model", "weaveffi-macros", "weaveffi"]
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+git_release_enable = true
+git_release_name = "v{{ version }}"

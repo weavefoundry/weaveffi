@@ -1,338 +1,221 @@
-# Annotated Rust Extraction
+# Library Mode
 
-## Overview
+The CLI never reads Rust source. A Rust producer's API is read from the
+library the crate builds: each WeaveFFI attribute embeds a description of its
+declaration in the compiled library, and `weaveffi generate`, `validate`,
+`extract`, `build`, and `package` read it back out. The bindings therefore
+describe exactly what the library was compiled with: `#[cfg]`, Cargo
+features, type aliases, and macro expansion all resolved.
 
-One way to drive WeaveFFI is to make annotated Rust your source of truth. The
-`#[weaveffi::module]` proc-macro reads that annotated source to generate the
-producer's C ABI glue (see [The Rust Producer Macro](producer-macro.md)), and
-the CLI reads the *same* annotations to derive the IDL and bindings. Both
-paths call into one shared extractor (`weaveffi-bridge`), so the IDL the CLI
-emits and the symbols the macro produces cannot drift.
+A Rust project's input is the crate: its directory (`[project] input = "."`,
+which `weaveffi init` writes) or its `Cargo.toml`.
 
-You can point `weaveffi generate` and `weaveffi extract` straight at a `.rs`
-file. `generate` lowers the source to the IR in memory and runs the
-generators; `extract` writes the derived IDL to disk (handy for review, for
-committing a canonical IDL alongside the source, or for piping into another
-command).
+```bash
+weaveffi generate                    # build the crate (dev profile), read it, generate
+weaveffi generate --profile release  # read a release build instead
+weaveffi generate -F sync,metrics    # build it with Cargo features
+weaveffi generate --library target/x86_64-unknown-linux-gnu/release/libkvstore.so
+```
 
-## When to use
+Without `--library`, the CLI resolves the crate with `cargo metadata` (its
+name, version, library name, and target directory), runs `cargo rustc --lib
+--crate-type cdylib --profile <profile>` with the project's Cargo features
+(Cargo's errors and warnings print as usual), and reads the `cdylib` it
+built, so the crate needs no `crate-type` of its own. `--profile` defaults
+to `dev`, and the features are `-F`/`--features`, `--all-features`, and
+`--no-default-features`, else `[build] features`, `all_features`, and
+`no_default_features` (see [Project Configuration](config.md#build)): the
+same set every build of the producer uses, so the bindings and the shipped
+libraries agree on every `#[cfg(feature = "...")]`.
 
-Reach for a `.rs` input when:
+`--library` skips the build and reads the given file: a shared library, a
+static archive, or a `.wasm` module, for any platform (an Android `.so`
+reads fine on a Mac). With no crate at all (no input argument and no
+`[project] input`), `--library` reads the library on its own: the prefix
+comes from its metadata and the library name from its file name, and a file
+holding the metadata of several WeaveFFI crates is an error that asks for
+the crate.
 
-- You want the Rust implementation to be the single source of truth, with no
-  separate IDL to maintain.
-- You want the IDL to track signature changes automatically: edit the Rust,
-  re-run.
+## Extracting an IDL
 
-Author an IDL document (YAML/JSON/TOML) directly when:
+`weaveffi extract` prints the API the library embeds as an IDL document,
+which is useful for reviewing the API surface, committing a canonical IDL
+next to the crate, or handing the API to a non-Rust implementation.
 
-- You want to design the API before any Rust exists.
-- You need a feature the extractor cannot infer from Rust syntax, such as
-  record field defaults or a code `doc:` distinct from its `message:`. See
-  [Pitfalls](#pitfalls).
+```bash
+weaveffi extract                       # the project's crate, YAML to stdout
+weaveffi extract path/to/crate -o api.yml
+weaveffi extract -f json -o api.json   # JSON
+weaveffi extract --library libkvstore.dylib
+```
 
-## Step-by-step
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-o`, `--out` | stdout | Write to a file |
+| `-f`, `--format` | `yaml` | `yaml` or `json` |
+| `--library` | build the crate | Read this library instead |
+| `--profile` | `dev` | The Cargo profile to build the crate with |
+| `-F`, `--features`; `--all-features`; `--no-default-features` | `[build]`'s | The Cargo features to build the crate with |
+| `--config` | discovered | The `weaveffi.toml` to use |
 
-### 1. Annotate the Rust source
+The document is validated before it's printed, so what `extract` prints
+always generates. An IDL input is an error: there's nothing to extract.
 
-Mark an inline module with `#[weaveffi::module]` and tag the items you want
-to export. The attributes come from the `weaveffi` crate; the same crate's
-macro generates the producer glue when you compile the library.
+The extracted IDL carries no package identity. When you generate from it,
+the identity comes from `[package]` in `weaveffi.toml` (IDL rules), not from
+`Cargo.toml`, so set `name`, `c_prefix`, and `library` to match the crate if
+the generated bindings must load the Rust library.
 
-```rust
-/// Catalog operations.
-#[weaveffi::module]
-pub mod inventory {
-    use std::sync::Arc;
+## How the API is embedded
 
-    /// A product in the catalog.
-    #[weaveffi::record]
-    #[derive(Clone)]
-    pub struct Product {
-        /// Stable identifier.
-        pub id: i32,
-        pub name: String,
-        pub price: f64,
-        pub tags: Vec<String>,
-        /// The warehouse that stocks it, if known.
-        pub warehouse: Option<Arc<Warehouse>>,
-    }
+For every declaration (a function, an interface and each of its members, a
+record, an enum, an error domain, a callback interface) the attribute emits
+an exported static holding one **frame**, a little-endian `u32` length and
+then compact JSON recording the declaration (in the IDL's own shape), the
+source location of its attribute, the crate's prefix, the schema version,
+and the ABI revision. The static is named the crate's uppercase prefix,
+`_META_`, and 16 uppercase hex digits of the FNV-1a 64 hash of the
+declaration's path (`Book.add`), so it never collides with another
+declaration or another crate:
 
-    /// Product availability.
-    #[weaveffi::enumeration]
-    #[repr(i32)]
-    #[derive(Clone, Copy)]
-    pub enum Availability {
-        InStock = 0,
-        OutOfStock = 1,
-        Preorder = 2,
-    }
+```rust,ignore
+#[unsafe(export_name = "MACRO_TOUR_META_...")]
+#[cfg_attr(target_family = "wasm", unsafe(link_section = "weaveffi_meta"))]
+#[used]
+pub static __WEAVEFFI_META: [u8; N] = /* the frame */;
+```
 
-    /// A stocking location.
-    #[weaveffi::interface]
-    pub struct Warehouse {
-        code: String,
-    }
+The CLI reads native libraries with the `object` crate, walking the symbol
+tables for `_META_` symbols and reading each one's bytes from the section
+that holds it (every member of a static archive included). A `wasm32`
+module keeps its data out of reach of any symbol table, so there the frames
+go to the `weaveffi_meta` custom section, which the linker fills with every
+frame back to back. The CLI keeps the frames carrying the crate's own
+prefix (a dependency that is itself a WeaveFFI producer embeds frames too)
+and assembles them into the API, ordering each kind of declaration by where
+its attribute is written (file, line, then column), whatever order the
+linker laid the statics out in. A frame built by another WeaveFFI version
+(another schema version or ABI revision) is an error.
 
-    impl Warehouse {
-        /// Open a warehouse by code.
-        pub fn new(code: String) -> Warehouse {
-            Warehouse { code }
-        }
+A frame carries its declaration's `#[cfg]` (and, for an interface member,
+its `impl` block's), so a declaration a build compiles out is missing from
+that build's metadata exactly as it's missing from its symbols and its
+contract functions. The [macro tour](producer-macro.md#conditional-compilation-and-features)'s
+`Book::purge` is in the API only when the crate is built with its `admin`
+feature (`weaveffi extract -F admin`).
 
-        /// The warehouse code.
-        pub fn code(&self) -> String {
-            self.code.clone()
-        }
-    }
+A library with no frames for the crate (the API isn't tagged) is an error
+that says what's missing: tagged items and one `weaveffi::export_runtime!()`
+call.
 
-    /// Consumer-implemented stock observer.
-    #[weaveffi::callback_interface]
-    pub trait StockObserver: Send + Sync {
-        /// A product's availability changed.
-        fn on_change(&self, product: &Product, now: Availability);
-    }
+## Iterating: `generate --dev`
 
-    /// Look up a product by ID.
-    #[weaveffi::export]
-    pub fn get_product(id: i32) -> Option<Product> {
-        let _ = id;
-        None
-    }
+`weaveffi generate --dev` generates as usual, then points the generated
+packages at the library the API was read from (the one it just built, or
+`--library`'s):
 
-    /// Watch for availability changes; returns the observer count.
-    #[weaveffi::export]
-    pub fn watch(observer: Arc<dyn StockObserver>) -> i32 {
-        let _ = observer;
-        1
-    }
+- it copies the library into each generated package that looks for a
+  bundled copy (when the library is a shared library), so it loads with no
+  environment variables;
+- for every other target that loads the library at run time, it prints the
+  `{PREFIX}_LIBRARY=<path>` to set;
+- for the targets that link the library when they're built (C, C++, Swift,
+  and Go), it prints the directory to link with (`-L<dir> -l{library}`) and
+  to put on the loader path;
+- WebAssembly needs a `wasm32` build, which `--dev` doesn't make (`weaveffi
+  build --platforms wasm32` does).
 
-    /// Replaced by `search_v2` in 0.3.0.
-    #[weaveffi::export]
-    #[deprecated(since = "0.2.0", note = "use search_v2 instead")]
-    pub fn search(query: String, limit: i32) -> Vec<Product> {
-        let _ = (query, limit);
-        Vec::new()
-    }
+`--dev` needs a Rust producer (or `--library`), and can't be combined with
+`--check`, `--diff`, or `--dry-run`. Rerun it after changing the crate:
+copies don't follow later builds. Each target's page says where its package
+looks for the library.
 
-    /// A nested namespace.
-    #[weaveffi::module]
-    pub mod nested {
-        /// Lives inside `inventory::nested`.
-        #[weaveffi::export]
-        pub fn helper() -> i32 {
-            0
-        }
-    }
+## Generating from a build script
+
+The CLI is also a library. `weaveffi_cli::project::Project` locates a
+project the way the `weaveffi` command does, and the
+`weaveffi_cli::codegen::Orchestrator` generates it, so a crate that ships
+bindings for an IDL-defined library can generate them from its `build.rs`:
+
+```rust,ignore
+// build.rs
+use weaveffi_cli::codegen::Orchestrator;
+use weaveffi_cli::project::Project;
+
+fn main() -> miette::Result<()> {
+    println!("cargo::rerun-if-changed=weaveffi.toml");
+    println!("cargo::rerun-if-changed=api.yml");
+    let project = Project::discover(env!("CARGO_MANIFEST_DIR"))?;
+    let targets = project.config.targets(None)?;
+    Orchestrator::new()
+        .with_targets(targets.iter().map(AsRef::as_ref))
+        .run(&project.model()?, &project.config.out_dir(None))?;
+    Ok(())
 }
 ```
 
-### 2. Run `weaveffi extract`
-
-```sh
-weaveffi extract src/lib.rs                      # YAML to stdout
-weaveffi extract src/lib.rs -o api.yml           # YAML to file
-weaveffi extract src/lib.rs -f json -o api.json  # JSON to file
-weaveffi extract src/lib.rs | weaveffi generate -o generated
+```toml
+[build-dependencies]
+weaveffi-cli = "0.25"
+miette = "7"
 ```
 
-The extracted IDL is validated automatically and **extraction fails loudly**
-if the result would not generate, for example an `Arc<Depot>` whose type the
-source never declares, a duplicate name, or a callback-interface method that
-returns a string. Pass `--warn` to downgrade those errors to a `warning:` line
-on stderr and emit the IDL anyway, which is useful when bootstrapping from
-source that references types you have not declared yet:
+`Project::discover` finds the nearest `weaveffi.toml` at or above the
+directory, and the orchestrator writes the `[project] targets` into
+`[project] out`, rewriting only changed files.
 
-```sh
-weaveffi extract src/lib.rs --warn          # best-effort, errors as warnings
-```
+A build script runs before its crate is compiled, so it can't read its own
+crate's library: from a `build.rs`, the project's input must be an IDL, or
+the API must come from a library built earlier, named with
+`Project::library(path)`. Pointing a crate's own `build.rs` at the crate is
+an error that says so. For a Rust producer, generate after the build
+instead: `weaveffi generate` in CI or a `cargo xtask`.
 
-Type *syntax* WeaveFFI can't express at all (a raw pointer, a `Box`, a
-tuple) is a hard error even under `--warn`; those are parse-time rejections,
-not validation findings. See [What is rejected](#what-is-rejected).
+## Type mapping
 
-### 3. Generate directly, or validate and generate the IDL
+| Rust | IDL |
+|------|-----|
+| `i8`..`i64`, `u8`..`u64`, `f32`, `f64`, `bool` | same |
+| `usize`, `isize` | `u64`, `i64` |
+| `char` | `string` |
+| `String`, `&str` | `string` |
+| `Vec<u8>`, `&[u8]` | `bytes` |
+| `Vec<T>`, `&[T]` | `[T]` |
+| `Option<T>`, `Option<&T>` | `T?` |
+| `HashMap<K, V>`, `BTreeMap<K, V>` | `{K:V}` |
+| `weaveffi::Iter<T>` | `iter<T>` |
+| `&T`, `Arc<T>` (interface), `Self`, `Arc<Self>` | `T` |
+| `Arc<dyn Trait>` (callback interface) | `Trait` |
+| `weaveffi::CancelToken` (an `async fn`'s last parameter) | removed; sets `cancellable: true` |
+| `Result<T, E>`, `E` a `#[weaveffi::error]` domain | return `T`, `throws: E` |
+| `Result<T, E>`, `E` an untyped error | return `T`, `throws: any` |
+| a `#[weaveffi::custom]` type | its repr |
+| a type alias | its target |
+| a tagged record, enum, or interface | its name |
 
-Skip the intermediate file and generate from the source:
+Compositions map recursively: `Option<Vec<i32>>` is `[i32]?` and
+`Vec<Arc<Book>>` is `[Book]`. An `async fn` sets `async: true`, and `()`
+and `Result<(), E>` returns are no return. A callback method's `Result<T,
+E>` follows the same rule as a function's: a domain `E` throws that domain,
+and an untyped one (`ForeignError` included) throws `any`. A type is named
+in the IDL by its declaration's name alone, wherever in the crate it's
+declared.
 
-```sh
-weaveffi generate src/lib.rs -o generated/
-```
+## Limits
 
-Or commit the derived IDL and feed that to the rest of the toolchain:
+- **Error messages.** A `#[weaveffi::error]` variant's doc comment becomes
+  the code's `doc:`, and the code's `message:` is the variant's
+  `#[weaveffi(message = "...")]` template as written, else its doc
+  comment's first line, else the variant name. The runtime message is the
+  generated `Display` (the template filled from the fields), which the IDL
+  can't express.
+- **Deprecation versions.** `#[deprecated(since = "...")]` keeps only the
+  note; the IDL has no `since` field.
+- **Parameter docs.** Rust doesn't allow doc comments on function
+  parameters, so an extracted API has no parameter `doc`; describe
+  parameters in the function's own doc comment.
 
-```sh
-weaveffi extract src/lib.rs -o api.yml
-weaveffi validate api.yml
-weaveffi generate api.yml -o generated/
-```
-
-## Reference
-
-### CLI command
-
-```
-weaveffi extract <INPUT> [--output <PATH>] [--format <FORMAT>] [--warn]
-```
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `<INPUT>` | required | Path to a `.rs` source file |
-| `-o`, `--output` | stdout | Write to a file instead of stdout |
-| `-f`, `--format` | `yaml` | Output format: `yaml`, `json`, or `toml` |
-| `--warn` | off | Downgrade validation errors to warnings and emit the IDL anyway |
-
-### Attribute reference
-
-The extractor matches a marker by its final path segment, so both the
-namespaced form (`#[weaveffi::record]`) and a bare form (`#[record]`) resolve
-identically. Prefer the namespaced form: it is what the `#[weaveffi::module]`
-macro consumes, and it reads unambiguously.
-
-| Attribute | Where it goes | Effect |
-|-----------|---------------|--------|
-| `#[weaveffi::module]` | inline `mod` | Marks an exported namespace. Required: only modules carrying it are extracted. Modules may nest. |
-| `#[weaveffi::export]` | free `fn` | Emits a [`Function`] in the enclosing module. `async fn` sets `async: true`; a `Result<T, E>` return sets `throws: true` (the IDL return type is `T`). |
-| `#[weaveffi::record]` | named-field `struct` | Emits a [`StructDef`]. Fields may be any IDL type, including `Arc<T>` and `Option<Arc<T>>` object references. |
-| `#[weaveffi::interface]` | `struct` with an inherent `impl` block | Emits an [`InterfaceDef`]. The `impl` block's `pub fn`s become constructors (no receiver, returning `Self`/`Arc<Self>`, optionally in a `Result`), methods (`&self` or `self: Arc<Self>` receivers), and statics (no receiver, any other return). |
-| `#[weaveffi::callback_interface]` | `trait` | Emits a [`CallbackInterfaceDef`]. Every trait method is a consumer-implemented callback taking `&self`. |
-| `#[weaveffi::error]` | `enum` with explicit discriminants | Emits the module's error domain. Every variant needs an explicit `= N` discriminant; the first doc line is the code's message. Named-field variants emit the code's payload `fields:` (and require a primitive repr such as `#[repr(i32)]`). |
-| `#[weaveffi::enumeration]` + `#[repr(i32)]` | `enum` | Emits an [`EnumDef`]. Every variant must have an explicit `= N` discriminant. |
-| `#[weaveffi::cancellable]` | exported `async fn` | Sets `cancellable: true` and strips the trailing `weaveffi::CancelToken` parameter from the IDL signature. |
-| `#[deprecated(note = "...")]` | exported `fn`, interface, record, enum, callback interface | Populates `deprecated` with the note. Bare `#[deprecated]` sets `deprecated = "deprecated"`; a `since = "..."` is parsed but has no IDL field (schema 0.9.0 dropped `since`). |
-
-[`Function`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.Function.html
-[`StructDef`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.StructDef.html
-[`InterfaceDef`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.InterfaceDef.html
-[`CallbackInterfaceDef`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.CallbackInterfaceDef.html
-[`EnumDef`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.EnumDef.html
-
-Doc comments (`///`) on items, fields, methods, and enum variants become the
-`doc` field in the IR.
-
-The module-level `#[weaveffi::callback]` and `#[weaveffi::listener]` markers
-from schema 0.8 are gone. A consumer-implemented hook is now a
-`#[weaveffi::callback_interface]` trait passed as `Arc<dyn Trait>`, and a
-`handle<T>` is now an interface object passed as `Arc<T>` or `&T`.
-
-> **Macro versus extraction.** Both the CLI extractor and the
-> `#[weaveffi::module]` proc-macro understand the full annotation surface
-> above, including interfaces, callback interfaces, error domains, async,
-> iterators, rich enums, maps, and objects inside records and collections.
-> A hand-authored IDL can additionally carry metadata that source can't
-> express (record field defaults and a code `doc:` separate from its
-> `message:`), which is why some samples keep a committed YAML IDL for
-> generation. See
-> [Feature support](producer-macro.md#feature-support) for the macro's
-> current matrix.
-
-### Type mapping
-
-| Rust type | WeaveFFI TypeRef | IDL string |
-|-----------|------------------|------------|
-| `i8`, `i16`, `i32`, `i64` | `I8`, `I16`, `I32`, `I64` | `i8`, `i16`, `i32`, `i64` |
-| `u8`, `u16`, `u32`, `u64` | `U8`, `U16`, `U32`, `U64` | `u8`, `u16`, `u32`, `u64` |
-| `f32`, `f64` | `F32`, `F64` | `f32`, `f64` |
-| `bool` | `Bool` | `bool` |
-| `String`, `&str` | `StringUtf8` | `string` |
-| `Vec<u8>`, `&[u8]` | `Bytes` | `bytes` |
-| `Vec<T>`, `&[T]` | `List(T)` | `[T]` |
-| `Option<T>` | `Optional(T)` | `T?` |
-| `HashMap<K, V>`, `BTreeMap<K, V>` | `Map(K, V)` | `{K:V}` |
-| `weaveffi::Iter<T>` | `Iterator(T)` | `iter<T>` |
-| `Arc<T>`, `&T` (`T` a `#[weaveffi::interface]`) | `Named("T")` | `T` |
-| `Arc<dyn Trait>` (`Trait` a `#[weaveffi::callback_interface]`) | `Named("Trait")` | `Trait` |
-| `weaveffi::CancelToken` | (removed from the signature) | |
-| Any other identifier | `Named(name)` | `name` |
-
-Compositions work recursively: `Option<Vec<i32>>` becomes `[i32]?`,
-`Vec<Option<String>>` becomes `[string?]`, `Vec<Arc<Gadget>>` becomes
-`[Gadget]`, and `weaveffi::Iter<Arc<Gadget>>` becomes `iter<Gadget>`.
-
-A reference is a producer-side calling convention, not an IDL distinction:
-`&str` and `String` both extract as `string`, `&T` and `Arc<T>` both extract
-as the interface `T`. The macro uses the spelling to decide whether the thunk
-lends a borrow or takes a new strong reference; the IDL sees the same type
-either way. `Arc<Self>` in an interface's return position names the interface
-itself. A `Named` reference is resolved by the validator to a record, enum,
-interface, or callback interface declared somewhere in the API; a name nothing
-declares is a validation error (downgradable with `--warn`).
-
-### What is rejected
-
-The extractor refuses type syntax that has no ABI representation. These are
-`syn` errors with a span, so `weaveffi extract` prints the offending line; the
-macro reports the same message as a compile error (each is pinned by a
-`trybuild` test under `crates/weaveffi-macros/tests/ui/`):
-
-| Rust syntax | Diagnostic |
-|-------------|------------|
-| `*const T`, `*mut T` | `` raw pointers cannot cross the FFI boundary; declare the pointee as a #[weaveffi::interface] and pass it as `&T` or `Arc<T>` `` |
-| `Box<T>`, `Box<dyn Trait>`, `Rc<T>` | `` `Box` cannot cross the FFI boundary; objects and callback interfaces are shared, so spell them as `Arc<T>` / `Arc<dyn Trait>` `` |
-| `&mut T` parameter | `` `&mut` parameters cannot cross the FFI boundary; take the value by `&T` or by value and return the updated result `` |
-| `&mut self` or by-value `self` receiver | `` interface methods must take `&self` or `self: Arc<Self>`; use interior mutability (Mutex, RwLock, atomics) for mutable state, because the object is shared across the FFI boundary `` |
-| `Arc<dyn A + B>` naming two traits | `` a trait object must name exactly one #[weaveffi::callback_interface] trait (plus optional `Send`/`Sync` bounds) `` |
-| tuples, `impl Trait`, function pointers, arrays | `unsupported type syntax` |
-| `weaveffi::Handle` | no longer exists; extracts as a `Named("Handle")` reference and fails validation with `unknown type reference: Handle` (the macro fails to compile it) |
-
-Interface objects must be spelled `Arc<T>` or `&T` and callback interfaces
-`Arc<dyn Trait>` because both are shared across the boundary: the producer
-and the consumer each hold references, so a uniquely owned `Box` or a
-single-threaded `Rc` cannot describe them.
-
-### Round-trip integrity
-
-The `roundtrip_kitchen_sink` integration test in
-`crates/weaveffi-cli/tests/extract_roundtrip.rs` proves that the
-hand-annotated form of the kitchen-sink IDL
-(`crates/weaveffi-cli/tests/fixtures/kitchen_sink_annotated.rs`) round-trips
-through `weaveffi extract` and matches the original IR for every supported
-feature: modules, nested modules, records (including object and optional
-object fields), enums, interfaces with constructors, methods, and statics,
-callback interfaces, error domains, per-function `throws`, every primitive
-type, borrowed spellings, optional/list/map composites, objects inside lists
-and iterators, `Interface?` in both directions, async, cancellable, and
-deprecated.
-
-The gaps the test deliberately tolerates are listed at the top of that
-fixture and reproduced in [Pitfalls](#pitfalls).
-
-## Pitfalls
-
-The extractor parses syntax, not semantics. The items below cannot be
-inferred from Rust source alone and either must be added to the generated IDL
-by hand or are documented as round-trip gaps.
-
-- **An error code's `doc:` separate from its `message:`.** In Rust the first
-  doc line on a `#[weaveffi::error]` variant is the code's message; the IDL
-  can carry both, so a distinct `doc:` is dropped on round-trip. The
-  round-trip test compares codes by name, value, and message only.
-- **Record field default values.** The IDL's `default:` field cannot be
-  derived from Rust syntax (Rust struct fields have no default expressions).
-- **Doc comments on parameters.** Rust accepts `///` on `fn` parameters but
-  most formatters strip them; when present, the extractor preserves them, but
-  plan for `Param.doc` to be lossy.
-- **`#[deprecated(since = "...")]` versions.** Schema 0.9.0 has no `since`
-  field, so the version is dropped; only the `note` survives as
-  `deprecated:`.
-- **Package and per-generator configuration.** These aren't part of the API
-  definition at all; they live in the `weaveffi.toml` beside the crate and
-  apply equally to extracted and hand-written IDLs.
-- **Generics, trait `impl` blocks, and macros.** The extractor never resolves
-  generics or expands macros, and it only reads the inherent `impl` block of
-  a `#[weaveffi::interface]` type. Items produced by proc-macros and
-  declarative macros are invisible.
-- **Non-`pub` `impl` items.** Only `pub fn`s in an interface's `impl` block
-  are exported; private helpers stay private. Free functions need the
-  `#[weaveffi::export]` marker regardless of visibility.
-- **External `mod foo;` declarations.** Only inline modules (`mod foo { ... }`)
-  are processed; declarations that point to other files are skipped.
-- **Tuple and unit structs.** Only structs with named fields work with
-  `#[weaveffi::record]`.
-- **Enum discriminants are mandatory.** C-style enums need `#[repr(i32)]`
-  with explicit `= N` discriminants, and rich (payload-carrying) enum
-  variants must use named fields; tuple-style variants are rejected.
-- **`Result<T, E>` hides `E`.** The extractor records only `throws: true`;
-  the error domain it maps to is the module's (or an ancestor's)
-  `#[weaveffi::error]` enum. A `Result<T, String>` still extracts as
-  `throws: true`, which the validator rejects if no domain is in scope.
+The CLI's tests build the fixture producer in
+`crates/weaveffi-cli/tests/fixtures/producer`, check that `weaveffi extract`
+prints exactly its `expected.yml`, and check that generating from the
+library and from that IDL gives identical output.

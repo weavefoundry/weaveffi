@@ -1,0 +1,222 @@
+//! `weaveffi init`: set up a project so a bare `weaveffi generate` works.
+//!
+//! In a Rust crate (a directory with a `Cargo.toml` that has a `[package]`),
+//! it writes a `weaveffi.toml` whose `[project] input` is the crate itself
+//! (`"."`), whose API WeaveFFI reads from the library the crate builds, then
+//! checks the things a producer needs (a `weaveffi` dependency, at least one
+//! `#[weaveffi::export]`, and one `weaveffi::export_runtime!()` call) and
+//! prints any that are missing. It never edits `Cargo.toml` or
+//! source files. Anywhere else, it writes a starter IDL plus a
+//! `weaveffi.toml` that points at it.
+
+use std::process::ExitCode;
+
+use camino::{Utf8Path, Utf8PathBuf};
+use miette::{bail, IntoDiagnostic, Result, WrapErr};
+use weaveffi_model::pkg::c_ident;
+
+use crate::config::CONFIG_FILE_NAME;
+
+/// The `targets` line `init` writes: the C header plus one language, which
+/// a project edits to the targets it ships.
+const TARGETS_LINE: &str = "targets = [\"c\", \"python\"]\n";
+
+/// Options for [`cmd_init`].
+pub struct InitArgs<'a> {
+    /// The project directory.
+    pub dir: &'a str,
+    /// `--name`.
+    pub name: Option<&'a str>,
+    /// `--force`.
+    pub force: bool,
+    /// `--quiet`.
+    pub quiet: bool,
+}
+
+/// Run `weaveffi init`.
+pub fn cmd_init(args: &InitArgs<'_>) -> Result<ExitCode> {
+    let dir = Utf8PathBuf::from(args.dir);
+    std::fs::create_dir_all(dir.as_std_path())
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create {dir}"))?;
+    let config_path = dir.join(CONFIG_FILE_NAME);
+    if config_path.exists() && !args.force {
+        bail!("{config_path} already exists; pass --force to overwrite it");
+    }
+    let manifest = dir.join("Cargo.toml");
+    let crate_name = std::fs::read_to_string(manifest.as_std_path())
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|doc| {
+            doc.get("package")?
+                .get("name")?
+                .as_str()
+                .map(str::to_string)
+        });
+    match crate_name {
+        Some(name) => init_rust(&dir, &config_path, &name, args.quiet)?,
+        None => init_idl(&dir, &config_path, args.name, args.quiet)?,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn write(path: &Utf8Path, contents: &str) -> Result<()> {
+    std::fs::write(path.as_std_path(), contents)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write {path}"))
+}
+
+fn init_rust(dir: &Utf8Path, config_path: &Utf8Path, crate_name: &str, quiet: bool) -> Result<()> {
+    write(
+        config_path,
+        &format!(
+            "# WeaveFFI project configuration. See https://weaveffi.com/guides/config.html\n\
+             [project]\n\
+             input = \".\"\n\
+             out = \"bindings\"\n\
+             {TARGETS_LINE}"
+        ),
+    )?;
+    if quiet {
+        return Ok(());
+    }
+    println!("Wrote {config_path} for the Rust producer `{crate_name}`.");
+    let manifest =
+        std::fs::read_to_string(dir.join("Cargo.toml").as_std_path()).unwrap_or_default();
+    let lib = std::fs::read_to_string(dir.join("src/lib.rs").as_std_path()).unwrap_or_default();
+    let mut todo = Vec::new();
+    if !manifest.contains("weaveffi") {
+        todo.push("run `cargo add weaveffi`");
+    }
+    if !lib.contains("export_runtime!") {
+        todo.push("call `weaveffi::export_runtime!();` once in src/lib.rs");
+    }
+    if !lib.contains("weaveffi::export") {
+        todo.push("annotate the functions and types to export with `#[weaveffi::export]` and its siblings");
+    }
+    if todo.is_empty() {
+        println!("The crate is ready: run `weaveffi generate`.");
+    } else {
+        println!("Before running `weaveffi generate`:");
+        for step in todo {
+            println!("  - {step}");
+        }
+    }
+    Ok(())
+}
+
+fn init_idl(dir: &Utf8Path, config_path: &Utf8Path, name: Option<&str>, quiet: bool) -> Result<()> {
+    let name = match name {
+        Some(n) => n.to_string(),
+        None => std::path::absolute(dir.as_std_path())
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "api".to_string()),
+    };
+    let idl_name = format!("{}.yml", c_ident(&name));
+    let idl_path = dir.join(&idl_name);
+    if !idl_path.exists() {
+        write(
+            &idl_path,
+            &format!(
+                "# yaml-language-server: $schema=https://weaveffi.com/weaveffi.schema.json\n\
+                 version: \"{version}\"\n\
+                 records:\n  \
+                   - name: Greeting\n    \
+                     fields:\n      \
+                       - {{ name: text, type: string }}\n      \
+                       - {{ name: count, type: u32 }}\n\
+                 functions:\n  \
+                   - name: greet\n    \
+                     doc: Build a greeting for `name`.\n    \
+                     params:\n      \
+                       - {{ name: name, type: string }}\n    \
+                     return: Greeting\n",
+                version = weaveffi_model::ir::CURRENT_SCHEMA_VERSION,
+            ),
+        )?;
+    }
+    write(
+        config_path,
+        &format!(
+            "# WeaveFFI project configuration. See https://weaveffi.com/guides/config.html\n\
+             [project]\n\
+             input = \"{idl_name}\"\n\
+             out = \"bindings\"\n\
+             {TARGETS_LINE}\
+             \n\
+             [package]\n\
+             name = \"{name}\"\n\
+             version = \"0.1.0\"\n"
+        ),
+    )?;
+    if !quiet {
+        println!("Wrote {idl_path} and {config_path}.");
+        println!(
+            "Run `weaveffi generate` to produce the C header your native library implements \
+             and the Python package over it; edit `targets` in {config_path} for the other \
+             languages you ship."
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idl_project_validates_and_generates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(dir.path()).unwrap().join("greeter");
+        cmd_init(&InitArgs {
+            dir: root.as_str(),
+            name: None,
+            force: false,
+            quiet: true,
+        })
+        .unwrap();
+        let project =
+            crate::project::Project::locate(Some(root.join(CONFIG_FILE_NAME).as_str()), None, None)
+                .unwrap();
+        assert!(matches!(
+            &project.source,
+            crate::project::Source::Idl(p) if *p == root.join("greeter.yml")
+        ));
+        assert_eq!(
+            project.config.package.identity.name.as_deref(),
+            Some("greeter")
+        );
+        project.model().unwrap();
+        let again = cmd_init(&InitArgs {
+            dir: root.as_str(),
+            name: None,
+            force: false,
+            quiet: true,
+        });
+        assert!(again.is_err(), "init must not overwrite without --force");
+    }
+
+    #[test]
+    fn rust_project_points_at_the_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(dir.path()).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"kv\"\n").unwrap();
+        cmd_init(&InitArgs {
+            dir: root.as_str(),
+            name: None,
+            force: false,
+            quiet: true,
+        })
+        .unwrap();
+        let cfg = crate::config::ProjectConfig::from_file(&root.join(CONFIG_FILE_NAME)).unwrap();
+        assert_eq!(cfg.project.input.as_deref(), Some(Utf8Path::new(".")));
+        let names: Vec<&str> = cfg
+            .targets(None)
+            .unwrap()
+            .iter()
+            .map(|t| t.name())
+            .collect();
+        assert_eq!(names, ["c", "python"]);
+    }
+}

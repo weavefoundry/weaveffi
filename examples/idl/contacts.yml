@@ -1,0 +1,147 @@
+# yaml-language-server: $schema=../../weaveffi.schema.json
+# The address book of examples/macro-tour, written as an IDL. The IDL
+# reference includes this file section by section.
+# ANCHOR: header
+version: "0.13.0"
+doc: An in-memory address book.
+# ANCHOR_END: header
+
+# ANCHOR: records
+records:
+  - name: Contact
+    doc: One contact.
+    fields:
+      - { name: id, type: u64, doc: The book-assigned id. }
+      - { name: name, type: string }
+      - { name: email, type: "string?" }
+      - { name: kind, type: Kind }
+      - { name: tags, type: "[string]" }
+      - { name: notes, type: "{string:string}" }
+# ANCHOR_END: records
+
+# ANCHOR: enums
+enums:
+  - name: Kind
+    doc: How a contact is filed.
+    variants:
+      - { name: Personal }
+      - { name: Work, value: 10 }
+      - { name: Other }
+  - name: Change
+    doc: A change to a book.
+    variants:
+      - name: Added
+        fields:
+          - { name: contact, type: Contact }
+      - name: Removed
+        fields:
+          - { name: id, type: u64 }
+      - { name: Cleared }
+# ANCHOR_END: enums
+
+# ANCHOR: errors
+errors:
+  - name: BookError
+    doc: The address book's errors.
+    codes:
+      - name: NotFound
+        code: 1
+        message: contact not found
+        fields:
+          - { name: id, type: u64 }
+      - name: Full
+        code: 2
+        message: the book is full
+        fields:
+          - { name: capacity, type: u32 }
+      - { name: EmptyName, code: 3, message: a contact needs a name }
+      - name: Rejected
+        code: 4
+        message: a listener rejected the contact
+        fields:
+          - { name: name, type: string }
+# ANCHOR_END: errors
+
+# ANCHOR: interfaces
+interfaces:
+  - name: Book
+    doc: An address book.
+    constructors:
+      - name: new
+        params:
+          - { name: capacity, type: u32 }
+    methods:
+      - name: add
+        params:
+          - { name: name, type: string }
+          - { name: email, type: "string?" }
+          - { name: kind, type: Kind }
+        return: Contact
+        throws: BookError
+      - name: get
+        params:
+          - { name: id, type: u64 }
+        return: Contact
+        throws: BookError
+      - name: remove
+        params:
+          - { name: id, type: u64 }
+        return: bool
+      - { name: count, return: u64 }
+      - { name: size, return: u32, deprecated: use count }
+      - name: names
+        doc: Every contact's name, pulled lazily.
+        return: "iter<string>"
+      - name: subscribe
+        params:
+          - { name: listener, type: Listener }
+      - name: export_all
+        return: "[Contact]"
+        async: true
+      - { name: merged_with, params: [{ name: other, type: "Book?" }], return: Book }
+    statics:
+      - { name: default_capacity, return: u32 }
+# ANCHOR_END: interfaces
+
+# ANCHOR: callbacks
+callbacks:
+  - name: Listener
+    doc: Approves the contacts a book adds and hears about its changes.
+    methods:
+      - name: approve
+        params:
+          - { name: contact, type: Contact }
+        return: bool
+        throws: BookError
+      - name: on_change
+        params:
+          - { name: change, type: Change }
+        throws: any
+# ANCHOR_END: callbacks
+
+# ANCHOR: functions
+# ANCHOR: async
+functions:
+  - name: greet_later
+    doc: Greet `name` after `delay_ms` milliseconds.
+    params:
+      - { name: name, type: string }
+      - { name: delay_ms, type: u64 }
+    return: string
+    async: true
+    cancellable: true
+# ANCHOR_END: async
+  - name: word_count
+    params:
+      - { name: text, type: string }
+    return: u64
+  - name: mean
+    params:
+      - { name: values, type: "[f64]" }
+    return: "f64?"
+  - name: parse_number
+    params:
+      - { name: text, type: string }
+    return: i64
+    throws: any
+# ANCHOR_END: functions

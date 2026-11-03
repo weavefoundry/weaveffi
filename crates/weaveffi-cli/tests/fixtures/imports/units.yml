@@ -1,0 +1,12 @@
+version: "0.13.0"
+enums:
+  - name: Unit
+    doc: A measurement unit.
+    variants:
+      - { name: pixels }
+      - { name: points }
+errors:
+  - name: GraphicsError
+    doc: Drawing failures.
+    codes:
+      - { name: OutOfBounds, code: 1, message: "coordinate out of bounds" }

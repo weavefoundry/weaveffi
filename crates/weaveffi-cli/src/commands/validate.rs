@@ -1,36 +1,47 @@
 //! `weaveffi validate`: schema validation with human-readable or `--format
 //! json` output, plus advisory warnings under `--warn`.
 
+use std::process::ExitCode;
+
 use miette::{Report, Result};
-use weaveffi_core::validate::{collect_warnings, validate_api, ValidationError, ValidationWarning};
+use weaveffi_model::validate::{ValidationError, ValidationWarning};
 
-pub(crate) fn cmd_validate(
-    input: &str,
-    warn: bool,
-    format: Option<&str>,
-    quiet: bool,
-) -> Result<()> {
-    let json_mode = format == Some("json");
-    let (api, contents) = super::load_api(input)?;
-
-    match validate_api(api, Some((input, &contents))) {
-        Ok(api) => {
+/// Run `weaveffi validate`, printing one JSON object with `json_mode`
+/// (also when the project can't be loaded at all).
+pub fn cmd_validate(locate: &super::Locate<'_>, warn: bool, json_mode: bool) -> Result<ExitCode> {
+    let quiet = locate.quiet;
+    let definition = match locate.project().and_then(|p| p.definition()) {
+        Ok(definition) => definition,
+        Err(report) if json_mode => {
+            let json = serde_json::json!({
+                "ok": false,
+                "errors": [{
+                    "code": report.code().map_or_else(|| "LoadError".to_string(), |c| c.to_string()),
+                    "message": format!("{report:#}"),
+                }],
+            });
+            println!("{json}");
+            return Ok(ExitCode::FAILURE);
+        }
+        Err(report) => return Err(report),
+    };
+    match definition.validate() {
+        Ok(_) => {
             let warnings = if warn {
-                collect_warnings(&api)
+                definition.warnings()
             } else {
                 Vec::new()
             };
-            let n_modules = api.modules.len();
-            let n_functions: usize = api.modules.iter().map(|m| m.functions.len()).sum();
-            let n_structs: usize = api.modules.iter().map(|m| m.structs.len()).sum();
-            let n_enums: usize = api.modules.iter().map(|m| m.enums.len()).sum();
+            let counts = Counts::of(&definition.api);
             if json_mode {
                 let json = serde_json::json!({
                     "ok": true,
-                    "modules": n_modules,
-                    "functions": n_functions,
-                    "structs": n_structs,
-                    "enums": n_enums,
+                    "functions": counts.functions,
+                    "interfaces": counts.interfaces,
+                    "callbacks": counts.callbacks,
+                    "records": counts.records,
+                    "enums": counts.enums,
+                    "error_domains": counts.error_domains,
                     "warnings": warnings.iter().map(warning_to_json).collect::<Vec<_>>(),
                 });
                 println!("{json}");
@@ -39,12 +50,9 @@ pub(crate) fn cmd_validate(
                     eprintln!("warning: {w}");
                 }
                 println!("Validation passed");
-                println!(
-                    "  {} modules, {} functions, {} structs, {} enums",
-                    n_modules, n_functions, n_structs, n_enums
-                );
+                println!("  {}", counts.summary());
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Err(diags) => {
             if json_mode {
@@ -57,243 +65,78 @@ pub(crate) fn cmd_validate(
                         .collect::<Vec<_>>(),
                 });
                 println!("{json}");
-                std::process::exit(1);
+                return Ok(ExitCode::FAILURE);
             }
             Err(Report::new(diags))
         }
     }
 }
 
-/// Stable string code for a [`ValidationError`] variant, used as the `code`
-/// field in `weaveffi validate --format json` failure output. Keeping the
-/// codes in lock-step with the variant identifiers makes them ergonomic to
-/// match against in CI scripts.
-fn validation_error_code(err: &ValidationError) -> &'static str {
-    match err {
-        ValidationError::NoModuleName => "NoModuleName",
-        ValidationError::DuplicateModuleName(_) => "DuplicateModuleName",
-        ValidationError::InvalidModuleName(_, _) => "InvalidModuleName",
-        ValidationError::DuplicateFunctionName { .. } => "DuplicateFunctionName",
-        ValidationError::DuplicateParamName { .. } => "DuplicateParamName",
-        ValidationError::ReservedKeyword(_) => "ReservedKeyword",
-        ValidationError::InvalidIdentifier(_, _) => "InvalidIdentifier",
-        ValidationError::ErrorDomainMissingName(_) => "ErrorDomainMissingName",
-        ValidationError::DuplicateErrorName { .. } => "DuplicateErrorName",
-        ValidationError::DuplicateErrorCode { .. } => "DuplicateErrorCode",
-        ValidationError::InvalidErrorCode { .. } => "InvalidErrorCode",
-        ValidationError::NameCollisionWithErrorDomain { .. } => "NameCollisionWithErrorDomain",
-        ValidationError::DuplicateStructName { .. } => "DuplicateStructName",
-        ValidationError::DuplicateStructField { .. } => "DuplicateStructField",
-        ValidationError::EmptyStruct { .. } => "EmptyStruct",
-        ValidationError::DuplicateEnumName { .. } => "DuplicateEnumName",
-        ValidationError::EmptyEnum { .. } => "EmptyEnum",
-        ValidationError::DuplicateEnumVariant { .. } => "DuplicateEnumVariant",
-        ValidationError::DuplicateEnumVariantField { .. } => "DuplicateEnumVariantField",
-        ValidationError::DuplicateEnumValue { .. } => "DuplicateEnumValue",
-        ValidationError::UnknownTypeRef { .. } => "UnknownTypeRef",
-        ValidationError::InvalidMapKey { .. } => "InvalidMapKey",
-        ValidationError::DuplicateCallbackInterfaceName { .. } => "DuplicateCallbackInterfaceName",
-        ValidationError::EmptyCallbackInterface { .. } => "EmptyCallbackInterface",
-        ValidationError::DuplicateCallbackMethod { .. } => "DuplicateCallbackMethod",
-        ValidationError::InvalidCallbackMethod { .. } => "InvalidCallbackMethod",
-        ValidationError::CallbackInterfaceInInvalidPosition { .. } => {
-            "CallbackInterfaceInInvalidPosition"
+/// Declaration counts, for the success summary.
+#[derive(Default)]
+struct Counts {
+    functions: usize,
+    interfaces: usize,
+    callbacks: usize,
+    records: usize,
+    enums: usize,
+    error_domains: usize,
+}
+
+impl Counts {
+    fn of(api: &weaveffi_model::ir::Api) -> Self {
+        Self {
+            functions: api.functions.len(),
+            interfaces: api.interfaces.len(),
+            callbacks: api.callbacks.len(),
+            records: api.records.len(),
+            enums: api.enums.len(),
+            error_domains: api.errors.len(),
         }
-        ValidationError::IteratorInInvalidPosition { .. } => "IteratorInInvalidPosition",
-        ValidationError::AsyncIteratorReturn { .. } => "AsyncIteratorReturn",
-        ValidationError::UnsupportedSchemaVersion { .. } => "UnsupportedSchemaVersion",
-        ValidationError::DuplicateInterfaceName { .. } => "DuplicateInterfaceName",
-        ValidationError::DuplicateInterfaceMember { .. } => "DuplicateInterfaceMember",
-        ValidationError::EmptyInterface { .. } => "EmptyInterface",
-        ValidationError::ConstructorHasReturn { .. } => "ConstructorHasReturn",
-        ValidationError::AsyncConstructor { .. } => "AsyncConstructor",
-        ValidationError::InterfaceInInvalidPosition { .. } => "InterfaceInInvalidPosition",
-        ValidationError::DuplicateTypeName { .. } => "DuplicateTypeName",
-        ValidationError::DuplicateErrorCodeName { .. } => "DuplicateErrorCodeName",
-        ValidationError::ThrowsWithoutErrorDomain { .. } => "ThrowsWithoutErrorDomain",
-        ValidationError::AbiSymbolCollision { .. } => "AbiSymbolCollision",
+    }
+
+    fn summary(&self) -> String {
+        let parts = [
+            (self.functions, "function", "functions"),
+            (self.interfaces, "interface", "interfaces"),
+            (self.callbacks, "callback interface", "callback interfaces"),
+            (self.records, "record", "records"),
+            (self.enums, "enum", "enums"),
+            (self.error_domains, "error domain", "error domains"),
+        ];
+        parts
+            .iter()
+            .filter(|(n, ..)| *n > 0)
+            .map(|(n, one, many)| format!("{n} {}", if *n == 1 { one } else { many }))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
-/// Convert a [`ValidationError`] into a JSON object with `code`, the
-/// variant-specific identifying fields (`module`, `function`, `name`, …),
-/// `message`, and `suggestion` derived from the [`miette::Diagnostic`] help.
+/// Convert a [`ValidationError`] into a JSON object: its `code` (the variant
+/// name) and identifying fields from its serialized form, plus `message` and
+/// a `suggestion` derived from the [`miette::Diagnostic`] help.
 fn validation_error_to_json(err: &ValidationError) -> serde_json::Value {
     use miette::Diagnostic;
-    use serde_json::{Map, Value};
-    let mut obj = Map::new();
-    obj.insert(
-        "code".into(),
-        Value::String(validation_error_code(err).into()),
-    );
-    match err {
-        ValidationError::NoModuleName => {}
-        ValidationError::DuplicateModuleName(name) | ValidationError::ReservedKeyword(name) => {
-            obj.insert("name".into(), Value::String(name.clone()));
-        }
-        ValidationError::InvalidModuleName(name, reason)
-        | ValidationError::InvalidIdentifier(name, reason) => {
-            obj.insert("name".into(), Value::String(name.clone()));
-            obj.insert("reason".into(), Value::String((*reason).into()));
-        }
-        ValidationError::DuplicateFunctionName { module, function } => {
-            obj.insert("module".into(), Value::String(module.clone()));
-            obj.insert("function".into(), Value::String(function.clone()));
-        }
-        ValidationError::DuplicateParamName {
-            module,
-            function,
-            param,
-        } => {
-            obj.insert("module".into(), Value::String(module.clone()));
-            obj.insert("function".into(), Value::String(function.clone()));
-            obj.insert("param".into(), Value::String(param.clone()));
-        }
-        ValidationError::ErrorDomainMissingName(module) => {
-            obj.insert("module".into(), Value::String(module.clone()));
-        }
-        ValidationError::DuplicateErrorName { module, name }
-        | ValidationError::NameCollisionWithErrorDomain { module, name }
-        | ValidationError::InvalidErrorCode { module, name }
-        | ValidationError::DuplicateStructName { module, name }
-        | ValidationError::EmptyStruct { module, name }
-        | ValidationError::DuplicateEnumName { module, name }
-        | ValidationError::EmptyEnum { module, name }
-        | ValidationError::DuplicateCallbackInterfaceName { module, name }
-        | ValidationError::EmptyCallbackInterface { module, name } => {
-            obj.insert("module".into(), Value::String(module.clone()));
-            obj.insert("name".into(), Value::String(name.clone()));
-        }
-        ValidationError::DuplicateErrorCode { module, code } => {
-            obj.insert("module".into(), Value::String(module.clone()));
-            obj.insert("error_code".into(), Value::Number((*code).into()));
-        }
-        ValidationError::DuplicateStructField { struct_name, field } => {
-            obj.insert("struct".into(), Value::String(struct_name.clone()));
-            obj.insert("field".into(), Value::String(field.clone()));
-        }
-        ValidationError::DuplicateEnumVariant { enum_name, variant } => {
-            obj.insert("enum".into(), Value::String(enum_name.clone()));
-            obj.insert("variant".into(), Value::String(variant.clone()));
-        }
-        ValidationError::DuplicateEnumVariantField {
-            enum_name,
-            variant,
-            field,
-        } => {
-            obj.insert("enum".into(), Value::String(enum_name.clone()));
-            obj.insert("variant".into(), Value::String(variant.clone()));
-            obj.insert("field".into(), Value::String(field.clone()));
-        }
-        ValidationError::DuplicateEnumValue { enum_name, value } => {
-            obj.insert("enum".into(), Value::String(enum_name.clone()));
-            obj.insert("value".into(), Value::Number((*value).into()));
-        }
-        ValidationError::UnknownTypeRef { name } => {
-            obj.insert("name".into(), Value::String(name.clone()));
-        }
-        ValidationError::InvalidMapKey { key_type } => {
-            obj.insert("key_type".into(), Value::String(key_type.clone()));
-        }
-        ValidationError::DuplicateCallbackMethod { interface, name } => {
-            obj.insert("interface".into(), Value::String(interface.clone()));
-            obj.insert("name".into(), Value::String(name.clone()));
-        }
-        ValidationError::InvalidCallbackMethod {
-            interface,
-            method,
-            reason,
-        } => {
-            obj.insert("interface".into(), Value::String(interface.clone()));
-            obj.insert("method".into(), Value::String(method.clone()));
-            obj.insert("reason".into(), Value::String((*reason).into()));
-        }
-        ValidationError::IteratorInInvalidPosition { location } => {
-            obj.insert("location".into(), Value::String(location.clone()));
-        }
-        ValidationError::AsyncIteratorReturn { module, function } => {
-            obj.insert("module".into(), Value::String(module.clone()));
-            obj.insert("function".into(), Value::String(function.clone()));
-        }
-        ValidationError::UnsupportedSchemaVersion { version, supported } => {
-            obj.insert("version".into(), Value::String(version.clone()));
-            obj.insert("supported".into(), Value::String(supported.clone()));
-        }
-        ValidationError::DuplicateInterfaceName { module, name }
-        | ValidationError::EmptyInterface { module, name } => {
-            obj.insert("module".into(), Value::String(module.clone()));
-            obj.insert("name".into(), Value::String(name.clone()));
-        }
-        ValidationError::DuplicateInterfaceMember { interface, name } => {
-            obj.insert("interface".into(), Value::String(interface.clone()));
-            obj.insert("name".into(), Value::String(name.clone()));
-        }
-        ValidationError::ConstructorHasReturn {
-            interface,
-            constructor,
-        }
-        | ValidationError::AsyncConstructor {
-            interface,
-            constructor,
-        } => {
-            obj.insert("interface".into(), Value::String(interface.clone()));
-            obj.insert("constructor".into(), Value::String(constructor.clone()));
-        }
-        ValidationError::InterfaceInInvalidPosition { name, location }
-        | ValidationError::CallbackInterfaceInInvalidPosition { name, location } => {
-            obj.insert("name".into(), Value::String(name.clone()));
-            obj.insert("location".into(), Value::String(location.clone()));
-        }
-        ValidationError::DuplicateTypeName {
-            name,
-            first,
-            second,
-        }
-        | ValidationError::DuplicateErrorCodeName {
-            name,
-            first,
-            second,
-        } => {
-            obj.insert("name".into(), Value::String(name.clone()));
-            obj.insert("first".into(), Value::String(first.clone()));
-            obj.insert("second".into(), Value::String(second.clone()));
-        }
-        ValidationError::ThrowsWithoutErrorDomain { module, function } => {
-            obj.insert("module".into(), Value::String(module.clone()));
-            obj.insert("function".into(), Value::String(function.clone()));
-        }
-        ValidationError::AbiSymbolCollision { module, symbol } => {
-            obj.insert("module".into(), Value::String(module.clone()));
-            obj.insert("symbol".into(), Value::String(symbol.clone()));
-        }
-    }
-    obj.insert("message".into(), Value::String(err.to_string()));
+    let mut obj = match serde_json::to_value(err) {
+        Ok(serde_json::Value::Object(obj)) => obj,
+        _ => serde_json::Map::new(),
+    };
+    obj.insert("message".into(), err.to_string().into());
     if let Some(help) = err.help() {
-        obj.insert("suggestion".into(), Value::String(help.to_string()));
+        obj.insert("suggestion".into(), help.to_string().into());
     }
-    Value::Object(obj)
+    serde_json::Value::Object(obj)
 }
 
-/// Convert a [`ValidationWarning`] into a JSON object of `{ code, location,
-/// message }`. Variants that do not carry an explicit `location` field
-/// synthesize one from the available identifiers (e.g. `module::function`).
+/// Convert a [`ValidationWarning`] into a JSON object: its serialized form
+/// (`code` and fields) plus `message`.
 fn warning_to_json(w: &ValidationWarning) -> serde_json::Value {
-    let (code, location) = match w {
-        ValidationWarning::LargeEnumVariantCount { enum_name, .. } => {
-            ("LargeEnumVariantCount", enum_name.clone())
-        }
-        ValidationWarning::DeepNesting { location, .. } => ("DeepNesting", location.clone()),
-        ValidationWarning::EmptyModuleDoc { module } => ("EmptyModuleDoc", module.clone()),
-        ValidationWarning::AsyncVoidFunction { module, function } => {
-            ("AsyncVoidFunction", format!("{module}::{function}"))
-        }
-        ValidationWarning::DeprecatedFunction {
-            module, function, ..
-        } => ("DeprecatedFunction", format!("{module}::{function}")),
+    let mut obj = match serde_json::to_value(w) {
+        Ok(serde_json::Value::Object(obj)) => obj,
+        _ => serde_json::Map::new(),
     };
-    serde_json::json!({
-        "code": code,
-        "location": location,
-        "message": w.to_string(),
-    })
+    obj.insert("code".into(), w.code().into());
+    obj.insert("message".into(), w.to_string().into());
+    serde_json::Value::Object(obj)
 }

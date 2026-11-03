@@ -1,68 +1,78 @@
 # Introduction
 
-**WeaveFFI generates type-safe bindings for 11 languages for any native library
-that exposes a C ABI, whether it's written in Rust, C, C++, Zig, or another
-language: no hand-written JNI, no duplicate implementations, no unsafe
-boilerplate.**
+**WeaveFFI generates idiomatic bindings for 11 languages from one API
+definition, over a stable C ABI.** Write the API as safe Rust tagged with
+WeaveFFI's attributes, or as a YAML or JSON IDL implemented by any library
+that can export C symbols (C, C++, Zig, and so on). WeaveFFI emits packages
+for C, C++, Swift, Kotlin, Node.js, WebAssembly, Python, .NET, Dart, Go, and
+Ruby that all call the same C functions.
 
-Define your API once as an IDL in YAML, JSON, or TOML, and WeaveFFI generates
-idiomatic packages for C, C++, Swift, Kotlin, Node.js, WebAssembly, Python,
-.NET, Dart, Go, and Ruby, all talking to the same stable C ABI. Any backend
-that implements the symbols declared in the generated C header can be the
-producer.
+## The design in one page
 
-Writing your producer in Rust? Annotate a normal module with
-`#[weaveffi::module]` and the macro generates the C ABI and derives the IDL for
-you, so you write no `unsafe` glue and keep no separate IDL in sync. The macro
-is one ergonomic path onto the same engine the IDL uses, so whichever you pick,
-the producer you build and the bindings you ship cannot drift.
+**One definition, two front doors.** A Rust producer tags ordinary items
+(`#[weaveffi::export]` on a function or an `impl` block,
+`#[weaveffi::record]` on a struct, and so on). Each attribute emits the
+item's `extern "C"` functions and embeds a description of the item in the
+compiled library, and the CLI reads that description back out to emit the
+bindings, so the bindings describe exactly the library you compiled,
+`#[cfg]` and Cargo features included. A non-Rust producer writes an
+[IDL](reference/idl.md) instead and implements the C header WeaveFFI
+generates from it.
 
-## Why WeaveFFI?
+**One library, one namespace.** Every record, enum, error domain,
+interface, callback interface, and function has a name unique across the
+library, and every C symbol is the library's prefix plus that name
+(`kvstore_Store_open`). An IDL may still be split across files with
+`imports:`, and a Rust crate across modules; neither changes a name.
 
-- **One definition, eleven languages.** Write the API once (safe Rust or an
-  IDL) and ship packages to npm, SwiftPM, Maven, PyPI, NuGet, pub.dev,
-  RubyGems, and Go modules.
-- **Safe Rust in, C ABI out.** The `#[weaveffi::module]` macro emits the
-  `extern "C"` thunks, marshalling every argument through an audited runtime,
-  so a Rust producer writes no `unsafe` glue and the IDL is derived from the
-  code rather than maintained beside it.
-- **Stable C ABI underneath.** Every target speaks to the same `extern "C"`
-  contract ([ABI revision 2](reference/abi.md)), so adding a new platform
-  later is a code-gen change, not a rewrite.
-- **Objects and callbacks that behave the same everywhere.** Interfaces are
-  reference-counted objects (`Arc<T>` in Rust) that consumers can share,
-  nest inside records and collections, and release deterministically, with a
-  garbage-collector backstop where the language has one. Callback interfaces
-  are method sets the consumer implements as a protocol, interface, or
-  abstract class and the native library calls from any thread.
-- **Idiomatic per-target output.** No lowest-common-denominator surface
-  area. Swift gets `async/await` and `throws`, Kotlin gets `suspend` and
-  JNI glue, Python gets typed `.pyi` stubs, TypeScript gets `Promise`s and
-  `BigInt`, Dart gets `dart:ffi` with `NativeFinalizer`, all from the same
-  definition. Async producers keep their own executor: plug Tokio in with
-  `weaveffi::set_spawner`, or let the default thread-per-future spawner do
-  the work.
+**Identity drives every name.** A library has one resolved
+[identity](reference/naming.md): a package `name`, a C symbol `prefix`, and a
+native `library` base name. For a Rust producer all three come from the crate
+(`kvstore` gives `kvstore_Store_open`, `libkvstore.so`, and an npm, PyPI, or
+NuGet package named `kvstore`). Nothing a generator emits is named after
+WeaveFFI, so any number of WeaveFFI-built libraries can live in one process.
 
-## Design principle: standalone generated packages
+**A small, explicit C ABI.** In [revision 6](reference/abi.md) every value
+crosses as exactly one C value, in every position: a scalar by value, an
+optional scalar as a `{p}_opt_*` struct, an object as a pointer, and
+everything else (strings, bytes, typed arrays of numbers, and the
+serialized [value buffers](reference/value-buffers.md) that carry records,
+rich enums, and the remaining optionals, lists, and maps) as one
+`{p}_run`, a pointer and a byte length. A callback interface is one
+`{ctx, vtable}` struct. Every fallible call reports through a `{p}_error`
+struct carrying a code, a length-delimited message, and the code's fields.
+Async functions complete through a callback that fires exactly once, and
+cancellation is a first-class runtime code.
 
-Generated packages are fully self-contained and publishable to their
-native ecosystem (npm, SwiftPM, Maven Central, PyPI, NuGet, pub.dev,
-RubyGems, and so on) without requiring consumers to install WeaveFFI tooling
-or runtime dependencies. WeaveFFI is a build-time tool for library
-authors; consumers should never need to know it exists. Helper code
-(error types, the value-buffer codec, object wrappers, callback trampolines)
-is generated inline into each package rather than pulled from a shared
-runtime dependency.
+**Bindings that refuse to drift.** Every declaration exports a contract
+function returning a hash of its signature. Each consumer checks the ABI
+revision and every declaration it was generated with when it loads the
+library, so a stale binding fails loudly, naming the declaration that
+changed, instead of misreading memory, while a library that only added
+declarations, error codes, or callback methods keeps loading.
+
+**Idiomatic generators.** Each target maps the model onto its own idioms:
+objects become classes with deterministic disposal and a garbage-collector
+backstop, async functions become `async`/`await`, coroutines, promises, or
+tasks with native cancellation, iterators stay lazy, and error domains
+become typed exceptions or error values. The
+[capability matrix](generators/README.md) summarizes all eleven.
+
+**Standalone output.** Generated packages are self-contained: helper code
+(the value-buffer codec, error types, object wrappers, loaders) is generated
+into each package, and no target needs compiled glue of its own, so
+consumers never install WeaveFFI. `weaveffi package` bundles prebuilt native
+libraries into publishable packages per ecosystem.
 
 ## Where to next
 
-- [Getting Started](getting-started.md): install, define an IDL, generate, and call from C.
-- [The Rust Producer Macro](guides/producer-macro.md): the `#[weaveffi::module]` attribute family and the supported feature set.
-- [C ABI Contract](reference/abi.md): the normative description of objects, callback interfaces, value buffers, async functions, and iterators at the boundary.
-- [Comparison](comparison.md): feature matrix vs UniFFI, Diplomat, cbindgen, swift-bridge, napi-rs, wasm-bindgen, SWIG, autocxx, and an honest "when to choose WeaveFFI" guide.
-- [FAQ](faq.md): object ownership, callback interfaces, the async spawner, runtime cost, customization, Windows support, distribution, licensing.
-- [Samples](samples.md): the kitchen-sink `kvstore` reference, the `events` callback-interface bus, the `codec` round-trip oracle, and the smaller walkthroughs.
-- [Stability and Versioning](stability.md): what schema `0.9.0` and ABI 2 changed and how to migrate.
-- [Roadmap](roadmap.md): what's planned after ABI 2.
-- [Generators](generators/README.md): per-target reference for each of the eleven languages.
-- [Guides](guides/README.md): memory ownership, error handling, async, configuration, packaging.
+- [Getting Started](getting-started.md): a Rust producer called from C and
+  Python in a few minutes, plus the IDL path for a C implementation.
+- [The Rust Producer Macros](guides/producer-macro.md): every attribute,
+  with a compiled example of each.
+- [C ABI Contract](reference/abi.md): the normative description of the
+  boundary.
+- [Comparison](comparison.md) and [FAQ](faq.md): how WeaveFFI relates to
+  UniFFI, Diplomat, cbindgen, and the single-language bridges.
+- [Stability and Versioning](stability.md): what the version numbers
+  promise.

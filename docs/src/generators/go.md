@@ -1,873 +1,395 @@
 # Go
 
-## Overview
+The Go target emits a self-contained cgo module that binds the library's
+[C ABI](../reference/abi.md). Records and rich enums are plain Go values,
+interfaces are reference-counted wrappers with `Close`, calls that declare
+errors return `error` values you match with `errors.As`, async functions
+block on a `context.Context`, and `iter<T>` returns standard-library
+`iter.Seq` sequences. The module requires Go 1.24 or later.
 
-The Go target produces idiomatic Go bindings that use cgo to call the C
-ABI (revision 2). The generator emits one Go source file (`weaveffi.go`)
-plus a `go.mod` so the result can be imported by any Go module.
-Functions marked `throws: true` return `(value, error)` to match Go
-conventions; all other wrappers return plain values and panic on the
-runtime trap codes. Records and rich enums are plain Go value types
-packed and unpacked from value buffers. Interfaces are reference-counted
-objects behind pointer wrappers with `Close()` and a finalizer backstop.
-Callback interfaces are Go `interface` types the consumer implements,
-crossing as a `cgo.Handle` plus one static vtable of exported
-trampolines. Async functions block the calling goroutine on a channel,
-and `iter<T>` returns produce standard-library `iter.Seq`/`iter.Seq2`
-sequences, so the generated module requires Go 1.23 or later (the
-emitted `go.mod` declares `go 1.23`).
+Go is a [Tier 2](../stability.md#target-tiers) target: it may lag behind a
+new ABI revision for a while, but it runs the same conformance suite as
+every other target before a release.
 
-## What gets generated
+## What's generated
 
-| File | Purpose |
-|------|---------|
-| `go/weaveffi.go` | cgo bindings: preamble, ABI check, codecs, type wrappers, function wrappers |
-| `go/go.mod` | Go module descriptor (configurable module path) |
-| `go/README.md` | Prerequisites and build instructions |
+For a library whose identity is `kvstore`:
 
-The package checks the producer's ABI revision in `init()` and panics
-on mismatch, so a stale library fails at load time:
-
-```go
-// The ABI revision these bindings were generated against.
-const wvABIVersion uint32 = 2
-
-func init() {
-	if found := uint32(C.weaveffi_abi_version()); found != wvABIVersion {
-		panic(fmt.Sprintf("WeaveFFI ABI mismatch: these bindings expect revision %d but the loaded library reports revision %d", wvABIVersion, found))
-	}
-}
+```text
+go/
+  go.mod        module path (the package name, or `name`), go 1.24
+  README.md
+  kvstore.h     a copy of the C header
+  bindings.go   the API: types, wrappers, trampolines, load-time checks
+  runtime.go    Check, errors, runs, optional scalars, objects, callbacks,
+                iterators, async
+  codec.go      the value-buffer writer and reader
 ```
 
-## Type mapping
+Every Go file carries the standard `// Code generated ... DO NOT EDIT.`
+line before its package clause, so linters skip it and editors warn before
+you change it.
 
-| IDL type     | Go type       | C type (cgo)               |
-|--------------|---------------|----------------------------|
-| `i8`, `i16`, `i32`, `i64` | `int8`, `int16`, `int32`, `int64` | `C.int8_t` ... `C.int64_t` |
-| `u8`, `u16`, `u32`, `u64` | `uint8`, `uint16`, `uint32`, `uint64` | `C.uint8_t` ... `C.uint64_t` |
-| `f32`, `f64` | `float32`, `float64` | `C.float`, `C.double` |
-| `bool`       | `bool`        | `C._Bool`                  |
-| `string`     | `string`      | `*C.char` (via `C.CString`/`C.GoString`) |
-| `bytes`      | `[]byte`      | `*C.uint8_t` + `C.size_t`  |
-| `Struct`     | `StructName` (plain struct) | value buffer (`*C.uint8_t` + `C.size_t`) |
-| `Enum` (plain) | `EnumName` (`int32` alias) | `C.weaveffi_mod_Enum` |
-| `Enum` (rich)  | `EnumName` (sealed interface + variant structs) | value buffer |
-| `Interface`  | `*InterfaceName` | `*C.weaveffi_mod_Interface` |
-| `Interface?` | `*InterfaceName` (nil-able) | `*C.weaveffi_mod_Interface` (NULL for `nil`) |
-| `CallbackInterface` | `CallbackName` (Go `interface`) | `void*` ctx + `const vtable*` |
-| `T?`         | `*T`          | value buffer               |
-| `[T]`        | `[]T`         | value buffer               |
-| `{K: V}`     | `map[K]V`     | value buffer               |
-| `iter<T>`    | `iter.Seq[T]`, or `iter.Seq2[T, error]` when the function throws | opaque iterator pointer + `_next`/`_destroy` |
+Every name comes from the package identity:
 
-Buffered types cross the boundary serialized in the
-[value-buffer format](../reference/value-buffers.md); the package
-carries a private `wvWriter`/`wvReader` pair plus one `wvPack*` and one
-`wvUnpack*` routine per record and rich enum. Objects nested inside a
-buffered value travel as `u64` object tokens (see
-[Objects](#objects-interfaces)). Booleans map to `C._Bool`, matching
-cgo's representation of `_Bool`.
-
-### 64-bit integers and floats
-
-`i64` and `u64` are native `int64` and `uint64`, both across cgo and
-inside value buffers (`writeI64`/`writeU64`), so the full range
-round-trips exactly. `f32`/`f64` are `float32`/`float64`, packed with
-`math.Float64bits`; the `codec` conformance consumer verifies NaN, both
-infinities, and `-0.0` survive a round trip bit-for-bit.
-
-## Example IDL and generated code
-
-```yaml
-version: "0.9.0"
-modules:
-  - name: contacts
-    enums:
-      - name: ContactType
-        variants:
-          - { name: Personal, value: 0 }
-          - { name: Work, value: 1 }
-          - { name: Other, value: 2 }
-
-    structs:
-      - name: Contact
-        fields:
-          - { name: id, type: i64 }
-          - { name: first_name, type: string }
-          - { name: email, type: "string?" }
-          - { name: contact_type, type: ContactType }
-
-    functions:
-      - name: create_contact
-        params:
-          - { name: first_name, type: string }
-          - { name: email, type: "string?" }
-          - { name: contact_type, type: ContactType }
-        return: Contact
-
-      - name: list_contacts
-        params: []
-        return: "[Contact]"
-
-      - name: count_contacts
-        params: []
-        return: i32
-```
-
-The generated `weaveffi.go` opens with the cgo preamble. The preamble
-also declares the exported trampolines and static vtables for every
-callback interface and async function in the IDL (from the `kvstore`
-sample):
-
-```go
-package kvstore
-
-/*
-#cgo LDFLAGS: -lkvstore
-#include "weaveffi.h"
-#include <stdlib.h>
-static void* wvHandlePtr(uintptr_t h) { return (void*)h; }
-extern bool goWv_weaveffi_kv_EvictionListener_on_evict(void* ctx, uint8_t* entry_ptr, size_t entry_len, weaveffi_kv_EvictionReason reason, weaveffi_error* out_err);
-extern void goWv_weaveffi_kv_EvictionListener_free(void* ctx);
-static const weaveffi_kv_EvictionListener_vtable wvVtable_weaveffi_kv_EvictionListener = {
-    (bool (*)(void*, const uint8_t*, size_t, weaveffi_kv_EvictionReason, weaveffi_error*))goWv_weaveffi_kv_EvictionListener_on_evict,
-    goWv_weaveffi_kv_EvictionListener_free,
-};
-static const weaveffi_kv_EvictionListener_vtable* wvVtablePtr_weaveffi_kv_EvictionListener(void) { return &wvVtable_weaveffi_kv_EvictionListener; }
-extern void goWv_weaveffi_kv_Store_compact_callback(void* context, weaveffi_error* err, int64_t result);
-*/
-import "C"
-```
-
-Enums become typed integer aliases:
-
-```go
-type ContactType int32
-
-const (
-	ContactTypePersonal ContactType = 0
-	ContactTypeWork     ContactType = 1
-	ContactTypeOther    ContactType = 2
-)
-```
-
-Structs become plain Go structs with exported, typed fields:
-
-```go
-// Contact is a plain value; there's no native handle and no Close.
-type Contact struct {
-	Id          int64
-	FirstName   string
-	Email       *string
-	ContactType ContactType
-}
-```
-
-Function wrappers are PascalCase with the IDL module prefix stripped
-(`CreateContact`, not `ContactsCreateContact`); set
-`strip_module_prefix: false` in the Go generator config (or under
-`[global]`) to keep prefixed names. A function marked `throws: true`
-returns `(value, error)`; a buffered return is copied into Go memory,
-released with `weaveffi_free_bytes`, and decoded. From the `kvstore`
-sample's cross-module `GetStats`:
-
-```go
-func GetStats(store *Store) (Stats, error) {
-	defer runtime.KeepAlive(store)
-	var cOutLen C.size_t
-	var cErr C.weaveffi_error
-	result := C.weaveffi_kv_stats_get_stats(store.ptr, &cOutLen, &cErr)
-	if cErr.code != 0 {
-		return Stats{}, wvMapKv(wvTakeError(&cErr))
-	}
-	rRes := &wvReader{buf: wvCopyBuffer(result, cOutLen)}
-	var goResult Stats
-	goResult = wvUnpackStats(rRes)
-	rRes.expectEnd()
-	return goResult, nil
-}
-```
-
-A function without `throws` returns a plain value; its error slot is
-checked by `wvTrap`, which panics, because a non-zero code there can
-only be a runtime trap:
-
-```go
-// wvTrap panics when the C error slot reports a failure. Non-throwing
-// wrappers check their slot with it: a non-zero code there can only be
-// a producer panic, a marshalling failure, or a callback-interface
-// implementation that panicked. The panic value is a *WeaveFFIError, so a
-// recover() site can still inspect the code.
-func wvTrap(cErr *C.weaveffi_error) {
-	if cErr.code != 0 {
-		panic(wvBrandError(wvTakeError(cErr)))
-	}
-}
-```
-
-The Go module path follows the `[package]` name in `weaveffi.toml`
-(falling back to `weaveffi`); override it directly with:
+| Name | Default | Override |
+|------|---------|----------|
+| Module path | the package `name` | `[generators.go] name` |
+| Package name | the C prefix without underscores (`kitchen_sink` is `kitchensink`) | `[generators.go] package` |
+| Linked library | `-l{library}` | none |
+| Header | `{library}.h` | none |
 
 ```toml
 [generators.go]
-module_path = "github.com/myorg/mylib"
+name = "github.com/example/kvstore"
+package = "kvstore"
 ```
 
-## Typed errors
+A package name that's a Go keyword gains a trailing underscore.
 
-The package defines a generic `WeaveFFIError` struct with `Code` and
-`Message` fields:
+A library is one namespace, so it renders into one Go package, and Go
+spells every exported name in PascalCase with Go's initialisms (`user_id`
+is `UserID`, `ttl_seconds` is `TTLSeconds`):
 
-```go
-// WeaveFFIError reports a failure crossing the C boundary that no typed
-// error domain claims: an unknown code, a marshalling failure, a
-// producer panic (code -2), or a Go callback-interface implementation
-// that panicked (code -4).
-type WeaveFFIError struct {
-	// Code is the numeric ABI error code.
-	Code int32
-	// Message is the human-readable error message.
-	Message string
-}
+| Declaration | Go name |
+|-------------|---------|
+| function `summarize` | `Summarize` |
+| interface `Store` | `*Store` |
+| constructor `Store.open` | `OpenStore` (and `new` is `NewStore`) |
+| method `Store.get_or_load` | `(*Store).GetOrLoad` |
+| static `Store.default_capacity` | `StoreDefaultCapacity` |
+| C-style enum `EntryKind`, variant `Volatile` | `EntryKind`, `EntryKindVolatile` |
+| rich enum `Change`, variant `Put` | `Change`, `ChangePut` |
+| error domain `KvError`, code `KeyNotFound` | `KvError`, `*KeyNotFoundError` |
+| error domain `KitchenErrors` | `KitchenError` (one `Error` suffix, never doubled) |
+
+A free function whose name would clash with a type, an enum constant, a
+constructor, a static, an error type, or the runtime's `Check`, `Error`,
+or `DebugLive` gains a trailing underscore: the kvstore sample's async
+`open_store` sits beside the `OpenStore` constructor, so it's `OpenStore_`,
+and the codec sample's `vector` function sits beside its `Vector` type, so
+it's `Vector_`. Methods never clash this way, since each lives on its own
+type.
+
+Doc comments are the IDL's docs. A package-level declaration's comment
+starts with its name, as Go convention asks, so a doc that doesn't is
+prefixed with `Name: `. Backticked API names become Go doc links
+(`` `new_op` `` is `[NewOp]`, a method `[Store.Get]`) or their Go spelling
+(a field `ExpiresAt`, a parameter `ttlSeconds`), and a deprecation becomes
+the final `Deprecated:` paragraph that Go tools recognize.
+
+## Build and load
+
+The bindings include the bundled header and link with
+`#cgo LDFLAGS: -l{library}`, so a consumer supplies only the library's
+directory:
+
+```sh
+export CGO_LDFLAGS="-L/path/to/lib"
+export LD_LIBRARY_PATH="/path/to/lib"   # DYLD_LIBRARY_PATH on macOS
+go build ./...
 ```
 
-A module's error domain adds a typed error struct named after the
-domain, package-level code constants, and a mapper that falls back to
-`*WeaveFFIError` for codes outside the domain. From the `kvstore`
-sample:
+cgo links the library into the program when it's built, and the
+platform's dynamic loader finds it when the program starts. The bindings
+never open the library themselves, so the `{PREFIX}_LIBRARY` override the
+other targets read at load time doesn't exist for Go; to choose the library
+at run time, set the loader's search path (`LD_LIBRARY_PATH`,
+`DYLD_LIBRARY_PATH`, or `PATH` on Windows). To record the directory in the
+binary instead, add an rpath when building:
 
-```go
-// KvError is a typed error reported by the `kv` module.
-type KvError struct {
-	// Code is the numeric ABI error code (one of the KvError constants).
-	Code int32
-	// Message is the human-readable error message.
-	Message string
-}
-
-func (e *KvError) Error() string {
-	return fmt.Sprintf("kv: %s (code %d)", e.Message, e.Code)
-}
-
-// KvError codes.
-const (
-	// KvErrorKeyNotFound key not found
-	KvErrorKeyNotFound int32 = 1001
-	// KvErrorExpired entry expired
-	KvErrorExpired int32 = 1002
-	// KvErrorStoreFull store has reached capacity
-	KvErrorStoreFull int32 = 1003
-	// KvErrorIoError: I/O failure
-	KvErrorIoError int32 = 1004
-)
+```sh
+export CGO_LDFLAGS="-L/path/to/lib -Wl,-rpath,/path/to/lib"
 ```
 
-A callable marked `throws: true` returns `(value, error)` and maps a
-non-zero error slot through the domain mapper (`wvMapKv`); match it with
-`errors.As` and compare the code constants:
+`weaveffi package` writes the module to `go/{package}/` with each desktop
+platform's library under `lib/<platform>/` and replaces the single link
+line with one per GOOS and GOARCH, so cgo picks the right library with no
+`CGO_LDFLAGS`:
 
 ```go
-_, err := store.Delete("missing")
-var kvErr *KvError
-if errors.As(err, &kvErr) && kvErr.Code == KvErrorKeyNotFound {
-	// specific code
-}
-```
-
-A callable without `throws` returns a plain value and checks its slot
-with `wvTrap`, which panics with a `*WeaveFFIError`.
-
-An error code that declares payload `fields:` carries them serialized in
-the error's payload buffer; the mapper decodes them into typed fields on
-the error value before `weaveffi_error_clear` releases the buffer.
-
-### Runtime error codes
-
-| Code | Meaning | Where it surfaces |
-|------|---------|-------------------|
-| `-1` | The producer reported an error without a declared code. | `*WeaveFFIError` returned from a throwing call, or the panic value of a non-throwing one. |
-| `-2` | The Rust implementation panicked; the export macros and the async spawner catch the unwind. | Same as above (a blocking async call returns it as its `error`). |
-| `-3` | Malformed input at the boundary (invalid UTF-8, a truncated value buffer, a bad enum discriminant). | Same as above. |
-| `-4` | A callback-interface method implemented in Go panicked. | `*WeaveFFIError` with `Code == -4` returned from the throwing producer call that invoked the callback, or the panic value of a non-throwing one (see [Callback interfaces](#callback-interfaces)). |
-
-The panic value from `wvTrap` is a `*WeaveFFIError`, so a `recover()`
-site can still inspect the code. Using a closed wrapper is a separate
-panic with a plain string message.
-
-## Objects (interfaces)
-
-An `interfaces:` entry becomes a struct holding the typed C pointer to a
-reference-counted producer object. Constructors become package-level
-factory functions combining the constructor and type names (`open`
-becomes `OpenStore`, `new` becomes `NewEventBus`), methods hang off the
-wrapper, statics become package-level functions prefixed by the type
-name (`StoreDefaultCapacity`, `StoreOpenMany`), and `Close()` releases
-the reference. From the `kvstore` sample (trimmed):
-
-```go
-// Each wrapper holds one strong reference; Close releases it, and a
-// finalizer releases it if the wrapper is garbage collected first.
-type Store struct {
-	ptr *C.weaveffi_kv_Store
-}
-
-// wvAdoptStore adopts one owned strong reference into a new wrapper. A null
-// pointer adopts to nil.
-func wvAdoptStore(ptr *C.weaveffi_kv_Store) *Store {
-	if ptr == nil {
-		return nil
-	}
-	s := &Store{ptr: ptr}
-	runtime.SetFinalizer(s, (*Store).Close)
-	return s
-}
-
-// wvTokenStore clones o's reference into a value-buffer object token. The
-// wrapper keeps its own reference; the token carries the new one.
-func wvTokenStore(o *Store) uint64 {
-	if o == nil || o.ptr == nil {
-		panic("weaveffi: nil or closed Store cannot be encoded in a non-optional position")
-	}
-	return uint64(uintptr(unsafe.Pointer(C.weaveffi_kv_Store_clone(o.ptr))))
-}
-
-func OpenStore(path string) (*Store, error) {
-	cPath := C.CString(path)
-	defer C.free(unsafe.Pointer(cPath))
-	var cErr C.weaveffi_error
-	result := C.weaveffi_kv_Store_open(cPath, &cErr)
-	if cErr.code != 0 {
-		return nil, wvMapKv(wvTakeError(&cErr))
-	}
-	return wvAdoptStore(result), nil
-}
-
-// Share: A second reference to this same store (the returned pointer equals
-// the receiver's; both must eventually be destroyed).
-func (s *Store) Share() *Store {
-	if s.ptr == nil {
-		panic("weaveffi: Store used after Close")
-	}
-	defer runtime.KeepAlive(s)
-	var cErr C.weaveffi_error
-	result := C.weaveffi_kv_Store_share(s.ptr, &cErr)
-	wvTrap(&cErr)
-	return wvAdoptStore(result)
-}
-
-func (s *Store) Close() {
-	if s.ptr != nil {
-		C.weaveffi_kv_Store_destroy(s.ptr)
-		s.ptr = nil
-		runtime.SetFinalizer(s, nil)
-	}
-}
-```
-
-- **Construction.** Every constructor is a package-level function; a
-  throwing one returns `(*T, error)`, a non-throwing one returns `*T`
-  (`NewEventBus()` in the `events` sample). Deprecated members carry a
-  standard `// Deprecated:` comment that `go vet` and editors
-  understand.
-- **Disposal.** `Close()` releases this wrapper's reference through the
-  `_destroy` symbol and clears the finalizer. It's idempotent. A
-  finalizer set at adoption releases the reference if the wrapper is
-  garbage collected first, but Go finalizers run on a non-deterministic
-  schedule, so pair every wrapper with `defer store.Close()`. The
-  producer object itself is dropped only when the last reference
-  anywhere is released.
-- **Use after close.** Every method checks `s.ptr == nil` first and
-  panics with `"weaveffi: Store used after Close"`. Encoding a closed
-  (or nil) wrapper into a non-optional position of a value buffer panics
-  from `wvTokenStore`.
-- **Copies mint new references.** Methods returning the receiver or an
-  existing object (`Share()`, `Fork()`) return a fresh strong reference
-  adopted into a new wrapper; closing one never affects another.
-  `runtime.KeepAlive` keeps the receiver (and object parameters)
-  reachable until the C call returns, so the finalizer can't fire
-  mid-call.
-
-```go
-store, err := OpenStore("/tmp/cache.kv")
-if err != nil {
-	return err
-}
-defer store.Close()
-ok, err := store.Put("alpha", []byte{1}, EntryKindPersistent, nil)
-fmt.Println(store.Count(), StoreDefaultCapacity())
-```
-
-### Nullable objects, and objects inside values
-
-An `Interface?` parameter is a nil-able pointer that crosses as NULL
-when nil, and an `Interface?` return adopts a NULL pointer to nil
-(`wvAdoptStore` handles both):
-
-```go
-func (s *Store) Larger(other *Store) *Store {
-	if s.ptr == nil {
-		panic("weaveffi: Store used after Close")
-	}
-	defer runtime.KeepAlive(s)
-	defer runtime.KeepAlive(other)
-	var cOther *C.weaveffi_kv_Store
-	if other != nil {
-		cOther = other.ptr
-	}
-	var cErr C.weaveffi_error
-	result := C.weaveffi_kv_Store_larger(s.ptr, cOther, &cErr)
-	wvTrap(&cErr)
-	return wvAdoptStore(result)
-}
-```
-
-Objects inside records, lists, maps, and optionals travel as `u64`
-object tokens in the value buffer. Writing a token mints a new strong
-reference with the `_clone` symbol (`wvTokenStore`); reading one adopts
-the reference into a fresh wrapper (`wvUntokenStore`). From the
-`StoreInfo` record (`Store *Store`, `Mirror *Store`):
-
-```go
-func wvPackStoreInfo(w *wvWriter, v StoreInfo) {
-	w.writeString(v.Label)
-	w.writeU64(wvTokenStore(v.Store))
-	if v.Mirror == nil {
-		w.writeOptionFlag(false)
-	} else {
-		w.writeOptionFlag(true)
-		w.writeU64(wvTokenStore(v.Mirror))
-	}
-	w.writeI64(v.Count)
-}
-
-func wvUnpackStoreInfo(r *wvReader) StoreInfo {
-	var v StoreInfo
-	v.Label = r.readString()
-	v.Store = wvUntokenStore(r.readU64())
-	if r.readOptionFlag() {
-		var oMirror0 *Store
-		oMirror0 = wvUntokenStore(r.readU64())
-		v.Mirror = oMirror0
-	}
-	v.Count = r.readI64()
-	return v
-}
-```
-
-Lists of objects work the same way in both directions
-(`StoreOpenMany(paths)` returns `([]*Store, error)`,
-`StoreTotalCount(stores, extra)` takes `[]*Store`); each wrapper in a
-returned slice owns its own reference and should be closed individually.
-Iterators over objects adopt one reference per step, and a blocking
-async call returning an object adopts the pointer inside the completion
-trampoline.
-
-## Rich (algebraic) enums
-
-A *rich* (algebraic) enum, a sum type whose variants carry associated
-data, crosses the C ABI as a serialized value buffer, exactly like a
-struct: an `i32` tag (the declared discriminant, or declaration order)
-followed by the active variant's fields in order. The Go surface is a
-sealed interface plus one struct per variant, with no `Close()`. (A
-plain C-style enum with no payloads stays a typed `int32` alias with
-`const` values; see above.) From the `codec` sample:
-
-```go
-// Shape is a sealed sum type: exactly one of its variant structs is the
-// value at a time.
-type Shape interface {
-	isShape()
-}
-
-// ShapeEmpty: No payload.
-type ShapeEmpty struct{}
-
-func (ShapeEmpty) isShape() {}
-
-// ShapeCircle: One `f64`.
-type ShapeCircle struct {
-	// Radius: Radius.
-	Radius float64
-}
-
-func (ShapeCircle) isShape() {}
-
-// ShapeLabeled: A string and an `i32`.
-type ShapeLabeled struct {
-	// Label: Label text.
-	Label string
-	// Count: Repeat count.
-	Count int32
-}
-
-func (ShapeLabeled) isShape() {}
-```
-
-Construct a variant as a struct literal and discriminate with a type
-switch:
-
-```go
-var c Shape = ShapeCircle{Radius: 2.0}
-switch v := c.(type) {
-case ShapeCircle:
-	fmt.Println(v.Radius)
-case ShapeLabeled:
-	fmt.Println(v.Label, v.Count)
-}
-```
-
-Free functions that take or return the enum pack it into a value buffer
-on the way in and unpack the returned buffer on the way out, releasing
-the producer's bytes with `weaveffi_free_bytes`. Variant fields of
-interface type follow the object token rules above.
-
-## Callback interfaces
-
-A `callback_interfaces:` entry becomes a Go `interface` the consumer
-implements and passes wherever the API takes that type. From the
-`kvstore` sample:
-
-```go
-// Implement this interface in Go and pass the value to native functions
-// that accept it.
-//
-// The native library may call any method from any thread until it releases
-// the implementation. A panic in a method is reported to the native caller
-// as a foreign error (code -4) instead of crashing the process.
-type EvictionListener interface {
-	// OnEvict: An entry left the store. Returns whether the listener wants to keep
-	// receiving notifications; `false` detaches it.
-	OnEvict(entry Entry, reason EvictionReason) bool
-}
-```
-
-```go
-type auditor struct{}
-
-func (auditor) OnEvict(entry kvstore.Entry, reason kvstore.EvictionReason) bool {
-	fmt.Println(entry.Key, reason)
-	return true
-}
-
-store.SetEvictionListener(auditor{})
-```
-
-cgo forbids passing Go pointers to C, so the implementation never
-crosses the boundary directly. Passing one wraps it in a `cgo.Handle`
-whose integer value crosses as `ctx` (widened to `void*` in C by the
-preamble's `wvHandlePtr`, which keeps `go vet` quiet), together with the
-address of one static vtable per interface whose slots are `//export`ed
-Go trampolines:
-
-```go
-//export goWv_weaveffi_kv_EvictionListener_on_evict
-func goWv_weaveffi_kv_EvictionListener_on_evict(ctx unsafe.Pointer, entry_ptr *C.uint8_t, entry_len C.size_t, reason C.weaveffi_kv_EvictionReason, out_err *C.weaveffi_error) (ret C._Bool) {
-	defer func() {
-		if r := recover(); r != nil {
-			wvForeignError(out_err, r)
-		}
-	}()
-	impl := cgo.Handle(uintptr(ctx)).Value().(EvictionListener)
-	rArg0 := &wvReader{buf: wvBorrowBuffer(entry_ptr, entry_len)}
-	var arg0 Entry
-	arg0 = wvUnpackEntry(rArg0)
-	rArg0.expectEnd()
-	arg1 := EvictionReason(reason)
-	ret = boolToC(impl.OnEvict(arg0, arg1))
-	return
-}
-
-//export goWv_weaveffi_kv_EvictionListener_free
-func goWv_weaveffi_kv_EvictionListener_free(ctx unsafe.Pointer) {
-	cgo.Handle(uintptr(ctx)).Delete()
-}
-```
-
-```go
-func (s *Store) SetEvictionListener(listener EvictionListener) {
-	if s.ptr == nil {
-		panic("weaveffi: Store used after Close")
-	}
-	defer runtime.KeepAlive(s)
-	hListener := cgo.NewHandle(listener)
-	var cErr C.weaveffi_error
-	C.weaveffi_kv_Store_set_eviction_listener(s.ptr, C.wvHandlePtr(C.uintptr_t(hListener)), C.wvVtablePtr_weaveffi_kv_EvictionListener(), &cErr)
-	wvTrap(&cErr)
-}
-```
-
-- **Lifetime.** The `cgo.Handle` keeps the implementation alive exactly
-  as long as the producer may call it; the vtable's `free` trampoline
-  deletes the handle when the producer drops its last reference. A
-  producer that retains the implementation (a store's eviction listener)
-  keeps it alive across calls; one that doesn't (the `events` sample's
-  `RouteOnce`) frees it before returning. Passing the same value twice
-  creates two handles.
-- **Argument ownership.** Borrowed strings and buffers are copied into
-  Go memory before the method runs (`wvBorrowBuffer`, `C.GoString`), so
-  the implementation may keep them. An object passed to a callback
-  method is owned by the implementation: the trampoline adopts it into a
-  new wrapper (`impl.OnAttached(wvAdoptEventBus(bus))` in the `events`
-  sample), and the implementation should `Close()` it when done (or let
-  the finalizer run).
-- **Return values.** A method's return value is converted back to its C
-  representation (`bool` via `boolToC`, a plain enum to its C enum, a
-  record to a value buffer the producer frees).
-- **Panics.** A panic escaping a method never unwinds through the C
-  frame. The deferred `recover()` hands the value to `wvForeignError`,
-  which writes code -4 with `fmt.Sprint(recovered)` into the producer's
-  error slot, and the trampoline returns its zero value; the producer
-  aborts the call in progress. The original caller then sees
-  `*WeaveFFIError` with `Code == -4` as the returned `error` (throwing
-  callable) or as the `wvTrap` panic value (non-throwing callable, the
-  trap idiom). The process is never taken down.
-- **Threads.** The producer may call a method from any thread; cgo
-  callbacks run on whatever OS thread the producer fires them from, with
-  the Go runtime attaching a goroutine to it. The `kvstore` eviction
-  listener fires synchronously inside `Delete()`/`Get()`; the `events`
-  sample's `PublishLater` calls subscribers from the producer's worker
-  thread. Don't block in a callback waiting on the goroutine that made
-  the producer call if the producer invoked it synchronously from that
-  call.
-
-## Build instructions
-
-1. Generate the bindings:
-
-   ```bash
-   weaveffi generate api.yaml -o generated --target go
-   ```
-
-2. Build the Rust shared library:
-
-   ```bash
-   cargo build --release -p your_library
-   ```
-
-3. Point cgo at the header and library. The Go package `#include`s the
-   header emitted by the C target, so generate that too:
-
-   ```bash
-   weaveffi generate api.yaml -o generated --target c
-   export CGO_CFLAGS="-I$PWD/generated/c"
-   export CGO_LDFLAGS="-L$PWD/target/release -lweaveffi"
-   ```
-
-4. Build and run a Go consumer:
-
-   ```bash
-   cd generated/go
-   go build ./...
-   ```
-
-cgo requires a C compiler (`gcc` or `clang`) on the host; on Windows use
-a MinGW-w64 toolchain or the MSVC build provided by `go env`. Go 1.23 or
-later is required for the `iter` package.
-
-## Packaging
-
-`weaveffi package --target go` emits the Go module under `go/` with a
-self-contained, relocatable cgo preamble and copies each supplied
-desktop binary to `go/lib/<platform-id>/` (`macos-arm64`, `macos-x64`,
-`linux-x64`, `linux-arm64`, `windows-x64`). The single
-`#cgo LDFLAGS: -l<name>` line is expanded into a `${SRCDIR}`-relative
-include path for the packaged C header plus one `-L` (and, except on
-Windows, `-Wl,-rpath`) directive per `GOOS,GOARCH` pair, so
-`go build` selects the matching slice with no environment setup:
-
-```go
-#cgo CFLAGS: -I${SRCDIR}/../c/include
-#cgo darwin,arm64 LDFLAGS: -L${SRCDIR}/lib/macos-arm64 -Wl,-rpath,${SRCDIR}/lib/macos-arm64
+/*
+#cgo darwin,arm64 LDFLAGS: -L${SRCDIR}/lib/darwin-arm64 -Wl,-rpath,${SRCDIR}/lib/darwin-arm64
 #cgo linux,amd64 LDFLAGS: -L${SRCDIR}/lib/linux-x64 -Wl,-rpath,${SRCDIR}/lib/linux-x64
 #cgo windows,amd64 LDFLAGS: -L${SRCDIR}/lib/windows-x64
 #cgo LDFLAGS: -lkvstore
+*/
 ```
 
-Android and `wasm32` binaries are skipped. See
-[Packaging](../guides/packaging.md) for the shared workflow.
+`${SRCDIR}` expands to the module's directory (in the module cache, for a
+dependency), so a program built on a machine runs there without a loader
+path. A binary you ship elsewhere still needs the library beside it or on
+the loader's path: copy it and link with an rpath such as
+`-Wl,-rpath,$ORIGIN` (`@executable_path` on macOS). Windows has no rpath;
+put the DLL next to the executable or on `PATH`. Android, iOS, and
+`wasm32` libraries aren't bundled. Publish the module by pushing the
+directory to the module path's repository; see
+[Packaging](../guides/packaging.md).
 
-## Memory and ownership
+## Load-time checks
 
-- **Strings in:** `C.CString` allocates a copy in C memory; the
-  generated wrapper pairs every `CString` with a `defer C.free(...)`.
-- **Strings out:** `C.GoString` copies the C string into Go-owned
-  memory, then the wrapper calls `weaveffi_free_string` to release the
-  Rust allocation.
-- **Bytes:** input slices are passed by pointer for the duration of the
-  call (no copy); returned bytes are copied with `C.GoBytes` and then
-  `weaveffi_free_bytes` is called.
-- **Buffered values (structs, rich enums, optionals, lists, maps):**
-  parameters are packed into a Go-owned `[]byte` that the producer
-  borrows for the duration of the call; returns are copied into Go
-  memory with `wvCopyBuffer`, released with `weaveffi_free_bytes`, and
-  decoded. Object tokens written into a buffer are fresh strong
-  references the producer owns; tokens read out are adopted into
-  wrappers.
-- **Interfaces:** one strong reference per wrapper, released by
-  `Close()` with a `runtime.SetFinalizer` backstop. Always
-  `defer s.Close()`.
-- **Callback implementations:** held by a `cgo.Handle` until the
-  producer calls the vtable's `free`.
-
-## Async support
-
-Functions marked `async: true` are exposed through `_async`-suffixed C
-launchers that take a completion callback plus `void* context`. Go has
-no ambient async runtime, so the generated wrapper turns that into a
-blocking call built on a channel: it makes a buffered channel, wraps it
-in a `cgo.Handle`, launches the C call with an exported trampoline and
-the handle as context, then receives from the channel. The generated
-doc comment states that the call blocks. From the `kvstore` sample:
+`Check() error` checks the library's ABI revision and then
+[the contract](../reference/abi.md#the-contract) of every declaration the
+bindings were generated with, including each error code and callback
+method: it calls the declaration's `{p}_contract_{id}` function and compares
+the hash with the one embedded in `bindings.go`.
 
 ```go
-// Blocks the calling goroutine until the async producer completes.
-func (s *Store) Compact() (int64, error) {
-	if s.ptr == nil {
-		panic("weaveffi: Store used after Close")
-	}
-	defer runtime.KeepAlive(s)
-	ch := make(chan wvOutcomeKvStoreCompact, 1)
-	h := cgo.NewHandle(ch)
-	C.weaveffi_kv_Store_compact_async(s.ptr, nil, C.weaveffi_kv_Store_compact_callback(unsafe.Pointer(C.goWv_weaveffi_kv_Store_compact_callback)), C.wvHandlePtr(C.uintptr_t(h)))
-	outcome := <-ch
-	if outcome.err != nil {
-		return 0, outcome.err
-	}
-	return outcome.val, nil
+if err := kvstore.Check(); err != nil {
+	log.Fatal(err) // kvstore: Store.put changed since these bindings were generated
 }
 ```
 
-The completion callback fires exactly once, on a producer thread. The
-trampoline takes the channel out of the handle (one-shot), converts the
-C error or result inside the callback, and sends a single `wvOutcome…`
-value:
+The checks run once, on the first call to `Check` or to any function of the
+package, and `Check` returns the same result from then on. Importing the
+package never panics. A function called after a failed check panics with
+the error `Check` returns, so call `Check` at startup when you'd rather
+handle a mismatched library as an error. The error names the first
+declaration whose hash differs. Because the bindings link the library, one
+that lacks a declaration fails to link (or, with a shared library swapped
+in later, to start) rather than failing the check. Declarations the library
+has and the bindings don't are fine, so a library that only adds functions,
+error codes, or callback methods keeps working with older bindings.
+
+## Type mapping
+
+Every value crosses as one C value, whatever its position:
+
+| IDL type | Go type | Crosses the ABI as |
+|----------|---------|--------------------|
+| `i8` to `i64`, `u8` to `u64` | `int8` to `int64`, `uint8` to `uint64` | the C integer |
+| `f32`, `f64` | `float32`, `float64` | `float`, `double` |
+| `bool` | `bool` | C `bool` |
+| `string` | `string` | a `{p}_run` of UTF-8 |
+| `bytes` | `[]byte` | a `{p}_run` of the bytes |
+| C-style enum | `type E int32` plus `E{Variant}` constants | `int32_t` |
+| rich enum | sealed `interface` plus one struct per variant | a value buffer in a `{p}_run` |
+| record | plain struct with exported fields | a value buffer in a `{p}_run` |
+| scalar `T?` (integer, float, `bool`, C-style enum) | `*T` | a `{p}_opt_{prim}` struct (`{p}_opt_i32` for an enum) |
+| other `T?` | `*T`; a slice, map, rich enum, `[]byte`, or wrapper stays as it is and nil is none | a value buffer in a `{p}_run` |
+| numeric `[T]` (`i8` to `i64`, `u16` to `u64`, `f32`, `f64`) | `[]T` | a `{p}_run` of the packed elements |
+| other `[T]`, `{K: V}` | `[]T`, `map[K]V` | a value buffer in a `{p}_run` |
+| interface | `*Iface` | object pointer |
+| `Iface?` | `*Iface` (nil is none) | object pointer or null |
+| callback interface | a Go `interface` you implement | a `{p}_{Cb}` struct of a handle and a static vtable |
+| `Cb?` | the same interface (nil is none) | the same struct with a null vtable for none |
+| `iter<T>` | `iter.Seq[T]` or `iter.Seq2[T, error]` | iterator handle |
+
+A string, byte slice, or numeric slice parameter lends its own memory for
+the call, with no copy and no encoding: the run points into the Go string
+or the slice's backing array (a sub-slice passes its own window), cgo keeps
+it in place until the call returns, and the library only reads it. Strings
+carry no NUL terminator, so they may contain `\x00`. A Go string can hold
+bytes that aren't UTF-8; the library rejects them as a marshalling failure
+(`-3`).
+
+A returned run is copied into Go memory and released with `{p}_run_free`.
+An empty string, byte slice, or numeric slice result is empty and non-nil.
+Inside a record, list, or map, numeric lists and optional scalars use the
+value-buffer encoding like everything else; the Go types are the same
+either way.
+
+Each type that crosses inside a value buffer has one codec pair, shared by
+every parameter, result, field, and callback argument of that type. A
+composite is named after its shared stem (the same name every target uses):
 
 ```go
-//export goWv_weaveffi_kv_Store_compact_callback
-func goWv_weaveffi_kv_Store_compact_callback(context unsafe.Pointer, err *C.weaveffi_error, result C.int64_t) {
-	h := cgo.Handle(uintptr(context))
-	ch := h.Value().(chan wvOutcomeKvStoreCompact)
-	h.Delete()
-	if err != nil && err.code != 0 {
-		ch <- wvOutcomeKvStoreCompact{err: wvMapKv(wvTakeBoxedError(err))}
-		return
-	}
-	ch <- wvOutcomeKvStoreCompact{val: int64(result)}
+func wvWrite_map_string_Store(w *wvWriter, v map[string]*Store) {
+	wvWriteMap(w, v, (*wvWriter).writeString, wvWriteStore)
 }
 ```
 
-Result buffers such as strings and buffered values are owned by the
-consumer, so the trampoline copies or decodes them into Go memory and
-then releases them with the runtime free symbols; a heap-boxed error is
-read and released by `wvTakeBoxedError` (`weaveffi_error_free`); an
-owned interface result is adopted into a wrapper instead.
+## Objects and lifetime
 
-For a callable marked `throws: true`, the trampoline maps the error
-through the domain mapper, so the returned `error` is the typed one
-(`*KvError` from `store.Compact()`); a non-throwing async callable
-returns a plain value and panics via `wvTrap` on a trap code. A panic
-inside the spawned future surfaces as code -2. The native producer
-already runs on its own thread, so the wrapper simply blocks the calling
-goroutine; callers that want concurrency run the call from a goroutine
-of their own.
+Each wrapper embeds the runtime's object core, which owns one strong
+reference. `Close() error` releases it (so a wrapper satisfies
+`io.Closer`), and a `runtime.AddCleanup` cleanup releases it some time after
+an unclosed wrapper becomes unreachable. Every call borrows the native
+pointer for its duration:
 
-For functions marked `cancellable: true` the C launcher gains a
-`weaveffi_cancel_token*` parameter. The Go wrapper passes `nil` for it
-and doesn't expose the token; only the C and C++ targets surface
-cancellation tokens.
+```go
+func (s *Store) Get(key string) (Entry, error) {
+	cSelf := s.native()
+	defer s.release()
+	var cErr C.kvstore_error
+	cRet := C.kvstore_Store_get(cSelf, wvStrRun(key), &cErr)
+	if cErr.code != 0 {
+		return Entry{}, wvKvError(wvTakeError(&cErr))
+	}
+	return wvDecode(cRet, wvReadEntry), nil
+}
+```
+
+`Close` is idempotent and goroutine-safe. When it races a call in flight
+(even one that closes the wrapper from inside a callback), the reference is
+released as soon as that call returns, never mid-call. Using a wrapper after
+`Close`, or passing a nil `*Iface` where an object is required, panics. An
+object inside a record, list, or map crosses as a token that carries a
+fresh reference, so the wrapper you passed stays valid. Two wrappers may
+refer to the same object (a method that returns its receiver hands back a
+new wrapper); each is closed on its own.
+
+Because every wrapper has `Close`, an IDL method named `close` is
+`Close_` ([reserved member names](../reference/naming.md#identifiers-in-generated-code)).
+
+## Errors
+
+A function's `throws` decides its Go signature:
+
+| IDL | Go signature | A failure is |
+|-----|--------------|--------------|
+| `throws: KvError` | `(T, error)` | a code of the domain, or an `*Error` for a runtime code |
+| `throws: any` | `(T, error)` | an `*Error` with code `-1` and the library's message |
+| no `throws` | `T` | a bug: the wrapper panics with an `*Error` |
+
+A domain code comes back as its code's type, a pointer to a struct holding
+the code's payload fields and a `Message`, and every code type of a domain
+implements the domain's sealed interface:
+
+```go
+_, err := store.Get("missing")
+var missing *kvstore.KeyNotFoundError
+if errors.As(err, &missing) {
+	fmt.Println(missing.Key, missing.Code()) // missing 1001
+}
+var kvErr kvstore.KvError
+if errors.As(err, &kvErr) {
+	// any code of the domain
+}
+```
+
+Domains are open: a positive code the bindings don't declare (from a newer
+library) comes back as the domain's `*Unknown{Domain}` type
+(`*UnknownKvError`), which keeps the code and message and still matches the
+domain's interface. Codes are unique only within a domain, so the
+calculator's `CalcError.DivisionByZero` and `ParseError.NotANumber` can both
+be 1; each function maps codes through its own domain.
+
+`Error()` returns the library's message, or the code's default message when
+`Message` is empty. A runtime code (`-1` generic, `-2` a panic in the
+library, `-3` a marshalling failure, `-4` a callback failure) comes back as
+the package's `*Error`, which keeps the code and message and never matches a
+domain interface. A function that declares no errors panics with that
+`*Error` instead (see
+[the trap policy](../guides/errors-and-memory.md#the-trap-policy)). The
+panic is an ordinary recoverable one, and its text names the code and the
+library's message, as in `kvstore: <message> (code -3)`.
+
+## Async and cancellation
+
+Async functions take a `context.Context` first and always return an error;
+they never panic on a failure. A function with no `throws` reports its
+failure as an `*Error` like a `throws: any` one. They block the calling
+goroutine on a channel that a completion trampoline fills from the
+library's thread; call them from a goroutine of your own for concurrency. A
+`cancellable` function creates a native cancel token, cancels it when the
+context is done, and returns `ctx.Err()` (`context.Canceled` or
+`context.DeadlineExceeded`) for the cancelled completion (code `-5`), or
+`context.Canceled` if the library cancelled the call on its own:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+defer cancel()
+removed, err := store.Compact(ctx, 60000)
+if errors.Is(err, context.DeadlineExceeded) {
+	// The native call was cancelled.
+}
+```
+
+Any other async function returns `ctx.Err()` as soon as the context is done
+and discards the native result when it arrives. A context that's already
+done never launches the call. The result is one C value like a sync
+return, so an optional scalar result is a `*T` and a numeric list result a
+`[]T`.
+
+## Callbacks
+
+A callback interface is a Go interface. Passing an implementation stores it
+in a handle table and hands the library the interface's argument struct:
+the handle as the context, and the address of one static vtable per
+interface, with the header's `size` and `flags` (0: Go may run a method on
+any thread), the `free` entry that deletes the handle once the library is
+done, and one `//export` trampoline per method. The library may call
+methods from any thread, and `free` may run on any thread too.
+
+```go
+type Policy interface {
+	// The TTL a write of `key` gets, given the TTL the caller
+	// requested (absent for none): ...
+	//
+	// Return a KvError to report one of its codes, with its fields, to the native
+	// caller; any other error reports code -1 with its text.
+	TTLFor(key string, requested *int64) (*int64, error)
+	Admit(entry Entry) (Entry, error)
+	Route(key string, home *Store) (*Store, error)
+}
+```
+
+- **Arguments.** Strings, bytes, typed arrays, and buffered values are lent
+  for the call, so they're copied or decoded into Go values, and an
+  optional scalar is a `*T`. An object argument (`home` above) is a new
+  wrapper that owns its own reference: keep it, return it, or `Close` it.
+- **Returns.** A method may return any type but an iterator or a callback
+  interface. A scalar returns by value and an optional scalar as its C
+  struct; a string, `[]byte`, typed array, or buffered value is copied
+  into a run allocated with the library's allocator, which the library
+  adopts; an object returns a fresh reference to the wrapper's object (the
+  wrapper stays yours). Returning nil for a required object, or a value the
+  library can't read (text that isn't UTF-8, an undeclared enum value),
+  fails the call in progress.
+- **Errors.** A method that declares `throws` returns `(T, error)` or
+  `error`. Returning one of its domain's code types (for example
+  `&kvstore.RejectedError{Key: k, Reason: "no secrets"}`) reports that code
+  and its payload fields, so the original caller can receive exactly that
+  error. Any other error reports code `-1` with its text. A method that
+  panics, throwing or not, is recovered and reported as `-4` with the
+  panic's text; nothing unwinds into the library. What the caller finally
+  sees is the producer's choice: a Rust producer renders a typed error's
+  message from its fields, and the kvstore sample turns every other
+  callback failure into `KvError.CallbackFailed`.
+- **Nil implementations.** A `Cb?` parameter accepts nil, which passes no
+  callback (a null vtable); so does a typed nil (an interface holding a nil
+  pointer, map, slice, func, or channel), which would otherwise reach the
+  library as an implementation whose every call panics. A required one
+  panics on either.
 
 ## Iterators
 
-`iter<T>` returns map to the standard library's range-over-function
-sequences (Go 1.23+): a non-throwing function returns `iter.Seq[T]` and
-a throwing one returns `iter.Seq2[T, error]`. Nothing is drained: the
-producer iterator is launched when the consumer starts ranging, and each
-consumer step issues exactly one producer `next` call. From the
-`kvstore` sample's throwing `ListKeys`:
+An `iter<T>` return becomes a lazy sequence: each `range` launches the
+native iterator, pulls one element per step, and destroys the iterator when
+the loop ends, including on an early `break`. A function that declares
+errors returns an `iter.Seq2[T, error]` that yields its error as a final
+`(zero, err)` pair:
 
 ```go
-// A launch or per-element error is yielded as the final (zero value,
-// error) pair, and iteration stops.
-func (s *Store) ListKeys(prefix *string) iter.Seq2[string, error] {
-	return func(yield func(string, error) bool) {
-		if s.ptr == nil {
-			panic("weaveffi: Store used after Close")
-		}
-		defer runtime.KeepAlive(s)
-		// ... pack the *string prefix into a value buffer ...
-		var cErr C.weaveffi_error
-		it := C.weaveffi_kv_Store_list_keys(s.ptr, cPrefixPtr, C.size_t(len(wPrefix.buf)), &cErr)
-		if cErr.code != 0 {
-			yield("", wvMapKv(wvTakeError(&cErr)))
-			return
-		}
-		defer C.weaveffi_kv_Store_ListKeysIterator_destroy(it)
-		for {
-			var outItem *C.char
-			var iterErr C.weaveffi_error
-			ok := C.weaveffi_kv_Store_ListKeysIterator_next(it, &outItem, &iterErr) != 0
-			if iterErr.code != 0 {
-				yield("", wvMapKv(wvTakeError(&iterErr)))
-				return
-			}
-			if !ok {
-				return
-			}
-			item := C.GoString(outItem)
-			C.weaveffi_free_string(outItem)
-			if !yield(item, nil) {
-				return
-			}
-		}
+for key, err := range store.Keys(nil) {
+	if err != nil {
+		return err
 	}
+	fmt.Println(key)
 }
 ```
 
-Consume it with `for key, err := range store.ListKeys(nil)`, checking
-`err` on each step. Each yielded element is copied into Go memory and
-its Rust allocation released per element (strings via
-`weaveffi_free_string`; buffered elements are decoded and released with
-`weaveffi_free_bytes`; object elements are adopted into wrappers). The
-deferred `_destroy` call runs exactly once, whether the consumer
-exhausts the sequence or breaks out of the `for range` loop early.
-Ranging over the same returned sequence again launches a fresh producer
-iterator.
+Each element is one C value, so elements may be optional scalars
+(`iter.Seq[*int64]`), numeric lists (`iter.Seq[[]int32]`), records, or
+objects, each received like a return.
 
-In a non-throwing sequence (the `events` sample's `Messages()`), a
-reported error can only be a producer bug or a panicking callback, so
-`wvTrap` panics instead of yielding it.
+## Leak checks
 
-## Known limitations
+`DebugLive(kind)` reports the library's live objects (0), callbacks (1),
+iterators (2), cancel tokens (3), and runs (4), and `DebugLive(-1)` is 1
+when the library counts at all. Every count is 0 unless the library was
+built with the `leak-check` feature. Wrappers you don't close are released
+by cleanups, so run `runtime.GC()` (and give the cleanups a moment) before
+reading the counts.
 
-- Async functions block the calling goroutine; there's no channel- or
-  context-based variant, and `cancellable: true` tokens are not exposed.
-- Callback methods run on the producer's thread as cgo callbacks; there
-  is no marshalling to a particular goroutine.
-- Non-throwing wrappers panic on the runtime trap codes (including a
-  panicking callback, code -4) rather than returning an `error`.
-- The generated module needs Go 1.23+ (`iter`, `range` over functions)
-  and a C toolchain for cgo.
-- The plain `generate` output expects `weaveffi.h` from the C target and
-  the library on `CGO_CFLAGS`/`CGO_LDFLAGS`; only `weaveffi package`
-  produces a relocatable module.
+## Limitations
 
-## Troubleshooting
-
-- **`undefined reference to weaveffi_*`**: `CGO_LDFLAGS` is missing the
-  `-l` flag or `-L` directory. Recheck the environment exports.
-- **`could not determine kind of name` in cgo**: ensure `CGO_CFLAGS`
-  points at the directory containing `weaveffi.h` (generate the C
-  target alongside Go).
-- **`panic: WeaveFFI ABI mismatch`** at startup: the library was built
-  by a different `weaveffi` release than the bindings. Regenerate the
-  bindings and rebuild the library together.
-- **`panic: weaveffi: Store used after Close`**: a closed wrapper was
-  used. Keep the wrapper alive for as long as the object is in use;
-  closing one wrapper doesn't affect others pointing at the same object.
-- **`weaveffi: ... (code -4)`** returned or panicked: a
-  callback-interface method you implemented panicked; the message is
-  the panic value. Recover inside the method if the producer call should
-  succeed anyway.
-- **`go: cannot find module providing package weaveffi`**: change the
-  generator config so `go.mod` declares the module path you actually
-  import, e.g. `github.com/myorg/mylib`.
+- The library is bound at link time, so there's no run-time override of
+  which library file loads beyond the platform loader's search path, and
+  `Check` reports a mismatched library only after the program has linked
+  and started.
+- A non-cancellable async call abandoned by its context keeps running in
+  the library until it finishes.
+- Vtables are never thread-affine, so a producer may call a Go callback
+  from any thread; Go's scheduler makes that safe.

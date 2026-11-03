@@ -1,340 +1,120 @@
-# Samples
+# Samples and Examples
 
-This repo includes eight sample projects under `samples/` that showcase
-end-to-end usage of WeaveFFI. Every producer is written as safe Rust and
-annotated with the `#[weaveffi::module]` family of attributes, so the macro
-generates its C ABI (see [The Rust Producer Macro](guides/producer-macro.md)),
-and every sample generates its bindings straight from that annotated
-`src/lib.rs`: there is no parallel IDL file to keep in sync. Package identity
-and per-target options live in each sample's `weaveffi.toml`, which the CLI
-discovers automatically next to the crate.
+The repository has two sets of producers. The **examples** in `examples/`
+are the code this book shows: small crates whose tests call their C
+functions, and IDL documents a test validates. The **samples** in
+`samples/` are the producers the
+[conformance harness](generators/README.md) runs in every language.
 
-Each sample builds as a `cdylib`, ships Rust tests that drive its own exported
-C symbols the way a foreign consumer would, and is regenerated in CI with
-`weaveffi diff --check` so the committed source and the generators can't drift.
+## Examples
 
-| Sample        | Path                  | Showcases                                                                      |
-|---------------|-----------------------|--------------------------------------------------------------------------------|
-| `calculator`  | `samples/calculator`  | The smallest module: scalars, strings, one error domain                        |
-| `contacts`    | `samples/contacts`    | A record, a C-style enum, an interface with CRUD methods, list returns         |
-| `inventory`   | `samples/inventory`   | Two modules, cross-module records, an interface owning a collection            |
-| `shapes`      | `samples/shapes`      | Rich (algebraic) enums and the full numeric primitive set                      |
-| `async-demo`  | `samples/async-demo`  | Async functions returning records and lists                                    |
-| `events`      | `samples/events`      | A callback interface, a shared reference-counted object, an iterator           |
-| `kvstore`     | `samples/kvstore`     | Every IDL feature, including an object graph and an eviction listener          |
-| `codec`       | `samples/codec`       | A round-trip oracle for every value-buffer wire shape, object tokens included  |
+| Example | What it is | Tested by |
+|---------|------------|-----------|
+| [`examples/getting-started`](https://github.com/weavefoundry/weaveffi/tree/main/examples/getting-started) | The [Getting Started](getting-started.md) producer (`add`, `div` with a typed error, `greet`) and its C consumer, `main.c` | `cargo test -p mathlib`: the C functions through an `extern "C"` block, and a check that the README's quickstart repeats the crate's source |
+| [`examples/macro-tour`](https://github.com/weavefoundry/weaveffi/tree/main/examples/macro-tour) | One of each producer attribute, for [the producer macro guide](guides/producer-macro.md): functions, typed and untyped errors, records and enums, custom types, an interface with an iterator, a callback interface, and async calls with cancellation | `cargo test -p macro-tour` (and `--features admin`): every C function the attributes generate, including a callback interface implemented with a hand-built vtable and a cancelled async call |
+| [`examples/idl`](https://github.com/weavefoundry/weaveffi/tree/main/examples/idl) | The IDL documents the [IDL reference](reference/idl.md) includes (`contacts.yml`, the multi-file `drawing/`, and the rejected documents), and the `greeter` project with its C producer, `greeter.c` | `cargo test -p idl-examples`: every document validates, and every rejected one fails with the code it's named after |
 
-## Kvstore (kitchen-sink reference)
+## Samples
 
-Path: `samples/kvstore`
-
-A production-quality, in-memory key/value store that exercises **every IDL
-feature WeaveFFI supports** in a single sample. Use this as the canonical
-reference when learning the IDL surface or when you need to copy a real-world
-pattern for a new generator.
-
-**What it demonstrates:**
-
-- A reference-counted interface (`Store`) with a throwing constructor
-  (`open`), instance methods, statics (`default_capacity`, `open_many`,
-  `total_count`), and the implicit `_clone`/`_destroy` pair
-- An **object graph**: `share` returns a second reference to the same store
-  (`self: Arc<Self>` in, `Arc<Store>` out), `fork` returns a new store,
-  `larger(other: Store?) -> Store?` takes and returns an optional object,
-  `describe -> StoreInfo` returns a record whose `store` field carries the
-  object itself (and an optional `mirror`), `open_many -> [Store]` returns a
-  list of objects, and `total_count([Store], StoreInfo?)` takes objects inside
-  a list and inside an optional record
-- A **callback interface** (`EvictionListener`) attached with
-  `set_eviction_listener` and detached with `clear_eviction_listener`; the
-  store retains the consumer's implementation, notifies it outside every
-  lock, and drops it when `on_evict` returns `false`
-- A record (`Entry`) with every primitive: `i64`, `string`, `bytes`, an
-  optional field (`expires_at: i64?`), a list field (`tags: [string]`), and a
-  map field (`metadata: {string:string}`), plus per-field doc strings
-- Documented C-style enums (`EntryKind`, `EvictionReason`)
-- A documented error domain (`KvError` with `KeyNotFound`, `Expired`,
-  `StoreFull`, `IoError`) and opt-in `throws: true` on the fallible methods
-- A streaming iterator return (`list_keys -> iter<string>`) with a prefix
-  filter
-- A cancellable async method (`compact`, `#[weaveffi::cancellable]`) that
-  checks its `CancelToken` before reclaiming expired entries
-- A deprecated method (`legacy_put`, via `#[deprecated(note = ...)]`)
-- A nested sub-module (`kv.stats`) with its own record (`Stats`) and a
-  function that takes the parent module's `Store` by reference
-- A `weaveffi.toml` with `[generators.<target>]` overrides for
-  `swift.module_name`, `cpp.namespace`, `dotnet.namespace`,
-  `dart.package_name`, `go.module_path`, and `ruby.module_name`
-
-**Build, generate bindings, and run the C ABI tests:**
+Three Rust producers: a minimal one, a wire-format oracle, and a
+feature-complete one. Each is a workspace crate built with the `leak-check`
+feature on, has unit tests, and is consumed by the conformance harness in
+all eleven languages, one consumer per sample per language.
 
 ```bash
-cargo build -p kvstore
-cargo test -p kvstore
-weaveffi generate samples/kvstore/src/lib.rs -o generated
+weaveffi generate samples/kvstore -o bindings
 ```
 
-The `conformance/` harness ships a kvstore consumer for every language that
-opens a `Store`, round-trips entries, shares and forks stores, attaches an
-eviction listener, drives the async `compact`, and asserts the typed `KvError`
-surface; see `conformance/run.sh`.
+Each sample's crate name is its C prefix: `kvstore` exports
+`kvstore_Store_open`, and its bindings load `libkvstore` (the targets that
+load it at run time also accept a path in `KVSTORE_LIBRARY`). `weaveffi
+generate` builds the crate and reads its API from the library; the
+`weaveffi.toml` beside each crate supplies package metadata.
 
-## Events (callback interface + shared object)
+### calculator
 
-Path: `samples/events`
+The smallest useful producer, small enough to read in a minute:
 
-A publish/subscribe bus and the reference sample for **callback interfaces**
-and **object sharing**. The consumer implements `Subscriber`; the bus retains
-any number of subscribers, asks each how to `route` a message, delivers
-accepted messages, and hands the bus itself back through a callback.
+- `add` (wrapping on overflow) and `greet`, a string in and a string out;
+- `divide`, which throws the `CalcError` domain on a zero divisor;
+- `parse`, which throws a second domain, `ParseError`, whose `NotANumber`
+  code carries the input as a field and renders its message from a
+  template (`not a number: 4x`); both domains use code `1`, so a binding
+  must interpret a code by the callable's domain;
+- `sqrt`, a `throws: any` function returning `Result<f64, String>`, which
+  fails with code `-1` and the message `cannot take the square root of -4`;
+- `mean` (`[f64]` in, `f64?` out) and `running_total` (`[i32]` in and out),
+  which cross as typed arrays and an optional scalar.
 
-**What it demonstrates:**
+The C target's `c-producer-exports` lane also implements the calculator's
+generated header by hand in C and checks that every runtime and contract
+symbol it requires is exported.
 
-- A callback interface (`Subscriber`) with three method shapes: `route(topic:
-  string) -> Delivery` returns a C-style enum, `on_message(message: Message)
-  -> i64` takes a record and returns a scalar, and `on_attached(bus:
-  EventBus)` receives an object the consumer adopts
-- A reference-counted interface (`EventBus`) whose constructor returns
-  `Arc<Self>` and whose `subscribe` method takes `self: Arc<Self>` so it can
-  hand a strong reference to the subscriber
-- Producer-side discipline for calling into consumer code: the bus snapshots
-  its subscriber list and never holds a lock across a callback, because a
-  failing subscriber aborts the publishing call with `FOREIGN_ERROR_CODE`
-- Consumer `free` semantics: `clear_subscribers` (or destroying the bus)
-  releases the producer's references and each consumer implementation's
-  `free` entry runs exactly once
-- An async method (`publish_later`), an iterator return (`messages ->
-  iter<string>`), an optional record return (`last_message -> Message?`), and
-  a free function taking a callback interface (`route_once`)
+### codec
 
-**Build and run tests:**
+The oracle for the [value-buffer format](reference/value-buffers.md), built
+on shared test vectors. The producer holds a fixed table of values covering
+every wire shape: each primitive at its extremes (with NaN, the infinities,
+`-0.0`, and subnormals for floats), empty and non-empty strings and bytes
+with non-ASCII text and interior NUL bytes, optionals, lists, maps keyed by
+strings, integers, and a C-style enum, nested records, C-style and rich
+enums, and objects inside buffers. Each vector is a variant of the `Vector`
+rich enum, so every language's codec check is one loop:
 
-```bash
-cargo build -p events
-cargo test -p events
-weaveffi generate samples/events/src/lib.rs -o generated
-```
+1. `vector_count()` returns how many vectors there are.
+2. `vector(i)` returns vector `i` for the consumer to decode. An index past
+   the end fails with `CodecError::OutOfRange { index, count }`.
+3. `check_vector(i, v)` takes the decoded value back, re-encoded by the
+   consumer, and returns `true` only if it's exactly vector `i` (floats keep
+   their sign, and any NaN matches NaN).
+4. `vector_name(i)` and `describe_vector(v)` label and render a vector, so a
+   failing consumer can say what went wrong.
 
-The Rust tests build a `Subscriber` vtable by hand, exactly as a generated
-binding does, and assert reference counts, `free` calls, and the foreign-error
-path. The `conformance/` harness runs an `events` consumer in all eleven
-languages.
+A round trip can't catch a decoder and an encoder that make the same mistake,
+so each consumer also builds a few vectors from literals and checks those,
+and spot-checks decoded fields. The `echo_*` functions return their argument
+through the other families, and each consumer pushes every primitive vector
+through the matching echo: scalars by value (`echo_i8` ... `echo_bool`),
+strings and bytes as runs (`echo_text`, `echo_blob`), the C-style enum as an
+`int32_t` (`echo_color`), optional scalars as `{p}_opt_*` structs
+(`echo_opt_i32`, `echo_opt_f64`, `echo_opt_bool`, and `echo_opt_color`,
+including `-0.0`, NaN, and absent), typed arrays (`echo_f64s`, `echo_i32s`,
+and `echo_u64s`, bit-exact at the extremes), a Rust `usize` as `u64`
+(`echo_usize`), a one-scalar string (`echo_char`; `"ab"` fails with `-3`),
+and a custom type crossing as a lowercase hex string (`echo_hex`; `"xyz"`
+fails with `-3`). `chunks` is an iterator of typed arrays, and a `Token`
+interface with `sum_holder`, `primary_of`, and `same_primary` checks object
+identity and reference counting through buffers.
 
-## Codec (value-buffer round-trip oracle)
+### kvstore
 
-Path: `samples/codec`
+The feature-complete producer: an in-memory key-value store whose API uses
+every feature WeaveFFI supports, arranged so a consumer can check each with
+concrete assertions. Time is a logical clock per store (`now`, advanced by
+`tick`), so TTLs are deterministic.
 
-Every generated binding ships its own encoder and decoder for the
-[value-buffer protocol](reference/value-buffers.md). This sample gives the
-conformance harness one producer that exercises **every wire shape in both
-directions**, so a codec bug in any language shows up as a concrete mismatch
-rather than a subtle corruption.
+| Feature | Where |
+|---|---|
+| Interface with constructors, methods, and statics | `Store` (`open`, `new`; `put`, `get`, ...; `open_many`, `default_capacity`, ...) |
+| Typed errors with payload fields and generated messages | `KvError`: `KeyNotFound { key }`, `Expired { key, expired_at }`, `StoreFull { capacity }`, `InvalidPath`, `Rejected { key, reason }`, `CallbackFailed { message }` |
+| An untyped (`throws: any`) error | `import_lines` (a `Result<usize, String>`) |
+| Optional scalars and typed arrays | `put`'s TTL (an `i64?` parameter), `expires_at` (an `i64?` return), `value_sizes` (a `[u64]` return), `expirations` (an iterator of `i64?`), `version_of` and `versions` (async `u32?` and `[u32]` results), and `Scorer::scores` (a `[u64]` parameter and `[f64]` return) |
+| `usize` | `count` and `listener_count` (`u64` in the IDL) |
+| Records, optionals, lists, maps | `Entry` (bytes, an optional TTL, tags, metadata), `StoreInfo`, `Stats` (a map keyed by a C-style enum) |
+| C-style and rich enums | `EntryKind`; `Change` (`Put`, `Removed`, `Cleared`) |
+| Objects in every position | parameters, returns, `Store?` both ways (`larger`), lists (`open_many`, `total_count`), map values (`by_label`), record fields (`StoreInfo`), iterator elements (`partition`), an async result (`open_store`), and a callback's parameter and return (`Policy::route`) |
+| Callback interfaces | `Listener` (retained by `subscribe`), `Policy` (`ttl_for`, an optional scalar in and out; `admit`, a record return whose typed `KvError` reaches the `put` caller; `route`, an object parameter and return), `Loader` (string, bytes, and optional-object returns; passed as an optional callback), `Scorer` (typed arrays in and out, used by `rank`) |
+| Callbacks from a producer thread | `compact` notifies listeners from the thread it runs on |
+| Lazy iterators | `keys` (strings, throwing), `entries` (records), `partition` (objects), `expirations` (optional scalars) |
+| Async and cancellation | `open_store` (an async free function returning an object), `compact` (cancellable; its background pause stops cooperatively, shown by `Store::active_jobs`), `get_many` (an async list), `summarize_all` |
+| Declarations in other Rust modules | `stats` (`Stats`, `summarize`, `summarize_all`) and `report` (`render_report`, with its own `ReportError` domain) join the library's one namespace |
+| Deprecation | `Store::size` (use `count`) |
 
-**What it demonstrates:**
-
-- `Scalars`: a record with every fixed-width scalar (`i8` through `u64`,
-  `f32`, `f64`, `bool`) and a C-style enum, using edge values such as
-  `u64::MAX`, `i64::MIN`, and a non-integer `f64`
-- `Composite`: a record with strings (including non-ASCII), bytes, present
-  and absent optionals, lists, lists of lists, an empty list, string-keyed and
-  integer-keyed maps, a nested record, a rich enum, a list of rich enums, an
-  optional rich enum, an optional list, a list of optionals, and a list of
-  enums
-- `Shape`: a rich enum with unit, scalar, mixed, string, and nested-record
-  variants
-- `Holder`: **objects inside buffers** (a required `Token`, an optional one,
-  and a list of them), with `make_holder`, `sum_holder`, `primary_of`, and
-  `same_primary` proving that each token carries one strong reference, that a
-  buffer is decoded exactly once, and that identity survives the round trip
-- Three function families per shape: `sample_*` (producer encodes, consumer
-  decodes), `verify_*` (consumer encodes, producer decodes and fails with
-  `CodecError::Mismatch` on any difference), and `roundtrip_*` (echo), plus
-  `describe_*` helpers that render what the producer actually saw
-
-**Build and run tests:**
-
-```bash
-cargo build -p codec
-cargo test -p codec
-weaveffi generate samples/codec/src/lib.rs -o generated
-```
-
-The `conformance/` harness runs the `codec` consumer in all eleven languages;
-it is the lane to watch when touching any generator's buffer code.
-
-## Shapes (rich enums + numerics)
-
-Path: `samples/shapes`
-
-The reference sample for **rich (algebraic) enums** (sum types whose variants
-carry associated data) and the **expanded numeric primitives**. Use it when
-learning how a tagged union crosses the C ABI serialized in a value buffer and
-how each backend surfaces it as an idiomatic sum type.
-
-**What it demonstrates:**
-
-- A rich enum (`Shape`) with a data-less variant (`Empty`) and three payload
-  variants (`Circle { radius: f64 }`, `Rectangle { width: f32, height: f32 }`,
-  and `Labeled { label: string, count: u8 }`), serialized on the wire as an
-  `i32` tag followed by the active variant's fields
-- A plain C-style enum (`Channel`) alongside the rich enum, showing both enum
-  flavors in one module
-- The numeric primitives `f32`, `u8`, and `u64` as variant fields, parameters,
-  and return types
-- Functions that take and return a rich enum (`describe`, `scale`) and a
-  list-of-bytes reduction (`sum_bytes(values: [u8]) -> u64`)
-
-**Build, generate bindings, and run the C ABI tests:**
-
-```bash
-cargo build -p shapes
-cargo test -p shapes
-weaveffi generate samples/shapes/src/lib.rs -o generated
-```
-
-The `conformance/` harness ships a `shapes` consumer for every language that
-constructs each variant, reads the tag and fields back, and round-trips through
-`describe`/`scale`.
-
-## Calculator
-
-Path: `samples/calculator`
-
-The simplest sample: a single `#[weaveffi::module]` with four functions that
-exercise primitive types (`i32`) and string passing. Good starting point for
-understanding the basic C ABI contract and the macro workflow.
-
-**What it demonstrates:**
-
-- Scalar parameters and return values (`i32`)
-- String parameters and return values (borrowed in, producer-owned out, freed
-  with `weaveffi_free_string`)
-- The smallest possible typed error surface: a `#[weaveffi::error]` enum
-  (`CalcError`) and one throwing function (`div` returns
-  `Result<i32, CalcError>`)
-- A producer written entirely as safe Rust (no hand-written FFI glue)
-
-**Build and generate bindings (from the annotated source):**
-
-```bash
-cargo build -p calculator
-weaveffi generate samples/calculator/src/lib.rs -o generated
-```
-
-This produces target-specific output under `generated/` for all eleven
-languages. The [Calculator tutorial](tutorials/calculator.md) walks through
-running C, Node, and Swift consumers against it.
-
-## Contacts
-
-Path: `samples/contacts`
-
-A CRUD-style sample with a single module. It exercises richer type-system
-features than the calculator while writing no `unsafe` glue.
-
-**What it demonstrates:**
-
-- A `#[weaveffi::enumeration]` (`ContactType` with `Personal`, `Work`, `Other`)
-- A `#[weaveffi::record]` (`Contact`) with a generated `BufferValue`
-  encode/decode impl
-- Optional fields (`Option<String>` for the email)
-- A `#[weaveffi::interface]` (`ContactBook`) with a `new` constructor,
-  `&self` methods guarding a `Mutex`, and the implicit `_clone`/`_destroy`
-  pair
-- List return types (`Vec<Contact>` from `ContactBook::list`)
-- A `#[weaveffi::error]` domain (`ContactsError`) surfaced by the throwing
-  methods via `Result<Contact, ContactsError>`
-
-**Build and generate bindings (from the annotated source):**
-
-```bash
-cargo build -p contacts
-weaveffi generate samples/contacts/src/lib.rs -o generated
-```
-
-The `conformance/` harness runs a `contacts` consumer in all eleven languages.
-
-## Inventory
-
-Path: `samples/inventory`
-
-A richer, multi-module sample with `products` and `orders` modules, written as
-safe Rust with two `#[weaveffi::module]` blocks. It exercises cross-module
-references and record lists.
-
-**What it demonstrates:**
-
-- Two annotated modules in one crate, each with its own error domain
-  (`ProductsError`, `OrdersError`)
-- A `#[weaveffi::interface]` (`Catalog`) owning its product list, alongside
-  free functions in the `orders` module
-- A `#[weaveffi::enumeration]` (`Category`) and `#[weaveffi::record]`s
-  (`Product`, `Order`, `OrderItem`)
-- Optional and list fields (`Option<String>`, `Vec<String>` tags)
-- A record-list return (`Catalog::search -> Vec<Product>`) and a record-list
-  parameter (`create_order(items: Vec<OrderItem>)`)
-- A cross-module record parameter (`orders::add_product_to_order` takes a
-  `products::Product`)
-
-**Build and generate bindings (from the annotated source):**
-
-```bash
-cargo build -p inventory
-weaveffi generate samples/inventory/src/lib.rs -o generated
-```
-
-The `conformance/` harness runs `inventory` consumers in C and Python.
-
-## Async Demo
-
-Path: `samples/async-demo`
-
-Demonstrates the async function pattern. An `async fn` export lowers to an
-`_async` launcher at the C ABI that accepts a completion callback plus a
-context pointer instead of returning directly, and each target wraps it in its
-native awaitable.
-
-**What it demonstrates:**
-
-- Async exports (`pub async fn` under `#[weaveffi::export]`) returning a
-  record (`run_task -> TaskResult`), a list of records (`run_batch`), and a
-  scalar (`run_n_tasks`)
-- A throwing async function (`run_task` returns
-  `Result<TaskResult, TaskError>`), delivered as a heap-boxed error the
-  consumer frees with `weaveffi_error_free`
-- Synchronous functions in the same module (`cancel_task`,
-  `active_callbacks`)
-- The default spawner (one thread per future) in action; see the
-  [Async Functions guide](guides/async.md) for plugging in Tokio with
-  `weaveffi::set_spawner`
-
-**Build and run tests:**
-
-```bash
-cargo build -p async-demo
-cargo test -p async-demo
-```
-
-The `conformance/` harness runs an `async-demo` consumer in all eleven
-languages, awaiting the results through each target's native idiom.
-
-## End-to-end testing
-
-The `conformance/` directory is the end-to-end regression oracle for the code
-generators. Every consumer under `conformance/<language>/` binds through the
-*generated* wrappers (not the raw C ABI) and asserts concrete results against
-the samples: `contacts`, `events`, `kvstore`, `shapes`, `codec`, and
-`async-demo` in all eleven languages, plus `inventory` in C and Python. The
-`conformance/run.sh` harness builds each producer cdylib, runs
-`weaveffi generate` for it, then compiles and runs every per-(language,
-sample) consumer:
-
-```bash
-bash conformance/run.sh
-```
-
-It prints `[OK] {target}` for each consumer that succeeds and reports a
-pass/fail summary at the end. Use `ONLY=c-contacts,cpp-contacts` to run a
-subset, or `SKIP=go-contacts` to omit individual targets. Missing toolchains
-cause the affected target to fail; skip those explicitly. See the comment
-block at the top of `conformance/run.sh` for the per-target prerequisites.
+A callback's failure surfaces according to its role: a `Listener` that fails
+is unsubscribed while the store operation succeeds; a `Policy`, `Loader`, or
+`Scorer` failure fails the call. A typed `KvError` a consumer raised (with
+its fields) reaches the original caller typed, its message rendered from the
+fields, and any other consumer failure becomes `KvError::CallbackFailed`
+carrying the consumer's message, through the domain's `From<ForeignError>`
+implementation. The store never holds a lock while a callback runs, so
+callbacks may call back into it.

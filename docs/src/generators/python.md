@@ -1,906 +1,425 @@
 # Python
 
-## Overview
+The Python target produces a pip-installable package of pure-Python
+`ctypes` bindings over the C ABI (revision 6). There's no compilation step,
+no native extension, and no third-party runtime dependency; the package
+works on any Python 3.10+ interpreter that can load the producer library.
+The implementation module is fully annotated and the package ships
+`py.typed`, so type checkers read the bindings themselves (there's no
+separate stub to drift out of date), and the generated code is written to
+pass `mypy --strict`.
 
-The Python target produces pure-Python `ctypes` bindings, `.pyi` type
-stubs, and packaging files over the C ABI (revision 2). Calls go
-through Python's built-in `ctypes` module, so there's no compilation
-step, no native extension, and no third-party runtime dependency. The
-generated package works on any Python 3.7+ interpreter that can
-`dlopen` the shared library.
+Every value crosses the boundary as one C value. Records and rich enums
+are frozen dataclasses that cross as value buffers. Interfaces are
+reference-counted wrapper classes with a context manager. Error domains
+are exception classes. Callback interfaces are abstract base classes the
+consumer subclasses. Async functions are coroutines whose cancellation
+cancels the native call, and `iter<T>` returns are lazy
+`NativeIterator[T]` objects.
 
-Records and rich enums are dataclasses that cross the boundary as value
-buffers; interfaces are reference-counted wrapper classes with `close()`
-and a `__del__` backstop; callback interfaces are abstract base classes
-the consumer subclasses; async functions surface as `async def` wrappers
-integrated with asyncio; and `iter<T>` returns are lazy Python
-iterators.
-
-The trade-off is that `ctypes` calls are slower than compiled extensions
-(`cffi`, `pybind11`, PyO3). For typical FFI workloads the overhead is
-negligible compared to the work done inside the Rust library.
+Python is a [Tier 1](../stability.md#target-tiers) target: it tracks every
+ABI revision as it lands and runs the full conformance suite in CI.
 
 ## What gets generated
 
-| File | Purpose |
-|------|---------|
-| `python/<pkg>/__init__.py` | Re-exports the public API from `weaveffi.py` |
-| `python/<pkg>/weaveffi.py` | ctypes bindings: library loader, ABI check, codecs, wrappers, classes |
-| `python/<pkg>/weaveffi.pyi` | Type stub for IDE autocompletion and `mypy` |
-| `python/pyproject.toml` | PEP 621 project metadata |
-| `python/setup.py` | Fallback setuptools script |
-| `python/README.md` | Basic usage instructions |
+For the `kvstore` sample (package name `kvstore`, C prefix `kvstore`):
 
-The package directory follows the IDL `package.name` (a package named
-`kvstore` produces `python/kvstore/...`); `weaveffi` is the default and
-`package_name` under `[generators.python]` overrides it.
+```text
+python/
+├── pyproject.toml          # PEP 621 metadata, built with setuptools
+├── README.md
+└── kvstore/                # the import package, named after the C prefix
+    ├── __init__.py         # re-exports the module's __all__
+    ├── kvstore.py          # runtime, prototypes, and wrappers
+    └── py.typed            # PEP 561 marker
+```
 
-The module verifies the producer's ABI revision at import time, so a
-stale library fails fast instead of misreading the error struct or a
-value buffer later:
+The distribution name is the package identity's `name` and the import
+package is its C prefix, so a crate named `key-store` installs as
+`key-store` and imports as `key_store`. Both are configurable:
+
+```toml
+[generators.python]
+name = "kvstore-python"      # distribution name (default: package name)
+import_name = "kvstore_py"   # import package (default: C prefix)
+requires_python = ">=3.12"   # default ">=3.10"
+```
+
+A library is one namespace, and so is the package: every record, enum,
+error class, interface, callback interface, and free function is exported
+from the package itself under its IDL name (functions in snake case). The
+module lists its public names in `__all__` (the error classes,
+`LibraryLoadError`, `NativeIterator`, every type, and the free functions),
+so `from kvstore import *` and the package's `__init__.py` export the API
+and none of the runtime's helpers. Annotations use builtin generics and
+`X | None`.
+
+## Install and load
+
+```bash
+weaveffi generate -o bindings --target python   # in the producer crate
+pip install bindings/python
+```
+
+At import, the module loads the producer library from the first of:
+
+1. the path in `{PREFIX}_LIBRARY` (for example `KVSTORE_LIBRARY`),
+2. a library bundled inside the package directory (what `weaveffi package`
+   produces, and where `weaveffi generate --dev` copies the debug build), and
+3. the system loader's search path, by platform file name
+   (`libkvstore.dylib`, `libkvstore.so`, or `kvstore.dll`).
+
+It then makes the two [load-time checks](../reference/abi.md#load-time-checks)
+before binding anything else. `kvstore_abi_version()` must report revision
+6, and every declaration the bindings were generated with (every function,
+interface member, type, error code, and callback method) must have its
+contract function in the library, returning the hash the bindings embed.
+The module holds one row per declaration: the contract function, the
+hash, and the declaration's path, with its canonical signature:
 
 ```python
-_ABI_VERSION = 2
-
-
-def _check_abi_version(lib: ctypes.CDLL) -> None:
-    try:
-        fn = lib.weaveffi_abi_version
-    except AttributeError:
-        raise ImportError(
-            "the loaded WeaveFFI library predates ABI versioning "
-            f"(these bindings expect ABI revision {_ABI_VERSION})"
-        ) from None
-    fn.argtypes = []
-    fn.restype = ctypes.c_uint32
-    found = fn()
-    if found != _ABI_VERSION:
-        raise ImportError(
-            f"WeaveFFI ABI mismatch: these bindings expect revision {_ABI_VERSION} "
-            f"but the loaded library reports revision {found}"
-        )
+_CONTRACT: list[tuple[str, int, str]] = [
+    ("kvstore_contract_c6c5d9ee1b7cfa9e", 0x36b344095a0f5bf9, "Store.rank"),  # method rank(Scorer) -> [string] throws KvError
+    ...
+]
 ```
+
+When the library can't be loaded, or a check fails, the import raises
+`LibraryLoadError`, an `ImportError` subclass whose message says what went
+wrong and whose `path` names the library:
+
+```text
+kvstore.kvstore.LibraryLoadError: Store.put changed since these bindings were generated (/opt/lib/libkvstore.dylib)
+```
+
+The other messages are `Store.put is missing from the library`, a C ABI
+mismatch naming both revisions, a library that doesn't export
+`kvstore_abi_version`, and the loader's own error with a hint to set
+`KVSTORE_LIBRARY`. A stale binding never misreads a buffer at runtime.
+Declarations the library has and the bindings don't are fine, so a library
+that grew new functions, error codes, or callback methods still loads.
+Since the failure happens during the import, catch it as `ImportError`
+around the `import` statement.
+
+Every C prototype is then bound once, in a module-level table:
+
+```python
+_c_Store_count = _bind("kvstore_Store_count", ctypes.c_uint64, ctypes.c_void_p, ctypes.POINTER(_ErrorStruct))
+```
+
+On macOS, the system `python3` strips `DYLD_LIBRARY_PATH`, so prefer
+`{PREFIX}_LIBRARY` there.
 
 ## Type mapping
 
-| IDL type     | Python type hint     | ctypes type                        |
-|--------------|----------------------|------------------------------------|
-| `i8`, `i16`, `i32`, `i64` | `int`   | `c_int8`, `c_int16`, `c_int32`, `c_int64` |
-| `u8`, `u16`, `u32`, `u64` | `int`   | `c_uint8`, `c_uint16`, `c_uint32`, `c_uint64` |
-| `f32`, `f64` | `float`              | `c_float`, `c_double`              |
-| `bool`       | `bool`               | `c_int32`                          |
-| `string`     | `str`                | `c_char_p`                         |
-| `bytes`      | `bytes`              | `POINTER(c_uint8)` + `c_size_t`    |
-| `Struct`     | `"StructName"` (a `@dataclass`) | value buffer: `POINTER(c_uint8)` + `c_size_t` |
-| `Enum` (plain) | `"EnumName"` (`IntEnum`) | `c_int32`                    |
-| `Enum` (rich)  | `"EnumName"` (variant dataclasses) | value buffer, like `Struct` |
-| `Interface`  | `"InterfaceName"` (wrapper class) | `c_void_p`            |
-| `Interface?` | `Optional["InterfaceName"]` | `c_void_p` (NULL for `None`) |
-| `CallbackInterface` | `"CallbackName"` (subclass of the generated ABC) | `c_void_p` ctx + `POINTER(<Name>Vtable)` |
-| `T?`         | `Optional[T]`        | value buffer                       |
-| `[T]`        | `List[T]`            | value buffer                       |
-| `{K: V}`     | `Dict[K, V]`         | value buffer                       |
-| `iter<T>`    | `Iterator[T]` (lazy) | opaque `c_void_p` iterator handle  |
+Parameters accept abstract containers (any `Sequence` or `Mapping`) and
+returns hand out concrete ones (`list`, `dict`). Every value is one C value
+in every position (a parameter, a return, an async result, an iterator
+item, and a callback method's arguments and return), and the runtime
+mirrors the C structures as `ctypes.Structure` subclasses passed and
+returned by value: `_Run` for `{prefix}_run` (a pointer and a byte length)
+and `_OptI32`, `_OptF64`, and so on for each `{prefix}_opt_{prim}` (a
+presence flag and a value).
 
-Buffered types (structs, rich enums, optionals, lists, maps) cross the
-boundary serialized in the
-[value-buffer format](../reference/value-buffers.md); the generated
-module ships a private `_BufferWriter`/`_BufferReader` pair plus one
-pack and one unpack function per record and rich enum. Objects nested
-inside a buffered value travel as object tokens (see
-[Objects](#objects-interfaces)).
+| IDL type | Python type | Crosses the ABI as |
+|---|---|---|
+| `i8` to `u64` | `int` | `c_int8` to `c_uint64`, range-checked |
+| `f32`, `f64` | `float` | `c_float`, `c_double` |
+| `bool` | `bool` | `c_bool` |
+| C-style enum | `IntEnum` subclass | `c_int32` |
+| scalar or enum `T?` | `T \| None` | `_Opt{Prim}` (an enum's is `_OptI32`) |
+| `string` | `str` | `_Run` of UTF-8 |
+| `bytes` | `bytes` | `_Run` of the bytes |
+| `[i8]` to `[u64]`, `[f32]`, `[f64]` | `Sequence[int]` or `Sequence[float]` in, `list` out | `_Run` of the packed elements (a typed array) |
+| record | frozen `@dataclass` | `_Run` holding a value buffer |
+| rich enum | base class plus one frozen `@dataclass` per variant | `_Run` holding a value buffer |
+| other `T?`, `[T]`, `{K:V}` | `T \| None`, `Sequence[T]`, `Mapping[K, V]` in; `T \| None`, `list[T]`, `dict[K, V]` out | `_Run` holding a value buffer |
+| interface | wrapper class | `c_void_p` |
+| interface `?` | `... \| None` | `c_void_p`, null for `None` |
+| callback interface | subclass of the generated ABC | `_{Name}Arg` (a context and a vtable) |
+| callback interface `?` | `... \| None` | `_{Name}Arg` with a null vtable for `None` |
+| `iter<T>` | `NativeIterator[T]` | iterator handle |
 
-Booleans cross the boundary as `c_int32` (`0`/`1`) because C has no
-standard fixed-width boolean type across ABIs.
+`ctypes` truncates an out-of-range integer to the parameter's C width
+without a word, so every integer argument is checked first: a value out of
+range raises `OverflowError` naming the parameter
+(`a: 2147483648 is out of range for i32`), and a non-integer raises
+`TypeError`. The checks run before anything is lent or registered for the
+call, so a failed check leaks nothing.
 
-### 64-bit integers and floats
+An optional scalar (`i64?`, `bool?`, `Priority?`) never touches a value
+buffer: `None` passes an absent `_Opt{Prim}`, and a returned one becomes
+the value or `None`. A numeric list parameter accepts any sequence or
+iterable of numbers (a `list`, a `tuple`, a `range`, a generator); it's
+packed into an `array.array` with range checks, whose buffer Python aligns
+for every element type, and lent to the call. An `array.array` of the
+matching type code is lent as is, without a copy. A `str` or `bytes`
+argument is refused rather than reinterpreted. Returned typed arrays are
+copied into a `list` and released.
 
-Python's `int` is arbitrary precision, so `i64` and `u64` round-trip
-exactly with no wrapper type: the `ctypes` slots are `c_int64` and
-`c_uint64`, and the value-buffer codec packs them with `struct` as
-`<q`/`<Q`. Out-of-range values raise from `ctypes`/`struct` before
-anything crosses the boundary. `f32`/`f64` map to Python `float`; the
-`codec` conformance consumer verifies that NaN, both infinities, and
-`-0.0` survive a round trip bit-for-bit (an `f32` is still rounded to
-single precision by the producer).
+Strings and bytes pass without per-byte loops: a `str` is encoded once and
+its bytes are lent to the call as a run, so interior NUL characters
+survive. Returned strings, bytes, typed arrays, and buffers are copied with
+`ctypes.string_at` and released with `{prefix}_run_free`.
 
-## Example IDL and generated code
+Every record and rich enum has one writer and one reader function
+(`_write_Entry`, `_read_Entry`), and so does every distinct composite type
+the API uses, named by the composite's canonical stem
+(`_write_list_string`, `_read_map_string_Store`, `_read_opt_Entry`); a call
+site makes one call instead of inlining a loop. Lists of a fixed-width
+number type inside a buffer are packed and unpacked with one `struct` call.
+A value out of range for its field raises `OverflowError` while encoding. A
+decoded buffer that's truncated, has trailing bytes, an invalid flag,
+invalid UTF-8, an undeclared enum value, or a repeated map key raises
+`InternalError` with code `-3`.
 
-```yaml
-version: "0.9.0"
-modules:
-  - name: contacts
-    enums:
-      - name: ContactType
-        doc: "Type of contact"
-        variants:
-          - { name: Personal, value: 0 }
-          - { name: Work, value: 1 }
-          - { name: Other, value: 2 }
-
-    structs:
-      - name: Contact
-        doc: "A contact record"
-        fields:
-          - { name: name, type: string }
-          - { name: email, type: "string?" }
-          - { name: age, type: i32 }
-
-    functions:
-      - name: create_contact
-        params:
-          - { name: name, type: string }
-          - { name: email, type: "string?" }
-          - { name: contact_type, type: ContactType }
-        return: Contact
-
-      - name: count_contacts
-        params: []
-        return: i32
-```
-
-The generated module loads the platform-specific shared library:
+Records are `@dataclass(frozen=True, slots=True)`: they compare and hash
+by value (a record holding a `list` or `dict` field compares by value but
+can't be hashed), and a changed copy comes from `dataclasses.replace`:
 
 ```python
-def _load_library() -> ctypes.CDLL:
-    # An explicit path in WEAVEFFI_LIBRARY wins, so callers can point at a
-    # specific build artifact regardless of its file name or location.
-    override = os.environ.get("WEAVEFFI_LIBRARY")
-    if override:
-        return ctypes.CDLL(override)
-    system = platform.system()
-    if system == "Darwin":
-        name = "libweaveffi.dylib"
-    elif system == "Windows":
-        name = "weaveffi.dll"
-    else:
-        name = "libweaveffi.so"
-    return ctypes.CDLL(name)
-
-_lib = _load_library()
+entry = store.get("alpha")
+renamed = dataclasses.replace(entry, tags=["archived"])
 ```
 
-Functions become snake_case Python functions with full type hints;
-ctypes `argtypes`/`restype` are set up at the call site. A buffered
-argument is packed with the generated codec; a buffered return is
-decoded from the producer's buffer, which the wrapper then frees. From
-the `kvstore` sample's `get_stats` (docstring trimmed):
+Rich-enum variants work with `isinstance` and with `match`:
 
 ```python
-def get_stats(store: "Store") -> "Stats":
-    _fn = _lib.weaveffi_kv_stats_get_stats
-    _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_void_p
-    _err = _WeaveFFIErrorStruct()
-    _out_len = ctypes.c_size_t(0)
-    _result = _fn(_borrow(store), ctypes.byref(_out_len), ctypes.byref(_err))
-    _check_kv_error(_err)
-    _data = _take_buffer(_result, _out_len.value)
-    return _unpack_Stats(_data)
+match change:
+    case kvstore.ChangePut(entry=entry, replaced=True):
+        print("replaced", entry.key)
+    case kvstore.ChangeRemoved(key=key):
+        print("removed", key)
 ```
 
-Enums become `IntEnum` subclasses:
+The module starts with `from __future__ import annotations`, so
+annotations name types declared later in the file without quotes.
+Backticked identifiers in IDL docs and deprecation messages are rewritten
+to their Python spellings in docstrings and `DeprecationWarning`s.
+
+## Objects and lifetime
+
+An interface wrapper holds one strong reference and releases it exactly
+once: from `close()`, the `with` statement, or the `__del__` backstop.
+`close()` is idempotent, and using a closed wrapper raises `ValueError`.
+Each call lends the pointer for its duration, so `close()` from another
+thread while a call is in flight defers the release until the call
+returns. Two wrappers compare equal (and hash alike) when they hold the
+same native object, so `store.share() == store` and a record holding a
+`Store` compares by identity. An interface member named `close` is
+`close_`, so it never replaces the wrapper's own ([reserved member
+names](../reference/naming.md#identifiers-in-generated-code)).
+
+A constructor named `new` becomes `__init__`; other constructors are
+`@classmethod` factories:
 
 ```python
-class ContactType(IntEnum):
-    """Type of contact"""
-    Personal = 0
-    Work = 1
-    Other = 2
+    @classmethod
+    def open(cls, path: str) -> Store:
+        _err = _ErrorStruct()
+        _ret = _c_Store_open(_run_in(path.encode("utf-8")), ctypes.byref(_err))
+        if _err.code:
+            raise _kv_error_from(*_read_error(_err))
+        return cls._adopt(_required(_ret))
 ```
 
-Structs become plain `@dataclass` value classes. There are no C symbols
-per struct: construction, equality, and repr come from the dataclass,
-and instances cross the boundary serialized in value buffers by
-generated private codec functions (`_pack_Contact` / `_unpack_Contact`):
+Objects returned by the producer, decoded from a buffer, or passed to a
+callback are adopted into new wrappers. Writing an object into a value
+buffer (a record field or a list element) mints a new reference only after
+the whole argument list has encoded, so a failed encoding leaks nothing.
 
-```python
-@dataclass
-class Contact:
-    """A contact record"""
+## Errors
 
-    name: str
-    email: Optional[str]
-    age: int
-```
-
-The accompanying `.pyi` stub mirrors the public surface for IDE/mypy:
-
-```python
-class ContactType(IntEnum):
-    Personal: int
-    Work: int
-    Other: int
-
-class Contact:
-    name: str
-    email: Optional[str]
-    age: int
-    def __init__(self, name: str, email: Optional[str], age: int) -> None: ...
-
-def create_contact(name: str, email: Optional[str], contact_type: "ContactType") -> "Contact": ...
-```
-
-Wrapper names drop the IDL module prefix by default and stay
-snake_case, so `create_contact` in module `contacts` is exported as
-plain `create_contact` (the C symbol keeps its full
-`weaveffi_contacts_create_contact` name). Set
-`strip_module_prefix: false` in the Python generator config (or under
-`[global]`) to restore module-prefixed wrapper names like
-`contacts_create_contact`.
-
-## Typed errors
-
-Every generated module defines `WeaveFFIError(Exception)` with `code`
-and `message` attributes and the four runtime trap codes as class
-constants:
-
-```python
-class WeaveFFIError(Exception):
-    """An error reported through the C ABI.
-
-    Positive codes are a module's declared error codes (raised as the
-    module's typed subclasses); negative codes are runtime traps: a generic
-    producer error (-1), a producer panic (-2), a marshalling failure (-3),
-    or an exception raised by a callback-interface implementation (-4).
-    """
-
-    GENERIC_ERROR_CODE = -1
-    PANIC_ERROR_CODE = -2
-    MARSHAL_ERROR_CODE = -3
-    FOREIGN_ERROR_CODE = -4
-
-    def __init__(self, code: int, message: str) -> None:
-        self.code = code
-        self.message = message
-        super().__init__(f"({code}) {message}")
-```
-
-A module that declares an error domain also gets a domain base class
-and one subclass per code, each pinning its stable `CODE`; from the
-`kvstore` sample:
-
-```python
-class KvError(WeaveFFIError):
-    """Base exception for the `kv` module's error domain."""
-
-
-class KeyNotFound(KvError):
-    """key not found"""
-
-    CODE = 1
-
-    def __init__(self, message: str = "key not found") -> None:
-        super().__init__(1, message)
-```
-
-Only callables marked `throws: true` in the IDL raise these typed
-errors: their wrappers check the error slot with `_check_kv_error`,
-which maps the code through `_kv_error_from` and raises `KeyNotFound`,
-`IoError`, or (for codes outside the domain, such as a producer panic)
-a plain `WeaveFFIError`. Their docstrings carry a `Raises` section
-naming the domain. A callable without `throws` uses the generic
-`_check_error`, which raises `WeaveFFIError` only if the producer
-misbehaves. The error slot's message and payload are copied and then
-released with `weaveffi_error_clear` before the exception is raised.
+Every declared error derives from the package's root `Error` (named
+`{PascalName}Error` if the API declares its own `Error` type), which
+carries `code` and `message`. Each error domain is a subclass named by the
+shared rule (`KvError` stays `KvError`, `KitchenErrors` becomes
+`KitchenError`, `Failure` becomes `FailureError`). Each code is a subclass
+of its domain named `{Code}Error` (`KeyNotFoundError`), also reachable as
+`KvError.KeyNotFound`, carrying its stable `CODE`. When `{Code}Error` would
+shadow a Python builtin (`TimeoutError`) or another declaration, it's
+qualified with the domain's stem (`KvTimeoutError`). A code's payload
+fields are constructor arguments and attributes; a field named like an
+exception attribute (`message`, `code`, `args`) gets a trailing `_`:
 
 ```python
 try:
-    store.put("k", b"", EntryKind.Persistent, None)
-except StoreFull:
-    ...                      # specific code
-except KvError as e:
-    print(e.code, e.message) # any domain error
+    store.get("nope")
+except kvstore.KvError.KeyNotFound as e:
+    print(e.code, e.key, e.message)  # 1001 nope key not found: nope
 ```
 
-### Runtime error codes
+What a failed call raises follows its `throws`:
 
-| Code | Constant | Meaning | Where it surfaces |
-|------|----------|---------|-------------------|
-| `-1` | `GENERIC_ERROR_CODE` | The producer reported an error without a declared code, or the wrapper itself detected misuse (a `None` object pointer, a wrapper used after `close()`). | Raised as `WeaveFFIError` from the call. |
-| `-2` | `PANIC_ERROR_CODE` | The Rust implementation panicked; the export macros and the async spawner catch the unwind. | Raised as `WeaveFFIError`, or set as an awaited future's exception. |
-| `-3` | `MARSHAL_ERROR_CODE` | Malformed input at the boundary (invalid UTF-8, a truncated value buffer, a bad enum discriminant). | Raised as `WeaveFFIError`. |
-| `-4` | `FOREIGN_ERROR_CODE` | A callback-interface method implemented in Python raised. | Raised as `WeaveFFIError` from the producer call that invoked the callback (see [Callback interfaces](#callback-interfaces)). |
+- `throws: SomeDomain`: the code's class. Codes are matched within the
+  callable's domain, so two domains may reuse a value. Domains are open: a
+  positive code these bindings don't know (from a newer library) raises the
+  domain's base class with its code and message.
+- `throws: any`: the root `Error` with code -1 and the producer's message.
+- A negative code on a throwing call (a panic, a marshalling failure, or a
+  failed callback) raises the root `Error` with that code; the constants
+  are `GENERIC_ERROR_CODE` (-1), `PANIC_ERROR_CODE` (-2),
+  `MARSHAL_ERROR_CODE` (-3), and `FOREIGN_ERROR_CODE` (-4).
 
-Python has no non-raising call path: a non-throwing callable whose
-error slot comes back non-zero still raises `WeaveFFIError`, so a
-producer bug or a raising callback never goes unnoticed.
+A call that declares no errors can only fail through a bug, so it follows
+the [trap policy](../guides/errors-and-memory.md#the-trap-policy): it
+raises `InternalError`, a `RuntimeError` subclass outside the `Error`
+hierarchy whose message names the code and the producer's message
+(`InternalError: (-3) ...`). A cancelled async call (-5) raises
+`asyncio.CancelledError` instead.
 
-## Objects (interfaces)
+Each call passes a fresh error slot, which the producer overwrites. Error
+messages cross as UTF-8 bytes plus a length, so they may contain any
+character; an empty message is `""`.
 
-An `interfaces:` entry becomes a Python class wrapping one strong
-reference to a reference-counted producer object. Every interface
-exports a `<Interface>_clone` and `<Interface>_destroy` pair on the C
-ABI, bound once at module scope:
+## Async and cancellation
 
-```python
-_lib.weaveffi_kv_Store_clone.argtypes = [ctypes.c_void_p]
-_lib.weaveffi_kv_Store_clone.restype = ctypes.c_void_p
-_lib.weaveffi_kv_Store_destroy.argtypes = [ctypes.c_void_p]
-_lib.weaveffi_kv_Store_destroy.restype = None
-```
-
-The wrapper class (from the `kvstore` sample, trimmed):
-
-```python
-class Store:
-    @classmethod
-    def _from_ptr(cls, ptr) -> "Store":
-        """Adopt one strong reference the producer handed over."""
-        _obj = cls.__new__(cls)
-        _obj._ptr = ptr
-        return _obj
-
-    def __init__(self) -> None:
-        raise TypeError("Store cannot be instantiated directly")
-
-    def _clone_ptr(self):
-        """A new strong reference to the same object (a raw pointer the
-        receiver must eventually release), leaving this wrapper's own
-        reference untouched."""
-        return _lib.weaveffi_kv_Store_clone(_borrow(self))
-
-    def close(self) -> None:
-        """Release this wrapper's reference. The object itself is dropped
-        when its last reference (here or in the producer) is released.
-        Idempotent; the wrapper is unusable afterwards."""
-        _p = getattr(self, "_ptr", None)
-        self._ptr = None
-        if _p is not None:
-            _lib.weaveffi_kv_Store_destroy(_p)
-
-    def __enter__(self) -> "Store":
-        return self
-
-    def __exit__(self, *exc) -> bool:
-        self.close()
-        return False
-
-    def __del__(self) -> None:
-        self.close()
-
-    @classmethod
-    def open(cls, path: str) -> "Store": ...
-```
-
-- **Construction.** A constructor named `new` renders as `__init__`
-  (the `events` sample's `EventBus()`); any other constructor becomes a
-  `@classmethod` factory (`Store.open("/tmp/cache.kv")`). An interface
-  without a `new` constructor cannot be instantiated directly; its
-  `__init__` raises `TypeError`. Methods are instance methods, statics
-  are `@staticmethod`s, and deprecated members emit `DeprecationWarning`
-  at call time.
-- **Disposal.** `close()` releases the wrapper's reference through the
-  `_destroy` symbol; it's idempotent, and the wrapper is a context
-  manager (`with Store.open(path) as store:`). `__del__` is a backstop
-  that closes an unclosed wrapper when the garbage collector reaches it.
-  The producer object itself is dropped only when the last reference
-  anywhere (any Python wrapper, the producer's own clones) is released.
-- **Use after close.** `_borrow(obj)` is the only way a wrapper's
-  pointer reaches the producer. On a closed wrapper it raises
-  `WeaveFFIError(-1, "Store used after close()")`, whether the wrapper
-  is the receiver, a parameter, or a field inside a record or list being
-  packed:
-
-  ```python
-  def _borrow(obj):
-      """The raw pointer of a live object wrapper, lent to the producer for the
-      duration of one call. Raises if the wrapper was already closed."""
-      _p = obj._ptr
-      if _p is None:
-          raise WeaveFFIError(-1, f"{type(obj).__name__} used after close()")
-      return _p
-  ```
-
-- **Copies mint new references.** A method that returns the receiver or
-  another existing object (`share()`, `fork()`) hands back a fresh
-  strong reference, adopted by `_from_ptr` into a new wrapper; closing
-  one wrapper never affects the other. The same holds for every object
-  read out of a value buffer.
-
-### Nullable objects, and objects inside values
-
-An `Interface?` parameter is passed as NULL for `None` and an
-`Interface?` return maps a NULL pointer to `None`:
+An async function is an `async def` that must run on an `asyncio` event
+loop. The launcher receives a static completion trampoline and an integer
+key; the trampoline takes ownership of the result (one C value, like a
+sync return) on the producer's thread and settles the future through
+`call_soon_threadsafe`:
 
 ```python
-def larger(self, other: Optional["Store"]) -> Optional["Store"]:
-    _fn = _lib.weaveffi_kv_Store_larger
-    _fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_void_p
-    _err = _WeaveFFIErrorStruct()
-    _result = _fn(_borrow(self), (_borrow(other) if other is not None else None), ctypes.byref(_err))
-    _check_error(_err)
-    if _result is None:
-        return None
-    return Store._from_ptr(_result)
-```
-
-Objects inside records, lists, maps, and optionals travel as 8-byte
-object tokens in the value buffer. Writing a token mints a new strong
-reference with `_clone_ptr()`, so the value can be dropped by the
-producer without touching the wrapper's own reference; reading a token
-adopts the reference into a fresh wrapper. From the `StoreInfo` record
-(`store: Store`, `mirror: Store?`):
-
-```python
-def _write_StoreInfo(_w: _BufferWriter, value: "StoreInfo") -> None:
-    _w.write_string(value.label)
-    _w.write_object(value.store)
-    if value.mirror is None:
-        _w.write_option_flag(False)
-    else:
-        _w.write_option_flag(True)
-        _w.write_object(value.mirror)
-    _w.write_i64(value.count)
-
-
-def _read_StoreInfo(_r: _BufferReader) -> "StoreInfo":
-    return StoreInfo(
-        label=_r.read_string(),
-        store=Store._from_ptr(_r.read_object()),
-        mirror=(Store._from_ptr(_r.read_object()) if _r.read_option_flag() else None),
-        count=_r.read_i64(),
-    )
-```
-
-`_BufferWriter.write_object` checks the wrapper is live immediately but
-defers the actual clone to `finish()`, so an encoding that raises
-part-way (a closed wrapper, a field of the wrong type) leaks no strong
-references. `Store.open_many(paths) -> List[Store]` and
-`Store.total_count(stores, extra)` in the `kvstore` sample show lists of
-objects in both directions; each wrapper in a returned list owns its own
-reference and must be closed (or left to `__del__`) individually.
-
-Iterators over objects (`iter<Interface>`) adopt one reference per
-`__next__`; async functions returning an object adopt the pointer inside
-the completion callback and hand the wrapper to the awaiting coroutine.
-
-## Rich (algebraic) enums
-
-A rich (algebraic) enum is a sum type whose variants carry associated
-data. Unlike a plain C-style `Enum`, which crosses the boundary as a
-bare `ctypes.c_int32` discriminant, a rich enum crosses as a serialized
-value buffer (`i32` tag, then the active variant's fields), and the
-generator emits an idiomatic Python sum type with no FFI symbols
-involved: a base class holding a nested `Tag` `IntEnum` and a `tag`
-property, plus one `@dataclass` subclass per variant.
-
-Given a `Shape` enum with variants `Empty`, `Circle { radius: f64 }`,
-`Rectangle { width: f32, height: f32 }`, and `Labeled { label: string,
-count: u8 }`:
-
-```python
-class Shape:
-    """An algebraic shape (sum type with associated data)"""
-
-    class Tag(IntEnum):
-        Empty = 0
-        Circle = 1
-        Rectangle = 2
-        Labeled = 3
-
-    @property
-    def tag(self) -> "Shape.Tag":
-        """The discriminant of this value's active variant."""
-        return type(self).TAG
-
-
-@dataclass
-class ShapeCircle(Shape):
-    """A circle with a radius"""
-
-    TAG = Shape.Tag.Circle
-
-    radius: float
-```
-
-Each variant class is also aliased under the base class
-(`Shape.Circle` is `ShapeCircle`), so consumers construct variants
-directly and discriminate with `isinstance` or the `tag` property:
-
-```python
-from weaveffi import Shape, describe, scale
-
-circle = Shape.Circle(2.0)
-labeled = Shape.Labeled("unit", 3)
-
-if isinstance(circle, Shape.Circle):
-    print(circle.radius)             # 2.0
-print(labeled.count)                 # 3
-
-print(describe(circle))              # render via the C ABI
-bigger = scale(circle, 3.0)          # returns a brand-new Shape value
-```
-
-Wrappers pack a `Shape` argument with the generated `_pack_Shape` codec
-and unpack a returned buffer with `_unpack_Shape`, freeing the returned
-buffer with `weaveffi_free_bytes`. Values are plain Python objects with
-no native handle and no destructor. Variant fields of interface type
-follow the object-token rules above. The `.pyi` stub mirrors the class
-hierarchy (nested `Tag`, variant subclasses with typed fields) for IDE
-and `mypy` support.
-
-## Callback interfaces
-
-A `callback_interfaces:` entry becomes an abstract base class. The
-consumer subclasses it, implements every abstract method, and passes
-an instance wherever the API takes that type. From the `kvstore`
-sample:
-
-```python
-class EvictionListener(abc.ABC):
-    """
-    Consumer-implemented callback interface. Subclass it, implement every abstract method, and pass an instance wherever the API takes a `EvictionListener`; the producer may call the methods from any thread until it releases the instance. An exception raised by a method is reported to the producer as WeaveFFIError.FOREIGN_ERROR_CODE (-4) and aborts the call that was in progress.
-    """
-
-    @abc.abstractmethod
-    def on_evict(self, entry: "Entry", reason: "EvictionReason") -> bool:
-        """
-        An entry left the store. Returns whether the listener wants to keep
-        receiving notifications; `false` detaches it.
-        """
-```
-
-```python
-class Auditor(kvstore.EvictionListener):
-    def on_evict(self, entry, reason):
-        print(entry.key, reason)
-        return True
-
-store.set_eviction_listener(Auditor())
-```
-
-Under the hood there's exactly one process-wide C vtable per callback
-interface, built from `ctypes.CFUNCTYPE` trampolines held at module
-scope so their function pointers stay valid for the process lifetime.
-Passing an implementation registers it in the module-level `_cb_impls`
-dict and hands the producer the integer key as its `ctx`, so the
-producer never holds a raw reference to a Python object:
-
-```python
-def _EvictionListener_on_evict_trampoline(ctx, entry_ptr, entry_len, reason, out_err):
+async def open_store(path: str) -> Store:
+    _call, _future = _async_begin()
     try:
-        _impl = _cb_impls[ctx]
-        _ret = _impl.on_evict(_unpack_Entry(ctypes.string_at(entry_ptr, entry_len) if entry_ptr else b""), EvictionReason(reason))
-        return 1 if _ret else 0
-    except Exception as _exc:
-        # Never unwind through the C frame: report the failure and return a
-        # default; the producer aborts its call with FOREIGN_ERROR_CODE.
-        _lib.weaveffi_error_set(out_err, -4, str(_exc).encode("utf-8", "replace"))
-        return 0
-
-
-def _EvictionListener_vtable_free_trampoline(ctx):
-    # The producer's last reference is gone; it never touches `ctx` again.
-    _cb_impls.pop(ctx, None)
+        _c_open_store(_run_in(path.encode("utf-8")), _open_store_completion, _call)
+    except BaseException:
+        _async_abandon(_call)
+        raise
+    _result: Store = await _future
+    return _result
 ```
+
+The launcher copies everything it needs before it returns, so the
+arguments' memory needn't outlive the call.
+
+For a `cancellable` function, each call owns a native cancel token.
+Cancelling the awaiting task (directly, through `asyncio.wait_for`, or by
+cancelling a `gather`) cancels the token, waits for the producer's
+cancelled completion, and raises `asyncio.CancelledError`. Cancelling the
+task awaiting a function that isn't `cancellable` stops the wait only; the
+native call runs to completion and its result is dropped.
+
+## Callbacks
+
+A callback interface is an `abc.ABC` with one abstract method per IDL
+method. Passing an instance registers it in a handle table under an integer
+key, and the call passes the producer a `_{Name}Arg` structure holding that
+key as `ctx` and the address of the interface's one vtable; `None` for an
+optional callback parameter passes a null vtable. The vtable is built the
+first time an implementation is passed and kept for the process lifetime.
+It starts with the header (its `size`, `flags`, and the shared `free`
+entry), and the producer's `free(ctx)` removes the table entry, so an
+implementation lives exactly as long as the producer holds it. `flags` is
+0: the producer may call any method from any thread.
+
+Each method's vtable entry is a trampoline that takes the method's C
+arguments and returns its one C value. A `ctypes` callback can't return a
+structure, so a method returning a `_Run` (a string, bytes, typed array, or
+buffered value) or an `_Opt{Prim}` is a libffi closure the runtime builds
+directly, through the libffi `ctypes` itself runs on; every other method is
+a plain `ctypes` callback.
+
+Trampolines run on whichever thread the producer calls from; `ctypes`
+acquires the GIL first. A trampoline adopts the object arguments first,
+converts the rest (an optional scalar arrives as `T | None`, a typed array
+as a `list`, and a run is copied, since it's only lent), calls the method,
+and returns:
+
+- a number, `bool`, or enum, checked for its type and range inside the
+  trampoline (so a wrong return is reported as a failure rather than
+  truncated);
+- an optional scalar as its `_Opt{Prim}`;
+- an object as a fresh strong reference the producer adopts (`None` is
+  allowed only for `I?`);
+- a `str`, `bytes`, typed array, record, or other buffered value as a run
+  allocated with `{prefix}_alloc`, which the producer adopts and frees.
 
 ```python
-def set_eviction_listener(self, listener: "EvictionListener") -> None:
-    _fn = _lib.weaveffi_kv_Store_set_eviction_listener
-    _fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(_EvictionListenerVtable), ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = None
-    _listener_ctx = _cb_register(listener)
-    _err = _WeaveFFIErrorStruct()
-    _fn(_borrow(self), _listener_ctx, ctypes.byref(_EvictionListener_vtable), ctypes.byref(_err))
-    _check_error(_err)
+def _Loader_load(ctx: int | None, key: _Run, out_err: int | None) -> _Run:
+    try:
+        _ret = _callback_get(ctx).load(_peek_str(key))
+        return _alloc_run(bytes(_ret))
+    except BaseException as exc:
+        _callback_fail(out_err, exc, _GENERIC, KvError)
+        return _Run()
 ```
 
-- **Lifetime.** The implementation stays registered (and therefore
-  alive) exactly as long as the producer may call it: the entry is
-  removed when the producer invokes the vtable's `free(ctx)`. A producer
-  that retains the implementation (a store's eviction listener) keeps it
-  alive across calls; one that doesn't (the `events` sample's
-  `route_once`) frees it before the call returns. The same Python object
-  may be passed more than once; each pass registers a new `ctx`.
-- **Argument ownership.** Borrowed strings and buffers are copied before
-  the method runs (`_unpack_Entry(ctypes.string_at(...))`), so the
-  implementation may keep them. An object passed to a callback method is
-  owned by the implementation: the trampoline adopts it with
-  `_from_ptr`, so the method receives a full wrapper it may store, use
-  after the callback returns, and must eventually `close()` (or leave to
-  `__del__`). The `events` sample's `on_attached(bus)` demonstrates this;
-  the received `EventBus` stays usable independently of the caller's
-  wrapper.
-- **Return values.** A method's return value is converted back to its C
-  representation (`bool` to `0`/`1`, a plain enum to its discriminant, a
-  record to a value buffer the producer frees).
-- **Exceptions.** An exception escaping a method never unwinds through
-  the C frame. The trampoline writes `FOREIGN_ERROR_CODE` (-4) with
-  `str(exc)` as the message into the producer's error slot and returns a
-  default value; the producer aborts the call that was in progress, and
-  the original caller sees `WeaveFFIError` with `code == -4`. For a
-  callable marked `throws`, the domain mapper passes -4 through
-  unchanged (it's outside the domain), so `except KvError` doesn't catch
-  it but `except WeaveFFIError` does. The interpreter is never taken
-  down.
-- **Threads.** The producer may call a method from any thread. `ctypes`
-  acquires the GIL before entering a `CFUNCTYPE` trampoline, so a
-  callback running on a producer thread is an ordinary Python call, but
-  it runs on that thread: don't touch an asyncio loop or UI toolkit from
-  it directly; use `loop.call_soon_threadsafe` or a queue. A blocking
-  producer call that waits for a callback dispatched on another thread
-  works only because the calling thread releases the GIL while inside
-  `ctypes`; a callback that itself blocks on the calling thread will
-  deadlock.
-
-## Build instructions
-
-1. Generate the bindings:
-
-   ```bash
-   weaveffi generate weaveffi.yaml -o generated --target python
-   ```
-
-2. Build the Rust shared library:
-
-   ```bash
-   cargo build --release -p your_library
-   ```
-
-3. Install the package (editable install for development):
-
-   ```bash
-   cd generated/python
-   pip install -e .
-   ```
-
-4. Make the shared library findable at runtime. `WEAVEFFI_LIBRARY` may
-   point at an exact file; otherwise the loader asks the dynamic linker
-   for `libweaveffi.dylib` / `libweaveffi.so` / `weaveffi.dll`:
-
-   - Any OS: `export WEAVEFFI_LIBRARY=$PWD/../../target/release/libweaveffi.dylib`
-   - macOS: `export DYLD_LIBRARY_PATH=$PWD/../../target/release`
-   - Linux: `export LD_LIBRARY_PATH=$PWD/../../target/release`
-   - Windows: place `weaveffi.dll` next to your script or add its
-     directory to `PATH`.
-
-5. Use the bindings:
-
-   ```python
-   import asyncio
-   from kvstore import EntryKind, Store
-
-   with Store.open("/tmp/cache.kv") as store:
-       store.put("alpha", b"\x01", EntryKind.Persistent, None)
-       print(store.count(), Store.default_capacity())
-       for key in store.list_keys(None):
-           print(key)
-       reclaimed = asyncio.run(store.compact())
-   ```
-
-## Packaging
-
-`weaveffi package --target python` assembles one wheel source tree per
-supplied desktop binary under `python/<platform-id>/`, each containing
-the generated package, the native library copied next to `weaveffi.py`,
-and a `setup.py` that ships it as package data and forces a
-platform-tagged (non-pure) wheel. The packaged loader still honours
-`WEAVEFFI_LIBRARY` first, then opens the bundled library if it exists,
-then falls back to the system path. Only platforms with a wheel
-platform tag are emitted:
-
-| Platform | Wheel tag |
-|----------|-----------|
-| `macos-arm64` | `macosx_11_0_arm64` |
-| `macos-x64` | `macosx_10_12_x86_64` |
-| `linux-x64` | `manylinux2014_x86_64` |
-| `linux-arm64` | `manylinux2014_aarch64` |
-| `windows-x64` | `win_amd64` |
-
-Android and `wasm32` binaries are skipped. Build each tree with
-`python -m build --wheel` and tag the result with the platform tag
-listed in its `README.md`. See [Packaging](../guides/packaging.md) for the
-shared workflow.
-
-## Memory and ownership
-
-- **Strings in:** Python `str` is encoded to UTF-8 by `_string_to_bytes`
-  before crossing the boundary. ctypes manages the lifetime of the
-  temporary buffer.
-- **Strings out:** owned `const char*` returns come back as raw
-  addresses; `_take_string` copies the text and immediately calls
-  `weaveffi_free_string` on the producer's buffer. `_bytes_to_string`
-  handles borrowed strings, such as callback-method parameters, which
-  the wrapper must not free.
-- **Bytes:** copied in via a ctypes array, copied out via
-  `ctypes.string_at`; the wrapper then releases the producer's buffer
-  with `weaveffi_free_bytes`.
-- **Buffered values out (structs, rich enums, optionals, lists, maps):**
-  the wrapper decodes the returned value buffer into plain Python values
-  (dataclasses, `dict`s, `list`s, `None`) with `_take_buffer`, which
-  copies then releases the one buffer with `weaveffi_free_bytes`.
-  Nothing is freed per element; object tokens are adopted into wrappers.
-- **Buffered values in:** the wrapper packs the Python value with the
-  generated codec into a `bytes` object it owns for the duration of the
-  call; the producer never frees it. Object tokens inside it are fresh
-  strong references the producer owns.
-- **Interfaces:** one strong reference per wrapper, released by `close()`
-  (or the `with` statement) with `__del__` as the backstop.
-- **Callback implementations:** pinned in `_cb_impls` until the producer
-  calls the vtable's `free`.
-
-## Async support
-
-Async IDL functions (`async: true`) are exposed as `async def` wrappers
-that integrate directly with asyncio; no worker thread blocks waiting
-for the result. The wrapper creates a future on the running loop, builds
-a `ctypes.CFUNCTYPE` completion callback, calls the `_async`-suffixed C
-launcher (which returns immediately), and awaits the future. From the
-`kvstore` sample's `Store.compact`:
+Nothing unwinds through C. A method that throws a domain may raise that
+domain's codes, which reach the producer as that code with the fields as
+the error payload (`{prefix}_error_set` and `{prefix}_error_set_payload`):
 
 ```python
-async def compact(self) -> int:
-    _fn = _lib.weaveffi_kv_Store_compact_async
-    _loop = asyncio.get_running_loop()
-    _fut = _loop.create_future()
+class EmptyLoader(kvstore.Loader):
+    def name(self) -> str:
+        return "empty"
 
-    def _cb_impl(context, err, result):
-        # Fires exactly once, on a producer thread: take ownership of
-        # the result here, then hop back to the event loop.
-        _state = {"err": None, "val": None}
-        if err and err.contents.code != 0:
-            _code = err.contents.code
-            _msg = err.contents.message.decode("utf-8") if err.contents.message else ""
-            _payload = ctypes.string_at(err.contents.payload_ptr, err.contents.payload_len) if err.contents.payload_ptr else b""
-            _lib.weaveffi_error_free(err)
-            _state["err"] = _kv_error_from(_code, _msg, _payload)
-        else:
-            try:
-                _state["val"] = result
-            except Exception as _exc:
-                _state["err"] = _exc
+    def fallback(self, key: str) -> kvstore.Store | None:
+        return None
 
-        def _resolve():
-            _async_pending.pop(_token, None)
-            # A cancelled future must not be resolved.
-            if _fut.cancelled():
-                return
-            if _state["err"] is not None:
-                _fut.set_exception(_state["err"])
-            else:
-                _fut.set_result(_state["val"])
-
-        _loop.call_soon_threadsafe(_resolve)
-
-    _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct), ctypes.c_int64)
-    _cb = _cb_type(_cb_impl)
-    _token = _async_register(_cb)  # pinned until completion
-    _fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, _cb_type, ctypes.c_void_p]
-    _fn.restype = None
-    _fn(self._ptr, None, _cb, None)
-    return await _fut
+    def load(self, key: str) -> bytes:
+        raise kvstore.KeyNotFoundError(key=key)
 ```
 
-The completion callback fires exactly once, on an arbitrary producer
-thread. Result buffers passed to it (strings, bytes, and the serialized
-value buffers of buffered results) are owned by the consumer, so the
-wrapper copies or decodes them inside the callback and releases them
-with `weaveffi_free_string` or `weaveffi_free_bytes`. A reported error
-is heap-boxed and released with `weaveffi_error_free` after its fields
-are copied. An object result is adopted into a wrapper with `_from_ptr`
-inside the callback. Conversion happens on the producer thread; the
-wrapper then hops back to the event loop with
-`loop.call_soon_threadsafe` to resolve the future, since asyncio
-futures must not be touched from foreign threads.
-
-When the callable is marked `throws: true`, an error reported through
-the callback is mapped through the domain mapper (here `_kv_error_from`)
-and set as the future's exception, so `await` raises the typed error.
-For a non-throwing callable a non-zero code can only be a producer bug
-or a raising callback; the wrapper raises the generic `WeaveFFIError`
-rather than swallowing it. A panic inside the spawned future surfaces
-as `PANIC_ERROR_CODE` (-2).
-
-Each callback trampoline is pinned in the module-level `_async_pending`
-dict until completion, so the GC cannot collect an object the producer
-still holds, even if the awaiting coroutine is cancelled. A cancelled
-future is never resolved, but the native operation itself keeps
-running.
-
-For functions marked `cancellable: true` the C launcher takes an extra
-cancel-token parameter; the Python wrapper always passes `None` (NULL)
-for it, as in the `compact` example above. The token is not exposed, so
-cancelling the awaiting asyncio task does not stop the native operation.
-Cancellation tokens are currently surfaced only by the C and C++
-targets.
+A Rust producer decodes such a code into its typed error, so the caller of
+the original function sees the domain's own message rendered from the
+fields. Any other exception, or a return of the wrong type, reaches the
+producer as code -1 with the exception's message (-4 for a method that
+declares no errors); a Rust producer receives it as a `ForeignError`, which
+the kvstore sample turns into `KvError.CallbackFailed`.
 
 ## Iterators
 
-Functions returning `iter<T>` receive an opaque iterator handle from the
-C ABI and wrap it in a generated lazy iterator class. The wrapper
-returns immediately; nothing is drained, and each consumer step issues
-exactly one producer `next` call. The signature is annotated
-`Iterator[T]`, so `for` loops, `list(...)`, and `next(...)` all work.
-From the `kvstore` sample's `Store.list_keys`:
+An `iter<T>` return is a `NativeIterator[T]`, a lazy iterator: each
+`next()` makes one native `next` call through the pre-bound function,
+receiving the item in one out slot of its C type, and the handle is
+released on exhaustion, `close()`, the end of a `with` block, or garbage
+collection. A closed iterator is exhausted.
 
 ```python
-class _StoreListKeysIterator:
-    """Lazy iterator over a producer stream: each step pulls one element
-    across the C boundary. The native handle is released exactly once, on
-    exhaustion, on close(), or when the iterator is garbage collected."""
+for key in store.keys(None):
+    print(key)
 
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self._done:
-            raise StopIteration
-        _next_fn = _lib.weaveffi_kv_Store_ListKeysIterator_next
-        _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(_WeaveFFIErrorStruct)]
-        _next_fn.restype = ctypes.c_int32
-        _out_item = ctypes.c_void_p()
-        _err = _WeaveFFIErrorStruct()
-        _has = _next_fn(self._ptr, ctypes.byref(_out_item), ctypes.byref(_err))
-        _check_kv_error(_err)
-        if not _has:
-            self._done = True
-            self._destroy()
-            raise StopIteration
-        return _take_string(_out_item.value)
-
-    def close(self):
-        """Release the native iterator without draining it."""
-        self._done = True
-        self._destroy()
-
-    def __del__(self):
-        self._destroy()
+with store.entries("user.") as entries:
+    first = next(entries)   # the rest is released when the block ends
 ```
 
-The native handle is destroyed exactly once: eagerly on exhaustion, via
-`close()` when iteration is abandoned early (a second `close()` is a
-no-op), or from `__del__` as a garbage-collection backstop. `_destroy`
-nulls the stored pointer, so a double destroy is impossible.
+## Packaging
 
-Each yielded element is owned by the consumer: strings are copied and
-freed with `_take_string`, buffered elements are decoded and freed with
-`_take_buffer`, and an object element is adopted into a wrapper with
-`_from_ptr` (or `None` for a NULL `Interface?` element).
-
-Errors from the launcher and from each `next` follow the function's
-error strategy. A throwing iterator such as `list_keys` checks each step
-with `_check_kv_error` and raises the typed domain error (`KeyNotFound`,
-`IoError`, ...) from the step that failed; a non-throwing iterator
-raises the generic `WeaveFFIError` only for producer bugs.
+`weaveffi package --target python` writes one wheel per desktop platform
+built, `python/{name}-{version}-py3-none-{platform}.whl` (the distribution
+name escaped for a wheel file name, so `Key-Store` becomes `key_store`),
+with the producer library inside the import package. The platform tag
+matches the build: the `[build]` macOS deployment target
+(`macosx_11_0_arm64`), the newest glibc the library links against on Linux
+(`manylinux_2_17_x86_64` or later), or `win_amd64`. The wheels install
+with `pip` and upload with `twine`; Android, iOS, and `wasm32` builds have
+no wheel platform and are skipped. See [Packaging](../guides/packaging.md).
 
 ## Known limitations
 
-- `ctypes` dispatch is slower than a compiled extension; hot loops
-  crossing the boundary per element will feel it.
-- Async cancellation doesn't propagate: cancelling the awaiting task
-  leaves the native operation running, and `cancellable: true` tokens
-  are not exposed.
-- Callback methods run on whatever thread the producer uses, under the
-  GIL; long-running callbacks stall the producer thread, and a callback
-  that blocks waiting for the calling thread deadlocks.
-- Interface wrappers without a `new` constructor can't be instantiated
-  from Python; use the generated factories.
-- The plain `generate` output relies on the dynamic linker (or
-  `WEAVEFFI_LIBRARY`) to find the library; only `weaveffi package`
-  bundles it.
-
-## Troubleshooting
-
-- **`OSError: cannot find ...`**: the loader could not locate the shared
-  library. Set `WEAVEFFI_LIBRARY`, `DYLD_LIBRARY_PATH` /
-  `LD_LIBRARY_PATH`, or copy the library next to your script.
-- **`ImportError: WeaveFFI ABI mismatch`**: the library was built by a
-  different `weaveffi` release than the bindings. Regenerate the bindings
-  and rebuild the library together.
-- **`WeaveFFIError: (-1) Store used after close()`**: a closed wrapper
-  was passed to the producer (as the receiver, a parameter, or a field
-  of a record or list). Keep the wrapper open for as long as it's in
-  use.
-- **`WeaveFFIError: (-4) ...`**: a callback-interface method you
-  implemented raised; the message is `str(exc)`. Catch the exception
-  inside the method if the producer call should succeed anyway.
-- **`WeaveFFIError: ...` with a positive code from a non-throwing
-  call**: the Rust side returned a domain error the IDL didn't declare
-  as `throws`; inspect `.code` / `.message`.
-- **`TypeError: Store cannot be instantiated directly`**: the interface
-  has no `new` constructor; call its `@classmethod` factory instead.
-- **`RuntimeError: no running event loop`**: `async def` wrappers need a
-  running loop; call them with `asyncio.run(...)` or from inside a
-  coroutine.
+- `ctypes` dispatch costs more per call than a compiled extension; hot
+  loops that cross the boundary per element will feel it. The bindings
+  keep the per-call work small (prototypes and vtable addresses are
+  resolved once, and the error check is inline), but each call still
+  allocates its error slot, and each integer argument costs a range check.
+- A callback method that returns a structure needs libffi, which the
+  runtime finds through the `_ctypes` extension or by name
+  (`ctypes.util.find_library("ffi")`). A Python whose `ctypes` links libffi
+  statically and hides its symbols, with no libffi installed, raises
+  `OSError` the first time an implementation of such an interface is
+  passed. The closures are built for the 64-bit platforms wheels target.
+- A typed-array parameter is copied into an `array.array` unless it already
+  is one of the matching type code; a NumPy array is copied element by
+  element.
+- The package's namespace also holds the typing names the module imports
+  (`Any`, `Callable`, `ClassVar`, `Iterable`, `Iterator`, `Mapping`,
+  `Sequence`): a declared type with one of those names still works at run
+  time, but type checkers reject the module.
+- A long-running callback stalls the producer thread that called it, and a
+  callback that waits for the thread blocked in the calling Python code
+  deadlocks.
+- `LibraryLoadError` is raised during the import, so it can only be caught
+  as `ImportError` (the package isn't importable to name the class).

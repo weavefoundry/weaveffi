@@ -7,20 +7,20 @@ authors = ["WeaveFoundry <hello@weavefoundry.dev>"]
 homepage = "https://github.com/weavefoundry/weaveffi"
 repository = "https://github.com/weavefoundry/weaveffi"
 
-[generators.ruby]
-module_name = "Codec"
+[generators.cpp]
+name = "codec"
 
 [generators.dotnet]
-namespace = "Codec"
-
-[generators.swift]
-module_name = "Codec"
-
-[generators.cpp]
-namespace = "codec"
+name = "Codec"
 
 [generators.dart]
-package_name = "codec"
+name = "codec"
+
+[generators.swift]
+name = "Codec"
 
 [generators.go]
-module_path = "github.com/example/codec"
+name = "github.com/example/codec"
+
+[generators.ruby]
+module_name = "Codec"

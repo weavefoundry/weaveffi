@@ -1,0 +1,413 @@
+"""Conformance consumer: codec sample, Python target (ABI revision 6).
+
+The shared-vector loop: for every vector the producer serves, decode it with
+the generated codecs, pass it back to `check_vector` (which re-decodes the
+generated encoding and compares), confirm it never matches its neighbor, and
+push each primitive vector's value through the matching direct-family
+`echo_*`, its optional (`_Opt{Prim}` structure) echo, and its typed-array
+echo.
+Then vectors built from literals (so a symmetric encode/decode bug can't
+hide), spot checks of decoded values, the typed out-of-range error with its
+payload, malformed input rejected on both sides, object identity and
+reference counting through buffers, the direct optionals and typed arrays at
+their edges, `usize`, `char`, and custom-type (`Hex`) strings with their
+marshalling errors, and an iterator of typed arrays. Ends with the leak
+check (see harness.py).
+"""
+import array
+import ctypes
+import dataclasses
+import math
+import struct
+from typing import Any, Callable, Dict, List
+
+import codec
+from harness import Consumer
+
+consumer = Consumer("codec", codec)
+check = consumer.check
+impl = consumer.impl
+
+INT64_MIN = -(2**63)
+INT64_MAX = 2**63 - 1
+UINT64_MAX = 2**64 - 1
+
+
+def f32_bits(x: float) -> bytes:
+    return struct.pack("<f", x)
+
+
+def f64_bits(x: float) -> bytes:
+    return struct.pack("<d", x)
+
+
+def same_f32(a: float, b: float) -> bool:
+    return f32_bits(a) == f32_bits(b) or (math.isnan(a) and math.isnan(b))
+
+
+def same_f64(a: float, b: float) -> bool:
+    return f64_bits(a) == f64_bits(b) or (math.isnan(a) and math.isnan(b))
+
+
+# The direct-family echo for each primitive vector variant, and how to
+# compare its result with the vector's value.
+ECHOES: Dict[type, Callable[[Any], bool]] = {
+    codec.VectorI8: lambda v: codec.echo_i8(v) == v,
+    codec.VectorU8: lambda v: codec.echo_u8(v) == v,
+    codec.VectorI16: lambda v: codec.echo_i16(v) == v,
+    codec.VectorU16: lambda v: codec.echo_u16(v) == v,
+    codec.VectorI32: lambda v: codec.echo_i32(v) == v,
+    codec.VectorU32: lambda v: codec.echo_u32(v) == v,
+    codec.VectorI64: lambda v: codec.echo_i64(v) == v,
+    codec.VectorU64: lambda v: codec.echo_u64(v) == v,
+    codec.VectorF32: lambda v: same_f32(codec.echo_f32(v), v),
+    codec.VectorF64: lambda v: same_f64(codec.echo_f64(v), v),
+    codec.VectorFlag: lambda v: codec.echo_bool(v) is v,
+    codec.VectorText: lambda v: codec.echo_text(v) == v,
+    codec.VectorBlob: lambda v: codec.echo_blob(v) == v,
+    codec.VectorHue: lambda v: codec.echo_color(v) is v,
+}
+
+
+def same_f64s(a: List[float], b: List[float]) -> bool:
+    return len(a) == len(b) and all(same_f64(x, y) for x, y in zip(a, b))
+
+
+# The optional (OptDirect) and typed-array (Slice) echoes each primitive
+# vector variant also goes through.
+DIRECT_ECHOES: Dict[type, Callable[[Any], bool]] = {
+    codec.VectorI32: lambda v: codec.echo_opt_i32(v) == v and codec.echo_i32s([v, v]) == [v, v],
+    codec.VectorU64: lambda v: codec.echo_u64s([v]) == [v] and codec.echo_usize(v) == v,
+    codec.VectorF64: lambda v: (same_f64(codec.echo_opt_f64(v), v)  # type: ignore[arg-type]
+                                and same_f64s(codec.echo_f64s([v]), [v])),
+    codec.VectorFlag: lambda v: codec.echo_opt_bool(v) is v,
+    codec.VectorHue: lambda v: codec.echo_opt_color(v) is v,
+}
+
+
+def find(n: int, name: str) -> int:
+    for i in range(n):
+        if codec.vector_name(i) == name:
+            return i
+    check(False, f"no vector named {name}")
+    raise AssertionError  # unreachable
+
+
+def every_vector(n: int) -> None:
+    for i in range(n):
+        v = codec.vector(i)
+        if not codec.check_vector(i, v):
+            check(False, f"vector {i} ({codec.vector_name(i)}) did not round-trip; "
+                         f"producer saw {codec.describe_vector(v)}")
+        check(not codec.check_vector((i + 1) % n, v), f"vector {i} matches its neighbor")
+        echo = ECHOES.get(type(v))
+        if echo is not None:
+            check(echo(v.value), f"echo of vector {i} ({codec.vector_name(i)})")
+        direct = DIRECT_ECHOES.get(type(v))
+        if direct is not None:
+            check(direct(v.value), f"direct echoes of vector {i} ({codec.vector_name(i)})")
+        del v  # releases any tokens inside
+
+
+def canonical_scalars() -> codec.Scalars:
+    return codec.Scalars(
+        i8_value=-8, u8_value=200, i16_value=-16000, u16_value=60000,
+        i32_value=-2000000000, u32_value=4000000000, i64_value=-9007199254740993,
+        u64_value=UINT64_MAX, f32_value=1.5, f64_value=-2.25e100, flag=True,
+        color=codec.Color.Blue,
+    )
+
+
+def literal_vectors(n: int) -> None:
+    s = canonical_scalars()
+    check(codec.check_vector(find(n, "scalars canonical"), codec.VectorAllScalars(s)),
+          "scalars canonical")
+    changed = dataclasses.replace(s, u16_value=60001)
+    check(not codec.check_vector(find(n, "scalars canonical"), codec.VectorAllScalars(changed)),
+          "a changed field no longer matches")
+    # Records are frozen and hashable by value.
+    raises_frozen = consumer.raises(dataclasses.FrozenInstanceError,
+                                    lambda: setattr(s, "u16_value", 1), "frozen record")
+    check("u16_value" in str(raises_frozen), str(raises_frozen))
+    check(hash(s) == hash(canonical_scalars()) and s == canonical_scalars(), "record hash")
+
+    check(codec.check_vector(find(n, "shape labeled"),
+                             codec.VectorFigure(codec.ShapeLabeled(label="tag", count=3))),
+          "shape labeled")
+    check(codec.check_vector(find(n, "string interior nul"), codec.VectorText("nul\0inside\0")),
+          "string interior nul")
+
+    # Any NaN matches the NaN vector; zero keeps its sign.
+    nan = struct.unpack("<d", struct.pack("<Q", 0x7FF8000000000001))[0]
+    check(codec.check_vector(find(n, "f64 nan"), codec.VectorF64(nan)), "f64 nan payload")
+    check(codec.check_vector(find(n, "f64 -0"), codec.VectorF64(-0.0)), "f64 -0")
+    check(not codec.check_vector(find(n, "f64 -0"), codec.VectorF64(0.0)), "+0 is not -0")
+
+    check(codec.check_vector(find(n, "u64 max"), codec.VectorU64(UINT64_MAX)), "u64 max")
+    check(codec.check_vector(find(n, "enum infrared"), codec.VectorHue(codec.Color.Infrared)),
+          "enum infrared")
+
+    check(codec.check_vector(find(n, "optional zero"), codec.VectorMaybeI64(0)), "Some(0)")
+    check(codec.check_vector(find(n, "optional absent"), codec.VectorMaybeI64(None)), "None")
+    check(not codec.check_vector(find(n, "optional zero"), codec.VectorMaybeI64(None)),
+          "None is not Some(0)")
+
+    # A map's entry order doesn't matter on the wire.
+    counts = {"x": 0, "héllo": -1, "": INT64_MAX}
+    check(codec.check_vector(find(n, "map of strings"), codec.VectorCounts(counts)),
+          "map of strings in another order")
+
+    check(codec.check_vector(find(n, "blank"), codec.VectorBlank()), "blank")
+
+    with codec.Token(-1) as lone:
+        sparse = codec.Holder(primary=lone, spare=None, many=[], by_name={})
+        check(codec.check_vector(find(n, "objects sparse"), codec.VectorObjects(sparse)),
+              "objects sparse from a consumer-made token")
+
+
+def spot_checks(n: int) -> None:
+    v: Any = codec.vector(find(n, "i64 past 2^53"))
+    check(isinstance(v, codec.VectorI64) and v.value == -9007199254740993, "i64 past 2^53")
+
+    v = codec.vector(find(n, "f32 min subnormal"))
+    check(isinstance(v, codec.VectorF32) and f32_bits(v.value) == b"\x01\0\0\0",
+          "f32 min subnormal bits")
+
+    v = codec.vector(find(n, "string astral"))
+    check(v == codec.VectorText("🦀 crab 😀"), f"string astral {v!r}")
+
+    v = codec.vector(find(n, "scalars minimum"))
+    check(isinstance(v, codec.VectorAllScalars), "scalars minimum variant")
+    m = v.value
+    check((m.i8_value, m.u8_value, m.i16_value, m.u16_value, m.i32_value, m.u32_value,
+           m.i64_value, m.u64_value) == (-128, 0, -32768, 0, -(2**31), 0, INT64_MIN, 0),
+          f"scalars minimum integers {m!r}")
+    check(m.f32_value == -math.inf and math.isnan(m.f64_value), "scalars minimum floats")
+    check(m.color is codec.Color.Infrared and m.flag is False, "scalars minimum enum and flag")
+
+    v = codec.vector(find(n, "composite canonical"))
+    check(isinstance(v, codec.VectorDeep), "composite canonical variant")
+    c = v.value
+    check(c.name == "héllo wörld ✓", "name")
+    check(c.blob == bytes([0, 1, 2, 253, 254, 255]), "blob")
+    check(c.some_i64 == INT64_MIN and c.none_i64 is None and c.some_text == "", "optionals")
+    check(c.names == ["a", "", "ccc"], "names")
+    check(c.matrix == [[1, 2, 3], [], [-4]], "matrix")
+    check(len(c.floats) == 6 and math.isnan(c.floats[0]) and c.floats[1:3] == [math.inf, -math.inf]
+          and f64_bits(c.floats[3]) == f64_bits(-0.0) and c.floats[4] == 5e-324
+          and c.floats[5] == 0.1, f"floats {c.floats!r}")
+    check(c.by_name == {"one": 1, "two": 2, "neg": -3, "": INT64_MAX}, "by_name")
+    check(sorted(c.by_id) == [-1, 42, 2**31 - 1] and c.by_id[-1] == canonical_scalars(), "by_id")
+    check(c.by_color == {codec.Color.Infrared: "below", codec.Color.Blue: "sky"}, "by_color")
+    check(c.flags == {0: False, UINT64_MAX: True}, "flags")
+    check(c.scalars == canonical_scalars(), "scalars")
+    check(c.shape == codec.ShapeLabeled(label="tag", count=3), "shape")
+    check(len(c.shapes) == 6 and isinstance(c.shapes[5], codec.ShapeNested)
+          and c.shapes[5].note is None, f"shapes {c.shapes!r}")
+    check(isinstance(c.maybe_shape, codec.ShapeNested) and c.maybe_shape.note is None,
+          "maybe_shape")
+    check(c.maybe_list == b"\x09\x08", "maybe_list")
+    check(c.sparse == [True, None, False], "sparse")
+    check(c.colors == [codec.Color.Red, codec.Color.Green, codec.Color.Blue, codec.Color.Infrared],
+          "colors")
+    check(c.shape.tag is codec.Shape.Tag.Labeled and codec.Shape.Labeled is codec.ShapeLabeled,
+          "rich enum tag and scoped alias")
+
+
+def out_of_range(n: int) -> None:
+    exc = consumer.raises(codec.CodecError.OutOfRange, lambda: codec.vector(n), "vector(n)")
+    check(exc.code == 1 and exc.index == n and exc.count == n, f"OutOfRange payload {exc!r}")
+    check(exc.message == f"vector {n} is out of range (count {n})", f"message {exc.message!r}")
+    check(isinstance(exc, codec.CodecError) and isinstance(exc, codec.Error), "hierarchy")
+    check(type(exc) is codec.OutOfRangeError, f"code class {exc!r}")
+
+    exc = consumer.raises(codec.OutOfRangeError, lambda: codec.vector_name(n + 5), "vector_name")
+    check(exc.index == n + 5 and exc.count == n, "vector_name payload")
+
+    check(not codec.check_vector(n, codec.VectorBlank()), "check_vector past the end")
+
+
+def check_raw(data: bytes) -> int:
+    """Send `data` to check_vector through its bound C function, returning the
+    error code."""
+    err = impl._ErrorStruct()
+    impl._c_check_vector(0, impl._run_in(data), ctypes.byref(err))
+    code = err.code
+    impl._error_clear(ctypes.byref(err))
+    return code
+
+
+def malformed() -> None:
+    i32 = struct.Struct("<i").pack
+    u32 = struct.Struct("<I").pack
+    tag = codec.Vector.Tag
+    bad = [
+        ("truncated", i32(tag.I64) + u32(7)),
+        ("unknown tag", i32(999)),
+        ("trailing bytes", i32(tag.Blank) + b"\0"),
+        ("bool 2", i32(tag.Flag) + b"\x02"),
+        ("undeclared enum", i32(tag.Hue) + i32(3)),
+        ("repeated map key", i32(tag.Counts) + u32(2) + u32(1) + b"a" + struct.pack("<q", 1)
+         + u32(1) + b"a" + struct.pack("<q", 2)),
+        ("non-UTF-8", i32(tag.Text) + u32(2) + b"\xc3\x28"),
+    ]
+    for what, data in bad:
+        check(check_raw(data) == -3, f"producer rejects {what}")
+        # The generated decoder rejects the same input as a trap.
+        exc = consumer.raises(codec.InternalError, lambda: impl._decode(data, impl._read_Vector),
+                              f"decoder rejects {what}")
+        check(exc.code == -3, f"decoder code for {what}")
+
+    # An undeclared C-style enum value in a direct slot is a marshalling
+    # failure; echo_color declares no errors, so it traps.
+    exc = consumer.raises(codec.InternalError, lambda: codec.echo_color(3), "echo_color(3)")
+    check(exc.code == -3 and isinstance(exc, RuntimeError), f"echo_color trap {exc!r}")
+
+
+def objects(n: int) -> None:
+    v: Any = codec.vector(find(n, "objects full"))
+    check(isinstance(v, codec.VectorObjects), "objects full variant")
+    h = v.value
+    check(h.primary.value() == 10 and h.spare is not None and h.spare.value() == 11, "tokens")
+    check([t.value() for t in h.many] == [12, 13, INT64_MIN], "many")
+    check({k: t.value() for k, t in h.by_name.items()} == {"a": 20, "b": 21}, "by_name")
+
+    # Each encoding mints fresh references, so the holder can be sent twice.
+    expected = (10 + 11 + 12 + 13 + 20 + 21 + INT64_MIN + 2**63) % 2**64 - 2**63
+    check(codec.sum_holder(h) == expected and codec.sum_holder(h) == expected, "sum_holder twice")
+
+    # primary_of returns the same native object (a new wrapper over it).
+    p = codec.primary_of(h)
+    check(p == h.primary and p is not h.primary, "primary_of is the same object")
+    check(codec.same_primary(h, codec.Holder(primary=p, spare=None, many=[], by_name={})),
+          "same_primary by identity")
+    twin = codec.Token(10)
+    check(twin != h.primary, "an equal value is a different object")
+    check(not codec.same_primary(h, codec.Holder(primary=twin, spare=None, many=[], by_name={})),
+          "same_primary is identity, not value")
+
+    # A holder built from consumer-made tokens, one wrapper in every slot.
+    minus = codec.Token(-4)
+    mine = codec.Holder(primary=twin, spare=twin, many=[twin, twin, minus], by_name={"k": twin})
+    check(codec.sum_holder(mine) == 10 * 5 - 4, "consumer-built holder")
+
+    # A closed wrapper can't be encoded.
+    minus.close()
+    consumer.raises(ValueError, lambda: codec.sum_holder(mine), "closed token")
+    twin.close()
+    twin.close()
+    p.close()
+
+
+INT32_MIN = -(2**31)
+INT32_MAX = 2**31 - 1
+
+
+def optionals() -> None:
+    check(codec.echo_opt_i32(None) is None, "echo_opt_i32(None)")
+    check(codec.echo_opt_i32(INT32_MIN) == INT32_MIN, "echo_opt_i32(MIN)")
+    check(codec.echo_opt_i32(0) == 0, "echo_opt_i32(0) is present")
+    consumer.raises(OverflowError, lambda: codec.echo_opt_i32(INT32_MAX + 1), "i32? range")
+
+    z = codec.echo_opt_f64(-0.0)
+    check(z is not None and f64_bits(z) == f64_bits(-0.0), "echo_opt_f64(-0.0) keeps the sign")
+    nan = codec.echo_opt_f64(math.nan)
+    check(nan is not None and math.isnan(nan), "echo_opt_f64(NaN)")
+    check(codec.echo_opt_f64(None) is None, "echo_opt_f64(None)")
+
+    check(codec.echo_opt_bool(True) is True and codec.echo_opt_bool(False) is False,
+          "echo_opt_bool present")
+    check(codec.echo_opt_bool(None) is None, "echo_opt_bool(None)")
+
+    for color in [codec.Color.Infrared, codec.Color.Blue]:
+        got = codec.echo_opt_color(color)
+        check(got is color and isinstance(got, codec.Color), f"echo_opt_color({color!r})")
+    check(codec.echo_opt_color(None) is None, "echo_opt_color(None)")
+    # An undeclared enum value is a marshalling failure; the call declares
+    # no errors, so it traps. Absent, the value slot is ignored.
+    exc = consumer.raises(codec.InternalError, lambda: codec.echo_opt_color(3),  # type: ignore[arg-type]
+                          "echo_opt_color(3)")
+    check(exc.code == -3, f"echo_opt_color(3) code {exc.code}")
+    err = impl._ErrorStruct()
+    got = impl._c_echo_opt_color(impl._OptI32(False, 3), ctypes.byref(err))
+    check(not got.has and got.value == 0 and err.code == 0, "absent ignores the value")
+
+
+def typed_arrays() -> None:
+    specials = [math.nan, -0.0, 5e-324, math.inf]
+    got = codec.echo_f64s(specials)
+    check([f64_bits(x) for x in got] == [f64_bits(x) for x in specials], f"echo_f64s {got!r}")
+    check(codec.echo_f64s([]) == [], "echo_f64s([])")
+    check(codec.echo_f64s(array.array("d", [1.5, 2.5])) == [1.5, 2.5], "an array lent as is")
+
+    extremes = [INT32_MIN, 0, INT32_MAX]
+    check(codec.echo_i32s(extremes) == extremes, "echo_i32s extremes")
+    check(codec.echo_i32s(()) == [], "echo_i32s(())")
+    exc = consumer.raises(OverflowError, lambda: codec.echo_i32s([0, INT32_MIN - 1]),
+                          "i32 element range")
+    check(str(exc) == "values: an element is out of range for i32", str(exc))
+
+    big = [UINT64_MAX, 2**63]
+    check(codec.echo_u64s(big) == big, f"echo_u64s {codec.echo_u64s(big)!r}")
+    check(codec.echo_u64s([]) == [], "echo_u64s([])")
+    consumer.raises(OverflowError, lambda: codec.echo_u64s([-1]), "u64 element range")
+    consumer.raises(OverflowError, lambda: codec.echo_u64s([2**64]), "u64 element range")
+
+    check(codec.echo_usize(4294967295) == 4294967295, "echo_usize(2^32 - 1)")
+    check(codec.echo_usize(UINT64_MAX) == UINT64_MAX, "echo_usize(u64::MAX)")
+    exc = consumer.raises(OverflowError, lambda: codec.echo_usize(-1), "echo_usize(-1)")
+    check(str(exc) == "value: -1 is out of range for u64", str(exc))
+
+    def pull(values: List[int], size: int) -> List[List[int]]:
+        with codec.chunks(values, size) as it:
+            check(isinstance(it, codec.NativeIterator), "chunks is a NativeIterator")
+            return list(it)
+
+    check(pull(extremes, 2) == [[INT32_MIN, 0], [INT32_MAX]], "chunks(extremes, 2)")
+    check(pull([1, 2, 3, 4], 2) == [[1, 2], [3, 4]], "chunks([1, 2, 3, 4], 2)")
+    check(pull([1, 2], 0) == [], "chunks(.., 0)")
+    check(pull([], 3) == [], "chunks([], 3)")
+    # Closing part-way releases the handle; a closed iterator is exhausted.
+    it = codec.chunks([1, 2, 3], 1)
+    check(next(it) == [1] and impl._debug_live(2) == 1, "one live iterator")
+    it.close()
+    check(impl._debug_live(2) == 0 and list(it) == [], "closed part-way")
+
+
+def strings() -> None:
+    for text in ["\U0001F980", "é", "a"]:
+        check(codec.echo_char(text) == text, f"echo_char({text!r})")
+    for text in ["ab", ""]:
+        exc = consumer.raises(codec.InternalError, lambda: codec.echo_char(text),
+                              f"echo_char({text!r})")
+        check(exc.code == -3 and exc.message == f"value: \"{text}\" is not a valid char",
+              f"echo_char({text!r}) {exc!r}")
+
+    for text, expected in [("ff", "ff"), ("00FF", "ff"), ("0", "0")]:
+        check(codec.echo_hex(text) == expected, f"echo_hex({text!r})")
+    for text, message in [
+        ("xyz", "value: invalid digit found in string"),
+        ("", "value: cannot parse integer from empty string"),
+        ("100000000", "value: number too large to fit in target type"),
+    ]:
+        exc = consumer.raises(codec.InternalError, lambda: codec.echo_hex(text),
+                              f"echo_hex({text!r})")
+        check(exc.code == -3 and exc.message == message, f"echo_hex({text!r}) {exc!r}")
+
+
+def main() -> None:
+    n = codec.vector_count()
+    check(n >= 60, f"vector_count {n}")
+    every_vector(n)
+    literal_vectors(n)
+    spot_checks(n)
+    out_of_range(n)
+    malformed()
+    objects(n)
+    optionals()
+    typed_arrays()
+    strings()
+    consumer.finish()
+
+
+main()

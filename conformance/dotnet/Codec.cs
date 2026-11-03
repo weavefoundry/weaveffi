@@ -1,32 +1,40 @@
-// Conformance consumer: codec sample, .NET target.
+// Conformance consumer: codec sample, .NET target (the wire oracle).
 //
-// Round-trips every value-buffer wire shape through the generated P/Invoke
-// wrapper (Codec.cs, namespace Codec) against the producer's oracle: the
-// canonical Scalars and Composite fixtures are decoded and checked field by
-// field (producer encodes, consumer decodes), handed back through Verify*
-// (consumer encodes, producer decodes) and Roundtrip* (both), then rebuilt
-// from scratch with edge values (empty strings, lists, and maps; unicode;
-// long/ulong extremes; NaN, the infinities, and negative zero) and
-// round-tripped again. Also covers every Shape variant of the rich enum, the
-// typed CodecException (Mismatch=1), and the Holder record carrying Token
-// objects in a required field, an optional, and a list: each encoded token is
-// a fresh clone, PrimaryOf returns a wrapper to the same native object as the
-// holder's Primary, and every wrapper is disposed (double Dispose safe,
-// ObjectDisposedException after). The producer cdylib is resolved by absolute
-// path via a DllImportResolver reading WEAVEFFI_LIBRARY.
+// Loading the generated project checks the ABI revision and every
+// declaration's contract. Then, against the producer's shared vectors:
 //
-// The harness compiles the generated source into this assembly, so the
-// wrapper's `internal` Handle property is reachable and used to prove two
-// wrappers point at the same native object. The IDL sets the .NET namespace
-// to `Codec` and the module is also `codec`, so the free-function class is
-// `Codec.Codec`; `using static` imports those statics.
+//   1. every vector decodes (producer encodes, consumer decodes), checks
+//      against its own index and not its neighbor's (consumer encodes,
+//      producer decodes), and primitive vectors echo back identically;
+//   2. vectors built from C# literals check against their named entries
+//      (catching symmetric codec bugs), including NaN, signed zero, maps in
+//      another insertion order, and a holder of consumer-made tokens;
+//   3. spot checks on decoded values (i64 past 2^53, the f32 subnormal's
+//      bits, astral text, every scalar minimum, the canonical composite);
+//   4. the typed CodecException.OutOfRange with its index and count fields;
+//   5. an undeclared Color value is rejected by the producer (-3, which a
+//      non-throwing call raises as NativeBugException);
+//   6. objects: token values, sum_holder twice over the same holder,
+//      primary_of returning the same native object, identity (not value)
+//      in same_primary, one wrapper in several slots;
+//   7. records are value-equal: every object-free vector decoded twice is
+//      equal (lists, maps, and byte arrays compare by content) with equal
+//      hashes, and `with` makes an unequal copy;
+//   8. the one-C-value shapes: optional scalars (`int?`, `double?`,
+//      `bool?`, `Color?`, each an opt struct) both ways, an undeclared optional enum value rejected
+//      (-3), typed arrays both ways (bit-identical floats, extreme
+//      integers, empty, a span over part of an array), a `usize`, a `char`
+//      (and its rejections), a custom type (and its lift failures), and an
+//      iterator of typed arrays, enumerated twice;
+//
+// and ends by asserting the producer's leak counters are zero. The free
+// functions are statics of the library class, `Codec.CodecLibrary`.
 
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Runtime.InteropServices;
 using Codec;
-using static Codec.Codec;
+using C = Codec.CodecLibrary;
 
 internal static class Program
 {
@@ -49,373 +57,401 @@ internal static class Program
         return BitConverter.SingleToInt32Bits(a) == BitConverter.SingleToInt32Bits(b);
     }
 
-    static Scalars CanonicalScalars()
+    // Look a vector up by name, so the table can grow without breaking us.
+    static uint Find(uint n, string name)
     {
-        return new Scalars(-8, 200, -16_000, 60_000, -2_000_000_000, 4_000_000_000U,
+        for (uint i = 0; i < n; i++)
+        {
+            if (C.VectorName(i) == name)
+            {
+                return i;
+            }
+        }
+        Expect(false, $"no vector named '{name}'");
+        return 0;
+    }
+
+    static void Release(Vector v)
+    {
+        if (v is Vector.Objects o)
+        {
+            Release(o.Value);
+        }
+    }
+
+    static void Release(Holder h)
+    {
+        h.Primary.Dispose();
+        h.Spare?.Dispose();
+        foreach (var t in h.Many)
+        {
+            t.Dispose();
+        }
+        foreach (var t in h.ByName.Values)
+        {
+            t.Dispose();
+        }
+    }
+
+    // A primitive vector's value comes back unchanged from its echo_*.
+    static void Echo(Vector v, string name)
+    {
+        switch (v)
+        {
+            case Vector.I8 x: Expect(C.EchoI8(x.Value) == x.Value, name); break;
+            case Vector.U8 x: Expect(C.EchoU8(x.Value) == x.Value, name); break;
+            case Vector.I16 x: Expect(C.EchoI16(x.Value) == x.Value, name); break;
+            case Vector.U16 x: Expect(C.EchoU16(x.Value) == x.Value, name); break;
+            case Vector.I32 x: Expect(C.EchoI32(x.Value) == x.Value, name); break;
+            case Vector.U32 x: Expect(C.EchoU32(x.Value) == x.Value, name); break;
+            case Vector.I64 x: Expect(C.EchoI64(x.Value) == x.Value, name); break;
+            case Vector.U64 x: Expect(C.EchoU64(x.Value) == x.Value, name); break;
+            case Vector.F32 x: Expect(SameBits(C.EchoF32(x.Value), x.Value), name); break;
+            case Vector.F64 x: Expect(SameBits(C.EchoF64(x.Value), x.Value), name); break;
+            case Vector.Flag x: Expect(C.EchoBool(x.Value) == x.Value, name); break;
+            case Vector.Text x: Expect(C.EchoText(x.Value) == x.Value, name); break;
+            case Vector.Blob x: Expect(C.EchoBlob(x.Value).SequenceEqual(x.Value), name); break;
+            case Vector.Hue x: Expect(C.EchoColor(x.Value) == x.Value, name); break;
+        }
+    }
+
+    static void EveryVector(uint n)
+    {
+        for (uint i = 0; i < n; i++)
+        {
+            var name = C.VectorName(i);
+            var v = C.Vector(i);
+            if (!C.CheckVector(i, v))
+            {
+                Expect(false, $"vector {i} ({name}) did not round-trip; producer saw {C.DescribeVector(v)}");
+            }
+            Expect(!C.CheckVector((i + 1) % n, v), $"vector {i} ({name}) matches its neighbor");
+            Echo(v, $"echo {name}");
+            Release(v);
+        }
+    }
+
+    static Scalars CanonicalScalars(ushort u16 = 60_000)
+    {
+        return new Scalars(-8, 200, -16_000, u16, -2_000_000_000, 4_000_000_000U,
             -9_007_199_254_740_993L, ulong.MaxValue, 1.5f, -2.25e100, true, Color.Blue);
     }
 
-    static void CheckScalars(Scalars s, string what)
+    static void LiteralVectors(uint n)
     {
-        Expect(s.I8Value == -8, $"{what}: i8 (got {s.I8Value})");
-        Expect(s.U8Value == 200, $"{what}: u8 (got {s.U8Value})");
-        Expect(s.I16Value == -16_000, $"{what}: i16 (got {s.I16Value})");
-        Expect(s.U16Value == 60_000, $"{what}: u16 (got {s.U16Value})");
-        Expect(s.I32Value == -2_000_000_000, $"{what}: i32 (got {s.I32Value})");
-        Expect(s.U32Value == 4_000_000_000U, $"{what}: u32 (got {s.U32Value})");
-        Expect(s.I64Value == -9_007_199_254_740_993L, $"{what}: i64 (got {s.I64Value})");
-        Expect(s.U64Value == ulong.MaxValue, $"{what}: u64 (got {s.U64Value})");
-        Expect(s.F32Value == 1.5f, $"{what}: f32 (got {s.F32Value})");
-        Expect(s.F64Value == -2.25e100, $"{what}: f64 (got {s.F64Value})");
-        Expect(s.Flag, $"{what}: flag");
-        Expect(s.Color == Color.Blue, $"{what}: color (got {s.Color})");
-    }
-
-    static void ExpectScalarsEqual(Scalars a, Scalars b, string what)
-    {
-        Expect(a.I8Value == b.I8Value && a.U8Value == b.U8Value
-               && a.I16Value == b.I16Value && a.U16Value == b.U16Value
-               && a.I32Value == b.I32Value && a.U32Value == b.U32Value
-               && a.I64Value == b.I64Value && a.U64Value == b.U64Value
-               && SameBits(a.F32Value, b.F32Value) && SameBits(a.F64Value, b.F64Value)
-               && a.Flag == b.Flag && a.Color == b.Color,
-            $"{what}: scalars equal");
-    }
-
-    static void ExpectShapesEqual(Shape a, Shape b, string what)
-    {
-        Expect(a.GetType() == b.GetType(), $"{what}: same variant ({a.GetType().Name} vs {b.GetType().Name})");
-        switch (a)
+        Expect(C.CheckVector(Find(n, "scalars canonical"), new Vector.AllScalars(CanonicalScalars())),
+            "literal scalars canonical");
+        Expect(!C.CheckVector(Find(n, "scalars canonical"), new Vector.AllScalars(CanonicalScalars(60_001))),
+            "changed scalars don't match");
+        Expect(C.CheckVector(Find(n, "shape labeled"), new Vector.Figure(new Shape.Labeled("tag", 3))),
+            "literal shape labeled");
+        Expect(C.CheckVector(Find(n, "string interior nul"), new Vector.Text("nul\0inside\0")),
+            "literal interior nul");
+        // Any NaN matches the NaN vector; zero keeps its sign.
+        var nan = BitConverter.Int64BitsToDouble(0x7ff8000000000001L);
+        Expect(C.CheckVector(Find(n, "f64 nan"), new Vector.F64(nan)), "any NaN matches");
+        Expect(C.CheckVector(Find(n, "f64 -0"), new Vector.F64(-0.0)), "-0.0 matches -0");
+        Expect(!C.CheckVector(Find(n, "f64 -0"), new Vector.F64(0.0)), "+0.0 doesn't match -0");
+        Expect(C.CheckVector(Find(n, "u64 max"), new Vector.U64(ulong.MaxValue)), "literal u64 max");
+        Expect(C.CheckVector(Find(n, "enum infrared"), new Vector.Hue(Color.Infrared)), "literal infrared");
+        Expect(C.CheckVector(Find(n, "optional zero"), new Vector.MaybeI64(0)), "Some(0)");
+        Expect(C.CheckVector(Find(n, "optional absent"), new Vector.MaybeI64(null)), "None");
+        Expect(!C.CheckVector(Find(n, "optional zero"), new Vector.MaybeI64(null)), "None isn't Some(0)");
+        // A map's entry order doesn't matter on the wire.
+        var counts = new Dictionary<string, long> { ["x"] = 0, ["héllo"] = -1, [""] = long.MaxValue };
+        Expect(C.CheckVector(Find(n, "map of strings"), new Vector.Counts(counts)), "map in another order");
+        Expect(C.CheckVector(Find(n, "blank"), new Vector.Blank()), "literal blank");
+        using (var lone = new Token(-1))
         {
-            case Shape.Empty _:
-                break;
-            case Shape.Circle ca:
-                Expect(SameBits(ca.Radius, ((Shape.Circle)b).Radius), $"{what}: circle radius");
-                break;
-            case Shape.Rect ra:
-                var rb = (Shape.Rect)b;
-                Expect(SameBits(ra.Width, rb.Width) && SameBits(ra.Height, rb.Height), $"{what}: rect dims");
-                break;
-            case Shape.Labeled la:
-                var lb = (Shape.Labeled)b;
-                Expect(la.Label == lb.Label && la.Count == lb.Count, $"{what}: labeled payload");
-                break;
-            case Shape.Nested na:
-                var nb = (Shape.Nested)b;
-                ExpectScalarsEqual(na.Inner, nb.Inner, what + ": nested inner");
-                Expect(na.Note == nb.Note, $"{what}: nested note");
-                break;
-            default:
-                Expect(false, $"{what}: unknown variant");
-                break;
+            var sparse = new Holder(lone, null, Array.Empty<Token>(), new Dictionary<string, Token>());
+            Expect(C.CheckVector(Find(n, "objects sparse"), new Vector.Objects(sparse)), "consumer-made sparse holder");
         }
     }
 
-    static void ExpectCompositesEqual(Composite a, Composite b, string what)
+    static T Fetch<T>(uint n, string name) where T : Vector
     {
-        Expect(a.Name == b.Name, $"{what}: name");
-        Expect(a.Blob.SequenceEqual(b.Blob), $"{what}: blob");
-        Expect(a.SomeI64 == b.SomeI64, $"{what}: some_i64");
-        Expect(a.NoneI64 == b.NoneI64, $"{what}: none_i64");
-        Expect(a.SomeText == b.SomeText, $"{what}: some_text");
-        Expect(a.Names.SequenceEqual(b.Names), $"{what}: names");
-        Expect(a.Matrix.Length == b.Matrix.Length
-               && a.Matrix.Zip(b.Matrix, (x, y) => x.SequenceEqual(y)).All(eq => eq),
-            $"{what}: matrix");
-        Expect(a.Empty.Length == b.Empty.Length
-               && a.Empty.Zip(b.Empty, (x, y) => SameBits(x, y)).All(eq => eq),
-            $"{what}: empty list");
-        Expect(a.ByName.Count == b.ByName.Count
-               && a.ByName.All(kv => b.ByName.TryGetValue(kv.Key, out var v) && v == kv.Value),
-            $"{what}: by_name");
-        Expect(a.ById.Count == b.ById.Count && a.ById.Keys.All(k => b.ById.ContainsKey(k)),
-            $"{what}: by_id keys");
-        foreach (var kv in a.ById)
+        var v = C.Vector(Find(n, name));
+        Expect(v is T, $"{name} is a {typeof(T).Name} (got {v.GetType().Name})");
+        return (T)v;
+    }
+
+    static void SpotChecks(uint n)
+    {
+        Expect(Fetch<Vector.I64>(n, "i64 past 2^53").Value == -9_007_199_254_740_993L, "i64 past 2^53");
+        Expect(BitConverter.SingleToInt32Bits(Fetch<Vector.F32>(n, "f32 min subnormal").Value) == 1,
+            "f32 min subnormal bits");
+        Expect(Fetch<Vector.Text>(n, "string astral").Value == "🦀 crab 😀", "string astral");
+
+        var m = Fetch<Vector.AllScalars>(n, "scalars minimum").Value;
+        Expect(m.I8Value == sbyte.MinValue && m.I16Value == short.MinValue && m.I32Value == int.MinValue,
+            "signed minimums");
+        Expect(m.I64Value == long.MinValue && m.U64Value == 0 && m.U8Value == 0 && m.U16Value == 0 && m.U32Value == 0,
+            "i64 and unsigned minimums");
+        Expect(float.IsNegativeInfinity(m.F32Value) && double.IsNaN(m.F64Value), "float minimums");
+        Expect(m.Color == Color.Infrared && !m.Flag, "color and flag minimums");
+
+        var c = Fetch<Vector.Deep>(n, "composite canonical").Value;
+        Expect(c.Name == "héllo wörld ✓", $"composite name (got {c.Name})");
+        Expect(c.Blob.Length == 6 && c.Blob[5] == 255, "composite blob");
+        Expect(c.SomeI64 == long.MinValue && c.NoneI64 == null, "composite optionals");
+        Expect(c.SomeText == "", "composite some_text is present and empty");
+        Expect(c.Names.Count == 3 && c.Names[1] == "", "composite names");
+        Expect(c.Matrix.Count == 3 && c.Matrix[1].Count == 0 && c.Matrix[2][0] == -4, "composite matrix");
+        Expect(c.Floats.Count == 6 && double.IsNaN(c.Floats[0]) && double.IsNegative(c.Floats[3]),
+            "composite floats");
+        Expect(c.ByName.Count == 4 && c.ById.Count == 3 && c.ByColor.Count == 2 && c.Flags.Count == 2,
+            "composite map sizes");
+        Expect(c.Scalars.U32Value == 4_000_000_000U, "composite scalars");
+        Expect(c.Shape is Shape.Labeled { Count: 3 }, "composite shape");
+        Expect(c.Shapes.Count == 6 && c.Shapes[5] is Shape.Nested { Note: null }, "composite shapes");
+        Expect(c.MaybeShape is Shape.Nested, "composite maybe_shape");
+        Expect(c.MaybeList != null && c.MaybeList.Length == 2, "composite maybe_list");
+        Expect(c.Sparse.Count == 3 && c.Sparse[1] == null && c.Sparse[0] == true, "composite sparse");
+        Expect(c.Colors.Count == 4 && c.Colors[3] == Color.Infrared, "composite colors");
+    }
+
+    static void OutOfRange(uint n)
+    {
+        try
         {
-            ExpectScalarsEqual(kv.Value, b.ById[kv.Key], $"{what}: by_id[{kv.Key}]");
+            C.Vector(n);
+            Expect(false, "vector(n) throws");
         }
-        ExpectScalarsEqual(a.Scalars, b.Scalars, what + ": scalars");
-        ExpectShapesEqual(a.Shape, b.Shape, what + ": shape");
-        Expect(a.Shapes.Length == b.Shapes.Length, $"{what}: shapes length");
-        for (int i = 0; i < a.Shapes.Length; i++)
+        catch (CodecException.OutOfRange e)
         {
-            ExpectShapesEqual(a.Shapes[i], b.Shapes[i], $"{what}: shapes[{i}]");
+            Expect(e.Code == CodecException.OutOfRange.ErrorCode && e.Code == 1, $"code (got {e.Code})");
+            Expect(e.Index == n && e.Count == n, $"payload (got {e.Index}, {e.Count})");
+            Expect(e.Message == $"vector {n} is out of range (count {n})", $"message (got '{e.Message}')");
         }
-        Expect((a.MaybeShape == null) == (b.MaybeShape == null), $"{what}: maybe_shape presence");
-        if (a.MaybeShape != null)
+        try
         {
-            ExpectShapesEqual(a.MaybeShape, b.MaybeShape, what + ": maybe_shape");
+            C.VectorName(n + 5);
+            Expect(false, "vector_name(n + 5) throws");
         }
-        Expect((a.MaybeList == null) == (b.MaybeList == null)
-               && (a.MaybeList == null || a.MaybeList.SequenceEqual(b.MaybeList)),
-            $"{what}: maybe_list");
-        Expect(a.Sparse.SequenceEqual(b.Sparse), $"{what}: sparse");
-        Expect(a.Colors.SequenceEqual(b.Colors), $"{what}: colors");
+        catch (CodecException.OutOfRange e)
+        {
+            Expect(e.Index == n + 5 && e.Count == n, $"vector_name payload (got {e.Index}, {e.Count})");
+        }
+        Expect(!C.CheckVector(n, new Vector.Blank()), "check_vector past the end is false");
+    }
+
+    static void Malformed()
+    {
+        // C# can name an undeclared enum value; the producer rejects it, and
+        // a non-throwing call traps with the marshalling code.
+        try
+        {
+            C.EchoColor((Color)3);
+            Expect(false, "echo_color(3) is rejected");
+        }
+        catch (NativeBugException e)
+        {
+            Expect(e.Code == NativeException.MarshalErrorCode, $"code -3 (got {e.Code})");
+            Expect(e.Message.Contains("-3"), $"the message names the code (got '{e.Message}')");
+        }
+    }
+
+    static void Objects(uint n)
+    {
+        var full = Fetch<Vector.Objects>(n, "objects full").Value;
+        Expect(full.Primary.Value() == 10 && full.Spare != null && full.Spare.Value() == 11, "primary and spare");
+        Expect(full.Many.Count == 3 && full.Many[2].Value() == long.MinValue, "many");
+        Expect(full.ByName.Count == 2 && full.ByName["b"].Value() == 21, "by_name");
+        // Each encoding mints fresh references, so the holder can be sent twice.
+        var expected = unchecked(10L + 11 + 12 + 13 + 20 + 21 + long.MinValue);
+        Expect(C.SumHolder(full) == expected && C.SumHolder(full) == expected, "sum_holder twice");
+
+        // primary_of returns the very same native object.
+        using var p = C.PrimaryOf(full);
+        Expect(p.Equals(full.Primary), "primary_of is the same object");
+        var none = new Dictionary<string, Token>();
+        Expect(C.SamePrimary(full, new Holder(p, null, Array.Empty<Token>(), none)), "same_primary by identity");
+        using var twin = new Token(10);
+        Expect(!C.SamePrimary(full, new Holder(twin, null, Array.Empty<Token>(), none)),
+            "an equal value isn't the same object");
+
+        // One consumer-made wrapper in every slot.
+        using var minus = new Token(-4);
+        var mine = new Holder(twin, twin, new[] { twin, twin, minus }, new Dictionary<string, Token> { ["k"] = twin });
+        Expect(C.SumHolder(mine) == 10 * 5 - 4, "holder of consumer tokens");
+        Expect(twin.Value() == 10, "the wrapper is still usable");
+
+        Release(full);
+        try
+        {
+            full.Primary.Value();
+            Expect(false, "a disposed wrapper throws");
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+    }
+
+    static bool HasObjects(Vector v) => v is Vector.Objects;
+
+    static void ValueEquality(uint n)
+    {
+        for (uint i = 0; i < n; i++)
+        {
+            var a = C.Vector(i);
+            var b = C.Vector(i);
+            if (HasObjects(a))
+            {
+                // Distinct wrappers of fresh references: equal only by identity.
+                Release(a);
+                Release(b);
+                continue;
+            }
+            var name = C.VectorName(i);
+            if (name.Contains("nan"))
+            {
+                // Record equality follows double.Equals, where NaN equals NaN.
+                Expect(a.Equals(b), $"{name}: NaN equals itself in a record");
+                continue;
+            }
+            Expect(a == b && a.GetHashCode() == b.GetHashCode(), $"{name}: decoded twice is equal");
+            Expect(!ReferenceEquals(a, b), $"{name}: two decodes are two objects");
+        }
+        var deep = Fetch<Vector.Deep>(n, "composite canonical").Value;
+        var copy = deep with { Names = deep.Names.ToList() };
+        Expect(copy == deep && copy.GetHashCode() == deep.GetHashCode(), "a list compares by content");
+        var changed = deep with { Names = deep.Names.Append("extra").ToList() };
+        Expect(changed != deep, "a longer list differs");
+        var blob = deep with { Blob = (byte[])deep.Blob.Clone() };
+        Expect(blob == deep, "a byte array compares by content");
+        blob.Blob[0] ^= 1;
+        Expect(blob != deep, "a changed byte differs");
+        var map = deep with { ByName = new Dictionary<string, long>(deep.ByName) };
+        Expect(map == deep, "a map compares by content");
+    }
+
+    static void OptionalScalars()
+    {
+        Expect(C.EchoOptI32(null) == null, "echo_opt_i32(none)");
+        Expect(C.EchoOptI32(int.MinValue) == int.MinValue, "echo_opt_i32(MIN)");
+        Expect(C.EchoOptI32(0) == 0, "echo_opt_i32(0) is present");
+        var negZero = C.EchoOptF64(-0.0);
+        Expect(negZero.HasValue && SameBits(negZero.Value, -0.0), "echo_opt_f64(-0.0) keeps the sign");
+        Expect(C.EchoOptF64(double.NaN) is double nan && double.IsNaN(nan), "echo_opt_f64(NaN)");
+        Expect(C.EchoOptF64(null) == null, "echo_opt_f64(none)");
+        Expect(C.EchoOptBool(true) == true && C.EchoOptBool(false) == false && C.EchoOptBool(null) == null,
+            "echo_opt_bool");
+        Expect(C.EchoOptColor(Color.Infrared) == Color.Infrared && C.EchoOptColor(Color.Blue) == Color.Blue,
+            "echo_opt_color");
+        Expect(C.EchoOptColor(null) == null, "echo_opt_color(none)");
+        var e = Throws<NativeBugException>(() => C.EchoOptColor((Color)3), "echo_opt_color(3)");
+        Expect(e.Code == NativeException.MarshalErrorCode, $"an undeclared present value is -3 (got {e.Code})");
+    }
+
+    static void TypedArrays()
+    {
+        var floats = new[] { double.NaN, -0.0, 5e-324, double.PositiveInfinity };
+        var echoed = C.EchoF64s(floats);
+        Expect(echoed.Length == 4, "echo_f64s length");
+        for (var i = 0; i < floats.Length; i++)
+        {
+            Expect(SameBits(echoed[i], floats[i]), $"echo_f64s[{i}] is bit-identical");
+        }
+        Expect(C.EchoI32s(new[] { int.MinValue, 0, int.MaxValue }).SequenceEqual(new[] { int.MinValue, 0, int.MaxValue }),
+            "echo_i32s");
+        Expect(C.EchoI32s(Array.Empty<int>()).Length == 0, "echo_i32s([])");
+        var big = new[] { ulong.MaxValue, 1UL << 63 };
+        Expect(C.EchoU64s(big).SequenceEqual(big), "echo_u64s");
+        Expect(C.EchoU64s(default).Length == 0, "echo_u64s([])");
+        // A span over the middle of an array crosses without a copy.
+        var window = new[] { 1, 2, 3, 4, 5 };
+        Expect(C.EchoI32s(window.AsSpan(1, 3)).SequenceEqual(new[] { 2, 3, 4 }), "echo_i32s of a slice");
+        var many = Enumerable.Range(0, 100_000).Select(i => (double)i).ToArray();
+        Expect(C.EchoF64s(many).SequenceEqual(many), "echo_f64s of 100k elements");
+    }
+
+    static void Conversions()
+    {
+        Expect(C.EchoUsize(4_294_967_295UL) == 4_294_967_295UL, "echo_usize(u32::MAX)");
+        Expect(C.EchoUsize(ulong.MaxValue) == ulong.MaxValue, "echo_usize(u64::MAX)");
+
+        Expect(C.EchoChar("🦀") == "🦀" && C.EchoChar("é") == "é" && C.EchoChar("a") == "a", "echo_char");
+        var two = Throws<NativeBugException>(() => C.EchoChar("ab"), "echo_char(ab)");
+        Expect(two.Code == -3 && two.Message.Contains("value: \"ab\" is not a valid char"),
+            $"echo_char(ab) message (got '{two.Message}')");
+        var none = Throws<NativeBugException>(() => C.EchoChar(""), "echo_char(\"\")");
+        Expect(none.Code == -3 && none.Message.Contains("value: \"\" is not a valid char"),
+            $"echo_char(\"\") message (got '{none.Message}')");
+
+        Expect(C.EchoHex("ff") == "ff" && C.EchoHex("00FF") == "ff" && C.EchoHex("0") == "0", "echo_hex");
+        foreach (var (input, message) in new[]
+        {
+            ("xyz", "value: invalid digit found in string"),
+            ("", "value: cannot parse integer from empty string"),
+            ("100000000", "value: number too large to fit in target type"),
+        })
+        {
+            var e = Throws<NativeBugException>(() => C.EchoHex(input), $"echo_hex({input})");
+            Expect(e.Code == -3 && e.Message.Contains(message), $"echo_hex({input}) message (got '{e.Message}')");
+        }
+    }
+
+    static void Chunks()
+    {
+        var chunks = C.Chunks(new[] { int.MinValue, 0, int.MaxValue }, 2);
+        // The sequence is re-enumerable: each enumeration is a new native
+        // iterator over the same (copied) input.
+        for (var pass = 0; pass < 2; pass++)
+        {
+            var got = chunks.ToList();
+            Expect(got.Count == 2 && got[0].SequenceEqual(new[] { int.MinValue, 0 })
+                && got[1].SequenceEqual(new[] { int.MaxValue }), $"chunks pass {pass}");
+        }
+        var pairs = C.Chunks(new[] { 1, 2, 3, 4 }, 2).ToList();
+        Expect(pairs.Count == 2 && pairs[1].SequenceEqual(new[] { 3, 4 }), "chunks([1, 2, 3, 4], 2)");
+        Expect(!C.Chunks(new[] { 1, 2 }, 0).Any(), "chunks(size 0) is empty");
+        Expect(!C.Chunks(Array.Empty<int>(), 3).Any(), "chunks([]) is empty");
+        // Abandoning an enumeration part-way releases its iterator.
+        using (var e = chunks.GetEnumerator())
+        {
+            Expect(e.MoveNext() && LeakCheck.Live("codec", LeakCheck.Iterators) == 1, "one live iterator");
+        }
+        Expect(LeakCheck.Live("codec", LeakCheck.Iterators) == 0, "released on dispose");
+    }
+
+    static T Throws<T>(Action action, string what) where T : Exception
+    {
+        try
+        {
+            action();
+        }
+        catch (T e)
+        {
+            return e;
+        }
+        catch (Exception e)
+        {
+            Expect(false, $"{what}: expected {typeof(T).Name}, got {e.GetType().Name}: {e.Message}");
+        }
+        Expect(false, $"{what}: expected {typeof(T).Name}, nothing thrown");
+        return null;
     }
 
     static int Main()
     {
-        var lib = Environment.GetEnvironmentVariable("WEAVEFFI_LIBRARY");
-        NativeLibrary.SetDllImportResolver(typeof(Program).Assembly, (name, asm, search) =>
-        {
-            if (name == "weaveffi" && !string.IsNullOrEmpty(lib))
-                return NativeLibrary.Load(lib);
-            return IntPtr.Zero;
-        });
+        CodecLibrary.Check();
+        var n = C.VectorCount();
+        Expect(n >= 60, $"vector_count >= 60 (got {n})");
 
-        // --- Scalars: producer encodes, consumer decodes; then back. ---
-        var scalars = SampleScalars();
-        CheckScalars(scalars, "sample_scalars");
-        Expect(VerifyScalars(scalars), "verify_scalars accepts the decoded sample");
-        CheckScalars(RoundtripScalars(scalars), "roundtrip_scalars");
-        var mine = CanonicalScalars();
-        Expect(VerifyScalars(mine), "verify_scalars accepts a consumer-built canonical value");
+        EveryVector(n);
+        LiteralVectors(n);
+        SpotChecks(n);
+        OutOfRange(n);
+        Malformed();
+        Objects(n);
+        ValueEquality(n);
+        OptionalScalars();
+        TypedArrays();
+        Conversions();
+        Chunks();
 
-        // A one-field mismatch reports the typed domain error.
-        var wrong = new Scalars(-8, 200, -16_000, 60_000, -2_000_000_000, 4_000_000_000U,
-            -9_007_199_254_740_993L, ulong.MaxValue, 1.5f, -2.25e100, false, Color.Blue);
-        try
-        {
-            VerifyScalars(wrong);
-            Expect(false, "expected CodecException for a mismatched Scalars");
-        }
-        catch (CodecException e)
-        {
-            Expect(e.Code == CodecException.Mismatch, $"Mismatch code == 1 (got {e.Code})");
-            Expect(e.Code == 1, "Mismatch constant is 1");
-            Expect(e is WeaveFFIException, "typed exception extends the brand exception");
-        }
-
-        // Scalars at the extremes, including float edge values whose bit
-        // patterns must survive both directions.
-        var extremes = new Scalars(sbyte.MinValue, byte.MaxValue, short.MinValue, ushort.MaxValue,
-            int.MinValue, uint.MaxValue, long.MinValue, ulong.MaxValue,
-            float.NegativeInfinity, -0.0, false, Color.Red);
-        var extremesBack = RoundtripScalars(extremes);
-        ExpectScalarsEqual(extremes, extremesBack, "extremes");
-        Expect(BitConverter.DoubleToInt64Bits(extremesBack.F64Value) == long.MinValue, "negative zero keeps its sign bit");
-        var nans = new Scalars(sbyte.MaxValue, 0, short.MaxValue, 0, int.MaxValue, 0, long.MaxValue, 0,
-            float.NaN, double.NaN, true, Color.Green);
-        var nansBack = RoundtripScalars(nans);
-        Expect(float.IsNaN(nansBack.F32Value) && double.IsNaN(nansBack.F64Value), "NaN survives both floats");
-        Expect(nansBack.I64Value == long.MaxValue && nansBack.I8Value == sbyte.MaxValue, "max extremes");
-        var infs = new Scalars(0, 0, 0, 0, 0, 0, 0, 0, float.PositiveInfinity, double.PositiveInfinity, false, Color.Red);
-        var infsBack = RoundtripScalars(infs);
-        Expect(float.IsPositiveInfinity(infsBack.F32Value) && double.IsPositiveInfinity(infsBack.F64Value),
-            "+inf survives both floats");
-        Expect(double.IsNegativeInfinity(RoundtripScalars(new Scalars(0, 0, 0, 0, 0, 0, 0, 0, 0f,
-            double.NegativeInfinity, false, Color.Red)).F64Value), "-inf survives f64");
-
-        // --- Composite: every nested wire shape. ---
-        var composite = SampleComposite();
-        Expect(composite.Name == "héllo wörld ✓", $"name (got '{composite.Name}')");
-        Expect(composite.Blob.SequenceEqual(new byte[] { 0, 1, 2, 253, 254, 255 }), "blob");
-        Expect(composite.SomeI64 == long.MinValue, $"some_i64 == i64::MIN (got {composite.SomeI64})");
-        Expect(composite.NoneI64 == null, "none_i64 absent");
-        Expect(composite.SomeText != null && composite.SomeText == "", "some_text is a present empty string");
-        Expect(composite.Names.SequenceEqual(new[] { "a", "", "ccc" }), "names");
-        Expect(composite.Matrix.Length == 3
-               && composite.Matrix[0].SequenceEqual(new[] { 1, 2, 3 })
-               && composite.Matrix[1].Length == 0
-               && composite.Matrix[2].SequenceEqual(new[] { -4 }),
-            "matrix");
-        Expect(composite.Empty.Length == 0, "empty list");
-        Expect(composite.ByName.Count == 3
-               && composite.ByName["one"] == 1 && composite.ByName["two"] == 2 && composite.ByName["neg"] == -3,
-            "by_name");
-        Expect(composite.ById.Count == 2 && composite.ById.ContainsKey(-1) && composite.ById.ContainsKey(42), "by_id keys");
-        CheckScalars(composite.ById[-1], "by_id[-1]");
-        Expect(!composite.ById[42].Flag && composite.ById[42].U64Value == ulong.MaxValue, "by_id[42] differs only in flag");
-        CheckScalars(composite.Scalars, "composite.scalars");
-        Expect(composite.Shape is Shape.Labeled sl && sl.Label == "tag" && sl.Count == 3, "shape is Labeled(tag, 3)");
-        Expect(composite.Shapes.Length == 5, "five shapes");
-        Expect(composite.Shapes[0] is Shape.Empty, "shapes[0] Empty");
-        Expect(composite.Shapes[1] is Shape.Circle c1 && c1.Radius == 2.5, "shapes[1] Circle(2.5)");
-        Expect(composite.Shapes[2] is Shape.Rect r2 && r2.Width == 1.0f && r2.Height == 0.5f, "shapes[2] Rect(1, 0.5)");
-        Expect(composite.Shapes[3] is Shape.Labeled l3 && l3.Label == "" && l3.Count == -1, "shapes[3] Labeled('', -1)");
-        Expect(composite.Shapes[4] is Shape.Nested n4 && n4.Note == "n", "shapes[4] Nested(note n)");
-        CheckScalars(((Shape.Nested)composite.Shapes[4]).Inner, "shapes[4].inner");
-        Expect(composite.MaybeShape is Shape.Nested mn && mn.Note == null, "maybe_shape Nested(note absent)");
-        CheckScalars(((Shape.Nested)composite.MaybeShape).Inner, "maybe_shape.inner");
-        Expect(composite.MaybeList != null && composite.MaybeList.SequenceEqual(new byte[] { 9, 8 }), "maybe_list");
-        Expect(composite.Sparse.SequenceEqual(new bool?[] { true, null, false }), "sparse");
-        Expect(composite.Colors.SequenceEqual(new[] { Color.Red, Color.Green, Color.Blue }), "colors");
-
-        Expect(VerifyComposite(composite), "verify_composite accepts the decoded sample");
-        ExpectCompositesEqual(composite, RoundtripComposite(composite), "roundtrip_composite");
-        var described = DescribeComposite(composite);
-        Expect(described.Contains("héllo wörld ✓") && described.Contains("Labeled"),
-            $"describe_composite renders the value (got '{described}')");
-
-        // The same composite with one nested change fails verification.
-        var tweaked = new Composite(composite.Name, composite.Blob, composite.SomeI64, composite.NoneI64,
-            composite.SomeText, composite.Names, composite.Matrix, composite.Empty, composite.ByName,
-            composite.ById, composite.Scalars, composite.Shape, composite.Shapes, composite.MaybeShape,
-            composite.MaybeList, new bool?[] { true, true, false }, composite.Colors);
-        try
-        {
-            VerifyComposite(tweaked);
-            Expect(false, "expected CodecException for a tweaked Composite");
-        }
-        catch (CodecException e)
-        {
-            Expect(e.Code == CodecException.Mismatch, "tweaked composite reports Mismatch");
-        }
-
-        // A consumer-built composite with edge values: empty everything,
-        // unicode, extremes, NaN, the infinities, and negative zero.
-        var edge = new Composite(
-            "",
-            new byte[0],
-            long.MaxValue,
-            null,
-            "日本語 🎉 \u0000 tail",
-            new string[0],
-            new int[][] { new int[0], new[] { int.MinValue, int.MaxValue } },
-            new[] { double.NaN, double.PositiveInfinity, double.NegativeInfinity, -0.0, double.Epsilon, double.MaxValue },
-            new Dictionary<string, long>(),
-            new Dictionary<int, Scalars> { [int.MinValue] = extremes, [0] = nans, [int.MaxValue] = infs },
-            extremes,
-            new Shape.Empty(),
-            new Shape[0],
-            null,
-            null,
-            new bool?[0],
-            new Color[0]);
-        var edgeBack = RoundtripComposite(edge);
-        ExpectCompositesEqual(edge, edgeBack, "edge composite");
-        Expect(edgeBack.SomeText == "日本語 🎉 \u0000 tail", "embedded NUL and astral characters survive inside a buffer");
-        Expect(double.IsNaN(edgeBack.Empty[0]) && double.IsPositiveInfinity(edgeBack.Empty[1])
-               && double.IsNegativeInfinity(edgeBack.Empty[2])
-               && BitConverter.DoubleToInt64Bits(edgeBack.Empty[3]) == long.MinValue,
-            "float edge values in a list");
-        Expect(edgeBack.MaybeShape == null && edgeBack.MaybeList == null && edgeBack.NoneI64 == null,
-            "absent optionals stay absent");
-
-        // Rich enum variants on their own and in a list.
-        Shape[] variants =
-        {
-            new Shape.Empty(),
-            new Shape.Circle(double.NaN),
-            new Shape.Circle(-0.0),
-            new Shape.Rect(float.MaxValue, float.Epsilon),
-            new Shape.Labeled("", int.MinValue),
-            new Shape.Labeled("ünïcödé", int.MaxValue),
-            new Shape.Nested(extremes, null),
-            new Shape.Nested(nans, ""),
-        };
-        foreach (var v in variants)
-        {
-            ExpectShapesEqual(v, RoundtripShape(v), "roundtrip_shape " + v.GetType().Name);
-        }
-        var listBack = RoundtripShapes(variants);
-        Expect(listBack.Length == variants.Length, "roundtrip_shapes length");
-        for (int i = 0; i < variants.Length; i++)
-        {
-            ExpectShapesEqual(variants[i], listBack[i], $"roundtrip_shapes[{i}]");
-        }
-        Expect(RoundtripShapes(new Shape[0]).Length == 0, "roundtrip_shapes empty");
-        Expect(DescribeShape(new Shape.Empty()) == "Empty", "describe_shape Empty");
-        Expect(DescribeShape(new Shape.Circle(2.5)) == "Circle { radius: 2.5 }",
-            $"describe_shape Circle (got '{DescribeShape(new Shape.Circle(2.5))}')");
-        Expect(DescribeShape(new Shape.Labeled("x", 7)) == "Labeled { label: \"x\", count: 7 }",
-            "describe_shape Labeled");
-
-        // Top-level optionals, maps, strings, bytes, and direct scalars.
-        Expect(RoundtripOptI64(null) == null, "opt_i64 absent");
-        Expect(RoundtripOptI64(long.MinValue) == long.MinValue, "opt_i64 i64::MIN");
-        Expect(RoundtripOptI64(0) == 0, "opt_i64 zero is present");
-        Expect(RoundtripMap(new Dictionary<string, long>()).Count == 0, "empty map");
-        var map = RoundtripMap(new Dictionary<string, long> { [""] = long.MinValue, ["k"] = 0, ["ключ"] = long.MaxValue });
-        Expect(map.Count == 3 && map[""] == long.MinValue && map["k"] == 0 && map["ключ"] == long.MaxValue, "map contents");
-        Expect(RoundtripString("") == "", "empty string");
-        Expect(RoundtripString("héllo wörld ✓ 🎉") == "héllo wörld ✓ 🎉", "unicode string");
-        Expect(RoundtripBytes(new byte[0]).Length == 0, "empty bytes");
-        Expect(RoundtripBytes(new byte[] { 0, 127, 128, 255 }).SequenceEqual(new byte[] { 0, 127, 128, 255 }), "bytes");
-        Expect(RoundtripI64(long.MinValue) == long.MinValue, "i64::MIN direct");
-        Expect(RoundtripI64(long.MaxValue) == long.MaxValue, "i64::MAX direct");
-        Expect(RoundtripU64(ulong.MaxValue) == ulong.MaxValue, "u64::MAX direct");
-        Expect(RoundtripU64(1UL << 63) == (1UL << 63), "2^63 direct");
-        Expect(double.IsNaN(RoundtripF64(double.NaN)), "f64 NaN direct");
-        Expect(double.IsPositiveInfinity(RoundtripF64(double.PositiveInfinity)), "f64 +inf direct");
-        Expect(double.IsNegativeInfinity(RoundtripF64(double.NegativeInfinity)), "f64 -inf direct");
-        Expect(BitConverter.DoubleToInt64Bits(RoundtripF64(-0.0)) == long.MinValue, "f64 -0.0 direct");
-        Expect(RoundtripF64(double.MaxValue) == double.MaxValue, "f64 max direct");
-        Expect(RoundtripBool(true) && !RoundtripBool(false), "bool direct");
-        Expect(RoundtripColor(Color.Blue) == Color.Blue && (int)RoundtripColor(Color.Blue) == 7, "enum direct");
-        Expect(RoundtripColor(Color.Red) == Color.Red, "enum zero direct");
-
-        // --- Objects inside buffers. ---
-        var holder = MakeHolder(10, true);
-        Expect(holder.Primary.Value() == 10, "holder.primary");
-        Expect(holder.Spare != null && holder.Spare.Value() == 11, "holder.spare");
-        Expect(holder.Many.Select(t => t.Value()).SequenceEqual(new long[] { 12, 13, 14 }), "holder.many");
-        Expect(holder.Many.Select(t => t.Handle).Distinct().Count() == 3, "holder.many are distinct objects");
-        Expect(SumHolder(holder) == 10 + 11 + 12 + 13 + 14, "sum_holder");
-        // Encoding cloned each token, so the holder is still fully usable.
-        Expect(SumHolder(holder) == 60, "sum_holder again after re-encoding");
-        Expect(holder.Primary.Value() == 10, "primary alive after encoding twice");
-
-        var primary = PrimaryOf(holder);
-        Expect(!ReferenceEquals(primary, holder.Primary), "primary_of is a new wrapper");
-        Expect(primary.Handle == holder.Primary.Handle, "primary_of wraps the same native object");
-        Expect(primary.Value() == 10, "primary_of value");
-        Expect(SamePrimary(holder, holder), "same_primary with itself");
-        var other = MakeHolder(10, true);
-        Expect(!SamePrimary(holder, other), "same_primary across holders");
-        var rebuilt = new Holder(primary, null, new Token[0]);
-        Expect(SamePrimary(holder, rebuilt), "same_primary through a consumer-built holder");
-        Expect(SumHolder(rebuilt) == 10, "sum_holder of a consumer-built holder");
-
-        var noSpare = MakeHolder(0, false);
-        Expect(noSpare.Spare == null, "make_holder without spare");
-        Expect(SumHolder(noSpare) == 0 + 2 + 3 + 4, "sum_holder without spare");
-
-        // Consumer-created tokens travel into buffers too.
-        var t1 = new Token(1);
-        var t2 = new Token(2);
-        var t3 = new Token(long.MinValue);
-        var own = new Holder(t1, t2, new[] { t3, t1 });
-        Expect(SumHolder(own) == 1 + 2 + long.MinValue + 1, "sum_holder over consumer tokens");
-        var ownPrimary = PrimaryOf(own);
-        Expect(ownPrimary.Handle == t1.Handle && ownPrimary.Value() == 1, "primary_of consumer token");
-
-        // Reference counting: dropping one wrapper leaves the others valid;
-        // double Dispose is a no-op; a disposed wrapper throws.
-        holder.Primary.Dispose();
-        holder.Primary.Dispose();
-        Expect(primary.Value() == 10, "primary_of wrapper outlives holder.Primary");
-        try
-        {
-            holder.Primary.Value();
-            Expect(false, "expected ObjectDisposedException");
-        }
-        catch (ObjectDisposedException)
-        {
-        }
-        try
-        {
-            SumHolder(holder);
-            Expect(false, "encoding a disposed token must throw before calling the producer");
-        }
-        catch (ObjectDisposedException)
-        {
-        }
-        ownPrimary.Dispose();
-        Expect(t1.Value() == 1, "t1 alive after disposing its twin");
-
-        foreach (var t in new[] { primary, holder.Spare, other.Primary, other.Spare, noSpare.Primary, t1, t2, t3 }
-                     .Concat(holder.Many).Concat(other.Many).Concat(noSpare.Many))
-        {
-            t.Dispose();
-            t.Dispose();
-        }
-        using (var scoped = new Token(99))
-        {
-            Expect(scoped.Value() == 99, "scoped token");
-        }
-
-        Console.WriteLine("dotnet/codec: OK");
+        LeakCheck.AssertNoLeaks("codec");
+        Console.WriteLine($"dotnet/codec: OK ({n} vectors)");
         return 0;
     }
 }

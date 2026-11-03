@@ -1,5 +1,5 @@
-error: weaveffi: `&mut` parameters cannot cross the FFI boundary; take the value by `&T` or by value and return the updated result
- --> tests/ui/fail_mut_ref_param.rs:4:23
+error: weaveffi: a `&mut` parameter can't cross the FFI boundary; take the value (or `&T`) and return the result
+ --> tests/ui/fail_mut_ref_param.rs:4:19
   |
-4 |     pub fn fill(text: &mut String) {
-  |                       ^
+4 | pub fn fill(text: &mut String) {
+  |                   ^

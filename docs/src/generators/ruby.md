@@ -1,887 +1,442 @@
 # Ruby
 
-## Overview
+The Ruby target generates a pure-Ruby gem that binds the C ABI (revision 6)
+through the [ffi](https://github.com/ffi/ffi) gem. There's no native
+extension to compile: the gem depends on `ffi ~> 1.16` and loads the
+producer's shared library at `require` time. Ruby 3.2 or newer is required
+(the gemspec says so in `required_ruby_version`).
 
-The Ruby target produces pure-Ruby FFI bindings using the
-[ffi](https://github.com/ffi/ffi) gem to call the C ABI (revision 2)
-directly. There's no native extension to compile; `gem install ffi` is
-the only prerequisite. The generator emits a single `.rb` file plus a
-`gemspec` ready for `gem build` and `gem install`.
-
-Interfaces become reference-counted wrapper classes (`close` plus a GC
-finalizer backstop, `dup`/`clone` for a second reference), records and
-rich enums become value classes packed into value buffers (with
-interfaces inside them carried as object tokens), callback interfaces
-become duck-typed Ruby modules backed by one static vtable of pinned
-`FFI::Function` trampolines per interface, async functions block on a
-`Queue`, and `iter<T>` returns are lazy `Enumerator`s.
-
-The trade-off is that FFI gem calls are slower than a hand-written C
-extension. For typical FFI workloads the overhead is negligible compared
-to the work done inside the Rust library.
+Ruby is a [Tier 2](../stability.md#target-tiers) target: it may lag a new
+ABI revision for a while, but it passes the same conformance suite as every
+other target before a release.
 
 ## What gets generated
 
-| File | Purpose |
-|------|---------|
-| `ruby/lib/weaveffi.rb` | FFI bindings: library loader, ABI check, `attach_function` declarations, codecs, wrapper classes |
-| `ruby/weaveffi.gemspec` | Gem specification with `ffi ~> 1.15` dependency |
-| `ruby/README.md` | Prerequisites and usage instructions |
+For a package named `kvstore` (prefix `kvstore`, library `kvstore`):
 
-The file names follow the gem name (IDL `package.name`): a package named
-`kvstore` produces `lib/kvstore.rb`, `kvstore.gemspec`, and
-`module Kvstore`; `weaveffi` is the default. The module verifies the
-producer's ABI revision at `require` time:
+```text
+ruby/
+  kvstore.gemspec         gem `kvstore`, Ruby >= 3.2, depends on ffi ~> 1.16
+  README.md
+  lib/
+    kvstore.rb            require 'kvstore': module Kvstore, the bindings
+    kvstore/
+      runtime.rb          loader, load-time checks, errors, marshalling
+```
+
+Names come from the package identity:
+
+| Name | Default | Override (`[generators.ruby]`) |
+|------|---------|--------------------------------|
+| Gem | the package name (`key-store`) | `name` |
+| Ruby module | the package name in PascalCase (`KeyStore`) | `module_name` |
+| `require` path | the C prefix (`key_store`) | none |
+
+A library is one namespace, so every declaration lives directly in the one
+Ruby module: `Kvstore::Store`, `Kvstore::Entry`, `Kvstore.render_report`.
+
+The module's public surface is only the idiomatic API: error classes, enum
+constants, records, rich enums, interface classes, callback-interface
+modules, and library functions. The C functions are attached in a private
+`Native` module, and the marshalling the wrappers share lives in a private
+`Bridge` module (both are `private_constant`, so `Kvstore::Native` raises
+`NameError`). `lib/{prefix}/runtime.rb` is fixed code shipped with the
+generator (the source lives in `targets/ruby/runtime/runtime.rb`); only the
+module name, the C prefix, and the library names are substituted into it.
+
+A wrapper converts each argument into its one C value and hands the C call
+to one runtime helper as a block, so the generated code stays short:
 
 ```ruby
-  ABI_VERSION = 2
-  begin
-    attach_function :weaveffi_abi_version, [], :uint32
-  rescue FFI::NotFoundError
-    raise LoadError, 'the loaded WeaveFFI library predates ABI versioning ' \
-                     "(these bindings expect ABI revision #{ABI_VERSION})"
+def get(key)
+  key = Bridge.string_arg(key)
+  Bridge.pin(self) do |self_|
+    Bridge.call(KvError, [:buffer, Entry]) do |out_err|
+      Native.kvstore_Store_get(self_, key, out_err)
+    end
   end
-  _wv_abi = weaveffi_abi_version
-  unless _wv_abi == ABI_VERSION
-    raise LoadError, "WeaveFFI ABI mismatch: these bindings expect revision #{ABI_VERSION} " \
-                     "but the loaded library reports revision #{_wv_abi}"
-  end
+end
 ```
+
+`Bridge.string_arg` copies the key's UTF-8 into a `kvstore_run` the library
+borrows; `Bridge.call` allocates the error slot, raises per the function's
+error domain, and receives the result (here, decodes an `Entry` from the
+returned run and releases it with `kvstore_run_free`); `Bridge.pin` keeps
+the receiver alive for the call.
+
+## Install, build, and load
+
+```bash
+weaveffi generate samples/kvstore -o bindings --target ruby
+cargo build --release -p kvstore
+cd bindings/ruby
+gem build kvstore.gemspec
+gem install kvstore-1.0.0.gem
+```
+
+The loader opens the library in this order:
+
+1. the path in `{PREFIX}_LIBRARY` (`KVSTORE_LIBRARY=/path/to/libkvstore.dylib`),
+2. a copy bundled at `lib/native/` (platform gems from `weaveffi package`),
+3. `libkvstore.dylib`, `libkvstore.so`, or `kvstore.dll` on the system
+   search path.
+
+```ruby
+require 'kvstore'
+
+store = Kvstore::Store.open('/tmp/data')
+store.put('greeting', 'hi'.b, Kvstore::EntryKind::VOLATILE)
+store.close
+```
+
+`weaveffi package --target ruby` writes one precompiled platform gem per
+desktop platform built, `ruby/{gem}-{version}-{platform}.gem` (`arm64-darwin`,
+`x86_64-darwin`, `x86_64-linux`, `aarch64-linux`, `x64-mingw-ucrt`), with the
+library at `lib/native/`. The gems install with `gem install` and publish
+with `gem push`; Android, iOS, and `wasm32` builds are skipped. See
+[Packaging](../guides/packaging.md).
+
+## Load-time checks
+
+`require` checks, before anything else is attached, that the library
+implements C ABI revision 6, and then that the library exports the
+[contract function](../reference/abi.md#the-contract) of every declaration
+the bindings were generated with and that each returns the expected hash.
+The rows are embedded in the bindings, each with its canonical signature as
+a comment:
+
+```ruby
+module Kvstore
+  Bridge.check_contract!(
+    [
+      # method get(string) -> Entry throws KvError
+      [:kvstore_contract_dc5ad183936cb6fc, 0x1898683461a88009, 'Store.get'],
+      # ...one row per declaration, error code, and callback method
+    ],
+  )
+```
+
+Any failure raises `Kvstore::LoadError`, a subclass of Ruby's `LoadError`,
+so both `rescue Kvstore::LoadError` and a plain `rescue LoadError` around
+the `require` catch it: a library that can't be opened, a different ABI
+revision, or a declaration that's missing or changed (`kvstore: Store.put
+is missing from the library`, `kvstore: Store.put changed since these
+bindings were generated`). Declarations, error codes, and callback methods
+the library has and the bindings don't are fine, so a library that only adds
+to its API keeps working with older bindings. A failed `require` isn't
+recorded as loaded, so it can be retried (after setting `{PREFIX}_LIBRARY`,
+for example).
 
 ## Type mapping
 
-| IDL type     | Ruby type          | FFI type                       |
-|--------------|--------------------|--------------------------------|
-| `i8`, `i16`, `i32`, `i64` | `Integer` | `:int8`, `:int16`, `:int32`, `:int64` |
-| `u8`, `u16`, `u32`, `u64` | `Integer` | `:uint8`, `:uint16`, `:uint32`, `:uint64` |
-| `f32`, `f64` | `Float`            | `:float`, `:double`            |
-| `bool`       | `true`/`false`     | `:int32` (0/1 conversion)      |
-| `string`     | `String`           | `:string` (param) / `:pointer` (return) |
-| `bytes`      | `String` (binary)  | `:pointer` + `:size_t`         |
-| `Struct`     | `StructName` (plain class) | value buffer (`:pointer` + `:size_t`) |
-| `Enum` (plain) | `Integer` (constants in a module) | `:int32`        |
-| `Enum` (rich)  | `EnumName` (nested variant classes) | value buffer  |
-| `Interface`  | `InterfaceName` (wrapper class) | `:pointer`        |
-| `Interface?` | `InterfaceName` or `nil` | `:pointer` (NULL for `nil`) |
-| `CallbackInterface` | any object responding to the methods (include the module) | `:pointer` ctx + vtable `:pointer` |
-| `T?`         | `T` or `nil`       | value buffer                   |
-| `[T]`        | `Array`            | value buffer                   |
-| `{K: V}`     | `Hash`             | value buffer                   |
-| `iter<T>`    | `Enumerator` (lazy) | `:pointer` iterator handle    |
+Every value crosses as one C value, in every position (a parameter, a
+return, an async result, an iterator element, and a callback argument or
+return). The structs are `FFI::Struct` classes in `Native`, passed by value.
 
-Buffered types cross the boundary serialized in the
-[value-buffer format](../reference/value-buffers.md); the module carries
-private `WvBufferWriter`/`WvBufferReader` classes plus one
-`_wv_write_*`/`_wv_read_*` pair per record and rich enum. Objects
-nested inside a buffered value travel as object tokens (see
-[Objects](#objects-interfaces)). Booleans cross as `:int32` (`0`/`1`);
-the wrapper converts both directions.
+| IDL type | Ruby type | C value |
+|----------|-----------|---------|
+| `i8` to `i64`, `u8` to `u64` | `Integer` | `:int8` to `:uint64` |
+| `f32`, `f64` | `Float` | `:float`, `:double` |
+| `bool` | `true` or `false` | `:bool` |
+| C-style enum | `Integer` constants in a module | `:int32` |
+| `T?` of a scalar, `bool`, or C-style enum | `T` or `nil` | `Native::OptI32` and so on: `{has, value}` |
+| `string` | `String` (UTF-8) | `Native::Run`: `{ptr, len}` |
+| `bytes` | `String` (binary) | `Native::Run` |
+| `[T]` of a numeric scalar (not `u8`, not `bool`) | `Array` of `Integer` or `Float` | `Native::Run` (a typed array) |
+| record | `Data` class | `Native::Run` (a value buffer) |
+| rich enum | module of `Data` variant classes | `Native::Run` (a value buffer) |
+| any other `T?`, `[T]`, `{K: V}` | `T` or `nil`, `Array`, `Hash` | `Native::Run` (a value buffer) |
+| interface | wrapper class | `:pointer` |
+| `Interface?` | wrapper or `nil` | `:pointer` (NULL for `nil`) |
+| callback interface | any object with the methods | `Native::Callback`: `{ctx, vtable}` |
+| `Cb?` | such an object or `nil` | `Native::Callback` (a NULL vtable for `nil`) |
+| `iter<T>` | lazy `Enumerator` | iterator handle |
 
-### 64-bit integers and floats
+Trailing optional parameters (`T?`, `Interface?`, `Cb?`) default to `nil`,
+so `store.keys` is `store.keys(nil)`.
 
-Ruby's `Integer` is arbitrary precision, so `i64` and `u64` round-trip
-exactly through the `:int64`/`:uint64` FFI types and the value-buffer
-codec's `write_i64`/`write_u64` (`String#pack` with `q<`/`Q<`).
-`f32`/`f64` map to `Float`; the `codec` conformance consumer verifies
-NaN, both infinities, and `-0.0` survive a round trip bit-for-bit.
+Arguments are checked before the call:
 
-## Example IDL and generated code
+- An integer (or a C-style enum value) must be an `Integer` in its type's
+  range: `RangeError` rather than silent wrapping, `TypeError` for a
+  `Float`. That holds for scalars, optional scalars, typed-array elements,
+  and integers inside value buffers.
+- A string must be a `String` (or convert with `to_str`) holding valid
+  UTF-8; a string in another encoding is converted. Anything else raises
+  `TypeError` or `ArgumentError`. Strings cross as a run of bytes, so
+  interior NUL characters survive. Returned strings are copied, tagged
+  UTF-8, and released.
+- A typed-array argument must be an `Array` (or convert with `to_ary`); its
+  range-checked elements are packed into an 8-aligned native run the
+  library borrows for the call. A typed-array return is copied into a new
+  `Array` and released.
+- An optional scalar crosses as its `{has, value}` struct, never through a
+  value buffer: `nil` in, `nil` out.
+- An object argument must be a wrapper of the declared interface, and a
+  record argument an instance of the record's class (`TypeError`
+  otherwise).
 
-```yaml
-version: "0.9.0"
-modules:
-  - name: contacts
-    enums:
-      - name: ContactType
-        variants:
-          - { name: Personal, value: 0 }
-          - { name: Work, value: 1 }
-          - { name: Other, value: 2 }
+Every run an argument borrows lives in native memory the `Native::Run`
+struct keeps alive for the call, and every run the library returns is
+copied into Ruby and released with `{prefix}_run_free` before the wrapper
+returns.
 
-    structs:
-      - name: Contact
-        doc: "A contact record"
-        fields:
-          - { name: id, type: i64 }
-          - { name: first_name, type: string }
-          - { name: email, type: "string?" }
-          - { name: contact_type, type: ContactType }
-
-    functions:
-      - name: create_contact
-        params:
-          - { name: first_name, type: string }
-          - { name: email, type: "string?" }
-          - { name: contact_type, type: ContactType }
-        return: Contact
-
-      - name: list_contacts
-        params: []
-        return: "[Contact]"
-```
-
-The generated module extends `FFI::Library` and selects the right shared
-library at load time:
+Records are `Data` classes: immutable, constructed with keywords or
+positionally, with value equality and hashing, `with`, `to_h`, and pattern
+matching:
 
 ```ruby
-require 'ffi'
-
-module WeaveFFI
-  extend FFI::Library
-
-  # An explicit path in WEAVEFFI_LIBRARY wins, so callers can point at a
-  # specific build artifact regardless of its file name or location.
-  _wv_override = ENV['WEAVEFFI_LIBRARY']
-  if _wv_override && !_wv_override.empty?
-    ffi_lib _wv_override
-  else
-    case FFI::Platform::OS
-    when /darwin/  then ffi_lib 'libweaveffi.dylib'
-    when /mswin|mingw/ then ffi_lib 'weaveffi.dll'
-    else ffi_lib 'libweaveffi.so'
-    end
-  end
-end
+entry = Kvstore::Entry.new(key: 'k', value: 'v'.b, kind: Kvstore::EntryKind::VOLATILE,
+                           version: 1, expires_at: nil, tags: [], metadata: {})
+entry.with(version: 2)
 ```
 
-Enums become Ruby modules with constants:
+A rich enum is a module whose variants are `Data` classes that include it,
+so `change.is_a?(Kvstore::Change)` holds and `case change in
+Kvstore::Change::Put(entry:)` works; `change.tag` (and each variant's `TAG`)
+is the wire tag.
+
+Value buffers use the [value-buffer format](../reference/value-buffers.md).
+Nothing per composite type is generated: the runtime's codec walks a
+literal type description (`[:list, [:opt, Entry]]`, `[:map, :string, :i64]`),
+and each record, variant, and error payload registers its field layout
+once, at the end of the bindings (`Bridge.record(Entry, key: :string, ...)`).
+
+A field named like a method a record or error relies on gains a trailing
+`_` (`hash_`, `to_h_`; an error field `message` is `message_`), and so does
+a type named like a constant the bindings use (`Error_`, `Data_`, `FFI_`);
+keywords are fine as member names (`entry.end`). See
+[reserved member names](../reference/naming.md#identifiers-in-generated-code).
+
+## Objects and lifetime
+
+Each interface becomes a subclass of the runtime's `Bridge::Handle`, holding
+one strong reference in an `FFI::AutoPointer`:
 
 ```ruby
-module ContactType
-  PERSONAL = 0
-  WORK = 1
-  OTHER = 2
-end
+  # An embedded key-value store. Each object owns its entries, logical
+  # clock, listeners, and policy; the last release drops them (and frees
+  # the consumer's callbacks).
+  class Store < Bridge::Handle
 ```
 
-Structs become plain Ruby value classes: one `attr_reader` per field, a
-keyword-argument initializer, and structural equality. They hold no
-native pointer and declare no C symbols:
+- `close` releases the reference now and is idempotent; otherwise the GC
+  finalizer releases it. The object itself lives until its last reference
+  anywhere (another wrapper, a record field, the library) goes.
+- `closed?` says whether the wrapper was closed.
+- Two open wrappers of the same native object are `==` (and `eql?`, with
+  equal `hash`), so a record holding objects compares as expected.
+- `dup` and `clone` make an independent wrapper with its own reference.
+- A constructor named `new` becomes `initialize`; other constructors are
+  class methods (`Store.open`). An interface without one hides `new`.
+- Every call pins its receiver and object arguments, so a `close` from
+  another thread or from a callback during the call takes effect only when
+  the call returns.
+- An object inside a value buffer carries its own reference, minted just
+  before the call; an object decoded from one is adopted into a new
+  wrapper.
+- Using a closed wrapper raises `Error` ("Kvstore::Store used after close").
+- A method spelled like one the wrapper relies on (`close`, `initialize`,
+  `class`, `dup`, `hash`, `inspect`, ...), or a static or factory named
+  `allocate`, `new`, or `name`, gains a trailing `_`: an IDL method `close`
+  is `close_`.
 
-```ruby
-# A contact record
-class Contact
-  attr_reader :id
-  attr_reader :first_name
-  attr_reader :email
-  attr_reader :contact_type
+## Errors
 
-  def initialize(id:, first_name:, email:, contact_type:)
-    @id = id
-    @first_name = first_name
-    @email = email
-    @contact_type = contact_type
-  end
-
-  # Structural equality over every field.
-  def ==(other)
-    # ...
-  end
-end
-```
-
-Functions are snake_case class methods on the module, with the IDL
-module prefix stripped by default (a `kv.open_store` function surfaces
-as `open_store`, not `kv_open_store`; the `attach_function` bindings
-keep the full C symbol names). Set `strip_module_prefix: false` in the
-Ruby generator config (or under `[global]`) to keep prefixed names. A
-buffered return is copied out, freed, and decoded; from the `kvstore`
-sample's cross-module `get_stats`:
-
-```ruby
-  def self.get_stats(store)
-    err = ErrorStruct.new
-    out_len = FFI::MemoryPointer.new(:size_t)
-    result = weaveffi_kv_stats_get_stats(store.handle, out_len, err)
-    check_kv_error!(err)
-    len = out_len.read(:size_t)
-    data = result.null? ? ''.b : result.read_string(len)
-    weaveffi_free_bytes(result, len) unless result.null?
-    _wv_r = WvBufferReader.new(data)
-    _wv_value = _wv_read_stats(_wv_r)
-    _wv_r.expect_end!
-    _wv_value
-  end
-```
-
-## Typed errors
-
-The shared error machinery: an `ErrorStruct` mirroring the C error
-slot, the four runtime trap codes as module constants, and a generic
-`Error`:
-
-```ruby
-  class ErrorStruct < FFI::Struct
-    layout :code, :int32,
-           :message, :pointer,
-           :payload_ptr, :pointer,
-           :payload_len, :size_t
-  end
-
-  # The runtime-reserved error codes. Positive codes belong to a module's
-  # declared error domain; these negative codes are programming errors the
-  # wrappers raise as a plain Error regardless of the function's `throws`.
-  GENERIC_ERROR_CODE = -1
-  PANIC_ERROR_CODE = -2
-  MARSHAL_ERROR_CODE = -3
-  # A callback-interface implementation raised; the message carries the
-  # exception text.
-  FOREIGN_ERROR_CODE = -4
-
-  class Error < StandardError
-    attr_reader :code
-
-    def initialize(code, message)
-      @code = code
-      super(message)
-    end
-  end
-```
-
-A module's error domain adds a base class extending `Error` with one
-nested class per code, each pinning its stable `CODE`, plus a mapper
-that falls back to the generic `Error` for codes outside the domain.
-From the `kvstore` sample:
-
-```ruby
-# Base error for the `kv` module's error domain.
-class KvError < Error
-  # key not found
-  class KeyNotFound < KvError
-    CODE = 1001
-
-    def initialize(message = 'key not found')
-      super(1001, message)
-    end
-  end
-
-  # Expired, StoreFull, IoError follow the same shape.
-end
-
-# Builds the KvError subclass matching `code`, or a generic Error
-# for codes outside the domain (panics, marshalling).
-def self.kv_error_from(code, message, payload = nil)
-  cls = KV_ERROR_CODES[code]
-  return Error.new(code, message) if cls.nil?
-  message.empty? ? cls.new : cls.new(message)
-end
-```
-
-Only callables marked `throws: true` in the IDL raise the typed
-classes: their wrappers call `check_kv_error!`, so you can rescue
-`Kvstore::KvError::KeyNotFound` for one code or `Kvstore::KvError` for
-the whole domain. A callable without `throws` uses the generic
-`check_error!`, which raises `Error` if the producer misbehaves. Both
-copy the message (and payload) out and release the slot with
-`weaveffi_error_clear` before raising.
-
-An error code that declares payload `fields:` carries them serialized in
-the error's payload buffer (`payload_ptr`/`payload_len` on
-`ErrorStruct`); the domain factory decodes them into attributes on the
-raised error object before the buffer is released.
+Every error a call reports derives from `{Module}::Error` (a
+`StandardError`), which carries `code`. Each error domain becomes a class
+under it, named by the shared rule (`KvError` stays `KvError`,
+`KitchenErrors` becomes `KitchenError`, `Failure` becomes `FailureError`),
+with one nested class per code. A code's class carries `CODE`, its
+documented `MESSAGE`, and a reader per payload field:
 
 ```ruby
 begin
-  store.delete('missing')
-rescue Kvstore::KvError::KeyNotFound
-  # specific code
-rescue Kvstore::KvError => e
-  puts "kv error #{e.code}: #{e.message}"
+  store.get('missing')
+rescue Kvstore::KvError::KeyNotFound => e
+  e.code    # => 1001
+  e.key     # => "missing"
+  e.message # => "key not found: missing"
 end
 ```
 
-### Runtime error codes
+A library may declare several domains, and a function names the one it
+throws, so codes are only unique per domain: `Calculator.divide` raises
+`CalcError::DivisionByZero` for code 1 and `Calculator.parse` raises
+`ParseError::NotANumber` for its code 1. Domains are open: a positive code
+these bindings don't know (a newer library added it) raises the domain
+class itself, with the code and the library's message.
 
-| Code | Constant | Meaning | Where it surfaces |
-|------|----------|---------|-------------------|
-| `-1` | `GENERIC_ERROR_CODE` | The producer reported an error without a declared code, or the wrapper itself detected misuse (a NULL object pointer, a wrapper used after `close`). | Raised as `Error`. |
-| `-2` | `PANIC_ERROR_CODE` | The Rust implementation panicked; the export macros and the async spawner catch the unwind. | Raised as `Error` (a blocking async call re-raises it on the caller's thread). |
-| `-3` | `MARSHAL_ERROR_CODE` | Malformed input at the boundary (invalid UTF-8, a truncated value buffer, a bad enum discriminant). | Raised as `Error`. |
-| `-4` | `FOREIGN_ERROR_CODE` | A callback-interface method implemented in Ruby raised. | Raised as `Error` from the producer call that invoked the callback (see [Callback interfaces](#callback-interfaces)). |
+What a failure raises follows the
+[trap policy](../guides/errors-and-memory.md#the-trap-policy):
 
-There's no non-raising call path in Ruby: a non-throwing callable whose
-error slot comes back non-zero still raises `Error`.
+| Call | Domain code | Runtime code (`-1` to `-4`) | `-5` |
+|------|-------------|-----------------------------|------|
+| `throws: Domain` | the code's class (`KvError::Expired`), or the domain class for an unknown code | `Error` with that code and the library's message | `Cancelled` |
+| `throws: any` | not possible | `Error` (a failure is code `-1` and its message) | `Cancelled` |
+| no `throws` | not possible | `NativeBugError` | `Cancelled` |
 
-## Objects (interfaces)
+`NativeBugError < Error` marks a bug in the library (a panic, an argument it
+couldn't accept, a callback failure it let through a call that can't report
+one), never an outcome to handle. Its message names the code and the
+library's message, as in `native call failed with code -2: {the panic
+message}`; a malformed value the library returned raises it with code `-3`.
+The runtime codes are constants on `Error` (`Error::GENERIC`,
+`Error::PANIC`, `Error::MARSHAL`, `Error::CALLBACK`, `Error::CANCELLED`).
 
-An `interfaces:` entry becomes a class holding an `FFI::AutoPointer`
-subclass that owns one strong reference to a reference-counted producer
-object; the `AutoPointer`'s `release` hook calls the `_destroy` symbol
-when Ruby garbage-collects it. From the `kvstore` sample (trimmed):
+An error code's class can be raised from a callback implementation; its
+payload fields are required keywords:
 
 ```ruby
-  # Owns one strong reference to a Store; releases it exactly once.
-  class StorePtr < FFI::AutoPointer
-    def self.release(ptr)
-      Kvstore.weaveffi_kv_Store_destroy(ptr)
-    end
-  end
-
-  class Store
-    # Adopts one strong reference the producer handed over, without
-    # re-running initialize.
-    def self._from_ptr(ptr)
-      obj = allocate
-      obj.instance_variable_set(:@handle, StorePtr.new(ptr))
-      obj
-    end
-
-    # The borrowed object pointer passed to producer calls.
-    def handle
-      raise Error.new(-1, 'Store used after close') if @handle.nil?
-      @handle
-    end
-
-    # Whether close has released this wrapper's reference.
-    def closed?
-      @handle.nil?
-    end
-
-    # Releases this wrapper's reference now rather than at GC time.
-    # Idempotent; the object itself is dropped when the last reference
-    # anywhere (another wrapper, a record field, the producer) goes.
-    def close
-      return if @handle.nil?
-      @handle.free
-      @handle = nil
-    end
-
-    # Mints a new strong reference the caller owns (used when this
-    # object is written into a value buffer).
-    def _wv_clone_ptr
-      Kvstore.weaveffi_kv_Store_clone(handle)
-    end
-
-    # dup and clone produce an independent wrapper with its own reference.
-    def initialize_copy(other)
-      super
-      @handle = StorePtr.new(Kvstore.weaveffi_kv_Store_clone(other.handle))
-    end
-
-    def self.open(path)
-      err = ErrorStruct.new
-      result = Kvstore.weaveffi_kv_Store_open(path, err)
-      Kvstore.check_kv_error!(err)
-      raise Error.new(-1, 'null pointer') if result.null?
-      _from_ptr(result)
-    end
-  end
+raise Kvstore::KvError::Rejected.new('read-only', key: entry.key, reason: 'read-only')
 ```
 
-- **Construction.** A constructor named `new` becomes an ordinary
-  `initialize`, so `EventBus.new` works as usual (the `events` sample);
-  any other constructor is a class method (`Store.open(path)`). Methods
-  are snake_case instance methods, statics are class methods
-  (`Store.default_capacity`), and deprecated members print a
-  `[DEPRECATED]` warning at call time.
-- **Disposal.** `close` releases this wrapper's reference through the
-  `_destroy` symbol now; it's idempotent, and `closed?` reports the
-  state. If you never call `close`, the `FFI::AutoPointer` releases the
-  reference when the wrapper is garbage-collected. The producer object
-  itself is dropped only when the last reference anywhere is released.
-- **Use after close.** Every call goes through `handle`, which raises
-  `Error.new(-1, 'Store used after close')` on a closed wrapper, whether
-  it's the receiver, a parameter, or a field of a record being packed.
-- **Copies mint new references.** `dup` and `clone` are overridden via
-  `initialize_copy` to mint a new strong reference, so the copy is an
-  independent wrapper; closing one never affects the other. Methods that
-  return the receiver or an existing object (`share`, `fork`) likewise
-  return a fresh reference adopted into a new wrapper.
+## Async and cancellation
+
+An async function blocks its caller until the library's completion fires,
+then returns the result or raises. The wait is a `Thread::Queue#pop`, so:
+
+- It releases the GVL; other threads keep running. Run calls in threads
+  for concurrency.
+- Under a Fiber scheduler (`Fiber.set_scheduler`, such as the `async` gem's),
+  `Queue#pop` in a non-blocking Fiber yields to the scheduler, so only the
+  calling Fiber waits and the thread's other Fibers keep running; the
+  completion wakes it through the scheduler's `unblock`. The conformance
+  suite checks this with two overlapping calls.
+
+A cancellable function takes a `cancel:` keyword:
 
 ```ruby
-store = Kvstore::Store.open('/tmp/cache.kv')
+token = Kvstore::CancelToken.new
+Thread.new { sleep 0.5; token.cancel }
 begin
-  store.put('alpha', "\x01".b, Kvstore::EntryKind::PERSISTENT, nil)
-  puts "#{store.count} / #{Kvstore::Store.default_capacity}"
-  reclaimed = store.compact
+  store.compact(60_000, cancel: token)
+rescue Kvstore::Cancelled
+  # cancelled while the pause was running
 ensure
-  store.close
+  token.close
 end
 ```
 
-### Nullable objects, and objects inside values
+`CancelToken#cancel` may be called from any thread; the call then raises
+`Cancelled` (code `-5`) unless it already completed. A token stays
+cancelled, can be shared by several calls, and is released by `close` or
+the GC. Without a token, interrupting the waiting thread (`Thread#raise`,
+`Timeout`) still cancels the library's work through a private token.
 
-An `Interface?` parameter passes `nil` as NULL (`other&.handle`), and an
-`Interface?` return maps a NULL pointer to `nil`:
-
-```ruby
-    def larger(other)
-      err = ErrorStruct.new
-      result = Kvstore.weaveffi_kv_Store_larger(handle, other&.handle, err)
-      Kvstore.check_error!(err)
-      return nil if result.null?
-      Store._from_ptr(result)
-    end
-```
-
-Objects inside records, arrays, hashes, and optionals travel as 8-byte
-object tokens in the value buffer. Writing a token mints a new strong
-reference with `_wv_clone_ptr`; reading one adopts the reference into a
-fresh wrapper. From the `StoreInfo` record (`store: Store`,
-`mirror: Store?`):
-
-```ruby
-  def self._wv_write_store_info(w, v)
-    w.write_string(v.label)
-    w.write_u64(v.store._wv_clone_ptr.address)
-    if v.mirror.nil?
-      w.write_flag(false)
-    else
-      w.write_flag(true)
-      w.write_u64(v.mirror._wv_clone_ptr.address)
-    end
-    w.write_i64(v.count)
-  end
-
-  def self._wv_read_store_info(r)
-    _wv_label = r.read_string
-    _wv_store = Store._from_ptr(r.read_object_token)
-    if r.read_flag
-      _wv_mirror = Store._from_ptr(r.read_object_token)
-    else
-      _wv_mirror = nil
-    end
-    _wv_count = r.read_i64
-    StoreInfo.new(label: _wv_label, store: _wv_store, mirror: _wv_mirror, count: _wv_count)
-  end
-```
-
-Arrays of objects work the same way in both directions
-(`Store.open_many(paths)` returns an `Array` of `Store`,
-`Store.total_count(stores, extra)` takes one); each wrapper in a returned
-array owns its own reference and should be closed (or left to GC)
-individually. Iterators over objects adopt one reference per pull, and a
-blocking async call returning an object adopts the pointer inside the
-completion callback.
-
-## Rich (algebraic) enums
-
-A rich (algebraic) enum is a sum type whose variants carry associated
-data. A plain C-style `Enum` crosses as a bare `:int32` discriminant; a
-rich enum instead becomes a plain class hierarchy: a base class with a
-`tag` reader plus one nested subclass per variant carrying that
-variant's fields as attributes, each pinning its `TAG` constant. Rich
-enums declare no C symbols; values cross the ABI serialized in value
-buffers as an `i32` tag followed by the active variant's fields. From
-the `codec` sample:
-
-```ruby
-  class Shape
-    # The active variant's integer tag.
-    def tag
-      self.class::TAG
-    end
-
-    # No payload.
-    class Empty < Shape
-      TAG = 0
-
-      # Structural equality over the variant and its fields.
-      def ==(other)
-        return false unless other.is_a?(Empty)
-        true
-      end
-    end
-
-    # One `f64`.
-    class Circle < Shape
-      TAG = 1
-
-      # Radius.
-      attr_reader :radius
-
-      def initialize(radius:)
-        @radius = radius
-      end
-
-      # Structural equality over the variant and its fields.
-      def ==(other)
-        return false unless other.is_a?(Circle)
-        # ...
-      end
-    end
-  end
-```
-
-Construct variants directly and branch with `case`/`when` on the class:
-
-```ruby
-circle = Codec::Shape::Circle.new(radius: 2.0)
-
-case circle
-when Codec::Shape::Circle
-  puts circle.radius                 # 2.0
-when Codec::Shape::Empty
-  puts 'empty'
-end
-```
-
-Values are plain Ruby data; there's no native handle and nothing to
-close. The private `_wv_write_shape`/`_wv_read_shape` codec helpers
-write and read the tagged wire format; variant fields of interface type
-follow the object token rules above.
+The completion receives the result as its one C value (a scalar, an
+optional's struct, a run, or an object pointer), which the runtime receives
+exactly as it does a return. The completion functions are shared by every
+async call whose result has the same C type and live for the process, so
+nothing the library may still call is ever garbage-collected.
 
 ## Callback interfaces
 
-A `callback_interfaces:` entry becomes a Ruby module. Any object that
-responds to the methods is accepted (duck typing); including the module
-gives you `NotImplementedError` defaults for the methods you don't
-override. From the `kvstore` sample:
+A callback interface becomes a Ruby module whose methods raise
+`NotImplementedError`. Any object that responds to the methods works;
+including the module documents intent and supplies the defaults.
 
 ```ruby
-  # Consumer-implemented callback interface. Any object responding to the
-  # methods below is accepted wherever a EvictionListener parameter is expected;
-  # include this module to inherit NotImplementedError defaults. The
-  # producer may call the methods from any thread until it releases the
-  # implementation.
-  module EvictionListener
-    # An entry left the store. Returns whether the listener wants to keep
-    # receiving notifications; `false` detaches it.
-    # @return [Object] a bool
-    def on_evict(entry, reason)
-      raise NotImplementedError, "#{self.class}#on_evict is not implemented"
-    end
+class FileLoader
+  include Kvstore::Loader
+
+  def name
+    'files'
   end
-```
 
-```ruby
-class Auditor
-  include Kvstore::EvictionListener
+  def fallback(_key)
+    nil
+  end
 
-  def on_evict(entry, reason)
-    puts "#{entry.key}: #{reason}"
-    true
+  def load(key)
+    path = File.join('/data', key)
+    raise Kvstore::KvError::KeyNotFound.new("no file for #{key}", key: key) unless File.exist?(path)
+
+    File.binread(path)
   end
 end
 
-store.set_eviction_listener(Auditor.new)
+entry = store.get_or_load('settings', FileLoader.new)
 ```
 
-Behind the module is one process-wide vtable per callback interface,
-whose entries are `FFI::Function` trampolines held in constants so they
-live for the process lifetime. Passing an implementation registers it in
-a mutex-guarded registry under an integer key; the key (as an
-`FFI::Pointer`) crosses as `ctx`, so the producer never holds a Ruby
-object:
+Passing an implementation stores it in a handle table and hands the library
+a `{ctx, vtable}` struct whose `ctx` is its key, so Ruby object addresses
+never cross the boundary; the entry is removed when the library calls the
+vtable's `free`, which may happen on any library thread. A required callback
+parameter rejects `nil` with `TypeError`; an optional one (`loader = nil`)
+passes a NULL vtable.
+
+Each interface has one vtable for the life of the process, registered at
+the end of the bindings as one row per method (its Ruby name, the error
+class it may raise, its return, and its parameters):
 
 ```ruby
-  # Trampoline for EvictionListener#on_evict.
-  WV_EVICTION_LISTENER_ON_EVICT = FFI::Function.new(:int32, [:pointer, :pointer, :size_t, :int32, :pointer]) do |ctx, entry_ptr, entry_len, reason, out_err|
-    begin
-      impl = _wv_cb_lookup(ctx)
-      entry_r = WvBufferReader.new(entry_ptr.null? ? ''.b : entry_ptr.read_string(entry_len))
-      entry_v = _wv_read_entry(entry_r)
-      entry_r.expect_end!
-      reason_v = reason
-      impl.on_evict(entry_v, reason_v) ? 1 : 0
-    rescue Exception => e
-      _wv_cb_fail(out_err, e)
-      0
-    end
-  end
-
-  # Releases a EvictionListener implementation when the producer drops its last
-  # reference.
-  WV_EVICTION_LISTENER_FREE = FFI::Function.new(:void, [:pointer]) do |ctx|
-    _wv_cb_free(ctx)
-  end
-
-  WV_EVICTION_LISTENER_VTABLE = WvEvictionListenerVtable.new
-  WV_EVICTION_LISTENER_VTABLE[:on_evict] = WV_EVICTION_LISTENER_ON_EVICT
-  WV_EVICTION_LISTENER_VTABLE[:free] = WV_EVICTION_LISTENER_FREE
+Bridge.vtable(
+  Listener,
+  [:accepts, Error, :bool, [:string]],
+  [:on_change, Error, nil, [[:buffer, Change]]],
+)
 ```
 
-```ruby
-    def set_eviction_listener(listener)
-      err = ErrorStruct.new
-      listener_ctx = Kvstore._wv_cb_register(listener)
-      Kvstore.weaveffi_kv_Store_set_eviction_listener(handle, listener_ctx, WV_EVICTION_LISTENER_VTABLE.to_ptr, err)
-      Kvstore.check_error!(err)
-    end
-```
+The runtime builds the `{size, flags, free}` header, with `size` the
+vtable's own size and `flags` 0 (the methods may be called from any
+thread), then one trampoline `FFI::Function` per row, which it keeps
+referenced for the life of the process.
 
-- **Lifetime.** The registry entry keeps the implementation alive
-  exactly as long as the producer may call it; the vtable's `free`
-  trampoline removes it when the producer drops its last reference. A
-  producer that retains the implementation (a store's eviction listener)
-  keeps it alive across calls; one that doesn't (the `events` sample's
-  `route_once`) frees it before returning. Passing the same object twice
-  registers two entries.
-- **Argument ownership.** Borrowed strings and buffers are copied into
-  Ruby values before the method runs, so the implementation may keep
-  them. An object passed to a callback method is owned by the
-  implementation: the trampoline adopts it into a new wrapper
-  (`impl.on_attached(EventBus._from_ptr(bus))` in the `events` sample),
-  and the implementation should `close` it when done (or let GC do it).
-- **Return values.** A method's return value is converted back to its C
-  representation (truthiness to `1`/`0`, an enum constant as its
-  `:int32`, a record as a value buffer the producer frees).
-- **Exceptions.** Any exception escaping a method (including the
-  `NotImplementedError` default) never unwinds through the C frame.
-  `_wv_cb_fail` writes `FOREIGN_ERROR_CODE` (-4) with the exception's
-  message into the producer's error slot, and the trampoline returns a
-  default; the producer aborts the call in progress, and the original
-  caller sees `Error` with `code == -4`. For a callable marked `throws`,
-  the domain mapper falls through to `Error` (so `rescue KvError`
-  doesn't catch it but `rescue Kvstore::Error` does). The VM is never
-  taken down.
-- **Threads.** The producer may call a method from any thread. The ffi
-  gem dispatches a callback arriving on a non-Ruby thread onto the VM
-  by acquiring the GVL first, so the method runs as ordinary Ruby code
-  on that thread. A blocking producer call that waits for a callback
-  dispatched on another thread works because the ffi gem releases the
-  GVL around the C call; a callback that itself blocks waiting on the
-  calling thread will deadlock.
+Arguments and returns follow the
+[ABI](../reference/abi.md#callback-interfaces):
 
-## Build instructions
+- Strings, bytes, value buffers, and typed arrays arrive as copies of the
+  borrowed run; an optional scalar arrives as the value or `nil`; an object
+  argument arrives as a wrapper that adopted the reference the library
+  passed, which the implementation may keep.
+- A returned number, boolean, C-style enum, or optional scalar crosses by
+  value (checked against its type's range); a returned object (`Store` or
+  `Store?`) as a fresh reference the library adopts (`nil` is NULL, which
+  the library rejects where the return isn't optional); and a returned
+  string, bytes, typed array, or value buffer as a run allocated with
+  `{prefix}_alloc`, which the library adopts.
+- A method that throws a domain may raise that domain's code classes: the
+  library receives the code and the fields as the payload, exactly as if
+  the producer had raised it (the caller then sees the domain's own message
+  for those fields). Any other exception, including `NotImplementedError`,
+  is reported as code `-1` with its message (`-4` for a method that declares
+  no errors), and the method returns its type's zero value. Nothing unwinds
+  through C.
 
-1. Generate the bindings:
+### Threads and the GVL
 
-   ```bash
-   weaveffi generate api.yaml -o generated --target ruby
-   ```
-
-2. Build the Rust shared library:
-
-   ```bash
-   cargo build --release -p your_library
-   ```
-
-3. Build and install the gem:
-
-   ```bash
-   cd generated/ruby
-   gem build weaveffi.gemspec
-   gem install weaveffi-0.1.0.gem
-   ```
-
-4. Make the cdylib findable at runtime. `WEAVEFFI_LIBRARY` may point at
-   an exact file; otherwise:
-
-   - macOS: `DYLD_LIBRARY_PATH=$PWD/../../target/release ruby your_script.rb`
-   - Linux: `LD_LIBRARY_PATH=$PWD/../../target/release ruby your_script.rb`
-   - Windows: place `weaveffi.dll` next to the script or add its
-     directory to `PATH`.
-
-The Ruby module name and gem name can be customised in `weaveffi.toml`:
-
-```toml
-[generators.ruby]
-module_name = "MyBindings"
-gem_name = "my_bindings"
-```
-
-## Packaging
-
-`weaveffi package --target ruby` assembles one precompiled platform gem
-tree per supplied desktop binary under `ruby/<platform-id>/`, each with
-the generated library, the native library at `lib/native/`, and a
-gemspec pinned to the RubyGems platform string. The packaged loader
-still honours `WEAVEFFI_LIBRARY` first, then opens the bundled library
-if it exists, then falls back to the system path.
-
-| Platform | RubyGems platform |
-|----------|-------------------|
-| `macos-arm64` | `arm64-darwin` |
-| `macos-x64` | `x86_64-darwin` |
-| `linux-x64` | `x86_64-linux` |
-| `linux-arm64` | `aarch64-linux` |
-| `windows-x64` | `x64-mingw-ucrt` |
-
-Android and `wasm32` binaries have no RubyGems platform and are skipped.
-Run `gem build` in each tree to produce the platform gems. See
-[Packaging](../guides/packaging.md) for the shared workflow.
-
-## Memory and ownership
-
-- **Strings in:** Ruby strings are passed as `:string` parameters and
-  the FFI gem encodes them to null-terminated C strings.
-- **Strings out:** the wrapper reads the returned `:pointer` with
-  `read_string` (forcing UTF-8), then calls `weaveffi_free_string` to
-  release the Rust-owned buffer.
-- **Bytes:** an `FFI::MemoryPointer` is allocated for inputs; outputs
-  are copied with `read_string(len)` and the returned buffer is released
-  with `weaveffi_free_bytes`.
-- **Buffered values (structs, rich enums, optionals, arrays, hashes):**
-  parameters are packed into a binary `String` staged in an
-  `FFI::MemoryPointer` the producer borrows for the duration of the
-  call; returns are copied into Ruby memory with `read_string(len)`,
-  released with `weaveffi_free_bytes`, and decoded with the `_wv_read_*`
-  helper. Object tokens written into a buffer are fresh strong
-  references the producer owns; tokens read out are adopted into
-  wrappers.
-- **Interfaces:** one strong reference per wrapper, released by `close`
-  or by the `FFI::AutoPointer` on GC.
-- **Callback implementations:** held in the module's registry until the
-  producer calls the vtable's `free`.
-
-## Async support
-
-Async IDL functions (`async: true`) are exposed as blocking wrapper
-methods. The wrapper creates a `Queue`, builds an `FFI::Function`
-completion callback that pushes either the converted result or an error
-onto it, calls the `_async`-suffixed C launcher, then pops the queue and
-raises if the producer reported an error. For a callable marked
-`throws: true`, the error goes through the domain mapper
-(`kv_error_from` here), so the raised object is the typed class. From
-the `kvstore` sample's `Store#compact`:
-
-```ruby
-    # Blocks the current thread until the async producer completes; the
-    # result (or error) is delivered through the completion callback (cancellation token not exposed; pass-through is NULL).
-    def compact()
-      queue = Queue.new
-      callback = FFI::Function.new(:void, [:pointer, :pointer, :int64]) do |_context, err_ptr, result|
-        err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
-        if err && err[:code] != 0
-          code = err[:code]
-          msg = err[:message].null? ? '' : err[:message].read_string.force_encoding(Encoding::UTF_8)
-          payload = err[:payload_ptr].null? ? nil : err[:payload_ptr].read_string(err[:payload_len])
-          Kvstore.weaveffi_error_free(err_ptr)
-          queue << Kvstore.kv_error_from(code, msg, payload)
-        else
-          queue << result
-        end
-      end
-      Kvstore.weaveffi_kv_Store_compact_async(handle, FFI::Pointer::NULL, callback, FFI::Pointer::NULL)
-      value = queue.pop
-      raise value if value.is_a?(Error)
-      value
-    end
-```
-
-There is no promise/future type and no `concurrent-ruby` dependency: the
-calling thread blocks until the completion callback fires. `Queue#pop`
-releases the GVL, and the ffi gem delivers the cross-thread completion
-callback safely. Wrap the call in a `Thread` when you need concurrency:
-
-```ruby
-t = Thread.new { store.compact }
-reclaimed = t.value  # joins; re-raises a Kvstore::Error from the call
-```
-
-The local `callback` reference keeps the `FFI::Function` alive until
-`queue.pop` returns, so the completion callback cannot be collected
-mid-flight.
-
-Result ownership follows the async contract: string, bytes, and buffered
-results (records, rich enums, optionals, arrays, and hashes, arriving as
-a pointer-plus-length pair) are owned by the consumer, so the callback
-copies or decodes them into Ruby values and then releases them with
-`weaveffi_free_string` or `weaveffi_free_bytes`. A reported error is
-heap-boxed: the callback copies its code, message, and payload, then
-releases it with `weaveffi_error_free`. An owned interface result
-transfers ownership too: the callback adopts the pointer into a new
-wrapper. A non-throwing async callable raises the generic `Error` on a
-trap code; a panic inside the spawned future surfaces as
-`PANIC_ERROR_CODE` (-2).
-
-For functions marked `cancellable: true` the C launcher takes an extra
-cancel-token parameter. The wrapper always passes `FFI::Pointer::NULL`
-for it and doesn't expose the token. Cancellation tokens are currently
-surfaced only by the C and C++ targets.
+Every call into the library except the trivial runtime helpers (`_clone`,
+`_destroy`, an iterator's `_destroy`, `{prefix}_run_free`, `{prefix}_alloc`,
+`{prefix}_debug_live`, the error and cancel-token functions, and the
+load-time checks) releases the GVL (`blocking: true`), so a long call
+doesn't stall other Ruby threads. That's also what lets a callback arrive
+while the call that triggered it is in flight: a callback on the calling
+thread reacquires the GVL there, and one from a library thread (such as the
+notifications `compact` sends from its worker) runs on the ffi gem's
+callback thread, which needs the GVL too.
 
 ## Iterators
 
-Functions returning `iter<T>` return a lazy `Enumerator` that streams
-one element per pull: each consumer step issues exactly one call to the
-generated `_next` binding, so nothing is drained up front. Call `.to_a`
-if you want an eager `Array`. From the `kvstore` sample's `list_keys`
-(argument packing elided):
-
-```ruby
-    # Returns a lazy Enumerator that streams one element per pull; call
-    # `.to_a` to collect eagerly. The underlying producer iterator is
-    # launched on the first pull, so launch errors raise at that point
-    # rather than when this method returns. The iterator handle is
-    # released exactly once, when iteration finishes or is abandoned
-    # early (for example by `break`).
-    def list_keys(prefix)
-      # ... pack the optional prefix into prefix_buf ...
-      Enumerator.new do |y|
-        err = ErrorStruct.new
-        iter = Kvstore.weaveffi_kv_Store_list_keys(handle, prefix_buf, prefix_data.bytesize, err)
-        begin
-          Kvstore.check_kv_error!(err)
-          unless iter.null?
-            loop do
-              out_item = FFI::MemoryPointer.new(:pointer)
-              item_err = ErrorStruct.new
-              has_item = Kvstore.weaveffi_kv_Store_ListKeysIterator_next(iter, out_item, item_err)
-              Kvstore.check_kv_error!(item_err)
-              break if has_item.zero?
-              item_ptr = out_item.read_pointer
-              if item_ptr.null?
-                y << ''
-              else
-                item = item_ptr.read_string.force_encoding(Encoding::UTF_8)
-                Kvstore.weaveffi_free_string(item_ptr)
-                y << item
-              end
-            end
-          end
-        ensure
-          Kvstore.weaveffi_kv_Store_ListKeysIterator_destroy(iter) unless iter.null?
-        end
-      end
-    end
-```
-
-The producer iterator launches on the first pull, so a launch error
-raises then, not when the method returns. Each string element is copied
-with `read_string` and freed with `weaveffi_free_string`; a buffered
-element arrives as a value buffer that's decoded with the `_wv_read_*`
-helper and released with `weaveffi_free_bytes`; an object element is
-adopted into a new wrapper. The `ensure` block destroys the handle
-exactly once, whether iteration exhausts, raises, or is abandoned early
-(Ruby runs `ensure` when the enumerator's fiber is torn down, for
-example after `break`). Enumerating the same `Enumerator` again
-launches a fresh producer iterator.
-
-The per-step error check follows the function's error strategy: the
-throwing `list_keys` checks the launcher and each `next` with
-`check_kv_error!`, so a failing step raises the typed `KvError`
-subclass; a non-throwing iterator uses the generic `check_error!`, which
-raises only on a producer bug.
+An `iter<T>` return is a lazy `Enumerator`, with every `Enumerable` method.
+Each enumeration launches its own native iterator on its first pull, makes
+one `_next` call per element, and destroys the iterator exactly once, when
+iteration finishes, raises, or stops early (`first(2)`, `break`), so the
+same `Enumerator` can be enumerated again. An external enumeration (`next`)
+releases its iterator the same way when it reaches the end or raises; one
+abandoned midway can't run its `ensure`, so the iterator handle is an
+`FFI::AutoPointer` whose GC finalizer destroys it once the suspended
+enumeration is collected. Either path destroys the iterator exactly once.
+Each element is its one C value, received like a return.
 
 ## Known limitations
 
-- Async functions block the calling thread; there's no `Fiber`- or
-  promise-based variant, and `cancellable: true` tokens are not exposed.
-- Callback methods run on whatever thread the producer uses, under the
-  GVL; a callback that blocks waiting for the calling thread deadlocks.
-- Callback-interface parameters are duck-typed: a missing method is only
-  detected when the producer calls it (surfacing as `Error` with
-  code -4, or `NoMethodError` text if the module wasn't included).
-- The plain `generate` output relies on the dynamic loader (or
-  `WEAVEFFI_LIBRARY`) to find the library; only `weaveffi package`
-  bundles it.
-
-## Troubleshooting
-
-- **`LoadError: Could not open library 'libweaveffi.dylib'`**: the
-  cdylib is not on the loader path. Set `WEAVEFFI_LIBRARY`,
-  `DYLD_LIBRARY_PATH` / `LD_LIBRARY_PATH`, or copy the library next to
-  your script.
-- **`LoadError: WeaveFFI ABI mismatch`**: the library was built by a
-  different `weaveffi` release than the bindings. Regenerate the bindings
-  and rebuild the library together.
-- **`FFI::NotFoundError: Function 'weaveffi_*' not found`**: the cdylib
-  does not export the symbol. Rebuild the Rust crate after regenerating
-  the IDL.
-- **`Error: Store used after close` (code -1)**: a closed wrapper was
-  used as a receiver, a parameter, or a record field. Keep the wrapper
-  open for as long as the object is in use; `dup` it if another owner
-  needs an independent reference.
-- **`Error` with `code == -4`**: a callback-interface method you
-  implemented raised (or wasn't implemented); the message is the
-  exception's text.
-- **Segmentation faults on Ruby exit**: the generated wrappers keep
-  vtable trampolines in constants and async completion callbacks
-  referenced until they fire. If you call the `attach_function` bindings
-  directly, keep your own `FFI::Function` objects alive for the lifetime
-  of the call; letting them be garbage-collected mid-call corrupts the C
-  side.
-- **Strings come back as binary garbage**: UTF-8 strings should round
-  trip through `read_string`; for binary data use `read_bytes(length)`
-  with the `out_len` returned by the C ABI.
+- Async calls block the calling thread (or, under a Fiber scheduler, the
+  calling Fiber); there's no promise-based surface.
+- Callback interfaces are duck-typed: a missing method is detected only
+  when the library calls it (and reported to it as a failure).
+- A callback that blocks waiting for the thread that made the triggering
+  call deadlocks.
+- A deprecated callable warns on every call in the `:deprecated` warning
+  category, which Ruby hides by default; enable it with
+  `Warning[:deprecated] = true` (or `ruby -W:deprecated`).

@@ -1,0 +1,32 @@
+[package]
+name = "weaveffi-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "IR, parsers, validation, and the validated model for WeaveFFI API definitions"
+keywords = ["ffi", "codegen", "bindings", "ir", "parser"]
+categories = ["development-tools::ffi"]
+
+[features]
+default = ["idl"]
+# The IDL text formats (YAML and JSON), JSON Schema derivation, and fancy
+# miette diagnostics. The proc-macros build without it.
+idl = ["dep:serde-saphyr", "dep:schemars", "dep:miette"]
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+heck = { workspace = true }
+serde-saphyr = { workspace = true, optional = true }
+serde_json = { workspace = true }
+schemars = { workspace = true, optional = true }
+miette = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde-saphyr = { workspace = true }
+
+[lints]
+workspace = true

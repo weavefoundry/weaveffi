@@ -1,118 +1,124 @@
-//! One module per subcommand. `main.rs` holds only argument parsing and
-//! dispatch; everything a command does lives here.
+//! The `weaveffi` subcommands, one module each. The binary parses the
+//! arguments and dispatches here; every command returns the process's exit
+//! code, and only the binary renders errors.
+//!
+//! This module is the binary's, not part of the library's API.
 
-pub(crate) mod diff;
-pub(crate) mod generate;
-pub(crate) mod package;
-pub(crate) mod validate;
+// The binary is the only caller; its `--help` documents the errors.
+#![allow(clippy::missing_errors_doc)]
 
-use crate::config::ProjectConfig;
-use crate::report::with_named_source;
-use camino::Utf8Path;
-use miette::{bail, IntoDiagnostic, Report, Result, WrapErr};
-use weaveffi_core::validate::{collect_warnings, validate_api};
-use weaveffi_core::ResolvedApi;
-use weaveffi_ir::ir::Api;
-use weaveffi_ir::parse::parse_api_str;
+pub mod build;
+pub mod extract;
+pub mod generate;
+pub mod init;
+pub mod package;
+pub mod validate;
 
-/// Map the input file extension onto the parser's format token.
-pub(crate) fn input_format(in_path: &Utf8Path) -> Result<&'static str> {
-    let ext = in_path.extension().unwrap_or("");
-    if ext.is_empty() {
-        bail!("input file has no extension (expected rs|yml|yaml|json|toml)");
-    }
-    match ext {
-        "yml" | "yaml" => Ok("yaml"),
-        "json" => Ok("json"),
-        "toml" => Ok("toml"),
-        other => bail!(
-            "unsupported input format: {} (expected rs|yml|yaml|json|toml)",
-            other
-        ),
+use std::process::ExitCode;
+
+use camino::{Utf8Path, Utf8PathBuf};
+use miette::{bail, Result};
+use weaveffi_model::model::Model;
+
+use crate::cargo::{CargoCrate, CargoFeatures};
+use crate::package::Skips;
+use crate::project::{Project, Source};
+
+/// How a command finds its project: the positional input, `--config`,
+/// `--library`, `--profile`, and the feature flags.
+#[derive(Clone, Copy, Default)]
+pub struct Locate<'a> {
+    /// The input: a producer crate or an IDL.
+    pub input: Option<&'a str>,
+    /// `--config`.
+    pub config: Option<&'a str>,
+    /// `--library`.
+    pub library: Option<&'a str>,
+    /// `--profile`.
+    pub profile: Option<&'a str>,
+    /// `--features`, `--all-features`, and `--no-default-features`, when
+    /// any is given (else `[build]`'s).
+    pub features: Option<&'a CargoFeatures>,
+    /// `--quiet`.
+    pub quiet: bool,
+}
+
+impl Locate<'_> {
+    /// Locate the project, building a crate's library with `--profile`
+    /// (default `dev`) and the feature flags.
+    pub(crate) fn project(&self) -> Result<Project> {
+        let mut project = Project::locate(self.config, self.input, self.library)?
+            .profile(self.profile.unwrap_or("dev"))
+            .quiet(self.quiet);
+        if let Some(features) = self.features {
+            project = project.features(features.clone());
+        }
+        Ok(project)
     }
 }
 
-/// Read and parse the API at `input` without validating it. Returns the parsed
-/// [`Api`] and the raw file contents (for snippet-rendered diagnostics).
-///
-/// A `.rs` input is treated as annotated Rust source and lowered to the IR
-/// through [`weaveffi_bridge`] (the same extraction the `#[weaveffi::module]`
-/// macro uses), so generating from a producer's source and building that
-/// producer cannot drift. Any other extension is parsed as an IDL document
-/// (yaml/json/toml).
-pub(crate) fn load_api(input: &str) -> Result<(Api, String)> {
-    let in_path = Utf8Path::new(input);
-    let contents = std::fs::read_to_string(in_path.as_std_path())
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    if in_path.extension() == Some("rs") {
-        let api = weaveffi_bridge::api_from_src_stringly(&contents)
-            .map_err(|e| miette::miette!("failed to extract API from Rust source {input}:\n{e}"))?;
-        return Ok((api, contents));
-    }
-    let format = input_format(in_path)?;
-    let api =
-        parse_api_str(&contents, format).map_err(|e| with_named_source(e, input, &contents))?;
-    Ok((api, contents))
-}
-
-/// [`load_api`] plus validation. Returns the [`ResolvedApi`] that every
-/// downstream consumer (orchestrator, packagers) requires.
-pub(crate) fn load_validated_api(input: &str) -> Result<(ResolvedApi, String)> {
-    let (api, contents) = load_api(input)?;
-    let api = validate_api(api, Some((input, &contents))).map_err(Report::new)?;
-    Ok((api, contents))
-}
-
-/// The shared front half of `generate`, `package`, and `diff`: locate and
-/// finalize the project config, load and validate the API, attach the
-/// `[package]` identity, and optionally print advisory warnings.
-pub(crate) fn load_project(
-    input: &str,
-    config_path: Option<&str>,
-    warn: bool,
-) -> Result<(ProjectConfig, ResolvedApi)> {
-    let in_path = Utf8Path::new(input);
-    let mut config = ProjectConfig::for_input(config_path, in_path)?;
-    if config.package.name.is_none() {
-        config.package.name = crate_dir_name(in_path);
-    }
-    let (api, _contents) = load_validated_api(input)?;
-    let api = api.with_package(config.package.clone());
+/// Load the project's validated [`Model`], printing advisory warnings with
+/// `warn`.
+pub(crate) fn load_model(project: &Project, warn: bool) -> Result<Model> {
+    let definition = project.definition()?;
+    let model = definition.validate().map_err(miette::Report::new)?;
     if warn {
-        for w in collect_warnings(&api) {
+        for w in definition.warnings() {
             eprintln!("warning: {w}");
         }
     }
-    Ok((config, api))
+    Ok(model)
 }
 
-/// For a Rust input named `lib.rs`, `main.rs`, or `mod.rs`, the enclosing
-/// crate directory's name (skipping a `src/` component), mirroring how Cargo
-/// names a package after its directory. That name stands in for
-/// `[package] name` when the project config omits it, so `weaveffi generate
-/// samples/kvstore/src/lib.rs` produces a `kvstore` package rather than a
-/// `lib` one. Any other input keeps the file-stem fallback applied by
-/// [`weaveffi_core::pkg::resolve`].
-fn crate_dir_name(input: &Utf8Path) -> Option<String> {
-    if input.extension() != Some("rs") {
-        return None;
+/// The project's Rust producer crate, resolved with `cargo metadata`: the
+/// manifest named by `manifest` (`--manifest-path`), else `[build]
+/// manifest`, else the project's own crate, else the `Cargo.toml` next to
+/// `weaveffi.toml` (or, without one, next to the IDL).
+pub(crate) fn producer_crate(project: &Project, manifest: Option<&str>) -> Result<CargoCrate> {
+    let config = &project.config;
+    let path = match (manifest, &config.build.manifest, &project.source) {
+        (Some(m), _, _) => Utf8PathBuf::from(m),
+        (None, Some(m), _) => config.relative_to_config(m),
+        (None, None, Source::Crate(krate)) => return Ok(krate.as_ref().clone()),
+        (None, None, Source::Idl(idl)) => match config.source.as_deref().and_then(Utf8Path::parent)
+        {
+            Some(dir) => dir.join("Cargo.toml"),
+            None => idl.parent().unwrap_or(Utf8Path::new("")).join("Cargo.toml"),
+        },
+        (None, None, Source::Library(lib)) => lib.with_file_name("Cargo.toml"),
+    };
+    if !path.is_file() {
+        bail!(
+            "no Cargo.toml at {path}: `weaveffi build` compiles a Rust producer crate. Point at \
+             it with `--manifest-path` or `[build] manifest`, or, for a producer built another \
+             way, lay its libraries out as <dir>/<platform>/ and pass `weaveffi package \
+             --binaries <dir>`"
+        );
     }
-    if !matches!(input.file_stem(), Some("lib" | "main" | "mod")) {
-        return None;
+    CargoCrate::resolve(&path)
+}
+
+/// Summarize the artifacts a `build` or `package` run skipped, returning
+/// the exit code: failure only with `strict`.
+pub(crate) fn finish(skips: &Skips, strict: bool) -> ExitCode {
+    let skipped = skips.list();
+    if skipped.is_empty() {
+        return ExitCode::SUCCESS;
     }
-    let mut dir = input.parent()?;
-    if dir.file_name() == Some("src") {
-        dir = dir.parent()?;
+    eprintln!(
+        "warning: skipped {} artifact{} because a tool is missing:",
+        skipped.len(),
+        if skipped.len() == 1 { "" } else { "s" }
+    );
+    for s in &skipped {
+        eprintln!("  - {}: {}", s.what, s.reason);
     }
-    dir.file_name()
-        .filter(|n| !n.is_empty() && *n != ".")
-        .map(str::to_string)
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
-        })
+    if strict {
+        eprintln!("error: --strict fails on skipped artifacts");
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 #[cfg(test)]
@@ -120,20 +126,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn crate_dir_name_follows_cargo_conventions() {
-        assert_eq!(
-            crate_dir_name(Utf8Path::new("samples/kvstore/src/lib.rs")).as_deref(),
-            Some("kvstore")
-        );
-        assert_eq!(
-            crate_dir_name(Utf8Path::new("/abs/crates/foo/src/main.rs")).as_deref(),
-            Some("foo")
-        );
-        assert_eq!(
-            crate_dir_name(Utf8Path::new("crates/foo/lib.rs")).as_deref(),
-            Some("foo")
-        );
-        assert_eq!(crate_dir_name(Utf8Path::new("api/kvstore.rs")), None);
-        assert_eq!(crate_dir_name(Utf8Path::new("api/kvstore.yml")), None);
+    fn skipped_artifacts_fail_only_strict_runs() {
+        let code = |skips: &Skips, strict| format!("{:?}", finish(skips, strict));
+        let success = format!("{:?}", ExitCode::SUCCESS);
+        let none = Skips::default();
+        assert_eq!(code(&none, true), success);
+        let some = Skips::default();
+        some.skip("the NuGet package", "no `dotnet` on PATH");
+        assert_eq!(code(&some, false), success);
+        assert_eq!(code(&some, true), format!("{:?}", ExitCode::FAILURE));
     }
 }

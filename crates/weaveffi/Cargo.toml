@@ -1,7 +1,8 @@
 [package]
 name = "weaveffi"
-version = "0.23.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -10,12 +11,41 @@ keywords = ["ffi", "abi", "bindings", "codegen", "proc-macro"]
 categories = ["development-tools::ffi"]
 
 [dependencies]
-weaveffi-abi = { path = "../weaveffi-abi", version = "0.23.0" }
-weaveffi-macros = { path = "../weaveffi-macros", version = "0.23.0" }
+weaveffi-macros = { workspace = true }
+anyhow = { version = "1", optional = true }
+
+# Tokio has no multi-thread runtime on wasm32, where async calls are polled
+# inline instead, so the dependency (and the `tokio` feature's effect) is
+# native-only.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"], optional = true }
+
+[features]
+default = ["tokio"]
+# Count live objects, callbacks, iterators, cancel tokens, and returned byte
+# allocations so `{prefix}_debug_live` can report leaks. Off by default
+# because every counted operation pays for an atomic update. Every sample
+# enables it.
+leak-check = []
+# Run exported `async fn`s on Tokio (on by default): the current runtime
+# when a launcher is called from inside one, otherwise a multi-thread
+# runtime created on first use. Without it, each call runs on a thread of
+# its own. `set_spawner` overrides either.
+tokio = ["dep:tokio"]
+# Let an exported function return `Result<T, anyhow::Error>` (`throws any`).
+anyhow = ["dep:anyhow"]
 
 [dev-dependencies]
-# Only for the ABI-revision lockstep test; the facade never links core at runtime.
-weaveffi-core = { path = "../weaveffi-core", version = "0.23.0" }
+# The leak-counter test needs counting on. A path-only self dependency turns
+# the feature on for this crate's tests, and `cargo publish` strips it. It
+# leaves the default features to the command line, so
+# `--no-default-features` tests the thread-per-call executor.
+weaveffi = { path = ".", default-features = false, features = ["leak-check"] }
+proptest = "1.11.0"
+# The contract tests compare each contract function with the hash the
+# model computes from the same API in the IDL.
+weaveffi-model = { workspace = true, features = ["idl"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
 
 [lints]
 workspace = true

@@ -1,0 +1,19 @@
+# ANCHOR: shapes
+version: "0.13.0"
+imports:
+  - units.yml
+enums:
+  - name: Shape
+    variants:
+      - name: Circle
+        fields:
+          - { name: radius, type: f64 }
+      - name: Rect
+        fields:
+          - { name: width, type: f64 }
+          - { name: height, type: f64 }
+errors:
+  - name: DrawError
+    codes:
+      - { name: NegativeSize, code: 1, message: a shape has a negative size }
+# ANCHOR_END: shapes

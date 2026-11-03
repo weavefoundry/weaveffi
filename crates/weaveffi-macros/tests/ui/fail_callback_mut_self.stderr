@@ -1,5 +1,5 @@
-error: weaveffi: callback interface methods must take `&self`
- --> tests/ui/fail_callback_mut_self.rs:5:21
+error: weaveffi: a callback interface method takes `&self` (the producer may call it from any thread)
+ --> tests/ui/fail_callback_mut_self.rs:6:17
   |
-5 |         fn on_event(&mut self, n: i32);
-  |                     ^
+6 |     fn on_event(&mut self, n: i32) -> Result<(), weaveffi::ForeignError>;
+  |                 ^

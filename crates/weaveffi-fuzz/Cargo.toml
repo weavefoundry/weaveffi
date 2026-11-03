@@ -1,7 +1,7 @@
 [package]
 name = "weaveffi-fuzz"
-version = "0.23.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 publish = false
 
 [package.metadata]
@@ -12,8 +12,8 @@ fuzzing = ["dep:libfuzzer-sys"]
 
 [dependencies]
 libfuzzer-sys = { version = "0.4", optional = true }
-weaveffi-ir = { path = "../weaveffi-ir" }
-weaveffi-core = { path = "../weaveffi-core" }
+weaveffi = { workspace = true }
+weaveffi-model = { workspace = true, features = ["idl"] }
 
 [lib]
 name = "weaveffi_fuzz"
@@ -34,13 +34,6 @@ doc = false
 required-features = ["fuzzing"]
 
 [[bin]]
-name = "fuzz_parse_toml"
-path = "fuzz_targets/parse_toml.rs"
-test = false
-doc = false
-required-features = ["fuzzing"]
-
-[[bin]]
 name = "fuzz_parse_type_ref"
 path = "fuzz_targets/parse_type_ref.rs"
 test = false
@@ -50,6 +43,20 @@ required-features = ["fuzzing"]
 [[bin]]
 name = "fuzz_validate"
 path = "fuzz_targets/fuzz_validate.rs"
+test = false
+doc = false
+required-features = ["fuzzing"]
+
+[[bin]]
+name = "fuzz_meta_frames"
+path = "fuzz_targets/meta_frames.rs"
+test = false
+doc = false
+required-features = ["fuzzing"]
+
+[[bin]]
+name = "fuzz_value_buffer"
+path = "fuzz_targets/value_buffer.rs"
 test = false
 doc = false
 required-features = ["fuzzing"]

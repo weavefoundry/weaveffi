@@ -1,0 +1,6 @@
+# rejected: InvalidMapKey
+version: "0.13.0"
+functions:
+  - name: by_weight
+    params:
+      - { name: index, type: "{f64:i32}" }

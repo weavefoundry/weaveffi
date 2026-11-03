@@ -1,23 +1,18 @@
-//! The ABI revision is declared twice on purpose: once in `weaveffi-abi`
-//! (which producers link) and once in `weaveffi-core` (which generators
-//! read). The runtime crate must not depend on the generator stack, so
-//! this test is what keeps the two numbers equal.
+//! `export_runtime!` exports the runtime's ABI revision under the crate's
+//! prefix (this test crate is `abi_version`).
 
 #![allow(unsafe_code)]
 
 weaveffi::export_runtime!();
 
-#[test]
-fn runtime_and_generator_abi_revisions_agree() {
-    assert_eq!(weaveffi::abi::ABI_VERSION, weaveffi_core::cabi::ABI_VERSION);
+unsafe extern "C" {
+    fn abi_version_abi_version() -> u32;
 }
 
 #[test]
 fn exported_thunk_reports_the_runtime_revision() {
-    assert_eq!(weaveffi_abi_version(), weaveffi::abi::ABI_VERSION);
-}
-
-#[test]
-fn header_alias_table_covers_the_version_symbol() {
-    assert!(weaveffi_core::utils::ABI_RUNTIME_SYMBOLS.contains(&"abi_version"));
+    assert_eq!(
+        unsafe { abi_version_abi_version() },
+        weaveffi::__rt::ABI_VERSION
+    );
 }
