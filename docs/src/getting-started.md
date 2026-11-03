@@ -18,6 +18,9 @@ cargo install weaveffi-cli
 weaveffi --version
 ```
 
+To set up tab completion in your shell, see
+[Shell Completions](reference/completions.md).
+
 ## Write the producer
 
 Create a library crate and add the `weaveffi` crate. It needs no

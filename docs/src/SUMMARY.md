@@ -19,6 +19,7 @@
 - [C ABI Contract](reference/abi.md)
 - [Value Buffers](reference/value-buffers.md)
 - [Naming](reference/naming.md)
+- [Shell Completions](reference/completions.md)
 
 # Generators
 
