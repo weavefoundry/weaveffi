@@ -27,6 +27,7 @@ jobs:
           - fuzz_parse_type_ref
           - fuzz_validate
           - fuzz_value_buffer
+          - fuzz_meta_frames
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,10 +55,13 @@ jobs:
             crates/weaveffi-fuzz/corpus/${{ matrix.target }}
 
       - name: Run ${{ matrix.target }} for 60s
-        # Any crash is written to artifacts/ and fails the job.
+        # Any crash is written to artifacts/ and fails the job. The prebuilt
+        # cargo-fuzz defaults to its own musl target, which the sanitizers
+        # can't use, so name the runner's target.
         run: |
           cargo +nightly fuzz run \
             --fuzz-dir crates/weaveffi-fuzz \
+            --target x86_64-unknown-linux-gnu \
             --features fuzzing \
             ${{ matrix.target }} \
             crates/weaveffi-fuzz/corpus/${{ matrix.target }} \

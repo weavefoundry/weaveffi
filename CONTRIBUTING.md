@@ -164,7 +164,7 @@ cargo install cargo-fuzz --locked
 Seed a target's corpus from its committed seeds and the snapshot fixtures
 (needs `pip install pyyaml`), then run it for 60 seconds (swap the target
 name for any of `fuzz_parse_yaml`, `fuzz_parse_json`, `fuzz_parse_type_ref`,
-`fuzz_validate`, `fuzz_value_buffer`):
+`fuzz_validate`, `fuzz_value_buffer`, `fuzz_meta_frames`):
 
 ```bash
 python3 crates/weaveffi-fuzz/seed_corpus.py fuzz_parse_yaml \

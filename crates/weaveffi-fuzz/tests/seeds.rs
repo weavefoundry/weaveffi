@@ -173,6 +173,13 @@ fn value_buffer_target_rejects_garbage() {
     }
 }
 
+#[test]
+fn meta_frames_seed_decodes() {
+    let data = seed_bytes("fuzz_meta_frames", "minimal.bin");
+    let frames = weaveffi_model::meta::decode(&data).expect("seed must decode");
+    assert!(!frames.is_empty());
+}
+
 /// Mirrors the body of `fuzz_target!` in `meta_frames.rs`: garbage and a
 /// truncated real frame are rejected without panicking, and a real frame
 /// round-trips.
