@@ -183,9 +183,14 @@ jobs:
       matrix:
         lang: [c, cpp, python, ruby, dart, go, swift, dotnet, node, kotlin, wasm]
         os: [ubuntu-latest, macos-latest]
+        # swift-actions/setup-swift doesn't support Ubuntu 26.04 (the
+        # current ubuntu-latest) yet, so Swift's Linux lane stays on 24.04.
+        exclude:
+          - { lang: swift, os: ubuntu-latest }
         # The targets whose consumers load the library at run time, on
         # Windows (where the lane scripts run under Git Bash).
         include:
+          - { lang: swift, os: ubuntu-24.04 }
           - { lang: python, os: windows-latest }
           - { lang: dotnet, os: windows-latest }
           - { lang: node, os: windows-latest }

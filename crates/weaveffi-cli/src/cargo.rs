@@ -8,6 +8,7 @@
 //! from, and every build output lands under its
 //! [`target_dir`](CargoCrate::target_dir).
 
+use std::fs::{File, OpenOptions};
 use std::process::{Command, Stdio};
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -157,6 +158,36 @@ impl CargoCrate {
         self.manifest_path.parent().unwrap_or(Utf8Path::new("."))
     }
 
+    /// Wait for and take the lock on `{target_dir}/weaveffi/build.lock`,
+    /// which WeaveFFI holds from running Cargo until it has found the files
+    /// Cargo built, so another `weaveffi` command on the same target
+    /// directory can't replace them in between (see
+    /// [`lib_artifacts`](Self::lib_artifacts)). The lock is released when
+    /// the returned file is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lock file can't be created, opened, or
+    /// locked.
+    pub(crate) fn lock_builds(&self) -> Result<File> {
+        let dir = self.weaveffi_dir();
+        std::fs::create_dir_all(dir.as_std_path())
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create {dir}"))?;
+        let path = dir.join("build.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.as_std_path())
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to open {path}"))?;
+        file.lock()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to lock {path}"))?;
+        Ok(file)
+    }
+
     /// Build the crate's library for the host as a `cdylib` with `cargo
     /// rustc --lib --crate-type cdylib --profile {profile}` and `features`
     /// (so the crate needs no particular `crate-type`), forwarding Cargo's
@@ -167,6 +198,7 @@ impl CargoCrate {
         features: &CargoFeatures,
         quiet: bool,
     ) -> Result<Utf8PathBuf> {
+        let _lock = self.lock_builds()?;
         let mut cmd = Command::new(cargo_bin());
         cmd.args(["rustc", "--lib", "--crate-type", "cdylib"])
             .args(["--profile", profile])
@@ -206,13 +238,18 @@ impl CargoCrate {
     /// The files Cargo reported for this crate's library target, from the
     /// JSON messages (`--message-format=json`) it printed to stdout.
     ///
-    /// Each is the file rustc wrote into the profile's `deps` directory
-    /// rather than the copy Cargo reports, which it uplifts into the profile
-    /// directory: Cargo deletes and re-creates that copy on every run, even
-    /// one with nothing to rebuild, so another `cargo` run on the same
-    /// target directory (a concurrent `weaveffi` command, an editor) can
-    /// remove it while this process reads it. The `deps` file changes only
-    /// when the crate is rebuilt. A file with no `deps` original (a name
+    /// Each is the file rustc wrote rather than the copy Cargo reports,
+    /// which it uplifts into the profile directory: Cargo deletes and
+    /// re-creates that copy on every run, even one with nothing to rebuild,
+    /// and a run with other features replaces it, so another `cargo` run on
+    /// the same target directory (a concurrent `weaveffi` command, an
+    /// editor) can change or remove it while this process reads it. The file
+    /// rustc wrote is in the profile's `deps` directory, or, in the layout
+    /// Cargo 1.100 adopted, in a `build/{package}/{hash}/out` directory of
+    /// the build's own, and changes only when that build reruns. Called
+    /// while holding [`lock_builds`](Self::lock_builds), the uplifted copy
+    /// is still the one this build made, which tells the build's own file
+    /// apart from another feature set's. A file with no original (a name
     /// Cargo decorated with a hash) is returned as reported.
     #[must_use]
     pub fn lib_artifacts(&self, stdout: &[u8]) -> Vec<Utf8PathBuf> {
@@ -239,7 +276,7 @@ impl CargoCrate {
                     files
                         .iter()
                         .filter_map(|f| f.as_str())
-                        .map(|f| unuplifted(Utf8Path::new(f))),
+                        .map(|f| unuplifted(Utf8Path::new(f), &self.name)),
                 );
             }
         }
@@ -253,16 +290,38 @@ pub fn cargo_bin() -> String {
     std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string())
 }
 
-/// The original in `deps/` of a file Cargo uplifted to `path`, if there is
-/// one (see [`CargoCrate::lib_artifacts`]), else `path`.
-fn unuplifted(path: &Utf8Path) -> Utf8PathBuf {
-    if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
-        let original = dir.join("deps").join(name);
-        if original.is_file() {
-            return original;
-        }
+/// The file rustc wrote that Cargo uplifted to `path`, if there is one (see
+/// [`CargoCrate::lib_artifacts`]), else `path`: `deps/{name}`, or, in Cargo
+/// 1.100's layout, the `build/{package}/{hash}/out/{name}` with the same
+/// contents as `path` (there's one such directory for each feature set and
+/// profile `package` was built with).
+fn unuplifted(path: &Utf8Path, package: &str) -> Utf8PathBuf {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return path.to_path_buf();
+    };
+    let original = dir.join("deps").join(name);
+    if original.is_file() {
+        return original;
     }
-    path.to_path_buf()
+    let Ok(units) = std::fs::read_dir(dir.join("build").join(package)) else {
+        return path.to_path_buf();
+    };
+    let Ok(uplifted) = std::fs::read(path) else {
+        return path.to_path_buf();
+    };
+    let mut candidates: Vec<Utf8PathBuf> = units
+        .filter_map(|unit| Utf8PathBuf::from_path_buf(unit.ok()?.path()).ok())
+        .map(|unit| unit.join("out").join(name))
+        .filter(|file| {
+            file.metadata()
+                .is_ok_and(|m| m.len() == uplifted.len() as u64)
+        })
+        .collect();
+    candidates.sort();
+    candidates
+        .into_iter()
+        .find(|file| std::fs::read(file).is_ok_and(|bytes| bytes == uplifted))
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 /// `path` with symlinks and `..` resolved where possible, for comparing

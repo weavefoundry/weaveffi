@@ -50,3 +50,20 @@ fn schema_emits_valid_json_schema() {
         );
     }
 }
+
+#[test]
+fn completions_and_schema_version() {
+    for (args, needle) in [
+        (&["completions", "bash"][..], "complete"),
+        (&["completions", "zsh"][..], "compdef"),
+        (
+            &["schema", "--version"][..],
+            weaveffi_model::ir::CURRENT_SCHEMA_VERSION,
+        ),
+    ] {
+        let output = cargo_bin().args(args).output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{args:?} failed: {stdout}");
+        assert!(stdout.contains(needle), "{args:?}: {stdout}");
+    }
+}
