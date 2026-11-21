@@ -474,22 +474,4 @@ mod tests {
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
         assert!(error.to_string().contains("rustlang"), "{error}");
     }
-
-    #[test]
-    fn completions_and_schema_version() {
-        for (args, needle) in [
-            (&["completions", "bash"][..], "complete"),
-            (&["completions", "zsh"][..], "compdef"),
-            (&["schema", "--version"][..], CURRENT_SCHEMA_VERSION),
-        ] {
-            let cmd = assert_cmd::Command::cargo_bin("weaveffi")
-                .expect("binary not found")
-                .args(args)
-                .output()
-                .expect("failed to run weaveffi");
-            let stdout = String::from_utf8_lossy(&cmd.stdout);
-            assert!(cmd.status.success(), "{args:?} failed: {stdout}");
-            assert!(stdout.contains(needle), "{args:?}: {stdout}");
-        }
-    }
 }

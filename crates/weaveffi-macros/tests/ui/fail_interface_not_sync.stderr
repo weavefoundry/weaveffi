@@ -7,10 +7,11 @@ error[E0277]: `Cell<i32>` cannot be shared between threads safely
   = help: within `Counter`, the trait `Sync` is not implemented for `Cell<i32>`
   = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicI32` instead
 note: required because it appears within the type `Counter`
- --> tests/ui/fail_interface_not_sync.rs:7:12
+ --> tests/ui/fail_interface_not_sync.rs:8:5
   |
 7 | pub struct Counter {
-  |            ^^^^^^^
+8 |     n: Cell<i32>,
+  |     ^^^^^^^^^^^^ required by this field
 note: required by a bound in `shared`
  --> tests/ui/fail_interface_not_sync.rs:7:12
   |

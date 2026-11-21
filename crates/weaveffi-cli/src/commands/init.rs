@@ -169,13 +169,14 @@ mod tests {
     fn idl_project_validates_and_generates() {
         let dir = tempfile::tempdir().unwrap();
         let root = Utf8Path::from_path(dir.path()).unwrap().join("greeter");
-        cmd_init(&InitArgs {
+        let code = cmd_init(&InitArgs {
             dir: root.as_str(),
             name: None,
             force: false,
             quiet: true,
         })
         .unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
         let project =
             crate::project::Project::locate(Some(root.join(CONFIG_FILE_NAME).as_str()), None, None)
                 .unwrap();
@@ -202,13 +203,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = Utf8Path::from_path(dir.path()).unwrap();
         std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"kv\"\n").unwrap();
-        cmd_init(&InitArgs {
+        let code = cmd_init(&InitArgs {
             dir: root.as_str(),
             name: None,
             force: false,
             quiet: true,
         })
         .unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
         let cfg = crate::config::ProjectConfig::from_file(&root.join(CONFIG_FILE_NAME)).unwrap();
         assert_eq!(cfg.project.input.as_deref(), Some(Utf8Path::new(".")));
         let names: Vec<&str> = cfg

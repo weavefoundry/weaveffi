@@ -213,11 +213,12 @@ mod tests {
         .unwrap();
         let out = dir.path().join("out");
         let targets = ["c".to_string()];
-        cmd_generate(&GenerateArgs {
+        let code = cmd_generate(&GenerateArgs {
             dry_run: true,
             ..args(yml.to_str().unwrap(), out.to_str().unwrap(), &targets)
         })
         .unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
         assert!(!out.exists(), "dry-run should not create output directory");
     }
 
