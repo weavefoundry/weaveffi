@@ -18,6 +18,13 @@ cargo install weaveffi-cli
 weaveffi --version
 ```
 
+On macOS and Linux, you can install the prebuilt binary with Homebrew
+instead:
+
+```bash
+brew install weavefoundry/tap/weaveffi
+```
+
 To set up tab completion in your shell, see
 [Shell Completions](reference/completions.md).
 

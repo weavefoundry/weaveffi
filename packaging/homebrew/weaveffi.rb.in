@@ -1,0 +1,40 @@
+# The weaveffi formula of the weavefoundry/homebrew-tap tap, rendered by
+# scripts/render-formula.py from a release's archives and their checksums.
+# release-binaries.yml pushes the result to the tap: edit this template, not
+# the tap's copy.
+class Weaveffi < Formula
+  desc "Generate idiomatic bindings for 11 languages from a C ABI library"
+  homepage "https://weaveffi.com/"
+  license any_of: ["MIT", "Apache-2.0"]
+
+  on_macos do
+    on_arm do
+      url "@URL_AARCH64_APPLE_DARWIN@"
+      sha256 "@SHA256_AARCH64_APPLE_DARWIN@"
+    end
+    on_intel do
+      url "@URL_X86_64_APPLE_DARWIN@"
+      sha256 "@SHA256_X86_64_APPLE_DARWIN@"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "@URL_AARCH64_UNKNOWN_LINUX_GNU@"
+      sha256 "@SHA256_AARCH64_UNKNOWN_LINUX_GNU@"
+    end
+    on_intel do
+      url "@URL_X86_64_UNKNOWN_LINUX_GNU@"
+      sha256 "@SHA256_X86_64_UNKNOWN_LINUX_GNU@"
+    end
+  end
+
+  def install
+    bin.install "weaveffi"
+    generate_completions_from_executable(bin/"weaveffi", "completions")
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/weaveffi --version")
+  end
+end

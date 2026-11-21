@@ -7,10 +7,16 @@ output, where `<shell>` is `bash`, `zsh`, `fish`, `powershell`, or `elvish`:
 weaveffi completions bash
 ```
 
-Install the script with the section for your shell below. The Bash, Zsh, and
-fish setups save a copy of the script, so regenerate it after upgrading the
-CLI to pick up new commands and flags; the PowerShell and Elvish setups run
-the CLI each time the shell starts and stay current on their own.
+If you installed the CLI with Homebrew (`brew install
+weavefoundry/tap/weaveffi`), the Bash, Zsh, and fish completions are already
+installed and stay current with each upgrade; Homebrew's [shell
+completion](https://docs.brew.sh/Shell-Completion) page covers loading them.
+
+Otherwise, install the script with the section for your shell below. The
+Bash, Zsh, and fish setups save a copy of the script, so regenerate it after
+upgrading the CLI to pick up new commands and flags; the PowerShell and
+Elvish setups run the CLI each time the shell starts and stay current on
+their own.
 
 ## Bash
 

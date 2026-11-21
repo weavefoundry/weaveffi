@@ -2,7 +2,9 @@ name: Release binaries
 
 # Builds the `weaveffi` CLI for every supported host and attaches the
 # archives to the GitHub release (the same names `cargo binstall weaveffi-cli`
-# resolves through the crate's `[package.metadata.binstall]`).
+# resolves through the crate's `[package.metadata.binstall]`). Once every
+# archive is attached, it adds their SHA256SUMS and the Homebrew formula
+# rendered from them, and pushes the formula to weavefoundry/homebrew-tap.
 on:
   release:
     types: [published]
@@ -71,3 +73,71 @@ jobs:
             tar czf "$name.tar.gz" "$name"
             gh release upload "$TAG" "$name.tar.gz" --clobber
           fi
+
+  homebrew:
+    name: Checksums and Homebrew formula
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      # The checksums are of the assets as published, so they're what a
+      # download (or the formula) gets.
+      - name: Checksums and the formula
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --dir dist \
+            --pattern 'weaveffi-*.tar.gz' --pattern 'weaveffi-*.zip'
+          (cd dist && sha256sum weaveffi-*.tar.gz weaveffi-*.zip > SHA256SUMS)
+          cat dist/SHA256SUMS
+          python3 scripts/render-formula.py "$TAG" dist --output dist/weaveffi.rb
+          gh release upload "$TAG" dist/SHA256SUMS dist/weaveffi.rb --clobber
+      # GITHUB_TOKEN can't write another repository. HOMEBREW_TAP_TOKEN, an
+      # organization secret the WeaveFoundry projects share, may push to
+      # weavefoundry/homebrew-tap (Contents: read and write). Only the latest
+      # release updates the tap, so rerunning this workflow for an older tag
+      # doesn't downgrade the formula.
+      - name: The Homebrew tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          latest="$(gh release view --json tagName --jq .tagName)"
+          if [ "$latest" != "$TAG" ]; then
+            echo "::notice::$TAG isn't the latest release ($latest): the tap keeps its formula."
+            exit 0
+          fi
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set: copy weaveffi.rb from the $TAG release to Formula/weaveffi.rb in weavefoundry/homebrew-tap."
+            exit 0
+          fi
+          git clone "https://x-access-token:$TAP_TOKEN@github.com/weavefoundry/homebrew-tap.git" "$RUNNER_TEMP/tap"
+          mkdir -p "$RUNNER_TEMP/tap/Formula"
+          cp dist/weaveffi.rb "$RUNNER_TEMP/tap/Formula/weaveffi.rb"
+          cd "$RUNNER_TEMP/tap"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/weaveffi.rb
+          if git diff --cached --quiet; then
+            echo "Formula/weaveffi.rb is already up to date."
+            exit 0
+          fi
+          git commit -m "weaveffi ${TAG#v}"
+          # The tap holds every WeaveFoundry project's formula: a push that
+          # lost a race with another project's release rebases onto it and
+          # tries again.
+          for attempt in 1 2 3 4 5; do
+            if git push origin main; then
+              exit 0
+            fi
+            sleep $((attempt * 5))
+            git pull --rebase origin main
+          done
+          echo "::error::could not push Formula/weaveffi.rb to weavefoundry/homebrew-tap"
+          exit 1

@@ -278,7 +278,12 @@ BREAKING CHANGE: JS bindings now return Promises instead of using callbacks; upd
 - Merging the release PR publishes every crate to crates.io, tags
   `v{version}`, and creates the GitHub release, which triggers
   `.github/workflows/release-binaries.yml` to attach prebuilt `weaveffi`
-  binaries (the archives `cargo binstall weaveffi-cli` resolves).
+  binaries (the archives `cargo binstall weaveffi-cli` resolves). Once
+  they're attached, the same workflow adds their `SHA256SUMS` and the
+  Homebrew formula rendered from them (`scripts/render-formula.py` fills in
+  `packaging/homebrew/weaveffi.rb.in`), and pushes the formula to
+  [weavefoundry/homebrew-tap](https://github.com/weavefoundry/homebrew-tap)
+  with the `HOMEBREW_TAP_TOKEN` organization secret.
 - The bump follows release-plz's Conventional Commits rules for `0.x`
   versions: breaking changes bump the minor version. Only `feat`, `fix`,
   `perf`, and `revert` commits appear in the changelog.

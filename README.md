@@ -190,13 +190,17 @@ pages have the details: type mapping, naming, loading, and known limits.
 ## Install
 
 ```bash
-cargo install weaveffi-cli      # from source
-cargo binstall weaveffi-cli     # prebuilt
+cargo install weaveffi-cli                # from source
+cargo binstall weaveffi-cli               # prebuilt
+brew install weavefoundry/tap/weaveffi    # prebuilt, macOS and Linux
 ```
 
 Prebuilt archives for Linux (x64, arm64), macOS (x64, arm64), and Windows
 (x64) are attached to every [GitHub
-release](https://github.com/weavefoundry/weaveffi/releases).
+release](https://github.com/weavefoundry/weaveffi/releases), with their
+`SHA256SUMS`. The Homebrew formula lives in WeaveFoundry's
+[tap](https://github.com/weavefoundry/homebrew-tap), which every release
+updates, and installs the shell completions too.
 
 ## CLI
 
