@@ -186,6 +186,9 @@ impl<'a> Builder<'a> {
             Os::Windows | Os::Ios => {}
         }
 
+        // Held until the files Cargo built are copied out (see
+        // `CargoCrate::lib_artifacts`).
+        let _lock = self.krate.lock_builds()?;
         let mut cmd = Command::new(cargo_bin());
         cmd.args(["rustc", "--lib", "--message-format=json-render-diagnostics"])
             .arg("--manifest-path")
