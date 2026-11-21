@@ -7,6 +7,12 @@ by release-plz, and earlier ones by semantic-release.
 
 ## [Unreleased]
 
+## [0.27.0](https://github.com/weavefoundry/weaveffi/compare/v0.26.0...v0.27.0) - 2026-11-21
+
+### Features
+
+- publish weaveffi to the shared Homebrew tap ([#63](https://github.com/weavefoundry/weaveffi/pull/63))
+
 ## [0.26.0](https://github.com/weavefoundry/weaveffi/compare/v0.25.0...v0.26.0) - 2026-11-02
 
 ### Features
